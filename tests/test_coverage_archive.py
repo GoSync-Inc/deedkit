@@ -2,6 +2,7 @@
 
 Fixtures are synthetic; provider methods and owner sessions are never activated.
 """
+import asyncio
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -180,6 +181,84 @@ def test_tombstone_commit_survives_publication_failure_and_latest_time_wins(arch
     assert state.apply_tombstones() == 0
     assert ar.ingest(event(origin='backfill'))['outcome'] == 'unchanged'
     assert store.get_context(key, mid)['message']['deleted']
+
+
+def run_real_state_passes(monkeypatch, state, passes, during_pass=lambda number: None):
+    """A collector's real drain loop over a real state; returns the sweeps that loop made."""
+    from messaging_service.telegram_collector import TelegramCollector
+    collector = TelegramCollector.__new__(TelegramCollector)
+    collector.spool = object(); collector._history_spool = object(); collector.state = state
+    drains = []; sweeps = []; original = state.apply_tombstones
+    def counted():
+        sweeps.append(len(drains))
+        return original()
+    monkeypatch.setattr(state, 'apply_tombstones', counted)
+    async def drain(spools, history_spools):
+        drains.append(1)
+        await asyncio.to_thread(during_pass, len(drains))
+    collector.drain_captures = drain
+    async def sleep(seconds):
+        if len(drains) == passes: raise asyncio.CancelledError
+    monkeypatch.setattr('messaging_service.telegram_collector.asyncio.sleep', sleep)
+    with pytest.raises(asyncio.CancelledError): asyncio.run(collector.drain_loop())
+    monkeypatch.setattr(state, 'apply_tombstones', original)
+    return sweeps
+
+
+# spec: ANYM-789
+def test_deletion_event_applies_in_line_while_the_sweep_is_not_due(archive, monkeypatch):
+    ar, store, key, _ = archive
+    state = CollectorState(ar, 'archive-test', ('coverage-worker', ar.acquire('archive-test', 'coverage-worker')))
+    state.apply({'kind': 'message', 'peer_kind': 'user', 'envelope': event()})
+    mid = stable_id('msg', 'archive-test', '100', '17')
+    seen = []
+    def delete_on_second_pass(number):
+        if number != 2: return
+        assert state.apply({'kind': 'telegram_delete', 'account': 'archive-test', 'chat': '100', 'ids': [17],
+            'observed_at': '2026-10-01T12:03:00Z'})['outcome'] == 'deletions_recorded'
+        seen.append(store.get_context(key, mid)['message']['deleted'])  # before the loop could sweep
+    assert run_real_state_passes(monkeypatch, state, 2, delete_on_second_pass) == [1, 2]  # 2: the in-line call
+    assert seen == [True]
+
+
+# spec: ANYM-789
+def test_first_pass_after_a_restart_applies_the_tombstone_of_a_crash(archive, monkeypatch):
+    ar, store, key, _ = archive
+    lease = ('coverage-worker', ar.acquire('archive-test', 'coverage-worker'))
+    state = CollectorState(ar, 'archive-test', lease)
+    state.apply({'kind': 'message', 'peer_kind': 'user', 'envelope': event()})
+    mid = stable_id('msg', 'archive-test', '100', '17')
+    original = state.apply_tombstones
+    def crash(): raise RuntimeError('synthetic-after-tombstone-commit')
+    monkeypatch.setattr(state, 'apply_tombstones', crash)
+    with pytest.raises(RuntimeError, match='after-tombstone-commit'):
+        state.apply({'kind': 'telegram_delete', 'account': 'archive-test', 'chat': '100', 'ids': [17],
+                     'observed_at': '2026-10-01T12:03:00Z'})
+    monkeypatch.setattr(state, 'apply_tombstones', original)
+    assert not store.get_context(key, mid)['message']['deleted']
+    restarted = CollectorState(ar, 'archive-test', lease)
+    assert run_real_state_passes(monkeypatch, restarted, 3) == [1]  # the first pass; the other two wait
+    assert store.get_context(key, mid)['message']['deleted']
+
+
+# spec: ANYM-789
+def test_a_real_full_tombstone_page_drains_on_consecutive_passes(archive, monkeypatch):
+    ar, store, key, _ = archive
+    state = CollectorState(ar, 'archive-test', ('coverage-worker', ar.acquire('archive-test', 'coverage-worker')))
+    for n in range(1, 102):
+        state.apply({'kind': 'message', 'peer_kind': 'user', 'envelope': event(
+            provider_id=str(n), updated_at='2026-10-01T12:10:00Z')})
+    original = state.apply_tombstones
+    def crash(): raise RuntimeError('synthetic-after-tombstone-commit')
+    monkeypatch.setattr(state, 'apply_tombstones', crash)
+    with pytest.raises(RuntimeError, match='after-tombstone-commit'):
+        state.apply({'kind': 'telegram_delete', 'account': 'archive-test', 'chat': '100',
+                     'ids': list(range(1, 102)), 'observed_at': '2026-10-01T12:03:00Z'})
+    monkeypatch.setattr(state, 'apply_tombstones', original)
+    # 100 of 101 rows, then the last one on the next pass; the page that was not full starts the period.
+    assert run_real_state_passes(monkeypatch, state, 4) == [1, 2]
+    with store.pool.connection() as c:
+        assert c.execute("SELECT count(*) n FROM messages WHERE account='archive-test' AND deleted").fetchone()['n'] == 101
 
 
 def test_sender_identity_provenance_uses_current_metadata_then_snapshot_never_names(archive):
