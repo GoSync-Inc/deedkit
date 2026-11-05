@@ -965,6 +965,10 @@ func joinRequestResults(values []types.GroupParticipant, expected []types.JID) (
 // calls cannot accumulate; the next request gets provider_timeout at once.
 var phoneLookupSlot = make(chan struct{}, 1)
 
+// phoneBeforeResult is a test seam: when set, the lookup goroutine calls it after
+// the resolution returns and before the result is sent. Nil in production.
+var phoneBeforeResult func()
+
 // openChatByPhone resolves one number to its canonical LID chat; it never sends
 // and never writes the archive (the Python collector materializes the chat).
 // The collector first asks with local_only for the LID the session store maps the
@@ -1028,9 +1032,16 @@ func openChatByPhone(ctx context.Context, job operationRequest, d operationDepen
 		return nil, errors.New("provider_timeout")
 	}
 	done := make(chan phoneResolution, 1)
+	// Read here: an abandoned goroutine must not read the seam while a later test sets it.
+	beforeResult := phoneBeforeResult
 	go func() {
-		defer func() { <-phoneLookupSlot }()
-		done <- resolvePhone(deadline, phone, pn, job, known, d, collected, check)
+		got := resolvePhone(deadline, phone, pn, job, known, d, collected, check)
+		// Free the slot first: a caller holding the result may start the next lookup at once.
+		<-phoneLookupSlot
+		if beforeResult != nil {
+			beforeResult()
+		}
+		done <- got
 	}()
 	var got phoneResolution
 	select {

@@ -764,6 +764,31 @@ func TestNativeOpenChatByPhoneLookupKeepsToTheCollectorsRemainingBudget(t *testi
 }
 
 // spec: ANYM-430
+func TestNativeOpenChatByPhoneFreesTheSlotBeforeTheResultIsSent(t *testing.T) {
+	calls, held := 0, 0
+	phoneBeforeResult = func() { calls++; held = len(phoneLookupSlot) }
+	defer func() { phoneBeforeResult = nil }()
+	d, _ := phoneLookupFake(t, nil, nil)
+	value, err := executeOperation(context.Background(), phoneJob(map[string]any{"phone": phoneFixture}), d)
+	operationResult(t, value, err, "confirmed")
+	if calls != 1 || held != 0 {
+		t.Fatalf("slot still held when the result was sent: %d held over %d calls", held, calls)
+	}
+}
+
+// spec: ANYM-430
+func TestNativeOpenChatByPhoneBackToBackLookupsNeverTimeOutFalsely(t *testing.T) {
+	d, _ := phoneLookupFake(t, nil, nil)
+	for i := 0; i < 200; i++ {
+		value, err := executeOperation(context.Background(), phoneJob(map[string]any{"phone": phoneFixture}), d)
+		if err != nil {
+			t.Fatalf("lookup %d: %v", i, err)
+		}
+		operationResult(t, value, err, "confirmed")
+	}
+}
+
+// spec: ANYM-430
 func TestNativeOpenChatByPhoneRejectsUnnormalizedNumbers(t *testing.T) {
 	for _, phone := range []any{"+12025550123", "07700 900123", "07700900123", "1 202", "", 12025550123, "12025550123@c.us"} {
 		d, queries := phoneLookupFake(t, nil, nil)
@@ -801,6 +826,40 @@ func TestNativeOpenChatByPhoneDeadlineCoversTheSessionStore(t *testing.T) {
 	value, err := executeOperation(context.Background(), job, d)
 	if data := operationResult(t, value, err, "confirmed"); data["provider_lookup"] != false {
 		t.Fatalf("recovered lane did not answer locally: %#v", data)
+	}
+}
+
+// spec: ANYM-430
+func TestNativeOpenChatByPhoneTimedOutResolutionKeepsItsSlot(t *testing.T) {
+	lid, _ := ParseChatID(lidFixture)
+	d, _ := phoneLookupFake(t, nil, &lid)
+	d.lookupTimeout = 50 * time.Millisecond
+	release := make(chan struct{})
+	entered := make(chan struct{}, 2)
+	d.lidForPN = func(context.Context, types.JID) (types.JID, error) {
+		entered <- struct{}{}
+		<-release // ignores its context, like a wedged store
+		return lid, nil
+	}
+	job := phoneJob(map[string]any{"phone": phoneFixture})
+	job.KnownChats = []string{lidFixture}
+	_, first := executeOperation(context.Background(), job, d)
+	// The caller has given up and its resolution is inside the wedged read, so only a
+	// release at the caller's deadline can empty the slot here.
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("the resolution never started")
+	}
+	held := len(phoneLookupSlot)
+	_, second := executeOperation(context.Background(), job, d)
+	close(release)
+	waitPhoneSlot(t)
+	requireError(t, first, "provider_timeout")
+	requireError(t, second, "provider_timeout")
+	if held != 1 {
+		t.Fatalf("slot count %d while a timed-out resolution was still running", held)
 	}
 }
 
