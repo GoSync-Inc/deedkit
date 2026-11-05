@@ -473,23 +473,28 @@ class EnrichmentWorker:
             guard.start_monitor(request_stop)
         delay=DB_RETRY_SECONDS
         try:
-            while not STOP.is_set():
-                if guard:guard.ensure()
-                try:
-                    self.publish_profiles()
-                    if not self.once():STOP.wait(10)
-                except psycopg.OperationalError as error:
-                    # Incident 11-05: one statement timeout in claim() ended the worker. A job whose finish failed, or
-                    # a claim whose commit was lost, stays under its lease until that expires. The stop path keeps
-                    # ending the worker. The next pass proves the confinement again first; a lost one wakes this wait.
-                    if STOP.is_set() or self.requeueing or not transient_database_error(error):raise
-                    database_retry(error,delay)
-                    STOP.wait(delay);delay=min(DB_RETRY_LIMIT_SECONDS,delay*2)
-                else:delay=DB_RETRY_SECONDS
-        finally:
-            # Also when the stop path itself fails: never keep advertising a worker that is going away.
-            if guard:guard.stop_monitor()
-            self.unpublish_profiles()
+            try:
+                while not STOP.is_set():
+                    if guard:guard.ensure()
+                    try:
+                        self.publish_profiles()
+                        if not self.once():STOP.wait(10)
+                    except psycopg.OperationalError as error:
+                        # Incident 11-05: one statement timeout in claim() ended the worker. A job whose finish failed, or
+                        # a claim whose commit was lost, stays under its lease until that expires. The stop path keeps
+                        # ending the worker. The next pass proves the confinement again first; a lost one wakes this wait.
+                        if STOP.is_set() or self.requeueing or not transient_database_error(error):raise
+                        database_retry(error,delay)
+                        STOP.wait(delay);delay=min(DB_RETRY_LIMIT_SECONDS,delay*2)
+                    else:delay=DB_RETRY_SECONDS
+            finally:
+                # Also when the stop path itself fails: never keep advertising a worker that is going away.
+                if guard:guard.stop_monitor()
+                self.unpublish_profiles()
+        except Exception:
+            # ANYM-786: exit 78 must stay fatal and readable, so a lost confinement outranks whatever failed on the way
+            # out; that error's text stays out of stderr, which carries only the check names.
+            if not (guard and guard.lost):raise
         if guard and guard.lost:raise ConfinementLost(guard.lost)
 
 

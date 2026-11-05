@@ -567,6 +567,116 @@ def test_the_worker_process_exits_78_with_the_failed_checks_and_never_touches_th
     assert line == {'error': 'confinement_not_effective', 'checks': ['tcp:1.1.1.1:443']}
 
 
+CANARY = 'synthetic-canary-of-the-masked-error'
+
+
+class GivesBack(Recorder):
+    """The real once() around a job the stop ends, with no database: the claim is canned and the requeue fails for good."""
+    def once(self):
+        self.calls.append('once')
+        return EnrichmentWorker.once(self)
+
+    def claim(self):
+        return {'attachment': 'synthetic', 'lease_token': 'synthetic'}, {}
+
+    def _requeue(self, row):
+        raise psycopg.Error(CANARY)
+
+
+class CannotUnpublish(Recorder):
+    def unpublish_profiles(self):
+        self.calls.append('unpublish')
+        raise psycopg.OperationalError(CANARY)
+
+
+def run_main(worker_for, fake, tmp_path, monkeypatch):
+    """main() with its real exit handling around a worker with no database; the monitor checks every 50 ms."""
+    path, dsn = mini_config(tmp_path)
+    monkeypatch.setattr(sys, 'argv', ['enrichment', '--config', str(path)])
+    monkeypatch.setenv('DATABASE_URL_FILE', str(dsn))
+    monkeypatch.setenv('PROBE_FILES', str(tmp_path))
+    monkeypatch.setattr('messaging_service.telemetry.configure', lambda *_: None)
+    monkeypatch.setattr(enrichment.signal, 'signal', lambda *_: None)
+    monkeypatch.setattr(inference_confinement, 'Confinement', lambda *_a, **_k: guard(fake, fresh=3600.0, interval=0.05))
+    monkeypatch.setattr(enrichment, 'EnrichmentWorker', lambda *_a, confinement: worker_for(confinement))
+    enrichment.main()
+
+
+def assert_exit_78_and_only_check_names(worker_for, fake, tmp_path, monkeypatch, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        run_main(worker_for, fake, tmp_path, monkeypatch)
+    assert exit_info.value.code == inference_confinement.EXIT_CODE == 78
+    output = capsys.readouterr()
+    assert json.loads(output.err) == {'error': 'confinement_not_effective', 'checks': ['tcp:1.1.1.1:443']}
+    assert CANARY not in output.err + output.out and 'Traceback' not in output.err
+
+
+def lost_in_flight(fake, stop):
+    """The rules vanish while a job runs; the job ends only when the monitor's request_stop() has ended it."""
+    fake.open_ports.add(('1.1.1.1', 443))
+    assert stop.wait(10)
+
+
+# spec: ANYM-786
+def test_a_database_error_on_the_stop_path_of_a_lost_confinement_exits_78(stop_state, tmp_path, monkeypatch, capsys):
+    fake, workers = Fake(), []
+
+    def lost_then_error():
+        lost_in_flight(fake, stop_state.STOP)
+        raise psycopg.errors.QueryCanceled(CANARY)
+
+    def worker_for(confinement):
+        workers.append(Recorder(confinement, after_first=lost_then_error))
+        return workers[-1]
+    assert_exit_78_and_only_check_names(worker_for, fake, tmp_path, monkeypatch, capsys)
+    assert workers[0].calls == ['publish', 'once', 'unpublish']
+
+
+# spec: ANYM-786
+def test_a_requeue_that_runs_out_of_time_after_a_lost_confinement_exits_78(stop_state, tmp_path, monkeypatch, capsys):
+    fake, workers = Fake(), []
+    monkeypatch.setattr(enrichment, 'REQUEUE_SECONDS', 0)
+
+    def ended_by_the_stop(_files, _row, _profile):
+        lost_in_flight(fake, stop_state.STOP)
+        raise enrichment.WorkerStopping
+
+    def worker_for(confinement):
+        workers.append(GivesBack(confinement))
+        workers[-1].processor = ended_by_the_stop
+        return workers[-1]
+    assert_exit_78_and_only_check_names(worker_for, fake, tmp_path, monkeypatch, capsys)
+    assert workers[0].requeueing and workers[0].calls == ['publish', 'once', 'unpublish']
+
+
+# spec: ANYM-786
+def test_an_unpublish_that_fails_after_a_lost_confinement_exits_78(stop_state, tmp_path, monkeypatch, capsys):
+    fake, workers = Fake(), []
+
+    def worker_for(confinement):
+        workers.append(CannotUnpublish(confinement, after_first=lambda: lost_in_flight(fake, stop_state.STOP)))
+        return workers[-1]
+    assert_exit_78_and_only_check_names(worker_for, fake, tmp_path, monkeypatch, capsys)
+    assert workers[0].calls == ['publish', 'once', 'unpublish']
+
+
+# spec: ANYM-786
+def test_a_clean_stop_of_a_confined_worker_exits_0(stop_state, tmp_path, monkeypatch, capsys):
+    run_main(lambda confinement: Recorder(confinement, after_first=stop_state.STOP.set), Fake(), tmp_path, monkeypatch)
+    assert capsys.readouterr().err == ''
+
+
+# spec: ANYM-786
+def test_without_a_lost_confinement_a_database_error_is_not_masked(stop_state, tmp_path, monkeypatch):
+    def fails():
+        raise psycopg.errors.UndefinedTable(CANARY)
+    with pytest.raises(psycopg.errors.UndefinedTable, match=CANARY):
+        run_main(lambda confinement: Recorder(confinement, after_first=fails), Fake(), tmp_path, monkeypatch)
+    stop_state.STOP.set()
+    with pytest.raises(psycopg.OperationalError, match=CANARY):
+        run_main(lambda confinement: CannotUnpublish(confinement), Fake(), tmp_path, monkeypatch)
+
+
 # spec: ANYM-688
 def test_the_probe_command_prints_one_json_line_and_exits_78_when_not_confined(monkeypatch, capsys):
     monkeypatch.setattr(inference_confinement, 'Network', lambda: Fake(dns_answers=['1.1.1.1']))
