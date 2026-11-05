@@ -764,6 +764,31 @@ func TestNativeOpenChatByPhoneLookupKeepsToTheCollectorsRemainingBudget(t *testi
 }
 
 // spec: ANYM-430
+func TestNativeOpenChatByPhoneFreesTheSlotBeforeTheResultIsSent(t *testing.T) {
+	calls, held := 0, 0
+	phoneBeforeResult = func() { calls++; held = len(phoneLookupSlot) }
+	defer func() { phoneBeforeResult = nil }()
+	d, _ := phoneLookupFake(t, nil, nil)
+	value, err := executeOperation(context.Background(), phoneJob(map[string]any{"phone": phoneFixture}), d)
+	operationResult(t, value, err, "confirmed")
+	if calls != 1 || held != 0 {
+		t.Fatalf("slot still held when the result was sent: %d held over %d calls", held, calls)
+	}
+}
+
+// spec: ANYM-430
+func TestNativeOpenChatByPhoneBackToBackLookupsNeverTimeOutFalsely(t *testing.T) {
+	d, _ := phoneLookupFake(t, nil, nil)
+	for i := 0; i < 200; i++ {
+		value, err := executeOperation(context.Background(), phoneJob(map[string]any{"phone": phoneFixture}), d)
+		if err != nil {
+			t.Fatalf("lookup %d: %v", i, err)
+		}
+		operationResult(t, value, err, "confirmed")
+	}
+}
+
+// spec: ANYM-430
 func TestNativeOpenChatByPhoneRejectsUnnormalizedNumbers(t *testing.T) {
 	for _, phone := range []any{"+12025550123", "07700 900123", "07700900123", "1 202", "", 12025550123, "12025550123@c.us"} {
 		d, queries := phoneLookupFake(t, nil, nil)
