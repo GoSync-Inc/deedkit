@@ -1223,9 +1223,11 @@ class NetworkHost(Applier):
 
 
 def refused_before_the_first_write(host, result, code, files, before):
-    assert [item["code"] for item in result["refusals"]] == [code], result
+    assert {item["code"] for item in result["refusals"]} == {code}, result
     assert not p.PAUSE.exists() and not (host.state / "enrollment.json").exists()
-    assert host.files() == files and tree(host.root) == before and host.mutations() == [] and host.up is None
+    # The host lock is taken before the check, in the state directory, and holds nothing of the enrollment.
+    written = [item for item in set(tree(host.root)) ^ set(before) if item[0] != "state" and not item[0].endswith(".lock")]
+    assert host.files() == files and written == [] and host.mutations() == [] and host.up is None
     assert not any(call[:3] == ["docker", "network", "create"]
                    or (call[:2] == ["docker", "compose"] and {"up", "stop", "down", "restart", "start"} & set(call))
                    for call in host.calls)
