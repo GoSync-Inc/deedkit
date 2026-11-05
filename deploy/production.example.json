@@ -22,6 +22,12 @@
       "files": ["/opt/deedkit/deploy/compose.gateway.yaml", "/opt/deedkit/deploy/compose.gateway-ingress.yaml"],
       "env_files": ["/opt/deedkit/deploy/private/gateway.env"],
       "services": {"gateway": "gateway"}
+    },
+    {
+      "name": "deedkit-file-lifecycle",
+      "directory": "/etc/deedkit",
+      "files": ["/etc/deedkit/file-lifecycle/compose.json"],
+      "services": {"file-lifecycle": "runtime", "cold-archive": "backup", "cold-restore": "backup"}
     }
   ]
 }
