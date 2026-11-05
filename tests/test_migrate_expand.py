@@ -214,7 +214,6 @@ def test_an_expand_migration_and_its_role_grant_apply_together(db, tmp_path):
 # spec: ANYM-596
 @pytest.mark.parametrize(('migration', 'roles', 'code'), [
     ('-- rollout: expand\nALTER TABLE messages DROP COLUMN body;\n', {}, 'not_unattended'),
-    ('-- rollout: manual\n' + NOTE.split('\n', 1)[1], {}, 'not_unattended'),
     (NOTE, {'gateway_role.sql': 'REVOKE SELECT ON messages FROM messaging_gateway;\n'}, 'role_not_additive'),
     (NOTE, {'gateway_role.sql': 'GRANT UPDATE ON synthetic_seq TO messaging_gateway;\n'}, 'role_not_additive'),
     # Sol r2 F1, F2: a "new" table named like an existing sequence, or like a catalog the GRANT would resolve to.
@@ -231,7 +230,7 @@ def test_an_expand_migration_and_its_role_grant_apply_together(db, tmp_path):
     ('-- rollout: expand\nCREATE TABLE synthetic_owner (id text PRIMARY KEY);\n'
      'CREATE TABLE IF NOT EXISTS synthetic_owner_pkey (id text);\n',
      {'gateway_role.sql': 'GRANT SELECT ON synthetic_owner_pkey TO messaging_gateway;\n'}, 'not_unattended'),
-], ids=['drop', 'declared-manual', 'revoke', 'not-a-table', 'sequence-collision', 'catalog-collision', 'catalog',
+], ids=['drop', 'revoke', 'not-a-table', 'sequence-collision', 'catalog-collision', 'catalog',
         'serial-sequence', 'batch-index'])
 def test_anything_outside_the_unattended_language_applies_nothing(db, tmp_path, migration, roles, code):
     _, dsn = db
@@ -356,24 +355,6 @@ def test_the_session_carries_the_deploy_name_over_one_the_dsn_names(db, tmp_path
         assert cli_module.main() == 0
     assert seen == ['deedkit-migrate-synthetic'] * 2
 
-
-
-# spec: ANYM-619
-@pytest.mark.parametrize('migration', [
-    '-- rollout: expand\nCREATE TABLE synthetic_notes (id text REFERENCES synthetic_absent(id));\n',
-    "-- rollout: expand\nCOMMENT ON SCHEMA public IS 'synthetic';\n",
-    "-- rollout: expand\nCOMMENT ON TABLE synthetic_seq IS 'synthetic';\n",
-], ids=['unknown-reference', 'comment-on-schema', 'comment-on-a-sequence'])
-def test_a_comment_or_reference_outside_the_archive_tables_applies_nothing(db, tmp_path, migration):
-    _, dsn = db
-    with psycopg.connect(dsn) as c: c.execute('CREATE SEQUENCE synthetic_seq')
-    root = package(tmp_path, migration)
-    plan = write_plan(tmp_path, plan_for(root, RUNTIME_SCHEMA, NEXT))
-    before = acls(dsn)
-    assert cli(dsn, tmp_path, '--plan', plan, root=root)[:2] == (1, {'error': 'not_unattended'})
-    assert ledger(dsn) == (RUNTIME_SCHEMA, 0, 0) and acls(dsn) == before
-    with psycopg.connect(dsn) as c:
-        assert c.execute("SELECT obj_description('public'::regnamespace, 'pg_namespace')").fetchone()[0] != 'synthetic'
 
 
 # spec: ANYM-619

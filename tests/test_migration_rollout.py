@@ -599,6 +599,234 @@ def test_the_pause_class_is_no_header_a_declared_manual_or_classify_of_a_declare
     assert rollout.rollout_class(EXPAND + COUNTEREXAMPLES['insert'][0]) == 'manual'
 
 
+CRITICAL_FORMS = {
+    'delete': ("DELETE FROM messages WHERE id = 'marker';", 'DELETE'),
+    'update': ("UPDATE messages SET body = 'marker';", 'UPDATE'),
+    'truncate': ('TRUNCATE messages;', 'TRUNCATE'),
+    'merge': ('MERGE INTO messages m USING other o ON m.id = o.id WHEN MATCHED THEN DELETE;', 'MERGE'),
+    'upsert': ("INSERT INTO messages (id) VALUES ('x') ON CONFLICT (id) DO UPDATE SET body = 'y';",
+               'INSERT ON CONFLICT DO UPDATE'),
+    'drop-table': ('DROP TABLE messages;', 'DROP TABLE'),
+    'drop-column': ('ALTER TABLE messages DROP COLUMN body;', 'DROP COLUMN'),
+    'drop-bare-column': ('ALTER TABLE messages ADD COLUMN x text, DROP body;', 'DROP COLUMN'),
+    'drop-cascade': ('DROP INDEX messages_body CASCADE;', 'DROP CASCADE'),
+    'drop-constraint-cascade': ('ALTER TABLE messages DROP CONSTRAINT messages_pkey CASCADE;', 'DROP CASCADE'),
+    'drop-schema': ('DROP SCHEMA archive;', 'DROP SCHEMA'),
+    'drop-sequence': ('DROP SEQUENCE messages_id_seq;', 'DROP SEQUENCE'),
+    'type': ('ALTER TABLE messages ALTER COLUMN body TYPE varchar(10);', 'ALTER COLUMN TYPE'),
+    'set-data-type': ('ALTER TABLE messages ALTER body SET DATA TYPE varchar(10);', 'ALTER COLUMN TYPE'),
+    'set-expression': ('ALTER TABLE messages ALTER COLUMN rank SET EXPRESSION AS (1);', 'ALTER COLUMN TYPE'),
+    'select': ('SELECT purge_messages();', 'SELECT'),
+    'call': ('CALL purge();', 'CALL'),
+    'cte': ('WITH gone AS (DELETE FROM messages RETURNING id) SELECT 1;', 'WITH'),
+    'do-delete': ("DO $$ BEGIN DELETE FROM messages; END $$;", 'DO'),
+    'do-perform': ("DO $$ BEGIN PERFORM purge(); END $$;", 'DO'),
+    'do-execute': ("DO $$ BEGIN EXECUTE 'DROP TABLE messages'; END $$;", 'DO'),
+    'extension': ('CREATE EXTENSION citext;', 'CREATE EXTENSION'),
+    'other-schema-table': ('ALTER TABLE other.messages ADD COLUMN x text;', 'unparsed'),
+    'unknown': ('VACUUM ANALYZE messages;', 'other statement'),
+    'do-call': ("DO $$ BEGIN IF synthetic_clear() THEN NULL; END IF; END $$;", 'DO'),
+    'new-function-default': ('CREATE FUNCTION synthetic_f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$; '
+                             'ALTER TABLE messages ADD COLUMN y int DEFAULT synthetic_f();', 'FUNCTION CALL'),
+    'bare-alter': ('ALTER;', 'unparsed'),
+    'bare-set': ('ALTER TABLE messages SET;', 'unparsed'),
+    'bare-create': ('CREATE TABLE;', 'unparsed'),
+    # Sol r2 F1: an INSERT fires a trigger or rule the file creates; a created function shadows a DO_CALLS name.
+    'trigger-on-insert': ('CREATE FUNCTION synthetic_wipe() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN '
+                          'ALTER TABLE messages DROP COLUMN body; RETURN NEW; END; $f$; CREATE TABLE synthetic_fire '
+                          '(id integer); CREATE TRIGGER synthetic_fire BEFORE INSERT ON synthetic_fire FOR EACH ROW '
+                          'EXECUTE FUNCTION synthetic_wipe(); INSERT INTO synthetic_fire VALUES (1);',
+                          'WRITING FUNCTION'),
+    'rule-on-insert': ('CREATE TABLE synthetic_fire (id integer); CREATE RULE synthetic_r AS ON INSERT TO '
+                       'synthetic_fire DO INSTEAD DELETE FROM messages; INSERT INTO synthetic_fire VALUES (1);',
+                       'CREATE RULE'),
+    'replaced-function-on-insert': ("CREATE OR REPLACE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+                                    "RETURN NEW; END $$; INSERT INTO messages (id) VALUES ('x');", 'FUNCTION CALL'),
+    'shadowed-do-call': ('CREATE FUNCTION to_regclass(integer) RETURNS regclass LANGUAGE plpgsql AS $f$ BEGIN '
+                         'RETURN NULL; END; $f$; DO $b$ BEGIN IF to_regclass(1) IS NULL THEN NULL; END IF; END; $b$;',
+                         'FUNCTION CALL'),
+    # Sol r3 F1: the runner's own ledger INSERT and UPDATE fire what a file creates, with no INSERT in the file.
+    'ledger-trigger-file': ("CREATE FUNCTION synthetic_wipe() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN DROP TABLE "
+                            "synthetic_existing; CREATE TABLE synthetic_existing (body text); INSERT INTO "
+                            "synthetic_existing VALUES ('erased'); RETURN NEW; END; $f$; CREATE TRIGGER synthetic_fire "
+                            "BEFORE INSERT ON archive_migrations FOR EACH ROW EXECUTE FUNCTION synthetic_wipe();",
+                            'WRITING FUNCTION'),
+    'trigger': ('CREATE TRIGGER synthetic_fire BEFORE INSERT ON archive_migrations FOR EACH ROW EXECUTE FUNCTION '
+                'synthetic_read();', 'CREATE TRIGGER'),
+    'constraint-trigger': ('CREATE CONSTRAINT TRIGGER synthetic_fire AFTER INSERT ON archive_migrations FOR EACH ROW '
+                           'EXECUTE FUNCTION synthetic_read();', 'CREATE TRIGGER'),
+    'replaced-trigger': ('CREATE OR REPLACE TRIGGER synthetic_fire BEFORE UPDATE ON probe_metadata FOR EACH ROW EXECUTE '
+                         'FUNCTION synthetic_read();', 'CREATE TRIGGER'),
+    'event-trigger': ('CREATE EVENT TRIGGER synthetic_fire ON ddl_command_end EXECUTE FUNCTION synthetic_read();',
+                      'CREATE TRIGGER'),
+    'rule': ('CREATE RULE synthetic_r AS ON INSERT TO archive_migrations DO ALSO NOTIFY synthetic;', 'CREATE RULE'),
+    'do-select-rule': ('DO $$ BEGIN CREATE RULE synthetic_r AS ON SELECT TO synthetic_v DO ALSO NOTIFY x; END $$;', 'DO'),
+    'do-function': ('DO $$ BEGIN CREATE FUNCTION synthetic_f() RETURNS int LANGUAGE sql AS $f$ SELECT 1 $f$; END $$;',
+                    'DO'),
+    # Routes the trigger rule leaves open: a function that writes is critical however it would run.
+    'renamed-function-default': ("CREATE FUNCTION synthetic_a() RETURNS int LANGUAGE plpgsql AS $f$ BEGIN TRUNCATE "
+                                 "messages; RETURN 1; END; $f$; ALTER FUNCTION synthetic_a() RENAME TO synthetic_b; "
+                                 "ALTER TABLE archive_migrations ADD COLUMN x int DEFAULT synthetic_b();",
+                                 'WRITING FUNCTION'),
+    'function-in-a-string': ("CREATE FUNCTION synthetic_wipe() RETURNS int LANGUAGE plpgsql AS $f$ BEGIN DROP TABLE "
+                             "messages; RETURN 1; END; $f$; ALTER TABLE archive_migrations ADD COLUMN x xml DEFAULT "
+                             "query_to_xml('SELECT synthetic_wipe()', false, true, '');", 'WRITING FUNCTION'),
+    'function-in-a-table-as': ("CREATE FUNCTION synthetic_wipe() RETURNS int LANGUAGE sql AS $f$ DELETE FROM messages "
+                               "RETURNING 1 $f$; CREATE TABLE synthetic_t AS SELECT query_to_xml('SELECT ' || "
+                               "'synthetic_wipe()', false, true, '');", 'WRITING FUNCTION'),
+    'function-body-in-a-string': ("CREATE FUNCTION synthetic_f() RETURNS void LANGUAGE sql AS 'SELECT 1';",
+                                  'WRITING FUNCTION'),
+    'function-body-in-escapes': (r"CREATE FUNCTION synthetic_f() RETURNS void LANGUAGE sql AS E'\x44ELETE FROM messages';",
+                                 'WRITING FUNCTION'),
+    'function-nested-quote': ('CREATE FUNCTION synthetic_f() RETURNS void LANGUAGE plpgsql AS $a$ BEGIN PERFORM $b$ DROP '
+                              'TABLE messages $b$; END; $a$;', 'WRITING FUNCTION'),
+    'function-other-language': ("CREATE FUNCTION synthetic_f() RETURNS void LANGUAGE internal AS $$ synthetic $$;",
+                                'WRITING FUNCTION'),
+    'function-no-language': ('CREATE FUNCTION synthetic_f() RETURNS int RETURN 1;', 'WRITING FUNCTION'),
+    'procedure-writes': ('CREATE PROCEDURE synthetic_p() LANGUAGE sql AS $$ UPDATE messages SET body = $s$x$s$ $$;',
+                         'WRITING FUNCTION'),
+    'alter-function': ('ALTER FUNCTION synthetic_a() RENAME TO synthetic_b;', 'ALTER other'),
+    'alter-other-kinds': ('ALTER ROLE messaging SUPERUSER;', 'ALTER other'),
+    # Sol r2 and r3 F5: an ALTER TABLE action is non-critical only as a complete form the classifier names.
+    'add-column-no-name': ('ALTER TABLE messages ADD COLUMN;', 'unparsed'),
+    'add-column-no-type': ('ALTER TABLE messages ADD COLUMN x;', 'unparsed'),
+    'add-column-open-bracket': ('ALTER TABLE messages ADD COLUMN x int CHECK (x > 0;', 'unparsed'),
+    'add-constraint-no-form': ('ALTER TABLE messages ADD CONSTRAINT k;', 'unparsed'),
+    'add-check-no-form': ('ALTER TABLE messages ADD CHECK;', 'unparsed'),
+    'alter-column-no-action': ('ALTER TABLE messages ALTER COLUMN body;', 'unparsed'),
+    'alter-column-set-unknown': ('ALTER TABLE messages ALTER COLUMN body SET foo;', 'unparsed'),
+    'alter-column-storage': ('ALTER TABLE messages ALTER COLUMN body SET STORAGE EXTERNAL;', 'unparsed'),
+    'alter-column-default-empty': ('ALTER TABLE messages ALTER COLUMN body SET DEFAULT;', 'unparsed'),
+    'alter-constraint': ('ALTER TABLE messages ALTER CONSTRAINT k DEFERRABLE;', 'unparsed'),
+    'validate-no-name': ('ALTER TABLE messages VALIDATE CONSTRAINT;', 'unparsed'),
+    'set-unknown': ('ALTER TABLE messages SET foo;', 'unparsed'),
+    'set-open-bracket': ('ALTER TABLE messages SET (;', 'unparsed'),
+    'set-options': ('ALTER TABLE messages SET (fillfactor = 70);', 'unparsed'),
+    'set-unlogged': ('ALTER TABLE messages SET UNLOGGED;', 'unparsed'),
+    'rename-no-target': ('ALTER TABLE messages RENAME;', 'unparsed'),
+    'rename-to-no-target': ('ALTER TABLE messages RENAME TO;', 'unparsed'),
+    'rename-table': ('ALTER TABLE messages RENAME TO messages_v2;', 'unparsed'),
+    'rename-column': ('ALTER TABLE messages RENAME COLUMN body TO text_body;', 'unparsed'),
+    'owner-no-to': ('ALTER TABLE messages OWNER x;', 'unparsed'),
+    'owner-to-no-target': ('ALTER TABLE messages OWNER TO;', 'unparsed'),
+    'disable-trigger': ('ALTER TABLE messages DISABLE TRIGGER ALL;', 'unparsed'),
+    'detach-partition': ('ALTER TABLE messages DETACH PARTITION synthetic_old;', 'unparsed'),
+    'no-inherit': ('ALTER TABLE messages NO INHERIT synthetic_parent;', 'unparsed'),
+}
+
+
+def calendar_rollout():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        'calendar_rollout', SOURCE.parents[1] / 'calendar/family_calendar/service/migration_rollout.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+CLASSIFIERS = {'messaging': rollout, 'calendar': calendar_rollout()}
+NON_CRITICAL_FORMS = {
+    'widening-pair': ALLOWED['widen-in'],
+    'index-on-existing': 'CREATE INDEX messages_body ON messages (body);',
+    'drop-index': 'DROP INDEX IF EXISTS messages_body;',
+    'drop-constraint': 'ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_kind_check;',
+    'drop-default': 'ALTER TABLE messages ALTER COLUMN body DROP DEFAULT, ALTER COLUMN body DROP NOT NULL;',
+    'function-that-reads': "CREATE OR REPLACE FUNCTION synthetic_f() RETURNS int LANGUAGE plpgsql AS $$ BEGIN "
+                           "RETURN (SELECT count(*) FROM messages); END $$;",
+    'function-plpgsql-syntax': "CREATE FUNCTION synthetic_g(p integer) RETURNS integer LANGUAGE plpgsql SET search_path="
+                               "pg_catalog AS $f$ DECLARE t integer[] := ARRAY[1, 2]; n integer := $1; BEGIN FOR i IN "
+                               "1..2 LOOP n := n + t[1:2][1]::integer; END LOOP; RETURN n; END; $f$;",
+    'grant-revoke': 'GRANT SELECT, UPDATE, DELETE ON messages TO messaging_gateway; REVOKE ALL ON messages FROM public;',
+    'do-grant': "DO $$ BEGIN IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'messaging_gateway') THEN GRANT SELECT, "
+                "INSERT, UPDATE, DELETE ON messages TO messaging_gateway; END IF; END $$;",
+    'insert': "INSERT INTO probe_metadata (name, value) VALUES ('synthetic', 'x') ON CONFLICT DO NOTHING;",
+    'comment': "COMMENT ON SCHEMA public IS 'synthetic';",
+    'precondition': ALLOWED['precondition'],
+    'complete-actions': 'ALTER TABLE messages ADD COLUMN IF NOT EXISTS x int, ALTER COLUMN body SET NOT NULL, '
+                        "ALTER body SET DEFAULT 'y', ADD CONSTRAINT k CHECK (x > 0) NOT VALID, ADD UNIQUE (x), "
+                        'VALIDATE CONSTRAINT j, DROP CONSTRAINT l RESTRICT; '
+                        'ALTER TABLE messages ENABLE ROW LEVEL SECURITY; ALTER TABLE messages FORCE ROW LEVEL SECURITY;',
+    'new-table-insert':'CREATE TABLE synthetic_t (id int); INSERT INTO synthetic_t VALUES (1);',
+}
+
+
+# spec: ANYM-743
+@pytest.mark.parametrize('database', sorted(CLASSIFIERS))
+@pytest.mark.parametrize('form', sorted(CRITICAL_FORMS))
+def test_a_statement_that_deletes_or_rewrites_rows_or_drops_stored_data_is_critical_with_its_line(form, database):
+    module, (text, kind) = CLASSIFIERS[database], CRITICAL_FORMS[form]
+    file = EXPAND + 'ALTER TABLE messages ADD COLUMN synthetic_note text;\n\n' + text + '\n'
+    assert module.risk_class(file) == ('critical', 4, kind) and kind in module.RISK_KINDS
+    assert module.unattended_class(file) == 'manual'
+
+
+# spec: ANYM-743
+@pytest.mark.parametrize('database', sorted(CLASSIFIERS))
+@pytest.mark.parametrize('form', sorted(NON_CRITICAL_FORMS))
+def test_every_other_named_form_is_non_critical_and_unattended_whatever_the_header_class(form, database):
+    module, text = CLASSIFIERS[database], NON_CRITICAL_FORMS[form]
+    assert module.risk_class(text) == ('non-critical', None, None)
+    assert module.unattended_class(EXPAND + text) == module.unattended_class('-- rollout: manual\n' + text) == 'expand'
+    assert module.unattended_class(text) == 'manual'  # no header
+    assert module.unattended_class(EXPAND + text + '\nCREATE INDEX CONCURRENTLY x ON messages (id);') == 'manual'
+
+
+# spec: ANYM-743
+@given(st.text(alphabet='abcdefghijklmnopqrstuvwxyz _(),;\'$-\n', max_size=200),
+       st.sampled_from(sorted(CRITICAL_FORMS)), st.sampled_from(sorted(CLASSIFIERS)))
+@settings(max_examples=300, deadline=None)
+def test_a_critical_statement_keeps_a_file_critical_whatever_precedes_it(noise, form, database):
+    # Fail-closed: no text before a critical statement makes the file non-critical (noise that does not tokenize
+    # is critical too).
+    assert CLASSIFIERS[database].risk_class(noise + ';\n' + CRITICAL_FORMS[form][0])[0] == 'critical'
+
+
+# spec: ANYM-743
+@given(st.text(alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz', min_size=4, max_size=30),
+       st.sampled_from(['{m};', '{m} now please;', 'CREATE {m} x;', 'DROP {m} x;', 'ALTER TABLE t {m} x;',
+                        'DO $$ BEGIN {m}(); END $$;', '{m} ( ;', "SELECT '{m}"]))
+@settings(max_examples=200, deadline=None)
+def test_the_pause_names_a_fixed_kind_never_a_word_of_the_file(marker, shape):
+    from scripts import production
+    text = EXPAND + shape.format(m='Zq' + marker) + '\n'
+    for module in CLASSIFIERS.values():
+        tier, _, kind = module.risk_class(text)
+        assert tier == 'non-critical' or kind in module.RISK_KINDS
+    assert set(production.RISK_KINDS) == set(rollout.RISK_KINDS) == set(CLASSIFIERS['calendar'].RISK_KINDS)
+    named = production.classifier_child(production.CLASSIFY, {'source': Path(rollout.__file__).read_text(),
+                                                              'texts': [text]})
+    assert production.NAMED_CLASS.fullmatch(named[0]) and 'zq' + marker.lower() not in named[0].lower()
+
+
+# spec: ANYM-743
+def test_the_classifier_child_names_the_tier_of_a_calendar_file_with_the_calendar_classifier():
+    # Sol r2 F3: the calendar module imports hashlib, which the child's audit hook would refuse.
+    from scripts import production
+    source = (SOURCE.parents[1] / 'calendar/family_calendar/service/migration_rollout.py').read_text()
+    texts = [EXPAND + NON_CRITICAL_FORMS['index-on-existing'] + '\n', EXPAND + CRITICAL_FORMS['truncate'][0] + '\n']
+    named = production.classifier_child(production.CLASSIFY, {'source': source, 'texts': texts})
+    assert all(production.NAMED_CLASS.fullmatch(name) for name in named)
+    assert named[0].endswith(' non-critical') and named[1].endswith(' critical: line 2 TRUNCATE')
+
+
+# spec: ANYM-743
+def test_most_applied_migrations_are_non_critical():
+    # The owner's «большая часть» (ANYM-743 C1b): more than half of the applied files of each database.
+    folder = SOURCE.parents[1] / 'calendar/family_calendar/service'
+    for module, paths, least in ((rollout, MIGRATIONS.values(), 60),
+                                 (CLASSIFIERS['calendar'], folder.glob('schema_v[0-9]*.sql'), 7)):
+        tiers = [module.risk_class(path.read_text())[0] for path in paths]
+        assert len(tiers) >= least and tiers.count('non-critical') > len(tiers) / 2
+
+
+# spec: ANYM-743
+def test_a_read_only_replaced_function_and_the_incident_widening_stay_non_critical_while_a_trigger_file_does_not():
+    # 067 is the incident of this card; 063 and 065 replace long read-only PL/pgSQL functions; 026 creates a trigger.
+    tier = {number: rollout.risk_class(source(MIGRATIONS[number]))[0] for number in (26, 63, 65, 67)}
+    assert tier == {26: 'critical', 63: 'non-critical', 65: 'non-critical', 67: 'non-critical'}
+    assert rollout.risk_class(source(MIGRATIONS[26]))[2] == 'CREATE TRIGGER'
+
+
 # 038 holds the widening pair too, but its partial unique index already makes it manual for `classify`.
 # spec: ANYM-596
 @pytest.mark.parametrize(('body', 'pause_class'), [(ALLOWED['widen-in'], 'expand'), (source(MIGRATIONS[36]), 'expand'),
@@ -606,16 +834,16 @@ def test_the_pause_class_is_no_header_a_declared_manual_or_classify_of_a_declare
 def test_the_unattended_class_calls_any_drop_manual_while_the_rollout_class_stays_expand(body, pause_class):
     text = EXPAND + body
     assert rollout.rollout_class(text) == pause_class
-    assert rollout.unattended_class(text) == 'manual'
-    assert rollout.unattended_class(text, EXISTING) == 'manual'
+    assert rollout.additive_class(text) == 'manual'
+    assert rollout.additive_class(text, EXISTING) == 'manual'
 
 
 # spec: ANYM-596
 @pytest.mark.parametrize('form', [f for f in ALLOWED if not f.startswith('widen')])
 def test_the_unattended_class_keeps_every_drop_free_expand_form(form):
-    assert rollout.unattended_class(EXPAND + ALLOWED[form], EXISTING) == 'expand'
-    assert rollout.unattended_class(ALLOWED[form], EXISTING) == 'manual'  # no header
-    assert rollout.unattended_class('-- rollout: manual\n' + ALLOWED[form], EXISTING) == 'manual'
+    assert rollout.additive_class(EXPAND + ALLOWED[form], EXISTING) == 'expand'
+    assert rollout.additive_class(ALLOWED[form], EXISTING) == 'manual'  # no header
+    assert rollout.additive_class('-- rollout: manual\n' + ALLOWED[form], EXISTING) == 'manual'
 
 
 # The appended text of each role file in #323 (schema 49) and #326 (schema 50), as merged.
@@ -766,8 +994,8 @@ def test_a_name_postgresql_would_truncate_is_never_unattended():
     existing = 't' * 63
     text = EXPAND + f'CREATE TABLE IF NOT EXISTS {existing}x (component text);\n'
     assert rollout.rollout_class(text, {existing}) == 'expand'  # the CI class is unchanged
-    assert rollout.unattended_class(text, {existing}) == 'manual'
-    assert rollout.unattended_class(text.replace('x (', ' ('), set()) == 'expand'
+    assert rollout.additive_class(text, {existing}) == 'manual'
+    assert rollout.additive_class(text.replace('x (', ' ('), set()) == 'expand'
 
 
 ADDITIVE_STATEMENTS = [ROLE_049['gateway_role.sql'], ROLE_050['gateway_role.sql'], GATEWAY_POLICY,
@@ -808,7 +1036,7 @@ def test_a_quoted_serial_type_is_manual_like_an_unquoted_one():
     for column in ('id serial', 'id "serial"', 'id "BIGSERIAL"'.lower()):
         text = EXPAND + f'CREATE TABLE synthetic_owner ({column});\n'
         assert rollout.classify(text) == 'manual'
-        assert rollout.unattended_class(text, set()) == 'manual'
+        assert rollout.additive_class(text, set()) == 'manual'
     assert rollout.classify(EXPAND + 'CREATE TABLE synthetic_owner (id "text");\n') == 'expand'
 
 
@@ -835,7 +1063,7 @@ COMMENT_OUTSIDE = {
 def test_comment_on_anything_but_a_known_table_or_its_column_is_manual(form):
     text = EXPAND + COMMENT_OUTSIDE[form] + '\n'
     assert rollout.classify(text, EXISTING) == 'manual'
-    assert rollout.unattended_class(text, EXISTING) == 'manual'
+    assert rollout.additive_class(text, EXISTING) == 'manual'
 
 
 # spec: ANYM-619
@@ -845,7 +1073,7 @@ def test_comment_on_a_known_or_created_table_and_its_column_is_expand():
                  created + "COMMENT ON TABLE synthetic_notes IS 'synthetic';\n",
                  created + "COMMENT ON COLUMN synthetic_notes.note IS E'synthetic';\n"):
         assert rollout.classify(EXPAND + text, EXISTING) == rollout.classify(EXPAND + text) == 'expand'
-        assert rollout.unattended_class(EXPAND + text, EXISTING) == 'expand'
+        assert rollout.additive_class(EXPAND + text, EXISTING) == 'expand'
     # A COMMENT before the CREATE TABLE names a table that does not exist yet.
     later = "COMMENT ON TABLE synthetic_notes IS 'synthetic';\n" + created
     assert rollout.classify(EXPAND + later, EXISTING) == 'manual'
@@ -871,7 +1099,7 @@ def test_a_reference_is_expand_only_to_an_inventory_or_created_table(reference, 
              f' CONSTRAINT synthetic_notes_parent FOREIGN KEY (parent) REFERENCES {reference} DEFERRABLE);\n')
     for text in (parents + column + later, parents + table + later):
         assert rollout.classify(EXPAND + text, EXISTING) == verdict
-        assert rollout.unattended_class(EXPAND + text, EXISTING) == verdict
+        assert rollout.additive_class(EXPAND + text, EXISTING) == verdict
 
 
 # spec: ANYM-619
@@ -880,8 +1108,8 @@ def test_without_an_inventory_an_unqualified_target_stays_preliminary_and_other_
     for text in ("CREATE TABLE synthetic_notes (id text REFERENCES synthetic_absent(id));\n",
                  "COMMENT ON TABLE synthetic_absent IS 'synthetic';\n",
                  "COMMENT ON COLUMN synthetic_absent.body IS 'synthetic';\n"):
-        assert rollout.rollout_class(EXPAND + text) == rollout.unattended_class(EXPAND + text) == 'expand'
-        assert rollout.unattended_class(EXPAND + text, EXISTING) == 'manual'
+        assert rollout.rollout_class(EXPAND + text) == rollout.additive_class(EXPAND + text) == 'expand'
+        assert rollout.additive_class(EXPAND + text, EXISTING) == 'manual'
     for form in ('schema', 'role', 'function', 'other-schema-table', 'other-schema-column', 'index', 'constraint'):
         assert rollout.rollout_class(EXPAND + COMMENT_OUTSIDE[form]) == 'manual'
     assert rollout.rollout_class(EXPAND + 'CREATE TABLE synthetic_notes (id text REFERENCES fcs.events(id));\n') == 'manual'
@@ -896,9 +1124,11 @@ def test_the_admission_classifiers_of_production_keep_the_preliminary_rule():
                       "COMMENT ON COLUMN synthetic_notes.id IS 'synthetic';\n",
              EXPAND + "COMMENT ON SCHEMA public IS 'synthetic';\n"]
     payload = {'source': source, 'texts': texts, 'roles': []}
-    assert production.classifier_child(production.CLASSIFY, payload) == ['expand', 'expand', 'manual']
+    # ANYM-743: the pause names each file's tier, and deploy's unattended gate is the tier, not ANYM-596's language.
+    assert production.classifier_child(production.CLASSIFY, payload) == [
+        'expand non-critical', 'expand non-critical', 'manual non-critical']
     found = production.classifier_child(production.UNATTENDED, payload)
-    assert found['files'] == ['expand', 'expand', 'manual']
+    assert found['files'] == ['expand', 'expand', 'expand']
     assert found['tables'] == ['synthetic_notes', 'synthetic_parents']
 
 

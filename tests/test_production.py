@@ -3017,8 +3017,9 @@ def test_the_sql_pause_names_the_class_the_candidate_classifier_gives_each_added
     # The pause is the one before ANYM-444; its reason adds only file names and classes, never file contents.
     assert outcome["status"] == "halted" and outcome["sha"] == NEWEST and host.steps == []
     assert outcome["reason"] == (f"the SQL inventory changed ({paths}); migrate by hand (production.md); added "
-                                 "migrations: 041_synthetic_expand.sql expand, 042_synthetic_manual.sql manual, "
-                                 "043_synthetic_claim.sql manual, 044_synthetic_bare.sql no header")
+                                 "migrations: 041_synthetic_expand.sql expand non-critical, 042_synthetic_manual.sql "
+                                 "manual non-critical, 043_synthetic_claim.sql manual critical: line 2 UPDATE, "
+                                 "044_synthetic_bare.sql no header non-critical")
     assert host.paused() == outcome["reason"] and "marker" not in outcome["reason"]
     assert [argv[3:] for argv in host.git if argv[3:5] == ["cat-file", "blob"]][-1] == \
         ["cat-file", "blob", f"{NEWEST}:{p.CLASSIFIER}"]

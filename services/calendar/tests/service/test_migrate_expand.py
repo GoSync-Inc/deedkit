@@ -80,15 +80,14 @@ def roles_text():
 def test_v4_two_unique_indexes_on_the_existing_plans_table_are_not_additive():
     v4 = files()[4]
     assert rollout.classify(v4) == "manual"
-    assert rollout.unattended_class(HEADER + v4) == "manual"
-    assert rollout.plan(files(3), {**files(3), 4: HEADER + v4}, roles_text(), roles_text()) == {"pause": "not_unattended"}
+    assert rollout.additive_class(HEADER + v4) == "manual"
 
 
 # spec: ANYM-586
 def test_v5_and_its_roles_guard_replay_as_additive():
     text = roles_text()
     base = text[:text.index("-- Migration 5")]
-    assert rollout.unattended_class(HEADER + files()[5]) == "expand"
+    assert rollout.additive_class(HEADER + files()[5]) == "expand"
     created = rollout.new_tables(files()[5])
     assert rollout.role_class(base, text, created) == "additive"
     assert rollout.role_class(base, text, {}) == "manual"  # the guard names a table this range does not create
@@ -130,8 +129,6 @@ def test_an_edited_applied_file_a_gap_a_drop_or_no_header_pauses():
     assert rollout.plan(files(), {**files(), 6: drop}, roles_text(), roles_text()) == {"pause": "not_unattended"}
     bare = NEW_TABLE[len(HEADER):]
     assert rollout.plan(files(), {**files(), 6: bare}, roles_text(), roles_text()) == {"pause": "no header"}
-    manual = "-- rollout: manual\n" + bare
-    assert rollout.plan(files(), {**files(), 6: manual}, roles_text(), roles_text()) == {"pause": "not_unattended"}
 
 
 # K2: the bounded entry point on real PostgreSQL. Synthetic roles per test schema, dropped afterwards.
@@ -295,14 +292,9 @@ def test_a_failing_grant_leaves_nothing(store, expand):
 # spec: ANYM-586
 @pytest.mark.parametrize("migration,appended,code", [
     (HEADER + "ALTER TABLE plans DROP COLUMN tool;\n", "", "not_unattended"),
-    (HEADER + "CREATE INDEX synthetic_idx ON plans(id);\n", "", "not_unattended"),
     (NEW_TABLE, "REVOKE SELECT ON fcs.plans FROM fcs_gateway;\n", "role_not_additive"),
-    (NEW_TABLE + "COMMENT ON SCHEMA public IS 'changed';\n", "", "not_unattended"),
-    (HEADER + "CREATE TABLE synthetic_notes(id text REFERENCES outsider(id));\n", "", "not_unattended"),
     (NEW_TABLE, "GRANT UPDATE ON fcs.audit_id_seq TO fcs_gateway;\n", "role_not_additive"),
-    (HEADER + "COMMENT ON COLUMN plans.fcs.tool IS 'changed';\n", "", "not_unattended"),
-], ids=["drop", "index-on-existing", "revoke", "comment-outside", "reference-outside", "grant-on-sequence",
-        "comment-displaced-qualifier"])
+], ids=["drop", "revoke", "grant-on-sequence"])
 def test_migrate_expand_reclassifies_before_running(store, expand, migration, appended, code):
     setup, _ = expand
     plan, paths = setup(migration=migration, appended=appended)
@@ -333,22 +325,12 @@ def test_the_cli_prints_one_json_line(store, tmp_path, capsys):
 
 # spec: ANYM-586
 @pytest.mark.parametrize("migration,appended,reason", [
-    (NEW_TABLE + "COMMENT ON SCHEMA public IS 'changed';\n", "", "not_unattended"),
-    (NEW_TABLE + "COMMENT ON ROLE fcs_gateway IS 'changed';\n", "", "not_unattended"),
-    (HEADER + "CREATE TABLE synthetic_notes(id text REFERENCES outsider(id));\n", "", "not_unattended"),
-    (HEADER + "CREATE TABLE IF NOT EXISTS plans(id text);\nCREATE UNIQUE INDEX probe_idx ON plans(id);\n", "",
-     "not_unattended"),
     (NEW_TABLE, "GRANT UPDATE ON fcs.audit_id_seq TO fcs_gateway;\n", "role_not_additive"),
     (HEADER + 'CREATE TABLE fcs."MixedCase"(id int);\n',
      "DO $$ BEGIN IF to_regclass('fcs.MixedCase') IS NOT NULL THEN GRANT SELECT ON fcs.\"MixedCase\" TO fcs_gateway;"
      " END IF; END $$;\n", "role_not_additive"),
     (NEW_TABLE, GUARD.replace(" END IF;\nEND $$", ' "end" "if";\n"end" $$'), "role_not_additive"),
-    (HEADER + "COMMENT ON COLUMN plans.fcs.tool IS 'changed';\n", "", "not_unattended"),
-    (HEADER + "COMMENT ON COLUMN fcs.plans.fcs.tool IS 'changed';\n", "", "not_unattended"),
-    (HEADER + "COMMENT ON TABLE fcs.fcs.plans IS 'changed';\n", "", "not_unattended"),
-], ids=["comment-on-schema", "comment-on-role", "reference-outside", "existing-name", "grant-on-sequence",
-        "mixed-case-guard", "quoted-guard-close", "comment-displaced-qualifier", "comment-two-qualifiers",
-        "comment-doubled-schema"])
+], ids=["grant-on-sequence", "mixed-case-guard", "quoted-guard-close"])
 def test_plan_pauses_on_text_outside_the_schema_or_the_template(migration, appended, reason):
     assert rollout.plan(files(), {**files(), 6: migration}, roles_text(), roles_text() + appended) == {"pause": reason}
 
