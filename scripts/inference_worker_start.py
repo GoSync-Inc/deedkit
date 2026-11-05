@@ -19,7 +19,10 @@ HOLD = Path("/etc/deedkit/inference-worker.hold")
 RECEIPT = Path("/var/lib/deedkit/inference-worker.json")
 EGRESS_CHECK = ["/usr/bin/python3", "/usr/local/lib/deedkit/inference_egress_check.py", "verify"]
 DATABASE_WAIT, CALLS_WAIT, START_WINDOW, POLL, READ_TIMEOUT, START_TIMEOUT = 300, 120, 60, 5, 60, 120
-BOUND = 570  # every command ends by then, so the receipt is written inside the unit's TimeoutStartSec=600
+# Every command, wait and sleep ends by then, so the receipt is written and the locks are free inside the unit's
+# TimeoutStartSec=600. A start begins only with time left for the command and the whole window after it.
+BOUND = 570
+START_RESERVE = START_TIMEOUT + START_WINDOW
 # What this script uses of the installed production.py; a tool without one of them is too old to start anything.
 REQUIRED = ("Refused", "CallActive", "DEADLINE", "HTTP_CONFIG", "active_config", "compose", "config", "legacy_identities",
             "lock", "backup_lock", "read", "run", "snapshot", "unresolved", "wait_for_calls")
@@ -119,8 +122,8 @@ def check_calls(tool, settings, deadline):
         raise Refusal("call_probe_failed") from None
 
 
-def wait_for_database(tool, project):
-    deadline = time.monotonic() + DATABASE_WAIT
+def wait_for_database(tool, project, last):
+    deadline = min(time.monotonic() + DATABASE_WAIT, last)
     while True:
         try:
             found = containers(tool, project, DATABASE)
@@ -133,9 +136,9 @@ def wait_for_database(tool, project):
         time.sleep(min(POLL, left))
 
 
-def watch_start(tool, container):
+def watch_start(tool, container, last):
     """Read the started container for START_WINDOW seconds. It is never started again here."""
-    deadline, known = time.monotonic() + START_WINDOW, False
+    deadline, known = min(time.monotonic() + START_WINDOW, last), False
     while True:
         try:
             running, code = field(tool, container, "{{.State.Running}} {{.State.ExitCode}}").split()
@@ -154,7 +157,7 @@ def watch_start(tool, container):
 def attempt():
     """The steps of the card, a to k; returns the outcome, raises Refusal with the reason."""
     tool = installed_tool()
-    tool.DEADLINE = time.monotonic() + BOUND
+    last = tool.DEADLINE = time.monotonic() + BOUND
     with step("config_unreadable"):
         settings = tool.config(tool.active_config())
         state = Path(settings["state_directory"])
@@ -182,8 +185,8 @@ def attempt():
         with step("previous_exit_78"):  # f
             if int(field(tool, found["container"], "{{.State.ExitCode}}")) == 78:
                 raise Refusal("previous_exit_78")
-        wait_for_database(tool, project)  # g
-        deadline = time.monotonic() + CALLS_WAIT
+        wait_for_database(tool, project, last)  # g
+        deadline = min(time.monotonic() + CALLS_WAIT, last - START_RESERVE)
         check_calls(tool, settings, deadline)  # h
         with step("egress_rules_not_verified"):  # i
             if tool.run(EGRESS_CHECK, timeout=READ_TIMEOUT).strip() != "ok":
@@ -191,11 +194,13 @@ def attempt():
         check_hold()  # j
         check_identity(tool, worker, recorded)
         check_calls(tool, settings, deadline)
+        if last - time.monotonic() < START_RESERVE:
+            raise Refusal("start_failed")
         command = tool.compose(project)
         command[command.index("*")] = PROFILE
         with step("start_failed"):  # k
             tool.run(command + ["start", SERVICE], timeout=START_TIMEOUT)
-        watch_start(tool, found["container"])
+        watch_start(tool, found["container"], last)
     return "started"
 
 

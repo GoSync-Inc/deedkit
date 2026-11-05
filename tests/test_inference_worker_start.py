@@ -384,10 +384,19 @@ def test_a_configuration_that_cannot_be_read_starts_nothing(world, monkeypatch):
 
 
 # spec: ANYM-794
-def test_every_command_is_bounded_so_the_receipt_is_written_before_the_unit_timeout(world):
-    start.main()
-    assert p.DEADLINE is not None
-    assert start.BOUND < 600
+@pytest.mark.parametrize("late_step,lost,expected", [("exit_code", 500, "database_not_ready"),
+                                                     ("egress", 400, "start_failed"),
+                                                     ("start", 530, None)])
+def test_every_command_is_bounded_so_the_receipt_is_written_before_the_unit_timeout(world, late_step, lost, expected):
+    begun = world.clock.now
+    world.host.db_health = ["starting"] if expected == "database_not_ready" else ["healthy"]
+    world.host.on = {late_step: lambda: setattr(world.clock, "now", begun + lost)}
+    assert start.main() == (1 if expected else 0)
+    assert receipt()["reason"] == expected
+    assert world.clock.now - begun <= start.BOUND < 600
+    assert p.DEADLINE == begun + start.BOUND
+    assert ("start" in world.host.steps) == (expected is None)
+    assert not held(os.environ["DEEDKIT_BACKUP_LOCK"]) and not held(world.state / "deploy.lock")
 
 
 # spec: ANYM-794
