@@ -419,7 +419,8 @@ def test_a_long_decorated_line_is_judged_in_linear_time(line):
 
 
 # spec: ANYM-405
-@pytest.mark.parametrize("fence, close", [("```", "```"), ("~~~", "~~~"), ("````md", "````"), ("  ```", "  ```")])
+@pytest.mark.parametrize("fence, close", [("```", "```"), ("~~~", "~~~"), ("````md", "````"), ("  ```", "  ```"),
+                                          ("- ```", "  ```"), ("> ```", "> ```"), ("1. ~~~", "   ~~~")])
 def test_a_fenced_example_is_no_attempt_and_the_real_line_is_still_read(fence, close):
     lines = pr_check.parse_body(f"Delivers: ANYM-1\n{fence}\n- Delivers: ANYM-999\n{close}\nText")
     assert (lines.errors, lines.delivers) == ([], [1])
@@ -433,6 +434,11 @@ def test_a_fenced_example_is_no_attempt_and_the_real_line_is_still_read(fence, c
     "```\nx\n```\n```\ny\n```\n- Delivers: ANYM-1",  # two blocks in a row
     "    ```\n- Delivers: ANYM-1",  # four spaces indent code, no fence
     "```inline``` text\n- Delivers: ANYM-1",  # inline code opens nothing
+    "- ```\n  example\n  ```\n- Delivers: ANYM-1",  # a list item's fence, closed before the line
+    "1. ```\n   example\n   ```\n2. Delivers: ANYM-1",  # the same in a numbered list
+    "> ```\n> example\n> ```\n> Delivers: ANYM-1",  # the same in a quote
+    "```\n- Delivers: ANYM-1",  # an unclosed fence hides nothing
+    "```\nx\n```\n```\n- Delivers: ANYM-1",  # nor one after a closed block
 ])
 def test_a_tiden_line_after_a_closed_fence_or_a_false_fence_still_fails(body):
     lines = pr_check.parse_body(body)
@@ -448,6 +454,19 @@ def test_a_merged_pull_request_with_a_fenced_example_still_settles_its_card(repo
     tiden_sync.sync(root, sha, 1, "Delivers: ANYM-12\n```\n- Delivers: ANYM-999\n```\n", str(server.cli), "product",
                     report.append)
     assert "status: ANYM-12 Review -> Done." in report
+
+
+# spec: ANYM-405
+def test_a_line_after_a_list_items_fence_fails_the_check_and_stops_the_sync(repo, server):
+    root, _ = repo
+    body = "- ```\n  example\n  ```\n- Delivers: ANYM-12\n"
+    server.set(main=[spec(12, sources=[anchor("app/core.py")], status="Review")])
+    code, out = run(repo, server, {"app/core.py": "x = 2\n"}, body)
+    assert code == 1 and "`- Delivers: ANYM-12`" in out
+    sha = commit(root, {"README.md": "text\n"}, "squash")
+    with pytest.raises(tiden_sync.StepFailed) as failed:
+        tiden_sync.sync(root, sha, 1, body, str(server.cli), "product", lambda _: None)
+    assert failed.value.step == "parse" and not server.writes()
 
 
 # spec: ANYM-405

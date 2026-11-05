@@ -46,7 +46,7 @@ PR_LINE = re.compile(r"^[ \t]*(Spec|Delivers|Tiden branch):[ \t]*(.*?)[ \t]*$", 
 DECORATION = r"[ \t\-*+>#_•–—]*"
 PR_LINE_LIKE = re.compile(rf"^{DECORATION}(?:(?:\d+[.)]|\[[ xX]?\]){DECORATION})*"
                           r"(?:specs?|delivers?|tiden[ _-]?branch)[*_]*[ \t]*:", re.IGNORECASE)
-FENCE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)$")
+FENCE = re.compile(r"[ \t>*+\-]*(?:\d+[.)][ \t]*)?(`{3,}|~{3,})(.*)$")  # also inside a list item or a quote
 BRANCH_NAME = re.compile(r"(?:proposal|review)/[a-z0-9]+(?:[/_-][a-z0-9]+)*")
 MARKER = re.compile(r"^[ \t]*(#|//)[ \t]*spec:[ \t]*(.*?)[ \t]*$")
 # A comment that tries to be a marker but is malformed (wrong case, missing colon) is reported, not ignored.
@@ -116,18 +116,20 @@ def ids(text: str) -> list[int] | None:
 
 
 def unfenced(body: str) -> list[str]:
-    """The lines outside fenced code blocks, as Markdown closes them: the same character, at least as long, alone."""
-    found, opened = [], ""
+    """The lines outside closed fenced code blocks, closed as Markdown closes them: the same character, at least as
+    long, alone. An unclosed block counts as text: a fence this scan misreads then gives an error, never silence."""
+    found, held, opened = [], [], ""
     for line in body.split("\n"):
         fence = FENCE.match(line)
         if opened:
+            held.append(line)
             if fence and fence[1][0] == opened[0] and len(fence[1]) >= len(opened) and not fence[2].strip():
-                opened = ""
+                held, opened = [], ""
         elif fence and not (fence[1][0] == "`" and "`" in fence[2]):  # backticks after the run make it inline code
-            opened = fence[1]
+            held, opened = [line], fence[1]
         else:
             found.append(line)
-    return found
+    return found + held
 
 
 def parse_body(body: str) -> Lines:
