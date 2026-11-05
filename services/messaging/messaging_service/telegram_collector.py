@@ -856,7 +856,12 @@ class TelegramCollector:
             getattr(self.provider,'verified_self',None))
         backoff=DbBackoff(self)
         while True:
-            try: await self.sync_once()
+            try:
+                await self.sync_once()
+                # Only a pass that reached its end replaces the count; a failed write keeps it for the next try.
+                if self._pass_head_capped is not None:
+                    await asyncio.to_thread(self.state.head_capped,self._pass_head_capped)
+                    self._pass_head_capped=None
             except (FloodWaitError,ProviderRateLimited) as exc:
                 print(json.dumps({'event':'telegram_rate_limited','seconds':exc.seconds}),flush=True)
                 if isinstance(exc,FloodWaitError):await asyncio.to_thread(self.state.defer,max(1,exc.seconds))
@@ -869,10 +874,6 @@ class TelegramCollector:
                 # Checkpoints are committed per page; retry instead of reconnecting the provider.
                 await backoff.wait(); continue
             backoff.reset()
-            # Only a pass that reached its end replaces the count.
-            if self._pass_head_capped is not None:
-                capped,self._pass_head_capped=self._pass_head_capped,None
-                await asyncio.to_thread(self.state.head_capped,capped)
             await asyncio.sleep(self.interval)
 
     async def drain_loop(self):

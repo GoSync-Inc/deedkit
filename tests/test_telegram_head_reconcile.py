@@ -112,27 +112,65 @@ def test_flood_wait_on_a_later_head_page_keeps_committed_high_water_and_propagat
     assert w.state.chat('100','user')['high_water']==351
 
 
+def run_passes(w,monkeypatch,passes,*,stop_on=None):
+    """Drive the real reconcile loop until it has finished this many passes or sleeps stop_on seconds."""
+    done=[]
+    async def sleep(seconds):
+        if seconds==stop_on:raise asyncio.CancelledError
+        if seconds==w.interval:
+            done.append(seconds)
+            if len(done)==passes:raise asyncio.CancelledError
+    monkeypatch.setattr('messaging_service.telegram_collector.asyncio.sleep',sleep)
+    with pytest.raises(asyncio.CancelledError):asyncio.run(w.reconcile_loop())
+    monkeypatch.undo()
+
+
+def capped_count(w,s):
+    with s.pool.connection() as c:
+        source=get_sync_status(c,{'accounts':[w.account],'chat_ids':None})['sources'][0]
+    return source['operations']['history'].get('head_capped_chats')
+
+
 # spec: ANYM-103
-def test_reconcile_loop_reports_capped_chats_and_logs_the_provider_wait(worker,capsys):
+def test_loop_publishes_the_capped_count_of_a_whole_pass_only_and_logs_the_wait(worker,monkeypatch,capsys):
     w,s,_=worker
     w.batch_size=2;w.head_pages=1;w.interval=0
     w.provider.messages=[message(1)]
     asyncio.run(w.sync_once())
-    w.provider.messages=[message(i) for i in range(1,7)]
+    w.provider.messages=[message(i) for i in range(1,12)]
+    run_passes(w,monkeypatch,1)
+    assert capped_count(w,s)==1
     page=w.provider.page;floods=[FloodWaitError(None,capture=7)]
     async def flooding(chat,**query):
         if floods:raise floods.pop()
         return await page(chat,**query)
     w.provider.page=flooding
-    async def sleep(_):raise asyncio.CancelledError
-    async def scenario():
-        import messaging_service.telegram_collector as module
-        real=module.asyncio.sleep;module.asyncio.sleep=sleep
-        try:await w.reconcile_loop()
-        finally:module.asyncio.sleep=real
-    with pytest.raises(asyncio.CancelledError):asyncio.run(scenario())
+    run_passes(w,monkeypatch,1,stop_on=7)
+    assert capped_count(w,s)==1
     logged=[json.loads(line) for line in capsys.readouterr().out.splitlines() if 'telegram_rate_limited' in line]
     assert logged==[{'event':'telegram_rate_limited','seconds':7}]
+    w.head_pages=100
+    run_passes(w,monkeypatch,1)
+    assert capped_count(w,s)==0
+
+
+# spec: ANYM-103
+def test_a_failed_count_write_stays_in_the_loop_and_keeps_the_count(worker,monkeypatch):
+    import psycopg
+    w,s,_=worker
+    w.batch_size=2;w.head_pages=1;w.interval=0
+    w.provider.messages=[message(1)]
+    asyncio.run(w.sync_once())
+    w.provider.messages=[message(i) for i in range(1,12)]
+    write=w.state.head_capped;failures=[psycopg.OperationalError('synthetic database failure')]
+    def flaky(count):
+        if failures:raise failures.pop()
+        write(count)
+    w.state.head_capped=flaky
+    async def wait(self):return None
+    monkeypatch.setattr('messaging_service.telegram_collector.DbBackoff.wait',wait)
+    run_passes(w,monkeypatch,1)
+    assert not failures and capped_count(w,s)==1
 
 
 # spec: ANYM-103
