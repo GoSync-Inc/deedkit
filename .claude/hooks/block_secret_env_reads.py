@@ -6,6 +6,7 @@ review rounds showed is the defect: it matches the raw text, conservatively norm
 accepted cost. Quotes are dropped and separators split the text even inside quotes, so ssh, sudo and sh -c need no
 handling and no misread syntax can hide a later line. The refusal never holds the command. Standard library only.
 """
+from fnmatch import fnmatchcase
 import json
 import re
 import sys
@@ -35,11 +36,22 @@ RESERVED = frozenset({"if", "then", "elif", "else", "do", "while", "until", "!",
 RUNNERS = frozenset({"ssh", "sudo", "sh", "bash", "zsh", "dash", "ksh", "ash", "su", "runuser", "eval", "watch", "xargs",
                      "timeout", "gtimeout", "nice", "ionice", "nohup", "time", "command", "exec", "stdbuf", "setsid", "flock",
                      "chroot", "find", "env", "uv", "docker", "podman", "docker-compose", "podman-compose"})
-PLAIN_READERS = frozenset({"cat", "less", "more", "head", "tail", "strings", "xxd", "base64"})
+PLAIN_READERS = frozenset({"cat", "less", "more", "head", "tail", "strings", "xxd", "base64", "nl", "tac", "od", "hexdump", "bat",
+                           "cut", "sort", "uniq"})
 PATTERN_READERS = frozenset({"grep", "egrep", "fgrep", "rg", "sed", "awk", "gawk"})
 ACTIVE = RUNNERS | PLAIN_READERS | PATTERN_READERS | {"printenv", "set", "export", "systemctl"}
 SENSITIVE_ENDINGS = (".env", ".dsn", ".token", ".key", ".pem", ".agekey")
 SENSITIVE_NAMES = frozenset({"environ", "config.v2.json"})
+# What a glob is tried against: `.env*` selects a private file although it does not end like one. `*` alone is not refused.
+SENSITIVE_SAMPLES = (".env", "x.env", "postgres.env", "x.dsn", "x.token", "x.key", "x.pem", "x.agekey", "environ", "config.v2.json")
+# A pattern reader given one of these directories reads the private files in it. /private/tmp is the macOS temp directory.
+PRIVATE_DIRECTORY = re.compile(r"(?:^|/)(?:private|\.local)(?:/|$)|^/etc/deedkit(?:/|$)")
+MACOS_SYSTEM = re.compile(r"^/private/(?:tmp|var|etc)(?:/|$)")
+# A reader's quoted pattern is data: its separators must not cut the reader off from its file.
+READER_PATTERN = re.compile(r"""(\b(?:grep|egrep|fgrep|rg|sed|awk|gawk)\b(?:\s+-\S+(?:\s+\d+)?)*\s+(?:--regexp=|--expression=)?)(['"])(.*?)\2""",
+                            re.DOTALL)
+# An attached pattern option leaves no pattern among the positional words, so the first of them is a path.
+EXPLICIT_PATTERN = re.compile(r"--(?:regexp|expression|file)=.*|-[A-Za-z]*[ef].+")
 PROC_ENVIRON = re.compile(r"/proc/[^/\s]+/environ")
 # --no-env-resolution and --no-interpolate are absent on purpose: each still prints values (SECURITY.md).
 COMPOSE_LIMITED = frozenset({"--services", "--images", "--quiet", "-q", "--volumes"})
@@ -51,9 +63,16 @@ GUARDED_NAME = re.compile(r"\b(?:docker|podman|compose|printenv|systemctl)\b|(?<
                           re.IGNORECASE)
 
 
+def one_word(match):
+    prefix, quote, pattern = match.groups()
+    if "$(" in pattern or "`" in pattern: return match.group(0)  # a substitution in it runs, so it stays visible
+    return prefix + quote + re.sub(r"[;&|()\s]+", ",", pattern) + quote
+
+
 def normalise(command):
     """Join continued lines, then drop quotes and backslashes: `doc''ker` and `\\"x\\"` read as what a shell would run."""
-    text = command.replace("\\\n", "")
+    joined = command.replace("\\\n", "").replace("'\"'\"'", '"').replace("'\\''", '"')  # how a shell nests a single quote
+    text = READER_PATTERN.sub(one_word, joined)
     text = TEMPLATE_ACTION.sub(lambda match: "{{" + re.sub(r"[;&|()]", " ", match.group(1)) + "}}", text)
     return re.sub(r"[\"'\\]", "", text)
 
@@ -64,7 +83,12 @@ def name_of(word):
 
 def sensitive(word):
     base = word.strip().rstrip("}").rsplit("/", 1)[-1].lower()
-    return base in SENSITIVE_NAMES or base.endswith(SENSITIVE_ENDINGS)
+    if base in SENSITIVE_NAMES or base.endswith(SENSITIVE_ENDINGS): return True
+    return base != "*" and any(char in base for char in "*?[") and any(fnmatchcase(sample, base) for sample in SENSITIVE_SAMPLES)
+
+
+def private_directory(word):
+    return bool(PRIVATE_DIRECTORY.search(word)) and not MACOS_SYSTEM.match(word)
 
 
 def input_blocked(chunk):
@@ -135,12 +159,14 @@ def reader_blocked(words):
         if name in PLAIN_READERS and any(sensitive(item) or sensitive(item.split("=", 1)[-1]) for item in rest): return True
         if name not in PATTERN_READERS: continue
         positional, after_dashes = [], False
+        explicit = any(EXPLICIT_PATTERN.fullmatch(item) for item in rest)
         for position, item in enumerate(rest):
             if after_dashes or not item.startswith("-"): positional.append(item)
             elif item == "--": after_dashes = True
             elif item in ("-f", "--file") and sensitive(rest[position + 1] if position + 1 < len(rest) else ""): return True
             elif re.match(r"--(?:file|include|glob|iglob)=", item) and sensitive(item.split("=", 1)[1]): return True
-        if any(sensitive(item) for item in positional[1:]): return True
+        paths = positional if explicit else positional[1:]
+        if any(sensitive(item) or private_directory(item) for item in paths): return True
     return False
 
 

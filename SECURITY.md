@@ -71,9 +71,9 @@ and the refusal names the allowed way, including passing prose through a file. B
 without a template, with any `--format=`/`-f=` form, or with a template that reads `.Config`, `.Spec` or the whole
 object; `docker compose config` unless limited by `--services`, `--images`, `--hash`, `--quiet` or `--volumes`, and always with
 `--environment`; `env`, `printenv`, `set` or `export` directly or through
-`docker exec|run` and `docker compose exec|run`; any such command naming `/proc/*/environ`; `cat`, `less`, `more`, `head`,
-`tail`, `grep`, `rg`, `sed`, `awk`, `strings`, `xxd` or `base64` of a path ending `.env`, `environ`, `config.v2.json`,
-`.dsn`, `.token`, `.key`, `.pem` or `.agekey`; `systemctl show` of `Environment` or without a property filter. Allowed:
+`docker exec|run` and `docker compose exec|run`; any such command naming `/proc/*/environ`; `cat`, `less`, `more`, `head`, `tail`, `grep`, `rg`, `sed`, `awk`, `strings`, `xxd`, `base64`, `nl`, `tac`, `od`, `hexdump`,
+`bat`, `cut`, `sort` or `uniq` of a path ending `.env`, `environ`, `config.v2.json`, `.dsn`, `.token`, `.key`, `.pem` or
+`.agekey`, or a glob that selects one (`.env*`); a pattern search of a `private` or `.local` directory or `/etc/deedkit`; `systemctl show` of `Environment` or without a property filter. Allowed:
 `docker inspect --format '<template>'` limited to `.State`, `.Name`, `.Image`, `.RestartCount` or `.Created`; `docker compose config --services`, `--images` or
 `--hash`; a key-names read through the orchestrator. Limits: it covers sessions started in
 this repository or its worktrees; it does not cover the orchestrator, other projects or a determined bypass (encoding,
