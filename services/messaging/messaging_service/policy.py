@@ -81,6 +81,7 @@ AUDIT_CODES = frozenset({
     'delivery_disabled','delivery_policy_unset','unsafe_endpoint','invalid_signing_secret','invalid_header',
     'reserved_header','rotation_in_progress','endpoint_limit','endpoint_conflict','operator_disabled',
     'invalid_endpoint_state','endpoint_paused','endpoint_auto_paused','dynamic_sources_disabled',
+    'duplicate_send_unresolved','chat_changed_since_seen','chat_guard_unavailable',
 })
 UNSET = object()
 

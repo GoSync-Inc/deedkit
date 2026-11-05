@@ -2,11 +2,13 @@
 
 Synthetic accounts and chats in an isolated PostgreSQL; no provider is started and nothing is sent.
 """
+import re
 import threading
 from datetime import datetime, timedelta, timezone
 
 import psycopg
 import pytest
+from hypothesis import given, strategies as st
 from starlette.testclient import TestClient
 
 from messaging_service import send_guard
@@ -15,6 +17,7 @@ from messaging_service.archive import Archive
 from messaging_service.collector_state import CollectorState
 from messaging_service.envelope import stable_id
 from messaging_service.error_details import payload
+from messaging_service.policy import AUDIT_CODES, audit
 from messaging_service.store import APIError
 from test_archive import event, wa_event
 
@@ -709,6 +712,15 @@ def test_the_60_minute_window_bounds_the_principal_time_index(duplicated):
     from messaging_service import outgoing
     s, archive, key = duplicated
     dup(s, key)
+    # Real statistics over a history older than the window: the bound is the selective path, so the plan does not
+    # depend on the planner's defaults for a table of one row.
+    columns = [name for name in rows(s)[0] if name not in ('id', 'request_id', 'created_at')]
+    names = ','.join(columns)
+    with s.pool.connection() as c:
+        c.execute(f'''INSERT INTO outgoing_messages({names},request_id,created_at)
+            SELECT {names},'guard-history-'||n,clock_timestamp()-make_interval(days=>1,mins=>n)
+            FROM outgoing_messages,generate_series(1,5000) n''')
+        c.execute('ANALYZE outgoing_messages')
     with s.authorized(key, 'send_message') as (c, p):
         c.execute('SET LOCAL enable_seqscan=off')
         plan = c.execute('EXPLAIN (FORMAT JSON) ' + outgoing.DUPLICATE_SQL, (p['id'], ACCOUNT, CHAT,
@@ -739,8 +751,84 @@ def test_a_lost_connection_during_the_lookup_is_chat_guard_unavailable_and_audit
     assert rows(s) == []
     with s.pool.connection() as c:
         audits = c.execute("SELECT outcome,error_code FROM audit_log WHERE operation='send_message'").fetchall()
-    # Both refusals are audited on a fresh connection (the audit allowlist records the code as operation_failed).
-    assert [(a['outcome'], a['error_code']) for a in audits] == [('denied', 'operation_failed')] * 2
+    # Both refusals are audited on a fresh connection, under the refusal's own name.
+    assert [(a['outcome'], a['error_code']) for a in audits] == [('denied', 'chat_guard_unavailable')] * 2
+
+
+GUARD_CODES = ['duplicate_send_unresolved', 'chat_changed_since_seen', 'chat_guard_unavailable']
+
+
+def refuse_as(code, s, archive, key, monkeypatch):
+    """Make send_message refuse with `code` through the real path."""
+    from messaging_service import outgoing
+    if code == 'chat_changed_since_seen':
+        seen = say(archive, 1, 0)
+        say(archive, 2, 10)
+        return refused(s, key, expected_last_message_id=seen)
+    if code == 'duplicate_send_unresolved':
+        dup(s, key)
+        settle(s, 'guard-request-0001', 'unknown')
+    else:
+        monkeypatch.setattr(outgoing, 'unresolved_send',
+                            lambda *args: (_ for _ in ()).throw(psycopg.OperationalError('synthetic')))
+    return dup_refused(s, key)
+
+
+def denied_rows(s):
+    with s.pool.connection() as c:
+        return c.execute("SELECT * FROM audit_log WHERE operation='send_message' AND outcome='denied' "
+                         'ORDER BY occurred_at').fetchall()
+
+
+# spec: ANYM-762
+@pytest.mark.parametrize('code', GUARD_CODES)
+def test_guard_refusal_is_audited_under_its_own_code(duplicated, monkeypatch, code):
+    s, archive, key = duplicated
+    assert refuse_as(code, s, archive, key, monkeypatch).code == code
+    assert [(a['outcome'], a['error_code']) for a in denied_rows(s)] == [('denied', code)]
+
+
+# spec: ANYM-762
+@pytest.mark.parametrize('code', GUARD_CODES)
+def test_guard_code_adds_no_datum_to_the_audit_row(duplicated, monkeypatch, code):
+    s, archive, key = duplicated
+    refuse_as(code, s, archive, key, monkeypatch)
+    named, = denied_rows(s)
+    with s.pool.connection() as c:
+        audit(c, {'id': named['principal'], 'key_id': named['key_id']}, 'send_message', 'denied', 'operation_failed')
+    collapsed = next(row for row in denied_rows(s) if row['error_code'] == 'operation_failed')
+    assert named.keys() == collapsed.keys()
+    differs = {name for name in named if named[name] != collapsed[name]}
+    assert differs == {'id', 'occurred_at', 'error_code'} and named['error_code'] == code
+    assert named['resource_ids'] == []
+    for private in ('Exact synthetic text', 'guard-request-', CANARY):
+        assert private not in str(named)
+
+
+# spec: ANYM-762
+@pytest.mark.parametrize('code', ['not_a_listed_code', 'Invalid Code; with text'])
+def test_unlisted_audit_code_is_stored_as_operation_failed(duplicated, code):
+    s, archive, key = duplicated
+    with s.pool.connection() as c:
+        audit(c, {}, 'send_message', 'denied', code)
+    assert [a['error_code'] for a in denied_rows(s)] == ['operation_failed']
+
+
+class RecordedAudit:
+    values = None
+
+    def execute(self, query, values):
+        self.values = values
+
+
+# spec: ANYM-762
+@given(st.one_of(st.text(min_size=1), st.sampled_from(sorted(AUDIT_CODES))))
+def test_audit_stores_only_a_listed_code_the_column_accepts(code):
+    connection = RecordedAudit()
+    audit(connection, {}, 'send_message', 'denied', code)
+    stored = connection.values[4]
+    assert stored == (code if code in AUDIT_CODES else 'operation_failed')
+    assert re.fullmatch(r'[a-z_]{1,64}', stored)
 
 
 # spec: ANYM-748
