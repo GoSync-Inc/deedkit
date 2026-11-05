@@ -7,11 +7,12 @@ import re
 import shlex
 import shutil
 import subprocess
-import textwrap
 import time
 
 from hypothesis import given, settings, strategies as st
 import pytest
+
+from scripts.check_doc_commands import fenced_shell_blocks
 
 ROOT = Path(__file__).resolve().parents[1]
 SETTINGS_FILE = ROOT / ".claude/settings.json"
@@ -430,12 +431,6 @@ def test_security_document_names_the_hook_and_its_limits():
         assert part in paragraph
 
 
-def fenced_shell_blocks(text):
-    pattern = re.compile(r"^([ \t]*)```(?:sh|bash|shell|zsh|console)[ \t]*\n(.*?)^[ \t]*```[ \t]*$", re.MULTILINE | re.DOTALL)
-    for match in pattern.finditer(text):
-        yield re.sub(r"^\$ ", "", textwrap.dedent(match.group(2)), flags=re.MULTILINE)
-
-
 # spec: ANYM-774
 def test_fence_extraction_finds_indented_blocks():
     assert list(fenced_shell_blocks("x\n  ```sh\n  $ ls\n  ```\n")) == ["ls\n"]
@@ -446,8 +441,8 @@ def test_no_document_prescribes_a_blocked_command():
     module = matcher()
     listing = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z", "*.md"], check=True, capture_output=True, text=True)
     found = []
-    # Criterion 6a checks every *.md. Naming them all would end the docs-only skip (ANYM-767), so a docs-only PR that adds
-    # a blocked command fails only on the main push run: the open major named in the PR. This comment names one document.
+    # Criterion 6a checks every *.md. Naming them all would end the docs-only skip (ANYM-767), so this comment names one
+    # document: the `documentation` job's scripts/check_doc_commands.py step covers docs-only pull requests (ANYM-790).
     # reads: docs/operations/production.md
     for name in filter(None, listing.stdout.split("\0")):
         path = ROOT / name

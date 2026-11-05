@@ -78,6 +78,9 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           BASE_SHA: ${{ github.event.merge_group.base_sha }}
         run: python3 scripts/docs_only.py
+      - name: Refuse a documented command the secret-read hook blocks
+        # Runs whatever the decision said, and a failure fails the run: a docs-only run has no test job to find it (ANYM-790).
+        run: python3 -I scripts/check_doc_commands.py
   verify:
     needs: documentation
     if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
