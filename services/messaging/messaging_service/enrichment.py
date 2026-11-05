@@ -405,7 +405,9 @@ class EnrichmentWorker:
             try:self._finish(row,result)
             except psycopg.OperationalError as error:
                 if not transient_database_error(error):raise
-                if time.monotonic()<deadline and not STOP.is_set() and not STOP.wait(1):continue
+                left=deadline-time.monotonic()
+                # The clock again after the wait: a late wakeup must not start an attempt past the deadline.
+                if left>0 and not STOP.is_set() and not STOP.wait(min(1,left)) and time.monotonic()<deadline:continue
                 unwritten=error
             else:unwritten=None
             lease=row.get('_resource_lease')

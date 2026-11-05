@@ -1486,7 +1486,7 @@ def test_a_result_write_that_runs_out_of_retries_records_no_failure_and_reaches_
     s,_,_=seeded;module=stop_state
     run=result_worker(s,tmp_path,module,monkeypatch,before=statement_times_out)
     run.worker.run()
-    attempts=module.FINISH_RETRY_SECONDS+1
+    attempts=module.FINISH_RETRY_SECONDS
     assert run.writes==[None]*attempts      # one second apart; never a write of the failure
     assert run.waited==[1]*module.FINISH_RETRY_SECONDS+[module.DB_RETRY_SECONDS,10]     # the next pass ran: the worker kept running
     assert run.closes==[attempts]
@@ -1501,7 +1501,25 @@ def test_the_result_write_stops_retrying_when_the_lease_ends(seeded,tmp_path,mon
     run=result_worker(s,tmp_path,module,monkeypatch,before=statement_times_out)
     ttl=run.worker.config['profiles']['audio']['timeout_seconds']+60
     with pytest.raises(psycopg.errors.QueryCanceled):run.worker.once()
-    assert len(run.writes)==ttl+1 and run.closes==[ttl+1]
+    assert len(run.writes)==ttl and run.closes==[ttl]
+    assert_survived_under_lease(s,run.worker,module,monkeypatch)
+
+
+# spec: ANYM-787
+@pytest.mark.parametrize('late,started,waited',[(0,[0,1,2],[1,1,0.5]),(5,[0],[1])],ids=['on_time','late_wakeup'])
+def test_no_result_write_starts_past_the_retry_window(seeded,tmp_path,monkeypatch,stop_state,late,started,waited):
+    import psycopg
+    s,_,_=seeded;module=stop_state;starts=[]
+    monkeypatch.setattr(module,'FINISH_RETRY_SECONDS',2.5,raising=False)
+    def fails(attempt):
+        starts.append(run.now);statement_times_out(attempt)
+    run=result_worker(s,tmp_path,module,monkeypatch,before=fails)
+    def wait(seconds=None):
+        run.waited.append(seconds);run.now+=seconds+late
+        return False
+    monkeypatch.setattr(module.STOP,'wait',wait)
+    with pytest.raises(psycopg.errors.QueryCanceled):run.worker.once()
+    assert starts==started and run.waited==waited and run.closes==[len(started)]
     assert_survived_under_lease(s,run.worker,module,monkeypatch)
 
 
