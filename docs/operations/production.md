@@ -2533,7 +2533,7 @@ own pause, in that older shape. A dry run reports `would_pause` and writes nothi
 
 | Code | Actor | Next |
 |---|---|---|
-| `attempt_unresolved` | agent | `seamless_release.py status --sha <sha>` |
+| `attempt_unresolved` | agent | `docs/operations/production.md#continuous-deployment` |
 | `call_wait_exhausted` | agent | `docs/operations/production.md#continuous-deployment` |
 | `configuration_drift` | agent | `docs/operations/production.md#apply-and-verify` |
 | `copies_unreconciled` | agent | `docs/operations/production.md#database-copies` |
@@ -2542,7 +2542,7 @@ own pause, in that older shape. A dry run reports `would_pause` and writes nothi
 | `deploy_unknown_state` | agent | `production.py status` |
 | `enroll_required` | agent | `production.py enroll --module <module> --sha <sha> --plan` |
 | `host_locks_failed` | agent | `docs/operations/production.md#continuous-deployment` |
-| `http_release_unsettled` | agent | `seamless_release.py status --sha <sha>` |
+| `http_release_unsettled` | agent | `docs/operations/production.md#continuous-deployment` |
 | `http_retirement_failed` | agent | `seamless_release.py status --sha <sha>` |
 | `main_unreadable` | agent | `docs/operations/production.md#continuous-deployment` |
 | `manifest_invalid` | agent | `docs/operations/production.md#recordings-anym-711` |
@@ -2554,7 +2554,7 @@ own pause, in that older shape. A dry run reports `would_pause` and writes nothi
 | `plan_a_refused` | agent | `docs/operations/production.md#prepare-and-inspect` |
 | `plan_a_rolled_back` | agent | `docs/operations/production.md#roll-back-the-current-release` |
 | `plan_a_unknown_state` | agent | `production.py status` |
-| `plan_b_preparation_unfinished` | agent | `seamless_release.py status --sha <sha>` |
+| `plan_b_preparation_unfinished` | agent | `docs/operations/production.md#continuous-deployment` |
 | `plan_b_stopped` | agent | `seamless_release.py status --sha <sha>` |
 | `registry_unreachable` | agent | `docs/operations/production.md#ci-published-images` |
 | `release_not_applied` | agent | `docs/operations/production.md#apply-and-verify` |

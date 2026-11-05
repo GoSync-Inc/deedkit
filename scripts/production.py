@@ -2747,7 +2747,7 @@ _AUTO, _ROLLBACK = _DOC + "unattended-migrations", _DOC + "roll-back-the-current
 # code: (who acts, the next step), production.md "Halts". `owner` only for what harness process.md section 2 keeps for
 # the owner's hands or words; a halt's `reason` names the SHA and the module a step's placeholders stand for.
 HALTS = {
-    "attempt_unresolved": ("agent", _HTTP),
+    "attempt_unresolved": ("agent", _DEPLOY),
     "call_wait_exhausted": ("agent", _DEPLOY),
     "configuration_drift": ("agent", _DOC + "apply-and-verify"),
     "copies_unreconciled": ("agent", _DOC + "database-copies"),
@@ -2756,7 +2756,7 @@ HALTS = {
     "deploy_unknown_state": ("agent", "production.py status"),
     "enroll_required": ("agent", "production.py enroll --module <module> --sha <sha> --plan"),
     "host_locks_failed": ("agent", _DEPLOY),
-    "http_release_unsettled": ("agent", _HTTP),
+    "http_release_unsettled": ("agent", _DEPLOY),
     "http_retirement_failed": ("agent", _HTTP),
     "main_unreadable": ("agent", _DEPLOY),
     "manifest_invalid": ("agent", _DOC + "recordings-anym-711"),
@@ -2768,7 +2768,7 @@ HALTS = {
     "plan_a_refused": ("agent", _DOC + "prepare-and-inspect"),
     "plan_a_rolled_back": ("agent", _ROLLBACK),
     "plan_a_unknown_state": ("agent", "production.py status"),
-    "plan_b_preparation_unfinished": ("agent", _HTTP),
+    "plan_b_preparation_unfinished": ("agent", _DEPLOY),
     "plan_b_stopped": ("agent", _HTTP),
     "registry_unreachable": ("agent", _DOC + "ci-published-images"),
     "release_not_applied": ("agent", _DOC + "apply-and-verify"),
@@ -6617,7 +6617,7 @@ def locked_action(args):
             if (state / "deploy.json").exists():
                 result["deploy"] = read(state / "deploy.json")
             if PAUSE.exists():
-                pause = PAUSE.read_bytes().decode(errors="replace")
+                pause = PAUSE.read_text(errors="replace")
                 result["autodeploy_pause"] = pause[:1000].strip()
                 result["autodeploy_halt"] = halt_summary(pause)
             if failed := http_failed_attempts(args.http_config):

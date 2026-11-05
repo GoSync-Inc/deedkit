@@ -3281,6 +3281,13 @@ def test_each_halt_names_an_actor_and_one_command_or_an_existing_document_anchor
 
 
 # spec: ANYM-766
+def test_a_halt_that_may_have_no_http_attempt_or_sha_routes_to_the_document_not_the_http_status_command():
+    # Sol r1: an unfinished plan A apply, a preparation that wrote no attempt receipt, and a reason that names no SHA.
+    for code in ("attempt_unresolved", "http_release_unsettled", "plan_b_preparation_unfinished"):
+        assert p.HALTS[code][1] == "docs/operations/production.md#continuous-deployment"
+
+
+# spec: ANYM-766
 def test_the_halts_table_of_production_md_is_the_table_of_the_tool():
     docs = (ROOT / "docs/operations/production.md").read_text()
     section = docs.split("\n### Halts\n", 1)[1].split("\n### ", 1)[0]
@@ -6243,6 +6250,12 @@ def test_status_prints_the_halt_with_its_waiting_time_and_keeps_the_existing_key
     assert printed["sha"] == "c" * 40 and printed["autodeploy_pause"] == body[:1000]
     assert printed["autodeploy_halt"] == {"reason": reason, "code": "configuration_drift", "actor": "agent",
                                           "next": "docs/operations/production.md#halts", "waiting": "waiting for 3h7m"}
+
+
+# spec: ANYM-766
+def test_status_keeps_the_text_read_of_autodeploy_pause_for_a_crlf_file(tmp_path, monkeypatch, capsys):
+    printed = status_with_pause(tmp_path, monkeypatch, capsys, b"maintenance\r\nwindow\r\n")
+    assert printed["autodeploy_pause"] == "maintenance\nwindow" == printed["autodeploy_halt"]["reason"]
 
 
 # spec: ANYM-766
