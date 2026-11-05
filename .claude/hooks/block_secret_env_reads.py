@@ -14,8 +14,8 @@ MAX_INPUT = 256 * 1024
 REFUSAL = (
     "Blocked by .claude/hooks/block-secret-env-reads.sh: this command can print a container's environment or a private "
     "env file, and a session transcript goes to the model provider. Allowed ways: docker inspect with --format "
-    "'<template>' limited to .State, .Name, .Image, .RestartCount or .Created; docker compose config "
-    "--no-env-resolution; for key names only, ask the orchestrator for a key-names read. The hook reads raw text and "
+    "'<template>' limited to .State, .Name, .Image, .RestartCount or .Created; docker compose config --services, "
+    "--images or --hash; for key names only, ask the orchestrator for a key-names read. The hook reads raw text and "
     "refuses some harmless commands: rewrite without ${...}, arithmetic, eval or env -S near these names, run one plain "
     "command at a time, and pass prose through a file (git commit -F, gh --body-file). See SECURITY.md."
 )
@@ -41,12 +41,13 @@ ACTIVE = RUNNERS | PLAIN_READERS | PATTERN_READERS | {"printenv", "set", "export
 SENSITIVE_ENDINGS = (".env", ".dsn", ".token", ".key", ".pem", ".agekey")
 SENSITIVE_NAMES = frozenset({"environ", "config.v2.json"})
 PROC_ENVIRON = re.compile(r"/proc/[^/\s]+/environ")
-COMPOSE_LIMITED = frozenset({"--services", "--images", "--quiet", "-q", "--volumes", "--no-env-resolution"})
+# --no-env-resolution and --no-interpolate are absent on purpose: each still prints values (SECURITY.md).
+COMPOSE_LIMITED = frozenset({"--services", "--images", "--quiet", "-q", "--volumes"})
 TEMPLATE_SECRET = re.compile(r"\.(?:Container)?Config\b|\.Spec\b", re.IGNORECASE)
 TEMPLATE_ROOT = re.compile(r"(?<![\w)\]$])\.(?!\w)|\$(?![\w.])")
 # Syntax this hook does not read, refused on a line that also holds a name it guards.
 UNREADABLE = re.compile(r"\$\{|\(\(|\$'|\beval\b|\benv\s+(?:-\w*S|--split-string)|\bbase64\s+(?:-\w*d|--decode)|\bxxd\s+-\w*r")
-GUARDED_NAME = re.compile(r"\b(?:docker|podman|compose|printenv|systemctl|env)\b|environ|config\.v2|\.(?:env|dsn|token|key|pem|agekey)\b",
+GUARDED_NAME = re.compile(r"\b(?:docker|podman|compose|printenv|systemctl)\b|(?<![\w-])env(?![\w-])|environ|config\.v2|\.(?:env|dsn|token|key|pem|agekey)\b",
                           re.IGNORECASE)
 
 

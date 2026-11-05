@@ -47,6 +47,9 @@ BLOCKED = [
     "docker compose config --format json",
     "docker compose config --environment",
     "docker compose config --no-env-resolution --environment",
+    "docker compose config --no-env-resolution",
+    "docker compose config --no-interpolate",
+    "docker compose config --no-interpolate --no-env-resolution",
     "docker compose config --services --environment",
     "docker-compose config",
     "docker exec c env",
@@ -114,7 +117,6 @@ BLOCKED = [
     "ssh -tt host cat a.env",
     "docker compose config --services=false",
     "docker compose config --no-env-resolution --environment=true",
-    "docker compose config --no-env-resolution=false",
     "docker compose config --quiet=false",
     "grep --color PASSWORD a.env",
     "sed -l 1p a.env",
@@ -148,7 +150,6 @@ ALLOWED = [
     "docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' c",
     "docker ps",
     "docker logs c",
-    "docker compose config --no-env-resolution",
     "docker compose config --services",
     "docker compose config --images",
     "docker compose config --hash '*'",
@@ -167,6 +168,8 @@ ALLOWED = [
     "grep -e .key a.py",
     "grep -r NAME --exclude=*.env .",
     "set -euo pipefail",
+    "x=${y:-env}",
+    "echo ${y} secret-env-reads.sh",
     "env -i HOME=/x PATH=/bin a.sh",
     "docker image inspect -f '{{index .Config.Labels \"a\"}}' i",
     "grep -E '((a|b)Dockerfile)' x",
@@ -198,7 +201,7 @@ ACCEPTED_FALSE_REFUSALS = [
     "docker exec -u root c ls env",
     "((printenv))",
     "docker compose config --environment=false --services",
-    "x=${y:-env}",
+    "x=${y:=env}",
     "env -S echo '$(printenv)'",
     "if true; then case $x in set|env) ls ;; esac; fi",
 ]
@@ -332,6 +335,12 @@ def test_path_without_python3_fails_closed(tmp_path):
 
 
 # spec: ANYM-774
+def test_path_without_a_timeout_tool_fails_closed_or_finds_a_known_directory(tmp_path):
+    done = run_hook(call("ls"), path=tool_path(tmp_path, "sh"))
+    assert done.returncode == 2 and b"not a secret refusal" in done.stderr and b".claude/settings.json" in done.stderr
+
+
+# spec: ANYM-774
 def test_missing_script_file_fails_closed(tmp_path):
     assert run_hook(call("ls"), project=tmp_path).returncode == 2
 
@@ -344,6 +353,7 @@ def test_matcher_that_sleeps_past_the_bound_exits_2_within_it(tmp_path):
     started = time.monotonic()
     done = run_hook(call("ls"), path=tool_path(tmp_path, "sh", "timeout"))
     assert done.returncode == 2 and time.monotonic() - started < 15
+    assert b"load refusal, not a secret refusal" in done.stderr and b"Retry" in done.stderr
 
 
 # spec: ANYM-774
@@ -376,9 +386,10 @@ def test_refusal_names_why_and_safe_forms_and_never_echoes_the_command():
     done = run_hook(call(f"docker inspect {CANARY}"))
     text = done.stderr.decode()
     assert done.returncode == 2 and CANARY not in text and len(text.strip().splitlines()) == 1
-    for part in ("model provider", ".State", ".Name", ".Image", ".RestartCount", ".Created", "--no-env-resolution",
+    for part in ("model provider", ".State", ".Name", ".Image", ".RestartCount", ".Created", "--services", "--images", "--hash",
                  "orchestrator", "git commit -F", "gh --body-file"):
         assert part in text
+    assert "--no-env-resolution" not in text
 
 
 # spec: ANYM-774
@@ -387,7 +398,8 @@ def test_security_document_names_the_hook_and_its_limits():
     start = text.index("Agent sessions: reading container environments")
     paragraph = " ".join(text[start:].split())
     for part in (".claude/hooks/block-secret-env-reads.sh", "worktrees", "orchestrator", "other projects", "secrets as files",
-                 "accidental", "out of scope", "False refusals"):
+                 "accidental", "out of scope", "False refusals", "`!` prefix", "Edit tool", "load refusal", "Mac mini",
+                 "`--no-interpolate`"):
         assert part in paragraph
 
 
