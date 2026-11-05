@@ -191,11 +191,8 @@ def provider_missing(parts):
 
 def pending_gap(metadata, now):
     """Seconds until a record with a pending part may be read again: 3 h in the first day, daily to 14 days, then never."""
-    created = metadata.get('created_at')
-    try:
-        age = now - datetime.fromisoformat(created.replace('Z', '+00:00')).timestamp()
-    except (AttributeError, ValueError, TypeError, OverflowError):
-        age = 0
+    created = parse_time(metadata.get('created_at'))
+    age = 0 if created is None else now - datetime.fromisoformat(created.replace('Z', '+00:00')).timestamp()
     if age < 86400:
         return 3 * 3600
     return 86400 if age < 14 * 86400 else None
