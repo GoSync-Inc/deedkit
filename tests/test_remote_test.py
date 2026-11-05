@@ -35,8 +35,8 @@ FAKES = {
 echo "ssh $*" >> "$FAKE_LOG"
 [ "${FAKE_SSH_DOWN:-0}" = 1 ] && exit 255
 case "$*" in *"${FAKE_SSH_FAIL:-no such command}"*) exit 255 ;; esac
-# FAKE_SSH_STALL: the channel stays up and the far end never reads or writes, for FAKE_SSH_STALL_SECONDS.
-case "$*" in *"${FAKE_SSH_STALL:-no such command}"*) echo "stalled pid=$$ at=$(date +%s)" >> "$FAKE_LOG"; exec sleep "${FAKE_SSH_STALL_SECONDS:-300}" ;; esac
+# FAKE_SSH_STALL: the channel stays up and the far end never reads or writes.
+case "$*" in *"${FAKE_SSH_STALL:-no such command}"*) echo "stalled pid=$$ at=$(date +%s)" >> "$FAKE_LOG"; exec sleep 300 ;; esac
 while [ $# -gt 0 ]; do case "$1" in -[ol]) shift 2 ;; -[ntq]) shift ;; *) break ;; esac; done  # GNU rsync: -l user
 shift
 cd "$FAKE_OWNER_HOME" || exit 255
@@ -145,6 +145,12 @@ exec {shutil.which('python3')} "$@"
 STALLED_RSYNC = '''#!/usr/bin/env bash
 echo "stalled pid=$$ at=$(date +%s) $*" >> "$FAKE_LOG"
 exec sleep 300
+'''
+# On the laptop's PATH: what openrsync does when its I/O timeout fires and its ssh then ends.
+OPENRSYNC_TIMEOUT = '''#!/usr/bin/env bash
+echo "stalled pid=$$ at=$(date +%s) $*" >> "$FAKE_LOG"
+echo "rsync($$): error: poll: timeout" >&2
+exit 1
 '''
 
 
@@ -756,17 +762,17 @@ def test_a_mini_that_cannot_start_the_suite_leaves_it_to_ci_and_runs_nothing_loc
 
 
 # spec: ANYM-769
-@pytest.mark.parametrize('double', ['far-end', 'far-end-gives-up', 'rsync'])
+@pytest.mark.parametrize('double', ['far-end', 'openrsync-reports-a-timeout', 'rsync'])
 def test_a_copy_that_stalls_ends_at_its_bound_and_ci_covers(mini, worktree, double):
     home, env = mini
     bound = 8  # long enough that a loaded runner has started the double when the bound ends the copy
     extra = {'DEEDKIT_REMOTE_COPY_IO_SECONDS': '3', 'DEEDKIT_REMOTE_COPY_SECONDS': str(bound)}
-    if double == 'rsync':
-        write(home / 'bin' / 'rsync', STALLED_RSYNC)
-    else:  # the real rsync: GNU exits 30 at --timeout, openrsync reports it and then waits for its ssh
+    if double == 'far-end':  # the real rsync: GNU exits 30 past --timeout, openrsync reports it and then waits for its ssh
         extra['FAKE_SSH_STALL'] = 'rsync --server'
-    if double == 'far-end-gives-up':  # its ssh ends after the I/O timeout: openrsync's exit 1 is still a timeout
-        extra.update(FAKE_SSH_STALL_SECONDS='5', DEEDKIT_REMOTE_COPY_SECONDS='20')
+    elif double == 'rsync':
+        write(home / 'bin' / 'rsync', STALLED_RSYNC)
+    else:  # its ssh ended after the I/O timeout: openrsync's exit 1 is still a timeout, whichever rsync is here
+        write(home / 'bin' / 'rsync', OPENRSYNC_TIMEOUT)
     # The guard: without a bound this run never ends.
     result = run_tracked(['bash', str(SCRIPT), '--full', str(worktree), 'gateway'], 30, env=dict(env, **extra))
     ended = time.time()
@@ -775,7 +781,7 @@ def test_a_copy_that_stalls_ends_at_its_bound_and_ci_covers(mini, worktree, doub
     stalled = log_lines(home, 'stalled')[0]
     assert ended - int(stalled.split('at=')[1].split()[0]) <= bound + 5
     assert not alive(pid_of(stalled))
-    if double == 'rsync':
+    if double != 'far-end':
         assert '--timeout=3' in stalled.split()
     assert not log_lines(home, 'uv')
     assert not (worker_dir(home) / 'src').exists()
