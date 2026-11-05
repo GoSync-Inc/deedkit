@@ -4004,6 +4004,41 @@ def test_an_automatic_deploy_installs_the_candidates_backup_runner_with_its_imag
     assert host.events == [] and p.read(host.state / NEWEST / "backup-runner.json")["status"] == "installed"
 
 
+# spec: ANYM-782
+def test_a_backup_runner_install_pins_the_calls_config_and_waits_for_the_calls_units():
+    assert Path("/opt/deedkit/calls-backup/runner.json") in p.RUNNER_CONFIGS
+    assert {"deedkit-calls-backup.service", "deedkit-calls-backup-catchup.service"} <= set(p.RUNNER_UNITS)
+
+
+def with_calls_config(tmp_path, monkeypatch, **extra):
+    config = tmp_path / "calls-backup" / "runner.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({"image": OLD_IMAGE, "directory": "/synthetic/calls", **extra}, indent=2) + "\n")
+    config.chmod(0o600)
+    monkeypatch.setattr(p, "RUNNER_CONFIGS", (*p.RUNNER_CONFIGS, config))
+    return config
+
+
+# spec: ANYM-782
+def test_an_automatic_deploy_moves_the_calls_pin_keeping_its_mode_and_a_copy(tmp_path, monkeypatch):
+    host, _, _, new = runner_host(tmp_path, monkeypatch)
+    config = with_calls_config(tmp_path, monkeypatch)
+    pin = config.read_bytes()
+    host.fail_apply = lambda sha: p.check_backup_runner(host.state / sha / "source", sha)
+    assert host.deploy(auto=True)["status"] == "deployed"
+    assert json.loads(config.read_text())["image"] == BACKUP_IMAGE_ID and oct(config.stat().st_mode & 0o777) == "0o600"
+    assert config.with_name(f"runner.json.before-{NEWEST}").read_bytes() == pin
+
+
+# spec: ANYM-782
+def test_a_calls_config_the_new_runner_refuses_changes_nothing(tmp_path, monkeypatch):
+    host, runner, configs, _ = runner_host(tmp_path, monkeypatch)
+    config = with_calls_config(tmp_path, monkeypatch, unfinished=True)
+    before = [path.read_bytes() for path in (runner, *configs, config)]
+    assert host.deploy(auto=True)["status"] != "deployed"
+    assert [path.read_bytes() for path in (runner, *configs, config)] == before
+
+
 # spec: ANYM-488
 @pytest.mark.parametrize("case", ["unit-active", "unfinished-journal", "other-image", "pull-failed", "pull-timeout",
                                   "call-active", "calls-unknown"])

@@ -25,7 +25,9 @@
     "timers": [
       "/etc/systemd/system/personal-os-backup.timer",
       "/etc/systemd/system/deedkit-calendar-backup.timer",
-      "/etc/systemd/system/deedkit-calendar-backup-catchup.timer"
+      "/etc/systemd/system/deedkit-calendar-backup-catchup.timer",
+      "/etc/systemd/system/deedkit-calls-backup.timer",
+      "/etc/systemd/system/deedkit-calls-backup-catchup.timer"
     ]
   }
 }

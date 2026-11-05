@@ -887,7 +887,8 @@ def test_the_example_config_loads_and_names_the_timers_of_the_profiles_it_must_n
     cfg = example(tmp_path)
     assert cfg['profile'] == 'recordings' and cfg['host_lock'] == '/opt/personal-os-probe/backups/.runner.lock'
     assert {Path(t).name for t in cfg['recordings']['timers']} == {
-        'personal-os-backup.timer', 'deedkit-calendar-backup.timer', 'deedkit-calendar-backup-catchup.timer'}
+        'personal-os-backup.timer', 'deedkit-calendar-backup.timer', 'deedkit-calendar-backup-catchup.timer',
+        'deedkit-calls-backup.timer', 'deedkit-calls-backup-catchup.timer'}
     assert cfg['recordings']['container_staging'] == '/run/deedkit/backup-staging'
     assert Path(cfg['recordings']['staging_directory']).parent == Path(cfg['directory']).parent
 

@@ -1,0 +1,16 @@
+[Unit]
+Description=DeedKit calls state backup cadence (daily, after the latest admitted evening catch-ups' worst cases)
+
+[Timer]
+# 02:15 UTC. The two catch-ups before it are admitted by their clock conditions until 23:59:59: the calendar's then ends by
+# 23:59:59 + 6300 s + two 180 s stops = 01:50:59, the recordings' by 23:59:59 + 4835 s = 01:20:34; with the 15 minute guard
+# 02:05:59. This run's own bound ends by 02:15:31 + 5875 s = 03:53:26, its catch-up's (04:15) by 05:52:56, long before
+# the calendar's 16:00. The runner's own admission still enforces it, from the timer files.
+OnCalendar=*-*-* 02:15:00 UTC
+Persistent=true
+RandomizedDelaySec=30s
+AccuracySec=1s
+Unit=deedkit-calls-backup.service
+
+[Install]
+WantedBy=timers.target

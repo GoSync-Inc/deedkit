@@ -73,6 +73,7 @@ RECOVERY_BUDGET=120
 # start while another profile's scheduled start is this recent (it may be due but waiting for its randomized delay).
 UNIT_STOP_SECONDS=180
 UNIT_START_SECONDS=4400  # TimeoutStartSec of both recordings units (a unit test keeps them equal)
+CALLS_UNIT_START_SECONDS=5400  # TimeoutStartSec of both calls units (tests/test_backup_units.py keeps them equal)
 DUE_GRACE_SECONDS=120
 REAP_SECONDS=20
 CLEANUP_CODES={'staging_cleanup_failed','staging_mount_refused','recordings_exec_unverified','calls_helper_unverified'}
@@ -340,7 +341,8 @@ def worst_case(cfg,phase='full'):
 def admission_bound(cfg):
     """Seconds from a start to the end of its recovery as the unit enforces them (any phase): the unit's own time limit
     is a floor, so a short configured budget never admits a run the unit would still let hold the lock."""
-    return max(worst_case(cfg,'full'),UNIT_START_SECONDS)+2*UNIT_STOP_SECONDS
+    floor=CALLS_UNIT_START_SECONDS if cfg.get('profile')=='calls' else UNIT_START_SECONDS
+    return max(worst_case(cfg,'full'),floor)+2*UNIT_STOP_SECONDS
 
 
 def container_path(value):

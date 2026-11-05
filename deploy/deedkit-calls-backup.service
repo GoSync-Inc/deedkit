@@ -1,0 +1,32 @@
+[Unit]
+Description=DeedKit calls state encrypted backup and delivery (ANYM-782)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# No clock condition: the runner admits a start itself. It reads the other profiles' timer files and does not start unless
+# its bound ends 15 minutes before the next start; otherwise it records `skipped` and exits 0. A busy host lock (another
+# profile, a deploy) is skipped the same way, never waited for.
+ExecStart=/usr/bin/python3 -I /opt/personal-os-probe/ops/backup_runner.py --config /opt/deedkit/calls-backup/runner.json
+# Recovery after every run that started: removes only its own helper and worker and empties the staging directory
+# (plaintext of the calls state).
+ExecStopPost=/usr/bin/python3 -I /opt/personal-os-probe/ops/backup_runner.py --config /opt/deedkit/calls-backup/runner.json --recover-stop
+# STOP 35 + helper 1340 (capture 1200 + 30 + 90 + 20) + hash 120 + worker 1200 + delivery 900 + busy wait 1800 = 5395 s for
+# the run; the recovery has its own TimeoutStopSec. 5400 + two 180 s stops = 5760 s, inside the runner's admission bound
+# (worst case 5515 + 360 = 5875 s). No Restart=: a failed day stays in status.json until the catch-up or the next day.
+TimeoutStartSec=5400s
+TimeoutStopSec=180s
+User=root
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+MemoryMax=192M
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+# Its own job, staging and state directories; messaging's backup directory only for the shared lock.
+ReadWritePaths=/opt/deedkit/calls-backup /opt/personal-os-probe/backups
