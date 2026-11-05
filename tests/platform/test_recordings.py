@@ -1,5 +1,6 @@
 """Omi contract tests: synthetic HTTP only, no wearable/provider sessions."""
 import asyncio
+from datetime import datetime, timezone
 import hashlib
 import importlib
 import json
@@ -515,6 +516,70 @@ def test_numeric_speaker_zero_is_distinct_from_missing_speaker():
     state, text = content(value,'transcript')
     assert state == 'available'
     assert [json.loads(line)['speaker'] for line in text.splitlines()] == ['0','unknown']
+
+
+# spec: ANYM-648
+def test_omi_speaker_precedence_uses_the_real_developer_fields():
+    from deedkit_recordings.omi import content
+    segments = [{'text': 'a', 'speaker_name': 'User', 'speaker_id': 0, 'start': 0.0, 'end': 1.0},
+                {'text': 'b', 'speaker_name': None, 'speaker_id': 1, 'start': 1.0, 'end': 2.0},
+                {'text': 'c', 'speaker_name': '', 'speaker_id': 2, 'start': 2.0, 'end': 3.0},
+                {'text': 'd', 'speaker_name': None, 'speaker_id': None, 'start': 3.0, 'end': 4.0, 'original_text': 'D'}]
+    state, text = content(conversation(transcript_segments=segments), 'transcript')
+    rows = [json.loads(line) for line in text.splitlines()]
+    assert state == 'available' and [row['speaker'] for row in rows] == ['User', '1', '2', 'unknown']
+    assert [row['text'] for row in rows] == ['a', 'b', 'c', 'd']  # `text` is the corrected line; `original_text` unused
+
+
+# spec: ANYM-648
+def test_unplaced_omi_segments_have_null_offsets_and_other_negatives_are_kept():
+    from deedkit_recordings.omi import content
+    segments = [{'text': 'late', 'speaker_name': 'User', 'start': -1.0, 'end': -1.0},
+                {'text': 'buffered', 'speaker_name': 'User', 'start': -2453.2, 'end': -2450.0},
+                {'text': 'edge', 'speaker_name': 'User', 'start': -1.0, 'end': 0.5},
+                {'text': 'live', 'speaker_name': 'User', 'start': 0.0, 'end': 2.0}]
+    state, text = content(conversation(transcript_segments=segments), 'transcript')
+    rows = [json.loads(line) for line in text.splitlines()]
+    assert state == 'available'
+    assert rows[0] == {'start': None, 'end': None, 'speaker': 'User', 'text': 'late', 'placed': False}
+    assert [(row['start'], row['end'], 'placed' in row) for row in rows[1:]] == [
+        (-2453.2, -2450.0, False), (-1.0, 0.5, False), (0.0, 2.0, False)]
+
+
+# spec: ANYM-725
+def test_an_unplaced_omi_segment_is_indexed_as_words_with_its_speaker():
+    from deedkit_recordings.archive_store import plain_text
+    from deedkit_recordings.omi import content
+    segments = [{'text': 'late words', 'speaker_name': 'Alice', 'start': -1.0, 'end': -1.0},
+                {'text': 'live words', 'speaker_name': 'Bob', 'start': 0.0, 'end': 2.0}]
+    _, text = content(conversation(transcript_segments=segments), 'transcript')
+    assert plain_text('transcript', text) == ('late words\nlive words', ['Alice', 'Bob'])
+    # Only that exact marker is an utterance: any other `placed` object stays searchable verbatim.
+    for line in ('{"text":"","placed":"telescope"}', '{"text":"x","placed":true}',
+                 '{"start":1.0,"end":null,"text":"x","placed":false}', '{"text":"x","placed":false,"extra":1}'):
+        assert plain_text('transcript', line) == (line, [])
+
+
+# spec: ANYM-648
+@pytest.mark.parametrize('structured,age,state', [
+    ({'title': '', 'overview': ''}, 3600, 'pending'),
+    ({'overview': ''}, 3600, 'pending'),
+    ({'title': '', 'overview': ''}, 2 * 86400, 'empty'),
+    ({'title': 'Synthetic', 'overview': ''}, 3600, 'empty'),
+    ({'title': '', 'overview': 'Synthetic overview'}, 3600, 'available'),
+    ({'title': '', 'overview': ''}, -1800, 'pending'),
+    ({'title': '', 'overview': ''}, -2 * 3600, 'empty'),
+    ({'title': '', 'overview': ''}, -70 * 365 * 86400, 'empty'),
+])
+def test_an_empty_omi_summary_is_pending_for_its_first_day_then_empty(structured, age, state):
+    from deedkit_recordings.omi import content
+    now = 1_800_000_000
+    created = datetime.fromtimestamp(now - age, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    assert content(conversation(structured=structured, created_at=created), 'summary', now)[0] == state
+    naive = created.removesuffix('Z')  # no zone means UTC, as the archive index reads it
+    assert content(conversation(structured=structured, created_at=naive), 'summary', now)[0] == state
+    assert content(conversation(structured=structured, created_at='not a time'), 'summary', now)[0] == (
+        'available' if state == 'available' else 'empty')
 
 
 # spec: ANYM-648

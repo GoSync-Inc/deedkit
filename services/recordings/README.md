@@ -119,10 +119,15 @@ it never means that an unknown traversal is complete.
 `recordings_read` takes `account`, `recording_id`, `kind` (`transcript` or
 `summary`), `page_chars` (100–10000, default 4000), and optional `cursor`.
 Transcript text is newline-delimited JSON segments preserving supplied offsets
-and speaker labels, split at character boundaries. A page may split one JSON
+(negative ones too: device-buffered speech before the live pin) and speaker labels
+(`speaker_name`, else `speaker_id`), split at character boundaries. A segment with
+Omi's unplaced sentinel `start == end == -1.0` has `start`/`end` null and
+`"placed":false`. A page may split one JSON
 segment; concatenate pages from the same digest before parsing it. The overview
 is provider-authored summary text. No extra transcription/model is invoked.
-`content_state` distinguishes `available`, `empty`, `pending`, `unavailable`.
+`content_state` distinguishes `available`, `empty`, `pending`, `unavailable`. An Omi
+summary with an empty title and overview under 24 hours old is `pending` (Omi's
+lazy processing; its GET omits `processing_deferred`), older it is `empty`.
 Omi raw audio is `unsupported`: its Developer API documents no download route.
 The service does not invent one.
 
