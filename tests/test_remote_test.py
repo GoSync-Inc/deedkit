@@ -488,7 +488,7 @@ JUNIT = '''<testsuites><testsuite>
 </testsuite></testsuites>'''
 
 
-# spec: ANYM-638
+# spec: ANYM-639
 def test_a_root_run_names_each_module_whose_tests_it_skipped(mini, worktree):
     home, env = mini
     result = remote(env, worktree, 'root', 'tests/test_app.py', FAKE_JUNIT=JUNIT)
@@ -499,7 +499,7 @@ def test_a_root_run_names_each_module_whose_tests_it_skipped(mini, worktree):
     assert 'test_known' not in result.stderr and 'test_app.py (' not in result.stderr
 
 
-# spec: ANYM-638
+# spec: ANYM-639
 def test_the_full_root_suite_adds_up_the_skips_of_every_shard(mini, worktree):
     home, env = mini
     result = remote(env, '--full', worktree, 'root', FAKE_JUNIT=JUNIT)
@@ -507,7 +507,7 @@ def test_the_full_root_suite_adds_up_the_skips_of_every_shard(mini, worktree):
     assert 'needs docker (CI covers): 6 tests did not run here: tests/test_auto_migration.py (4), tests/test_compose.py (2)' in result.stderr
 
 
-# spec: ANYM-638
+# spec: ANYM-639
 def test_a_module_level_docker_skip_counts_as_docker(mini, worktree):
     home, env = mini
     report = ('<testsuites><testsuite><testcase classname="" name="tests.test_mod"><skipped message="collection skipped">'
@@ -516,7 +516,7 @@ def test_a_module_level_docker_skip_counts_as_docker(mini, worktree):
     assert 'needs docker (CI covers): 1 tests did not run here: tests.test_mod (1)' in result.stderr, result.stderr
 
 
-# spec: ANYM-638
+# spec: ANYM-639
 def test_a_report_path_that_is_no_regular_file_never_stalls_the_run(mini, worktree):
     home, env = mini
     result = remote(env, worktree, 'root', 'tests/test_app.py', FAKE_JUNIT=JUNIT, FAKE_JUNIT_FIFO='1', FAKE_UV_EXIT='3')
@@ -525,14 +525,14 @@ def test_a_report_path_that_is_no_regular_file_never_stalls_the_run(mini, worktr
     assert not list((worker_dir(home) / 'runs').iterdir())
 
 
-# spec: ANYM-638
+# spec: ANYM-639
 def test_the_skip_summary_is_best_effort_in_the_exit_trap():
     text = SCRIPT.read_text()
     # A here-string needs a temporary file under bash 3.2, and a failure there would end `finish` under set -e.
     assert 'report_skips || true' in text and 'done <<<' not in text
 
 
-# spec: ANYM-638
+# spec: ANYM-639
 def test_an_unreadable_skip_report_never_changes_the_runs_status(mini, worktree):
     home, env = mini
     result = remote(env, worktree, 'root', 'tests/test_app.py', FAKE_JUNIT='not xml', FAKE_UV_EXIT='3')
@@ -1252,7 +1252,7 @@ def test_an_undo_that_cannot_remove_a_resource_keeps_it_in_the_ledger_and_fails(
     assert setup_leftovers(root) == []
 
 
-# spec: ANYM-638
+# spec: ANYM-639
 def test_a_hyphenated_worker_name_is_one_directory_for_a_run_and_its_cleanup(mini, worktree):
     home, env = mini
     assert remote(env, worktree, 'gateway', 'tests/test_x.py', DEEDKIT_REMOTE_WORKER='fix-defects-11-05').returncode == 0
@@ -1262,7 +1262,7 @@ def test_a_hyphenated_worker_name_is_one_directory_for_a_run_and_its_cleanup(min
     assert not directory.exists() and not (home / 'shared' / 'stage' / 'fix_defects_11_05').exists()
 
 
-# spec: ANYM-638
+# spec: ANYM-639
 def test_a_long_derived_worker_name_is_cut_and_stays_apart_from_a_near_twin(mini, worktree):
     home, env = mini
     previous = worktree
