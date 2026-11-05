@@ -269,6 +269,123 @@ def test_a_valid_hint_answers_200_within_the_deadline_even_when_the_channel_hang
     asyncio.run(scenario())
 
 
+class Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def isolation(answers, clock=None):
+    """An isolation probe with scripted (main listener, channel) outcomes."""
+    pending = list(answers)
+
+    def probe(port):
+        pair = pending[0]
+        if port == hint.CHANNEL_PORT:
+            pending.pop(0)
+            return pair[1]
+        return pair[0]
+    return hint.Isolation(probe=probe, clock=clock or Clock())
+
+
+# spec: ANYM-760
+def test_until_isolation_is_proven_the_right_token_gets_the_same_404_and_the_channel_is_not_called(tmp_path):
+    async def scenario():
+        guard = isolation([('timeout', 'connected')])
+        app, channel = receiver(tmp_path, isolation=guard)
+        closed = await call(app)
+        unknown = await call(app, path='/omi/memory/' + 'X' * 43)
+        assert closed[:3] == unknown[:3] and closed[0] == 404 and closed[3] == 0 and not channel.requests
+        guard.round()
+        assert (await call(app))[0] == 200 and len(channel.requests) == 1
+    asyncio.run(scenario())
+
+
+# spec: ANYM-760
+@pytest.mark.parametrize('target', ['connected', 'refused'])
+def test_a_main_listener_that_answers_closes_a_proven_receiver_at_once(target):
+    guard = isolation([('timeout', 'connected'), (target, 'connected')])
+    guard.round()
+    assert guard.proven()
+    guard.round()
+    assert not guard.proven()
+
+
+# spec: ANYM-760
+@pytest.mark.parametrize('pair', [('timeout', 'refused'), ('timeout', 'timeout'), ('unreachable', 'connected'), ('unresolved', 'unresolved')])
+def test_a_timeout_without_a_live_channel_proves_nothing(pair):
+    guard = isolation([pair])
+    guard.round()
+    assert not guard.proven()
+
+
+# spec: ANYM-760
+def test_a_proof_ages_out_when_the_probe_stops_so_a_dead_thread_fails_closed():
+    clock = Clock()
+    guard = isolation([('timeout', 'connected')], clock)
+    guard.round()
+    clock.now += hint.ISOLATION_TTL - 1
+    assert guard.proven()
+    clock.now += 1
+    assert not guard.proven()
+
+
+# spec: ANYM-760
+@given(steps=st.lists(st.tuples(st.sampled_from(['connected', 'refused', 'timeout', 'unreachable', 'unresolved']),
+                                st.sampled_from(['connected', 'refused', 'timeout', 'unreachable', 'unresolved']),
+                                st.integers(0, 2 * hint.ISOLATION_TTL)), max_size=30))
+def test_the_receiver_is_open_only_on_a_fresh_proof_with_no_answer_from_the_main_listener_since(steps):
+    clock = Clock()
+    guard = isolation([step[:2] for step in steps], clock)
+    assert not guard.proven()
+    proof = None
+    for target, control, wait in steps:
+        clock.now += wait
+        guard.round()
+        if target in ('connected', 'refused'):
+            proof = None
+        elif target == 'timeout' and control == 'connected':
+            proof = clock.now
+        assert guard.proven() == (proof is not None and clock.now - proof < hint.ISOLATION_TTL)
+
+
+# spec: ANYM-760
+def test_a_real_listener_on_the_main_port_is_not_isolation():
+    with socket.socket() as listener:
+        listener.bind(('127.0.0.1', 0)); listener.listen(4)
+        port = listener.getsockname()[1]
+        guard = hint.Isolation(host='127.0.0.1', target_port=port, control_port=port, timeout=0.5)
+        guard.round()
+        assert not guard.proven()
+
+
+# spec: ANYM-760
+def test_a_probe_fault_leaves_the_receiver_closed_and_the_loop_alive():
+    def broken(port):
+        raise RuntimeError('fault')
+    guard = hint.Isolation(probe=broken, clock=Clock())
+    assert guard.step() == hint.ISOLATION_RETRY
+    assert not guard.proven()
+
+
+# spec: ANYM-760
+def test_the_receiver_entry_point_starts_the_probe_and_gates_the_app(tmp_path, monkeypatch):
+    import uvicorn
+    started, served = [], []
+    monkeypatch.setattr(hint.Isolation, 'start', lambda self: started.append(self))
+    monkeypatch.setattr(uvicorn, 'run', lambda app, **options: served.append(app))
+    cli.run_receiver(type('Args', (), {'config': str(receiver_files(tmp_path)), 'host': '127.0.0.1', 'port': 1})())
+    assert served[0].isolation is started[0]
+
+
+# spec: ANYM-760
+def test_the_probed_main_port_is_the_port_the_backend_serves():
+    command = yaml.safe_load((ROOT / 'deploy/compose.recordings.yaml').read_text())['services']['recordings-api']['command']
+    assert command[command.index('--port') + 1] == str(hint.MAIN_PORT)
+
+
 # spec: ANYM-760
 def test_the_receiver_process_loads_no_archive_app_or_collector_code():
     code = ('import sys; sys.path.insert(0, sys.argv[1]); from deedkit_recordings import hint; '

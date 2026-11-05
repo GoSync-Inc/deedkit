@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import threading
 import time
 from typing import Annotated
 from urllib.parse import parse_qs
@@ -24,6 +25,7 @@ from urllib.parse import parse_qs
 import httpx
 from pydantic import Field
 
+from . import admission
 from .omi import ID, fingerprint, metadata, pagination
 from .security import Failure, RateLimited, Strict, digest_matches, hint_authorized, loads, private
 
@@ -36,7 +38,10 @@ RECEIVER_PORT = 13236
 KEY_TTL, KEY_ENTRIES = 600, 1024  # the same Idempotency-Key inside ten minutes has one effect
 LOG_EVERY = 300
 RECEIVER_REASONS = frozenset(('accepted', 'duplicate', 'not_found', 'bad_uid', 'bad_shape', 'too_large', 'deadline', 'busy',
-                              'channel_failed'))
+                              'channel_failed', 'isolation_unproven'))
+MAIN_PORT = 13234  # the backend's main listener: the known listener the isolation probe must not reach
+ISOLATION_TIMEOUT = 3
+ISOLATION_EVERY, ISOLATION_RETRY, ISOLATION_TTL = 60, 5, 180
 
 CHANNEL_PATH = '/omi-hint'
 CHANNEL_ALIAS = 'recordings-hint-channel'
@@ -167,10 +172,57 @@ def conversation_id(raw):
     return ident
 
 
+class Isolation:
+    """Serve only while the host's bridge table is proven to work (production.md, "Omi webhook receiver"). A boot whose table failed
+    to load, or a flushed ruleset, still lets Docker start this process, and nothing else would notice. A proof is one round in which
+    the backend's main listener, a known listener on the same bridge, times out while the channel on the same address connects.
+    An answer from the main listener closes at once; any other result proves nothing and the last proof ages out, so a backend
+    restart costs no hint and a dead probe thread fails closed. It cannot bind a compromised process, which can ignore it."""
+    def __init__(self, *, host=CHANNEL_ALIAS, target_port=MAIN_PORT, control_port=CHANNEL_PORT, timeout=ISOLATION_TIMEOUT, probe=None,
+                 clock=None):
+        self.host, self.target_port, self.control_port, self.timeout = host, target_port, control_port, timeout
+        self.probe = probe or self.connect
+        self.clock = clock or monotonic
+        self.proof, self.said = None, None
+
+    def connect(self, port):
+        return admission.probe(f'{self.host}:{port}', 'open', self.timeout)[0]
+
+    def proven(self):
+        return self.proof is not None and self.clock() - self.proof < ISOLATION_TTL
+
+    def round(self):
+        target = self.probe(self.target_port)
+        control = self.probe(self.control_port)
+        if target in ('connected', 'refused'):  # a DROP never sends a refusal
+            self.proof = None
+        elif target == 'timeout' and control == 'connected':
+            self.proof = self.clock()
+
+    def step(self):
+        """One round that survives any fault; the seconds until the next. Names only reach the log, on a change."""
+        try:
+            self.round()
+        except Exception:
+            pass
+        state = self.proven()
+        if state != self.said:
+            self.said = state
+            print('omi_hint_isolation ' + ('proven' if state else 'unproven'), flush=True)
+        return ISOLATION_EVERY if state else ISOLATION_RETRY
+
+    def start(self):
+        def loop():
+            while True:
+                time.sleep(self.step())
+        threading.Thread(target=loop, name='omi-hint-isolation', daemon=True).start()
+
+
 class Receiver:
     """ASGI app. Everything but one route answers one fixed 404 before the body is read."""
-    def __init__(self, path, *, transport=None, deadline=DEADLINE):
+    def __init__(self, path, *, transport=None, deadline=DEADLINE, isolation=None):
         self.path, self.transport, self.deadline = Path(path).absolute(), transport, deadline
+        self.isolation = isolation
         self.counters = Counter()
         self.active = 0
         self.keys = OrderedDict()  # digests of delivered Idempotency-Key values
@@ -217,6 +269,8 @@ class Receiver:
         self.log_counters()
 
     async def handle(self, scope, receive):
+        if self.isolation is not None and not self.isolation.proven():
+            return 404, 'isolation_unproven'
         path = scope.get('path', '')
         token = path[len(ROUTE_PREFIX):] if path.startswith(ROUTE_PREFIX) else ''
         settings = self.settings() if scope.get('method') == 'POST' and PATH_TOKEN.fullmatch(token) else None
