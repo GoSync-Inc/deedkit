@@ -1,14 +1,18 @@
 """A single synthetic Telegram client, independent network lanes and real disposable outbox."""
 import asyncio
+import copy
 import json
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace as NS
 
 import pytest
+from psycopg.errors import LockNotAvailable
 
 from messaging_service import outgoing, subscriptions
+from messaging_service.collector_state import CollectorState
 from messaging_service.envelope import stable_id
 from messaging_service.telegram_collector import TelegramCollector, TelethonProvider
 from messaging_service.telegram_governor import ProviderRateLimited, RequestGovernor
@@ -240,6 +244,153 @@ def test_expiry_sweep_is_bounded_fenced_and_does_not_touch_other_attempts(sender
         assert c.execute('SELECT status FROM outgoing_messages WHERE id=%s',(ids[-2],)).fetchone()['status'] == 'dispatching'
 
 
+class RecordingPool:
+    """Real connections; records each statement, and raises `fail` in place of the first outgoing_messages statement."""
+    def __init__(self, pool, fail=None): self.pool, self.fail, self.statements = pool, fail, []
+
+    @contextmanager
+    def connection(self, timeout=None):
+        recorder = self
+        with self.pool.connection(timeout=timeout) as c:
+            class Proxy:
+                def __getattr__(self, name): return getattr(c, name)
+                def execute(self, query, params=None):
+                    recorder.statements.append(query)
+                    if recorder.fail and 'outgoing_messages' in query: raise recorder.fail
+                    return c.execute(query, params)
+            yield Proxy()
+
+    def kinds(self):
+        def kind(query):
+            if 'SET LOCAL' in query: return 'bound'
+            if 'collector_leases' in query: return 'fence'
+            if 'SKIP LOCKED' in query: return 'claim'
+            if 'outgoing_messages' in query: return 'read'
+        return [k for k in map(kind, self.statements) if k]
+
+
+def recording_state(state, fail=None):
+    archive = copy.copy(state.archive); archive.store = copy.copy(archive.store)
+    archive.store.pool = recorder = RecordingPool(state.archive.store.pool, fail)
+    return NS(archive=archive, account=state.account, lease=state.lease), recorder
+
+
+def queue_expiry(s, key, name, *, due):
+    chat = stable_id('chat', 'send-fixture', '100')
+    send_id = s.send_message(key, account='send-fixture', chat_id=chat, text='Synthetic expiry',
+        request_id='synthetic-expiry-'+name)['send_id']
+    if due:
+        with s.pool.connection() as c:
+            c.execute("UPDATE outgoing_messages SET expires_at=clock_timestamp()-interval '1 second' WHERE id=%s", (send_id,))
+    return send_id
+
+
+def send_state(s, send_id):
+    with s.pool.connection() as c:
+        return c.execute('SELECT status FROM outgoing_messages WHERE id=%s', (send_id,)).fetchone()['status']
+
+
+# spec: ANYM-788
+def test_expiry_pass_with_nothing_due_takes_no_lease_lock(sender):  # noqa: F811
+    s, archive, key, _, state = sender
+    waiting = queue_expiry(s, key, 'waiting', due=False)
+    # Rows the pass must not count as due: past expires_at but no longer queued, or another account's.
+    unknown, dispatching = queue_expiry(s, key, 'unknown', due=True), queue_expiry(s, key, 'dispatching', due=True)
+    with s.pool.connection() as c:
+        c.execute("UPDATE outgoing_messages SET status='unknown' WHERE id=%s", (unknown,))
+        c.execute("UPDATE outgoing_messages SET status='dispatching',lease_epoch=%s WHERE id=%s", (state.lease[1], dispatching))
+    with s.pool.connection() as holder:
+        holder.execute('SELECT 1 FROM collector_leases WHERE account=%s FOR UPDATE', (state.account,))
+        assert outgoing.OutgoingWorker(state, None).expire_queued() == 0
+    assert (send_state(s, waiting), send_state(s, unknown), send_state(s, dispatching)) == ('queued', 'unknown', 'dispatching')
+    archive.register('send-other', 'telegram', 'Synthetic other', discover=True)
+    other = CollectorState(archive, 'send-other', ('synthetic-other-worker', archive.acquire('send-other', 'synthetic-other-worker')))
+    with s.pool.connection() as c:
+        c.execute("UPDATE outgoing_messages SET expires_at=clock_timestamp()-interval '1 second' WHERE id=%s", (waiting,))
+    with s.pool.connection() as holder:
+        holder.execute('SELECT 1 FROM collector_leases WHERE account=%s FOR UPDATE', (other.account,))
+        assert outgoing.OutgoingWorker(other, None).expire_queued() == 0
+    assert send_state(s, waiting) == 'queued'
+
+
+# spec: ANYM-788
+def test_expiry_due_row_keeps_bounds_and_fence_and_a_later_due_row_expires_next_pass(sender):  # noqa: F811
+    s, _, key, _, state = sender
+    queued = queue_expiry(s, key, 'later', due=False)
+    bound, recorder = recording_state(state)
+    worker = outgoing.OutgoingWorker(bound, None)
+    assert worker.expire_queued() == 0
+    assert recorder.kinds() == ['bound', 'bound', 'read']
+    with s.pool.connection() as c:
+        c.execute("UPDATE outgoing_messages SET expires_at=clock_timestamp()-interval '1 second' WHERE id=%s", (queued,))
+    # No write without the fence: a busy lease row leaves the due row queued.
+    with s.pool.connection() as holder:
+        holder.execute('SELECT 1 FROM collector_leases WHERE account=%s FOR UPDATE', (state.account,))
+        with pytest.raises(LockNotAvailable): worker.expire_queued()
+    assert send_state(s, queued) == 'queued'
+    recorder.statements.clear()
+    assert worker.expire_queued() == 1 and send_state(s, queued) == 'expired'
+    assert recorder.kinds() == ['bound', 'bound', 'read', 'fence', 'claim']
+
+
+# spec: ANYM-788
+def test_lost_lease_with_nothing_due_still_ends_the_collector_through_heartbeat(sender, monkeypatch):  # noqa: F811
+    s, archive, _, _, state = sender; passes = []; first = Event(); original = outgoing.OutgoingWorker.expire_queued
+    def counted(self, **kwargs):
+        passes.append(original(self, **kwargs)); first.set(); return passes[-1]
+    monkeypatch.setattr(outgoing.OutgoingWorker, 'expire_queued', counted)
+    worker = TelegramCollector.__new__(TelegramCollector); worker.state = state; worker.database_retry = .01
+    worker.archive = archive; worker.account = state.account; worker.owner = state.lease[0]
+    worker.lease_ttl = 60; worker.heartbeat_interval = .05; worker._lease_valid_until = None
+    lease = state.lease; state.lease = lease[0], lease[1]+1
+    async def scenario():
+        expiry = asyncio.create_task(worker.outgoing_expiry_loop())
+        beat = None
+        try:
+            # The empty pass does not notice the lost lease; the heartbeat started after it does.
+            assert await asyncio.to_thread(first.wait, 2) and passes == [0]
+            beat = asyncio.create_task(worker.heartbeat())
+            done, _ = await asyncio.wait({expiry, beat}, timeout=2, return_when=asyncio.FIRST_COMPLETED)
+            assert done == {beat}
+            with pytest.raises(RuntimeError, match='collector_lease_lost'): beat.result()
+        finally:
+            for task in filter(None, (expiry, beat)): task.cancel()
+            await asyncio.gather(*filter(None, (expiry, beat)), return_exceptions=True)
+    try: asyncio.run(scenario())
+    finally: state.lease = lease
+
+
+# spec: ANYM-788
+@pytest.mark.parametrize('error,quiet', [('LockNotAvailable', True), ('QueryCanceled', False)])
+def test_failed_expiry_read_reaches_the_loops_existing_branches(sender, monkeypatch, caplog, error, quiet):  # noqa: F811
+    from psycopg import errors
+    from messaging_service import telegram_collector
+    _, _, _, _, state = sender; waits = []
+    bound, recorder = recording_state(state, getattr(errors, error)('synthetic'))
+    class Backoff:
+        def __init__(self, owner): pass
+        async def wait(self): waits.append(True); await asyncio.sleep(.01)
+        def reset(self): pass
+    monkeypatch.setattr(telegram_collector, 'DbBackoff', Backoff)
+    worker = TelegramCollector.__new__(TelegramCollector); worker.state = bound; worker.database_retry = .01
+    caplog.set_level('WARNING', 'messaging_service.telegram_collector')
+    async def scenario():
+        task = asyncio.create_task(worker.outgoing_expiry_loop())
+        try:
+            for _ in range(500):
+                if recorder.kinds().count('read') >= 3: break
+                assert not task.done()
+                await asyncio.sleep(.01)
+        finally:
+            task.cancel(); await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(scenario())
+    # The read fails first: inside the pass's bounds, with no lease statement sent.
+    assert recorder.kinds()[:3] == ['bound', 'bound', 'read'] and recorder.kinds().count('read') >= 3
+    assert 'fence' not in recorder.kinds() and 'claim' not in recorder.kinds()
+    assert ('outgoing_expiry_failed' not in caplog.text) is quiet
+    assert (waits == []) is quiet
+
+
 # spec: ANYM-655
 @pytest.mark.parametrize('old_guard', [False, True])
 def test_bound_collector_terminal_events_and_schema62_guard_isolation(sender, old_guard):  # noqa: F811
@@ -454,7 +605,8 @@ def test_expiry_pool_acquisition_obeys_one_absolute_deadline(sender, monkeypatch
 # spec: ANYM-655
 def test_stalled_expiry_transaction_releases_fence_and_cancellation_is_bounded(sender, monkeypatch):  # noqa: F811
     from messaging_service.archive import Archive
-    s, _, _, _, state = sender; entered = Event(); release = Event(); original = Archive.fence
+    s, _, key, _, state = sender; entered = Event(); release = Event(); original = Archive.fence
+    queue_expiry(s, key, 'stalled', due=True)  # ANYM-788: an empty pass no longer reaches the fence this test stalls in.
     monkeypatch.setattr(outgoing,'EXPIRY_SECONDS',.2,raising=False)
     monkeypatch.setattr(outgoing,'EXPIRY_GRACE',.1,raising=False)
     def stalled(c, account, lease):

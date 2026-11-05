@@ -665,6 +665,10 @@ class OutgoingWorker:
         with pool.connection() as c:
             c.execute("SET LOCAL lock_timeout='100ms'")
             c.execute("SET LOCAL statement_timeout='2s'")
+            # ANYM-788: every ingest holds the lease row, so fencing an empty pass only fills the database
+            # log with lock timeouts. A lost lease with nothing due is for heartbeat and claim() to notice.
+            if not c.execute("""SELECT 1 FROM outgoing_messages WHERE account=%s AND status='queued'
+                AND expires_at<=clock_timestamp() LIMIT 1""",(st.account,)).fetchone():return 0
             st.archive.fence(c,st.account,st.lease)
             rows=c.execute("""WITH due AS (
                 SELECT id FROM outgoing_messages WHERE account=%s AND status='queued'
