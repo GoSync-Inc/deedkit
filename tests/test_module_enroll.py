@@ -690,6 +690,88 @@ def test_a_changed_malformed_manifest_is_pending_and_never_an_exception(monkeypa
     assert p.enrollment_pending(Path("/mirror"), "a" * 40, "b" * 40, {"projects": []}) == ["broken"]
 
 
+MANIFEST_PATH = "deploy/modules/recordings.json"
+BROKEN_MANIFEST = '{"name": "recordings", "project": {"services": {"x": []}}}'
+RUNS_RECORDINGS = {"projects": [{"name": "deedkit-recordings"}]}
+
+
+def revisions(monkeypatch, changed, trees):
+    """Git answered from `trees` ({sha: {path: text}}): unlike `mirror_listing`, a manifest differs per revision."""
+    def fake(argv, **kwargs):
+        command = argv[3:]
+        if command[0] == "diff":
+            return "\0".join(changed) + "\0"
+        if command[0] == "ls-tree":
+            return "\0".join(trees[command[-2]]) + "\0"
+        sha, path = command[2].split(":", 1)
+        return trees[sha][path]
+    monkeypatch.setattr(p, "run", fake)
+
+
+# spec: ANYM-765
+@pytest.mark.parametrize("head, code", [(BROKEN_MANIFEST, "manifest_invalid"), ("{not json", "invalid"),
+                                        (RECORDINGS.replace('"project"', '"unknown": 1, "project"', 1), "manifest_unknown_key")],
+                         ids=["fields", "not_json", "unknown_key"])
+def test_a_running_module_with_a_broken_changed_manifest_is_manifest_invalid_with_a_fixed_code(monkeypatch, head, code):
+    revisions(monkeypatch, [MANIFEST_PATH], {BASE: {MANIFEST_PATH: RECORDINGS}, SHA: {MANIFEST_PATH: head}})
+    pending = p.enrollment_pending(Path("/mirror"), BASE, SHA, RUNS_RECORDINGS)
+    assert pending == ["recordings"]
+    reason, fields = p.enrollment_halt(pending[0], SHA)
+    assert reason == "manifest_invalid: recordings: fix deploy/modules/recordings.json; enroll is not needed"
+    assert fields == {"manifest_code": code}
+
+
+# spec: ANYM-765
+def test_the_reason_a_manifest_failed_is_a_code_and_never_the_text_of_the_file(monkeypatch):
+    text = "synthetic-parse-text-0001"
+    revisions(monkeypatch, [], {SHA: {MANIFEST_PATH: json.dumps({"name": "recordings", text: text})}})
+    assert p.module_manifests(Path("/mirror"), SHA) == ({"recordings": None}, {"recordings": "manifest_unknown_key"})
+    revisions(monkeypatch, [], {SHA: {MANIFEST_PATH: "{" + text}})
+    assert p.module_manifests(Path("/mirror"), SHA) == ({"recordings": None}, {"recordings": "invalid"})
+
+
+# spec: ANYM-765
+def test_a_new_module_with_a_broken_manifest_still_needs_the_enroll_command_and_the_plan_then_refuses_it(tmp_path, monkeypatch):
+    host = Enroller(tmp_path, monkeypatch)
+    host.repo[MANIFEST_PATH] = b"{not json"
+    assert host.codes() == ["manifest_invalid"]
+    for base_tree, settings in (({}, {"projects": []}), ({}, RUNS_RECORDINGS), ({MANIFEST_PATH: RECORDINGS}, {"projects": []})):
+        revisions(monkeypatch, [MANIFEST_PATH], {BASE: base_tree, SHA: {MANIFEST_PATH: BROKEN_MANIFEST}})
+        pending = p.enrollment_pending(Path("/mirror"), BASE, SHA, settings)
+        assert pending == ["recordings"]
+        assert p.enrollment_halt(pending[0], SHA) == (p.enroll_required("recordings", SHA), {})
+
+
+# spec: ANYM-765
+@pytest.mark.parametrize("base", [BROKEN_MANIFEST, "{not json"], ids=["fields", "not_json"])
+def test_a_module_whose_base_manifest_is_also_broken_is_pending_and_never_an_exception(monkeypatch, base):
+    revisions(monkeypatch, [MANIFEST_PATH], {BASE: {MANIFEST_PATH: base}, SHA: {MANIFEST_PATH: BROKEN_MANIFEST}})
+    pending = p.enrollment_pending(Path("/mirror"), BASE, SHA, RUNS_RECORDINGS)
+    assert pending == ["recordings"]
+    assert p.enrollment_halt(pending[0], SHA) == (p.enroll_required("recordings", SHA), {})
+
+
+# spec: ANYM-765
+def test_a_broken_manifest_of_a_running_module_never_lets_an_enrollment_alone_explain_the_difference(tmp_path, monkeypatch):
+    host = Enroller(tmp_path, monkeypatch)
+    prepared, http = p.settings_digest(host.settings), {"config_digest": p.digest(host.http)}
+    other_path, other = "deploy/modules/other.json", RECORDINGS.replace('"name": "recordings"', '"name": "other"', 1).replace(
+        '"name": "deedkit-recordings"', '"name": "deedkit-other"', 1)
+    for name, service in (("deedkit-recordings", "recordings-api"), ("deedkit-other", "other-api")):
+        host.settings["projects"].append({"name": name, "directory": str(host.deploy), "files": [], "services": {service: "recordings"}})
+    (host.state / BASE).mkdir()
+    p.write(host.state / BASE / "prepared.json", {"config_digest": prepared})
+
+    def explained(recordings):
+        revisions(monkeypatch, [], {SHA: {MANIFEST_PATH: recordings, other_path: other}})
+        return p.enrollment_only(Path("/mirror"), SHA, host.settings, host.http, {"sha": BASE}, http)
+    assert explained(RECORDINGS) == ["other", "recordings"]  # the control: reversing both reproduces the recorded digests
+    assert explained(BROKEN_MANIFEST) == []  # the valid manifest does not explain the module the broken one hides
+    host.settings["projects"].pop()
+    revisions(monkeypatch, [], {SHA: {MANIFEST_PATH: BROKEN_MANIFEST}})
+    assert p.enrollment_only(Path("/mirror"), SHA, host.settings, host.http, {"sha": BASE}, http) == []
+
+
 # spec: ANYM-745
 def test_an_unverified_sha_refuses_before_anything_is_read(tmp_path, monkeypatch):
     host = Enroller(tmp_path, monkeypatch)
@@ -1121,6 +1203,134 @@ def test_a_call_active_at_apply_is_refused_before_the_pause(tmp_path, monkeypatc
     host.active = ["call-1"]
     assert host.apply(plan)["refusals"][0]["code"] == "call_active"
     assert host.mutations() == [] and not p.PAUSE.exists()
+
+
+class NetworkHost(Applier):
+    """`Applier` whose project document gains the `extra` networks and whose existing networks may be not internal."""
+    extra, internal = {}, True
+
+    def compose(self, argv):
+        document = json.loads(super().compose(argv))
+        if document["services"]:
+            document["networks"].update(self.extra)
+        return json.dumps(document)
+
+    def run(self, argv, **kwargs):
+        if argv[:3] == ["docker", "network", "inspect"]:
+            self.calls.append(argv)
+            return ("true" if self.internal else "false") + "\n"
+        return super().run(argv, **kwargs)
+
+
+def refused_before_the_first_write(host, result, code, files, before):
+    assert {item["code"] for item in result["refusals"]} == {code}, result
+    assert not p.PAUSE.exists() and not (host.state / "enrollment.json").exists()
+    # The host lock is taken before the check, in the state directory, and holds nothing of the enrollment.
+    written = [item for item in set(tree(host.root)) ^ set(before) if item[0] != "state" and not item[0].endswith(".lock")]
+    assert host.files() == files and written == [] and host.mutations() == [] and host.up is None
+    assert not any(call[:3] == ["docker", "network", "create"]
+                   or (call[:2] == ["docker", "compose"] and {"up", "stop", "down", "restart", "start"} & set(call))
+                   for call in host.calls)
+
+
+UNDECLARED = [{"undeclared": {"name": "deedkit-undeclared", "external": True}}, {"deedkit-undeclared": {"external": True}}]
+
+
+# spec: ANYM-765
+@pytest.mark.parametrize("network", UNDECLARED, ids=["named", "key_only"])
+def test_an_undeclared_external_network_refuses_apply_before_the_first_write(tmp_path, monkeypatch, network):
+    host = NetworkHost(tmp_path, monkeypatch)
+    approved = host.plan()["plan_digest"]
+    host.extra = network
+    files, before = host.files(), tree(host.root)
+    result = host.apply(approved)
+    refused_before_the_first_write(host, result, "network_unsafe", files, before)
+    assert "deedkit-undeclared" in result["refusals"][0]["detail"]
+
+
+# spec: ANYM-765
+@pytest.mark.parametrize("network", UNDECLARED, ids=["named", "key_only"])
+def test_the_plan_reports_an_undeclared_external_network(tmp_path, monkeypatch, network):
+    host = NetworkHost(tmp_path, monkeypatch)
+    host.extra = network
+    assert host.codes() == ["network_unsafe"]
+
+
+# spec: ANYM-765
+def test_a_declared_network_that_exists_and_is_not_internal_refuses_apply_before_the_first_write(tmp_path, monkeypatch):
+    host = NetworkHost(tmp_path, monkeypatch)
+    approved = host.plan()["plan_digest"]
+    host.networks, host.internal = {"deedkit-recordings-backend"}, False
+    files, before = host.files(), tree(host.root)
+    result = host.apply(approved)
+    refused_before_the_first_write(host, result, "network_unsafe", files, before)
+    assert "deedkit-recordings-backend" in result["refusals"][0]["detail"]
+
+
+# spec: ANYM-765
+def test_a_plan_that_cannot_resolve_the_document_says_so_and_apply_writes_nothing(tmp_path, monkeypatch):
+    host = NetworkHost(tmp_path, monkeypatch)
+    approved = host.plan()["plan_digest"]
+    host.compose_error = p.Refused("docker failed (exit 1); production was not accepted")
+    files, before = host.files(), tree(host.root)
+    refused_before_the_first_write(host, host.apply(approved), "compose_config_failed", files, before)
+
+
+# spec: ANYM-765
+def test_a_manifest_that_lists_an_overlay_twice_still_resolves_the_document_and_checks_its_networks(tmp_path, monkeypatch):
+    overlay = "deploy/compose.recordings.yaml"
+    host = NetworkHost(tmp_path, monkeypatch, mutate=set_path("project", "files", value=[overlay, overlay]))
+    plan = host.plan()
+    assert "project" in plan["inputs"]["compose"]
+    host.extra = UNDECLARED[0]
+    assert host.codes() == ["network_unsafe"]
+    files, before = host.files(), tree(host.root)
+    refused_before_the_first_write(host, host.apply(plan["plan_digest"]), "network_unsafe", files, before)
+
+
+# spec: ANYM-765
+def test_a_plan_without_a_resolved_document_never_succeeds(tmp_path, monkeypatch):
+    host = NetworkHost(tmp_path, monkeypatch)
+    monkeypatch.setattr(p, "read_env_file", lambda path: None)  # no document, and no refusal explains why
+    assert host.codes() == ["compose_config_failed"]
+
+
+# spec: ANYM-765
+@pytest.mark.parametrize("networks, undeclared", [
+    ({"backend": {"name": "declared", "external": True}}, None),
+    ({"declared": {"external": True}}, None),
+    ({"backend": {"name": "other", "external": True}}, "other"),
+    ({"other": {"external": True}}, "other"),
+    ({"other": {"name": "other", "driver": "bridge"}, "local": {"external": False}}, None),
+], ids=["named_declared", "key_declared", "named_undeclared", "key_undeclared", "not_external"])
+def test_the_external_names_come_from_the_name_or_the_compose_key(networks, undeclared):
+    project = {"networks": [{"name": "declared", "bridge": "dk-declared0"}]}
+    if undeclared is None:
+        p.check_external_networks(project, {"networks": networks})
+        return
+    with pytest.raises(p.EnrollRefused) as refused:
+        p.check_external_networks(project, {"networks": networks})
+    assert refused.value.code == "network_unsafe" and undeclared in refused.value.detail
+
+
+# spec: ANYM-765
+def test_declared_and_non_external_networks_pass_and_only_the_first_start_creates_the_missing_one(tmp_path, monkeypatch):
+    host = NetworkHost(tmp_path, monkeypatch)
+    host.networks = {"deedkit-recordings-backend"}
+    host.extra = {"deedkit-recordings-router": {"external": True}, "local": {"driver": "bridge"}}
+    assert host.apply()["status"] == "enrolled"
+    created = [call[-1] for call in host.calls if call[:3] == ["docker", "network", "create"]]
+    assert created == ["deedkit-recordings-router"] and ("network", True) in host.events
+
+
+# spec: ANYM-765
+def test_a_network_that_turns_unsafe_after_the_check_stops_the_first_start_with_the_pause_kept(tmp_path, monkeypatch):
+    host = NetworkHost(tmp_path, monkeypatch)
+    host.networks = {"deedkit-recordings-backend"}
+    host.triggers["overlay"] = lambda: setattr(host, "internal", False)
+    result = host.apply()
+    assert result["status"] == "stopped" and result["code"] == "network_unsafe", result
+    assert "up" not in host.names() and "network" not in host.names() and p.PAUSE.exists()
 
 
 # spec: ANYM-746

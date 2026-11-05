@@ -5041,7 +5041,8 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
     # ANYM-745: the gate reads the range of the release this run would deploy, not the tip of main; a catch-up of the
     # HTTP pair to the applied plan A (candidate == base) installs no new manifest.
     if candidate != base and (pending := enrollment_pending(mirror, since, candidate, settings)):
-        return halt(enroll_required(pending[0], candidate), sha=candidate)
+        reason, fields = enrollment_halt(pending[0], candidate)
+        return halt(reason, sha=candidate, **fields)
     sql, pending = range_changes(mirror, since, candidate, installed)
     halted, plans = deploy_plan(settings, s, configs, mirror, base, since, candidate, sql, pending, dry_run, halt)
     if halted is not None:
@@ -5253,7 +5254,7 @@ def checked_manifest(value, name):
     if manifest_text(value["name"], "name", MODULE_NAME) != name:
         raise EnrollRefused("manifest_invalid", "name differs from the file name")
     # `networks` is optional: a manifest key the installed host tool does not know is a "malformed manifest" to it, and a
-    # deploy then pauses with `enroll_required` even for a module that is already running (incident 11-04, #632).
+    # deploy then pauses even for a module that is already running (incident 11-04, #632).
     project = manifest_keys(value["project"], {"name", "files", "env_file", "env_required", "services", "networks"}, "project",
                             required={"name", "files", "env_file", "env_required", "services"})
     check_networks(project.get("networks", []))
@@ -5619,7 +5620,7 @@ def enroll_plan(settings, http, name, sha, mirror, state=None):
             with os.fdopen(new_file(target), "wb") as handle:
                 handle.write(content)
             scratch_files[path] = str(target)
-        if env is not None and len(contents) == len(wanted):
+        if env is not None and contents.keys() >= set(wanted):  # a path listed twice has one entry in `contents`
             overlay = manifest["gateway"]["overlay"]
             for label, item, files in (("project", new_project, [scratch_files[path] for path in project["files"]]),
                                        ("gateway", gateway, [*gateway["files"], *([scratch_files[overlay]] if overlay else [])]),
@@ -5632,6 +5633,7 @@ def enroll_plan(settings, http, name, sha, mirror, state=None):
         private_digest = None
         if "project" in documents:
             private_digest = attempt(check_private_config, documents["project"], project, private)
+            attempt(check_external_networks, project, documents["project"])
         egress = manifest["egress"]
         if egress["outside"] and env is not None:
             attempt(check_egress, mirror, sha, egress, variables, scratch)
@@ -5656,6 +5658,8 @@ def enroll_plan(settings, http, name, sha, mirror, state=None):
                     check_policy_candidate(candidate, scratch)
                 except EnrollRefused as exc:
                     failures.append({"code": exc.code, "detail": exc.detail})
+    if "project" not in documents and not failures:  # the private configuration and the networks were not checked
+        failures.append({"code": "compose_config_failed", "detail": f"{project['name']}: no resolved document"})
     if failures:
         raise EnrollRefusals(failures)
     grants = {principal: sorted(section["grants"]) for principal, section in fragment["principals"].items()}
@@ -5672,6 +5676,16 @@ def enroll_plan(settings, http, name, sha, mirror, state=None):
                        "grants": grants, "candidate_digest": inputs["candidate_policy"]},
             "owner_steps": manifest["owner_steps"], "live_actions": [], "inputs": inputs,
             "plan_digest": digest(inputs)}
+
+
+def check_external_networks(project, document):
+    """Refuses an external network of the resolved Compose document the manifest does not declare. Its Docker name is
+    `name` or, when absent, the Compose key. Reads the document only: `enroll --plan` and `check()` run it before a write."""
+    declared = {item["name"] for item in project.get("networks", [])}
+    external = {network.get("name") or key for key, network in (document.get("networks") or {}).items()
+                if isinstance(network, dict) and network.get("external")}
+    if undeclared := sorted(external - declared):
+        raise EnrollRefused("network_unsafe", ", ".join(undeclared) + " is external but not declared in the manifest")
 
 
 def check_private_config(document, project, private):
@@ -5885,6 +5899,9 @@ class Enrollment:
             raise EnrollRefused("no_current_release", "plan A and plan B do not serve the same applied release")
         if drift := configuration_drift(self.settings, self.http, current, serving):
             raise EnrollRefused("configuration_changed", drift)
+        # The undeclared external networks are `enroll_plan`'s refusal, on the document only it holds: `--plan` prints
+        # its result, and a resolved document carries env values.
+        self.check_networks()
         self.base = current["sha"]
 
     def begin(self):
@@ -5966,19 +5983,24 @@ class Enrollment:
         project = self.plan["production_json"]["append_project"]
         return project, compose_document(project, project["directory"], project["files"])
 
+    def check_networks(self):
+        """Read-only: refuses a declared network that exists and is not internal; the declared networks still missing."""
+        missing = []
+        for item in self.manifest["project"].get("networks", []):
+            name = item["name"]
+            if not run(["docker", "network", "ls", "--filter", f"name=^{name}$", "--format", "{{.Name}}"]).split():
+                missing.append(item)
+            elif run(["docker", "network", "inspect", "--format", "{{.Internal}}", name]).strip() != "true":
+                raise EnrollRefused("network_unsafe", f"{name} exists but is not internal")
+        return missing
+
     def networks(self, document):
-        declared = {item["name"]: item for item in self.manifest["project"].get("networks", [])}
-        external = {network.get("name") for network in document.get("networks", {}).values()
-                    if isinstance(network, dict) and network.get("external")}
-        if undeclared := sorted(name for name in external - declared.keys() if name):
-            raise EnrollRefused("network_unsafe", ", ".join(undeclared) + " is external but not declared in the manifest")
-        for name, item in declared.items():
-            if run(["docker", "network", "ls", "--filter", f"name=^{name}$", "--format", "{{.Name}}"]).split():
-                if run(["docker", "network", "inspect", "--format", "{{.Internal}}", name]).strip() != "true":
-                    raise EnrollRefused("network_unsafe", f"{name} exists but is not internal")
-            else:
-                run(["docker", "network", "create", "--internal", "-o", f"com.docker.network.bridge.name={item['bridge']}",
-                     "-o", "com.docker.network.bridge.gateway_mode_ipv4=isolated", name])
+        """Creates the missing networks. The same reads as `check()` run again on the installed files: a network that
+        turned unsafe since then stops the run here, under the pause."""
+        check_external_networks(self.manifest["project"], document)
+        for item in self.check_networks():
+            run(["docker", "network", "create", "--internal", "-o", f"com.docker.network.bridge.name={item['bridge']}",
+                 "-o", "com.docker.network.bridge.gateway_mode_ipv4=isolated", item["name"]])
 
     def tag_images(self):
         for target in sorted(set(self.manifest["project"]["services"].values())):
@@ -6377,29 +6399,56 @@ def enroll_required(module, sha):
     return f"enroll_required: {module}: production.py enroll --module {module} --sha {sha} --plan"
 
 
+class ManifestInvalid(str):
+    """A module name from `enrollment_pending` whose changed manifest does not parse while the module runs; `code` is the
+    fixed reason (`module_manifests`). Enrolling cannot help it."""
+    code: str
+
+    def __new__(cls, module, code):
+        value = super().__new__(cls, module)
+        value.code = code
+        return value
+
+
+def enrollment_halt(module, sha):
+    """The pause text and its extra fields for one module of `enrollment_pending`."""
+    if isinstance(module, ManifestInvalid):
+        return f"manifest_invalid: {module}: fix {MODULE_DIRECTORY}{module}.json; enroll is not needed", {"manifest_code": module.code}
+    return enroll_required(module, sha), {}
+
+
 MANIFEST_FILE = re.compile(MODULE_DIRECTORY + r"[a-z][a-z0-9-]*\.json")
 
 
 def module_manifests(mirror, sha, only=None):
-    """`{module: manifest or None}` for the deploy/modules/*.json at `sha` (those named in `only`, when given); None when
-    a manifest does not parse. A manifest nobody asked for is not parsed."""
+    """`{module: manifest or None}` for the deploy/modules/*.json at `sha` (those named in `only`, when given), and
+    `{module: code}` for each None: the `EnrollRefused` code or `invalid`, never a word of the file. A manifest nobody
+    asked for is not parsed."""
     listing = run(["git", "-C", str(mirror), "ls-tree", "-r", "--name-only", "-z", sha, MODULE_DIRECTORY]).split("\0")
-    found = {}
+    found, reasons = {}, {}
     for path in (path for path in listing if MANIFEST_FILE.fullmatch(path) and (only is None or Path(path).stem in only)):
+        module = Path(path).stem
         try:
-            found[Path(path).stem] = check_manifest(json.loads(repo_file(mirror, sha, path)), Path(path).stem)
-        except (EnrollRefused, ValueError, Refused):
-            found[Path(path).stem] = None
-    return found
+            found[module] = check_manifest(json.loads(repo_file(mirror, sha, path)), module)
+        except EnrollRefused as exc:
+            found[module], reasons[module] = None, exc.code
+        except (ValueError, Refused):
+            found[module], reasons[module] = None, "invalid"
+    return found, reasons
 
 
 def enrollment_pending(mirror, base, head, settings):
-    """The modules whose manifest `base..head` adds or changes while the configuration runs no project of it."""
+    """The modules whose manifest `base..head` adds or changes while the configuration runs no project of it. A changed
+    manifest that does not parse is pending too, unless `base`'s manifest of that module parses and names a running
+    project: then the module comes back as `ManifestInvalid`. `base` is read only for a broken manifest."""
     changed = run(["git", "-C", str(mirror), "diff", "--name-only", "--no-renames", "-z", base, head]).split("\0")
     wanted = {Path(path).stem for path in changed if MANIFEST_FILE.fullmatch(path)}
     running = {project["name"] for project in settings["projects"]}
-    manifests = module_manifests(mirror, head, wanted) if wanted else {}
-    return sorted(module for module in wanted & manifests.keys()
+    manifests, reasons = module_manifests(mirror, head, wanted) if wanted else ({}, {})
+    before = module_manifests(mirror, base, reasons.keys())[0] if reasons else {}
+    return sorted(ManifestInvalid(module, reasons[module])
+                  if module in reasons and before.get(module) and before[module]["project"]["name"] in running else module
+                  for module in wanted & manifests.keys()
                   if manifests[module] is None or manifests[module]["project"]["name"] not in running)
 
 
@@ -6417,7 +6466,7 @@ def enrollment_only(mirror, head, settings, http, current, serving):
     """The modules whose enrollment alone explains why the configuration differs from the recorded digests: reversing
     every enrolled manifest of `head` reproduces both. Empty when something else differs too."""
     running = {project["name"] for project in settings["projects"]}
-    manifests = [manifest for manifest in module_manifests(mirror, head).values()
+    manifests = [manifest for manifest in module_manifests(mirror, head)[0].values()
                  if manifest is not None and manifest["project"]["name"] in running]
     if not manifests:
         return []

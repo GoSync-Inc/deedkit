@@ -3177,6 +3177,29 @@ def test_a_configuration_that_differs_only_by_an_enrollment_pauses_with_the_enro
     assert outcome["status"] == "halted" and outcome["reason"] == enroll_required(NEWEST) and host.steps == []
 
 
+# spec: ANYM-765
+def test_a_running_module_with_a_broken_changed_manifest_pauses_with_its_real_cause(tmp_path, monkeypatch):
+    path = "deploy/modules/recordings.json"
+    host = Deployer(tmp_path, monkeypatch, changes={NEWEST: [path]})
+    host.contents[f"{BASE}:{path}"], host.contents[f"{NEWEST}:{path}"] = MODULE_MANIFEST, "{not json"
+    host.settings["projects"].append({"name": "deedkit-recordings", "directory": str(tmp_path), "files": [],
+                                      "services": {"recordings-api": "recordings"}})
+    host.current(BASE)  # the module runs in the current release: nothing drifts
+    outcome = host.deploy(auto=True)
+    assert outcome["status"] == "halted" and outcome["manifest_code"] == "invalid" and outcome["sha"] == NEWEST
+    assert outcome["reason"] == "manifest_invalid: recordings: fix deploy/modules/recordings.json; enroll is not needed"
+    assert host.steps == [] and host.paused() == outcome["reason"]
+
+
+# spec: ANYM-765
+def test_a_broken_manifest_of_a_module_that_was_not_running_keeps_the_enroll_pause(tmp_path, monkeypatch):
+    path = "deploy/modules/recordings.json"
+    host = Deployer(tmp_path, monkeypatch, changes={NEWEST: [path]})
+    host.contents[f"{BASE}:{path}"], host.contents[f"{NEWEST}:{path}"] = MODULE_MANIFEST, "{not json"
+    outcome = host.deploy(auto=True)
+    assert outcome["reason"] == enroll_required(NEWEST) and "manifest_code" not in outcome and host.steps == []
+
+
 # spec: ANYM-745
 def test_a_drift_beyond_an_enrollment_keeps_the_apply_by_hand_pause(tmp_path, monkeypatch):
     host = Deployer(tmp_path, monkeypatch)
@@ -3195,6 +3218,13 @@ def test_production_md_names_every_enrollment_refusal_code_and_the_pause_text():
     assert not [code for code in p.ENROLL_CODES if f"`{code}`" not in docs]
     assert "enroll_required: <module>: production.py enroll --module <module> --sha <sha> --plan" in docs
     assert "plan_digest" in docs and "deploy/modules/<module>.json" in docs
+
+
+# spec: ANYM-765
+def test_production_md_states_the_manifest_invalid_pause_and_the_earlier_network_refusal():
+    docs = " ".join((ROOT / "docs/operations/production.md").read_text().split())
+    assert "manifest_invalid: <module>: fix deploy/modules/<module>.json; enroll is not needed" in docs
+    assert "is refused as `network_unsafe` before the pause, the receipt or any file is written" in docs
 
 
 # spec: ANYM-745
