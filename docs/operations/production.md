@@ -2417,9 +2417,9 @@ What each step does:
 - `verify`: the replaced value is refused and the new one accepted on fresh connections, the files hold the new
   value, `db-roles --check` is ok through `runtime.json`, `/health` is 200, the saved container identities are the
   same, then a real calendar backup through the new `owner.dsn`. `verify --no-backup` makes `finish` refuse.
-- Retired list: `apply owner` appends the replaced password's prefix to
-  `/opt/deedkit/calendar-backup/retired-passwords` (0600 root, one per line) once the `ALTER` settled; entries are
-  never removed. The restore card (ANYM-780) reads it.
+- Retired list: `apply owner` adds the replaced password's prefix to
+  `/opt/deedkit/calendar-backup/retired-passwords` (0600 root, one per line, replaced by one rename) once the `ALTER`
+  settled; entries are never removed. The restore card (ANYM-780) reads it.
 
 Admission: `/opt/deedkit/calendar-backup/rotation/rotation.unsettled` exists from the first byte of phase `staged`
 until `finished`, and it outlives the process. While it exists `production.py deploy` (also `--auto` and
@@ -2427,7 +2427,9 @@ until `finished`, and it outlives the process. While it exists `production.py de
 `rotation_in_progress` (the catch-up timer starts it again later; a `--recover-stop` still runs). In phase
 `verifying` only the tool's own backup passes, by the token in the marker. Other `production.py` commands (`apply`,
 `rollback`) do not read the marker: run none during a rotation. The tool holds the locks only for the instants it
-writes, and they are free while its backup runs.
+writes, and they are free while its backup runs. The marker has no expiry: while it stays, every calendar backup
+refuses (`status.json` reads `rotation_in_progress`, the freshness alert fires once the newest snapshot is too old)
+and deploys answer `busy`, so a stopped rotation is finished with `recover` the same day.
 
 Phases in `journal.json` (0600, directory 0700, fsync and atomic rename): `staged` (copies of the old files on
 disk, the new value staged 0600), `altered`, `files`, `verifying`, `finished`. HUP, INT, TERM, QUIT and TSTP are
@@ -2439,7 +2441,7 @@ which value it accepts and completes with the staged one; it never enables the r
 | Interrupted | State | `recover` |
 |---|---|---|
 | before the `ALTER` was sent (`staged`) | nothing changed in the database or the files | aborts, removes the staged files and the marker; run `apply` again |
-| after the `ALTER`, before the first file | the database has the new value (or the `ALTER`'s result is uncertain, which a probe settles before any file changes), the files the old one | completes with the staged value: sends it again if needed, retired list, files, restart, `verifying` |
+| after the `ALTER`, before the first file | the database has the new value (or the `ALTER`'s result is uncertain, which a probe settles before any file changes), the files the old one | ends what is left of the earlier `ALTER` (its docker client, its `psql`, its backend, all named after the rotation), then completes with the staged value: sends it again if needed, retired list, files, restart, `verifying` |
 | between files | some files old, some new | rewrites the rest from what each holds now |
 | a short write or a killed write | the file itself is whole (rename); a `.tmp` beside it | removes the `.tmp`, writes the file |
 | staged value lost | the journal's fingerprint no longer matches a file | generates a fresh value, sends it, rewrites every file |
@@ -2449,14 +2451,17 @@ which value it accepts and completes with the staged one; it never enables the r
 
 Usable operator credentials exist throughout: the database container's local socket needs no password, and the old
 copies and the staged value stay on disk (`rotation/staged/<id>/`, 0600) until `finish`. An active call or a held
-lock makes `recover` answer `busy`: the marker stays and it is run again. A marker with an unreadable journal
+lock makes `recover` answer `busy`: the marker stays and it is run again. So does a calendar backup worker a dead
+runner left behind (`backup_unsettled`): `recover` first runs the runner's `--recover-stop` and changes nothing while
+`<host_lock>.unsettled` exists. A throwaway container an earlier run stranded is removed by its label. A marker with an unreadable journal
 (`journal_unreadable`) never happens through the tool: stop and compare the database and the files by hand.
 
 Restore (ANYM-780): `--mode isolated --container <name> --profile-dir <dir> [--retired-list <file>]` on every
 subcommand rotates the roles in that container and rewrites only the profile files in that directory (the journal
-goes to `<dir>.rotation`). It refuses when the container's project has a `calendar-api` or `calendar-worker`, when
-the container is on a non-internal network, or when the directory is production state. It restarts nothing, reads
-no production credential, takes no production admission and verifies at the database level only.
+goes to `<dir>.rotation`, on the resolved path). It refuses when the container's project has a `calendar-api` or
+`calendar-worker`, when the container is on a non-internal network or shares one with any other container, or when
+the directory or the list is under production state. It restarts nothing, reads no production credential, takes no
+production admission and verifies at the database level only.
 
 Undo: undo is another rotation (`apply` the same set again); an exposed value is never restored. Until ANYM-779
 moves the calendar project off its rendered Compose document, that document keeps the previous `POSTGRES_PASSWORD`

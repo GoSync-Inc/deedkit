@@ -36,6 +36,7 @@ FAKE_DOCKER = r'''#!/usr/bin/env python3
 """The docker the tool sees. State and call log live in one JSON file beside it."""
 import base64, fcntl, hashlib, hmac, json, os, re, signal, sys, time, urllib.parse
 HOME = os.path.dirname(os.path.abspath(__file__))
+PATTERN = r'''+"\"\"\"ALTER ROLE \"(\\w+)\" PASSWORD '([^']+)';\"\"\""+r'''
 STATE = os.path.join(HOME, 'state.json')
 def locked(change):
     with open(STATE + '.lock', 'a') as lock:
@@ -56,17 +57,24 @@ argv = sys.argv[1:]
 stdin = sys.stdin.read() if not sys.stdin.isatty() and (argv[:1] == ['run'] and '-i' in argv or argv[:2] == ['exec', '-i']) else ''
 locked(lambda state: state['log'].append({'argv': argv, 'stdin': stdin}))
 state = locked(lambda state: dict(state))
-def filters():
-    return dict(item.partition('=')[2].partition('=')[::2] for item in (argv[i + 1] for i, a in enumerate(argv) if a == '--filter'))
+def matches(ident, info):
+    for wanted in (argv[i + 1] for i, a in enumerate(argv) if a == '--filter'):
+        kind, _, value = wanted.partition('=')
+        if kind == 'network':
+            if value not in info['networks']:
+                return False
+        else:
+            key, _, expected = value.partition('=')
+            if info['labels'].get(key) != expected:
+                return False
+    return True
 def containers():
     return state['containers']
 command = argv[0]
 if command == 'ps':
-    wanted = filters()
     every = '-a' in argv or '-aq' in argv
     for ident, info in containers().items():
-        labels = info['labels']
-        if all(labels.get(key) == value for key, value in wanted.items()) and (every or info['running']):
+        if matches(ident, info) and (every or info['running']):
             print(ident)
 elif command == 'inspect':
     info = containers().get(argv[1])
@@ -79,7 +87,36 @@ elif command == 'inspect':
                        'NetworkSettings': {'Networks': {name: {'IPAddress': '10.9.0.2'} for name in info['networks']}}}]))
 elif command == 'network':
     print(json.dumps([{'Internal': state['networks'].get(argv[2], False)}]))
+elif command == 'exec' and argv[1] == '-i' and argv[-2:] == ['sh', '-s']:
+    def end(state):
+        alive = state.pop('executors', [])
+        for pid in alive:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        return alive
+    if locked(end):
+        print('found')
+elif command == 'exec' and argv[1] == '-i' and 'pg_terminate_backend' in stdin:
+    print(locked(lambda state: state.pop('backends', 0)))
 elif command == 'exec' and argv[1] == '-i':
+    changes = re.findall(PATTERN, stdin)
+    if 'ALTER' in stdin and state.get('alter') in ('late', 'orphan'):
+        # The exec outlives its client (`late`) or the client outlives the tool (`orphan`): it commits when the gate goes.
+        if state['alter'] == 'orphan':
+            os.kill(os.getppid(), signal.SIGKILL)
+        elif os.fork():
+            sys.exit(0)
+        else:
+            os.setsid()
+            for number in (0, 1, 2):
+                os.close(number)
+            locked(lambda state: state.setdefault('executors', []).append(os.getpid()))
+        while os.path.exists(state['gate']):
+            time.sleep(0.02)
+        locked(lambda state: state['roles'].update(changes))
+        sys.exit(0)
     if state.get('stop_tool_on') == 'alter' and 'ALTER' in stdin:
         os.kill(os.getppid(), signal.SIGTERM); os.kill(os.getppid(), signal.SIGHUP); time.sleep(0.2)
     while 'ALTER' in stdin and state.get('pause_alter') and os.path.exists(state['pause_alter']):
@@ -89,7 +126,6 @@ elif command == 'exec' and argv[1] == '-i':
         sys.exit(1)
     if mode == 'hang':
         time.sleep(60)
-    changes = re.findall(r'''+"\"\"\"ALTER ROLE \"(\\w+)\" PASSWORD '([^']+)';\"\"\""+r''', stdin)
     locked(lambda state: state['roles'].update(changes))
     if mode == 'commit_then_error':
         sys.exit(1)
@@ -123,6 +159,8 @@ elif command == 'create':
     print('e' * 64)
 elif command == 'kill':
     pass
+elif command == 'rm':
+    locked(lambda state: state['containers'].pop(argv[-1], None))
 else:
     sys.exit(125)
 '''
@@ -134,6 +172,11 @@ sys.path.insert(0, os.environ['ROTATE_TEST_SOURCE'])
 from messaging_service import backup_runner as real
 config = sys.argv[sys.argv.index('--config') + 1]
 cfg = json.load(open(config))
+if '--recover-stop' in sys.argv:
+    if not json.load(open(os.environ['ROTATE_TEST_STATE'])).get('worker_running'):
+        os.unlink(cfg['host_lock'] + '.unsettled')
+        sys.exit(0)
+    sys.exit(1)
 status = os.path.join(cfg['directory'], 'status.json')
 def done(state, id=None, code=None):
     with open(status, 'w') as file:
@@ -596,6 +639,86 @@ def test_a_lost_staged_value_is_replaced_by_a_fresh_one_never_by_the_old_one(hos
 
 
 # spec: ANYM-784
+@pytest.mark.parametrize('mode', ['late', 'orphan'])
+def test_an_alter_that_outlives_its_caller_cannot_commit_after_the_recovery(host, mode):
+    """Astra r1 M1: its staged value is lost, so the recovery makes a fresh one; the old executor must not overwrite it."""
+    gate = host.tmp / 'gate'
+    gate.write_text('')
+    host.change(alter=mode, gate=str(gate))
+    code = host.tool('apply', 'owner')[0]
+    assert code == (1 if mode == 'late' else -signal.SIGKILL)
+    host.change(alter=None, backends=1)
+    (host.journal_dir / 'staged' / json.loads(host.journal.read_text())['id'] / 'new.json').unlink()
+    host.ok('recover')
+    value = host.assert_owner_rotated()
+    gate.unlink()  # what was left of the first ALTER would commit now
+    time.sleep(0.5)
+    assert host.assert_owner_rotated() == value
+    assert 'backends' not in host.state() and 'executors' not in host.state()
+    host.ok('verify')
+    host.ok('finish')
+
+
+# spec: ANYM-784
+def test_every_alter_carries_the_rotation_name_and_server_side_deadlines(host):
+    host.ok('apply', 'owner')
+    entry = next(entry for entry in host.state()['log'] if 'ALTER ROLE' in entry['stdin'])
+    rotation_id = json.loads(host.journal.read_text())['id']
+    assert entry['argv'][2:4] == ['-e', 'PGAPPNAME=' + rotate.EXECUTOR + rotation_id]
+    for setting in ('lock_timeout', 'statement_timeout', 'idle_in_transaction_session_timeout'):
+        assert f'SET LOCAL {setting} = ' in entry['stdin']
+    assert len(rotate.EXECUTOR + rotation_id) < 64  # PostgreSQL's limit for a name
+
+
+# spec: ANYM-784
+def test_a_helper_container_left_in_any_state_blocks_nothing(host):
+    """Astra r1 M2: a client that died between create and start: `docker kill` cannot remove such a container."""
+    host.ok('apply', 'owner')
+    state = host.state()
+    stranded, foreign = '7' * 64, '6' * 64
+    state['containers'][stranded] = {'running': False, 'image': IMAGE, 'networks': ['deedkit-calendar_calendar-backend'],
+                                     'labels': {rotate.HELPER_LABEL: DB}}
+    state['containers'][foreign] = {'running': False, 'image': IMAGE, 'networks': [], 'labels': {rotate.HELPER_LABEL: 'another-database'}}
+    host.state_path.write_text(json.dumps(state))
+    host.ok('verify', '--no-backup')
+    assert host.calls_of('rm') == [['rm', '--force', stranded]] and foreign in host.state()['containers']
+    host.ok('verify')
+    names = [argv[argv.index('--name') + 1] for argv in host.calls_of('run') if '--name' in argv]
+    assert len(names) == len(set(names))
+    checks = [argv for argv in host.calls_of('run') if argv[-2:] == ['db-roles', '--check']]
+    assert len(checks) == 2 and all(f'{rotate.HELPER_LABEL}={DB}' in argv for argv in checks)
+    host.ok('finish')
+
+
+# spec: ANYM-784
+def test_a_recovery_waits_for_a_backup_worker_left_by_a_dead_runner(host):
+    """Astra r1 M3: its flocks are free, its `.unsettled` is not, and it holds the owner credentials."""
+    host.tool('apply', 'owner', kill_at='altered')
+    unsettled = host.messaging / '.runner.lock.unsettled'
+    unsettled.write_text('{}')
+    host.change(worker_running=True)
+    before = {name: path.read_bytes() for name, path in host.files.items()}
+    code, line, _ = host.tool('recover')
+    assert code == 75 and line['code'] == 'backup_unsettled' and line['next'] == 'recover'
+    assert {name: path.read_bytes() for name, path in host.files.items()} == before and not host.calls_of('stop')
+    # The runner's own recovery runs first and settles it as soon as the worker is gone.
+    host.change(worker_running=False)
+    assert host.ok('recover')['status'] == 'verifying' and not unsettled.exists()
+    host.ok('verify')
+    host.ok('finish')
+    host.assert_owner_rotated()
+
+
+# spec: ANYM-784
+def test_a_retained_upload_does_not_stop_a_recovery(host):
+    """A journal without `.unsettled` holds an encrypted bundle and no credential."""
+    host.tool('apply', 'owner', kill_at='altered')
+    (host.backup / 'backups' / 'journal.json').write_text('{}')
+    assert host.ok('recover')['status'] == 'verifying'
+    host.assert_owner_rotated()
+
+
+# spec: ANYM-784
 def test_no_value_reaches_an_argument_a_log_or_the_output(host):
     host.tool('apply', 'owner', kill_at='files')
     host.ok('recover')
@@ -858,6 +981,27 @@ def test_the_retired_list_grows_and_never_shrinks(host):
 
 
 # spec: ANYM-784
+@pytest.mark.parametrize('present, kept', [('aaaaaaaaaaaa\n012345', ['aaaaaaaaaaaa']), ('012345', []),
+                                           ('aaaaaaaaaaaa\nbbbbbbbbbbbb', ['aaaaaaaaaaaa', 'bbbbbbbbbbbb'])])
+def test_a_torn_line_in_the_retired_list_leaves_every_whole_entry_and_the_new_one(host, present, kept):
+    """Astra r1 M6: an append after a torn line used to glue the two into one malformed line."""
+    host.retired.write_text(present)
+    host.ok('apply', 'owner')
+    assert host.retired.read_text() == ''.join(entry + '\n' for entry in [*kept, rotate.fingerprint(OLD['fcs_owner'])])
+
+
+# spec: ANYM-784
+def test_a_kill_while_the_retired_list_is_written_leaves_it_whole_and_recover_completes_it(host):
+    host.retired.write_text('aaaaaaaaaaaa\n')
+    code = host.tool('apply', 'owner', write_fails_after='settled', write_failure='kill')[0]
+    assert code == -signal.SIGKILL
+    assert host.retired.read_text() == 'aaaaaaaaaaaa\n' and list(host.backup.glob('.retired-passwords.*.tmp'))
+    host.ok('recover')
+    assert host.retired.read_text().split() == ['aaaaaaaaaaaa', rotate.fingerprint(OLD['fcs_owner'])]
+    assert not list(host.backup.glob('.retired-passwords.*.tmp'))
+
+
+# spec: ANYM-784
 def test_a_retired_list_that_cannot_be_written_refuses_before_the_alter(host):
     host.retired.symlink_to(host.tmp / 'elsewhere')
     code, line, _ = host.tool('apply', 'owner')
@@ -947,6 +1091,7 @@ def test_an_isolated_rotation_also_recovers_from_a_kill(host, scratch):
 @pytest.mark.parametrize('change, code', [
     ('api', 'isolated_project_has_services'), ('worker', 'isolated_project_has_services'),
     ('network', 'isolated_network_not_internal'), ('no_network', 'isolated_network_not_internal'),
+    ('neighbour', 'isolated_network_shared'), ('stopped_neighbour', 'isolated_network_shared'),
     ('production_project', 'isolated_target_is_production'),
     ('production_state', 'isolated_profile_is_production'), ('under_production', 'isolated_profile_is_production')])
 def test_an_isolated_rotation_refuses_a_target_that_is_not_isolated(host, scratch, change, code):
@@ -959,6 +1104,9 @@ def test_an_isolated_rotation_refuses_a_target_that_is_not_isolated(host, scratc
         state['networks']['scratch_backend'] = False
     elif change == 'no_network':
         state['containers'][DB]['networks'] = []
+    elif change in ('neighbour', 'stopped_neighbour'):  # Astra r1 M4: another project on the same internal network
+        state['containers'][API] = {'running': change == 'neighbour', 'image': IMAGE, 'networks': ['scratch_backend'], 'labels': {
+            'com.docker.compose.project': 'deedkit-calendar', 'com.docker.compose.service': 'calendar-api'}}
     elif change == 'production_project':
         labels['com.docker.compose.project'] = 'deedkit-calendar'
     host.state_path.write_text(json.dumps(state))
@@ -972,6 +1120,44 @@ def test_an_isolated_rotation_refuses_a_target_that_is_not_isolated(host, scratc
     assert found == 1 and line['code'] == code
     assert not (scratch.profile.parent / 'service.rotation' / 'rotation.unsettled').exists()
     assert all('ALTER' not in entry['stdin'] for entry in host.state()['log'])
+
+
+# spec: ANYM-784
+def test_an_isolated_rotation_accepts_its_own_helper_on_the_network(host, scratch):
+    state = host.state()
+    state['containers']['7' * 64] = {'running': False, 'image': IMAGE, 'networks': ['scratch_backend'], 'labels': {rotate.HELPER_LABEL: DB}}
+    host.state_path.write_text(json.dumps(state))
+    assert scratch.ok('apply', 'owner')['status'] == 'verifying'
+
+
+# spec: ANYM-784
+def test_an_isolated_retired_list_in_production_is_refused_before_anything_is_created(host, scratch):
+    """Astra r1 M5, also through a symbolic link."""
+    link = host.tmp / 'scratch-list'
+    link.symlink_to(host.retired)
+    for listed in (host.retired, link):
+        code, line, _ = scratch.run(('apply', 'owner'), '--retired-list', str(listed))
+        assert code == 1 and line['code'] == 'isolated_retired_list_is_production'
+    assert not host.retired.exists() and not (host.tmp / 'scratch' / 'service.rotation').exists()
+
+
+# spec: ANYM-784
+def test_an_isolated_profile_reached_through_a_production_link_keeps_its_journal_out_of_production(host, scratch):
+    """Astra r1 M5: the check read the resolved path and the journal used the spelling."""
+    link = host.backup / 'scratch-link'
+    link.symlink_to(scratch.profile)
+    args = ('--mode', 'isolated', '--container', DB, '--profile-dir', str(link))
+    code, line, output = host.tool('apply', 'owner', *args)
+    assert code == 0, output
+    assert not (host.backup / 'scratch-link.rotation').exists()
+    assert (host.tmp / 'scratch' / 'service.rotation' / 'rotation.unsettled').exists()
+
+
+# spec: ANYM-784
+def test_a_refused_production_profile_creates_no_journal_directory(host, scratch):
+    code, line, _ = host.tool('apply', 'owner', '--mode', 'isolated', '--container', DB, '--profile-dir', str(host.service))
+    assert code == 1 and line['code'] == 'isolated_profile_is_production'
+    assert not Path(f'{host.service}.rotation').exists()
 
 
 # spec: ANYM-784

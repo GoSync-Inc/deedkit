@@ -49,11 +49,15 @@ OWNER = "fcs_owner"
 PHASES = ("staged", "altered", "files", "verifying", "finished")
 MARKER = "rotation.unsettled"
 TOKEN_ENV = "DEEDKIT_ROTATION_BACKUP_TOKEN"  # backup_runner.py: the tool's own backup in phase `verifying`
+HELPER_LABEL = "io.deedkit.calendar-rotate-helper"  # a throwaway container; its value is the database container
+EXECUTOR = "deedkit-calendar-rotate-"  # + the rotation id: every ALTER's client, psql process and backend carry it
+FINGERPRINT = re.compile(rb"[0-9a-f]{12}")
 ITERATIONS = 4096  # PostgreSQL's default scram_iterations
 
 SIGNALS = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGQUIT, signal.SIGTSTP)
 DOCKER_TIMEOUT, ALTER_TIMEOUT, PROBE_TIMEOUT, STOP_TIMEOUT = 60, 60, 30, 120
 HEALTH_WAIT, HEALTH_POLL = 120, 2
+EXECUTOR_TRIES, EXECUTOR_POLL = 10, 1
 BACKUP_TIMEOUT, BACKUP_STOP = 6300, 180  # the calendar backup unit's TimeoutStartSec and TimeoutStopSec
 
 # Runs in a throwaway container of the database's own image, on its network: never the loopback address, whose
@@ -141,6 +145,15 @@ def scram_verifier(password, *, salt=None, iterations=ITERATIONS):
     return f"SCRAM-SHA-256${iterations}:{b64(salt)}${b64(hashlib.sha256(client_key).digest())}:{b64(server_key)}"
 
 
+def under_production(real):
+    """`real` (resolved) is a production root, lies in one or holds one."""
+    for root in PRODUCTION_ROOTS:
+        root = Path(os.path.realpath(root))
+        if real == root or root in real.parents or real in root.parents:
+            return True
+    return False
+
+
 # Durable files -----------------------------------------------------------------------------------------------------
 
 
@@ -201,13 +214,14 @@ def durable_write(path, data, *, mode=0o600, uid=None, gid=None, check=None):
         raise Refused("read_back_failed", file=path.name)
 
 
-def sweep_staged(directories):
-    """What a killed writer left beside the profile files: never a file of the running configuration."""
-    for directory in directories:
+def sweep_staged(paths):
+    """What a killed writer left beside `paths`: only durable_write's names of exactly these files."""
+    for path in paths:
+        path = Path(path)
         with suppress(FileNotFoundError):
-            for entry in os.listdir(directory):
-                if entry.startswith(".") and entry.endswith(".tmp"):
-                    os.unlink(Path(directory) / entry)
+            for entry in os.listdir(path.parent):
+                if re.fullmatch(re.escape(f".{path.name}.") + r"[0-9a-f]{8}\.tmp", entry):
+                    os.unlink(path.parent / entry)
 
 
 # Profile files: the password is the only thing that changes -----------------------------------------------------------
@@ -341,9 +355,20 @@ class Target:
         dsn = self.profile_dir / "owner.dsn"
         return dsn if os.path.lexists(dsn) else None
 
-    def sql(self, statements, timeout=DOCKER_TIMEOUT):
+    def remove_helpers(self):
+        """A throwaway container of an earlier run, in whatever state it was left: a client that died between its
+        create and start leaves one that nothing else would remove."""
+        code, output = docker("ps", "-aq", "--no-trunc", "--filter", f"label={HELPER_LABEL}={self.container}")
+        if code != 0:
+            raise Refused("docker_unreadable")
+        for container in output.split():
+            if docker("rm", "--force", container)[0] != 0:
+                raise Refused("helper_not_removed")
+
+    def sql(self, statements, timeout=DOCKER_TIMEOUT, application=None):
         """Over the container's local socket as the owner: the path that needs no password, so operators keep one."""
-        return docker("exec", "-i", self.container, "psql", "-X", "-q", "-A", "-t", "-w", "-v", "ON_ERROR_STOP=1",
+        return docker("exec", "-i", *(("-e", "PGAPPNAME=" + application) if application else ()), self.container,
+                      "psql", "-X", "-q", "-A", "-t", "-w", "-v", "ON_ERROR_STOP=1",
                       "-U", OWNER, "-d", self.database, "-f", "-", stdin=statements, timeout=timeout)
 
     def probe(self, role, value):
@@ -354,7 +379,7 @@ class Target:
                     "require_auth=scram-sha-256 connect_timeout=5")
         escaped = value.replace("\\", "\\\\").replace(":", "\\:")
         code, output = docker(
-            "run", "--rm", "-i", "--name", name, "--label", "io.deedkit.calendar-rotate-probe=" + token,
+            "run", "--rm", "-i", "--name", name, "--label", f"{HELPER_LABEL}={self.container}",
             "--pull", "never", "--network", self.network, "--log-driver", "none", "--read-only", "--user", "postgres",
             "--tmpfs", "/tmp:rw,size=1m,mode=1777", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "--memory", "64m", "--pids-limit", "16", "--entrypoint", "sh", self.image, "-c", PROBE_SCRIPT, "sh", conninfo,
@@ -369,6 +394,12 @@ class Target:
 
     def preflight(self):
         """Nothing else stands in the way of a new rotation; asked with the locks held."""
+
+    def reconcile_backup(self):
+        """No backup worker can hold the credentials this recovery changes."""
+
+    def require_worker_stopped(self):
+        """Asked with the locks held, after reconcile_backup."""
 
     def identities(self):
         return {}
@@ -454,6 +485,22 @@ class Production(Target):
         if os.path.lexists(f"{self.host_lock}.unsettled") or os.path.lexists(self.runner_journal):
             raise Held("backup_unsettled")
 
+    def reconcile_backup(self):
+        """A runner that died leaves its worker and `.unsettled` behind and its flocks free. The runner's own
+        `--recover-stop` settles them (the marker does not stop it); it cannot run under this tool's locks."""
+        if not os.path.lexists(f"{self.host_lock}.unsettled"):
+            return
+        with suppress(subprocess.TimeoutExpired):
+            subprocess.run([RUNNER_PYTHON, "-I", str(RUNNER_PROGRAM), "--config", str(RUNNER_CONFIG), "--recover-stop"],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=BACKUP_STOP, start_new_session=True, check=False)
+
+    def require_worker_stopped(self):
+        """A worker that may still run holds the owner credentials: no recovery while `.unsettled` exists. A retained
+        upload (a journal, no marker) holds no credential and the tool's own backup finishes it."""
+        if os.path.lexists(f"{self.host_lock}.unsettled"):
+            raise Held("backup_unsettled", next="recover")
+
     @contextmanager
     def instant(self):
         """The runner's lock, messaging's lock and the deploy locks, each without waiting: held while this writes."""
@@ -502,8 +549,10 @@ class Production(Target):
             api = containers["calendar-api"]
             checks["health"] = self.healthy(api["Id"])
             tool = production_tool()
-            code, answer = tool.calendar_run(f"deedkit-calendar-rotate-check-{journal['id'][-8:]}", api["Image"], self.network,
-                                             str(self.profile_dir / "runtime.json"), ["db-roles", "--check"])
+            # A name of its own each time: a stranded earlier one conflicts with nothing.
+            code, answer = tool.calendar_run(f"deedkit-calendar-rotate-check-{uuid.uuid4().hex[:12]}", api["Image"], self.network,
+                                             str(self.profile_dir / "runtime.json"), ["db-roles", "--check"],
+                                             label=f"{HELPER_LABEL}={self.container}")
             checks["db_roles"] = code == 0 and isinstance(answer, dict) and answer.get("db_roles_check") == "ok"
         except Refused as exc:
             checks[exc.code] = False
@@ -544,16 +593,17 @@ class Isolated(Target):
     """A restore's scratch database: no production path, no service, no production admission."""
 
     def __init__(self, container, profile_dir, retired):
-        # Asked before anything is created: the journal's directory lies beside the profile.
+        # Asked before anything is created, on resolved paths: every output lies beside these two.
         real = Path(os.path.realpath(profile_dir))
         if not real.is_dir():
             raise Refused("isolated_profile_missing")
-        for root in PRODUCTION_ROOTS:
-            root = Path(os.path.realpath(root))
-            if real == root or root in real.parents or real in root.parents:
-                raise Refused("isolated_profile_is_production")
-        super().__init__(str(profile_dir).rstrip("/") + ".rotation", profile_dir)
-        self.retired = Path(retired) if retired else None
+        if under_production(real):
+            raise Refused("isolated_profile_is_production")
+        listed = Path(os.path.realpath(retired)) if retired else None
+        if listed and under_production(listed):
+            raise Refused("isolated_retired_list_is_production")
+        super().__init__(str(real) + ".rotation", real)
+        self.retired = listed
         self.requested = container
 
     def connect(self):
@@ -566,6 +616,15 @@ class Isolated(Target):
         networks = info.get("NetworkSettings", {}).get("Networks") or {}
         if not networks or not all(self.internal(name) for name in networks):
             raise Refused("isolated_network_not_internal")
+        # Internal keeps the internet out, not a neighbour: any other container on its network could reach it, whatever
+        # project it is in or whether it runs now. Own helpers are the tool's.
+        for name in networks:
+            code, members = docker("ps", "-aq", "--no-trunc", "--filter", "network=" + name)
+            code2, helpers = docker("ps", "-aq", "--no-trunc", "--filter", f"label={HELPER_LABEL}={info['Id']}")
+            if code != 0 or code2 != 0:
+                raise Refused("docker_unreadable")
+            if set(members.split()) - set(helpers.split()) - {info["Id"]}:
+                raise Refused("isolated_network_shared")
         return self.attach(self.requested)
 
 
@@ -649,13 +708,45 @@ class Rotation:
         durable_write(self.staged_dir() / "new.json", (json.dumps(values) + "\n").encode())
         self.journal["new"] = {role: fingerprint(value) for role, value in values.items()}
 
+    def executor(self):
+        return EXECUTOR + self.journal["id"]
+
+    def settle_executors(self):
+        """No earlier ALTER of this rotation can still commit, before anything is sent again or a fresh value is made:
+        Docker runs an exec independently of its client, so a killed tool can leave a client, a psql or a backend that
+        would apply a staged value late. Each is found by the rotation's name and ended; none left, or a refusal."""
+        name = self.executor()
+        found = subprocess.run(["pgrep", "-f", name], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                               timeout=DOCKER_TIMEOUT, check=False)
+        if found.returncode not in (0, 1):
+            raise Refused("alter_executor_unsettled")
+        for pid in found.stdout.split():
+            if int(pid) != os.getpid():
+                with suppress(ProcessLookupError):
+                    os.kill(int(pid), signal.SIGKILL)
+        # The name is in each psql's environment, so this script's own arguments and environment do not hold it.
+        script = (f"name={name}\nfor dir in /proc/[0-9]*; do\n"
+                  "  if grep -qas \"PGAPPNAME=$name\" \"$dir/environ\"; then kill -9 \"${dir#/proc/}\" 2>/dev/null; echo found; fi\n"
+                  "done\n")
+        query = f"SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE application_name = '{name}';\n"
+        for _ in range(EXECUTOR_TRIES):
+            code, processes = docker("exec", "-i", self.target.container, "sh", "-s", stdin=script)
+            answer, backends = self.target.sql(query)
+            if code == 0 and answer == 0 and not processes.strip() and backends.strip() == "0":
+                return
+            time.sleep(EXECUTOR_POLL)
+        raise Refused("alter_executor_unsettled")
+
     def send_alter(self, values):
-        """One transaction per set, with the verifier computed here. The exit status proves nothing: see settle."""
-        statements = ["BEGIN;", "SET LOCAL log_statement = 'none';", "SET LOCAL log_min_error_statement = 'panic';"]
+        """One transaction per set, with the verifier computed here and deadlines the server enforces. The exit status
+        proves nothing: see settle."""
+        statements = ["BEGIN;", "SET LOCAL log_statement = 'none';", "SET LOCAL log_min_error_statement = 'panic';",
+                      "SET LOCAL lock_timeout = '10s';", "SET LOCAL statement_timeout = '30s';",
+                      "SET LOCAL idle_in_transaction_session_timeout = '30s';"]
         for role, value in values.items():
             statements.append(f"ALTER ROLE \"{role}\" PASSWORD '{scram_verifier(value)}';")
         statements.append("COMMIT;")
-        self.target.sql("\n".join(statements) + "\n", timeout=ALTER_TIMEOUT)
+        self.target.sql("\n".join(statements) + "\n", timeout=ALTER_TIMEOUT, application=self.executor())
 
     def settle(self, values, *, resend):
         """Which password the database accepts decides, on fresh connections. `resend` (recover) sends the staged value
@@ -670,23 +761,23 @@ class Rotation:
             raise Refused("database_unsettled")
 
     def retire(self):
-        """Durable before any file changes; entries are never removed. A repeat adds nothing."""
+        """Durable before any file changes; entries are never removed. A repeat adds nothing. One rename replaces the
+        list, so a kill leaves it whole; an unfinished line an older writer left is not an entry and goes."""
         path = self.target.retired
         old = self.journal["old"].get(OWNER)
         if path is None or old is None:
             return
-        descriptor = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        try:
-            os.fchmod(descriptor, 0o600)
-            present = b""
-            while chunk := os.read(descriptor, 65536):
-                present += chunk
-            if old.encode() not in present.split():
-                write_all(descriptor, old.encode() + b"\n")
-                os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        fsync_directory(path.parent)
+        present = read_private(path) if os.path.lexists(path) else b""
+        lines = present.split(b"\n")
+        tail = lines.pop()
+        entries = [line for line in lines if line] + ([tail] if FINGERPRINT.fullmatch(tail) else [])
+        if old.encode() not in entries:
+            entries.append(old.encode())
+        wanted = b"".join(entry + b"\n" for entry in entries)
+        if wanted != present:
+            durable_write(path, wanted)
+        else:
+            os.chmod(path, 0o600)
 
     def rewrite_files(self, values):
         """Each file from what it holds now (lossless), same owner and mode. Already right: not written again."""
@@ -788,6 +879,7 @@ def apply(target, which):
     with tool_lock(target):
         rotation = Rotation(target)
         target.connect()
+        target.remove_helpers()
         target.gate_calls()
         check_retired_list(target)
         with target.instant():
@@ -870,6 +962,8 @@ def recover(target):
             journal["phase"] == "staged" and not journal.get("alter_sent"))
         if not unsent:
             target.connect()
+            target.remove_helpers()
+            target.reconcile_backup()
         target.gate_calls()
         with target.instant():
             if journal is None or journal["phase"] == "aborted":
@@ -888,8 +982,9 @@ def recover(target):
             if journal["phase"] == "staged" and not journal.get("alter_sent"):
                 abort(rotation, target)
                 return
-            directories = {str(Path(entry["path"]).parent) for entry in journal["files"]}
-            sweep_staged(directories)
+            target.require_worker_stopped()
+            sweep_staged([entry["path"] for entry in journal["files"]] + ([target.retired] if target.retired else []))
+            rotation.settle_executors()
             values = rotation.new_values()
             if values is None:
                 values = {role: secrets.token_urlsafe(40) for role in SETS[journal["set"]]}
@@ -921,6 +1016,7 @@ def verify(target, backup):
         rotation = Rotation(target)
         journal = rotation.journal = active_journal(target)
         target.connect()
+        target.remove_helpers()
         values, old = rotation.new_values(), rotation.old_values()
         if values is None:
             raise Refused("staged_value_lost", next="recover")
