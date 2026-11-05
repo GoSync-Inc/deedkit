@@ -304,6 +304,9 @@ class ArchiveRuntime:
         try:
             async with asyncio.timeout(60):
                 value, _ = await self.provider.get(token, recording_id, {'include_transcript':'true'})
+                # The read is stamped with when it returned, not when the pass began: a stage or the 24-hour boundary the
+                # pass crossed meanwhile counts, so a stage is never read a second time.
+                now = self.clock(now)
                 projected = metadata(value)
                 if projected['id'] != recording_id:
                     raise Failure('invalid_provider_response')

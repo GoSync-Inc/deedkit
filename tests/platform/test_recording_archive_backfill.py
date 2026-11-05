@@ -754,8 +754,9 @@ def test_thirty_records_gone_at_omi_use_no_transcript_reads_while_five_new_ones_
         back = sorted(gone)[:3]  # listed again (an unlocked conversation): due now, read in full
         omi.gone.difference_update(back); omi.unlisted.difference_update(back)
         before = len(omi.details)
-        await passes(r, omi, omi.now + 86400, 60, 3)
-        assert sorted(omi.details[before:]) == [(ident, 'true') for ident in back]
+        await passes(r, omi, omi.now + 86400, 60, 6)  # the five new records' overdue stage reads (ANYM-759) go first
+        assert sorted(d for d in omi.details[before:] if not d[0].startswith('new-')) == [(ident, 'true') for ident in back]
+        assert sorted(d[0] for d in omi.details[before:] if d[0].startswith('new-')) == [f'new-{n}' for n in range(5)]
         assert (await r.status(account, now=omi.now))['provider_missing'] == 27
         await r.close()
     asyncio.run(run())
@@ -943,10 +944,31 @@ def test_a_changed_list_row_read_after_a_stage_time_counts_as_that_stage(tmp_pat
     item = omi.add('rec', T0)
     async def run():
         r = runtime(path, omi); await r.start(background=False)
-        await passes(r, omi, T0, 900, 19)
+        await passes(r, omi, T0, 900, 1)
+        item['structured']['overview'] = 'Changed while the collector was away'
+        await passes(r, omi, T0 + 7 * HOUR, 900, 180)  # the one read at 7 h is the 6 h stage as well; only 48 h is left
+        assert [c[0] for c in omi.of('tokenaaaa', 'detail')] == [T0, T0 + 7 * HOUR, T0 + 48 * HOUR]
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-759
+def test_a_stage_the_pass_crossed_before_its_read_returned_is_not_read_twice(tmp_path, monkeypatch):
+    path, doc = build(tmp_path); omi = Omi()
+    omi.add('rec', T0)
+    clock = [0.0]
+    monkeypatch.setattr('deedkit_recordings.archive.monotonic', lambda: clock[0])
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        await passes(r, omi, T0, 60, 1)
+        omi.on_list = lambda: clock.__setitem__(0, clock[0] + 30)  # the pass began 10 s before the stage; its list took 30 s
+        item = omi.items[0]
         item['structured']['overview'] = 'Changed just before the stage'
-        await passes(r, omi, T0 + 19 * 900, 900, 200)  # a row changed at 4.75 h is read then; 6 h still follows, once
-        assert [c[0] for c in omi.of('tokenaaaa', 'detail')] == [T0, T0 + 19 * 900, T0 + 6 * HOUR, T0 + 48 * HOUR]
+        await passes(r, omi, T0 + 6 * HOUR - 10, 60, 1)
+        omi.on_list = None
+        assert sql(doc, 'SELECT due FROM records') == [(T0 + 48 * HOUR,)]
+        await passes(r, omi, T0 + 6 * HOUR + 50, 60, 3)
+        assert len(omi.of('tokenaaaa', 'detail')) == 2
         await r.close()
     asyncio.run(run())
 
