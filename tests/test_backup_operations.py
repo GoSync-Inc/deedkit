@@ -7,11 +7,14 @@ import json
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
+from hypothesis import given,strategies as st
 import pytest
 
+from messaging_service import backup_runner as backup_runner_module
 from messaging_service.backup_receiver import receive,locked,prune,AGE_HEADER
-from messaging_service.backup_runner import ID,Runner,write_json,read_json,upload
+from messaging_service.backup_runner import DOCKER_DETAILS,Docker,DockerFailure,ID,Runner,docker_detail,source_absent,write_json,read_json,upload
 from messaging_service.backup_worker import dump_credentials
 
 NAME='20261013T000000Z-0123456789abcdef'
@@ -222,6 +225,87 @@ def test_runner_capture_failure_resume_and_remove_only_owned_staging(tmp_path):
     runner.recover_stop()
     assert docker.containers['tg-id']['State']['Running'] and not docker.containers['wa-id']['State']['Running']
     assert not (tmp_path/'journal.json').exists() and not any(p.name=='snapshot' for p in tmp_path.rglob('*'))
+
+
+def missing_source_runner(tmp_path):
+    runner,docker=runner_fixture(tmp_path);(tmp_path/'dsn').write_text('synthetic');(tmp_path/'recipient').write_text('synthetic')
+    (tmp_path/'kept').mkdir()
+    runner.cfg.update(dsn_file=str(tmp_path/'dsn'),recipient_file=str(tmp_path/'recipient'),
+        mounts=[{'name':'kept','source':str(tmp_path/'kept')},{'name':'retention-gone','source':str(tmp_path/'gone'/'settings')}])
+    runner.absent=source_absent
+    return runner,docker
+
+
+# spec: ANYM-126
+def test_a_missing_bind_source_refuses_by_mount_name_before_any_collector_stops(tmp_path):
+    runner,docker=missing_source_runner(tmp_path)
+    with pytest.raises(RuntimeError,match='^backup_source_missing$'):runner.run()
+    assert docker.calls==[] and not (tmp_path/'journal.json').exists()
+    status=read_json(tmp_path/'status.json')
+    assert status['error_code']=='backup_source_missing' and status['error_mounts']==['retention-gone']
+    assert str(tmp_path) not in json.dumps(status)
+    (tmp_path/'gone').mkdir();(tmp_path/'gone'/'settings').mkdir()
+    runner.run();status=read_json(tmp_path/'status.json')
+    assert status['state']=='ok' and 'error_code' not in status and 'error_mounts' not in status
+
+
+# spec: ANYM-126
+def test_a_missing_source_does_not_hold_a_job_past_its_capture(tmp_path):
+    attempts=[]
+    async def send(path,result,*_):
+        attempts.append(result['id'])
+        if len(attempts)==1:raise RuntimeError('receiver_quota')
+        return {**result,'status':'stored','duplicate':True}
+    runner,docker=runner_fixture(tmp_path,send)
+    with pytest.raises(RuntimeError,match='quota'):runner.run()
+    runner.recover_stop()
+    assert read_json(tmp_path/'journal.json')['phase']=='upload'
+    runner.absent=lambda _:True  # the source went while the bundle waited for its delivery
+    runner.run();assert read_json(tmp_path/'status.json')['state']=='ok'
+
+
+# spec: ANYM-126
+def test_a_real_runner_checks_real_sources_and_an_old_configuration_needs_no_new_field(tmp_path):
+    cfg=runner_fixture(tmp_path)[0].cfg
+    assert 'mounts' in cfg and Runner(cfg).absent is source_absent
+    assert source_absent(tmp_path/'none') and source_absent(tmp_path/'none'/'x') and not source_absent(tmp_path)
+
+
+# spec: ANYM-126
+def test_a_docker_failure_records_what_failed_without_any_value(tmp_path,monkeypatch):
+    stderr=(b'Error response from daemon: invalid mount config for type "bind": bind source path does not exist: '
+            b'/opt/private/owner.dsn postgres://user:hunter2@db/x sha256:abc')
+    monkeypatch.setattr(backup_runner_module.subprocess,'run',lambda *a,**k:SimpleNamespace(returncode=1,stdout=b'',stderr=stderr))
+    with pytest.raises(DockerFailure,match='^docker_operation_failed$') as failure:Docker.call('create')
+    assert failure.value.detail=='bind_source_missing'
+    monkeypatch.undo()
+    runner,docker=runner_fixture(tmp_path)
+    real=docker.call
+    def failing(*args,**kw):
+        if args[0]=='create':raise failure.value
+        return real(*args,**kw)
+    docker.call=failing
+    with pytest.raises(RuntimeError):runner.run()
+    status=read_json(tmp_path/'status.json')
+    assert status['error_code']=='docker_operation_failed' and status['error_detail']==failure.value.detail
+    assert b'hunter2' not in (tmp_path/'status.json').read_bytes() and b'/opt/private' not in (tmp_path/'status.json').read_bytes()
+
+
+# spec: ANYM-126
+@given(st.binary(max_size=6000))
+def test_a_docker_detail_is_only_ever_a_fixed_category(stderr):
+    assert docker_detail(stderr) in {detail for _,detail in DOCKER_DETAILS}|{'other'}
+
+
+# spec: ANYM-126
+@pytest.mark.parametrize('stderr,detail',[
+    (b'Error: No such container: "login"','container_missing'),
+    (b'Error response from daemon: Conflict. The container name "/private-name" is already in use by container "abc"','name_conflict'),
+    (b' '*4091+b'login-private-suffix','other'),
+    (b'postgres://user:hunter2@db/x','other'),
+],ids=['allowlisted_word_as_a_name','name_conflict','token_across_the_input_bound','a_value_alone'])
+def test_no_word_of_a_docker_stderr_reaches_the_detail(stderr,detail):
+    assert docker_detail(stderr)==detail
 
 
 def test_runner_interrupted_capture_removes_abandoned_ciphertext_but_never_delivered_jobs(tmp_path):

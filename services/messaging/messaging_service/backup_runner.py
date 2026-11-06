@@ -28,7 +28,7 @@ SERVICES={'telegram','whatsapp1','whatsapp2'}
 COLLECTOR_LABEL='org.messaging-archive.collector'
 SAFE_ERRORS={'backup_capture_failed','backup_capture_timeout','backup_container_disappeared','backup_container_mismatch',
     'backup_delivery_failed','invalid_backup_receipt','local_backup_corrupt','receiver_quota','receiver_disk_reserve',
-    'receiver_busy','backup_id_conflict','docker_inspection_failed','docker_operation_failed',
+    'receiver_busy','backup_id_conflict','docker_inspection_failed','docker_operation_failed','backup_source_missing',
     'backup_fence_release_failed','backup_capture_unfenced','backup_fence_retained',
     'collector_missing_during_resume','collector_identity_changed','collector_missing_during_stop','host_lock_busy',
     'recordings_snapshot_absent','recordings_snapshot_empty','recordings_snapshot_unsafe','recordings_snapshot_corrupt',
@@ -493,11 +493,58 @@ def dump_timeout(cfg):
     return cfg.get('dump_timeout_seconds',min(1800,cfg['timeout_seconds']))
 
 
+# What a failed Docker command's stderr says, as a fixed category. Only the category leaves this process, never a word of
+# stderr: a name or path can be any word, so no filter of the text itself could tell it from Docker's message (Astra r1).
+DOCKER_DETAILS=(('bind source path does not exist','bind_source_missing'),('no such image','image_missing'),
+    ('unable to find image','image_missing'),('no such container','container_missing'),('no such network','network_missing'),
+    ('no such volume','volume_missing'),('is already in use','name_conflict'),('no space left','no_space'),
+    ('read-only file system','read_only_filesystem'),('permission denied','permission_denied'),
+    ('cannot connect to the docker daemon','daemon_unreachable'),('deadline exceeded','daemon_timeout'))
+DETAIL_INPUT=4096
+
+
+def docker_detail(stderr):
+    """The category of Docker's stderr; `other` when no known message is in it."""
+    text=stderr[:DETAIL_INPUT].decode(errors='replace').lower()
+    return next((detail for message,detail in DOCKER_DETAILS if message in text),'other')
+
+
+class DockerFailure(RuntimeError):
+    """The fixed `docker_operation_failed`, with the docker_detail category of its stderr beside it."""
+    def __init__(self,stderr):
+        super().__init__('docker_operation_failed');self.detail=docker_detail(stderr)
+
+
+class SourceMissing(RuntimeError):
+    """`backup_source_missing`; `mounts` are configured mount names, never their paths."""
+    def __init__(self,mounts):
+        super().__init__('backup_source_missing');self.mounts=mounts
+
+
+def bind_sources(cfg):
+    """(mount name, host path) of every bind source a worker needs that the runner does not make itself."""
+    sources=[('recipient',cfg['recipient_file'])]
+    if 'dsn_file' in cfg:sources.append(('database_url',cfg['dsn_file']))
+    sources+=[(mount['name'],mount['source']) for mount in cfg.get('mounts',[])]
+    sources+=sorted(cfg.get('state_mounts',{}).items())
+    if cfg.get('profile')=='calls':sources.append(('data',cfg['calls']['data_mount']))
+    return sources
+
+
+def source_absent(path):
+    """Authoritative absence only, as `docker create` would meet it; any other doubt is left for Docker to answer."""
+    try:os.stat(path)
+    except (FileNotFoundError,NotADirectoryError):return True
+    except OSError:pass
+    return False
+
+
 class Docker:
+    source_absent=staticmethod(source_absent)
     @staticmethod
     def call(*args,timeout=90):
         result=subprocess.run(['docker',*args],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout)
-        if result.returncode:raise RuntimeError('docker_operation_failed')
+        if result.returncode:raise DockerFailure(result.stderr)
         return result.stdout.decode().strip()
     @staticmethod
     def inspect(name,timeout=30):
@@ -728,11 +775,13 @@ async def upload_file_v2(path,result,transfer,timeout):
 
 
 class Runner:
-    def __init__(self,cfg,*,docker=None,clock=time.time,sleep=time.sleep,send=None,stream_send=upload_stream):
+    def __init__(self,cfg,*,docker=None,clock=time.time,sleep=time.sleep,send=None,stream_send=upload_stream,absent=None):
         self.cfg=cfg;self.root=Path(cfg['directory']);self.root.mkdir(mode=0o700,parents=True,exist_ok=True)
         if self.root.is_symlink() or self.root.stat().st_mode&0o077:raise ValueError('private_backup_directory_required')
         self.journal_path=self.root/'journal.json';self.status_path=self.root/'status.json'
         self.monotonic=time.monotonic;self.docker=docker or Docker();self.clock=clock;self.sleep=sleep;self.send=send;self.stream_send=stream_send;self.journal=None
+        # A stand-in for Docker has no host behind it, so it names no real source unless it or the caller asks.
+        self.absent=absent or getattr(self.docker,'source_absent',lambda _:False)
         self.calendar=cfg.get('profile')=='calendar';self.recordings=cfg.get('profile')=='recordings'
         # Both own no application container, open no fence and take the host lock; each names only its own worker.
         self.calls=cfg.get('profile')=='calls';self.staged_profile=self.recordings or self.calls
@@ -786,11 +835,12 @@ class Runner:
                               'attempt':attempt,'retry_seconds':BUSY_RETRY_SECONDS if retry else 0},
                              separators=(',',':')),flush=True)
         except (OSError,ValueError):pass
-    def status(self,state,code=None):
+    def status(self,state,code=None,**detail):
         previous=read_json(self.status_path) if self.status_path.exists() else {}
         data={**previous,'state':state,'updated_at':datetime.now(timezone.utc).isoformat()}
-        data.pop('error_code',None)
+        for key in ('error_code','error_detail','error_mounts'):data.pop(key,None)
         if code:data['error_code']=code
+        data.update(detail)
         if self.journal:data['id']=self.journal['id']
         write_json(self.status_path,data)
     def check_worker(self,info):
@@ -1380,10 +1430,21 @@ class Runner:
         completed=sorted((p for p in self.root.iterdir() if p.is_dir() and ID.fullmatch(p.name) and (p/'delivery.json').is_file()),
                          key=lambda p:p.name,reverse=True)
         for old in completed[self.cfg['keep_local']:]:shutil.rmtree(old)
+    def check_sources(self):
+        """Refuse a job whose worker cannot be created, before any collector stops. A job past its capture creates no
+        worker and must still finish, so it is not asked. With a journal, the caller's recovery resumes what it stopped."""
+        if self.journal_path.exists():
+            job=read_json(self.journal_path)
+            if job.get('phase')=='upload' or (self.root/str(job.get('id'))/'delivery.json').exists():return
+        missing=[name for name,source in bind_sources(self.cfg) if self.absent(source)]
+        if missing:
+            self.status('error','backup_source_missing',error_mounts=missing)
+            raise SourceMissing(missing)
     def run(self):
         if self.staged_profile:
             resumed=read_json(self.journal_path).get('phase') if self.journal_path.exists() else None
             self.admit('upload' if resumed=='upload' else 'full')
+        self.check_sources()
         self.prepare();work=self.root/self.journal['id']
         try:
             if self.journal['phase']=='abandoning':
@@ -1406,7 +1467,8 @@ class Runner:
             receipt,_=self.deliver(lambda:asyncio.run(self.send(path,result,self.cfg['transfer'],self.cfg['timeout_seconds'])))
             self.finish(work,result,receipt)
         except BaseException as exc:
-            self.status('skipped' if isinstance(exc,Skip) else 'error',str(exc) if str(exc) in SAFE_ERRORS else 'backup_job_failed')
+            self.status('skipped' if isinstance(exc,Skip) else 'error',str(exc) if str(exc) in SAFE_ERRORS else 'backup_job_failed',
+                        **({'error_detail':exc.detail} if isinstance(exc,DockerFailure) else {}))
             # A snapshot producer not verified gone still holds the file: the recovery reaps it first, then cleans.
             if self.staged_profile and not (self.journal or {}).get('exec_target') and not (self.journal or {}).get('helper'):
                 try:self.clean_staging()
@@ -1554,6 +1616,7 @@ def main():
         elif runner.staged_profile and isinstance(unrecovered,OSError):code='staging_cleanup_failed'
         elif runner.staged_profile and str(exc) in CLEANUP_CODES:code=str(exc)
         elif runner.calls and str(exc) in SAFE_ERRORS:code=str(exc)
+        elif isinstance(exc,SourceMissing):code=str(exc)
         # A skip whose cleanup failed is a failure: plaintext may remain.
         if isinstance(exc,Skip) and not (runner.staged_profile and unrecovered is not None):
             try:runner.status('skipped',exc.code)
@@ -1564,7 +1627,8 @@ def main():
             code=str(exc)
             try:runner.status('error',code)
             except Exception:pass
-        print(json.dumps({'status':'error','code':code},separators=(',',':')),flush=True)
+        print(json.dumps({'status':'error','code':code,**({'mounts':exc.mounts} if isinstance(exc,SourceMissing) else {}),
+                          **({'detail':exc.detail} if isinstance(exc,DockerFailure) else {})},separators=(',',':')),flush=True)
         raise SystemExit(1) from None
 
 

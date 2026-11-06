@@ -505,6 +505,21 @@ def test_the_unsettled_marker_exists_from_before_the_worker_until_it_is_verified
 
 
 # spec: ANYM-608
+def test_the_runs_journal_line_names_the_missing_mount_and_no_worker_is_created(tmp_path, monkeypatch, capsys):
+    cfg = calendar_cfg(tmp_path)
+    Path(cfg['host_lock']).parent.mkdir(mode=0o700)
+    path = private_file(tmp_path / 'calendar.json', cfg)
+    docker = CalendarDocker(Path(cfg['directory']))
+    docker.source_absent = lambda source: source == cfg['dsn_file']
+    monkeypatch.setattr(backup_runner, 'Docker', lambda: docker)
+    assert run_main(monkeypatch, '--config', str(path)) == 1
+    assert json.loads(capsys.readouterr().out.splitlines()[-1]) == {'status': 'error', 'code': 'backup_source_missing',
+                                                                    'mounts': ['database_url']}
+    assert read_json(Path(cfg['directory']) / 'status.json')['error_mounts'] == ['database_url']
+    assert 'create' not in {call[0] for call in docker.calls}
+
+
+# spec: ANYM-608
 def test_a_failed_recovery_leaves_the_unsettled_marker_and_the_next_recovery_removes_it(tmp_path, monkeypatch):
     cfg = calendar_cfg(tmp_path)
     Path(cfg['host_lock']).parent.mkdir(mode=0o700)

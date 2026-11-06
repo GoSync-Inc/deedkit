@@ -2243,12 +2243,11 @@ def pinned_id(path, pinned):
     return found
 
 
-def runner_pins(settings, keep):
-    """The image each backup runner's own configuration pins, and those its `.before-*` copies name, the undo of a move
-    (ANYM-525). Nothing else protects them once a project deploys the `backup` target and no backup container exists between
-    two runs, so a pin that cannot be read refuses before any removal. Every copy counts: `cp -p` keeps an old time, so no
-    time tells the last move, and an operator deletes a copy to let its image go. A host without the runner and without a
-    runner.json runs no backup and has no pin to read; each profile's runner.json is optional, as `deploy` reads them."""
+def runner_configurations(settings):
+    """Each backup runner configuration and its `.before-*` copies, the undo of a move, as (path, content, is a copy). A
+    configuration that cannot be read refuses before any removal. Every copy counts: `cp -p` keeps an old time, so no time
+    tells the last move, and an operator deletes a copy to let what it names go. A host without the runner and without a
+    runner.json runs no backup and has nothing to read; each profile's runner.json is optional, as `deploy` reads them."""
     configured = configured_runner(settings)
     if configured is not None and not present(configured):
         raise Refused(f"cannot read the configured {configured}; no image is removed")
@@ -2256,14 +2255,34 @@ def runner_pins(settings, keep):
     if present(BACKUP_RUNNER) and not paths:
         raise Refused(f"the backup runner {BACKUP_RUNNER} is installed and no runner.json names its image; no image is removed")
     for path in paths:
-        image = pinned_id(path, load(path))
-        if image is None:
-            raise Refused(f"the image {path} pins cannot be resolved; no image is removed")
-        keep(image, f"pinned by {path}")
+        yield path, load(path), False
         for entry in directory_entries(path.parent):
             if entry.name.startswith(path.name + ".before-") and present(entry):
-                # A copy whose reference resolves to nothing has no image left: its undo is lost either way.
-                keep(pinned_id(entry, load(entry)), f"pinned by the undo copy {entry}")
+                yield entry, load(entry), True
+
+
+def runner_pins(settings, keep):
+    """The image each backup runner's configuration and undo copy pin (ANYM-525). Nothing else protects them once a project
+    deploys the `backup` target and no backup container exists between two runs."""
+    for path, pinned, undo in runner_configurations(settings):
+        image = pinned_id(path, pinned)
+        if undo:  # A copy whose reference resolves to nothing has no image left: its undo is lost either way.
+            keep(image, f"pinned by the undo copy {path}")
+        elif image is None:
+            raise Refused(f"the image {path} pins cannot be resolved; no image is removed")
+        else:
+            keep(image, f"pinned by {path}")
+
+
+def runner_releases(settings):
+    """The release directories a backup runner configuration or undo copy names: its worker exists only during a run, so
+    no container mount shows them between two runs (incident 11-05: every daily backup failed after a prune)."""
+    named = set()
+    for path, content, _ in runner_configurations(settings):
+        if not isinstance(content, dict):
+            raise Refused(f"cannot read {path}; no image is removed")
+        named.update(RELEASE_DIRECTORY.findall(json.dumps(content)))
+    return named
 
 
 def release_name(name):
@@ -2467,7 +2486,8 @@ def prune_state(directory, mirror, tip, protected, mounted, deadline, summary, *
         if time.monotonic() >= deadline:
             summary["interrupted"] = "time budget"
             return
-        remove_path(leftover, deadline)
+        if leftover.name not in protected | mounted:  # a path may name a directory already moved here
+            remove_path(leftover, deadline)
     history = run(["git", "-C", str(mirror), "rev-list", "--first-parent", tip]).split()
     present = {path.name for path in subdirectories(directory) if RELEASE_DIRECTORY.fullmatch(path.name)}
     if tip not in history:
@@ -2500,13 +2520,18 @@ def prune_releases(settings, http_state, deadline):
         containers = run(["docker", "ps", "--all", "--quiet", "--no-trunc"]).split()
         mounted = {sha for value in (json.loads(run(["docker", "inspect", *containers])) if containers else [])
                    for mount in value.get("Mounts") or [] for sha in RELEASE_DIRECTORY.findall(mount.get("Source") or "")}
+        try:
+            named = runner_releases(settings)
+        except Refused as exc:  # read before the first removal: nothing is pruned, not even the trash
+            summary["error"], summary["skipped"] = "Refused", f"no release directory is removed: {exc}"
+            return summary
         current = read(state / "current.json") if (state / "current.json").exists() else {}
         if current.get("status") == "applied":
-            prune_state(state, mirror, current["sha"], {current["sha"], *unfinished(state), *unsettled_migrations(state)},
+            prune_state(state, mirror, current["sha"], {current["sha"], *unfinished(state), *unsettled_migrations(state), *named},
                         mounted, deadline, summary, current=current)
         serving = read(http_state / "http-current.json") if (http_state / "http-current.json").exists() else {}
         if serving.get("status") == "serving":
-            prune_state(http_state, mirror, serving["sha"], {serving["sha"], (serving.get("previous") or {}).get("sha")},
+            prune_state(http_state, mirror, serving["sha"], {serving["sha"], (serving.get("previous") or {}).get("sha"), *named},
                         mounted, deadline, summary, serving=serving)
     except Exception as exc:
         summary["error"] = type(exc).__name__
