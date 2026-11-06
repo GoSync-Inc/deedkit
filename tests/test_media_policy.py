@@ -187,6 +187,25 @@ def test_personal_and_subscribed_group_media_keep_the_prefetch_window(archive):
 
 
 # spec: ANYM-805
+def test_a_request_during_a_running_download_records_the_recognition_request(archive):
+    ar,s,key,_=archive;mid=original(ar,age=3600)
+    set_kind(s,mid,'group')
+    subscribe(s,chat_of(s,mid))
+    job=ar.claim_media('worker',media_prefetch_days=7);assert job['message']==mid
+    with s.pool.connection() as c:
+        # Paused while the file downloads: the chat is on request again.
+        c.execute("UPDATE subscriptions SET state='paused'")
+    assert s.request_file_download(key,job['id'])['request_status']=='processing'
+    with s.pool.connection() as c:
+        recorded=c.execute('SELECT request_key_digest FROM media_jobs WHERE id=%s',(job['id'],)).fetchone()['request_key_digest']
+    assert recorded is not None
+    # A repeated request changes nothing.
+    assert s.request_file_download(key,job['id'])['request_status']=='processing'
+    with s.pool.connection() as c:
+        assert c.execute('SELECT request_key_digest FROM media_jobs WHERE id=%s',(job['id'],)).fetchone()['request_key_digest']==recorded
+
+
+# spec: ANYM-805
 def test_backfill_and_live_tier_skip_on_request_chats(archive):
     ar,s,_,_=archive
     background,live=writers(s)

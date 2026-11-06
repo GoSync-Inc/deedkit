@@ -86,6 +86,27 @@ ON_REQUEST_REASONS=('group_chat_on_request','channel_on_request')
 RECOGNITION_WITHHELD=('('+ON_REQUEST_CHAT+' AND EXISTS(SELECT FROM media_jobs rj WHERE rj.id=a.id'
     ' AND rj.request_key_digest IS NULL))')
 RECOGNITION_REASON='(SELECT orr.reason FROM ('+ON_REQUEST_CHATS+') orr WHERE orr.chat=m.chat)'
+# Columns the policy reads (the worker role files grant exactly these).
+POLICY_COLUMNS=(('chats','id'),('chats','account'),('chats','provider_chat'),('chats','chat_type'),
+    ('collector_chats','account'),('collector_chats','provider_chat'),('collector_chats','peer_kind'),
+    ('subscription_sources','subscription'),('subscription_sources','account'),('subscription_sources','chat'),
+    ('subscriptions','id'),('subscriptions','state'),('subscriptions','expires_at'),('subscriptions','closed_at'),
+    ('media_jobs','id'),('media_jobs','request_key_digest'))
+
+
+def recognition_withheld(c):
+    """RECOGNITION_WITHHELD when this login can read the policy's columns, else 'false' (recognize as before).
+
+    A worker running under its previous grants or on a schema before 62 (no subscriptions.closed_at) keeps
+    working instead of failing every claim with a permission or column error; the same fallback as
+    media_requests.cold_copy. CASE keeps has_column_privilege from seeing a column that does not exist.
+    """
+    readable=c.execute('''SELECT bool_and(CASE WHEN EXISTS(SELECT FROM pg_attribute pa
+            WHERE pa.attrelid=to_regclass('public.'||v.t) AND pa.attname=v.col AND NOT pa.attisdropped)
+        THEN has_column_privilege('public.'||v.t,v.col,'SELECT') ELSE false END) AS readable
+        FROM unnest(%s::text[],%s::text[]) v(t,col)''',
+        ([t for t,_ in POLICY_COLUMNS],[col for _,col in POLICY_COLUMNS])).fetchone()['readable']
+    return RECOGNITION_WITHHELD if readable else 'false'
 
 
 # Requires aliases j (media_jobs), m (messages) and ch (chats); adds mp, ecc, ecp, eor and

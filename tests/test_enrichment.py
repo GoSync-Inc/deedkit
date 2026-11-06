@@ -532,6 +532,9 @@ def test_a_group_image_is_recognized_only_after_an_agent_asks(seeded,tmp_path,ch
     result=s.request_file_download(key,'enrich-image')
     assert result['request_status']=='ready' and result['recognition_request']=='requested'
     assert result['next_action']=='get_attachment' and result['requested_until'] is None
+    # The answer already reads as queued recognition, not as waiting for a request.
+    assert result['enrichment_status']=='queued'
+    assert 'recognition_reason' not in result and 'recognition_next_action' not in result
     with s.pool.connection() as c:
         digest=c.execute("SELECT request_key_digest,requested_until FROM media_jobs WHERE id='enrich-image'").fetchone()
     assert digest['request_key_digest'] and digest['requested_until'] is None

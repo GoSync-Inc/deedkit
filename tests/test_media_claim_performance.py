@@ -309,6 +309,7 @@ def grow_recent_group(s, count, chat_type='group'):
         chat=stable_id('chat',ACCOUNT,'300')
         c.execute('''INSERT INTO chats(id,account,title,provider_chat,chat_type) VALUES(%s,%s,'Busy group','300',%s)
             ON CONFLICT DO NOTHING''',(chat,ACCOUNT,chat_type))
+        c.execute("UPDATE account_policies SET include_chats=array_append(include_chats,'300') WHERE account=%s",(ACCOUNT,))
         c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at)
             SELECT 'group-msg-'||n,%s,%s,'group-'||n,'42','',clock_timestamp()-(n%%6000)*interval '1 minute'
             FROM generate_series(1,%s::int) n''',(ACCOUNT,chat,count))

@@ -185,7 +185,8 @@ def test_indexer_skips_a_withheld_group_file_and_its_ceiling_sweep_leaves_it_que
         c.execute("UPDATE chats SET chat_type='group' FROM messages m WHERE m.id='demo-tg-1' AND chats.id=m.chat")
         before = c.execute("SELECT state,attempts FROM attachment_text WHERE attachment='file-group'").fetchone()
     worker = worker_for(s)
-    assert drain(worker) == []
+    # The seeded files of the chat have no media job, so they are not withheld; the group's file is.
+    assert 'file-group' not in [item['attachment'] for item in drain(worker)]
     with s.pool.connection() as c:
         assert c.execute("SELECT state,attempts FROM attachment_text WHERE attachment='file-group'").fetchone() == before
         # At the attempt ceiling a queued withheld row is still not failed.
@@ -195,7 +196,7 @@ def test_indexer_skips_a_withheld_group_file_and_its_ceiling_sweep_leaves_it_que
         assert c.execute("SELECT state FROM attachment_text WHERE attachment='file-group'").fetchone()['state'] == 'queued'
         c.execute("UPDATE attachment_text SET attempts=0 WHERE attachment='file-group'")
     assert s.request_file_download(key, 'file-group')['recognition_request'] == 'requested'
-    assert len(drain(worker)) == 1
+    assert [item['attachment'] for item in drain(worker)] == ['file-group']
     with s.pool.connection() as c:
         assert c.execute("SELECT state FROM attachment_text WHERE attachment='file-group'").fetchone()['state'] == 'ready'
 

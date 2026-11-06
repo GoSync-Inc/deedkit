@@ -217,7 +217,8 @@ def other_account(ar, s):
     mid = ar.ingest(media_event(account='archive-other', chat='200', provider_id='5'))['message']
     with s.pool.connection() as c:
         for account, chat in [('archive-test', '100'), ('archive-other', '200')]:
-            c.execute('''INSERT INTO collector_chats(account,provider_chat,peer_kind) VALUES(%s,%s,'chat')
+            # Personal chats: their media is claimed by itself (ANYM-805).
+            c.execute('''INSERT INTO collector_chats(account,provider_chat,peer_kind) VALUES(%s,%s,'user')
                 ON CONFLICT DO NOTHING''', (account, chat))
             c.execute('''INSERT INTO whatsapp_checkpoints(account,provider_chat) VALUES(%s,%s)
                 ON CONFLICT DO NOTHING''', (account, chat))
@@ -236,7 +237,7 @@ def other_account(ar, s):
     ('enrichment_role.sql', 'messaging_enricher'), ('indexer_role.sql', 'messaging_indexer'),
     ('file_lifecycle_role.sql', 'messaging_file_lifecycle')])
 def test_worker_roles_read_the_chat_media_policy_and_nothing_more_of_subscriptions(archive, template, base):  # noqa: F811
-    from messaging_service.media_policy import ON_REQUEST_CHATS, RECOGNITION_WITHHELD
+    from messaging_service.media_policy import ON_REQUEST_CHATS, RECOGNITION_WITHHELD, recognition_withheld
     ar, s, _, _ = archive
     ar.ingest(media_event())
     with s.pool.connection() as c:
@@ -246,8 +247,13 @@ def test_worker_roles_read_the_chat_media_policy_and_nothing_more_of_subscriptio
         with as_role(s, role) as c:
             assert len(c.execute(ON_REQUEST_CHATS).fetchall()) == 1
             if base in ('messaging_enricher', 'messaging_indexer'):
-                assert c.execute('SELECT ' + RECOGNITION_WITHHELD + ''' AS withheld FROM attachments a
-                    JOIN messages m ON m.id=a.message''').fetchall() == []
+                # The role reads every column of the policy, so its worker applies it (no fallback).
+                assert recognition_withheld(c) == RECOGNITION_WITHHELD
+                withheld = 'SELECT a.id,' + RECOGNITION_WITHHELD + ' AS withheld FROM attachments a JOIN messages m ON m.id=a.message ORDER BY a.id'
+                seen = c.execute(withheld).fetchall()
+        if base in ('messaging_enricher', 'messaging_indexer'):
+            with s.pool.connection() as c:
+                assert seen == c.execute(withheld).fetchall()
         # Only the policy's columns: never a selector, label or another job column.
         refused(s, role, 'SELECT selector FROM subscriptions')
         refused(s, role, 'SELECT label FROM subscriptions')

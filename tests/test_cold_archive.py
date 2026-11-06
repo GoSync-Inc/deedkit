@@ -689,6 +689,31 @@ def test_rehydrate_without_cold_copy_uses_provider(archive):
     assert ar.claim_media('fixture')['id']==fid
 
 
+# spec: ANYM-805
+def test_cold_restore_of_a_group_file_without_provider_fallback_records_its_recognition_request(env,archive):
+    from messaging_service.media_policy import RECOGNITION_WITHHELD
+    ar,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive)
+    def marker():
+        with s.pool.connection() as c:
+            return c.execute('''SELECT j.request_key_digest,j.requested_until,'''+RECOGNITION_WITHHELD+''' AS withheld
+                FROM media_jobs j JOIN attachments a ON a.id=j.id JOIN messages m ON m.id=a.message
+                WHERE j.id=%s''',(fid,)).fetchone()
+    with s.pool.connection() as c:
+        # A group file the provider can no longer serve (attempts spent): the R2 copy is its only source.
+        c.execute('''UPDATE chats SET chat_type='group' FROM messages m,media_jobs j
+            WHERE j.id=%s AND m.id=j.message AND chats.id=m.chat''',(fid,))
+        c.execute('UPDATE media_jobs SET attempts=%s,request_key_digest=NULL WHERE id=%s',(MEDIA_MAX_ATTEMPTS,fid))
+    assert marker()['withheld'] and marker()['request_key_digest'] is None
+    first=s.request_file_download(key,fid)
+    assert first['request_status']=='queued' and first['rehydration_source']=='cold_archive'
+    recorded=marker()
+    # Recorded once; no request window, so no provider demand or quota.
+    assert recorded['request_key_digest'] is not None and recorded['requested_until'] is None and not recorded['withheld']
+    assert s.request_file_download(key,fid)['request_status']=='coalesced' and marker()==recorded
+    assert restorer(env).run_once()['restored']==1 and resident(s,blob.digest)
+    assert marker()==recorded and ar.claim_media('fixture') is None
+
+
 # spec: ANYM-350
 def test_stalled_cold_restore_falls_back_to_provider(env,archive):
     ar,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive)
