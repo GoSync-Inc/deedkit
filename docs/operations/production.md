@@ -2623,7 +2623,8 @@ old `<state>/<sha>` directories of the plan A and HTTP states: a whole directory
 checkout. Selected are those
 on main before the current release (`git rev-list --first-parent`), beyond the newest 5 of that
 state. Never selected: the current or serving release and its HTTP `previous`, a release a
-container mounts, an unfinished apply, rollback or HTTP attempt, a failed apply not rolled back,
+container mounts, a release a backup runner configuration or its `.before-*` copy names (one that
+cannot be read removes nothing: `preflight.releases.skipped`), an unfinished apply, rollback or HTTP attempt, a failed apply not rolled back,
 a preparation made since the current release was applied, an unsettled migration, the
 receipt recording the retirement of a generation whose containers still exist, an unreadable
 receipt, anything newer than the current release or not on main. A state whose release is not

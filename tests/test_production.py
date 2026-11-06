@@ -5503,6 +5503,55 @@ def test_the_release_pass_removes_nothing_when_history_or_settlement_is_unknown(
 
 
 # spec: ANYM-689
+@pytest.mark.parametrize("copy", [False, True], ids=["configuration", "undo_copy"])
+def test_a_release_a_backup_runner_configuration_names_stays_with_no_backup_container(tmp_path, monkeypatch, copy):
+    settings, state, history = prune_host(tmp_path)
+    http_state = tmp_path / "http"
+    http_state.mkdir()
+    runners = tmp_path / "runners"
+    configs = tuple(runners / name / "runner.json" for name in ("messaging", "calendar"))
+    monkeypatch.setattr(p, "RUNNER_CONFIGS", configs)
+    mounts = [{"name": "settings", "source": f"{state}/{'1' * 40}/settings"}]
+    pin(configs[0], image_id("a"), **({} if copy else {"mounts": mounts}))
+    if copy:
+        (runners / "messaging" / "runner.json.before-x").write_text(json.dumps({"image": image_id("a"), "mounts": mounts}))
+    PruneHost(monkeypatch, [], history)
+    summary = p.prune_releases(settings, http_state, p.time.monotonic() + 60)
+    assert summary == {"removed": ["4" * 12, "3" * 12, "2" * 12], "failed": []} and (state / ("1" * 40)).is_dir()
+
+
+# spec: ANYM-689
+def test_a_release_a_runner_configuration_names_stays_in_the_http_state_too(tmp_path, monkeypatch):
+    settings, state, history = prune_host(tmp_path)
+    http_state = tmp_path / "http"
+    for sha in history:
+        (http_state / sha).mkdir(parents=True)
+    p.write(http_state / "http-current.json", {"status": "serving", "sha": history[0], "generation": "a" * 12})
+    config = tmp_path / "runners" / "runner.json"
+    monkeypatch.setattr(p, "RUNNER_CONFIGS", (config,))
+    pin(config, image_id("a"), source=f"{http_state}/{history[-1]}/settings")
+    PruneHost(monkeypatch, [], history)
+    p.prune_releases(settings, http_state, p.time.monotonic() + 60)
+    assert (http_state / history[-1]).is_dir() and not (http_state / history[-2]).exists()
+
+
+# spec: ANYM-689
+@pytest.mark.parametrize("content", ["{broken", "[]"], ids=["broken", "not_a_mapping"])
+def test_a_runner_configuration_that_cannot_be_read_prunes_nothing_and_says_so(tmp_path, monkeypatch, content):
+    settings, state, history = prune_host(tmp_path)
+    (tmp_path / "http").mkdir()
+    (state / p.RELEASE_TRASH / ("e" * 40)).mkdir(parents=True)
+    config = tmp_path / "runners" / "runner.json"
+    config.parent.mkdir()
+    config.write_text(content)
+    monkeypatch.setattr(p, "RUNNER_CONFIGS", (config,))
+    PruneHost(monkeypatch, [], history)
+    summary = p.prune_releases(settings, tmp_path / "http", p.time.monotonic() + 60)
+    assert summary["removed"] == [] and summary["error"] == "Refused" and str(config) in summary["skipped"]
+    assert (state / ("1" * 40)).is_dir() and (state / p.RELEASE_TRASH / ("e" * 40)).is_dir()
+
+
+# spec: ANYM-689
 def test_the_receipt_that_records_a_retirement_stays_while_that_generations_containers_exist(tmp_path):
     release = tmp_path / "release"
     release.mkdir()
