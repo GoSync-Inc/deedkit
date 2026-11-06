@@ -23,5 +23,17 @@
     "pr": 560,
     "evidence": "gh pr view 560: merged as this squash, Spec: names ANYM-657, no Delivers line; #650 only mentions the card; no merged pull request has Delivers: ANYM-657",
     "added": "2026-11-05"
+  },
+  "ANYM-737": {
+    "commit": "ce6c88c0dccec20d6f8ecbd33c3968bcd0c6692a",
+    "pr": 604,
+    "evidence": "gh pr view 604: merged as this squash, Spec: names ANYM-737, no Delivers line; no merged pull request has Delivers: ANYM-737; card in Review",
+    "added": "2026-11-06"
+  },
+  "ANYM-713": {
+    "commit": "9cb75eb91cc461764e5b3c3f224d8460c3483754",
+    "pr": 623,
+    "evidence": "gh pr view 623: merged as this squash, Spec: names ANYM-648, ANYM-713, no Delivers line; #589 only mentions the card; no merged pull request has Delivers: ANYM-713; card in Review",
+    "added": "2026-11-06"
   }
 }
