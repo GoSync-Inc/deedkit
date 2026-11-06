@@ -269,6 +269,9 @@ def get_sync_status(c, p):
             if row.get('archive_detail_code')=='version_conflict' and not row['active_conflicts']:
                 row['archive_detail_code']='coverage_not_reconciled'
             row['deletions']=deletion_status.get(account) or {}
+            # ANYM-809: the native journal's repair count, per account and repair version; full detail only.
+            row['native_repair']=dict(row.get('operations') or {}).get('provider_repair')
+            if row.get('operations'):row['operations']={k:v for k,v in row['operations'].items() if k!='provider_repair'}
             # ANYM-700: the stored code waits for the next collector pass; the flag is the truth.
             if not row['history'].get('gap_chats'):
                 for key in ('detail_code','archive_detail_code'):

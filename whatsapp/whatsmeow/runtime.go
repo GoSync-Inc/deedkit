@@ -293,9 +293,11 @@ func (p *Provider) start(ctx context.Context) (result any, err error) {
 		}
 		return true
 	})
-	p.workers.Add(2)
+	p.workers.Add(3)
 	go func() { defer p.workers.Done(); p.historyWorker(child) }()
 	go func() { defer p.workers.Done(); p.replayWorker(child, time.Second) }()
+	// The repair count (ANYM-809) never fails the provider; its errors are status codes.
+	go func() { defer p.workers.Done(); p.repairWorker(child, time.Second) }()
 	if e = p.Client.ConnectContext(child); e != nil {
 		return nil, errors.New("provider_initialization_failed")
 	}
