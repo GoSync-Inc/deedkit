@@ -203,7 +203,7 @@ Direct Store calls, which have no presentation level, always include it.
 | Code | Points | When |
 | --- | --- | --- |
 | `private_chat` / `group_attention` | 100 / 25 | private chat / explicit group attention |
-| `question_mark` | +25 | the attention message has question punctuation |
+| `question_mark` | +25 | the attention message has question punctuation (`?`, `？`, ❓ or ❔) |
 | `provider_contact` | +10 | the sender is an observed provider contact |
 | `waiting_age`, `waiting_age_capped` | +1 to +19, +20 | square root of waiting hours; capped after about 17 days |
 | `owner_question` | +40 | a group message that mentions the owner (basis `owner_mention`) with question punctuation, from a sender that is not an observed bot, a provider business/verified sender or another account of the key |
@@ -211,10 +211,11 @@ Direct Store calls, which have no presentation level, always include it.
 | `one_way_chat` | -60 | private chat in which no meaningful owner message is archived |
 | `provider_business_or_verified` | -40 | the provider stated a business/verified (WhatsApp `VerifiedName`) or verified/support (Telegram) sender |
 | `own_account` | -80 | the sender ID is a recent outgoing sender of another account of the key |
-| `closing_courtesy` | -30 | the whole message (at most 40 characters, no question mark) is only closing words or common emoji |
+| `closing_courtesy` | -30 | the whole message (at most 40 characters, no question punctuation) is only closing words or common emoji |
 | `observed_bot` | -20 | a group message from a sender the provider marks as a bot |
 
-A demotion never excludes a row (private bots stay excluded as before); a
+A demotion never excludes a row (private bots stay excluded as before; only
+`courtesies=exclude`, below, leaves out courtesy closes on request); a
 demoted private hint may rank below a group hint, and a group question that
 mentions the owner (+40, owner decision 2026-10-19) outranks a one-way mailing
 with a question mark up to 85 points (waiting capped, no contact). Replies to the
@@ -237,7 +238,30 @@ en `thanks`, `thank you`, `thx`, `ty`, `ok`, `okay`, `noted`, `got it`, `great`,
 `siap`, `baik`, `sip`, `mantap`, `ya`, `iya`. Fillers `большое`, `огромное`,
 `вам`, `тебе`, `you`, `so much`, `very much`, `banyak`, `sangat` may precede or
 follow a closing word but never stand alone. A message with other words
-("ок, завтра созвонимся") is not a courtesy.
+("ок, завтра созвонимся") is not a courtesy. Common emoji are the Unicode
+blocks U+1F300-U+1FAFF and U+2600-U+27BF plus ⭐; the nudges ❓ ❔ ❕ ❗ and 🤔 are
+not courtesies (ANYM-810), and ❓ and ❔ are question punctuation wherever the
+queue tests for a question. A courtesy needs text: a body-less GIF (`animation`)
+or any other body-less media is not one.
+
+`courtesies` (ANYM-810, `awaiting_reply=true` only) handles private chats that
+ended with a closer. `include` (the default) lists them as before, with
+`closing_courtesy` and -30. `exclude` leaves a private chat out only when all of
+these hold: X, the latest of its last 20 meaningful incoming messages that is
+neither a closing courtesy nor a body-less sticker (media kind `sticker`), exists;
+the owner has a meaningful message after X; none of the owner's messages from X
+on (at most 20 are read, more keep the chat) has question punctuation; and
+everything that came in after X is a courtesy or a sticker. A chat with no such X
+within 20 messages, a chat the owner never wrote in, a group, a channel and a
+self chat are never left out. `courtesies=only` lists just the rows `exclude`
+leaves out, so an agent working the inbox to zero passes `exclude` and reviews
+`only` once. `excluded_courtesies_total` counts the rows `exclude` removed within
+the key's scope and the request's other filters, `promotional` included (absent
+means none), so `awaiting_reply_total` plus it equals the `include` total. Muted,
+dismissed and snoozed rows follow the promotional rules below. The cursor binds
+the choice; the word list is unchanged, so a courtesy in one language that is a
+request in another is a known limit `only` shows. `courtesies` other than
+`include` needs `awaiting_reply=true` (`invalid_filter`).
 
 By default the queue leaves out likely promotional rows (ANYM-427): a private
 chat with no meaningful owner message whose attention sender is not an observed

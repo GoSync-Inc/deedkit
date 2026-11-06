@@ -120,6 +120,8 @@ PROMOTIONAL_BASIS="business_sender or repeated_days; absent when not promotional
 LIST_CHATS_OUTPUT_PROPERTIES={
     'excluded_promotional_total':{'type':'integer','minimum':0,'description':
         'Queue rows promotional=exclude removed (awaiting_reply=true only); absent means none.'},
+    'excluded_courtesies_total':{'type':'integer','minimum':0,'description':
+        'Queue rows courtesies=exclude removed (awaiting_reply=true only); absent means none.'},
     'items':{'type':'array','items':{'type':'object','additionalProperties':True,'properties':{**RELATED_PROPERTIES,
         'awaiting_reply':{'description':'Conversation compact hint; carries likely_promotional (true) and '
             'promotional_basis ('+PROMOTIONAL_BASIS+')'},
@@ -687,9 +689,11 @@ def register_conversation_tools(mcp, call, read):
                    include_muted: bool=False,promotional: Literal['exclude','include','only']='exclude',
                    my_roles: list[Literal['creator','admin','member','left','unknown']] | None=None,
                    can_post: StrictBool | None=None,awaiting_their_reply: StrictBool=False,
-                   min_wait_hours: StrictInt | None=None) -> dict[str, Any]:
+                   min_wait_hours: StrictInt | None=None,
+                   courtesies: Literal['include','exclude','only']='include') -> dict[str, Any]:
         """List permitted chats. order: activity (default) or last_activity_desc = recent first; id = stable catalogue traversal. query also matches a channel @username. account/accounts: each account's source status and last ingest. No provider read changes.
         awaiting_reply: private incoming, excluding known bots, or explicit group owner mention/reply; heuristic, not obligation. Attention expires after awaiting_reply_days (0 = no age limit) from the attention message time; group evidence survives others' chatter and clears after owner writes. priority requires awaiting_reply=true; score/reasons are transparent heuristics (an owner group mention without a question mark scores owner_request; detail=full adds awaiting_reply_priority_components). Private-only: chat_types=['private']. A due snooze returns with snoozed_until and snooze_due. Details: CONVERSATION.md.
+        courtesies (awaiting_reply=true): include (default) lists private chats that ended with a thanks, an ok or a sticker after the owner's answer, demoted; exclude leaves them out and counts them in excluded_courtesies_total; only lists just them. An agent working an inbox to zero passes courtesies=exclude and reviews courtesies=only once.
         Compact rows omit values the row fixes (rows without type omit nothing); an absent field means the value below.
         last_turn: not_applicable on groups, and on channel and self_chat rows without suggested_action;
         else the shown head's direction (owner/peer; a head hint: peer).
@@ -715,7 +719,7 @@ def register_conversation_tools(mcp, call, read):
                     only_questions=only_questions,only_unread=only_unread,view=view,
                     exclude_likely_broadcasts=exclude_likely_broadcasts,include_muted=include_muted,
                     promotional=promotional,my_roles=my_roles,can_post=can_post,
-                    awaiting_their_reply=awaiting_their_reply,min_wait_hours=min_wait_hours)
+                    awaiting_their_reply=awaiting_their_reply,min_wait_hours=min_wait_hours,courtesies=courtesies)
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(readOnlyHint=False,
         destructiveHint=False, idempotentHint=True, openWorldHint=False))

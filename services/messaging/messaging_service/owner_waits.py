@@ -116,7 +116,7 @@ def run_has(condition, aliases):
 
 def conditions(*, aliases, min_wait_hours, days, principal, mutes):
     """SQL predicates: chat (the queue's chats), listed, uncertain, question, muted (a flag expression or None)."""
-    from .chat_queries import courtesy_pattern,self_chat_sql,sql_literal
+    from .chat_queries import courtesy_sql,question_sql,self_chat_sql,sql_literal
     pair="(c.id,score_clock.aliases->>c.id)" if aliases else '(c.id)'
     peer_id="coalesce(wp.sender,c.provider_chat)"
     chat=(f"""c.chat_type='private' AND NOT coalesce(ro.is_self_chat,false) AND NOT (a.platform='telegram' AND c.provider_chat='777000')
@@ -126,13 +126,13 @@ def conditions(*, aliases, min_wait_hours, days, principal, mutes):
         f''' AND EXISTS(SELECT 1 FROM messages recent WHERE recent.account=c.account AND {chats(aliases,'recent')}
           AND recent.direction='outgoing' AND NOT recent.deleted
           AND recent.sent_at>=CURRENT_TIMESTAMP-interval '{days} days' OFFSET 0)''' if days else ''))
-    courtesy=(f"length(btrim(m.body)) BETWEEN 1 AND 40 AND position('?' in m.body)=0 AND position('？' in m.body)=0"
-        f" AND lower(btrim(m.body)) ~ {sql_literal(courtesy_pattern())}")
+    # The reply queue's courtesy and question punctuation (ANYM-810: the question emoji ask, they never close).
+    courtesy=courtesy_sql()
     listed=(f"""wu.code IS NULL AND wh.direction='outgoing' AND ws.sent_at IS NOT NULL
         AND ws.sent_at<=CURRENT_TIMESTAMP-interval '{min_wait_hours} hours'"""+(
         f" AND ws.sent_at>=CURRENT_TIMESTAMP-interval '{days} days'" if days else '')+
         ' AND '+run_has(f'NOT ({courtesy})',aliases))
-    question=run_has("(position('?' in m.body)>0 OR position('？' in m.body)>0)",aliases)
+    question=run_has(question_sql(),aliases)
     muted=None
     if mutes:
         principal=sql_literal(principal)

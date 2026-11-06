@@ -6,7 +6,7 @@ from psycopg.types.json import Jsonb
 from .field_errors import cursor_refusal,date_range_refusal,refusal
 from .policy import scope_filter,targets
 from .search_query import coverage,cursor_binding,decode_cursor,encode_cursor,filter_values,position_date,position_text,valid_text
-from .conversation import meaningful_sql,options
+from .conversation import meaningful_sql,metadata_sql,options
 from .conversation_state import conversation_state,group_thread_query
 from .time_references import owner_zone,passed_reference
 
@@ -107,13 +107,21 @@ PROMOTIONAL_DAYS=3
 READ_STATE_MAX_AGE_HOURS=24
 READ_STATE_HEARTBEAT_SECONDS=60
 PROMOTIONAL=('exclude','include','only')
-# Priority cursors bind the scoring formula: a position from another formula would skip rows after a deploy. Bump with any weight change.
-SCORE_FORMULA=3
+# ANYM-810: courtesy closes; include (default) keeps today's rows, exclude leaves out a private chat that ended with a closer.
+COURTESIES=('include','exclude','only')
+# The closing rule reads at most this many meaningful incoming messages back from the head, and as many owner messages after it.
+COURTESY_DEPTH=20
+# Priority cursors bind the scoring formula: a position from another formula would skip rows after a deploy. Bump with any weight change
+# or a change of the row set (ANYM-810: courtesies, the narrower emoji class and the question emoji).
+SCORE_FORMULA=4
 COURTESY_WORDS=('спасибо','спс','благодарю','ок','окей','хорошо','ясно','понятно','понял','поняла','принято','отлично','супер',
     'взаимно','пожалуйста','thanks','thank you','thx','ty','ok','okay','noted','got it','great','perfect','cool','appreciated',
     'terima kasih','makasih','trims','oke','siap','baik','sip','mantap','ya','iya')
 COURTESY_FILLER=('большое','огромное','вам','тебе','you','so much','very much','banyak','sangat')
-COURTESY_EMOJI=r'\U0001F300-\U0001FAFF☀-➿⭐️‍'
+# ANYM-810: ❓ ❔ ❕ ❗ (U+2753-2755, U+2757) and 🤔 (U+1F914) are nudges, not closers, and stay out of the class.
+COURTESY_EMOJI=r'\U0001F300-\U0001F913\U0001F915-\U0001FAFF☀-❒❖❘-➿⭐️‍'
+# Question punctuation wherever the queue tests for a question (ANYM-810 adds the question emoji).
+QUESTION_MARKS=('?','？','❓','❔')
 
 
 def courtesy_pattern():
@@ -123,6 +131,17 @@ def courtesy_pattern():
     tail=r'[\s,.!)\-'+COURTESY_EMOJI+']'
     return (r'^\s*(?:'+filler+r'\s+)*'+word+'(?:'+tail+'+(?:'+word+'|'+filler+'))*'+tail+'*$|'+
         r'^\s*['+COURTESY_EMOJI+']['+COURTESY_EMOJI+r'\s]*$')
+
+
+def question_sql(alias='m'):
+    return '('+' OR '.join(f"position('{mark}' in {alias}.body)>0" for mark in QUESTION_MARKS)+')'
+
+
+def courtesy_sql(alias='m'):
+    """A closing courtesy: at most 40 characters, no question punctuation, only closing words or emoji."""
+    # lower() folds Cyrillic only under a UTF-8 database collation (the postgres image default).
+    return (f'(length(btrim({alias}.body)) BETWEEN 1 AND 40 AND NOT {question_sql(alias)}'
+        f' AND lower(btrim({alias}.body)) ~ {sql_literal(courtesy_pattern())})')
 
 
 def sql_literal(value):
@@ -311,7 +330,7 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         include_coverage=True,awaiting_reply_days=14,exclude_chats=None,exclude_senders=None,
         only_questions=False,only_unread=False,selected_chat=None,include_dismissed=False,
         view='archive',exclude_likely_broadcasts=False,include_muted=False,promotional='exclude',
-        my_roles=None,can_post=None,awaiting_their_reply=False,min_wait_hours=None):
+        my_roles=None,can_post=None,awaiting_their_reply=False,min_wait_hours=None,courtesies='include'):
     from .store import APIError,bounded,date_bound,serial
     from . import owner_waits
     bounded(limit);valid_text(after,4096);valid_text(query,200)
@@ -326,13 +345,16 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     min_wait_hours=owner_waits.validate(order,min_wait_hours,awaiting_their_reply=awaiting_their_reply,
         awaiting_reply=awaiting_reply,others={'only_unread':only_unread,'exclude_senders':exclude_senders is not None,
         'exclude_likely_broadcasts':exclude_likely_broadcasts,'from_time':from_time,'to_time':to_time,
-        'my_roles':my_roles is not None,'can_post':can_post is not None,'promotional':promotional!='exclude'})
+        'my_roles':my_roles is not None,'can_post':can_post is not None,'promotional':promotional!='exclude',
+        'courtesies':courtesies!='include'})
     if awaiting_reply and order=='id':order='activity'
     if (order=='priority' or exclude_likely_broadcasts) and not awaiting_reply:raise APIError('invalid_filter')
     if include_muted and not (awaiting_reply or awaiting_their_reply):raise APIError('invalid_filter')
     # ANYM-427: likely promotional rows leave the queue by default; include returns them marked, only lists just them.
     if promotional not in PROMOTIONAL or promotional!='exclude' and (exclude_likely_broadcasts or not awaiting_reply):
         raise APIError('invalid_filter')
+    # ANYM-810: courtesy closes stay listed by default; exclude and only need the reply queue.
+    if courtesies not in COURTESIES or courtesies!='include' and not awaiting_reply:raise APIError('invalid_filter')
     c.execute('SET LOCAL jit=off')
     accounts=filter_values(accounts);chat_types=filter_values(chat_types)
     exclude_chats=filter_values(exclude_chats);exclude_senders=filter_values(exclude_senders)
@@ -394,6 +416,7 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         **({'exclude_likely_broadcasts':True} if exclude_likely_broadcasts else {}),
         **({'include_muted':True} if include_muted else {}),
         **({'promotional':promotional} if awaiting_reply else {}),
+        **({'courtesies':courtesies} if awaiting_reply and courtesies!='include' else {}),
         **({'score_formula':SCORE_FORMULA} if order=='priority' else {}),
         **({'my_roles':my_roles} if my_roles is not None else {}),**({'can_post':can_post} if can_post is not None else {}),
         **({'awaiting_their_reply':True,'min_wait_hours':min_wait_hours} if awaiting_their_reply else {})})
@@ -500,18 +523,15 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     after_owner=f'''(own_last.sent_at IS NULL OR m.sent_at>own_last.sent_at OR
         (a.platform='telegram' AND m.sent_at=own_last.sent_at AND {number('m')}>own_last.numeric_id)
         OR (a.platform='whatsapp' AND m.sent_at=own_last.sent_at))'''
-    # lower() folds Cyrillic only under a UTF-8 database collation (the postgres image default).
-    courtesy=sql_literal(courtesy_pattern())
     message_projection=f'''m.id,m.provider_id,m.revision,m.sender,m.sent_at,m.direction,
         CASE WHEN a.platform='telegram' THEN {number('m')} ELSE 0::bigint END AS numeric_id,
         coalesce(nullif(left(m.body,160),''),'['||coalesce(md.metadata->>'media_kind','attachment')||']') AS snippet,
         md.metadata->'is_self_chat'='true'::jsonb AS is_self_chat,
         md.metadata->'sender_is_contact'='true'::jsonb AS known_contact,
-        (position('?' in m.body)>0 OR position('？' in m.body)>0) AS question,
+        {question_sql('m')} AS question,
         md.metadata->'sender_is_business_or_verified'='true'::jsonb AS business,
         md.metadata->'sender_is_bot'='true'::jsonb AS bot,
-        (length(btrim(m.body)) BETWEEN 1 AND 40 AND position('?' in m.body)=0 AND position('？' in m.body)=0
-          AND lower(btrim(m.body)) ~ {courtesy}) AS courtesy,
+        {courtesy_sql('m')} AS courtesy,
         CASE WHEN c.chat_type='private' THEN 'last_archived_message_incoming'
           WHEN md.metadata->'mentions_owner'='true'::jsonb THEN 'owner_mention' ELSE 'reply_to_owner_message' END AS basis'''
     select_message='SELECT '+message_projection+f'''
@@ -573,11 +593,37 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         alias_owner=latest_sql(owner_sql.replace('m.chat=c.id',"m.chat=(score_clock.aliases->>c.id)"))
         owner_lookup=('SELECT * FROM (('+owner_lookup+') UNION ALL ('+alias_owner+
             ')) owner_heads ORDER BY sent_at DESC,numeric_id DESC,id DESC LIMIT 1')
+    # ANYM-810: a private chat closes with a courtesy when X, the latest of its last COURTESY_DEPTH meaningful incoming
+    # messages that is neither a courtesy nor a body-less sticker, is followed by an owner message, no owner message from
+    # X on has question punctuation, and only courtesies or stickers came in after it. Read only for exclude and only.
+    closing=awaiting_reply and courtesies!='include'
+    closing_laterals=courtesy_closed=''
+    if closing:
+        meta=metadata_sql()
+        closer_sql=f'''SELECT m.id,m.sent_at,CASE WHEN a.platform='telegram' THEN {number('m')} ELSE 0::bigint END AS numeric_id,
+            ({courtesy_sql('m')} OR length(btrim(m.body))=0 AND ({meta}->>'media_kind'='sticker' OR {meta}->>'message_kind'='sticker'))
+              AS closer FROM messages m LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision
+            WHERE m.account=c.account AND m.chat=c.id AND c.chat_type='private' AND m.direction='incoming' AND {meaningful()}'''
+        # The owner's messages from X on, in either chat of a WhatsApp pair; one more than the depth shows an unread rest.
+        owner_after=f'''SELECT m.sent_at,{number('m')} AS numeric_id,{question_sql('m')} AS question FROM messages m
+            LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision
+            WHERE m.account=c.account AND m.chat=c.id AND m.direction='outgoing' AND {meaningful()}
+              AND m.sent_at>=closing_from.sent_at ORDER BY m.sent_at DESC LIMIT {COURTESY_DEPTH+1}'''
+        branches=[owner_after,*([owner_after.replace('m.chat=c.id',"m.chat=(score_clock.aliases->>c.id)")] if aliases else [])]
+        # A WhatsApp owner message at X's own second is not proven after X, so it never answers (it may still ask).
+        answered="o.sent_at>closing_from.sent_at OR a.platform='telegram' AND o.sent_at=closing_from.sent_at AND o.numeric_id>closing_from.numeric_id"
+        closing_laterals=f'''
+      LEFT JOIN LATERAL (SELECT tail.id,tail.sent_at,tail.numeric_id FROM ({latest_sql(closer_sql,limit=COURTESY_DEPTH)}) tail
+        WHERE NOT tail.closer ORDER BY tail.sent_at DESC,tail.numeric_id DESC,tail.id DESC LIMIT 1) closing_from ON true
+      LEFT JOIN LATERAL (SELECT count(*) AS n,count(*) FILTER(WHERE {answered}) AS answered,coalesce(bool_or(o.question),false) AS asked
+        FROM ({' UNION ALL '.join('('+b+')' for b in branches)}) o) closing_owner ON true'''
+        courtesy_closed=(f"(c.chat_type='private' AND closing_from.id IS NOT NULL AND closing_owner.answered>0"
+            f" AND closing_owner.n<={COURTESY_DEPTH} AND NOT closing_owner.asked)")
     def base_for(attention_lookup):return f''' FROM chats c JOIN accounts a ON a.id=c.account
       CROSS JOIN (SELECT %s::timestamptz AS at,%s::jsonb AS owners,%s::jsonb AS aliases) score_clock
       LEFT JOIN LATERAL ({latest_sql(last_sql,both_directions=True)}) last ON true
       LEFT JOIN LATERAL ({owner_lookup}) own_last ON true
-      LEFT JOIN LATERAL ({latest_sql(select_message+" AND m.direction='incoming'")}) incoming ON true
+      LEFT JOIN LATERAL ({latest_sql(select_message+" AND m.direction='incoming'")}) incoming ON true{closing_laterals}
       LEFT JOIN chat_read_observations ro ON ro.account=c.account AND ro.chat=c.id
       LEFT JOIN reply_dismissals d ON d.key_id=%s AND d.chat=c.id
       LEFT JOIN LATERAL ({attention_lookup}) attention ON true
@@ -599,6 +645,13 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         excluded_promotional=c.execute('SELECT count(*) AS n'+(base_for(ranked_for(broadcasts=False)) if attention_lookup is ranked else base)+' AND '.join([*(v for v in clauses if v!='NOT '+broadcast),
             likely_promotional,*([unread+' IS TRUE'] if only_unread else [])]),[*base_args,*args]).fetchone()['n']
     if promotional_filter:clauses.append(promotional_filter)
+    excluded_courtesies=None
+    if closing:
+        if courtesies=='exclude':
+            # Counted after every other filter (promotional included), so the shown and left-out totals add up to include's.
+            excluded_courtesies=c.execute('SELECT count(*) AS n'+base+' AND '.join([*clauses,courtesy_closed,
+                *([unread+' IS TRUE'] if only_unread else [])]),[*base_args,*args]).fetchone()['n']
+        clauses.append(('NOT ' if courtesies=='exclude' else '')+courtesy_closed)
     totals=c.execute('SELECT count(*) AS n,count(*) FILTER(WHERE '+unread+' IS NULL) AS unknown'+base+
         ' AND '.join(clauses),[*base_args,*args]).fetchone() if awaiting_reply and not inline_totals else None
     if only_unread:clauses.append(unread+' IS TRUE')
@@ -741,6 +794,7 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         **({'excluded_likely_broadcasts_total':excluded} if exclude_likely_broadcasts else {}),
         # Absent means none, so a queue without likely promotional rows keeps its shape.
         **({'excluded_promotional_total':excluded_promotional} if excluded_promotional else {}),
+        **({'excluded_courtesies_total':excluded_courtesies} if excluded_courtesies else {}),
         'read_state_unknown_total':totals['unknown'] if totals else None,
         'only_unread_notice':'unknown_or_stale_read_state_excluded' if only_unread else None,
         'bot_filter_coverage':'observed_sender_flags_only' if awaiting_reply else None,
