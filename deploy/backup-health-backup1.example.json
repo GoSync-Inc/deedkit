@@ -1,0 +1,16 @@
+{
+  "side": "verifier",
+  "environment": "production",
+  "release_sha": "0000000000000000000000000000000000000000",
+  "dsn_file": "/etc/deedkit-backup-health/tiden.dsn",
+  "state_directory": "/var/lib/deedkit-backup-health",
+  "profiles": {
+    "messaging": {"unit": "deedkit-backup-r2-verifier.service", "directory": "/srv/backups/deedkit/verifier"},
+    "calendar": {"unit": "deedkit-calendar-backup-r2-verifier.service",
+                 "directory": "/var/lib/deedkit-calendar-backup-r2/verification"},
+    "recordings": {"unit": "deedkit-recordings-backup-r2-verifier.service",
+                   "directory": "/var/lib/deedkit-recordings-backup-r2/verification"},
+    "calls": {"unit": "deedkit-calls-backup-r2-verifier.service",
+              "directory": "/var/lib/deedkit-calls-backup-r2/verification"}
+  }
+}

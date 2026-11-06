@@ -1229,6 +1229,22 @@ no second snapshot exists that day. Undo: `systemctl disable --now deedkit-calen
 deedkit-calendar-backup-fresh.timer`, remove the four unit files and `freshness.py`, `daemon-reload`; the daily
 service and timer are never touched.
 
+Backup alerts (ANYM-807, BACKUP.md "Backup alerts"): a hand install on both hosts under the section 2 gates (units, a
+script and a configuration; no schema, no data, no backup unit or runner configuration changes). Steps, as root, per
+host: install `services/messaging/messaging_service/backup_health.py` from the main commit you name as
+`/opt/deedkit/backup-health/backup_health.py` (root, `0755`); write `/etc/deedkit-backup-health/config.json` (root
+`0600`) from `deploy/backup-health-production.example.json` on the production host or
+`deploy/backup-health-backup1.example.json` on backup-1, with `release_sha` set to that commit; copy
+`deploy/deedkit-backup-health.service` and `.timer` to `/etc/systemd/system/` (`0644`); `systemctl daemon-reload`;
+`systemctl enable --now deedkit-backup-health.timer`. Production's `dsn_file` is the ingest DSN the API's telemetry
+overlay already mounts (no copy). On backup-1 the same DSN is copied to `/etc/deedkit-backup-health/tiden.dsn` (root
+`0600`) over the tailnet without printing it; read back by comparing the sha256 of both files. Read back:
+`systemctl start deedkit-backup-health.service` exits 0, `production.py status` prints the five `backup` lines,
+`--print` on backup-1 prints four. The copy does not follow later releases: reinstall it when `backup_health.py`
+changes. Undo per host: `systemctl disable --now deedkit-backup-health.timer`; remove the two unit files,
+`/opt/deedkit/backup-health`, `/etc/deedkit-backup-health` (on backup-1 the DSN copy with it) and
+`/var/lib/deedkit-backup-health`; `daemon-reload`. No backup is touched, so nothing else is undone.
+
 ### Module event router (ANYM-575)
 
 The router (`deploy/compose.event-router.yaml`, SUBSCRIPTIONS.md "Module event router") is not

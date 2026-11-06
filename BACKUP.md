@@ -778,3 +778,43 @@ Read-only. It follows `last-success.json` to `proof-<verification_id>.json` and 
 limit defaults to 36 hours, so one missed day shows. A rejected candidate leaves the old proof current and a retried old
 snapshot keeps its capture age. No timer runs it, as for recordings. The catch-up's `status.json` check on the host is delivery
 state, not a proof: it only decides whether the catch-up starts.
+
+## Backup alerts (ANYM-807)
+
+A failed, undelivered or unverified daily backup raises a Tiden issue within an hour, and `production.py status` prints
+one line per backup. `deploy/deedkit-backup-health.timer` runs `deploy/deedkit-backup-health.service` hourly at :37 on
+both hosts. The service runs the standard-library checker `services/messaging/messaging_service/backup_health.py`
+(host copy `/opt/deedkit/backup-health/backup_health.py`) with `/etc/deedkit-backup-health/config.json`. Host install
+and undo: `docs/operations/production.md`, "Backup alerts".
+
+- **Production host** (`side: producer`, the four runners):
+  - `backup_failed.<profile>` when `status.json` reads `error`, or when one of the profile's units is `failed` at or
+    after its `last_success_at`. A catch-up that repaired the day ends the episode; a skipped catch-up is no failure.
+  - `backup_stale.<profile>` when `last_snapshot_at` is older than the limit, missing, unreadable or more than 5
+    minutes ahead.
+- **Backup server** (`side: verifier`, the four verifiers):
+  - `backup_verify_failed.<profile>` when `last-failure.json` is newer than `last-success.json`, or when the verifier
+    unit is `failed`.
+  - `backup_unverified.<profile>` when the last verified backup's capture is older than the limit. Recordings and
+    calls read `captured_at` from the proof. Messaging and calendar read the `backup_id` time, which is the job's
+    creation time and which a resumed job keeps. That is conservative: the age can only read too large.
+- **Limits**, measured from capture, are policy rather than every timeout's worst case: messaging 30 h, calendar 32 h,
+  recordings 30 h, calls 36 h. A slow verification inside its budgets can raise one `backup_unverified` event;
+  resolve it.
+- **Episodes**: one event per code per episode, and again every 24 h while it lasts, kept in
+  `/var/lib/deedkit-backup-health/state.json`. A send that fails stays due for the next hour. The event carries only
+  the code (TELEMETRY.md); details stay in the host's files and journal.
+- **Status**: `production.py status` prints `backup <profile>: delivered|FAILED|STALE|UNKNOWN last capture <time>
+  age=<h>h (checked <time>)` from `result.json`. When the checker has not run for 3 hours it prints
+  `UNKNOWN (no recent check)`. A last line points to the verified side, on backup-1:
+  `python3 -I /opt/deedkit/backup-health/backup_health.py --config /etc/deedkit-backup-health/config.json --print`.
+- **Isolation**: the checker has no dependency on any backup or verifier unit, takes no lock and starts no container.
+  It runs one `systemctl show` (10 s), reads files, and makes at most 8 posts under one 45 s deadline. Nothing in a
+  backup, a verifier or a deploy waits on it.
+- **Assumptions and limits**:
+  - Both hosts' clocks are NTP-synced.
+  - A failure cleared with `systemctl reset-failed` before the next check, with no `error` in `status.json`, is not
+    reported.
+  - Nothing reports a stopped checker except the `UNKNOWN (no recent check)` lines.
+  - The Tiden sweep reads component `backup`. Whether a new event reopens a resolved issue is recorded here after the
+    first drill.

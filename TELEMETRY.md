@@ -73,6 +73,19 @@ The API checks the mini's enrichment queue every 5 minutes and reports
 fingerprint `["enrichment-health", <component>, <code>]`. The event carries no count,
 kind, account, profile hash or file name; `get_sync_status` shows the counts.
 
+Backup alerts (ANYM-807): the host checker `backup_health.py` runs hourly on the
+production host and on the backup server and posts its own events, built exactly as
+`safe_event` and `before_send` build them and sent the way the SDK sends them, to the
+same ingest DSN (BACKUP.md, Backup alerts). Component `backup`, one issue per code with
+the fingerprint `["backup-health", "backup", <code>]`, one event per episode and again
+every 24 hours: `backup_failed.<profile>` (a run failed), `backup_stale.<profile>`
+(no delivered capture within the limit), `backup_verify_failed.<profile>` (an isolated
+restore failed) and `backup_unverified.<profile>` (no verified capture within the
+limit), for the profiles `messaging`, `calendar`, `recordings` and `calls`. The release
+is `deedkit@<sha>` of the checker's install copy, not the running product's. The event
+carries no path other than the public source frame, no unit name, backup ID, size,
+runner error code, host name or count.
+
 Collector stop codes: `capture_overload`, `collection_disabled`,
 `collector_already_owned`, `collector_disabled`, `collector_lease_lost`,
 `disk_reserve`, `durable_capture_failed`, `live_account_required`,
