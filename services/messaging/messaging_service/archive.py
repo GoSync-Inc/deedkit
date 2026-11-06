@@ -89,6 +89,33 @@ def whatsapp_body_completion(retained,candidate):
         return False
 
 
+# The kinds whose single file completes a revision stored without text or file (ANYM-808). Never audio,
+# voice, sticker or location: those stay today's outcome.
+WHATSAPP_ATTACHMENT_KINDS=('photo','video','document')
+
+
+def whatsapp_attachment_completion(retained,candidate):
+    """True when a WhatsApp photo, video or document (one file, with or without a caption) completes a retained
+    revision of unknown or no kind with an empty body and no file: same identity and provider time, neither deleted.
+    `retained` is the revision snapshot, `candidate` a validated envelope. Pure, so the conflict re-evaluation can call
+    it; evidence it cannot read is no completion, never an exception inside ingest."""
+    try:
+        if candidate['platform']!='whatsapp' or retained['platform']!='whatsapp' or retained['deleted'] or candidate['deleted']:
+            return False
+        if retained.get('metadata',{}).get('message_kind') not in (None,'unknown') or retained['body'] or retained['media']:
+            return False
+        if candidate.get('metadata',{}).get('message_kind') not in WHATSAPP_ATTACHMENT_KINDS:return False
+        if not isinstance(candidate['media'],list) or len(candidate['media'])!=1 or not isinstance(candidate['media'][0],dict):
+            return False
+        if datetime.fromisoformat(candidate['updated_at'])!=datetime.fromisoformat(retained['updated_at']):return False
+        # WhatsApp's known formatting is the digest of its own body: a retained one must state no text.
+        if known_formatting(retained.get('formatting')) and retained['formatting'].get('wire_sha256')!=wire_digest(''):return False
+        envelope={**{k:v for k,v in retained.items() if k not in REVISION_FIELDS},'chat':retained['provider_chat']}
+        return fingerprint({**candidate,'body':'','media':[]})==fingerprint(envelope)
+    except (KeyError,TypeError,ValueError,AttributeError):
+        return False
+
+
 def telegram_web_preview_refresh(retained,candidate,version):
     """True when a Telegram link preview differs from the retained revision only by its attachments, both
     sides naming the same preview page ID: Telegram re-crawled the page (updateWebPage, no edit). Same
@@ -148,8 +175,8 @@ _SNAPSHOT=object()
 def ingest_outcome(old,e,retained_snapshot,sender_alias=False,retained_buttons=_SNAPSHOT):
     """What ingest does with the validated candidate `e` against the retained message row `old` (None: a new message)
     and the retained revision's snapshot: (outcome, sender_completed, sender_device_only, unreadable, sent_at_jitter,
-    jitter_version, body_completed, web_preview_refresh, known_candidate, known_retained, old_format, link_completed).
-    The version a
+    jitter_version, body_completed, web_preview_refresh, known_candidate, known_retained, old_format, link_completed,
+    attachment_completed). The version a
     rule compares with is `old['provider_updated_at']`. `sender_alias` is ingest's ANYM-559 lookup, a database read:
     the caller makes it and has already put the retained sender into `e`. Pure, so conflict re-evaluation asks the
     same rule whether it would still raise a stored conflict (ANYM-621); it passes no alias, which keeps a row raised
@@ -215,6 +242,12 @@ def ingest_outcome(old,e,retained_snapshot,sender_alias=False,retained_buttons=_
     body_completed=bool(old and retained_snapshot and whatsapp_body_completion(retained_snapshot,e)
         and not old['body'] and old['provider_updated_at']==updated
         and fingerprint({**e,'body':''})==old['content_hash'])
+    # A WhatsApp photo, video or document at the retained provider version completes a revision stored
+    # without text or file: a new revision, the empty one stays readable. It is no later evidence, so it
+    # resolves no open conflict (ANYM-808).
+    attachment_completed=bool(old and retained_snapshot and not old['deleted'] and not old['body']
+        and old['provider_updated_at']==updated and whatsapp_attachment_completion(retained_snapshot,e)
+        and fingerprint({**e,'body':'','media':[]})==old['content_hash'])
     # Telegram's re-crawl of the same link preview page at the retained provider version changes
     # only the attachment: the retained revision, its metadata, media and attachments stay, and it
     # is no later evidence for an open conflict (ANYM-611).
@@ -231,7 +264,7 @@ def ingest_outcome(old,e,retained_snapshot,sender_alias=False,retained_buttons=_
         elif sender_device_only:outcome='unchanged'
         elif unreadable:outcome='unchanged'
         elif sent_at_jitter:outcome='stale' if old['provider_updated_at'] and updated<old['provider_updated_at'] else 'unchanged'
-        elif body_completed:outcome='edited'
+        elif body_completed or attachment_completed:outcome='edited'
         elif web_preview_refresh:outcome='unchanged'
         elif (old['sent_at']!=datetime.fromisoformat(e['sent_at']) or old['direction']!=e['direction']
               or old['sender']!=e['sender']): outcome='conflict'
@@ -243,7 +276,7 @@ def ingest_outcome(old,e,retained_snapshot,sender_alias=False,retained_buttons=_
         if sender_alias and outcome not in ('unchanged','stale') and old['provider_updated_at']==updated:outcome='conflict'
     elif e['deleted']: outcome='deleted'
     return (outcome,sender_completed,sender_device_only,unreadable,sent_at_jitter,jitter_version,body_completed,
-            web_preview_refresh,known_candidate,known_retained,old_format,link_completed)
+            web_preview_refresh,known_candidate,known_retained,old_format,link_completed,attachment_completed)
 
 
 def effective_buttons(c,mid,old,retained_snapshot):
@@ -391,7 +424,7 @@ class Archive:
                     (mid,old['revision'])).fetchone()
                 retained_snapshot=retained['snapshot'] if retained else None
             (outcome,sender_completed,sender_device_only,unreadable,sent_at_jitter,jitter_version,body_completed,
-             web_preview_refresh,known_candidate,known_retained,old_format,link_completed)=ingest_outcome(old,e,retained_snapshot,sender_alias,
+             web_preview_refresh,known_candidate,known_retained,old_format,link_completed,attachment_completed)=ingest_outcome(old,e,retained_snapshot,sender_alias,
                 effective_buttons(c,mid,old,retained_snapshot))
             if replay and outcome!='edited':raise ValueError('replay_not_accepted')
             if link_completed and outcome=='edited':
@@ -496,7 +529,7 @@ class Archive:
                     candidate_updated_at,observed_at) VALUES(%s,%s,%s,%s,clock_timestamp())''',
                     (receipt,mid,old['revision'],updated))
             elif (outcome in ('edited','deleted','unchanged') and not sender_device_only and not unreadable and not jitter_version
-                    and not body_completed and not web_preview_refresh and not (sender_alias and outcome=='unchanged')):
+                    and not body_completed and not attachment_completed and not web_preview_refresh and not (sender_alias and outcome=='unchanged')):
                 # A repeated copy of the retained revision does not resolve an
                 # equal/newer conflicting observation. Only later evidence does.
                 # From schema 57 each resolve names how it was resolved (ANYM-621); N-1 rows keep NULL, unknown.
