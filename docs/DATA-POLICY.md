@@ -27,6 +27,12 @@ volume) (owner 11-03, see Data egress).
 - Retention: processed, unpinned originals may leave local disk after 30 days without a request, only
   with a verified cold copy; text, titles, summaries and transcripts stay (MEDIA_STORAGE.md; owner 10-17
   cold archive «yes»; owner 10-18 BL-33 disk vs retention «давай оставим как есть если так работает»).
+  Originals of group and channel chats that no agent subscription names leave the server's disk 24 hours
+  after their last read, once their R2 copy is verified, or later while a recognition an agent asked for is
+  pending (at most 7 days after that work last changed). Their R2 copy, the message, its text,
+  transcripts and descriptions stay, and `request_file_download` restores the original (ANYM-806; owner
+  11-06 «в целом я бы их вообще все поудалял как файлы из группы и запросов тоже чтобы место не
+  заниматься»).
   Backup copies age out by the backup rotation (BACKUP.md). Messages and other kinds: proposal (no
   owner decision on a limit).
 - Recording texts (recordings archive, owner 11-03 «2) ок»): kept until the owner sets a term; deleted on
