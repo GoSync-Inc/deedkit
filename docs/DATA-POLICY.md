@@ -118,7 +118,10 @@ volume) (owner 11-03, see Data egress).
     reason only, never content or file names. The derived text returns to DeedKit and is stored as
     untrusted, model-generated enrichment (ENRICHMENT.md). No third party receives them (owner 11-01
     «на мини я бы и аудио и остальные файлы разбирал бы локальной моделью хорошей для всех сервисов
-    наших»; photos: owner 11-01 «2 b»).
+    наших»; photos: owner 11-01 «2 b»). Originals of group and channel chats that no agent
+    subscription names are downloaded and go to the Mac mini only after an agent's
+    `request_file_download` (ANYM-805; owner 11-06 «только излички разбирать, а группы только по
+    запросу. И группы, и, и каналы только по запросу»; MEDIA_STORAGE.md).
   - Cloud model providers for enrichment (ENRICHMENT.md: OpenAI, Anthropic, Gemini endpoints; Codex not
     deployed) stay off; media understanding uses the local models above (owner 11-01 «2 b»). Enabling a
     cloud endpoint is a `user-data` ask.

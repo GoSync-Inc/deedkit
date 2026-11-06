@@ -1469,6 +1469,18 @@ older code already masks in get, list and passive reads and refuses to resume or
 its queued hints (`dynamic_sources_disabled`) under the fence and prints the definition and hint
 IDs. Agents recreate their definitions after a new `--enable`.
 
+## Files of a named group or channel (ANYM-805)
+
+Files of group and channel chats are downloaded and recognized only when an agent asks
+(`request_file_download`), except in chats a subscription names (owner 2026-11-06; MEDIA_STORAGE.md,
+"Group and channel chats: download and recognition on request"). Naming a group or channel in
+`chat_ids` of a subscription turns on its automatic download, the collector's 7-day prefetch window
+included, and its automatic recognition (transcripts, OCR, descriptions) while the subscription is
+`active`, and for 24 hours after it expires or becomes `closed` or `access_changed`, so a renewal gap
+does not flip the chat. A paused subscription does not count. A dynamic subscription
+(`sources={all_visible_chats: true}`) names no chat and turns on nothing: to watch a group's files,
+name the group.
+
 ## Remaining extensions and verification boundaries
 
 Coalescing across subscriptions of different keys, stream resource notifications,

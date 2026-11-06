@@ -438,3 +438,22 @@ exhausting the first configured modality. This does not yet introduce a public
 on-demand job-priority API. Local native children exit after every file; Ollama
 requests already use `keep_alive=0`. No model, cloud profile or autoscaler is
 enabled by this change.
+
+### On-request chats (ANYM-805)
+
+Owner 2026-11-06: files of personal chats are recognized by themselves; files of groups and channels
+only when an agent asks, unless an agent's subscription names the chat (the chat kinds and the
+exception: MEDIA_STORAGE.md, "Group and channel chats: download and recognition on request"). The
+enrichment worker's claim and the indexer's claim (text extraction and OCR) skip a withheld file: a
+file of an on-request chat whose media job carries no agent request. A request is any accepted
+`request_file_download` for the file; it sets the job's `request_key_digest`, which nothing clears.
+A file without a media job (a legacy or restored original) is never withheld, since no request could
+be recorded for it.
+
+A withheld row that is not leased is never changed, leased, counted against a budget or marked
+failed; the indexer's attempt-ceiling sweep skips it too, and `enrichment_health` does not count it,
+so withheld work raises no stall alarm. A lease taken before the rule took effect ends as before. The
+row becomes claimable when an agent asks or its chat becomes subscribed, so group and channel rows
+queued before the rule leave the queue without a failure. The enricher and the indexer read only the
+columns this needs (chat kind, the subscription's state and chats, the job's request digest) through
+column grants in their role files.
