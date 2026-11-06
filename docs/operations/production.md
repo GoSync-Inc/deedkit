@@ -640,10 +640,10 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
    wait for: no fresh backup, restore proof, hold, backup-age check, `copy-database`, time window, merge
    freeze, new release kit or plan review. The latest verified daily backup is its restore point. Its only
    waits are the tool's own: an active call, and a backup that holds the runner lock. This holds for
-   messaging and calendar. A store with no daily backup running keeps a restore point anyway: a PostgreSQL
-   database, unattended, its pre-migration copy (Database copies), by hand `copy-database` first; the calls
-   state (`voice.sqlite3`, which no daily backup covers), a SQLite online backup before a release that changes
-   its schema or stored rows. A critical release needs the backup gate above (a fresh backup and its
+   messaging, calendar, recordings and the calls state (`voice.sqlite3`, BACKUP.md "Calls state"): each has a
+   daily verified backup as its restore point. A store with no daily backup running keeps a restore point
+   anyway: a PostgreSQL database, unattended, its pre-migration copy (Database copies), by hand
+   `copy-database` first. A critical release needs the backup gate above (a fresh backup and its
    restore proof, never a reused daily backup), an undo and one Astra review round of
    its plan (harness process.md section 2, reviews.md Rounds 7). The release kit or PR names each file's tier.
 
