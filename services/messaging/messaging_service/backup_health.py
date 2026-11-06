@@ -11,14 +11,15 @@ fixed code and nothing else (TELEMETRY.md, Backup alerts). Exit codes: 0 checked
 import argparse
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -61,7 +62,7 @@ def load_config(path):
     if not isinstance(data, dict) or set(data) != CONFIG_KEYS:
         raise ConfigError('configuration keys')
     side, environment, sha = data['side'], data['environment'], data['release_sha']
-    if side not in KINDS or environment not in ENVIRONMENTS:
+    if type(side) is not str or side not in KINDS or type(environment) is not str or environment not in ENVIRONMENTS:
         raise ConfigError('side or environment')
     if not isinstance(sha, str) or not re.fullmatch('[0-9a-f]{40}', sha):
         raise ConfigError('release_sha')
@@ -284,8 +285,35 @@ def post(url, data, timeout):
         with urllib.request.urlopen(request, timeout=timeout) as response:
             response.read(4096)
             return 200 <= response.status < 300
-    except (OSError, ValueError, urllib.error.URLError):
+    except Exception:  # an HTTP protocol error (IncompleteRead, BadStatusLine) is a failed send like any other
         return False
+
+
+def bounded(send, url, data, timeout):
+    """`send` with a limit on its whole duration: a response that trickles in counts as failed once `timeout` passes.
+    The daemon thread of an abandoned send ends with the process."""
+    outcome = []
+
+    def attempt():
+        try:
+            outcome.append(bool(send(url, data, timeout)))
+        except Exception:
+            outcome.append(False)
+    worker = threading.Thread(target=attempt, name='backup-health-send', daemon=True)
+    worker.start()
+    worker.join(timeout)
+    return bool(outcome and outcome[0])
+
+
+def moment_value(value):
+    """A stored epoch time, or None for anything else (bool, non-finite, out of range)."""
+    if type(value) not in (int, float):
+        return None
+    try:
+        value = float(value)
+    except OverflowError:
+        return None
+    return value if math.isfinite(value) and 0 <= value < 1e11 else None
 
 
 def read_state(path):
@@ -298,9 +326,12 @@ def read_state(path):
         return {}
     good = {}
     for code, entry in codes.items():
-        if code in CODES and isinstance(entry, dict) and all(
-                entry.get(k) is None or isinstance(entry.get(k), (int, float)) for k in ('sent', 'attempted')):
-            good[code] = {'sent': entry.get('sent'), 'attempted': entry.get('attempted')}
+        if code not in CODES or not isinstance(entry, dict):
+            continue
+        sent, attempted = (moment_value(entry.get(k)) for k in ('sent', 'attempted'))
+        if (sent is None) != (entry.get('sent') is None) or (attempted is None) != (entry.get('attempted') is None):
+            continue  # a malformed entry is dropped: its code is due again
+        good[code] = {'sent': sent, 'attempted': attempted}
     return good
 
 
@@ -362,7 +393,7 @@ def check(config, *, now=None, clock=time.monotonic, run=None, send=None, wall=t
             if url is None or remaining <= 0:
                 break
             state[code]['attempted'] = stamp
-            if send(url, envelope(build_event(code, config, wall())), min(SEND_TIMEOUT_S, remaining)):
+            if bounded(send, url, envelope(build_event(code, config, wall())), min(SEND_TIMEOUT_S, remaining)):
                 state[code]['sent'] = stamp
     write_json(state_dir / 'state.json', {'v': 1, 'codes': state}, 0o600)
     return readings, due

@@ -107,7 +107,8 @@ def test_a_valid_configuration_of_each_side_loads(tmp_path, side):
 
 # spec: ANYM-807
 @pytest.mark.parametrize('change', ['unknown_key', 'unknown_side', 'unknown_profile', 'empty_profiles', 'bad_sha',
-                                    'bad_environment', 'relative_path', 'bad_unit', 'entry_key', 'not_json'])
+                                    'bad_environment', 'relative_path', 'bad_unit', 'entry_key', 'not_json',
+                                    'side_list', 'environment_object'])
 def test_each_refused_configuration_exits_2_before_any_read(tmp_path, change, monkeypatch):
     cfg = config(tmp_path)
     data = json.loads((tmp_path / 'producer.json').read_text())
@@ -129,6 +130,10 @@ def test_each_refused_configuration_exits_2_before_any_read(tmp_path, change, mo
         data['profiles']['messaging']['units'] = ['personal-os-backup.timer']
     elif change == 'entry_key':
         data['profiles']['messaging']['directory'] = '/x'
+    elif change == 'side_list':
+        data['side'] = []
+    elif change == 'environment_object':
+        data['environment'] = {}
     path = tmp_path / 'bad.json'
     path.write_text('{' if change == 'not_json' else json.dumps(data))
     monkeypatch.setattr(h, 'evaluate', lambda *a, **k: pytest.fail('read before refusal'))
@@ -291,6 +296,60 @@ def test_episodes_raise_once_repeat_after_a_day_and_start_again_after_clearing(t
     status(tmp_path, 'messaging', state='error', last_snapshot_at=iso(NOW + timedelta(hours=24)))
     h.check(cfg, now=NOW + timedelta(hours=26), run=run, send=send)
     assert sent == ['backup_failed.messaging'] * 3
+
+
+# spec: ANYM-807
+@pytest.mark.parametrize('value', ['1e309', '-1e309', '1' + '0' * 400, 'true', '"x"'])
+def test_a_corrupt_stored_time_never_silences_an_alert(tmp_path, value):
+    cfg = config(tmp_path, profiles=['messaging', 'calls'])
+    for p in ('messaging', 'calls'):
+        status(tmp_path, p, state='error', last_snapshot_at=iso(NOW))
+    (tmp_path / 'state' / 'state.json').write_text(
+        '{"v":1,"codes":{"backup_failed.messaging":{"sent":%s,"attempted":null}}}' % value)
+    sent = []
+    h.check(cfg, now=NOW, run=systemctl(),
+            send=lambda url, data, timeout: sent.append(json.loads(data.split(b'\n')[2])['tags']['error_code']) or True)
+    assert set(sent) == {'backup_failed.messaging', 'backup_failed.calls'}
+
+
+# spec: ANYM-807
+@pytest.mark.parametrize('error', ['IncompleteRead', 'BadStatusLine', 'RemoteDisconnected'])
+def test_an_http_protocol_error_is_a_failed_send_and_later_codes_still_go(tmp_path, monkeypatch, error):
+    import http.client
+    cfg = config(tmp_path, profiles=['messaging', 'calls'])
+    for p in ('messaging', 'calls'):
+        status(tmp_path, p, state='error', last_snapshot_at=iso(NOW))
+    raised = {'IncompleteRead': http.client.IncompleteRead(b''), 'BadStatusLine': http.client.BadStatusLine('x'),
+              'RemoteDisconnected': http.client.RemoteDisconnected('x')}[error]
+    calls = []
+
+    def urlopen(request, timeout):
+        calls.append(request)
+        if len(calls) == 1:
+            raise raised
+
+        class Response:
+            status = 202
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, n=-1): return b''
+        return Response()
+    monkeypatch.setattr(h.urllib.request, 'urlopen', urlopen)
+    h.check(cfg, now=NOW, run=systemctl())
+    codes = json.loads((tmp_path / 'state' / 'state.json').read_text())['codes']
+    assert len(calls) == 2 and sorted(c['sent'] is None for c in codes.values()) == [False, True]
+
+
+# spec: ANYM-807
+def test_a_send_that_trickles_past_its_timeout_counts_as_failed_and_the_run_stays_bounded(tmp_path, monkeypatch):
+    import time as clock
+    cfg = config(tmp_path, profiles=['messaging'])
+    status(tmp_path, 'messaging', state='error', last_snapshot_at=iso(NOW))
+    monkeypatch.setattr(h, 'SEND_TIMEOUT_S', 0.2)
+    started = clock.monotonic()
+    h.check(cfg, now=NOW, run=systemctl(), send=lambda url, data, timeout: clock.sleep(3) or True)
+    assert clock.monotonic() - started < 2
+    assert json.loads((tmp_path / 'state' / 'state.json').read_text())['codes']['backup_failed.messaging']['sent'] is None
 
 
 # spec: ANYM-807
