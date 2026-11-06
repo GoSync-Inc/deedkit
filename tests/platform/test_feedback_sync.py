@@ -773,8 +773,11 @@ def test_the_mapping_file_holds_the_four_reviewed_entries_and_all_validate():
         'ANYM-579': (322, '9a0e6b38d383c6eb831736bd9aa1682070e2c51f'),
         'ANYM-522': (452, 'cbb894101864fbe8e67845291319c2ca7f2e5cfc'),
         'ANYM-657': (560, '89763a956eac1d3cebff6b0f3afe054dd578d971'),
+        'ANYM-737': (604, 'ce6c88c0dccec20d6f8ecbd33c3968bcd0c6692a'),
+        'ANYM-713': (623, '9cb75eb91cc461764e5b3c3f224d8460c3483754'),
     }
     assert all(entries[card]['added'] == '2026-11-05' for card in ('ANYM-579', 'ANYM-522', 'ANYM-657'))
+    assert all(entries[card]['added'] == '2026-11-06' for card in ('ANYM-737', 'ANYM-713'))
     assert 'in a reviewed pull request' in json.loads((sync.ROOT / sync.MAPPING).read_text())[sync.HEADER]
 
 
