@@ -73,8 +73,6 @@ def test_an_attachment_completes_an_empty_unknown_revision(kind,caption,retained
     # The retained revision has text or a file.
     ({'body':'Старый текст','formatting':wire('Старый текст')},{},'conflict'),
     ({'media':[DOCUMENT]},{},'conflict'),
-    # A retained known formatting that states text the revision does not have.
-    ({'formatting':wire('report.pdf')},{},'conflict'),
     # Kinds outside photo, video and document.
     ({},{'metadata':{'message_kind':'unknown','chat_type':'private'}},'conflict'),
     ({},{'metadata':{'message_kind':'audio','chat_type':'private'}},'conflict'),
@@ -85,7 +83,7 @@ def test_an_attachment_completes_an_empty_unknown_revision(kind,caption,retained
     ({},{'metadata':{'chat_type':'private'}},'conflict'),
     # Two files, no file.
     ({},{'media':[PHOTO,VIDEO]},'conflict'),
-    ({},{'media':[]},'conflict'),
+    ({},{'media':[],'formatting':UNREADABLE_FORMAT},'unchanged'),
     # Another identity.
     ({},{'sender':'901@lid'},'conflict'),
     ({},{'sent_at':'2026-10-01T11:59:59+00:00'},'conflict'),
@@ -96,7 +94,7 @@ def test_an_attachment_completes_an_empty_unknown_revision(kind,caption,retained
     # Another provider time: the ordinary edit and the stale observation.
     ({},{'updated_at':'2026-10-01T12:01:00+00:00'},'edited'),
     ({'updated_at':'2026-10-01T12:01:00+00:00'},{},'stale')],
-    ids=['retained_text','retained_file','retained_text_format','unknown','audio','voice','sticker','location','text',
+    ids=['retained_text','retained_file','unknown','audio','voice','sticker','location','text',
          'no_kind','two_files','no_file','sender','sent_at','direction','retained_tombstone','candidate_tombstone',
          'newer','older'])
 def test_other_shapes_keep_todays_outcome(retained,candidate,expected):
@@ -114,6 +112,10 @@ def test_unreadable_evidence_is_no_completion():
     retained=snapshot(empty())
     for broken in (None,{},{**retained,'metadata':'unknown'},{**retained,'updated_at':'not a time'},{**retained,'media':None}):
         assert whatsapp_attachment_completion(broken,candidate) is False
+    # A retained known formatting that states text the revision does not have contradicts the completion.
+    stated={**retained,'formatting':wire('report.pdf')}
+    assert whatsapp_attachment_completion(stated,candidate) is False
+    assert ingest_outcome(retained_row(empty()),candidate,stated)[0]=='conflict'
     assert whatsapp_attachment_completion(retained,{**candidate,'media':['not a descriptor']}) is False
     telegram={**candidate,'platform':'telegram'}
     assert whatsapp_attachment_completion(retained,telegram) is False
