@@ -52,7 +52,43 @@ def published_window(account):
             AND pg_input_is_valid(h.operations->'media_policy'->>'history_since','timestamptz'))) mp ON true'''
 
 
-# Requires aliases j (media_jobs), m (messages) and ch (chats); adds mp, ecc, ecp and
+# ANYM-805 (owner 2026-11-06): media of a group or channel chat that no active agent subscription names waits for an
+# agent's request; personal chats, chats of unknown kind and subscribed chats keep automatic download and recognition.
+# Kind: chats.chat_type when private, group or channel, else collector_chats.peer_kind (user, chat, channel), else
+# unknown, which counts as personal. Subscribed: listed in subscription_sources of a subscription that is active with
+# expires_at unset or less than 24 hours past (expiry is lazy), or closed, expired or access_changed less than 24
+# hours ago, so a renewal gap does not flip the chat. A dynamic subscription (all visible chats) lists no chat.
+# Uncorrelated, so the planner hashes the set once per statement; it reads and never writes, and follows
+# subscriptions as they start and end without rewriting a row. The worker roles read only these columns
+# (*_role.sql, column grants).
+ON_REQUEST_CHATS='''SELECT oc.id AS chat,CASE okind.kind WHEN 'channel' THEN 'channel_on_request'
+        ELSE 'group_chat_on_request' END AS reason
+    FROM chats oc LEFT JOIN collector_chats occ ON occ.account=oc.account AND occ.provider_chat=oc.provider_chat
+    CROSS JOIN LATERAL (SELECT CASE WHEN oc.chat_type IN ('private','group','channel') THEN oc.chat_type
+        WHEN occ.peer_kind='user' THEN 'private' WHEN occ.peer_kind='chat' THEN 'group'
+        WHEN occ.peer_kind='channel' THEN 'channel' END AS kind) okind
+    WHERE okind.kind IN ('group','channel') AND NOT EXISTS(SELECT FROM subscription_sources oss
+        JOIN subscriptions os ON os.id=oss.subscription WHERE oss.chat=oc.id AND oss.account=oc.account
+        AND (os.state='active' AND (os.expires_at IS NULL OR os.expires_at>clock_timestamp()-interval '24 hours')
+            OR os.state IN ('closed','expired','access_changed') AND os.closed_at>clock_timestamp()-interval '24 hours'))'''
+def on_request_chat(alias='m'):
+    """`<alias>.chat` (a messages alias) is an on-request chat."""
+    return alias+'.chat IN (SELECT orc.chat FROM ('+ON_REQUEST_CHATS+') orc)'
+
+
+ON_REQUEST_CHAT=on_request_chat()
+ON_REQUEST_REASONS=('group_chat_on_request','channel_on_request')
+# Recognition (text extraction, OCR, transcription, description) of an attachment (alias a, message m) waits while it
+# is in an on-request chat and its media job has no request: every accepted request_file_download sets the job's
+# request key digest and nothing clears it (media_requests.py). An attachment without a media job (a legacy or
+# restored original) is not withheld: no request could be recorded for it. The enricher and the indexer read only
+# media_jobs id and request_key_digest.
+RECOGNITION_WITHHELD=('('+ON_REQUEST_CHAT+' AND EXISTS(SELECT FROM media_jobs rj WHERE rj.id=a.id'
+    ' AND rj.request_key_digest IS NULL))')
+RECOGNITION_REASON='(SELECT orr.reason FROM ('+ON_REQUEST_CHATS+') orr WHERE orr.chat=m.chat)'
+
+
+# Requires aliases j (media_jobs), m (messages) and ch (chats); adds mp, ecc, ecp, eor and
 # el. A chat's history bound is confirmed only when its collector_chats row records
 # the bound this run published (NULL=NULL is a confirmed unbounded history): a row a
 # live callback created without a bound, one left from an earlier configuration, or
@@ -60,12 +96,15 @@ def published_window(account):
 # el.claim mirrors Archive.claim_media (what the run downloads by itself; status
 # counts). el.occurrence is what one attachment and its request may promise: it is
 # unknown whenever the chat's bound is unconfirmed, also for a repeated request.
-# Below the bound only an explicit request is claimed (owner 2026-10-23, ANYM-477).
+# Below the bound only an explicit request is claimed (owner 2026-10-23, ANYM-477). In an on-request chat only an
+# unexpired request is claimed (ANYM-805); its reason is what the occurrence promises, like collection_excluded.
 ELIGIBILITY_JOIN=published_window('m.account')+'''
     LEFT JOIN collector_chats ecc ON ecc.account=m.account AND ecc.provider_chat=ch.provider_chat
         AND ecc.history_since IS NOT DISTINCT FROM mp.since
     LEFT JOIN account_policies ecp ON ecp.account=m.account
-    CROSS JOIN LATERAL (SELECT claim,CASE WHEN claim IN ('collection_excluded','outside_history_bounds')
+    LEFT JOIN ('''+ON_REQUEST_CHATS+''') eor ON eor.chat=m.chat
+    CROSS JOIN LATERAL (SELECT claim,CASE WHEN claim IN ('collection_excluded','outside_history_bounds',
+            'group_chat_on_request','channel_on_request')
             OR mp.published AND ecc.account IS NOT NULL THEN claim ELSE 'unknown' END AS occurrence,
         CASE WHEN mp.published AND ecc.account IS NOT NULL THEN 'confirmed' ELSE 'unknown' END AS history_bound
         FROM (SELECT CASE WHEN ecp.account IS NULL OR NOT ecp.enabled OR ch.provider_chat=ANY(ecp.exclude_chats)
@@ -74,6 +113,8 @@ ELIGIBILITY_JOIN=published_window('m.account')+'''
             WHEN ecc.history_since IS NOT NULL AND m.sent_at<ecc.history_since THEN
                 CASE WHEN j.requested_until>clock_timestamp() THEN 'eligible' ELSE 'outside_history_bounds' END
             WHEN mp.since IS NOT NULL AND m.sent_at<mp.since THEN 'history_bound_unknown'
+            WHEN eor.chat IS NOT NULL THEN
+                CASE WHEN j.requested_until>clock_timestamp() THEN 'eligible' ELSE eor.reason END
             WHEN j.requested_until>clock_timestamp() OR mp.days IS NULL OR mp.days>0
                 AND m.sent_at>=clock_timestamp()-mp.days*interval '1 day'
                 AND m.sent_at<=clock_timestamp()+interval '5 minutes' THEN 'eligible'

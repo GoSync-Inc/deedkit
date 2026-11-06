@@ -302,6 +302,65 @@ def test_claimable_job_in_a_dormant_backlog_is_claimed_with_bounded_plans(backlo
     assert_bounded(plans,index_tables(s)); selection_is_indexed(plans)
 
 
+def grow_recent_group(s, count, chat_type='group'):
+    """Recent, unrequested jobs of one group chat inside the window: waiting for a request (ANYM-805)."""
+    with s.pool.connection() as c:
+        c.execute("SET LOCAL statement_timeout='120s'")
+        chat=stable_id('chat',ACCOUNT,'300')
+        c.execute('''INSERT INTO chats(id,account,title,provider_chat,chat_type) VALUES(%s,%s,'Busy group','300',%s)
+            ON CONFLICT DO NOTHING''',(chat,ACCOUNT,chat_type))
+        c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at)
+            SELECT 'group-msg-'||n,%s,%s,'group-'||n,'42','',clock_timestamp()-(n%%6000)*interval '1 minute'
+            FROM generate_series(1,%s::int) n''',(ACCOUNT,chat,count))
+        c.execute('''INSERT INTO media_jobs(id,account,message,descriptor,state,next_due)
+            SELECT 'group-job-'||n,%s,'group-msg-'||n,jsonb_build_object('provider_id','group-'||n,'mime','audio/ogg','bytes',4),
+                'queued',clock_timestamp()-interval '1 minute' FROM generate_series(1,%s::int) n''',(ACCOUNT,count))
+        c.execute('ANALYZE messages'); c.execute('ANALYZE media_jobs'); c.execute('ANALYZE chats')
+    return chat
+
+
+def job_work(plans, indexes):
+    """media_jobs tuples per claim statement; no sequential scan of media_jobs or messages."""
+    result=[]
+    for query,plan in plans:
+        totals=work(plan,indexes)
+        result.append((' '.join(query.split())[:60],totals.get('media_jobs',{'tuples':0})['tuples']))
+    return result
+
+
+# spec: ANYM-805
+def test_recent_group_jobs_add_no_job_work_to_a_claim_and_requested_personal_and_subscribed_ones_are_claimed(backlog):
+    ar,s,claim,_=backlog
+    grow_dormant(s,30_000)
+    assert claim() is None
+    indexes=index_tables(s)
+    plans=[]
+    with explained(ar,plans): assert claim() is None
+    before=job_work(plans,indexes)
+    group=grow_recent_group(s,3_000)
+    plans=[]
+    started=time.perf_counter()
+    with explained(ar,plans): assert claim() is None
+    elapsed=time.perf_counter()-started
+    # The window arm reads the group's recent messages, as it reads every recent message, but brings none of
+    # its jobs: the claim examines no more media_jobs rows than without them.
+    assert job_work(plans,indexes)==before,(before,job_work(plans,indexes))
+    selection_is_indexed(plans)
+    print(f'\n3000 recent group jobs: idle claim {elapsed*1000:.1f} ms')
+    with s.pool.connection() as c:
+        assert c.execute("SELECT count(*) AS n FROM media_jobs WHERE id LIKE 'group-job-%' AND (state<>'queued' OR attempts<>0)").fetchone()['n']==0
+        c.execute("UPDATE media_jobs SET requested_until=clock_timestamp()+interval '1 hour' WHERE id='group-job-7'")
+    personal=message(ar,'personal',3600)
+    assert claim()['id']=='group-job-7'
+    assert claim()['message']==personal
+    assert claim() is None
+    token=s.issue_key('perf-watcher',[ACCOUNT],permissions=['read','subscription-write'],
+        key_permissions=['read','subscription-write'])
+    s.create_subscription(token,[group])
+    # Subscribed: the group's recent jobs are the window's own work again, newest first.
+    assert claim()['message'].startswith('group-msg-')
+
+
 def test_job_found_by_both_paths_is_claimed_once_and_locked_rows_are_skipped(backlog):
     ar,s,claim,other=backlog
     both=message(ar,'both',3600); second=message(ar,'second',7200)

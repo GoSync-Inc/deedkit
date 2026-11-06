@@ -231,6 +231,33 @@ def other_account(ar, s):
     return mid, job
 
 
+# spec: ANYM-805
+@pytest.mark.parametrize('template,base', [('collector_role.sql', 'messaging_collector'),
+    ('enrichment_role.sql', 'messaging_enricher'), ('indexer_role.sql', 'messaging_indexer'),
+    ('file_lifecycle_role.sql', 'messaging_file_lifecycle')])
+def test_worker_roles_read_the_chat_media_policy_and_nothing_more_of_subscriptions(archive, template, base):  # noqa: F811
+    from messaging_service.media_policy import ON_REQUEST_CHATS, RECOGNITION_WITHHELD
+    ar, s, _, _ = archive
+    ar.ingest(media_event())
+    with s.pool.connection() as c:
+        c.execute("UPDATE chats SET chat_type='group' WHERE account='archive-test'")
+    role = install(s, template, base)
+    try:
+        with as_role(s, role) as c:
+            assert len(c.execute(ON_REQUEST_CHATS).fetchall()) == 1
+            if base in ('messaging_enricher', 'messaging_indexer'):
+                assert c.execute('SELECT ' + RECOGNITION_WITHHELD + ''' AS withheld FROM attachments a
+                    JOIN messages m ON m.id=a.message''').fetchall() == []
+        # Only the policy's columns: never a selector, label or another job column.
+        refused(s, role, 'SELECT selector FROM subscriptions')
+        refused(s, role, 'SELECT label FROM subscriptions')
+        if base in ('messaging_enricher', 'messaging_indexer'):
+            refused(s, role, 'SELECT title FROM chats')
+            refused(s, role, 'SELECT descriptor FROM media_jobs')
+    finally:
+        remove(s, role)
+
+
 # spec: ANYM-254
 def test_collector_bound_to_one_account_ingests_it_but_cannot_write_another(archive):  # noqa: F811
     ar, s, key, _ = archive

@@ -679,12 +679,14 @@ class FileIndexer:
         # or candidate-row lock held by ingestion waiting on that same counter.
         with self.connection() as c:
             from .file_lifecycle import lifecycle_lock
+            from .media_policy import RECOGNITION_WITHHELD
             lifecycle_lock(c)
             c.execute('SELECT pg_advisory_xact_lock(74509139)')
+            # A queued withheld row (ANYM-805) stays as it is; a lease already taken ends as before.
             expired = c.execute('''SELECT f.attachment,m.account FROM attachment_text f
                 JOIN attachments a ON a.id=f.attachment JOIN messages m ON m.id=a.message
                 WHERE f.attempts>=%s AND
-                (f.state='queued' OR (f.state='leased' AND f.lease_until<clock_timestamp()))
+                ((f.state='queued' AND NOT ''' + RECOGNITION_WITHHELD + ''') OR (f.state='leased' AND f.lease_until<clock_timestamp()))
                 ORDER BY m.account,f.attachment LIMIT 64''', (self.max_attempts,)).fetchall()
             for account in sorted({item['account'] for item in expired}):
                 c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',
@@ -707,11 +709,13 @@ class FileIndexer:
         self._expire_leases()
         with resource_admission.transaction(self.connection()) as (c,resources):
             from .file_lifecycle import lifecycle_lock,PROCESSABLE_ORIGINAL
+            from .media_policy import RECOGNITION_WITHHELD
             lifecycle_lock(c)
             c.execute('SELECT pg_advisory_xact_lock(74509139)')
+            # A withheld file (ANYM-805) is skipped, never changed: it is claimable once a request or a subscription comes.
             rows = c.execute('''SELECT f.*,a.message,m.account FROM attachment_text f
                 JOIN attachments a ON a.id=f.attachment JOIN messages m ON m.id=a.message
-                WHERE ''' + CURRENT + ' AND ' + PROCESSABLE_ORIGINAL + ''' AND f.attempts<%s AND
+                WHERE ''' + CURRENT + ' AND ' + PROCESSABLE_ORIGINAL + ' AND NOT ' + RECOGNITION_WITHHELD + ''' AND f.attempts<%s AND
                 ((f.state='queued' AND f.next_due<=clock_timestamp()) OR
                  (f.state='leased' AND f.lease_until<clock_timestamp()))
                 ORDER BY (m.sent_at>=clock_timestamp()-interval '1 day') DESC,f.next_due,f.attachment

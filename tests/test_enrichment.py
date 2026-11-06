@@ -496,6 +496,66 @@ def test_the_image_flags_survive_the_worker_to_database_read_back(seeded,tmp_pat
     assert saved['metadata']['image_downscaled'] is True and saved['metadata']['image_over_budget'] is True
 
 
+def chat_image(s,chat_type):
+    """A stored image with its media job (no request yet) in a chat of the given kind."""
+    add_image(s)
+    with s.pool.connection() as c:
+        c.execute('''INSERT INTO media_jobs(id,account,message,descriptor,state)
+            VALUES('enrich-image','telegram-demo','demo-tg-2','{}'::jsonb,'ready')''')
+        c.execute("UPDATE chats SET chat_type=%s FROM messages m WHERE m.id='demo-tg-2' AND chats.id=m.chat",(chat_type,))
+        c.execute('TRUNCATE enrichment_budget')
+
+
+def image_worker(s,tmp_path):
+    cfg={'accounts':['telegram-demo'],'max_jobs_per_day':20,'profiles':{'image':profile(tmp_path,kind='image')}}
+    return EnrichmentWorker(s.pool.conninfo,s.files,cfg,processor=lambda *_:None)
+
+
+# spec: ANYM-805
+@pytest.mark.parametrize('chat_type',['group','channel'])
+def test_a_group_image_is_recognized_only_after_an_agent_asks(seeded,tmp_path,chat_type):
+    s,key,_=seeded;chat_image(s,chat_type);w=image_worker(s,tmp_path)
+    def state():
+        with s.pool.connection() as c:
+            row=c.execute("SELECT state,attempts,updated_at FROM attachment_enrichment WHERE attachment='enrich-image'").fetchone()
+            spent=c.execute('''SELECT (SELECT coalesce(sum(attempts),0) FROM enrichment_budget)+
+                (SELECT coalesce(sum(attempts),0) FROM processing_budget) AS n''').fetchone()['n']
+        return row,spent
+    before=state()
+    assert w.claim() is None
+    # Skipped, never changed: no lease, attempt, budget or failure.
+    assert state()==before and before[1]==0
+    item=s.get_attachment(key,'enrich-image')
+    assert item['enrichment_status']=='available_on_request'
+    assert item['recognition_reason']==('channel_on_request' if chat_type=='channel' else 'group_chat_on_request')
+    assert item['recognition_next_action']=='request_file_download'
+    result=s.request_file_download(key,'enrich-image')
+    assert result['request_status']=='ready' and result['recognition_request']=='requested'
+    assert result['next_action']=='get_attachment' and result['requested_until'] is None
+    with s.pool.connection() as c:
+        digest=c.execute("SELECT request_key_digest,requested_until FROM media_jobs WHERE id='enrich-image'").fetchone()
+    assert digest['request_key_digest'] and digest['requested_until'] is None
+    # A repeated request changes nothing.
+    assert 'recognition_request' not in s.request_file_download(key,'enrich-image')
+    row,_=w.claim();assert row['attachment']=='enrich-image'
+
+
+# spec: ANYM-805
+def test_a_personal_image_is_recognized_by_itself(seeded,tmp_path):
+    s,key,_=seeded;chat_image(s,'private');w=image_worker(s,tmp_path)
+    row,_=w.claim();assert row['attachment']=='enrich-image'
+    assert 'recognition_reason' not in s.get_attachment(key,'enrich-image')
+
+
+# spec: ANYM-805
+def test_an_original_without_a_media_job_is_never_withheld(seeded,tmp_path):
+    s,_,_=seeded;add_image(s);w=image_worker(s,tmp_path)
+    with s.pool.connection() as c:
+        c.execute("UPDATE chats SET chat_type='group' FROM messages m WHERE m.id='demo-tg-2' AND chats.id=m.chat")
+        c.execute('TRUNCATE enrichment_budget')
+    row,_=w.claim();assert row['attachment']=='enrich-image'
+
+
 def test_enrichment_budget_fencing_and_deletion(seeded,tmp_path):
     s,_,_=seeded;add_audio(s);w=worker(s,tmp_path,1)
     with s.pool.connection() as c:c.execute('TRUNCATE enrichment_budget')

@@ -16,7 +16,8 @@ TERMINAL = {
 CONNECTION_ERRORS = set(CODES['connection_errors'])
 MEDIA_ERRORS = set(CODES['media_errors'])
 # Why a queued original is not automatic work of the current run (ANYM-284).
-INELIGIBLE = ('outside_prefetch_window','outside_history_bounds','history_bound_unknown','collection_excluded')
+INELIGIBLE = ('outside_prefetch_window','outside_history_bounds','history_bound_unknown','collection_excluded',
+    'group_chat_on_request','channel_on_request')  # the last two: ANYM-805
 LOCAL_STORAGE_ERRORS = {'storage_unavailable','media_storage_unavailable'}
 # The fixed causes of a fail-closed live capture write (ANYM-352).
 CAPTURE_STOP_DETAILS = {'spool_full','disk_reserve','spool_io_error','capture_error'}

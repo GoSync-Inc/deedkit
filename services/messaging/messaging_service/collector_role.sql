@@ -56,3 +56,7 @@ GRANT SELECT,INSERT,UPDATE ON owner_message_reads TO messaging_collector;
 -- Schema 57 (ANYM-621): each collector keeps its own account's conflict re-evaluation progress; the key columns
 -- are not updatable, so a bound collector cannot move another account's row to its own (the CHECK sees NEW only).
 GRANT SELECT,INSERT,UPDATE(cursor,watermark,done_at,last_error) ON conflict_reevaluations TO messaging_collector;
+-- ANYM-805 (owner 2026-11-06): which chats are groups or channels that no active subscription names
+-- (media_policy.ON_REQUEST_CHATS); these columns only.
+GRANT SELECT(subscription,account,chat) ON subscription_sources TO messaging_collector;
+GRANT SELECT(id,state,expires_at,closed_at) ON subscriptions TO messaging_collector;

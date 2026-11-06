@@ -49,6 +49,8 @@ DETAILS={
     'outside_prefetch_window':('The message is outside the collector\'s automatic prefetch window. The original is a known occurrence, downloaded only on an explicit request; a recorded earlier reason is history.','request_file_download'),
     'outside_history_bounds':('The message is older than the collector\'s configured history bound. The collector does not download the original by itself; an explicit request downloads it.','request_file_download'),
     'collection_excluded':('Collection is disabled for this account or chat; the original is not downloaded.','check_collection_policy'),
+    'group_chat_on_request':('Files of this group chat are downloaded and recognized only when an agent asks (owner 2026-11-06); no active subscription names the chat. request_file_download downloads it and its text follows.','request_file_download'),
+    'channel_on_request':('Files of this channel are downloaded and recognized only when an agent asks (owner 2026-11-06); no active subscription names the chat. request_file_download downloads it and its text follows.','request_file_download'),
     'history_bound_unknown':('The collector has not confirmed the history bound of this chat. A request is recorded, but whether the collector can download the original is unknown.','get_sync_status_for_chat'),
 }
 

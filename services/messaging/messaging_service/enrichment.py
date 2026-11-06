@@ -268,6 +268,7 @@ class EnrichmentWorker:
         self._expire_leases()
         with resource_admission.transaction(self.connection()) as (c,resources):
             from .file_lifecycle import lifecycle_lock,PROCESSABLE_ORIGINAL
+            from .media_policy import RECOGNITION_WITHHELD
             lifecycle_lock(c)
             # Serialize claims/budget only, never inference. Failed attempts count.
             c.execute('SELECT pg_advisory_xact_lock(74509139)')
@@ -301,7 +302,7 @@ class EnrichmentWorker:
                     JOIN attachments a ON a.id=e.attachment JOIN messages m ON m.id=a.message
                     LEFT JOIN attachment_text f ON f.attachment=a.id'''+residency+'''
                     LEFT JOIN processing_control pc ON pc.account=m.account AND pc.kind=%s AND pc.profile_hash=%s
-                    WHERE '''+PROCESSABLE_ORIGINAL+''' AND (pc.pause_reason IS NULL OR pc.paused_until<=clock_timestamp()) AND a.active AND NOT m.deleted AND e.source_digest=a.digest AND e.source_revision=m.revision
+                    WHERE '''+PROCESSABLE_ORIGINAL+''' AND NOT '''+RECOGNITION_WITHHELD+''' AND (pc.pause_reason IS NULL OR pc.paused_until<=clock_timestamp()) AND a.active AND NOT m.deleted AND e.source_digest=a.digest AND e.source_revision=m.revision
                     AND m.account=ANY(%s) AND '''+condition+''' AND e.next_due<=clock_timestamp()
                     AND ((e.state IN ('unconfigured','queued','failed') AND (e.attempts<3 OR e.profile_hash IS DISTINCT FROM %s)
                             AND NOT (e.state='failed' AND coalesce(e.error_code,'')=ANY(%s) AND e.profile_hash IS NOT DISTINCT FROM %s))

@@ -11,12 +11,13 @@ from datetime import datetime, timezone
 
 from .file_index import file_response_fields
 from .media_retry import MEDIA_MAX_ATTEMPTS
+from .media_policy import RECOGNITION_REASON, RECOGNITION_WITHHELD
 from .status_details import describe
 
 
 # Download phase of a queued original the current collector run will not fetch by itself.
 WAITING = {'outside_prefetch_window':'available_on_request','outside_history_bounds':'available_on_request',
-    'collection_excluded':'blocked'}
+    'collection_excluded':'blocked','group_chat_on_request':'available_on_request','channel_on_request':'available_on_request'}
 
 
 def processing_phases(c, row):
@@ -35,6 +36,7 @@ def processing_phases(c, row):
         coalesce(length(f.text_content),0) AS text_chars,f.processor_version,f.extractor,
         coalesce(f.truncated,false) AS truncated,
         (f.extraction_metadata-'page_spans'-'sheet_spans'-'cell_spans') AS extraction_metadata,
+        '''+RECOGNITION_WITHHELD+''' AS recognition_withheld,'''+RECOGNITION_REASON+''' AS recognition_reason,
         CASE WHEN coalesce(e.state,'unconfigured')='unconfigured' AND EXISTS(
             SELECT FROM processing_profiles pp WHERE pp.account=m.account AND pp.enabled
             AND pp.kind=CASE WHEN a.mime LIKE 'audio/%%' OR a.mime='application/ogg' THEN 'audio'
@@ -102,6 +104,11 @@ def attachment_fields(row, *, original_present=None):
             action='get_attachment' if requested or state=='leased' else 'request_file_download' if state=='queued' else 'get_sync_status_for_chat'
     extraction=row.get('extraction_state',row.get('extraction_status','unknown')) if registered else 'awaiting_download'
     enrichment=row.get('enrichment_state',row.get('enrichment_status','unconfigured')) if registered else 'awaiting_download'
+    # ANYM-805: recognition of a file of an on-request chat that no agent asked for waits for a request.
+    withheld=registered and bool(row.get('recognition_withheld'))
+    if withheld:
+        extraction='available_on_request' if extraction=='queued' else extraction
+        enrichment='available_on_request' if enrichment in ('queued','unconfigured') else enrichment
     coverage={key:row[key] for key in ('text_chars','processor_version','truncated','extraction_metadata','extractor')
         if registered and key in row}
     # ANYM-669: a message read selects only the two OCR counters (ocr_metadata); they join the coverage for OCR rows
@@ -137,6 +144,9 @@ def attachment_fields(row, *, original_present=None):
     if enrichment=='ready' and (kind.startswith('audio/') or kind=='application/ogg'):
         item['transcript_ready']=True  # get_file_text returns it by default (ANYM-453).
     if eligibility=='unknown':item['eligibility_reason']='history_bound_unknown'
+    if withheld and 'available_on_request' in (extraction,enrichment):
+        item.update(recognition_reason=row.get('recognition_reason') or 'group_chat_on_request',
+            recognition_next_action='request_file_download')
     source={}
     for name,aliases in {'account':('account',),'chat':('chat',),'message_id':('message_id','message'),
             'provider_chat_id':('provider_chat_id','provider_chat'),
