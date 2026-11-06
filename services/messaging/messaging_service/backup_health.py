@@ -114,8 +114,9 @@ def read_object(path):
     return data
 
 
-def probe_units(units, run=subprocess.run):
+def probe_units(units, run=None):
     """{unit: (ActiveState, StateChangeTimestamp or None)} from one `systemctl show`; None when the probe failed."""
+    run = run or subprocess.run
     try:
         done = run(['systemctl', 'show', '-p', 'Id', '-p', 'ActiveState', '-p', 'StateChangeTimestamp',
                     '--timestamp=us+utc', '--', *units], capture_output=True, text=True, timeout=PROBE_TIMEOUT_S)
@@ -214,7 +215,7 @@ def verifier(profile, entry, states, now):
             'last_snapshot_at': captured.strftime(TIME_FORMAT) if captured else None, 'age_hours': age}
 
 
-def evaluate(config, now, run=subprocess.run):
+def evaluate(config, now, run=None):
     """{profile: reading}; one profile's failure leaves it UNKNOWN and the others evaluated."""
     side, entries = config['side'], config['profiles']
     units = sorted({u for e in entries.values() for u in (e['units'] if side == 'producer' else [e['unit']])})
@@ -336,9 +337,9 @@ def due_codes(active, state, now):
     return sorted(due, key=lambda c: (state.get(c, {}).get('attempted') is not None, state.get(c, {}).get('attempted') or 0, c))
 
 
-def check(config, *, now=None, clock=time.monotonic, run=subprocess.run, send=post, wall=time.time):
+def check(config, *, now=None, clock=time.monotonic, run=None, send=None, wall=time.time):
     """One run: evaluate, write result.json, send due events within the deadline, write the episode state."""
-    moment = now or datetime.now(timezone.utc)
+    moment, send = now or datetime.now(timezone.utc), send or post
     readings = evaluate(config, moment, run)
     state_dir = Path(config['state_directory'])
     checked = moment.strftime(TIME_FORMAT)

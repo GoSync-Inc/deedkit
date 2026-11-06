@@ -7511,7 +7511,8 @@ def test_any_backup_result_gives_five_lines_and_no_error(content):
         handle.write(content)
         handle.flush()
         lines = p.backup_health_lines(handle.name)
-    assert len(lines) == 5 and all(line.startswith("backup ") and "\n" not in line for line in lines)
+    assert len(lines) == 5 and lines[-1] == BACKUP_HINT
+    assert all(line.startswith("backup ") and "\n" not in line for line in lines[:4])
 
 
 # spec: ANYM-807
