@@ -646,8 +646,11 @@ class Archive:
     def _backfill_candidates(self,account,since,days,tiers):
         # Read-only and lock-free: one bounded pass over the due queue that the
         # claim below re-checks under its locks and fences.
-        from .media_policy import ON_REQUEST_CHAT
+        from .media_policy import ON_REQUEST_CHATS
         with self.store.pool.connection() as c:
+            # The on-request chats (ANYM-805) as a constant list, so the candidate plan stays the base query's: a
+            # NOT IN subquery's row estimate could flip it to a backlog-sized join.
+            waiting=[r['chat'] for r in c.execute('SELECT orc.chat FROM ('+ON_REQUEST_CHATS+') orc').fetchall()]
             return [r['id'] for r in c.execute('''SELECT j.id FROM media_jobs j
                 JOIN account_policies p ON p.account=j.account
                 JOIN messages m ON m.id=j.message AND m.account=j.account
@@ -658,9 +661,10 @@ class Archive:
                 (%(account)s::text IS NULL OR j.account=%(account)s) AND p.enabled AND NOT m.deleted AND
                 NOT(ch.provider_chat=ANY(p.exclude_chats)) AND (p.discover_chats OR ch.provider_chat=ANY(p.include_chats)) AND
                 (%(since)s::timestamptz IS NULL OR m.sent_at>=%(since)s) AND
-                m.sent_at<clock_timestamp()-%(days)s*interval '1 day' AND priority.tier<2 AND NOT '''+ON_REQUEST_CHAT+'''
+                m.sent_at<clock_timestamp()-%(days)s*interval '1 day' AND priority.tier<2 AND NOT m.chat=ANY(%(waiting)s::text[])
                 ORDER BY priority.tier,m.sent_at DESC,j.next_due,j.id LIMIT %(limit)s''',
-                {'account':account,'since':since,'days':days,'limit':BACKFILL_CANDIDATES,'max_attempts':MEDIA_MAX_ATTEMPTS,**tiers})]
+                {'account':account,'since':since,'days':days,'limit':BACKFILL_CANDIDATES,'max_attempts':MEDIA_MAX_ATTEMPTS,
+                 'waiting':waiting,**tiers})]
 
     @contextmanager
     def _media_sweep(self,account):
