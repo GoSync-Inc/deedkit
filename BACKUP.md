@@ -233,8 +233,8 @@ does not take a new snapshot and does not stop the collectors again. The error
 is saved in `backups/status.json`; the last successful ID/hash/delivery and
 `last_snapshot_at` are there too. Staleness must be counted from the snapshot, not from a late retry.
 A bind source that is gone refuses the job before any collector stops: `error_code: backup_source_missing`, with
-the mount names in `error_mounts`. A failed Docker command keeps `docker_operation_failed` and adds `error_detail`: Docker's
-stderr, only words of Docker's own messages, everything else `*`.
+the mount names in `error_mounts`. A failed Docker command keeps `docker_operation_failed` and adds `error_detail`, a fixed
+category of its stderr such as `bind_source_missing` or `other`; no text of stderr is kept.
 The receiver's own verifier holds the upload lock for a whole restore (about an hour). A delivery it
 refuses as `receiver_busy` before it stores anything (stream_v2: before the stream started; staged_v1: the
 receiver checks its lock before it stores a byte, though the runner may already have sent part of the bundle

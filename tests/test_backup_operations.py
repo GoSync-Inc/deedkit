@@ -14,7 +14,7 @@ import pytest
 
 from messaging_service import backup_runner as backup_runner_module
 from messaging_service.backup_receiver import receive,locked,prune,AGE_HEADER
-from messaging_service.backup_runner import DETAIL_LIMIT,DOCKER_WORDS,Docker,DockerFailure,ID,Runner,docker_detail,source_absent,write_json,read_json,upload
+from messaging_service.backup_runner import DOCKER_DETAILS,Docker,DockerFailure,ID,Runner,docker_detail,source_absent,write_json,read_json,upload
 from messaging_service.backup_worker import dump_credentials
 
 NAME='20261013T000000Z-0123456789abcdef'
@@ -277,7 +277,7 @@ def test_a_docker_failure_records_what_failed_without_any_value(tmp_path,monkeyp
             b'/opt/private/owner.dsn postgres://user:hunter2@db/x sha256:abc')
     monkeypatch.setattr(backup_runner_module.subprocess,'run',lambda *a,**k:SimpleNamespace(returncode=1,stdout=b'',stderr=stderr))
     with pytest.raises(DockerFailure,match='^docker_operation_failed$') as failure:Docker.call('create')
-    assert failure.value.detail=='error response from daemon invalid mount config for type bind bind source path does not exist *'
+    assert failure.value.detail=='bind_source_missing'
     monkeypatch.undo()
     runner,docker=runner_fixture(tmp_path)
     real=docker.call
@@ -293,13 +293,19 @@ def test_a_docker_failure_records_what_failed_without_any_value(tmp_path,monkeyp
 
 # spec: ANYM-126
 @given(st.binary(max_size=6000))
-def test_a_docker_detail_is_bounded_and_only_ever_docker_words(stderr):
-    detail=docker_detail(stderr)
-    assert len(detail)<=DETAIL_LIMIT
-    # Cut at the limit a last word may be a prefix of a listed word: a prefix of a fixed word is no value either.
-    words=detail.split()
-    assert all(word=='*' or word in DOCKER_WORDS for word in words[:-1])
-    assert not words or words[-1]=='*' or any(known.startswith(words[-1]) for known in DOCKER_WORDS)
+def test_a_docker_detail_is_only_ever_a_fixed_category(stderr):
+    assert docker_detail(stderr) in {detail for _,detail in DOCKER_DETAILS}|{'other'}
+
+
+# spec: ANYM-126
+@pytest.mark.parametrize('stderr,detail',[
+    (b'Error: No such container: "login"','container_missing'),
+    (b'Error response from daemon: Conflict. The container name "/private-name" is already in use by container "abc"','name_conflict'),
+    (b' '*4091+b'login-private-suffix','other'),
+    (b'postgres://user:hunter2@db/x','other'),
+],ids=['allowlisted_word_as_a_name','name_conflict','token_across_the_input_bound','a_value_alone'])
+def test_no_word_of_a_docker_stderr_reaches_the_detail(stderr,detail):
+    assert docker_detail(stderr)==detail
 
 
 def test_runner_interrupted_capture_removes_abandoned_ciphertext_but_never_delivered_jobs(tmp_path):

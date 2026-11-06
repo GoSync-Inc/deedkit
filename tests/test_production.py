@@ -5521,6 +5521,25 @@ def test_a_release_a_backup_runner_configuration_names_stays_with_no_backup_cont
 
 
 # spec: ANYM-689
+@pytest.mark.parametrize("undo", [False, True], ids=["configuration", "undo_copy"])
+def test_a_directory_in_the_trash_a_runner_configuration_names_stays(tmp_path, monkeypatch, undo):
+    settings, state, history = prune_host(tmp_path)
+    (tmp_path / "http").mkdir()
+    trash = state / p.RELEASE_TRASH
+    (trash / ("e" * 40) / "settings").mkdir(parents=True)
+    (trash / ("f" * 40)).mkdir()
+    config = tmp_path / "runners" / "runner.json"
+    monkeypatch.setattr(p, "RUNNER_CONFIGS", (config,))
+    source = f"{trash}/{'e' * 40}/settings"
+    pin(config, image_id("a"), **({} if undo else {"source": source}))
+    if undo:
+        (config.parent / "runner.json.before-x").write_text(json.dumps({"image": image_id("a"), "source": source}))
+    PruneHost(monkeypatch, [], history)
+    p.prune_releases(settings, tmp_path / "http", p.time.monotonic() + 60)
+    assert (trash / ("e" * 40) / "settings").is_dir() and not (trash / ("f" * 40)).exists()
+
+
+# spec: ANYM-689
 def test_a_release_a_runner_configuration_names_stays_in_the_http_state_too(tmp_path, monkeypatch):
     settings, state, history = prune_host(tmp_path)
     http_state = tmp_path / "http"

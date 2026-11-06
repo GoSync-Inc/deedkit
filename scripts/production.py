@@ -2486,7 +2486,8 @@ def prune_state(directory, mirror, tip, protected, mounted, deadline, summary, *
         if time.monotonic() >= deadline:
             summary["interrupted"] = "time budget"
             return
-        remove_path(leftover, deadline)
+        if leftover.name not in protected | mounted:  # a path may name a directory already moved here
+            remove_path(leftover, deadline)
     history = run(["git", "-C", str(mirror), "rev-list", "--first-parent", tip]).split()
     present = {path.name for path in subdirectories(directory) if RELEASE_DIRECTORY.fullmatch(path.name)}
     if tip not in history:

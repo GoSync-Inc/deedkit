@@ -493,28 +493,24 @@ def dump_timeout(cfg):
     return cfg.get('dump_timeout_seconds',min(1800,cfg['timeout_seconds']))
 
 
-# Words of Docker's own error messages. docker_detail keeps only these, so nothing else of stderr (a path, a name, an ID,
-# the output of a process in the container) can reach a record: anything outside the list reads `*`.
-DOCKER_WORDS=frozenset("""a able access already at bind by can cannot config conflict connect container context create
-    daemon deadline denied device directory does error exceeded exec exist failed file find for from have image in invalid
-    is kill killed left locally login may mkdir mount name network no not oci on or path permission process pull read-only
-    remove rename repository require response reuse runtime running shim source space start stop such system task that
-    the timeout to type unable use volume you""".split())
+# What a failed Docker command's stderr says, as a fixed category. Only the category leaves this process, never a word of
+# stderr: a name or path can be any word, so no filter of the text itself could tell it from Docker's message (Astra r1).
+DOCKER_DETAILS=(('bind source path does not exist','bind_source_missing'),('no such image','image_missing'),
+    ('unable to find image','image_missing'),('no such container','container_missing'),('no such network','network_missing'),
+    ('no such volume','volume_missing'),('is already in use','name_conflict'),('no space left','no_space'),
+    ('read-only file system','read_only_filesystem'),('permission denied','permission_denied'),
+    ('cannot connect to the docker daemon','daemon_unreachable'),('deadline exceeded','daemon_timeout'))
 DETAIL_INPUT=4096
-DETAIL_LIMIT=300
 
 
 def docker_detail(stderr):
-    """Docker's stderr as a bounded record that holds no value: only DOCKER_WORDS and `*`, one space between them."""
-    words=[]
-    for word in stderr[:DETAIL_INPUT].decode(errors='replace').split():
-        word=word.strip('"\'`:;,.()[]').lower();word=word if word in DOCKER_WORDS else '*'
-        if word!='*' or words[-1:]!=['*']:words.append(word)
-    return ' '.join(words)[:DETAIL_LIMIT].strip()
+    """The category of Docker's stderr; `other` when no known message is in it."""
+    text=stderr[:DETAIL_INPUT].decode(errors='replace').lower()
+    return next((detail for message,detail in DOCKER_DETAILS if message in text),'other')
 
 
 class DockerFailure(RuntimeError):
-    """The fixed `docker_operation_failed`, with what docker_detail keeps of stderr beside it."""
+    """The fixed `docker_operation_failed`, with the docker_detail category of its stderr beside it."""
     def __init__(self,stderr):
         super().__init__('docker_operation_failed');self.detail=docker_detail(stderr)
 
