@@ -42,6 +42,17 @@ message history notice are service events. Template, interactive, buttons,
 list, product and group invite messages keep their visible text (header media
 is not fetched). A business placeholder masked from linked devices stays an
 empty `unknown` message of native type `placeholder` (ANYM-471).
+Rows captured before that change stay `unknown` in the archive. While the
+provider is connected, the adapter counts them once per `REPAIR_VERSION`
+(`repair.go`, ANYM-809): it runs the current classifier on each retained raw
+(at most 50 rows a tick, never while capture has queued work) and tallies
+`would_add_content`, `label_only`, `same`, `no_raw`, `placeholder`,
+`sender_key_only` or `parse_error`. It rewrites no journal row and publishes
+nothing; its only write is one `repair_progress` row in `capture.sqlite`, and
+`.repair-status` carries counts and a fixed error code (`repair_read`,
+`repair_storage`) to `get_sync_status` (detail=full, `native_repair`). A
+rollback to the previous adapter ignores the table. The repair itself is a
+follow-up.
 An exhausted local cache is not a complete WhatsApp history.
 
 The account-specific operation manifest reflects the selected provider after
