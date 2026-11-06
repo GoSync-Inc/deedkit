@@ -29,8 +29,9 @@ def publish(ar, *, days=7, since=None, chat_since='published'):
     state.media_policy(days,since)
     if chat_since!='absent':
         with ar.store.pool.connection() as c:
+            # A personal chat (peer_kind user): a group's media waits for a request (ANYM-805).
             c.execute('''INSERT INTO collector_chats(account,provider_chat,peer_kind,history_since)
-                VALUES(%s,'100','chat',%s) ON CONFLICT(account,provider_chat) DO UPDATE SET history_since=excluded.history_since''',
+                VALUES(%s,'100','user',%s) ON CONFLICT(account,provider_chat) DO UPDATE SET history_since=excluded.history_since''',
                 (ACCOUNT,since if chat_since=='published' else chat_since))
     return state
 
@@ -95,6 +96,54 @@ def test_attachment_outside_window_is_available_on_request_not_blocked(archive):
     assert row['attachments'][0]['download_reason']=='outside_prefetch_window'
     text=present_message({**row,'body':''},0)['display_text']
     assert 'доступен по запросу' in text and 'недостаточно места' not in text
+
+
+def kind(s, chat_type):
+    with s.pool.connection() as c:
+        c.execute("UPDATE chats SET chat_type=%s WHERE account=%s AND provider_chat='100'",(chat_type,ACCOUNT))
+
+
+# spec: ANYM-805
+@pytest.mark.parametrize('chat_type,reason',[('group','group_chat_on_request'),('channel','channel_on_request')])
+def test_group_and_channel_files_read_available_on_request_everywhere(archive,chat_type,reason):
+    from messaging_service.result_evidence import decorate
+    from messaging_service.conversation import present_message
+    ar,s,key,_=archive;publish(ar)
+    fid=queued(ar,s,days=1)
+    kind(s,chat_type)
+    result=s.get_attachment(key,fid)
+    assert result['download_phase']=='available_on_request' and result['download_reason']==reason
+    assert result['next_action']=='request_file_download' and result['download_eligibility']==reason
+    assert 'request_file_download' in result['error_detail']['explanation']
+    with s.pool.connection() as c:
+        row=c.execute('SELECT * FROM messages WHERE id=%s',(result['message_id'],)).fetchone()
+        decorate(c,[row])
+    assert row['attachments'][0]['download_reason']==reason
+    assert row['attachments'][0]['next_action']=='request_file_download'
+    assert 'доступен по запросу' in present_message({**row,'body':''},0)['display_text']
+    status,_=media(s)
+    assert status[reason+'_jobs']==1 and status['eligible_queued_jobs']==0 and status['state']=='idle'
+    assert reason in [d['reason_code'] for d in status['diagnostics']]
+    # A request makes it the run's own work again.
+    assert s.request_file_download(key,fid)['request_status']=='queued'
+    status,_=media(s)
+    assert status[reason+'_jobs']==0 and status['eligible_queued_jobs']==1
+
+
+# spec: ANYM-805
+def test_a_subscription_naming_the_group_returns_its_files_to_the_window(archive):
+    ar,s,key,_=archive;publish(ar)
+    fid=queued(ar,s,days=1)
+    kind(s,'group')
+    assert media(s)[0]['group_chat_on_request_jobs']==1
+    with s.pool.connection() as c:
+        chat=c.execute("SELECT id FROM chats WHERE account=%s AND provider_chat='100'",(ACCOUNT,)).fetchone()['id']
+    token=s.issue_key('media-watcher',[ACCOUNT],permissions=['read','subscription-write'],
+        key_permissions=['read','subscription-write'])
+    s.create_subscription(token,[chat])
+    status,_=media(s)
+    assert status['group_chat_on_request_jobs']==0 and status['eligible_queued_jobs']==1
+    assert s.get_attachment(key,fid)['download_phase']!='available_on_request'
 
 
 # spec: ANYM-284

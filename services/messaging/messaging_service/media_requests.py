@@ -132,6 +132,10 @@ def _request(store,c,p,attachment_id):
     if row.get('digest') and not managed:
         result.update(request_status='ready' if present else 'unavailable',
             reason='original_downloaded' if present else 'original_missing',requested_until=None)
+        if present and recognition_request(c,p,row):
+            # ANYM-805: the stored original of an on-request chat is recognized now that an agent asked.
+            recognition_requested(result)
+            result.update(recognition_request='requested',next_action='get_attachment',poll_after_seconds=60)
         return serial(result)
     if managed and 'job_state' not in row:
         result.update(request_status='unavailable',reason='provider_source_unavailable',requested_until=None)
@@ -156,6 +160,8 @@ def _request(store,c,p,attachment_id):
         idle_job=row['job_state'] in ('ready','failed') or (row['job_state']=='queued' and row['attempts']>=MEDIA_MAX_ATTEMPTS)
         if cold and cold['verified'] and idle_job:
             if cold['restore_state']=='requested':
+                # Another occurrence of the digest may have asked first; this one's recognition follows too (ANYM-805).
+                recognition_request(c,p,row)
                 result.update(request_status='coalesced',reason='managed_original_evicted',rehydration_source='cold_archive',
                     requested_until=row['requested_until'],next_action='get_attachment',poll_after_seconds=10)
                 return serial(result)
@@ -176,6 +182,9 @@ def _request(store,c,p,attachment_id):
             next_action='check_collection_policy')
         return serial(result)
     if row['job_state']=='leased' and row['transfer_active']:
+        # A download that started before the request (a subscription since paused, an older collector):
+        # its recognition follows the request once it is stored (ANYM-805).
+        recognition_request(c,p,row)
         result.update(request_status='processing',requested_until=row['requested_until'],
             next_action='get_attachment')
         return serial(result)
@@ -222,6 +231,26 @@ def _request(store,c,p,attachment_id):
     return serial(result)
 
 
+def recognition_request(c,p,row):
+    """Record an agent's request on a job whose recognition is withheld (ANYM-805); True when it was withheld.
+
+    The request key digest is the evidence the enricher and the indexer read; it opens no request window, so it
+    takes no request quota (provider_demand counts open windows only) and moves no download.
+    """
+    if row.get('request_key_digest') is not None:return False
+    from .media_policy import ON_REQUEST_CHAT
+    return c.execute('''UPDATE media_jobs j SET request_key_digest=%s FROM messages m
+        WHERE j.id=%s AND m.id=j.message AND j.request_key_digest IS NULL AND '''+ON_REQUEST_CHAT+''' RETURNING j.id''',
+        (p['key_digest'],row['id'])).fetchone() is not None
+
+
+def recognition_requested(result):
+    """The answer to a recorded recognition request reads as queued work, not as waiting for one (ANYM-805)."""
+    for key in ('extraction_status','enrichment_status'):
+        if result.get(key)=='available_on_request':result[key]='queued'
+    result.pop('recognition_reason',None);result.pop('recognition_next_action',None)
+
+
 def wake_backoff(c,row,result,attachment_id):
     """Make a queued job due now for an open request window; no attempt is spent (ANYM-699).
 
@@ -260,6 +289,9 @@ def cold_request(c,p,attachment_id,row,result):
     if provider:
         until=c.execute('''UPDATE media_jobs SET requested_until=clock_timestamp()+interval '1 hour',
             request_key_digest=%s WHERE id=%s RETURNING requested_until''',(p['key_digest'],attachment_id)).fetchone()['requested_until']
+    else:
+        # The restored original's recognition follows the request too (ANYM-805).
+        recognition_request(c,p,row)
     c.execute('''UPDATE attachment_cold_copies SET restore_state='requested',restore_attachment=%s,
         restore_requested_at=clock_timestamp(),restore_error=NULL,
         restore_finished_at=CASE WHEN restore_finished_at>clock_timestamp() THEN restore_finished_at END WHERE digest=%s''',

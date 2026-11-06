@@ -34,3 +34,10 @@ REVOKE ALL ON FUNCTION public.publish_processing_event(text[],text,text,text,tex
  public.publish_file_enrichment_event(text,text,text,text,jsonb) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.publish_file_enrichment_event(text,text,text,text,jsonb) TO messaging_enricher;
 COMMIT;
+-- ANYM-805 (owner 2026-11-06): which chats are groups or channels that no active subscription names
+-- (media_policy.ON_REQUEST_CHATS), and whether an agent asked for a file; these columns only.
+GRANT SELECT(id,account,provider_chat,chat_type) ON chats TO messaging_enricher;
+GRANT SELECT(account,provider_chat,peer_kind) ON collector_chats TO messaging_enricher;
+GRANT SELECT(subscription,account,chat) ON subscription_sources TO messaging_enricher;
+GRANT SELECT(id,state,expires_at,closed_at) ON subscriptions TO messaging_enricher;
+GRANT SELECT(id,request_key_digest) ON media_jobs TO messaging_enricher;

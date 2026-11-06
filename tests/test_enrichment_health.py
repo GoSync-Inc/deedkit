@@ -80,6 +80,19 @@ def test_stall_raises_for_a_scope_whose_newest_ready_is_old(s):
     assert codes(s) == {'enrichment_stalled'}
 
 
+# spec: ANYM-805
+def test_withheld_group_rows_raise_no_stall_until_an_agent_asks(s):
+    profile(s);queued=job(s);job(s, 'ready', age='7 hours')
+    with s.pool.connection() as c:
+        c.execute('''INSERT INTO media_jobs(id,account,message,descriptor,state)
+            SELECT id,%s,message,'{}'::jsonb,'ready' FROM attachments WHERE id=%s''', (TG, queued))
+        c.execute("UPDATE chats SET chat_type='group' FROM messages m WHERE m.id=%s AND chats.id=m.chat", (MESSAGE[TG],))
+    assert codes(s) == set()
+    with s.pool.connection() as c:
+        c.execute("UPDATE media_jobs SET request_key_digest='synthetic-key' WHERE id=%s", (queued,))
+    assert codes(s) == {'enrichment_stalled'}
+
+
 # spec: ANYM-785
 def test_another_scopes_fresh_ready_does_not_hide_a_stall(s):
     profile(s);profile(s, WA)

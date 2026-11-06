@@ -175,6 +175,32 @@ def add_file(s, attachment, message, content, filename='invoice.txt', mime='text
     return digest
 
 
+# spec: ANYM-805
+def test_indexer_skips_a_withheld_group_file_and_its_ceiling_sweep_leaves_it_queued(seeded):
+    s, key, _ = seeded
+    add_file(s, 'file-group', 'demo-tg-1', b'group invoice text')
+    with s.pool.connection() as c:
+        c.execute('''INSERT INTO media_jobs(id,account,message,descriptor,state)
+            VALUES('file-group','telegram-demo','demo-tg-1','{}'::jsonb,'ready')''')
+        c.execute("UPDATE chats SET chat_type='group' FROM messages m WHERE m.id='demo-tg-1' AND chats.id=m.chat")
+        before = c.execute("SELECT state,attempts FROM attachment_text WHERE attachment='file-group'").fetchone()
+    worker = worker_for(s)
+    # The seeded files of the chat have no media job, so they are not withheld; the group's file is.
+    assert 'file-group' not in [item['attachment'] for item in drain(worker)]
+    with s.pool.connection() as c:
+        assert c.execute("SELECT state,attempts FROM attachment_text WHERE attachment='file-group'").fetchone() == before
+        # At the attempt ceiling a queued withheld row is still not failed.
+        c.execute("UPDATE attachment_text SET attempts=%s WHERE attachment='file-group'", (worker.max_attempts,))
+    assert drain(worker) == []
+    with s.pool.connection() as c:
+        assert c.execute("SELECT state FROM attachment_text WHERE attachment='file-group'").fetchone()['state'] == 'queued'
+        c.execute("UPDATE attachment_text SET attempts=0 WHERE attachment='file-group'")
+    assert s.request_file_download(key, 'file-group')['recognition_request'] == 'requested'
+    assert [item['attachment'] for item in drain(worker)] == ['file-group']
+    with s.pool.connection() as c:
+        assert c.execute("SELECT state FROM attachment_text WHERE attachment='file-group'").fetchone()['state'] == 'ready'
+
+
 def search(s, token, *args, **kwargs):
     with s.authorized(token, 'search') as (c, p):
         return search_files(s, c, p, *args, **kwargs)

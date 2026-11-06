@@ -378,6 +378,45 @@ another automatic retry. `needs_attention` remains true when other jobs are
 simultaneously paused for storage. Other smaller eligible jobs can proceed on later passes.
 Normal capture and metadata/text search remain independent of this pause.
 
+### Group and channel chats: download and recognition on request (ANYM-805)
+
+Owner 2026-11-06: files of personal chats are downloaded and recognized by themselves; files of
+groups and channels only when an agent asks, unless an agent's subscription names the chat. One SQL
+definition, `media_policy.ON_REQUEST_CHATS`, decides it for every path below:
+
+- **Chat kind.** `chats.chat_type` when it is `private`, `group` or `channel`; otherwise the
+  collector's `collector_chats.peer_kind` (`user` personal, `chat` group, `channel` channel);
+  otherwise unknown. A chat of unknown kind counts as personal: the rule fails toward keeping and
+  recognizing files. WhatsApp group chats are groups; WhatsApp channels are not captured at all.
+- **The exception.** A group or channel listed in `subscription_sources` of a subscription that is
+  `active` (with `expires_at` unset or less than 24 hours past), or that became `closed`, `expired`
+  or `access_changed` less than 24 hours ago, keeps automatic download and recognition. A paused
+  subscription and a dynamic one (`sources={all_visible_chats: true}`, which lists no chat) make no
+  exception. The set follows subscriptions as they start and end; no stored row is rewritten.
+
+`Archive.claim_media` claims a job of an on-request chat only while its explicit request window is
+open: not through the prefetch window, `media_prefetch_days: null`, the live tier or Telegram backfill.
+Jobs of personal, unknown-kind and subscribed chats are claimed as before, the 7-day window included,
+so naming a busy group in a subscription downloads its last week of files. Telegram and both WhatsApp
+collectors share this path. Messages of on-request chats are still captured and searchable.
+
+What an agent sees for such a file not yet downloaded: `download_phase: available_on_request`,
+`download_reason` `group_chat_on_request` or `channel_on_request`, `next_action:
+request_file_download`, in `get_attachment` and in the attachment items of message reads,
+conversation views and search results. Account media operations in sync status count them as
+`group_chat_on_request_jobs` and `channel_on_request_jobs`, not in `eligible_queued_jobs`.
+
+Recognition (text extraction, OCR, transcription, description) of a file of an on-request chat
+waits for an agent's request as well; ENRICHMENT.md, "On-request chats", says how. A stored file
+whose recognition waits reads `extraction_status`/`enrichment_status` `available_on_request` with
+`recognition_reason` (the chat code) and `recognition_next_action: request_file_download`.
+`request_file_download` on such a stored file answers `request_status: ready`,
+`recognition_request: requested`, `next_action: get_attachment`, `poll_after_seconds: 60`; it opens
+no request window, takes no request quota and moves no download.
+
+WhatsApp keeps media on its servers only for a limited time, so a WhatsApp group file nobody asked
+for in that time cannot be fetched later. The rule is the same for both messengers (owner 2026-11-06).
+
 ### Which queued originals count as pending (schema 35, no migration)
 
 A recorded `error_code` is the reason of the job's last attempt, not a current

@@ -537,7 +537,7 @@ class Archive:
     def claim_media(self,owner,*,account=None,ttl=120,collector_lease=None,since=None,writer=None,
                     live_writer=None,live_window_seconds=86400,media_prefetch_days=None,backfill=False):
         from .storage_admission import StorageAdmission
-        from .media_policy import validate_prefetch_days
+        from .media_policy import validate_prefetch_days,ON_REQUEST_CHAT,on_request_chat
         validate_prefetch_days(media_prefetch_days)
         if type(backfill) is not bool: raise ValueError('invalid_backfill')
         if not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',owner) or not 10<=ttl<=600: raise ValueError('invalid_worker')
@@ -577,11 +577,14 @@ class Archive:
                 # the job, message and chat joins start from these ids, never a backlog scan.
                 arms=['SELECT r.id FROM media_jobs r WHERE r.requested_until>%(now)s'
                     +('' if account is None else ' AND r.account=%(account)s')]
+                # An on-request chat's recent messages bring no job into the arm (ANYM-805): its jobs wait
+                # for a request, and the requests arm reaches them.
                 if media_prefetch_days>0:arms.append('''SELECT w.id FROM media_jobs w WHERE w.message=ANY(ARRAY(
                     SELECT wm.id FROM messages wm WHERE wm.sent_at<=%(now)s+interval '5 minutes'
                     AND wm.sent_at>=greatest(%(now)s-%(days)s::integer*interval '1 day',
                         coalesce(%(since)s::timestamptz,'-infinity'))'''
-                    +(' AND NOT wm.deleted' if account is None else ' AND wm.account=%(account)s')+'))')
+                    +(' AND NOT wm.deleted' if account is None else ' AND wm.account=%(account)s')
+                    +' AND NOT '+on_request_chat('wm')+'))')
                 if backfill_ids:arms.append('SELECT unnest(%(backfill_ids)s::text[])')
                 candidates=' AND j.id=ANY(ARRAY('+' UNION ALL '.join(arms)+'))'
             # A cached generic plan of this repeated statement would not see the window bounds.
@@ -603,10 +606,11 @@ class Archive:
                     j.requested_until>clock_timestamp() AND EXISTS(SELECT 1 FROM collector_chats bc
                         WHERE bc.account=j.account AND bc.provider_chat=ch.provider_chat
                         AND bc.history_since=%(since)s::timestamptz)) AND
-                (%(days)s::integer IS NULL OR j.requested_until>clock_timestamp() OR
+                -- An on-request chat's job is claimed only by an unexpired request (ANYM-805, media_policy.ON_REQUEST_CHAT).
+                (j.requested_until>clock_timestamp() OR NOT '''+ON_REQUEST_CHAT+''' AND (%(days)s::integer IS NULL OR
                     (%(days)s::integer>0 AND m.sent_at>=%(now)s-%(days)s*interval '1 day'
                         AND m.sent_at<=%(now)s+interval '5 minutes') OR
-                    (j.id=ANY(%(backfill_ids)s::text[]) AND priority.tier<2)) AND
+                    (j.id=ANY(%(backfill_ids)s::text[]) AND priority.tier<2))) AND
                 ((j.state='queued' AND j.next_due<=clock_timestamp()) OR
                  (j.state='leased' AND j.lease_until<clock_timestamp()))'''+candidates+'''
                 ORDER BY priority.requested DESC,CASE WHEN NOT priority.requested THEN j.id=ANY(%(backfill_ids)s::text[]) END,
@@ -642,7 +646,11 @@ class Archive:
     def _backfill_candidates(self,account,since,days,tiers):
         # Read-only and lock-free: one bounded pass over the due queue that the
         # claim below re-checks under its locks and fences.
+        from .media_policy import ON_REQUEST_CHATS
         with self.store.pool.connection() as c:
+            # The on-request chats (ANYM-805) as a constant list, so the candidate plan stays the base query's: a
+            # NOT IN subquery's row estimate could flip it to a backlog-sized join.
+            waiting=[r['chat'] for r in c.execute('SELECT orc.chat FROM ('+ON_REQUEST_CHATS+') orc').fetchall()]
             return [r['id'] for r in c.execute('''SELECT j.id FROM media_jobs j
                 JOIN account_policies p ON p.account=j.account
                 JOIN messages m ON m.id=j.message AND m.account=j.account
@@ -653,9 +661,10 @@ class Archive:
                 (%(account)s::text IS NULL OR j.account=%(account)s) AND p.enabled AND NOT m.deleted AND
                 NOT(ch.provider_chat=ANY(p.exclude_chats)) AND (p.discover_chats OR ch.provider_chat=ANY(p.include_chats)) AND
                 (%(since)s::timestamptz IS NULL OR m.sent_at>=%(since)s) AND
-                m.sent_at<clock_timestamp()-%(days)s*interval '1 day' AND priority.tier<2
+                m.sent_at<clock_timestamp()-%(days)s*interval '1 day' AND priority.tier<2 AND NOT m.chat=ANY(%(waiting)s::text[])
                 ORDER BY priority.tier,m.sent_at DESC,j.next_due,j.id LIMIT %(limit)s''',
-                {'account':account,'since':since,'days':days,'limit':BACKFILL_CANDIDATES,'max_attempts':MEDIA_MAX_ATTEMPTS,**tiers})]
+                {'account':account,'since':since,'days':days,'limit':BACKFILL_CANDIDATES,'max_attempts':MEDIA_MAX_ATTEMPTS,
+                 'waiting':waiting,**tiers})]
 
     @contextmanager
     def _media_sweep(self,account):

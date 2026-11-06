@@ -4,6 +4,7 @@ import time
 
 from . import telemetry
 from .file_lifecycle import PROCESSABLE_ORIGINAL
+from .media_policy import RECOGNITION_WITHHELD
 
 MINI_PROVIDER = 'deedkit_inference'
 CHECK_PERIOD_S = 300
@@ -18,7 +19,8 @@ LOCK_TIMEOUT_MS = 1000
 
 STALLED, STARVED, NO_WORKER = 'enrichment_stalled', 'enrichment_starved', 'enrichment_no_worker'
 
-# A scope is (account, kind, profile_hash). Only current rows a claim could take count: a row of a
+# A scope is (account, kind, profile_hash). Only current rows a claim could take count (a withheld file of an
+# on-request chat no agent asked for, ANYM-805, is not one): a row of a
 # replaced revision, a deleted message or an evicted original waits forever and would alert forever.
 SCOPES_SQL = '''WITH queued AS MATERIALIZED (
         SELECT m.account,e.kind,e.profile_hash,count(*) AS queued,min(e.updated_at) AS oldest_queued,
@@ -27,7 +29,7 @@ SCOPES_SQL = '''WITH queued AS MATERIALIZED (
         FROM attachment_enrichment e JOIN attachments a ON a.id=e.attachment JOIN messages m ON m.id=a.message
         WHERE e.state='queued' AND e.provider=%(provider)s AND e.kind IS NOT NULL AND e.profile_hash IS NOT NULL
             AND a.active AND NOT m.deleted AND e.source_digest=a.digest AND e.source_revision=m.revision
-            AND '''+PROCESSABLE_ORIGINAL.replace('%', '%%')+'''
+            AND '''+PROCESSABLE_ORIGINAL.replace('%', '%%')+''' AND NOT '''+RECOGNITION_WITHHELD.replace('%', '%%')+'''
         GROUP BY 1,2,3),
     ready AS (
         SELECT m.account,e.kind,e.profile_hash,max(e.updated_at) AS newest
