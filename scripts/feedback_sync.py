@@ -368,11 +368,11 @@ def open_check(text):
 def follow_target(now, status, commit, live, check=None, via=None, refused=None):
     """The card-driven target of one item, or (None, reason). `check` is a Review card's open check, `via` the pull
     request of the mapping entry `commit` comes from, `refused` why the card's entry is refused."""
+    if now['status'] in (*AGENT_VERDICTS, 'declined', 'duplicate'):
+        return None, f'{now["status"]} kept'
     ref = now['spec_ref']
     if not ref:
         return None, 'no card'
-    if now['status'] in (*AGENT_VERDICTS, 'declined', 'duplicate'):
-        return None, f'{now["status"]} kept'
     if (now.get('note') or '').startswith(triage.HOLD):
         return None, 'opt-in hold'
     if status is None:

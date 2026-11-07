@@ -1175,6 +1175,21 @@ def test_a_feedback_line_on_exactly_one_card_links_and_other_mentions_do_not(tmp
     assert 'proposed new card' not in (state_dir(tmp_path) / 'last-run.json').read_text()  # no note text
 
 
+# spec: ANYM-536
+def test_hourly_report_distinguishes_closed_feedback_without_a_card_from_pending_feedback(tmp_path):
+    prod = Prod({A: disp('declined'), B: disp('duplicate', dup=A), C: disp()})
+    assert auto(tmp_path, prod, '--apply', main=main_of()) == 0
+
+    report = synced(tmp_path, 'last-run.json')
+    assert report['reasons'] == {
+        'declined kept': [{'feedback': A, 'card': None}],
+        'duplicate kept': [{'feedback': B, 'card': None}],
+        'waiting for a card': [{'feedback': C, 'card': None}],
+    }
+    assert [row['feedback'] for row in report['waiting_for_card']] == [C]
+    assert prod.writes == []
+
+
 # spec: ANYM-570
 def test_an_enable_only_hold_is_never_linked_or_followed_even_when_a_card_names_it(tmp_path):
     hold = disp('received', note='waits for the owner: opt-in (ANYM-12)')
