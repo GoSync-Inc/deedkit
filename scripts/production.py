@@ -4217,6 +4217,52 @@ def calendar_backup_line(path=None, at=None):
 INFERENCE_WORKER_RECEIPT = Path("/var/lib/deedkit/inference-worker.json")
 
 
+# ANYM-807: the hourly backup checker (deploy/deedkit-backup-health.service) writes this; `status` prints one line a profile.
+BACKUP_HEALTH_RESULT = Path("/var/lib/deedkit-backup-health/result.json")
+BACKUP_HEALTH_PROFILES = ("messaging", "calendar", "recordings", "calls")
+BACKUP_HEALTH_WORDS = ("delivered", "FAILED", "STALE", "UNKNOWN")
+
+
+def backup_health_lines(path=None, at=None):
+    """One `status` line per backup profile from the checker's result; read-only, and never an error for `status`."""
+    def unknown(reason):
+        return [f"backup {name}: UNKNOWN ({reason})" for name in BACKUP_HEALTH_PROFILES]
+    hint = "backup: verified state is on backup-1 (backup_health.py --print)"
+    try:
+        try:
+            with open(path or BACKUP_HEALTH_RESULT, "rb") as handle:
+                data = json.loads(handle.read(65536))
+        except FileNotFoundError:
+            return [*unknown("no recent check"), hint]
+        if not isinstance(data, dict) or not isinstance(data.get("profiles"), dict):
+            return [*unknown("result unreadable"), hint]
+        checked = data.get("checked_at")
+        try:
+            moment = datetime.strptime(checked, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return [*unknown("result unreadable"), hint]
+        elapsed = ((at or datetime.now(timezone.utc)) - moment).total_seconds()
+        if elapsed > CALENDAR_FRESHNESS_MAX_AGE or elapsed < -300:
+            return [*unknown("no recent check"), hint]
+        lines = []
+        for name in BACKUP_HEALTH_PROFILES:
+            entry = data["profiles"].get(name)
+            if entry is None:
+                lines.append(f"backup {name}: not configured")
+                continue
+            word = entry.get("word") if isinstance(entry, dict) else None
+            if word not in BACKUP_HEALTH_WORDS:
+                lines.append(f"backup {name}: UNKNOWN (result unreadable)")
+                continue
+            last, age = entry.get("last_snapshot_at"), entry.get("age_hours")
+            last = last if isinstance(last, str) and re.fullmatch(r"[0-9T:Z-]{20}", last) else "never"
+            shown = f"{age:.1f}h" if isinstance(age, (int, float)) and not isinstance(age, bool) else "?"
+            lines.append(f"backup {name}: {word} last capture {last} age={shown} (checked {checked})")
+        return [*lines, hint]
+    except Exception:
+        return [*unknown("result unreadable"), hint]
+
+
 def inference_worker_line(path=None):
     """The `status` line for deedkit-inference-worker.service's receipt (ANYM-794); read-only, never an error for `status`."""
     prefix = "inference worker: "
@@ -7233,6 +7279,8 @@ def print_result(args, result, parser):
         if args.action == "status":
             # Beside the JSON, not in it: a reader that parses stdout keeps getting one document.
             print(calendar_backup_line(), file=sys.stderr)
+            for line in backup_health_lines():
+                print(line, file=sys.stderr)
             print(inference_worker_line(), file=sys.stderr)
 
 

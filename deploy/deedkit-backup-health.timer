@@ -1,0 +1,11 @@
+[Unit]
+Description=DeedKit backup alerts (hourly at :37, away from the :00 backup starts and the calendar check at :07)
+
+[Timer]
+OnCalendar=*-*-* *:37:00 UTC
+Persistent=true
+AccuracySec=1min
+Unit=deedkit-backup-health.service
+
+[Install]
+WantedBy=timers.target
