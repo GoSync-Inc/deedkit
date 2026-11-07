@@ -3,6 +3,8 @@
 # Eviction always requires a read-back verified cold copy (ANYM-297): enable
 # the cold-archive profile first, and keep eviction in dry run until its report
 # shows verified copies for the due originals.
+# ANYM-806: each pass also removes originals of on-request group/channel chats 24 hours after their last read
+# (MEDIA_STORAGE.md); an operator's bulk run uses a one-shot `run --rm file-lifecycle ... --chat-policy-only`.
 services:
   file-lifecycle:
     profiles: [file-lifecycle]

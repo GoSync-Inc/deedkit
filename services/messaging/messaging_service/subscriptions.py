@@ -483,6 +483,11 @@ def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=
         raise APIError('invalid_subscription')
     if len(json.dumps(selector, ensure_ascii=False).encode()) > 14000:
         raise APIError('invalid_filter')
+    if sources:
+        # ANYM-805/806: a chat a subscription names keeps its originals; serialize with the eviction recheck and
+        # unlink (file_lifecycle), which run under the lifecycle lock, so a file is never removed after this commits.
+        from .file_lifecycle import lifecycle_lock
+        lifecycle_lock(c)
     row = c.execute('''INSERT INTO subscriptions(principal,key_id,scope_version,key_permission_version,
         selector,label,start_position,matched_through,expires_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
         RETURNING *''', (p['id'], p['key_id'], p['scope_version'], p['key_permission_version'],
@@ -554,6 +559,10 @@ def update_subscription(store, c, p, subscription_id, version, *, action, resume
             gap = {'reason': 'explicit_resume_skip', 'after': position, 'through': head,
                 'recoverable': False, 'intentional': True}
         position = head
+    if action == 'resume':
+        # ANYM-805/806: a resumed subscription protects its chats' originals again (see create).
+        from .file_lifecycle import lifecycle_lock
+        lifecycle_lock(c)
     row = c.execute('''UPDATE subscriptions SET state=%s,version=version+1,
         matched_through=%s,gap=%s,blocked_reason=NULL,updated_at=clock_timestamp()
         WHERE id=%s RETURNING *''', (state, position, Jsonb(gap) if gap else None, row['id'])).fetchone()
