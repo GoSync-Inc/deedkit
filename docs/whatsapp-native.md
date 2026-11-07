@@ -42,6 +42,12 @@ message history notice are service events. Template, interactive, buttons,
 list, product and group invite messages keep their visible text (header media
 is not fetched). A business placeholder masked from linked devices stays an
 empty `unknown` message of native type `placeholder` (ANYM-471).
+A message stored before that as `unknown` with no text and no file gets its
+photo, video or document (one file, with or without a caption) when the same
+message is read again at the same provider time: a new revision with a media
+job, the empty revision stays readable, and no version conflict is raised. It
+is no later evidence, so it resolves no open conflict; any other shape keeps
+today's outcome (ANYM-808).
 An exhausted local cache is not a complete WhatsApp history.
 
 The account-specific operation manifest reflects the selected provider after
