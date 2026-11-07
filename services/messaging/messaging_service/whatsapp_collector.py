@@ -115,7 +115,7 @@ class WhatsAppState(CollectorState):
         with self.archive.store.pool.connection() as c:
             row=self._operations(c);value=row['operations']
             value['provider']={'name':name,'contract_version':1,'observed_at':row['observed'].isoformat()}
-            value.pop('provider_history',None)
+            value.pop('provider_history',None);value.pop('provider_repair',None)
             self._save_operations(c,value)
 
     def native_history_observation(self,status):
@@ -126,6 +126,16 @@ class WhatsAppState(CollectorState):
             if value.get('provider',{}).get('name')!='whatsmeow':return
             value['provider_history']={**status,'checked_at':row['observed'].isoformat(),
                 'scope':'latest_native_history_batch','full_history_verified':False}
+            self._save_operations(c,value)
+
+    def native_repair_observation(self,status):
+        # ANYM-809: the native journal's repair count; fixed integers and one fixed code only.
+        status=validate_native_repair_status(status)
+        with self.archive.store.pool.connection() as c:
+            row=self._operations(c);value=row['operations']
+            if value.get('provider',{}).get('name')!='whatsmeow':return
+            value['provider_repair']={**status,'checked_at':row['observed'].isoformat(),
+                'scope':'native_capture_journal','publishes':False}
             self._save_operations(c,value)
 
     def progress(self,chat,kind):
@@ -456,6 +466,21 @@ def validate_native_history_status(value):
     return {**value,'observed_at':utc(value['observed_at'])}
 
 
+NATIVE_REPAIR_STATES=('would_add_content','label_only','same','no_raw','placeholder','sender_key_only','parse_error')
+
+
+def validate_native_repair_status(value):
+    from .envelope import utc
+    def count(x):return type(x) is int and 0<=x<2**53
+    if (not isinstance(value,dict) or set(value)!={'version','done','rows_scanned','counts','last_error','observed_at'}
+        or not count(value['version']) or not 1<=value['version']<=10**6 or type(value['done']) is not bool
+        or not count(value['rows_scanned']) or value['last_error'] not in ('','repair_read','repair_storage')
+        or not isinstance(value['counts'],dict) or set(value['counts'])!=set(NATIVE_REPAIR_STATES)
+        or not all(count(x) for x in value['counts'].values())):
+        raise ValueError('invalid_native_repair_status')
+    return {**value,'counts':{k:value['counts'][k] for k in NATIVE_REPAIR_STATES},'observed_at':utc(value['observed_at'])}
+
+
 class WhatsmeowProvider(NodeProvider):
     """The native child shares the reviewed two-lane IPC, lease and outbox gates.
 
@@ -470,6 +495,9 @@ class WhatsmeowProvider(NodeProvider):
         pass
     def history_status(self):
         try:return validate_native_history_status(private_json(Path(self.cfg['events_directory'])/'.history-status'))
+        except FileNotFoundError:return None
+    def repair_status(self):
+        try:return validate_native_repair_status(private_json(Path(self.cfg['events_directory'])/'.repair-status'))
         except FileNotFoundError:return None
 
 
@@ -524,6 +552,12 @@ class WhatsAppCollector(TelegramCollector):
                 if status is not None:
                     try:await asyncio.to_thread(self.state.native_history_observation,status)
                     except database_errors():pass  # Diagnostics only; the next heartbeat reports again.
+                # ANYM-809: an invalid or unreadable count file is skipped; it never stops the heartbeat.
+                try:repair=await asyncio.to_thread(self.provider.repair_status)
+                except (OSError,ValueError):repair=None
+                if repair is not None:
+                    try:await asyncio.to_thread(self.state.native_repair_observation,repair)
+                    except database_errors():pass
     async def commit_page_wa(self,page,chat,title,origin):
         if not isinstance(page,dict) or set(page)!={'messages','exhausted','pending'} or not isinstance(page['messages'],list) or len(page['messages'])>self.batch_size:
             raise RuntimeError('invalid_whatsapp_page')
