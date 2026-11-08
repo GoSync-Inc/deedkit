@@ -209,16 +209,60 @@ def test_history_sources_name_the_pairing_batch_live_since_and_the_older_message
     assert row['history']['sources'] == {'pairing_batch_days': 7, 'pairing_batch_per_chat': 50,
         'live_since': None, 'older_messages_call': 'request_chat_history'}
     # A live message under the browser provider is not a native capture.
-    w.state.provider_observation('webjs'); w.state.capture_progress(capture(event(6, chat=A)), 1, 0)
+    w.state.provider_observation('webjs'); drain(w, live(6))
     assert history(w, s)['sources']['live_since'] is None
-    w.state.provider_observation('whatsmeow'); w.state.capture_progress(capture(event(7, chat=A)), 1, 0)
-    first = history(w, s)['sources']['live_since']
-    assert first is not None
-    w.state.capture_progress(capture(event(8, chat=A)), 1, 0)
-    assert history(w, s)['sources']['live_since'] == first
+    # Under the native provider: the batch's first live message counts, not its last item.
+    w.state.provider_observation('whatsmeow'); drain(w, live(7), live(8))
+    assert history(w, s)['sources']['live_since'] == at_second(7)
+    drain(w, live(9))
+    assert history(w, s)['sources']['live_since'] == at_second(7)
     assert row['detail_code'] == 'whatsapp_history_partial'
     explanation = row['detail']['explanation']
     assert 'request_chat_history' in explanation and explanation.count('. ') == 0 and explanation.endswith('.')
+
+
+def live(mid):
+    item = capture(event(mid, chat=A)); item['observed_at'] = at_second(mid)
+    return item
+
+
+def at_second(mid):
+    return datetime(2026, 10, 13, 0, 0, mid, tzinfo=timezone.utc).isoformat()
+
+
+def drain(w, *items):
+    for item in items:
+        w.events_spool.put(item)
+    asyncio.run(w.drain_captures([w.events_spool], [w.history_spool]))
+
+
+# spec: ANYM-813
+def test_live_since_keeps_a_live_message_followed_by_a_deletion_in_one_drain(native):
+    w, s = native
+    w.state.provider_observation('whatsmeow')
+    tombstone = {'kind': 'whatsapp_delete', 'account': w.account, 'chat': A, 'ids': [event(1, chat=A)['messageId']],
+                 'observed_at': at_second(12)}
+    drain(w, live(11), tombstone)
+    assert history(w, s)['sources']['live_since'] == at_second(11)
+
+
+# spec: ANYM-813
+def test_the_first_20_spans_are_the_longest_by_exact_interval():
+    from messaging_service.sync_status import _history
+    base = 1790000000
+    def row(chat, minutes):
+        span = {'from': datetime.fromtimestamp(base, timezone.utc).isoformat(),
+                'to': datetime.fromtimestamp(base+60*minutes, timezone.utc).isoformat(), 'stalled_since': None}
+        return {'account': 'wa-one', 'provider_chat': chat, 'wa_last_scan_at': None,
+                'wa_progress': {'history_exhausted': False, 'unverified_span': span}}
+    # Every span rounds to 0.0 days; the longest has the chat ID that sorts last.
+    rows = [row(f'{n:03d}@c.us', 5+n) for n in range(20)] + [row('999@c.us', 60)]
+    result = _history('whatsapp', set(), rows)
+    listed = [span['chat_id'] for span in result['unverified_spans']]
+    assert result['unverified_span_chats'] == 21 and len(listed) == 20
+    assert listed[0] == stable_id('chat', 'wa-one', '999@c.us')
+    assert stable_id('chat', 'wa-one', '000@c.us') not in listed
+    assert {span['days'] for span in result['unverified_spans']} == {0.0}
 
 
 # spec: ANYM-813

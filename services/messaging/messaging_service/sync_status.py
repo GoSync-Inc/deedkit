@@ -90,7 +90,9 @@ def _history(platform, catalog_ids, rows):
                 spans.append({'chat_id': chat_id, **span})
             result['gap_cleared_chats'] += progress.get('gap') is not True and progress.get('gap_cleared_at') is not None
         result['unverified_span_chats'] = len(spans)
-        spans.sort(key=lambda span: (-span['days'], span['chat_id']))
+        # Longest first by the exact interval; `days` is rounded for display only.
+        spans.sort(key=lambda span: (datetime.fromisoformat(span['from'])-datetime.fromisoformat(span['to']),
+                                     span['chat_id']))
         result['unverified_spans'] = spans[:20]
         # A flagged gap has no recorded span: the archive cannot say how much is missing (ANYM-700).
         result['gap_chat_ids'] = [{'chat_id': chat_id, 'span': 'unknown'} for chat_id in sorted(gap_ids)[:20]]
