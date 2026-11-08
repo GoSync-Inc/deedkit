@@ -54,7 +54,7 @@ class FakeAdapter:
         return subprocess.CompletedProcess(argv, 0, '\n'.join(out)+'\n', '')
 
 
-def test_dsn():
+def probe_dsn():
     # The disposable database of the `database` fixture (tests/conftest.py), which these tests already require.
     return Path(os.environ['PROBE_TEST_DSN_FILE']).read_text().strip()
 
@@ -124,7 +124,7 @@ def test_media_key_is_unknown_when_the_adapter_cannot_answer(inventory_archive, 
 def test_inventory_runs_inside_a_read_only_transaction_and_changes_nothing(inventory_archive, tmp_path, monkeypatch, capsys):
     ar, s = inventory_archive
     fid = failed(ar, s, 'false_'+CHAT+'_OLD1', sent_days=400)
-    dsn = test_dsn()
+    dsn = probe_dsn()
     with s.pool.connection() as c:
         before = c.execute('SELECT state,error_code,attempts,next_due,requested_until FROM media_jobs WHERE id=%s',
             (fid,)).fetchone()
@@ -146,7 +146,7 @@ def test_inventory_runs_inside_a_read_only_transaction_and_changes_nothing(inven
     assert len(opened) == 1 and opened[0].read_only is True
     # The same reads succeed in a transaction PostgreSQL itself keeps read-only: none of them writes.
     with real(dsn, row_factory=dict_row) as c:
-        c.execute('SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY')
+        c.read_only = True  # every transaction of this session begins READ ONLY
         assert media_inventory.inventory(c, ACCOUNT)['failed_jobs'] == 1
         with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
             c.execute("UPDATE media_jobs SET attempts=attempts WHERE id=%s", (fid,))
@@ -159,7 +159,7 @@ def test_inventory_runs_inside_a_read_only_transaction_and_changes_nothing(inven
 # spec: ANYM-815
 def test_inventory_refuses_an_unknown_or_non_whatsapp_account(inventory_archive, tmp_path, capsys):
     ar, s = inventory_archive
-    dsn_file = tmp_path/'dsn'; dsn_file.write_text(test_dsn()); dsn_file.chmod(0o600)
+    dsn_file = tmp_path/'dsn'; dsn_file.write_text(probe_dsn()); dsn_file.chmod(0o600)
     for account in ('archive-test', 'missing-account', 'bad account'):
         with pytest.raises(SystemExit):
             collector_control.run_media_inventory(dsn_file, account, None)
