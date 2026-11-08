@@ -41,7 +41,8 @@ def exit_detail(returncode):
     return {0:'exit_clean',1:'exit_error',2:'exit_panic'}.get(returncode,'exit_other')
 # How long history waits for whatsmeow's own auto-reconnect: the connect_timeout a fresh start gets.
 NOT_READY_WAIT_SECONDS=300
-HISTORY_READS=('dialogs','page')
+# ANYM-814: the repair calls are refused before any send while not ready, like a page read.
+HISTORY_READS=('dialogs','page','gap_repair_status','gap_repair')
 
 
 class ProviderOperationError(RuntimeError): pass
@@ -134,7 +135,7 @@ def merge_gap_clear(progress,stored,gap_set):
     if not gap_set:progress.pop('gap',None)
 
 
-GAP_REPAIR_TERMINAL=frozenset({'verified','phone_has_no_older','budget_exhausted','request_uncertain'})
+GAP_REPAIR_TERMINAL=frozenset({'verified','phone_has_no_older','budget_exhausted','request_uncertain','incomplete_answer'})
 GAP_REPAIR_SPAN_ANSWERS=10
 
 
@@ -176,6 +177,9 @@ def advance_gap_repair(span,repair,rows):
         if state!='answered':continue
         repair['request_ids'].append(rid);repair['answered']+=1
         oldest,got,count=row['oldest_ts'],row['got'],row['count']
+        # A message the adapter's capture did not keep breaks continuity: never verified (Astra r1 B3).
+        if row.get('skipped',0):
+            repair.update(state='incomplete_answer',remaining={'from':span['from'],'to':span['to']});break
         if got>0 and oldest<=start:
             repair.update(state='verified',verified_by='phone_history');break
         if got<count:repair['state']='phone_has_no_older';break
@@ -194,7 +198,8 @@ def valid_gap_status(status):
     if type(status.get('outstanding')) is not int or type(status.get('paused_until_ms')) is not int:return None
     for row in status['requests']:
         if (not isinstance(row,dict) or not all(isinstance(row.get(k),str) for k in ('request_id','span_id','state'))
-                or not all(type(row.get(k)) is int for k in ('count','got','oldest_ts'))):return None
+                or not all(type(row.get(k)) is int for k in ('count','got','oldest_ts'))
+                or type(row.get('skipped',0)) is not int):return None
     return status
 
 
@@ -204,7 +209,7 @@ class WhatsAppState(CollectorState):
         with self.archive.store.pool.connection() as c:
             row=self._operations(c);value=row['operations']
             value['provider']={'name':name,'contract_version':1,'observed_at':row['observed'].isoformat()}
-            value.pop('provider_history',None);value.pop('provider_repair',None)
+            value.pop('provider_history',None);value.pop('provider_repair',None);value.pop('gap_repair',None)
             self._save_operations(c,value)
 
     def native_history_observation(self,status):
@@ -651,6 +656,7 @@ class WhatsAppCollector(TelegramCollector):
     connect_timeout=300
     retry_connect=True
     gap_repair=False  # ANYM-814: also off for an instance built without __init__.
+    gap_repair_reported=False
     @property
     def history_spool(self):
         # WhatsApp pages already have their own spool; live events use events_spool.
@@ -758,13 +764,20 @@ class WhatsAppCollector(TelegramCollector):
         await asyncio.to_thread(self.state.status,'degraded' if missing or unavailable else 'receiving',code)
         await asyncio.to_thread(self.state.phase,'history','waiting','history_scan_finished')
         if self.gap_repair:await self.repair_gaps()
+        elif not self.gap_repair_reported and getattr(self.provider,'native_history',False) is True:
+            # Off: say so locally, once per process, without any adapter call (Astra r1 M1).
+            await asyncio.to_thread(self.state.gap_repair_observation,{'enabled':False,'outstanding':0,'paused_until_ms':0})
+            self.gap_repair_reported=True
     async def repair_gaps(self):
         """ANYM-814: one step of the phone repair: read the adapter's requests, update each span, ask for at
         most one. The request returns after the send; the answer arrives through the adapter's history worker.
         A provider refusal or a malformed reply ends this step only: the scan above is already committed."""
         if getattr(self.provider,'native_history',False) is not True:return
+        from .commands import CommandRejected
+        # Expected adapter refusals (rate limit, anchor, caps) end this step only (Astra r1 B1).
+        refused=(ProviderOperationError,ProviderUnavailable,CommandRejected)
         try:status=valid_gap_status(await self.provider.call('gap_repair_status',{}))
-        except ProviderOperationError:return
+        except refused:return
         if status is None:return
         rows={}
         for row in status['requests']:rows.setdefault(row['span_id'],[]).append(row)
@@ -788,7 +801,7 @@ class WhatsAppCollector(TelegramCollector):
         params={'chat':chat,'span_id':repair['span_id'],'before_ts':int(datetime.fromisoformat(span['to']).timestamp()),
             'after_request':repair.get('cursor_request') or ''}
         try:await self.provider.call('gap_repair',params)
-        except ProviderOperationError:return
+        except refused:return
         await asyncio.to_thread(self.state.save_gap_repair,chat,{**repair,'state':'outstanding'})
     async def reconcile_loop(self):
         from .telegram_collector import database_errors

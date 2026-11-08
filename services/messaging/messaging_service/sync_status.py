@@ -127,7 +127,7 @@ def unverified_span(progress):
 
 
 GAP_REPAIR_STATES = ('waiting', 'outstanding', 'verified', 'phone_has_no_older', 'budget_exhausted',
-                     'request_uncertain')
+                     'request_uncertain', 'incomplete_answer')
 
 
 def gap_repair_state(progress):
@@ -138,7 +138,7 @@ def gap_repair_state(progress):
     value = {'state': state, 'request_ids': ids}
     if state == 'verified':
         value['verified_by'] = 'phone_history'
-    if state == 'budget_exhausted' and isinstance(repair.get('remaining'), dict):
+    if state in ('budget_exhausted', 'incomplete_answer') and isinstance(repair.get('remaining'), dict):
         value['remaining'] = {k: repair['remaining'].get(k) for k in ('from', 'to')}
     return value
 

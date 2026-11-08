@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"go.mau.fi/whatsmeow"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waHistorySync "go.mau.fi/whatsmeow/proto/waHistorySync"
@@ -66,7 +67,7 @@ type gapRequest struct {
 
 func ensureRepairRequests(db *sql.DB) error {
 	for _, q := range []string{
-		`CREATE TABLE IF NOT EXISTS repair_requests(request_id TEXT PRIMARY KEY,account TEXT NOT NULL,chat TEXT NOT NULL,span_id TEXT NOT NULL,anchor_id TEXT NOT NULL,anchor_ts INTEGER NOT NULL,anchor_from_me INTEGER NOT NULL,count INTEGER NOT NULL,state TEXT NOT NULL,created_ms INTEGER NOT NULL,deadline_ms INTEGER NOT NULL DEFAULT 0,answered_ms INTEGER NOT NULL DEFAULT 0,got INTEGER NOT NULL DEFAULT 0,oldest_id TEXT NOT NULL DEFAULT '',oldest_ts INTEGER NOT NULL DEFAULT 0,oldest_from_me INTEGER NOT NULL DEFAULT 0)`,
+		`CREATE TABLE IF NOT EXISTS repair_requests(request_id TEXT PRIMARY KEY,account TEXT NOT NULL,chat TEXT NOT NULL,span_id TEXT NOT NULL,anchor_id TEXT NOT NULL,anchor_ts INTEGER NOT NULL,anchor_from_me INTEGER NOT NULL,count INTEGER NOT NULL,state TEXT NOT NULL,created_ms INTEGER NOT NULL,deadline_ms INTEGER NOT NULL DEFAULT 0,answered_ms INTEGER NOT NULL DEFAULT 0,got INTEGER NOT NULL DEFAULT 0,oldest_id TEXT NOT NULL DEFAULT '',oldest_ts INTEGER NOT NULL DEFAULT 0,oldest_from_me INTEGER NOT NULL DEFAULT 0,skipped INTEGER NOT NULL DEFAULT 0)`,
 		`CREATE INDEX IF NOT EXISTS repair_requests_span ON repair_requests(span_id,state)`,
 		`CREATE TABLE IF NOT EXISTS repair_account(id INTEGER PRIMARY KEY CHECK(id=1),no_answer_streak INTEGER NOT NULL DEFAULT 0,paused_until_ms INTEGER NOT NULL DEFAULT 0,reason TEXT NOT NULL DEFAULT '')`,
 		`INSERT INTO repair_account(id)VALUES(1)ON CONFLICT DO NOTHING`,
@@ -291,7 +292,13 @@ func (p *Provider) gapRepairRequest(ctx context.Context, raw json.RawMessage, po
 	}
 	deadline := time.Now().Add(repairDeadline).UnixMilli()
 	if err = p.Capture.moveRepair(id, "sending", "sent", deadline); err != nil {
-		return nil, err
+		// The phone may answer before the send returns: the row is then already
+		// answered, which completes this request (Astra r1 B2).
+		var state string
+		if p.Capture.db.QueryRow("SELECT state FROM repair_requests WHERE request_id=?", id).Scan(&state) != nil || state != "answered" {
+			return nil, err
+		}
+		return map[string]any{"request_id": id, "state": state, "deadline_ms": deadline, "count": repairCount}, nil
 	}
 	return map[string]any{"request_id": id, "state": "sent", "deadline_ms": deadline, "count": repairCount}, nil
 }
@@ -309,9 +316,9 @@ func (s *CaptureStore) repairAnswer(notif *waE2E.HistorySyncNotification, data *
 	}
 	return s.inRepairTx(func(tx *sql.Tx) error {
 		var chat, state string
-		var got int
+		var got, skipped int
 		var oldestTS int64
-		err := tx.QueryRow("SELECT chat,state,got,oldest_ts FROM repair_requests WHERE request_id=?", session).Scan(&chat, &state, &got, &oldestTS)
+		err := tx.QueryRow("SELECT chat,state,got,oldest_ts,skipped FROM repair_requests WHERE request_id=?", session).Scan(&chat, &state, &got, &oldestTS, &skipped)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -328,7 +335,7 @@ func (s *CaptureStore) repairAnswer(notif *waE2E.HistorySyncNotification, data *
 				return err
 			}
 		} else {
-			got, oldestTS = 0, 0
+			got, oldestTS, skipped = 0, 0, 0
 		}
 		for _, conv := range data.GetConversations() {
 			jid, err := types.ParseJID(conv.GetID())
@@ -338,7 +345,19 @@ func (s *CaptureStore) repairAnswer(notif *waE2E.HistorySyncNotification, data *
 			for _, item := range conv.GetMessages() {
 				wm := item.GetMessage()
 				ts := int64(wm.GetMessageTimestamp())
-				if wm.GetKey().GetID() == "" || ts == 0 || ts > maxEnvelopeUnix {
+				// Evidence is only what capture durably kept (Astra r1 B3): a message
+				// skipped as invalid, unrepresentable or excluded is counted apart and
+				// keeps the span from being verified.
+				var kept int
+				if wm.GetKey().GetID() != "" && ts != 0 && ts <= maxEnvelopeUnix {
+					// capture.message_id is LegacyMessageID: fromMe_chat_id, plus _sender in groups.
+					legacy := fmt.Sprintf("%t_%s_%s", wm.GetKey().GetFromMe(), chat, wm.GetKey().GetID())
+					if err = tx.QueryRow("SELECT COUNT(*) FROM capture WHERE chat=? AND(message_id=? OR substr(message_id,1,?)=?)", chat, legacy, len(legacy)+1, legacy+"_").Scan(&kept); err != nil {
+						return err
+					}
+				}
+				if kept == 0 {
+					skipped++
 					continue
 				}
 				got++
@@ -347,7 +366,7 @@ func (s *CaptureStore) repairAnswer(notif *waE2E.HistorySyncNotification, data *
 				}
 			}
 		}
-		if _, err = tx.Exec("UPDATE repair_requests SET state='answered',answered_ms=?,got=?,oldest_id=?,oldest_ts=?,oldest_from_me=? WHERE request_id=?", now.UnixMilli(), got, oldestID, oldestTS, oldestFromMe, session); err != nil {
+		if _, err = tx.Exec("UPDATE repair_requests SET state='answered',answered_ms=?,got=?,oldest_id=?,oldest_ts=?,oldest_from_me=?,skipped=? WHERE request_id=?", now.UnixMilli(), got, oldestID, oldestTS, oldestFromMe, skipped, session); err != nil {
 			return err
 		}
 		_, err = tx.Exec("UPDATE repair_account SET no_answer_streak=0 WHERE id=1")
@@ -369,7 +388,7 @@ func (s *CaptureStore) repairStatus(enabled bool, now time.Time) (map[string]any
 	if paused <= now.UnixMilli() {
 		paused, reason = 0, ""
 	}
-	rows, err := s.db.Query("SELECT request_id,chat,span_id,state,count,created_ms,got,oldest_ts FROM(SELECT * FROM repair_requests ORDER BY created_ms DESC LIMIT 500)ORDER BY created_ms")
+	rows, err := s.db.Query("SELECT request_id,chat,span_id,state,count,created_ms,got,oldest_ts,skipped FROM(SELECT * FROM repair_requests ORDER BY created_ms DESC LIMIT 500)ORDER BY created_ms")
 	if err != nil {
 		return nil, err
 	}
@@ -377,15 +396,15 @@ func (s *CaptureStore) repairStatus(enabled bool, now time.Time) (map[string]any
 	requests, outstanding := []map[string]any{}, 0
 	for rows.Next() {
 		var id, chat, span, state string
-		var count, got int
+		var count, got, skipped int
 		var created, oldest int64
-		if err = rows.Scan(&id, &chat, &span, &state, &count, &created, &got, &oldest); err != nil {
+		if err = rows.Scan(&id, &chat, &span, &state, &count, &created, &got, &oldest, &skipped); err != nil {
 			return nil, err
 		}
 		if state == "reserved" || state == "sending" || state == "sent" {
 			outstanding++
 		}
-		requests = append(requests, map[string]any{"request_id": id, "chat": chat, "span_id": span, "state": state, "count": count, "created_ms": created, "got": got, "oldest_ts": oldest})
+		requests = append(requests, map[string]any{"request_id": id, "chat": chat, "span_id": span, "state": state, "count": count, "created_ms": created, "got": got, "oldest_ts": oldest, "skipped": skipped})
 	}
 	if err = rows.Err(); err != nil {
 		return nil, err

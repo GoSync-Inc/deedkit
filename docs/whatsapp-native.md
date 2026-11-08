@@ -93,13 +93,18 @@ for at most one span through `gap_repair` on the background lane. Contract:
   apart; per span at most 10 answered requests; two consecutive `no_answer` pause
   the repair for 6 hours (`phone_unreachable`), spending no answer budget.
 - Correlation: only an ON_DEMAND history sync whose `PeerDataRequestSessionID`
-  equals the reserved request id is recorded as its answer (count and oldest
-  message). A cache page, a catch-up reaching the head, a pairing batch or an
+  equals the reserved request id is recorded as its answer: the count and oldest
+  of the messages capture kept, and how many it did not keep (skipped, excluded);
+  one not kept ends the span `incomplete_answer`, never verified. An answer that
+  arrives before the send returns completes the request. A cache page, a catch-up reaching the head, a pairing batch or an
   agent's own request closes nothing. If the phone does not echo the id, nothing
   closes and requests end `no_answer` (fail closed). The answer's messages are
   captured by the existing history worker like any history sync; the next request
   anchors on the answer's oldest message. The first anchor is the oldest cached
   message at or after the span's `to`.
+- A refusal (`history_rate_limited`, an unavailable anchor, a cap) ends only that
+  repair step; `provider_not_ready` keeps the reconnect grace of a page read. With
+  the switch off the collector records `enabled: false` without an adapter call.
 - Waiting holds no lock: the request returns after the send; live capture, sends,
   other history and media continue.
 

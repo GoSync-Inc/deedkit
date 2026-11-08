@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"reflect"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -109,11 +111,29 @@ func onDemand(session string, chat string, ids []string, first int64) (*waE2E.Hi
 	conv := &waHistorySync.Conversation{ID: proto.String(chat)}
 	for i, id := range ids {
 		conv.Messages = append(conv.Messages, &waHistorySync.HistorySyncMsg{Message: &waWeb.WebMessageInfo{
-			Key:              &waCommon.MessageKey{RemoteJID: proto.String(chat), FromMe: proto.Bool(i%2 == 0), ID: proto.String(id)},
+			Key:              &waCommon.MessageKey{RemoteJID: proto.String(chat), FromMe: proto.Bool(false), ID: proto.String(id)},
 			MessageTimestamp: proto.Uint64(uint64(first + int64(i))),
 		}})
 	}
 	return notif, &waHistorySync.HistorySync{SyncType: waHistorySync.HistorySync_ON_DEMAND.Enum(), Conversations: []*waHistorySync.Conversation{conv}}
+}
+
+// keepAnswer captures the answer's messages as the history worker does before repairAnswer.
+func keepAnswer(t *testing.T, p *Provider, ids []string, first int64) {
+	t.Helper()
+	for i, id := range ids {
+		if err := p.Capture.Put(fixtureMessage(id, first+int64(i)), "history"); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func fiftyIDs() []string {
+	ids := make([]string, 50)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("OLD%02d", i)
+	}
+	return ids
 }
 
 // spec: ANYM-814
@@ -333,6 +353,7 @@ func TestGapRepairCountsOnlyTheCorrelatedOnDemandAnswer(t *testing.T) {
 	if err := p.Capture.repairAnswer(notif, data, time.Now()); err != nil || repairState(t, p, "REQ1") != "sent" {
 		t.Fatalf("uncorrelated closed state=%s err=%v", repairState(t, p, "REQ1"), err)
 	}
+	keepAnswer(t, p, ids, 1600000000)
 	notif, data = onDemand("REQ1", "111111@s.whatsapp.net", ids, 1600000000)
 	if err := p.Capture.repairAnswer(notif, data, time.Now()); err != nil {
 		t.Fatal(err)
@@ -342,7 +363,7 @@ func TestGapRepairCountsOnlyTheCorrelatedOnDemandAnswer(t *testing.T) {
 		t.Fatal(err)
 	}
 	row := status["requests"].([]map[string]any)[0]
-	if row["state"] != "answered" || row["got"] != 50 || row["oldest_ts"] != int64(1600000000) || status["outstanding"] != 0 {
+	if row["state"] != "answered" || row["got"] != 50 || row["skipped"] != 0 || row["oldest_ts"] != int64(1600000000) || status["outstanding"] != 0 {
 		t.Fatalf("row=%v status=%v", row, status)
 	}
 	// The cursor moves to the answer's oldest message; the span stays.
@@ -378,5 +399,80 @@ func TestGapRepairWaitingHoldsNoLock(t *testing.T) {
 	}
 	if got := repairState(t, p, "REQ1"); got != "sent" {
 		t.Fatalf("state=%s", got)
+	}
+}
+
+// spec: ANYM-814
+func TestGapRepairAnswerCountsOnlyMessagesCaptureKept(t *testing.T) {
+	p := repairProvider(t)
+	installRepairFake(t)
+	if _, err := askRepair(p, "span-a", ""); err != nil {
+		t.Fatal(err)
+	}
+	ids := fiftyIDs()
+	// The oldest message was not kept (skipped or excluded): it is no evidence.
+	keepAnswer(t, p, ids[1:], 1600000001)
+	notif, data := onDemand("REQ1", "111111@s.whatsapp.net", ids, 1600000000)
+	if err := p.Capture.repairAnswer(notif, data, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	status, err := p.Capture.repairStatus(true, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := status["requests"].([]map[string]any)[0]
+	if row["got"] != 49 || row["skipped"] != 1 || row["oldest_ts"] != int64(1600000001) {
+		t.Fatalf("row=%v", row)
+	}
+}
+
+// spec: ANYM-814
+func TestGapRepairAnswerBeforeTheSendReturnsCompletesTheRequest(t *testing.T) {
+	p := repairProvider(t)
+	f := installRepairFake(t)
+	ids := fiftyIDs()
+	// The phone answers while the send is still returning (Astra r1 B2).
+	f.after = func() {
+		keepAnswer(t, p, ids, 1600000000)
+		notif, data := onDemand("REQ1", "111111@s.whatsapp.net", ids, 1600000000)
+		if err := p.Capture.repairAnswer(notif, data, time.Now()); err != nil {
+			t.Error(err)
+		}
+	}
+	result, err := askRepair(p, "span-a", "")
+	if err != nil || result["state"] != "answered" || repairState(t, p, "REQ1") != "answered" {
+		t.Fatalf("result=%v err=%v state=%s", result, err, repairState(t, p, "REQ1"))
+	}
+}
+
+// spec: ANYM-814
+func TestGapRepairAndAgentRequestRaceSendOnlyOne(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		p := repairProvider(t)
+		f := installRepairFake(t)
+		var agent atomic.Int32
+		old := sendHistoryRequest
+		sendHistoryRequest = func(context.Context, *whatsmeow.Client, *types.MessageInfo, int) error {
+			agent.Add(1)
+			return nil
+		}
+		pol, _ := p.policy()
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			<-start
+			raw, _ := json.Marshal(map[string]any{"chat": historyChat, "count": 10})
+			_, _ = p.requestHistory(context.Background(), raw, pol)
+		})
+		wg.Go(func() {
+			<-start
+			_, _ = askRepair(p, "span-a", "")
+		})
+		close(start)
+		wg.Wait()
+		sendHistoryRequest = old
+		if total := int(agent.Load()) + len(f.sent); total != 1 {
+			t.Fatalf("round %d: agent=%d repair=%d", i, agent.Load(), len(f.sent))
+		}
 	}
 }

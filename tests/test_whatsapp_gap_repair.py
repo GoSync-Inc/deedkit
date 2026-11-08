@@ -32,13 +32,14 @@ class Phone(NativeCache):
         self.asked.append(dict(params))
         request = f'REQ{len(self.rows)+1}'
         self.rows.append({'request_id': request, 'chat': params['chat'], 'span_id': params['span_id'],
-                          'state': 'sent', 'count': 50, 'created_ms': len(self.rows), 'got': 0, 'oldest_ts': 0})
+                          'state': 'sent', 'count': 50, 'created_ms': len(self.rows), 'got': 0, 'oldest_ts': 0,
+                          'skipped': 0})
         return {'request_id': request, 'state': 'sent', 'deadline_ms': 0, 'count': 50}
 
-    def answer(self, got, oldest_ts, state='answered'):
+    def answer(self, got, oldest_ts, state='answered', skipped=0):
         row = self.rows[-1]
         assert row['state'] == 'sent'
-        row.update(state=state, got=got, oldest_ts=oldest_ts)
+        row.update(state=state, got=got, oldest_ts=oldest_ts, skipped=skipped)
 
 
 def ts(mid):
@@ -73,7 +74,7 @@ def test_flag_off_makes_no_repair_request_and_no_reservation(seeded, tmp_path):
     stored = progress(w)
     assert stored['unverified_span'] and 'gap_repair' not in stored
     status = history(w, s)
-    assert status['gap_repair']['enabled'] is False and status['gap_repair']['outstanding'] == 0
+    assert status['gap_repair']['enabled'] is False and status['gap_repair']['waiting'] == 1
     assert status['unverified_spans'][0]['repair'] == {'state': 'waiting', 'request_ids': []}
 
 
@@ -196,3 +197,47 @@ def test_a_refused_repair_step_leaves_the_scan_committed(phone):
     scan(w, 3)
     assert progress(w)['unverified_span'] and history(w, s)['unverified_span_chats'] == 1
     asyncio.run(w.repair_gaps())
+
+
+# spec: ANYM-814
+def test_an_answer_with_a_message_capture_did_not_keep_never_verifies(phone):
+    w, s = phone
+    span = recorded_span(w)
+    w.provider.answer(49, ts(4), skipped=1); scan(w, 2)
+    done = repair(w)
+    assert done['state'] == 'incomplete_answer' and 'verified_by' not in done and len(w.provider.asked) == 1
+    assert done['remaining'] == {'from': span['from'], 'to': span['to']}
+    assert history(w, s)['gap_repair']['incomplete_answer'] == 1
+
+
+# spec: ANYM-814
+@pytest.mark.parametrize('code', ['history_rate_limited', 'history_anchor_unavailable'])
+def test_an_adapter_refusal_ends_only_the_repair_step(phone, code):
+    """The real reply mapping: these codes arrive as CommandRejected (error_codes.json), not as an operation error."""
+    w, s = phone
+    from messaging_service import whatsapp_collector as wc
+    reply = {'id': 1, 'error': code}
+
+    class Reader:
+        async def readline(self): return (wc.json.dumps(reply)+'\n').encode()
+    provider = w.provider
+    provider.process = type('P', (), {'stdout': Reader(), 'returncode': None})()
+    with pytest.raises(Exception) as raised:
+        asyncio.run(wc.NodeProvider.reply(provider, 1))
+    rejected = type(raised.value)
+
+    async def refuse(method, params):
+        if method == 'gap_repair_status':
+            return {'enabled': True, 'outstanding': 0, 'paused_until_ms': 0, 'requests': []}
+        raise rejected(code)
+    start_catchup(w, A, 5, [20, 21])
+    provider.call = refuse
+    scan(w, 3)
+    assert rejected.__name__ == 'CommandRejected'
+    assert progress(w)['unverified_span'] and progress(w)['gap_repair']['state'] == 'waiting'
+
+
+# spec: ANYM-814
+def test_repair_calls_keep_the_native_reconnect_grace():
+    from messaging_service.whatsapp_collector import HISTORY_READS
+    assert {'gap_repair_status', 'gap_repair'} <= set(HISTORY_READS)
