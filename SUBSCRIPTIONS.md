@@ -172,12 +172,12 @@ What can add more than a few seconds:
   its count; `max_wait_s` caps `debounce_s` and is the timeout of a `batch_count` without a
   `batch_window_s` (with both, the window ends the wait unless the count comes first), and
   defaults to 300 s (or `debounce_s` if larger) whenever `debounce_s` or `batch_count` is set. Quiet hours hold a due hint to the window end.
-  The policy's hourly budget (20 hints per key, `SUBSCRIPTION_MAX_HINTS_PER_HOUR`) holds it
+  The policy's hourly budget (200 hints per key, `SUBSCRIPTION_MAX_HINTS_PER_HOUR`) holds it
   to the next slot, and a self-service key with 32 queued hints holds the next one for a
   minute; both read `held_reason: budget`.
 - Dispatcher admission, with or without a policy: the first POST of a hint takes one slot of the
-  key's rolling hour (the same 20) and, for a self-service endpoint, one of its host's
-  (100 per hour, `DELIVERY_MAX_HINTS_PER_HOST_PER_HOUR`). These holds keep the hint `pending` in the outbox and are not in `get_subscription`
+  key's rolling hour (the same 200) and, for a self-service endpoint, one of its host's
+  (300 per hour, `DELIVERY_MAX_HINTS_PER_HOST_PER_HOUR`). These holds keep the hint `pending` in the outbox and are not in `get_subscription`
   until it is admitted: `list_delivery_attempts` then shows `hint_created_at` and
   `hint_admitted_at`, the wait.
 - Retries after a failed attempt: 2, 4, 8, 16, 32, 64 and 128 s, or the receiver's
@@ -519,7 +519,7 @@ emits one hint with `kind: "silence"`. The reference is the timer record in `get
 cancels the timer; a later reply is a normal match. Any later version change cancels it: configure
 again to re-arm.
 
-**Per-key budget.** `SUBSCRIPTION_MAX_HINTS_PER_HOUR` (default 20, bounds 1–1000, set on the
+**Per-key budget.** `SUBSCRIPTION_MAX_HINTS_PER_HOUR` (default 200, bounds 1–1000, set on the
 matcher and dispatcher) counts every hint of a key across its subscriptions (`events`, `silence`,
 `test`), with or without a policy: this deliberately changes schema-32 hint timing for
 subscriptions that already have a receiver. The matcher holds a new hint over budget
@@ -707,7 +707,7 @@ same fence as receivers: no POST starts after the change commits.
 1–32) that are not deleted (`endpoint_limit`); registration and test each at most
 once per minute per key (`rate_limited` with `retry_after_s`). Endpoint hints
 count toward `SUBSCRIPTION_MAX_HINTS_PER_HOUR`. Across all keys, at most
-`DELIVERY_MAX_HINTS_PER_HOST_PER_HOUR` endpoint hints (default 100, 1–10000) are
+`DELIVERY_MAX_HINTS_PER_HOST_PER_HOUR` endpoint hints (default 300, 1–10000) are
 admitted (their first attempt reserved) for one host in a rolling hour
 (ANYM-585); past it a hint waits
 for the next slot, spends no attempt and never dead-letters for the budget. Like

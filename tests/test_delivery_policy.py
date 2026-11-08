@@ -226,6 +226,33 @@ def test_silence_timer_fires_once_and_a_reply_cancels_it(seeded, tmp_path):
     assert hints(store, answered, 'silence') == [] and len(hints(store, answered)) == 1
 
 
+class _Recorder:
+    """A connection stand-in that records each query's parameters; no database."""
+
+    def __init__(self, rows=()):
+        self.params, self.rows = [], list(rows)
+
+    def execute(self, query, params=()):
+        self.params.append(params)
+        row = self.rows.pop(0) if self.rows else None
+        return type('Result', (), {'fetchone': lambda _self: row})()
+
+
+# spec: ANYM-520
+def test_production_hint_budgets_default_to_200_per_key_and_300_per_host(monkeypatch):
+    # Owner 11-08 hotfix: 20 per key and 100 per host held fast searches; the unset settings now give 200 and 300.
+    monkeypatch.delenv('SUBSCRIPTION_MAX_HINTS_PER_HOUR', raising=False)
+    monkeypatch.delenv('DELIVERY_MAX_HINTS_PER_HOST_PER_HOUR', raising=False)
+    now, owner = datetime(2026, 11, 8, tzinfo=UTC), {'principal': 'agent', 'key_id': 'key'}
+    for slot in (delivery_policy.budget_slot, delivery_policy.admission_slot):
+        c = _Recorder()
+        assert slot(c, owner, now) is None
+        assert c.params[-1][-1] == 199
+    c = _Recorder([{'host': 'vendor.example'}])
+    assert delivery_policy.host_admission_slot(c, 'endpoint', now) is None
+    assert c.params[-1][-1] == 299
+
+
 # spec: ANYM-252
 def test_budget_coalesces_across_subscriptions_and_loses_no_reference(seeded, tmp_path):
     store, _, _ = seeded

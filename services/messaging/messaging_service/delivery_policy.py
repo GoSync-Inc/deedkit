@@ -99,7 +99,7 @@ def quiet_until(c, policy, at):
 
 
 def _slot(c, owner, column, now):
-    limit = _bound_setting('SUBSCRIPTION_MAX_HINTS_PER_HOUR', 20, 1, 1000)
+    limit = _bound_setting('SUBSCRIPTION_MAX_HINTS_PER_HOUR', 200, 1, 1000)
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))', ('subscription-hints:' + str(owner['key_id']),))
     charged = c.execute('''SELECT o.{0} AS t FROM subscription_outbox o JOIN subscriptions s ON s.id=o.subscription
         WHERE s.principal=%s AND s.key_id=%s AND o.{0}>%s-interval '1 hour'
@@ -136,7 +136,7 @@ def host_admission_slot(c, endpoint, now):
     Counts endpoint hints admitted to one canonical host in the rolling hour across every key, so agents choosing
     their own hosts cannot pile on one third party. Taken after the per-key lock; nothing takes them the other way.
     """
-    limit = _bound_setting('DELIVERY_MAX_HINTS_PER_HOST_PER_HOUR', 100, 1, 10000)
+    limit = _bound_setting('DELIVERY_MAX_HINTS_PER_HOST_PER_HOUR', 300, 1, 10000)
     host = c.execute('SELECT host FROM delivery_endpoints WHERE id=%s', (endpoint,)).fetchone()
     if host is None:
         return None
