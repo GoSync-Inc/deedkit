@@ -51,8 +51,8 @@ today's outcome (ANYM-808).
 Rows captured before that change stay `unknown` in the archive. While the
 provider is connected, the adapter counts them once per `REPAIR_VERSION`
 (`repair.go`, ANYM-809): it runs the current classifier on each retained raw
-(one read covers at most 32 journal rows, the replay batch bound; it yields
-before each statement when capture has queued work, and writes nothing unless
+(at most 32 journal rows a tick, each read in a statement of its own; it
+yields before each statement when capture has queued work, and writes nothing unless
 8,192 free pages stay under the file's page ceiling for capture) and tallies
 `would_add_content`, `label_only`, `same`, `no_raw`, `placeholder`,
 `sender_key_only` or `parse_error`. It rewrites no journal row and publishes

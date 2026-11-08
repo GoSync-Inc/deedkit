@@ -22,9 +22,9 @@ const REPAIR_VERSION = 1
 
 const (
 	repairBatchRows = 50 // rows classified per tick at most
-	// One read covers at most this many journal rows. A journal row is at most
-	// maxCaptureEnvelopeBytes (append empties a larger raw), so a read holds the
-	// shared connection for no more data than one replay batch (replayBatchBytes).
+	// One tick covers at most this many journal rows (the replay batch). It
+	// lists their keys, then reads each row in a statement of its own, so live
+	// capture waits for at most one row read (append caps a row at 512 KiB).
 	repairWindowSeqs  = replayBatchEntries
 	repairTimeSlice   = 200 * time.Millisecond
 	repairStatementTO = 2 * time.Second // bound of every SQLite statement of the pass
@@ -47,7 +47,8 @@ type repairPass struct {
 	version      int
 	slice        time.Duration
 	stmt         time.Duration
-	read         func(ctx context.Context, after, upto int64, limit int) ([]repairRow, error)
+	seqs         func(ctx context.Context, after, upto int64, limit int) ([]int64, error)
+	row          func(ctx context.Context, seq int64) (repairRow, bool, error)
 	classify     func(repairRow) string
 	now          func() time.Time
 	active       func() bool // false on disconnect, lost lease or shutdown
@@ -65,7 +66,7 @@ type repairPass struct {
 func newRepairPass(s *CaptureStore) *repairPass {
 	p := &repairPass{s: s, version: REPAIR_VERSION, slice: repairTimeSlice, stmt: repairStatementTO, now: time.Now, reservePages: repairReservePages}
 	p.active = func() bool { return true }
-	p.read = s.repairRows
+	p.seqs, p.row = s.repairSeqs, s.repairRow
 	p.classify = func(r repairRow) string { return s.repairState(r) }
 	return p
 }
@@ -124,24 +125,35 @@ func (s *CaptureStore) repairState(r repairRow) (state string) {
 	return "same"
 }
 
-// repairRows returns candidate rows in (after, upto], oldest first. The text
-// prefilter only narrows the read: json.Marshal escapes quotes inside values,
-// so the marker can only match the envelope's own field; repairCandidate decides.
-func (s *CaptureStore) repairRows(ctx context.Context, after, upto int64, limit int) ([]repairRow, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT seq,envelope,raw FROM capture WHERE seq>? AND seq<=? AND instr(envelope,'"messageType":"unknown"')>0 ORDER BY seq LIMIT ?`, after, upto, limit)
+// repairSeqs lists the journal sequence numbers in (after, upto]. It reads
+// only the table's keys, never a row's raw or envelope.
+func (s *CaptureStore) repairSeqs(ctx context.Context, after, upto int64, limit int) ([]int64, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT seq FROM capture WHERE seq>? AND seq<=? ORDER BY seq LIMIT ?", after, upto, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []repairRow
+	var out []int64
 	for rows.Next() {
-		var r repairRow
-		if err = rows.Scan(&r.Seq, &r.Envelope, &r.Raw); err != nil {
+		var seq int64
+		if err = rows.Scan(&seq); err != nil {
 			return nil, err
 		}
-		out = append(out, r)
+		out = append(out, seq)
 	}
 	return out, rows.Err()
+}
+
+// repairRow reads one journal row by its key: one statement holds the shared
+// connection for at most one row, which append caps at maxCaptureEnvelopeBytes.
+// A row evicted since repairSeqs is reported as absent.
+func (s *CaptureStore) repairRow(ctx context.Context, seq int64) (repairRow, bool, error) {
+	r := repairRow{Seq: seq}
+	err := s.db.QueryRowContext(ctx, "SELECT envelope,raw FROM capture WHERE seq=?", seq).Scan(&r.Envelope, &r.Raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return r, false, nil
+	}
+	return r, err == nil, err
 }
 
 // captureQueued reports live capture work: a held capture lock, an unexported
@@ -301,7 +313,7 @@ func (p *repairPass) step(ctx context.Context) string {
 	}
 	upto := min(p.lastSeq+repairWindowSeqs, maxSeq)
 	c, cancel = context.WithTimeout(ctx, p.stmt)
-	rows, err := p.read(c, p.lastSeq, upto, repairBatchRows)
+	seqs, err := p.seqs(c, p.lastSeq, upto, repairBatchRows)
 	cancel()
 	if err != nil {
 		return "repair_read"
@@ -312,25 +324,39 @@ func (p *repairPass) step(ctx context.Context) string {
 		counts[k] = v
 	}
 	complete := true
-	for _, r := range rows {
-		if ctx.Err() != nil || !p.active() {
-			return "" // stopped: nothing of this tick is kept
-		}
-		if p.now().After(deadline) {
+	for i, seq := range seqs {
+		// At least one row per tick, so a slow read can never stall the count.
+		if i > 0 && p.now().After(deadline) {
 			complete = false
 			break
 		}
-		if selected, _, _ := repairCandidate(r.Envelope); selected {
-			scanned++
-			state := p.safeClassify(r)
-			if !validRepairState(state) {
-				state = "parse_error"
+		// Capture priority between rows: capture waits for at most one row read.
+		if stop, code := p.yield(ctx); stop {
+			if code != "" || ctx.Err() != nil || !p.active() {
+				return code // stopped: nothing of this tick is kept
 			}
-			counts[state]++
+			complete = false
+			break
 		}
-		next = r.Seq
+		c, cancel = context.WithTimeout(ctx, p.stmt)
+		r, ok, err := p.row(c, seq)
+		cancel()
+		if err != nil {
+			return "repair_read"
+		}
+		if ok {
+			if selected, _, _ := repairCandidate(r.Envelope); selected {
+				scanned++
+				state := p.safeClassify(r)
+				if !validRepairState(state) {
+					state = "parse_error"
+				}
+				counts[state]++
+			}
+		}
+		next = seq
 	}
-	if complete && len(rows) < repairBatchRows {
+	if complete && len(seqs) < repairBatchRows {
 		next = upto // the whole window was read
 	}
 	done := next >= maxSeq && complete

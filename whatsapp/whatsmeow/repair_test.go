@@ -232,9 +232,19 @@ func TestRepairGoldenStatesArePinnedToTheVersion(t *testing.T) {
 	for _, f := range repairFixtures() {
 		journalUnknown(t, s, f.msg, f.raw)
 	}
-	rows, err := s.repairRows(context.Background(), 0, 1<<40, 100)
+	seqs, err := s.repairSeqs(context.Background(), 0, 1<<40, 100)
 	if err != nil {
 		t.Fatal(err)
+	}
+	var rows []repairRow
+	for _, seq := range seqs {
+		r, ok, err := s.repairRow(context.Background(), seq)
+		if err != nil || !ok {
+			t.Fatal(err, ok)
+		}
+		if selected, _, _ := repairCandidate(r.Envelope); selected {
+			rows = append(rows, r)
+		}
 	}
 	fixtures := repairFixtures()
 	if len(rows) != len(fixtures) {
@@ -275,12 +285,12 @@ func TestRepairResumesAfterLastSeqAndAFinishedVersionDoesNotRunAgain(t *testing.
 	}
 	// Restart: a new pass resumes after last_seq and counts each row once.
 	second := newRepairPass(s)
-	read := second.read
-	second.read = func(ctx context.Context, after, upto int64, limit int) ([]repairRow, error) {
+	list := second.seqs
+	second.seqs = func(ctx context.Context, after, upto int64, limit int) ([]int64, error) {
 		if upto-after > repairWindowSeqs || limit > repairBatchRows {
-			t.Errorf("one read covers %d journal rows, limit %d", upto-after, limit)
+			t.Errorf("one tick covers %d journal rows, limit %d", upto-after, limit)
 		}
-		return read(ctx, after, upto, limit)
+		return list(ctx, after, upto, limit)
 	}
 	runRepairToEnd(t, second)
 	if second.scanned != repairWindowSeqs+10 || second.counts["label_only"] != repairWindowSeqs+10 {
@@ -305,8 +315,8 @@ func TestRepairStalledJournalReadIsAStatusCodeAndCaptureContinues(t *testing.T) 
 	journalUnknown(t, s, repairFixtures()[1].msg, nil)
 	p := newRepairPass(s)
 	p.stmt = 100 * time.Millisecond
-	p.read = func(ctx context.Context, after, upto int64, limit int) ([]repairRow, error) {
-		// A stalled read holds neither the capture lock nor the connection.
+	p.row = func(ctx context.Context, seq int64) (repairRow, bool, error) {
+		// A stalled row read past its statement bound; capture is not held behind it.
 		done := make(chan error, 1)
 		go func() { done <- s.Put(fixtureMessage("DURING", 1700000500), "live") }()
 		select {
@@ -318,7 +328,7 @@ func TestRepairStalledJournalReadIsAStatusCodeAndCaptureContinues(t *testing.T) 
 			t.Error("capture blocked by a stalled repair read")
 		}
 		<-ctx.Done()
-		return nil, ctx.Err()
+		return repairRow{}, false, ctx.Err()
 	}
 	started := time.Now()
 	p.tick(context.Background())
@@ -503,7 +513,19 @@ func TestRepairFailedProgressUpdateKeepsTheDurableAndInMemoryPosition(t *testing
 	if _, err := s.db.Exec("PRAGMA max_page_count=131072"); err != nil {
 		t.Fatal(err)
 	}
-	// A failing UPDATE statement (its row is gone) keeps the position too.
+	// An UPDATE that SQLite refuses keeps the durable and in-memory position.
+	if _, err := s.db.Exec("CREATE TRIGGER refuse_repair BEFORE UPDATE ON repair_progress BEGIN SELECT RAISE(ABORT,'synthetic storage failure'); END"); err != nil {
+		t.Fatal(err)
+	}
+	p.lastError = ""
+	p.tick(context.Background())
+	if p.lastError != "repair_storage" || p.lastSeq != last || p.scanned != scanned || !p.loaded || durableLastSeq(t, s) != last {
+		t.Fatalf("refused UPDATE moved progress: err=%q last=%d durable=%d", p.lastError, p.lastSeq, durableLastSeq(t, s))
+	}
+	if _, err := s.db.Exec("DROP TRIGGER refuse_repair"); err != nil {
+		t.Fatal(err)
+	}
+	// An UPDATE that finds no row (the row is gone) keeps the position too.
 	if _, err := s.db.Exec("DELETE FROM repair_progress"); err != nil {
 		t.Fatal(err)
 	}
@@ -618,5 +640,97 @@ func TestRepairWorkerRunsOnlyWhileReadyAndEndsWithTheProviderContext(t *testing.
 	}
 	if code, _ := p.failure.Load().(string); code != "" {
 		t.Fatal("the repair worker failed the provider:", code)
+	}
+}
+
+// spec: ANYM-809
+func TestRepairSlowReadsStillAdvanceTheCountEveryTick(t *testing.T) {
+	s := openTestStore(t)
+	album := repairFixtures()[2].msg.Message
+	for i := 0; i < 5; i++ {
+		e := fixtureMessage("W"+string(rune('A'+i)), 1700000000+int64(i))
+		e.Message, e.RawMessage = album, album
+		journalUnknown(t, s, e, nil)
+	}
+	p := newRepairPass(s)
+	clock := time.Unix(1700000000, 0)
+	p.now = func() time.Time { return clock }
+	row := p.row
+	// Every row read costs more than the whole time slice.
+	p.row = func(ctx context.Context, seq int64) (repairRow, bool, error) {
+		clock = clock.Add(2 * p.slice)
+		return row(ctx, seq)
+	}
+	for tick := 1; tick <= 5; tick++ {
+		before := p.lastSeq
+		p.tick(context.Background())
+		if p.lastError != "" || p.lastSeq <= before {
+			t.Fatalf("tick %d made no progress: last=%d err=%q", tick, p.lastSeq, p.lastError)
+		}
+	}
+	runRepairToEnd(t, p)
+	if p.scanned != 5 {
+		t.Fatalf("scanned %d, want 5", p.scanned)
+	}
+}
+
+// spec: ANYM-809
+func TestRepairCaptureArrivingMidTickWaitsForAtMostOneRowRead(t *testing.T) {
+	s := openTestStore(t)
+	// Rows near the journal's size bound: a large raw behind a small envelope.
+	big := &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: proto.String(strings.Repeat("x", 400<<10))}}
+	for i := 0; i < repairWindowSeqs; i++ {
+		e := fixtureMessage("B"+string(rune('A'+i%26))+string(rune('A'+i/26)), 1700000000+int64(i))
+		e.Message, e.RawMessage = big, big
+		envelope, err := captureEnvelope(s.Config.Account, e, s.Owner, "live", s.OwnerLID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		event := envelope["event"].(map[string]any)
+		event["messageType"], event["body"] = "unknown", ""
+		raw, _ := marshalMessage(e)
+		if err = s.append(LegacyChatID(e.Info.Chat), LegacyMessageID(e), e.Info.Timestamp.Unix(), raw, envelope, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var withRaw int
+	s.db.QueryRow("SELECT COUNT(*) FROM capture WHERE length(raw)>300000").Scan(&withRaw)
+	if withRaw != repairWindowSeqs {
+		t.Fatal("fixture rows lost their raw", withRaw)
+	}
+	p := newRepairPass(s)
+	type result struct {
+		err     error
+		latency time.Duration
+	}
+	arrived := make(chan result, 1)
+	calls := 0
+	p.classify = func(r repairRow) string {
+		if calls++; calls == 2 {
+			// Capture arrives after the pass was admitted, while it keeps reading rows.
+			go func() {
+				started := time.Now()
+				err := s.Put(fixtureMessage("MIDTICK", 1700100000), "live")
+				arrived <- result{err, time.Since(started)}
+			}()
+		}
+		return s.repairState(r)
+	}
+	p.tick(context.Background())
+	got := <-arrived
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	if got.latency > time.Second {
+		t.Fatal("capture waited behind the repair pass", got.latency)
+	}
+	var last string
+	s.db.QueryRow("SELECT message_id FROM capture ORDER BY seq DESC LIMIT 1").Scan(&last)
+	if !strings.Contains(last, "MIDTICK") {
+		t.Fatal("capture order changed under the repair pass")
+	}
+	runRepairToEnd(t, p)
+	if p.scanned != repairWindowSeqs || p.counts["would_add_content"] != repairWindowSeqs {
+		t.Fatalf("count with capture mid-tick: scanned=%d counts=%v", p.scanned, p.counts)
 	}
 }
