@@ -165,13 +165,15 @@ def hide_out_of_scope(c, principal, accounts, chats):
 
 def protection_lock(c):
     """ANYM-806: serialize a change that starts the protection of named chats' files (media_policy.ON_REQUEST_CHATS)
-    with the lifecycle worker's recheck and unlink, which hold the same lock: create with named chats, an owner's
-    pause, resume or close, and the operator's retention release. It is the last lock those transactions take.
+    with the lifecycle worker's recheck and unlink, which hold the same lock: an owner's pause, resume or close, and
+    the operator's retention release. It is the last lock those transactions take.
 
-    Lazy expiry and access invalidation (_state, the matcher) take no lock: they run under many other locks, and they
+    Create, lazy expiry and access invalidation (_state, the matcher) take no lock. Create's subscription_sources
+    rows hold a KEY SHARE on their chats, which Archive.ingest updates while it holds the lifecycle lock, so waiting
+    for the lock there could deadlock. Lazy expiry and access invalidation run under many other locks, and they
     never protect a chat that was unprotected except through the 24-hour grace of a subscription that was already
-    not protecting it (paused, or expired more than 24 hours before). An eviction racing them loses nothing the
-    verified R2 copy cannot restore on request."""
+    not protecting it (paused, or expired more than 24 hours before). An eviction racing any of them loses nothing
+    the verified R2 copy cannot restore on request (request_file_download, cold-first rehydration)."""
     from .file_lifecycle import lifecycle_lock
     lifecycle_lock(c)
 
@@ -511,10 +513,8 @@ def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=
         result = configure_subscription_delivery(store, c, p, str(row['id']), row['version'], None,
             delivery.get('delivery_policy'), delivery['endpoint_id'])
         targets(p, [str(row['id'])])
-    if sources:
-        # ANYM-805/806: the named chats keep their originals from this commit on. The lifecycle lock is the last
-        # lock this transaction takes (after the endpoint lock of the delivery), as in every subscription path.
-        protection_lock(c)
+    # ANYM-806: create takes no lifecycle lock (see protection_lock): its source rows hold the chats' keys, which
+    # Archive.ingest updates under that lock. An eviction racing a create is restored from R2 on request.
     return result if delivery is not None else _view(c, row, p)
 
 

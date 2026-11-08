@@ -1132,7 +1132,7 @@ def test_a_subscription_change_during_the_recheck_waits_for_the_unlink(archive,m
 # spec: ANYM-806
 def test_a_retention_release_locks_its_rows_before_the_lifecycle_lock(archive):
     import threading
-    _,s,_,_=archive;api=lifecycle()
+    _,s,_,_=archive;api=lifecycle();chat_original(archive)
     token,sub=name_in_subscription(s);sid=sub['subscription_id']
     s.update_subscription(token,sid,1,action='close')
     with s.pool.connection() as c:c.execute('UPDATE subscriptions SET retention_hold=true WHERE id=%s',(sid,))
@@ -1151,23 +1151,50 @@ def test_a_retention_release_locks_its_rows_before_the_lifecycle_lock(archive):
 
 
 # spec: ANYM-806
-def test_subscription_create_takes_the_lifecycle_lock_after_its_delivery_endpoint(archive,monkeypatch):
+def test_subscription_create_takes_no_lifecycle_lock(archive,monkeypatch):
     from messaging_service import delivery_endpoints, event_delivery, file_lifecycle
-    _,s,_,_=archive;order=[];real=file_lifecycle.lifecycle_lock
+    _,s,_,_=archive;chat_original(archive);taken=[];real=file_lifecycle.lifecycle_lock
     def lock(c):
-        order.append('lifecycle');real(c)
-    def configure(store,c,p,subscription_id,version,*_args):
-        # The endpoint lock is taken here; the lifecycle lock must not be held yet.
-        order.append('endpoint');return {'subscription_id':subscription_id,'version':version}
+        taken.append('lifecycle');real(c)
     monkeypatch.setattr(file_lifecycle,'lifecycle_lock',lock)
-    monkeypatch.setattr(event_delivery,'configure_subscription_delivery',configure)
+    monkeypatch.setattr(event_delivery,'configure_subscription_delivery',
+        lambda store,c,p,subscription_id,version,*_args:{'subscription_id':subscription_id,'version':version})
     monkeypatch.setattr(delivery_endpoints,'gate_on',lambda c:True)
     token=s.issue_key('lifecycle-delivery',['archive-test'],permissions=['read','subscription-write','delivery-write'],
         key_permissions=['read','subscription-write','delivery-write'])
     with s.pool.connection() as c:
         chat=c.execute("SELECT id FROM chats WHERE account='archive-test' AND provider_chat='100'").fetchone()['id']
+    # Its source rows hold the chat's key, which ingest updates under the lifecycle lock: waiting for it could deadlock.
+    s.create_subscription(token,[chat])
     s.create_subscription(token,[chat],delivery={'endpoint_id':'00000000-0000-4000-8000-000000000001'})
-    assert order==['endpoint','lifecycle']
+    assert taken==[]
+
+
+# spec: ANYM-806
+def test_a_create_racing_an_eviction_is_restored_from_r2_on_request(archive,monkeypatch):
+    import threading
+    from messaging_service import cold_archive
+    _,s,key,_=archive;fid,blob=chat_original(archive);api=lifecycle()
+    presence=cold_archive.WorkerPresence(s.pool.conninfo);assert presence.acquire()
+    try:
+        worker=api.LifecycleWorker(s,require_cold_copy=True);eligible=worker._eligible;created=threading.Event()
+        def recheck(c,row):
+            reason=eligible(c,row)
+            if row['state']=='evicting':
+                # The create commits after _complete's recheck and before the unlink: it does not wait for the lock.
+                threading.Thread(target=lambda:(name_in_subscription(s),created.set()),daemon=True).start()
+                assert created.wait(10)
+            return reason
+        monkeypatch.setattr(worker,'_eligible',recheck)
+        assert worker.run_once(apply=True)['evicted']==1 and not (s.files/blob.digest).exists()
+        # The subscribed chat's original comes back from the verified R2 copy, never from the provider.
+        result=s.request_file_download(key,fid)
+        assert result['request_status']=='queued' and result['rehydration_source']=='cold_archive'
+        with s.pool.connection() as c:
+            assert c.execute('SELECT restore_state FROM attachment_cold_copies WHERE digest=%s',(blob.digest,)).fetchone()['restore_state']=='requested'
+            assert c.execute('SELECT state FROM media_jobs WHERE id=%s',(fid,)).fetchone()['state']=='ready'
+    finally:
+        presence.close()
 
 
 # spec: ANYM-806
