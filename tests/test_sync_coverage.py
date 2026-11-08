@@ -473,7 +473,11 @@ def test_the_coverage_counts_add_no_scan_and_no_per_row_sequential_subquery(cov)
     grow(s)
     plans = []
     with explained(ar, plans):
-        row, _ = status(s)
+        with s.pool.connection() as c:
+            # This test measures plan shape, not speed: a loaded CI runner may need more than the serving timeout.
+            c.execute("SET LOCAL statement_timeout='120s'")
+            result = get_sync_status(c, {'accounts': [ACCOUNT], 'chat_ids': None})
+        row = next(r for r in result['sources'] if r['account'] == ACCOUNT)
     assert row['coverage']['done']['stored'] == BULK
     assert row['coverage']['available_on_request']['stored_not_recognized'] == BULK // 2
     full = 0
