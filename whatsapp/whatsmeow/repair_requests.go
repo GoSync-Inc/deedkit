@@ -264,7 +264,9 @@ func (p *Provider) gapRepairRequest(ctx context.Context, raw json.RawMessage, po
 	if err = p.Capture.reserveRepair(row, time.Now()); err != nil {
 		return nil, err
 	}
-	release := func() { _, _ = p.Capture.db.Exec("DELETE FROM repair_requests WHERE request_id=? AND state='reserved'", id) }
+	release := func() {
+		_, _ = p.Capture.db.Exec("DELETE FROM repair_requests WHERE request_id=? AND state='reserved'", id)
+	}
 	fresh, err := p.policy()
 	if err != nil || !fresh.Allows(v.Chat) || !startChange(ctx) {
 		release()
