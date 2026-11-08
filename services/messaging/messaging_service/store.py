@@ -1328,12 +1328,15 @@ class Store:
         with self.pool.connection() as c:
             # ANYM-447: from schema 62 a closed definition's 30 days count from its release.
             closure = ',closed_at=clock_timestamp()' if schema_version(c) >= 62 else ''
-            # A new closed_at restarts the 24-hour file protection of the named chats (ANYM-806).
+            # A new closed_at restarts the 24-hour file protection of the named chats (ANYM-806): lock the rows
+            # first, in id order, then the lifecycle lock last, as every subscription path does.
+            held = [row['id'] for row in c.execute('''SELECT id FROM subscriptions
+                WHERE retention_hold AND (%s::uuid[] IS NULL OR id=ANY(%s::uuid[])) ORDER BY id FOR UPDATE''',
+                (ids, ids)).fetchall()]
             from .subscriptions import protection_lock
             protection_lock(c)
             released = c.execute('''UPDATE subscriptions SET retention_hold=false''' + closure + '''
-                WHERE retention_hold AND (%s::uuid[] IS NULL OR id=ANY(%s::uuid[])) RETURNING id''',
-                (ids, ids)).fetchall()
+                WHERE retention_hold AND id=ANY(%s::uuid[]) RETURNING id''', (held,)).fetchall()
         return {'released': len(released)}
 
     def set_subscription_retention(self, enabled, *, verify_components=False):

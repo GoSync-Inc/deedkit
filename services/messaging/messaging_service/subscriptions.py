@@ -166,7 +166,8 @@ def hide_out_of_scope(c, principal, accounts, chats):
 def protection_lock(c):
     """ANYM-806: a state change of a subscription that names chats can start or end the protection of their files
     (media_policy.ON_REQUEST_CHATS reads state, expires_at and closed_at). Serialize it with the lifecycle
-    worker's recheck and unlink, which hold the same lock; the lock is always taken after subscription locks."""
+    worker's recheck and unlink, which hold the same lock. It is the last lock a subscription transaction takes
+    (after subscription rows, principal, endpoint and module locks); its holders never wait for those."""
     from .file_lifecycle import lifecycle_lock
     lifecycle_lock(c)
 
@@ -493,11 +494,6 @@ def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=
         raise APIError('invalid_subscription')
     if len(json.dumps(selector, ensure_ascii=False).encode()) > 14000:
         raise APIError('invalid_filter')
-    if sources:
-        # ANYM-805/806: a chat a subscription names keeps its originals; serialize with the eviction recheck and
-        # unlink (file_lifecycle), which run under the lifecycle lock, so a file is never removed after this commits.
-        from .file_lifecycle import lifecycle_lock
-        lifecycle_lock(c)
     row = c.execute('''INSERT INTO subscriptions(principal,key_id,scope_version,key_permission_version,
         selector,label,start_position,matched_through,expires_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
         RETURNING *''', (p['id'], p['key_id'], p['scope_version'], p['key_permission_version'],
@@ -507,13 +503,17 @@ def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=
         c.execute('INSERT INTO subscription_sources(subscription,account,chat,sender_ids) VALUES(%s,%s,%s,%s)',
             (row['id'], source['account'], source['id'], selected))
     targets(p, [str(row['id'])])
+    result = None
     if delivery is not None:
         from .event_delivery import configure_subscription_delivery
         result = configure_subscription_delivery(store, c, p, str(row['id']), row['version'], None,
             delivery.get('delivery_policy'), delivery['endpoint_id'])
         targets(p, [str(row['id'])])
-        return result
-    return _view(c, row, p)
+    if sources:
+        # ANYM-805/806: the named chats keep their originals from this commit on. The lifecycle lock is the last
+        # lock this transaction takes (after the endpoint lock of the delivery), as in every subscription path.
+        protection_lock(c)
+    return result if delivery is not None else _view(c, row, p)
 
 
 def list_subscriptions(store, c, p, *, limit=50):

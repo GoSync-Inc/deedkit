@@ -1130,6 +1130,47 @@ def test_a_subscription_change_during_the_recheck_waits_for_the_unlink(archive,m
 
 
 # spec: ANYM-806
+def test_a_retention_release_locks_its_rows_before_the_lifecycle_lock(archive):
+    import threading
+    _,s,_,_=archive;api=lifecycle()
+    token,sub=name_in_subscription(s);sid=sub['subscription_id']
+    s.update_subscription(token,sid,1,action='close')
+    with s.pool.connection() as c:c.execute('UPDATE subscriptions SET retention_hold=true WHERE id=%s',(sid,))
+    released=threading.Event()
+    with s.pool.connection() as c:
+        # A reader holds the row (as _owned does) and then needs the lifecycle lock (as _state does).
+        c.execute('SELECT id FROM subscriptions WHERE id=%s FOR UPDATE',(sid,))
+        worker=threading.Thread(target=lambda:(s.release_retention_hold([str(sid)]),released.set()),daemon=True)
+        worker.start()
+        assert not released.wait(1.0)  # the release waits for the row, holding nothing the reader needs
+        c.execute("SET LOCAL lock_timeout='5s'")
+        api.lifecycle_lock(c)
+    assert released.wait(10)
+    with s.pool.connection() as c:
+        assert c.execute('SELECT retention_hold FROM subscriptions WHERE id=%s',(sid,)).fetchone()['retention_hold'] is False
+
+
+# spec: ANYM-806
+def test_subscription_create_takes_the_lifecycle_lock_after_its_delivery_endpoint(archive,monkeypatch):
+    from messaging_service import delivery_endpoints, event_delivery, file_lifecycle
+    _,s,_,_=archive;order=[];real=file_lifecycle.lifecycle_lock
+    def lock(c):
+        order.append('lifecycle');real(c)
+    def configure(store,c,p,subscription_id,version,*_args):
+        # The endpoint lock is taken here; the lifecycle lock must not be held yet.
+        order.append('endpoint');return {'subscription_id':subscription_id,'version':version}
+    monkeypatch.setattr(file_lifecycle,'lifecycle_lock',lock)
+    monkeypatch.setattr(event_delivery,'configure_subscription_delivery',configure)
+    monkeypatch.setattr(delivery_endpoints,'gate_on',lambda c:True)
+    token=s.issue_key('lifecycle-delivery',['archive-test'],permissions=['read','subscription-write','delivery-write'],
+        key_permissions=['read','subscription-write','delivery-write'])
+    with s.pool.connection() as c:
+        chat=c.execute("SELECT id FROM chats WHERE account='archive-test' AND provider_chat='100'").fetchone()['id']
+    s.create_subscription(token,[chat],delivery={'endpoint_id':'00000000-0000-4000-8000-000000000001'})
+    assert order==['endpoint','lifecycle']
+
+
+# spec: ANYM-806
 def test_chat_policy_dry_run_reports_what_bounded_apply_passes_then_remove(archive,capsys):
     _,s,_,_=archive;api=lifecycle()
     blobs=[chat_original(archive,mid=f'group-{n}',payload=f'Synthetic group photo {n}'.encode())[1] for n in range(3)]
