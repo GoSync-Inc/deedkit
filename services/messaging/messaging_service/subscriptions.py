@@ -163,6 +163,21 @@ def hide_out_of_scope(c, principal, accounts, chats):
                     error_code='scope_changed',lease_token=NULL,lease_until=NULL WHERE id=%s''', (hint['id'],))
 
 
+def protection_lock(c):
+    """ANYM-806: serialize a change that starts the protection of named chats' files (media_policy.ON_REQUEST_CHATS)
+    with the lifecycle worker's recheck and unlink, which hold the same lock: an owner's pause, resume or close, and
+    the operator's retention release. It is the last lock those transactions take.
+
+    Create, lazy expiry and access invalidation (_state, the matcher) take no lock. Create's subscription_sources
+    rows hold a KEY SHARE on their chats, which Archive.ingest updates while it holds the lifecycle lock, so waiting
+    for the lock there could deadlock. Lazy expiry and access invalidation run under many other locks, and they
+    never protect a chat that was unprotected except through the 24-hour grace of a subscription that was already
+    not protecting it (paused, or expired more than 24 hours before). An eviction racing any of them loses nothing
+    the verified R2 copy cannot restore on request (request_file_download, cold-first rehydration)."""
+    from .file_lifecycle import lifecycle_lock
+    lifecycle_lock(c)
+
+
 def invalidate_dynamic(c, principal, key_id=None):
     """ANYM-522, in the operator's change under the exclusive principal lock: losing read or subscription-write
     (or a disabled principal) ends the dynamic definitions at once, so restoring the right cannot revive them."""
@@ -492,13 +507,15 @@ def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=
         c.execute('INSERT INTO subscription_sources(subscription,account,chat,sender_ids) VALUES(%s,%s,%s,%s)',
             (row['id'], source['account'], source['id'], selected))
     targets(p, [str(row['id'])])
+    result = None
     if delivery is not None:
         from .event_delivery import configure_subscription_delivery
         result = configure_subscription_delivery(store, c, p, str(row['id']), row['version'], None,
             delivery.get('delivery_policy'), delivery['endpoint_id'])
         targets(p, [str(row['id'])])
-        return result
-    return _view(c, row, p)
+    # ANYM-806: create takes no lifecycle lock (see protection_lock): its source rows hold the chats' keys, which
+    # Archive.ingest updates under that lock. An eviction racing a create is restored from R2 on request.
+    return result if delivery is not None else _view(c, row, p)
 
 
 def list_subscriptions(store, c, p, *, limit=50):
@@ -554,6 +571,8 @@ def update_subscription(store, c, p, subscription_id, version, *, action, resume
             gap = {'reason': 'explicit_resume_skip', 'after': position, 'through': head,
                 'recoverable': False, 'intentional': True}
         position = head
+    # ANYM-805/806: resume protects its chats' originals again, and close starts their 24-hour grace (see create).
+    protection_lock(c)
     row = c.execute('''UPDATE subscriptions SET state=%s,version=version+1,
         matched_through=%s,gap=%s,blocked_reason=NULL,updated_at=clock_timestamp()
         WHERE id=%s RETURNING *''', (state, position, Jsonb(gap) if gap else None, row['id'])).fetchone()

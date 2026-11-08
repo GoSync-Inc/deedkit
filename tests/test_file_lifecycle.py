@@ -970,6 +970,255 @@ def test_cold_copy_lost_between_prepare_and_unlink_cancels_eviction(archive,monk
         assert c.execute('SELECT state FROM attachment_residency WHERE digest=%s',(blob.digest,)).fetchone()['state']=='resident'
 
 
+def chat_original(archive,*,mid='group-1',chat='100',chat_type='group',payload=b'Synthetic group photo',
+        idle_hours=25,copy=True,text='Synthetic harbour invoice'):
+    """A downloaded image whose chat then has the given kind, idle for idle_hours, with a verified R2 copy (ANYM-806)."""
+    from messaging_service.blobs import BlobWriter
+    ar,s,_,_=archive
+    with s.pool.connection() as c:
+        c.execute('''UPDATE account_policies SET include_chats=array_append(include_chats,%s)
+            WHERE account='archive-test' AND NOT %s=ANY(include_chats)''',(chat,chat))
+        # Downloaded while the chat's kind is unknown (personal); the kind is set afterwards.
+        c.execute("UPDATE chats SET chat_type=NULL WHERE account='archive-test' AND provider_chat=%s",(chat,))
+    ar.ingest(event(provider_id=mid,chat=chat,media=[{'provider_id':'asset-'+mid,'filename':'Photo.jpg',
+        'mime':'image/jpeg','bytes':len(payload)}]))
+    job=ar.claim_media('fixture');writer=BlobWriter(s.files,reserve_bytes=0)
+    blob=writer.write([payload]);ar.finish_media(job,blob,writer)
+    with s.pool.connection() as c:
+        c.execute("UPDATE chats SET chat_type=%s WHERE account='archive-test' AND provider_chat=%s",(chat_type,chat))
+        c.execute("UPDATE attachment_text SET state='ready',text_content=%s,error_code=NULL WHERE attachment=%s",(text,job['id']))
+        c.execute("UPDATE attachment_residency SET last_accessed_at=clock_timestamp()-%s*interval '1 hour' WHERE digest=%s",
+            (idle_hours,blob.digest))
+    if copy:cold_copy(s,blob)
+    return job['id'],blob
+
+
+def name_in_subscription(s,provider_chat='100'):
+    token=s.issue_key('lifecycle-watcher',['archive-test'],permissions=['read','subscription-write'],
+        key_permissions=['read','subscription-write'])
+    with s.pool.connection() as c:
+        chat=c.execute("SELECT id FROM chats WHERE account='archive-test' AND provider_chat=%s",(provider_chat,)).fetchone()['id']
+    return token,s.create_subscription(token,[chat])
+
+
+# spec: ANYM-806
+def test_a_group_original_leaves_the_disk_a_day_after_its_last_read_and_keeps_its_text(archive):
+    _,s,key,_=archive;fid,blob=chat_original(archive);api=lifecycle()
+    # Neither 30 days nor a description are needed; the verified R2 copy is.
+    preview=api.LifecycleWorker(s,require_cold_copy=True).run_once()
+    assert preview['candidates']==1 and preview['evicted']==0 and (s.files/blob.digest).exists()
+    report=api.LifecycleWorker(s,require_cold_copy=True).run_once(apply=True)
+    assert report['evicted']==1 and report['evicted_bytes']==blob.bytes and not (s.files/blob.digest).exists()
+    item=s.get_attachment(key,fid)
+    assert item['original_residency']=='evicted' and item['download_reason']=='original_evicted'
+    assert item['next_action']=='request_file_download' and item['original_retention_hours']==24
+    assert s.get_file_text(key,fid)['text']=='Synthetic harbour invoice'
+    assert [row['attachment_id'] for row in s.search_files(key,query='harbour')['items']]==[fid]
+
+
+# spec: ANYM-806
+@pytest.mark.parametrize('keeper,reason',[('read_recently',None),('personal',None),('unknown_kind',None),
+    ('subscribed',None),('shared_with_personal',None),('pinned',None),('no_cold_copy','cold_copy_missing'),
+    ('download_grant','inflight'),('request_window','inflight'),('legacy',None),('shared_with_legacy',None)])
+def test_a_group_original_stays_while_a_rule_protects_it(archive,keeper,reason):
+    _,s,key,_=archive;api=lifecycle()
+    fid,blob=chat_original(archive,idle_hours=23 if keeper=='read_recently' else 25,copy=keeper!='no_cold_copy',
+        chat_type={'personal':'private','unknown_kind':None}.get(keeper,'group'))
+    if keeper=='subscribed':name_in_subscription(s)
+    if keeper=='shared_with_personal':
+        # The same bytes in a personal chat: that occurrence keeps the 30-day rule for the whole original.
+        chat_original(archive,mid='personal-1',chat='101',chat_type='private',payload=b'Synthetic group photo',copy=False)
+        with s.pool.connection() as c:
+            c.execute("UPDATE attachment_residency SET last_accessed_at=clock_timestamp()-interval '25 hours' WHERE digest=%s",(blob.digest,))
+    if keeper=='shared_with_legacy':
+        # A second occurrence of the same bytes without a media job: a request could not restore it from R2.
+        other,_=chat_original(archive,mid='group-legacy',payload=b'Synthetic group photo',copy=False)
+        with s.pool.connection() as c:
+            c.execute('DELETE FROM media_jobs WHERE id=%s',(other,))
+            c.execute("UPDATE attachment_residency SET last_accessed_at=clock_timestamp()-interval '25 hours' WHERE digest=%s",(blob.digest,))
+    with s.pool.connection() as c:
+        if keeper=='legacy':c.execute('DELETE FROM media_jobs WHERE id=%s',(fid,))
+        if keeper=='pinned':api.pin_original(c,blob.digest)
+        if keeper=='download_grant':
+            c.execute('''INSERT INTO download_grants SELECT %s,digest,1,%s,clock_timestamp()+interval '2 minutes'
+                FROM api_keys LIMIT 1''',('g'*64,fid))
+        if keeper=='request_window':
+            c.execute("UPDATE media_jobs SET requested_until=clock_timestamp()+interval '1 hour' WHERE id=%s",(fid,))
+    for only in (False,True):
+        report=api.LifecycleWorker(s,require_cold_copy=True,chat_policy_only=only).run_once(apply=True)
+        assert report['evicted']==0 and report['reasons']==({reason:1} if reason else {}),report
+    assert (s.files/blob.digest).exists()
+
+
+# spec: ANYM-806
+@pytest.mark.parametrize('requested,attempts',[(True,1),(True,3),(False,1)])
+def test_a_requested_recognition_holds_a_group_original_for_at_most_seven_days(archive,requested,attempts):
+    _,s,key,_=archive;fid,blob=chat_original(archive);api=lifecycle()
+    with s.pool.connection() as c:
+        c.execute("UPDATE media_jobs SET request_key_digest=%s WHERE id=%s",('r'*64 if requested else None,fid))
+        # A failure is still pending recognition, an exhausted one too: a changed profile retries it.
+        c.execute("UPDATE attachment_enrichment SET state='failed',attempts=%s,error_code='provider_unavailable' WHERE attachment=%s",
+            (attempts,fid))
+    report=api.LifecycleWorker(s,require_cold_copy=True,chat_policy_only=True).run_once(apply=True)
+    if not requested:
+        # Nobody asked: the withheld recognition does not hold the original.
+        assert report['evicted']==1;return
+    assert report['evicted']==0 and report['reasons']=={'recognition_pending':1} and (s.files/blob.digest).exists()
+    with s.pool.connection() as c:
+        c.execute("UPDATE attachment_enrichment SET updated_at=clock_timestamp()-interval '8 days' WHERE attachment=%s",(fid,))
+    assert api.LifecycleWorker(s,require_cold_copy=True,chat_policy_only=True).run_once(apply=True)['evicted']==1
+
+
+# spec: ANYM-806
+@pytest.mark.parametrize('state',['ready','queued','failed','leased'])
+def test_a_removed_group_file_shows_what_an_agent_can_do(archive,state):
+    _,s,key,_=archive;fid,blob=chat_original(archive);api=lifecycle()
+    finished=state=='ready'
+    with s.pool.connection() as c:
+        c.execute("UPDATE media_jobs SET request_key_digest=%s WHERE id=%s",('r'*64,fid))
+        # Unfinished work older than the 7-day cap; a leased row's lease has expired.
+        c.execute('''UPDATE attachment_enrichment SET state=%s,kind='image',text_content=%s,attempts=CASE WHEN %s='failed' THEN 3 ELSE attempts END,
+            lease_until=CASE WHEN %s='leased' THEN clock_timestamp()-interval '1 hour' END,
+            updated_at=clock_timestamp()-interval '8 days' WHERE attachment=%s''',
+            (state,'A synthetic harbour photo' if finished else '',state,state,fid))
+    assert api.LifecycleWorker(s,require_cold_copy=True).run_once(apply=True)['evicted']==1
+    item=s.get_attachment(key,fid)
+    assert item['original_residency']=='evicted' and item['next_action']=='request_file_download'
+    if finished:
+        assert item['enrichment_status']=='ready' and 'recognition_next_action' not in item
+    else:
+        assert item['enrichment_status']=='available_on_request'
+        assert item['recognition_next_action']=='request_file_download' and item['recognition_reason']=='group_chat_on_request'
+
+
+# spec: ANYM-806
+def test_a_subscription_created_between_prepare_and_unlink_cancels_the_eviction(archive,monkeypatch):
+    _,s,_,_=archive;fid,blob=chat_original(archive);api=lifecycle()
+    worker=api.LifecycleWorker(s,require_cold_copy=True);prepare=worker._prepare
+    def subscribed_after_prepare(digest):
+        token,reason=prepare(digest);name_in_subscription(s);return token,reason
+    monkeypatch.setattr(worker,'_prepare',subscribed_after_prepare)
+    report=worker.run_once(apply=True)
+    # Now the chat keeps its originals: the 30-day rule applies again, under the lock before unlink.
+    assert report['evicted']==0 and report['reasons']=={'recently_requested':1} and (s.files/blob.digest).exists()
+    with s.pool.connection() as c:
+        journal=c.execute('SELECT state,error_code FROM attachment_eviction_journal WHERE digest=%s',(blob.digest,)).fetchone()
+        assert dict(journal)=={'state':'cancelled','error_code':'recently_requested'}
+
+
+# spec: ANYM-806
+def test_a_subscription_change_during_the_recheck_waits_for_the_unlink(archive,monkeypatch):
+    import threading
+    _,s,_,_=archive;fid,blob=chat_original(archive);api=lifecycle()
+    token,sub=name_in_subscription(s)
+    paused=s.update_subscription(token,sub['subscription_id'],1,action='pause')
+    # Paused: the chat is on request again, so the original is in the class.
+    worker=api.LifecycleWorker(s,require_cold_copy=True);eligible=worker._eligible;closed=threading.Event()
+    def close():
+        s.update_subscription(token,sub['subscription_id'],paused['version'],action='close');closed.set()
+    def recheck(c,row):
+        reason=eligible(c,row)
+        if row['state']=='evicting':
+            # _complete's recheck under the lifecycle lock, before unlink: a close (which starts the chat's
+            # 24-hour grace) waits for this transaction instead of committing between the recheck and the unlink.
+            threading.Thread(target=close,daemon=True).start()
+            assert not closed.wait(1.0)
+        return reason
+    monkeypatch.setattr(worker,'_eligible',recheck)
+    assert worker.run_once(apply=True)['evicted']==1
+    assert closed.wait(10)
+
+
+# spec: ANYM-806
+def test_a_retention_release_locks_its_rows_before_the_lifecycle_lock(archive):
+    import threading
+    _,s,_,_=archive;api=lifecycle();chat_original(archive)
+    token,sub=name_in_subscription(s);sid=sub['subscription_id']
+    s.update_subscription(token,sid,1,action='close')
+    with s.pool.connection() as c:c.execute('UPDATE subscriptions SET retention_hold=true WHERE id=%s',(sid,))
+    released=threading.Event()
+    with s.pool.connection() as c:
+        # A reader holds the row (as _owned does) and then needs the lifecycle lock (as _state does).
+        c.execute('SELECT id FROM subscriptions WHERE id=%s FOR UPDATE',(sid,))
+        worker=threading.Thread(target=lambda:(s.release_retention_hold([str(sid)]),released.set()),daemon=True)
+        worker.start()
+        assert not released.wait(1.0)  # the release waits for the row, holding nothing the reader needs
+        c.execute("SET LOCAL lock_timeout='5s'")
+        api.lifecycle_lock(c)
+    assert released.wait(10)
+    with s.pool.connection() as c:
+        assert c.execute('SELECT retention_hold FROM subscriptions WHERE id=%s',(sid,)).fetchone()['retention_hold'] is False
+
+
+# spec: ANYM-806
+def test_subscription_create_takes_no_lifecycle_lock(archive,monkeypatch):
+    from messaging_service import delivery_endpoints, event_delivery, file_lifecycle
+    _,s,_,_=archive;chat_original(archive);taken=[];real=file_lifecycle.lifecycle_lock
+    def lock(c):
+        taken.append('lifecycle');real(c)
+    monkeypatch.setattr(file_lifecycle,'lifecycle_lock',lock)
+    monkeypatch.setattr(event_delivery,'configure_subscription_delivery',
+        lambda store,c,p,subscription_id,version,*_args:{'subscription_id':subscription_id,'version':version})
+    monkeypatch.setattr(delivery_endpoints,'gate_on',lambda c:True)
+    token=s.issue_key('lifecycle-delivery',['archive-test'],permissions=['read','subscription-write','delivery-write'],
+        key_permissions=['read','subscription-write','delivery-write'])
+    with s.pool.connection() as c:
+        chat=c.execute("SELECT id FROM chats WHERE account='archive-test' AND provider_chat='100'").fetchone()['id']
+    # Its source rows hold the chat's key, which ingest updates under the lifecycle lock: waiting for it could deadlock.
+    s.create_subscription(token,[chat])
+    s.create_subscription(token,[chat],delivery={'endpoint_id':'00000000-0000-4000-8000-000000000001'})
+    assert taken==[]
+
+
+# spec: ANYM-806
+def test_a_create_racing_an_eviction_is_restored_from_r2_on_request(archive,monkeypatch):
+    import threading
+    from messaging_service import cold_archive
+    _,s,key,_=archive;fid,blob=chat_original(archive);api=lifecycle()
+    presence=cold_archive.WorkerPresence(s.pool.conninfo);assert presence.acquire()
+    try:
+        worker=api.LifecycleWorker(s,require_cold_copy=True);eligible=worker._eligible;created=threading.Event()
+        def recheck(c,row):
+            reason=eligible(c,row)
+            if row['state']=='evicting':
+                # The create commits after _complete's recheck and before the unlink: it does not wait for the lock.
+                threading.Thread(target=lambda:(name_in_subscription(s),created.set()),daemon=True).start()
+                assert created.wait(10)
+            return reason
+        monkeypatch.setattr(worker,'_eligible',recheck)
+        assert worker.run_once(apply=True)['evicted']==1 and not (s.files/blob.digest).exists()
+        # The subscribed chat's original comes back from the verified R2 copy, never from the provider.
+        result=s.request_file_download(key,fid)
+        assert result['request_status']=='queued' and result['rehydration_source']=='cold_archive'
+        with s.pool.connection() as c:
+            assert c.execute('SELECT restore_state FROM attachment_cold_copies WHERE digest=%s',(blob.digest,)).fetchone()['restore_state']=='requested'
+            assert c.execute('SELECT state FROM media_jobs WHERE id=%s',(fid,)).fetchone()['state']=='ready'
+    finally:
+        presence.close()
+
+
+# spec: ANYM-806
+def test_chat_policy_dry_run_reports_what_bounded_apply_passes_then_remove(archive,capsys):
+    _,s,_,_=archive;api=lifecycle()
+    blobs=[chat_original(archive,mid=f'group-{n}',payload=f'Synthetic group photo {n}'.encode())[1] for n in range(3)]
+    _,personal=chat_original(archive,mid='personal-old',chat='101',chat_type='private',idle_hours=31*24,
+        payload=b'Synthetic old personal photo')
+    dsn=['--dsn-file',os.environ['PROBE_TEST_DSN_FILE'],'--files',str(s.files),'--chat-policy-only']
+    assert api.main(dsn)==0
+    report=json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert report['dry_run'] is True and report['candidates']==3
+    assert report['candidate_bytes']==sum(b.bytes for b in blobs) and report['evicted']==0
+    assert all((s.files/b.digest).exists() for b in blobs+[personal])
+    first=api.LifecycleWorker(s,require_cold_copy=True,chat_policy_only=True).run_once(apply=True,limit=2)
+    assert first['evicted']==2
+    second=api.LifecycleWorker(s,require_cold_copy=True,chat_policy_only=True).run_once(apply=True,max_bytes=blobs[0].bytes-1)
+    assert second['evicted']==0 and second['reasons']=={'byte_limit':1}
+    assert api.main([*dsn,'--apply'])==0 and '"evicted": 1' in capsys.readouterr().out
+    assert not any((s.files/b.digest).exists() for b in blobs)
+    # The 30-day rule of a personal original is not part of the chat policy pass.
+    assert (s.files/personal.digest).exists()
+
+
 def test_every_production_entry_point_requires_a_cold_copy(archive,monkeypatch,capsys):
     from pathlib import Path
     import yaml

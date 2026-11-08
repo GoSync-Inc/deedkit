@@ -14,6 +14,11 @@ from uuid import uuid4
 
 LOCK_NAME='attachment-residency-v1'
 RETENTION_DAYS=30
+# ANYM-806 (owner 2026-11-06): an original whose every current occurrence is in an on-request chat (a group or
+# channel no active subscription names, media_policy.ON_REQUEST_CHATS) leaves the disk 24 hours after its last read
+# once its R2 copy is verified; a recognition an agent asked for holds it while it is pending, for at most 7 days.
+CHAT_POLICY_HOURS=24
+RECOGNITION_WAIT_DAYS=7
 
 # Used only while holding lifecycle_lock, with the current attachment aliased a.
 # A durable managed transition pauses original-dependent work without spending
@@ -103,10 +108,44 @@ class LifecycleWorker:
     Production entry points pass require_cold_copy=True: no original is
     unlinked without a verified cold copy. The default exists for fixtures.
     """
-    def __init__(self,store,*,expire_unprocessed=False,require_cold_copy=False):
+    def __init__(self,store,*,expire_unprocessed=False,require_cold_copy=False,chat_policy_only=False):
         if type(expire_unprocessed) is not bool:raise ValueError('invalid_retention_policy')
         if type(require_cold_copy) is not bool:raise ValueError('invalid_retention_policy')
+        if type(chat_policy_only) is not bool:raise ValueError('invalid_retention_policy')
         self.store=store;self.expire_unprocessed=expire_unprocessed;self.require_cold_copy=require_cold_copy
+        self.chat_policy_only=chat_policy_only
+
+    @staticmethod
+    def _chat_policy(c,digest):
+        """Every current occurrence of the original is in an on-request chat (ANYM-806); there is at least one.
+
+        An occurrence without a media job (a legacy or restored original) keeps the 30-day rule for the whole
+        original: request_file_download cannot restore it from the cold copy (provider_source_unavailable).
+        """
+        from .media_policy import ON_REQUEST_CHAT
+        row=c.execute('''SELECT count(*) AS occurrences,count(*) FILTER (WHERE NOT '''+ON_REQUEST_CHAT+'''
+                OR NOT EXISTS(SELECT FROM media_jobs j WHERE j.id=a.id)) AS kept
+            FROM attachments a JOIN messages m ON m.id=a.message WHERE a.digest=%s AND a.active AND NOT m.deleted''',
+            (digest,)).fetchone()
+        return row['occurrences']>0 and row['kept']==0
+
+    @staticmethod
+    def _recognition_pending(c,digest):
+        """An occurrence an agent asked to recognize (ANYM-805: its job's request key digest) still waits for it.
+
+        Pending: enrichment unconfigured, queued, leased or failed (a changed profile retries even an exhausted one), or
+        text queued or leased, that changed in the last RECOGNITION_WAIT_DAYS; older pending work no longer holds the
+        original (it can be asked for again).
+        """
+        return c.execute('''SELECT EXISTS(SELECT FROM attachments a JOIN messages m ON m.id=a.message
+            JOIN media_jobs j ON j.id=a.id AND j.request_key_digest IS NOT NULL
+            WHERE a.digest=%s AND a.active AND NOT m.deleted AND (
+                EXISTS(SELECT FROM attachment_enrichment e WHERE e.attachment=a.id AND e.source_digest=a.digest
+                    AND e.source_revision=m.revision AND e.updated_at>clock_timestamp()-%s*interval '1 day'
+                    AND e.state IN ('unconfigured','queued','leased','failed'))
+                OR EXISTS(SELECT FROM attachment_text f WHERE f.attachment=a.id AND f.source_digest=a.digest
+                    AND f.updated_at>clock_timestamp()-%s*interval '1 day' AND f.state IN ('queued','leased')))) AS pending''',
+            (digest,RECOGNITION_WAIT_DAYS,RECOGNITION_WAIT_DAYS)).fetchone()['pending']
 
     def _lock_sources(self,c,digest):
         return c.execute('SELECT public.lock_lifecycle_sources(%s) AS locked',(digest,)).fetchone()['locked']
@@ -114,11 +153,15 @@ class LifecycleWorker:
     def _eligible(self,c,row):
         if backup_fence_active(c):return 'backup_active'
         if row['pinned']:return 'pinned'
-        old=c.execute("SELECT %s::timestamptz<=clock_timestamp()-interval '30 days' AS old",(row['last_accessed_at'],)).fetchone()['old']
+        # Rechecked under the lifecycle lock before unlink; subscription create and resume take the same lock.
+        chat=self._chat_policy(c,row['digest'])
+        if self.chat_policy_only and not chat:return 'chat_policy_changed'
+        old=c.execute("SELECT %s::timestamptz<=clock_timestamp()-%s*interval '1 hour' AS old",
+            (row['last_accessed_at'],CHAT_POLICY_HOURS if chat else RETENTION_DAYS*24)).fetchone()['old']
         if not old:return 'recently_requested'
         # Rechecked under the lock by _complete, so a copy invalidated after
-        # prepare cancels the journal before unlink.
-        if self.require_cold_copy and not cold_copy_verified(c,row['digest'],row['bytes']):return 'cold_copy_missing'
+        # prepare cancels the journal before unlink. The chat policy always needs one.
+        if (self.require_cold_copy or chat) and not cold_copy_verified(c,row['digest'],row['bytes']):return 'cold_copy_missing'
         if not self._lock_sources(c,row['digest']):return 'occurrence_limit'
         # The default policy requires usable detail for every occurrence.
         # The explicit unprocessed policy instead requires every source to be old.
@@ -145,6 +188,8 @@ class LifecycleWorker:
               OR EXISTS(SELECT FROM attachment_enrichment e WHERE e.attachment=a.id AND e.state='leased' AND e.lease_until>clock_timestamp())
               OR EXISTS(SELECT FROM attachment_understanding u WHERE u.attachment=a.id AND u.state='leased' AND u.lease_until>clock_timestamp())) LIMIT 1''',(row['digest'],)).fetchone()
         if active:return 'inflight'
+        # The chat policy needs no detail: the message, its text and any description stay; the R2 copy restores it.
+        if chat:return 'recognition_pending' if self._recognition_pending(c,row['digest']) else None
         # An explicit operator policy may accept losing unprocessed originals.
         # Every shared occurrence must still be old; all other protections apply.
         if self.expire_unprocessed:
@@ -290,7 +335,21 @@ class LifecycleWorker:
             # This durable order survives one-shot workers and prevents an old
             # unprocessed/corrupt/oversized original from starving later rows.
             # last_accessed_at remains exclusively the retention clock.
-            rows=c.execute("SELECT * FROM attachment_residency WHERE state='resident' AND NOT pinned AND last_accessed_at<=clock_timestamp()-interval '30 days' ORDER BY updated_at,last_accessed_at,digest LIMIT %s",(limit,)).fetchall()
+            # The chat policy's candidates (ANYM-806) are read with the on-request chats as a constant list;
+            # _eligible rechecks each one under the lock.
+            from .media_policy import ON_REQUEST_CHATS
+            waiting=[r['chat'] for r in c.execute('SELECT orc.chat FROM ('+ON_REQUEST_CHATS+') orc').fetchall()]
+            chat_policy='''(r.last_accessed_at<=clock_timestamp()-%(hours)s*interval '1 hour'
+                AND EXISTS(SELECT FROM attachments ca JOIN messages cm ON cm.id=ca.message
+                    WHERE ca.digest=r.digest AND ca.active AND NOT cm.deleted)
+                AND NOT EXISTS(SELECT FROM attachments ca JOIN messages cm ON cm.id=ca.message
+                    WHERE ca.digest=r.digest AND ca.active AND NOT cm.deleted AND (NOT cm.chat=ANY(%(waiting)s::text[])
+                        OR NOT EXISTS(SELECT FROM media_jobs cj WHERE cj.id=ca.id))))'''
+            retention=chat_policy if self.chat_policy_only else (
+                "(r.last_accessed_at<=clock_timestamp()-interval '30 days' OR "+chat_policy+')')
+            rows=c.execute("SELECT r.* FROM attachment_residency r WHERE r.state='resident' AND NOT r.pinned AND "+retention
+                +" ORDER BY r.updated_at,r.last_accessed_at,r.digest LIMIT %(limit)s",
+                {'limit':limit,'hours':CHAT_POLICY_HOURS,'waiting':waiting}).fetchall()
         spent=0;handled=0
         for row in pending:
             if handled>=limit:break
@@ -371,6 +430,8 @@ def main(argv=None):
     parser.add_argument('--apply',action='store_true',help='explicitly enable original deletion')
     parser.add_argument('--expire-unprocessed',action='store_true',
         help='allow old unprocessed originals to expire; retain existing text; a verified cold copy is still required')
+    parser.add_argument('--chat-policy-only',action='store_true',
+        help='one pass over originals of on-request group/channel chats only (ANYM-806); a verified cold copy is required')
     parser.add_argument('--limit',type=int,default=100)
     parser.add_argument('--max-bytes',type=int,default=1024**3)
     parser.add_argument('--interval-seconds',type=int,help='repeat until SIGTERM/SIGINT; omit for one pass')
@@ -382,7 +443,8 @@ def main(argv=None):
     if not 1<=args.limit<=1000 or not 1<=args.max_bytes<=1024**4:parser.error('invalid_lifecycle_limit')
     if args.interval_seconds is not None and not 60<=args.interval_seconds<=7*86400:parser.error('invalid_interval')
     if bool(args.digest)!=(args.pin or args.unpin):parser.error('--digest and --pin/--unpin are required together')
-    if (args.pin or args.unpin) and (args.apply or args.interval_seconds or args.expire_unprocessed):parser.error('pin is a separate one-shot operation')
+    if (args.pin or args.unpin) and (args.apply or args.interval_seconds or args.expire_unprocessed or args.chat_policy_only):
+        parser.error('pin is a separate one-shot operation')
     store=Store(Path(args.dsn_file).read_text().strip(),Path(args.files),'http://localhost')
     stopped=threading.Event()
     old_handlers={}
@@ -394,7 +456,8 @@ def main(argv=None):
             with store.pool.connection() as c:result=pin_original(c,args.digest,args.pin)
             print(json.dumps({'operation':'pin' if args.pin else 'unpin',**result}),flush=True)
             return 0
-        worker=LifecycleWorker(store,expire_unprocessed=args.expire_unprocessed,require_cold_copy=True)
+        worker=LifecycleWorker(store,expire_unprocessed=args.expire_unprocessed,require_cold_copy=True,
+            **({'chat_policy_only':True} if args.chat_policy_only else {}))
         while not stopped.is_set():
             try:result=worker.run_once(apply=args.apply,limit=args.limit,max_bytes=args.max_bytes)
             except Exception:

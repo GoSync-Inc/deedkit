@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from .file_index import file_response_fields
+from .file_lifecycle import CHAT_POLICY_HOURS
 from .media_retry import MEDIA_MAX_ATTEMPTS
 from .media_policy import RECOGNITION_REASON, RECOGNITION_WITHHELD
 from .status_details import describe
@@ -106,9 +107,18 @@ def attachment_fields(row, *, original_present=None):
     enrichment=row.get('enrichment_state',row.get('enrichment_status','unconfigured')) if registered else 'awaiting_download'
     # ANYM-805: recognition of a file of an on-request chat that no agent asked for waits for a request.
     withheld=registered and bool(row.get('recognition_withheld'))
+    # ANYM-806: an on-request chat's original removed from disk before its recognition finished waits for a new
+    # request, which restores it from the R2 copy; it is not queued work while the original is away.
+    evicted_wait=(registered and original_present is False and row.get('original_residency')=='evicted'
+        and bool(row.get('recognition_reason')))
     if withheld:
         extraction='available_on_request' if extraction=='queued' else extraction
         enrichment='available_on_request' if enrichment in ('queued','unconfigured') else enrichment
+    if evicted_wait:
+        # Unfinished work of any kind (queued, leased, failed, unconfigured) waits for the restore; a finished or
+        # unsupported result stays as it is.
+        extraction=extraction if extraction in ('ready','unsupported') else 'available_on_request'
+        enrichment=enrichment if enrichment in ('ready','unsupported') else 'available_on_request'
     coverage={key:row[key] for key in ('text_chars','processor_version','truncated','extraction_metadata','extractor')
         if registered and key in row}
     # ANYM-669: a message read selects only the two OCR counters (ocr_metadata); they join the coverage for OCR rows
@@ -144,9 +154,11 @@ def attachment_fields(row, *, original_present=None):
     if enrichment=='ready' and (kind.startswith('audio/') or kind=='application/ogg'):
         item['transcript_ready']=True  # get_file_text returns it by default (ANYM-453).
     if eligibility=='unknown':item['eligibility_reason']='history_bound_unknown'
-    if withheld and 'available_on_request' in (extraction,enrichment):
+    if (withheld or evicted_wait) and 'available_on_request' in (extraction,enrichment):
         item.update(recognition_reason=row.get('recognition_reason') or 'group_chat_on_request',
             recognition_next_action='request_file_download')
+    if registered and row.get('recognition_reason'):
+        item['original_retention_hours']=CHAT_POLICY_HOURS  # ANYM-806: kept 24 hours after its last read.
     source={}
     for name,aliases in {'account':('account',),'chat':('chat',),'message_id':('message_id','message'),
             'provider_chat_id':('provider_chat_id','provider_chat'),

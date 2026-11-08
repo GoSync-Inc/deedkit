@@ -8,6 +8,31 @@ refresh that clock. An authorized original request does. Existing originals get
 a full 30-day grace period when residency tracking is first installed; message
 age alone never authorizes immediate deletion.
 
+**On-request chats (ANYM-806).** An original whose every current occurrence (active attachment, message
+not deleted) lies in an on-request chat (a group or channel that no active subscription names; see
+"Group and channel chats: download and recognition on request" below) is the `chat_policy` class. It
+leaves the disk **24 hours after its last read** instead of 30 days, and needs no processed detail. A read
+is what moves `last_accessed_at`: an original request, a download grant or served bytes. Metadata reads,
+search and text reads do not. The class always requires a verified cold copy. While a recognition an
+agent asked for (`request_file_download`) is pending, the original stays: enrichment `unconfigured`,
+`queued`, `leased` or `failed` (a changed profile retries even an exhausted failure), or text
+`queued`/`leased`. That wait ends
+7 days after the pending work last changed. All other protections apply unchanged: backup fence, pin,
+occurrence limit, identity, in-flight lease, open request window, live download grant, the integrity
+hash and journal replay. An original with any occurrence in a personal, unknown-kind or subscribed
+chat, or with an occurrence that has no media job (a legacy or restored original, which a request cannot
+restore from the cold copy), keeps the 30-day rule. An owner's pause, resume or close and the operator's
+retention release take the lifecycle lock, so the recheck before unlink and the unlink itself are
+serialized with them. A create with named chats, lazy expiry and access invalidation take no lock: the
+recheck sees a create committed before it, and an eviction racing a create is restored from R2 on request
+(`request_file_download`). Lazy expiry and access invalidation protect an unprotected chat only through
+the 24-hour grace of a subscription that already did not protect it. Attachment items of
+on-request chats carry `original_retention_hours: 24`. An evicted file whose requested recognition never
+finished (queued, leased, failed or unconfigured work) reads `enrichment_status: available_on_request` with `recognition_next_action:
+request_file_download`. The daemon's daily pass includes the class within its `--limit`/`--max-bytes`
+bounds. `--chat-policy-only` runs one pass over this class only; without `--apply` it prints the
+counts, bytes and blocked reasons it would remove.
+
 Since schema 35 no original is deleted without a **verified cold copy** in the
 private R2 bucket (see [Cold archive](#cold-archive-of-originals-schema-35)).
 Every production entry point of the lifecycle worker enforces this; a candidate
