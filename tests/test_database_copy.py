@@ -155,6 +155,21 @@ def test_a_role_membership_the_bootstrap_superuser_granted_restores_in_the_copy(
         psql("postgres", f"DROP ROLE IF EXISTS {member}; DROP ROLE IF EXISTS {group};")
 
 
+# spec: ANYM-588
+def test_a_check_whose_text_reads_back_flattened_still_verifies_the_copy(source):
+    # Incident 11-06: a BETWEEN inside an AND is stored nested and prints `((a) AND (b)) AND (c)`; parsed again it
+    # prints `(a) AND (b) AND (c)`, so the restored schema text differed from the live one: schema_mismatch.
+    settings, database = source
+    psql(database, "CREATE TABLE notes (note text CHECK (length(note) BETWEEN 1 AND 200 AND note !~ '[x]'));"
+                   " INSERT INTO notes VALUES ('synthetic');")
+    assert ")) AND (" in psql(database, "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = "
+                                        "'notes_note_check'")
+    with p.database_copy(settings, "main", SHA) as record:
+        assert record["verified"] and record["counts"]["public.notes"] == 1
+    directory = released(settings, record["id"])
+    assert not (directory / "restored.schema").exists() and not (directory / "round-trip.schema").exists()
+
+
 def fail_dump(copy, argv):
     if "-Fc" in argv:
         return [*argv, "--no-such-option"]
