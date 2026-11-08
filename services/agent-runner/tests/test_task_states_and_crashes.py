@@ -92,6 +92,9 @@ def test_a_crash_while_running_kills_the_container_marks_lost_and_runs_nothing_t
     queued, _ = runner.submit("orchestrator-a", "a-run", fields())
     runner.tick()
     running = wait_running(runner, task["id"])
+    deadline = time.monotonic() + 20  # the engine has read its prompt and recorded its run
+    while task["id"] not in runner.docker.runs() and time.monotonic() < deadline:
+        time.sleep(0.02)
     process = runner.docker.containers[running["container"]].proc
     fresh = restart(runner)  # the old process is gone; its containers are not
     assert process.poll() is not None

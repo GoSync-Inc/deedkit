@@ -413,7 +413,10 @@ class Runner:
                        if k in result}
             self.store.update(task_id, **allowed)
             task = self.store.task(task_id)
-        if task["publish_state"] in SETTLED and not task["volumes_removed"]:
+        # The volumes go only once the container is confirmed gone: `docker volume rm` fails on a volume a
+        # container still uses, and marking it removed then would leak it.
+        gone = not task["container"] or task["container_gone"]
+        if task["publish_state"] in SETTLED and not task["volumes_removed"] and gone:
             self.docker.volume_rm(dk.workspace_volume(task_id))
             self.docker.volume_rm(dk.out_volume(task_id))
             self.store.update(task_id, volumes_removed=1)

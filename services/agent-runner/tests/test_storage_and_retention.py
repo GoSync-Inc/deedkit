@@ -24,6 +24,33 @@ def test_the_container_goes_at_the_terminal_state_and_the_volumes_when_publicati
 
 
 # spec: ANYM-819
+def test_the_volumes_stay_while_the_stopped_container_is_not_confirmed_gone(tmp_path):
+    import time
+    runner = make_runner(tmp_path, modes={"claude": "sleep"})
+    task, _ = runner.submit("orchestrator-a", "a-run", fields())
+    runner.tick()
+    deadline = time.monotonic() + 20
+    while runner.store.task(task["id"])["state"] != "running" and time.monotonic() < deadline:
+        time.sleep(0.02)
+    name = runner.store.task(task["id"])["container"]
+    runner.docker.unstoppable.add(name)  # the stop does not land; the container still uses its volumes
+    runner.stop(task["id"])
+    for _ in range(3):
+        runner.tick()
+        time.sleep(0.1)
+    row = runner.store.task(task["id"])
+    assert row["publish_state"] == "refused" and row["container_gone"] == 0 and row["volumes_removed"] == 0
+    assert {f"agent-ws-{task['id']}", f"agent-out-{task['id']}"} <= set(runner.docker.volumes)
+    runner.docker.unstoppable.clear()
+    while not runner.store.task(task["id"])["volumes_removed"] and time.monotonic() < deadline + 20:
+        runner.tick()
+        time.sleep(0.1)
+    assert runner.store.task(task["id"])["container_gone"] == 1
+    assert not {f"agent-ws-{task['id']}", f"agent-out-{task['id']}"} & set(runner.docker.volumes)
+    assert runner.join(30)
+
+
+# spec: ANYM-819
 def test_texts_logs_and_patches_go_14_days_after_the_terminal_state(tmp_path):
     clock = Clock()
     runner = make_runner(tmp_path, clock=clock)
