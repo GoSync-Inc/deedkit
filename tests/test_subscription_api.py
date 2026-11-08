@@ -579,31 +579,32 @@ def tracked_keys(function,item,*args):
     ({'mentions_owner':True,'reply_to_owner':True,'reply_to_provider_id':'p-1','sender_is_bot':True,
         'forward_origin':{'kind':'channel','chat_id':'c-1'},'media':{'kind':'photo'}},{}),
     ({'reply_to_owner':False,'reply_to_provider_id':'n-1','unread':True},
-        {'basis':'exact_native_reply_to_archived_outgoing','target_provider_id':'p-2','excerpt':'x'}),
+        {'basis':'exact_native_reply_to_archived_outgoing','target_message':'m-2','target_revision':3,
+            'target_provider_id':'p-2'}),
     ({},{}),
 ])
 def test_wake_reason_and_dynamic_match_read_only_compact_keys(metadata,proof):
     import inspect
     import re
     from messaging_service import subscription_consumption as consumption, subscriptions
-    from messaging_service.subscription_consumption import COMPACT_METADATA,COMPACT_REPLY_EVIDENCE,project_page
+    from messaging_service.subscription_consumption import COMPACT_METADATA,project_page
     item={'event_id':1,'kind':'message.created','direction':'incoming','account':'a','chat':'c','historical':False,
         'metadata':metadata,'reply_evidence':proof,'matching_basis':'exact_event_revision'}
     selector={'reply_anchor':{'account':'a','chat':'c','provider_id':'p-1','native_reply_id':'n-1'}}
     compact=project_page({'items':[item]},'compact')['items'][0]
-    assert 'matching_basis' not in compact
+    assert 'matching_basis' not in compact and compact.get('reply_evidence')==item['reply_evidence']
     full_reason,full_seen=tracked_keys(consumption.wake_reason,item,selector)
     compact_reason,_=tracked_keys(consumption.wake_reason,compact,selector)
     assert compact_reason==full_reason
-    assert full_seen<=set(COMPACT_METADATA)|set(COMPACT_REPLY_EVIDENCE)
+    assert full_seen<=set(COMPACT_METADATA)|{'basis','target_provider_id'}
     for sources in ({'include_bots':False},{'include_bots':True}):
         assert subscriptions._dynamic_match(sources,'group',compact)==subscriptions._dynamic_match(sources,'group',item)
     _,dynamic_seen=tracked_keys(lambda snapshot:subscriptions._dynamic_match({'include_bots':False},'group',snapshot),item)
     assert dynamic_seen<=set(COMPACT_METADATA)
-    # Every metadata or reply-evidence key a server reader names is on the allow-list.
+    # Every metadata key a server reader names is on the allow-list (reply_evidence is kept whole).
     for reader in (consumption.wake_reason,subscriptions._dynamic_match,subscriptions._own_send_replies):
-        names=set(re.findall(r"(?:metadata|proof|get\('metadata'\) or \{\}\))\.get\('([a-z_]+)'",inspect.getsource(reader)))
-        assert names and names<=set(COMPACT_METADATA)|set(COMPACT_REPLY_EVIDENCE),(reader.__name__,names)
+        names=set(re.findall(r"(?:metadata|get\('metadata'\) or \{\}\))\.get\('([a-z_]+)'",inspect.getsource(reader)))
+        assert names and names<=set(COMPACT_METADATA),(reader.__name__,names)
 
 
 # spec: ANYM-826

@@ -116,7 +116,7 @@ test('typed action definitions retain required identities and optional reviewed 
     executeMessengerOperation:'args: MessengerOperationAction',getMessengerOperation:'args: {operation_id:string}',
     createSubscription:'args: SubscriptionSelection',listSubscriptions:'args?: {limit?:number}',
     getSubscription:'args: {subscription_id:string}',updateSubscription:'args: SubscriptionLifecycleAction',
-    getSubscriptionEvents:'args: {subscription_id:string; after?:number; limit?:number}',
+    getSubscriptionEvents:'args: SubscriptionPage & {after?:number}',
   };
   const compact=value=>value.replace(/\s+/g,'');
   for(const [name,expected] of Object.entries(methodArguments)){
@@ -124,6 +124,9 @@ test('typed action definitions retain required identities and optional reviewed 
     assert.ok(actual,`typed method missing: ${name}`);
     assert.equal(compact(actual),compact(expected),`typed arguments: ${name}`);
   }
+  // ANYM-826: subscription page projection options.
+  assert.match(declared,/detail\?: 'full'\|'compact';/);
+  assert.match(declared,/include\?: Array<'subscription'\|'delivery'\|'metadata'\|'reply_evidence'>;/);
   for(const name of ['code','status','requestId','retryable'])assert.match(declared,new RegExp(`readonly ${name}:`));
   assert.match(declared,/call<T = Record<string, unknown>>/);
   assert.match(declared,/export type Json = null \| boolean \| number \| string \| Json\[\]/);

@@ -79,10 +79,10 @@ def wake_reason(item, selector=None):
     return reasons or ['selected_event']
 
 
-# ANYM-826: the metadata and reply_evidence keys the server itself reads (wake_reason above; subscriptions._dynamic_match
-# and _own_send_replies): a compact item keeps exactly these, so routing never depends on an omitted key.
+# ANYM-826: the metadata keys the server itself reads (wake_reason above; subscriptions._dynamic_match and
+# _own_send_replies): a compact item keeps exactly these, so routing never depends on an omitted key. reply_evidence
+# is filter evidence and stays whole.
 COMPACT_METADATA = ('mentions_owner', 'reply_to_owner', 'reply_to_provider_id', 'sender_is_bot')
-COMPACT_REPLY_EVIDENCE = ('basis', 'target_provider_id')
 COMPACT_SUBSCRIPTION = ('subscription_id', 'state', 'version', 'label', 'matched_through', 'matcher_caught_up',
     'acked_through', 'blocked_reason', 'gap', 'scope_masked')
 COMPACT_ITEM = ('event_id', 'kind', 'origin', 'revision', 'observed_at', 'matched_at', 'delivered_at', 'historical',
@@ -115,12 +115,8 @@ def _compact_item(item, include):
             kept['forward_origin'] = {'kind': origin['kind']}
         if kept:
             view['metadata'] = kept
-    proof = item.get('reply_evidence')
-    if 'reply_evidence' in include or not isinstance(proof, dict):
-        if proof is not None:
-            view['reply_evidence'] = proof
-    else:
-        view['reply_evidence'] = {key: proof[key] for key in COMPACT_REPLY_EVIDENCE if key in proof}
+    if 'reply_evidence' in item:
+        view['reply_evidence'] = item['reply_evidence']
     return view
 
 
