@@ -41,9 +41,9 @@ def psql(database, text):
 
 
 def scratch_sql(copy_id, database, text):
-    subprocess.run(["docker", "exec", "-i", "deedkit-copy-" + copy_id, "psql", "-X", "-q", "-v", "ON_ERROR_STOP=1",
-                    "-h", "127.0.0.1", "-U", p.COPY_USER, "-d", database], input=text, text=True, capture_output=True,
-                   check=True, timeout=60)
+    return subprocess.run(["docker", "exec", "-i", "deedkit-copy-" + copy_id, "psql", "-X", "-q", "-A", "-t", "-v",
+                           "ON_ERROR_STOP=1", "-h", "127.0.0.1", "-U", OWNER, "-d", database], input=text, text=True,
+                          capture_output=True, check=True, timeout=60).stdout.strip()
 
 
 def copy_sessions(copy_id, step=""):
@@ -132,6 +132,27 @@ def test_copy_holds_the_snapshot_counts_while_a_writer_inserts_and_restores_them
         assert (directory / name).stat().st_mode & 0o777 == 0o600
         assert record["files"][name] == p.file_digest(directory / name)
     assert record["server_version"].startswith("18") and record["database_bytes"] > 0
+
+
+# spec: ANYM-588
+def test_a_role_membership_the_bootstrap_superuser_granted_restores_in_the_copy(source):
+    # Incident 11-06: pg_dumpall writes `GRANTED BY <bootstrap superuser>`; PostgreSQL 16+ refuses that grant from a
+    # role without ADMIN OPTION, and the scratch server's bootstrap superuser had another name: restore_failed.
+    settings, database = source
+    group, member = ("anymsg_copy_" + uuid4().hex[:10] + suffix for suffix in ("_g", "_m"))
+    psql("postgres", f"CREATE ROLE {group} NOLOGIN; CREATE ROLE {member} NOLOGIN; GRANT {group} TO {member};")
+    membership = (f"SELECT pg_get_userbyid(grantor) || ' ' || (grantor = 10) FROM pg_auth_members"
+                  f" WHERE roleid = '{group}'::regrole AND member = '{member}'::regrole")
+    try:
+        bootstrap = psql("postgres", "SELECT rolname FROM pg_roles WHERE oid = 10")
+        assert psql("postgres", membership) == bootstrap + " true"
+        with p.database_copy(settings, "main", SHA, keep=True) as record:
+            assert record["verified"] and record["scratch_user"] == bootstrap
+            # The copy's membership keeps its grantor: the scratch server's own bootstrap superuser of that name.
+            assert scratch_sql(record["id"], "postgres", membership) == bootstrap + " true"
+        released(settings, record["id"])
+    finally:
+        psql("postgres", f"DROP ROLE IF EXISTS {member}; DROP ROLE IF EXISTS {group};")
 
 
 def fail_dump(copy, argv):
@@ -499,7 +520,7 @@ def test_free_space_read_while_the_restore_runs_cancels_it_below_the_reserve(sou
         # A restore that is still running at the next 2 s read.
         if "pg_restore" in argv:
             reads.append("start")
-            return [*argv[:6], "psql", "-X", "-q", "-h", "127.0.0.1", "-U", p.COPY_USER, "-d", "postgres", "-c",
+            return [*argv[:6], "psql", "-X", "-q", "-h", "127.0.0.1", "-U", OWNER, "-d", "postgres", "-c",
                     "SELECT pg_sleep(60)"]
     wrap_watched(monkeypatch, before=slow)
     started = time.monotonic()
