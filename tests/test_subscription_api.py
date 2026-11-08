@@ -602,7 +602,7 @@ def test_wake_reason_and_dynamic_match_read_only_compact_keys(metadata,proof):
     assert dynamic_seen<=set(COMPACT_METADATA)
     # Every metadata or reply-evidence key a server reader names is on the allow-list.
     for reader in (consumption.wake_reason,subscriptions._dynamic_match,subscriptions._own_send_replies):
-        names=set(re.findall(r"(?:metadata|proof|\{\}\))\.get\('([a-z_]+)'",inspect.getsource(reader)))
+        names=set(re.findall(r"(?:metadata|proof|get\('metadata'\) or \{\}\))\.get\('([a-z_]+)'",inspect.getsource(reader)))
         assert names and names<=set(COMPACT_METADATA)|set(COMPACT_REPLY_EVIDENCE),(reader.__name__,names)
 
 
@@ -667,7 +667,11 @@ def test_page_detail_is_described_alike_in_backend_gateway_and_clients():
             'Accept':'application/json, text/event-stream'},json={'jsonrpc':'2.0','id':1,
             'method':'tools/list','params':{}}).json()['result']['tools']
     backend={tool['name']:tool for tool in listed}
-    python=Client('http://testserver','synthetic-token')
+    sent=[]
+    def transport(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200,json={'synthetic':True})
+    python=Client('https://archive.example','synthetic-token',transport=httpx.MockTransport(transport))
     for name in ('get_subscription_events','fetch_subscription_events','wait_for_subscription_events'):
         properties=backend[name]['inputSchema']['properties']
         assert 'default' not in properties['detail'] and 'default' not in properties['include']
@@ -676,11 +680,14 @@ def test_page_detail_is_described_alike_in_backend_gateway_and_clients():
         assert gateway['inputSchema']['properties']['include']==properties['include']
         assert 'detail=compact' in backend[name]['description']
         assert gateway['description']==backend[name]['description']
-        sent=[]
-        python.call=lambda operation,parameters=None:sent.append(parameters) or {}
+        sent.clear()
         getattr(python,name)(subscription_id='sub_synthetic')
         getattr(python,name)(subscription_id='sub_synthetic',detail='compact',include=['metadata'])
         assert 'detail' not in sent[0] and sent[1]['detail']=='compact' and sent[1]['include']==['metadata']
+        for bad in ({'detail':'brief'},{'include':['selector']}):
+            with pytest.raises(ValueError):
+                getattr(python,name)(subscription_id='sub_synthetic',**bad)
+        assert len(sent)==2
     readme=(root/'SUBSCRIPTIONS.md').read_text()
     assert "detail='compact'" in readme and 'the default stays `full`' in readme
 
