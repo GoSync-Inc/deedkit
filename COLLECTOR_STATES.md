@@ -19,8 +19,9 @@ that profile is enabled and unexpired; a cleanly stopped or killed worker is `en
 Withheld, evicted and not-recognizable rows never count.
 
 `coverage` (each account row, ANYM-812; never for a chat-restricted reader) answers "is everything due
-under the current policy done". `detail=compact` carries only `state`, `since`, `due` totals
-(`to_download`, `to_index`, `to_recognize`) and the `available_on_request` total; full detail:
+under the current policy done". `detail=compact` carries, while `behind`, only `state`, `since`, `due`
+totals (`to_download`, `to_index`, `to_recognize`) and the `available_on_request` total; while `done`, the
+state and that total; while `unknown`, nothing (the 8 KiB compact budget). Full detail:
 
 - `state`: `done` when every `due.to_*` is 0, `behind` otherwise, `unknown` when the run's window is
   unpublished or the collector lease has expired. A terminal failure never makes it `behind`.

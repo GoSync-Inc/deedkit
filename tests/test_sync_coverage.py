@@ -374,6 +374,9 @@ def test_compact_status_shows_the_verdict_and_one_on_request_total(cov):
     full = status(s)[0]['coverage']
     assert block == {'state': 'behind', 'since': full['since'], 'available_on_request': 4,
                      'due': {'to_download': 1, 'to_index': 1, 'to_recognize': 3}}
+    # A done account names its on-request total; an unknown one stays out of the compact budget.
+    assert coverage.compact({**full, 'state': 'done'}) == {'state': 'done', 'available_on_request': 4}
+    assert coverage.compact({**full, 'state': 'unknown'}) is None
     json.dumps(compact, default=str)
 
 

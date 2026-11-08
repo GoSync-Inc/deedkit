@@ -579,7 +579,8 @@ def render(method, result, detail, include_coverage=False):
             # ANYM-812: the policy verdict, due counts and one on-request total.
             if source.get('coverage'):
                 from .coverage import compact as coverage_compact
-                row['coverage']=coverage_compact(source['coverage'])
+                block=coverage_compact(source['coverage'])
+                if block is not None:row['coverage']=block
             compact['sources'].append(row)
         # ANYM-785: the compact budget names only accounts with something to report.
         health=result.get('enrichment_health')

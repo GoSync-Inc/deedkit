@@ -213,7 +213,13 @@ def block(row, platform, files, tally, eligibility, health_codes, lease_live):
 def compact(full):
     """Compact detail: the verdict and its totals (ANYM-812 criterion 1); detail=full has the policy and every bucket.
 
-    Kept small: the compact account overview has an 8 KiB budget over MCP (tests/test_grok_followup.py)."""
+    Kept small: the compact account overview has an 8 KiB budget over MCP (tests/test_grok_followup.py). None while
+    the state is unknown (nothing to act on yet; full detail says why); a done account names only its on-request
+    total."""
+    if full['state'] == 'unknown':
+        return None
+    if full['state'] == 'done':
+        return {'state': 'done', 'available_on_request': full['available_on_request']['total']}
     due = full['due']
     return {'state': full['state'], 'since': full['since'],
             'due': {'to_download': due['to_download'], 'to_index': due['to_index'],
