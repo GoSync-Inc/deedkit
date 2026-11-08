@@ -917,6 +917,11 @@ class TelegramCollector:
         def apply(item):
             nonlocal last,count
             settle(item);last=item;count+=1
+            # ANYM-813: the first committed live message of a batch, kept until a status write succeeds
+            # (capture_progress records it for the native WhatsApp provider only).
+            if (getattr(self,'first_live',None) is None and isinstance(item,dict) and item.get('kind')=='message'
+                    and isinstance(item.get('envelope'),dict) and item['envelope'].get('origin')=='live'):
+                self.first_live=item
         gap_lock=getattr(getattr(self,'provider',None),'read_gap_lock',None) or nullcontext()
         async with gap_lock:await self.flush_read_gap()
         for spool in spools:await asyncio.to_thread(spool.drain,apply,100)
@@ -940,8 +945,11 @@ class TelegramCollector:
                 # A gap write waits for this heartbeat; one that failed meanwhile is written first.
                 async with gap_lock:
                     await self.flush_read_gap()
+                    first_live=getattr(self,'first_live',None)
+                    if first_live is not None:extra['first_live']=first_live
                     await asyncio.to_thread(self.state.capture_progress,last,count,backlog,
                         quarantined=min(20000,quarantined),invalid=invalid,**extra)
+                    self.first_live=None
             except BaseException:
                 # Skipped items have no spool record to replay; keep their counts for the retry.
                 self.invalid_messages+=invalid

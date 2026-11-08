@@ -5,7 +5,7 @@ DETAILS={
     'version_conflict':('Conflicting provider observations; current archive revision is retained. The account conflict line counts what needs attention; get_sync_status with a chat_id lists that chat\'s open conflicts.','inspect_chat'),
     'coverage_not_reconciled':('Archived observations do not establish complete provider history.','get_sync_status_for_chat'),
     'whatsapp_catchup_gap':('Provider traversal did not reach a previous checkpoint. Live collection may still work.','inspect_chat_gaps'),
-    'whatsapp_history_partial':('WhatsApp history remains a partial provider traversal.','get_sync_status_for_chat'),
+    'whatsapp_history_partial':('Partial is permanent for WhatsApp, which keeps no server history: the archive holds the phone\'s batch after pairing (7 days, 50 messages per chat) and live capture since, and request_chat_history asks the phone for one chat\'s older messages.','get_sync_status_for_chat'),
     'telegram_history_partial':('Telegram history traversal is in progress or limited.','get_sync_status_for_chat'),
     'telegram_history':('Telegram is traversing archived history.','get_sync_status_for_chat'),
     'telegram_discovery':('Telegram chat catalogue discovery is in progress.','wait_for_discovery'),

@@ -1,5 +1,5 @@
 """Durable provider captures and reconciliation checkpoints, independent of clients."""
-from contextlib import contextmanager
+from contextlib import contextmanager,suppress
 from datetime import datetime
 import fcntl
 import os
@@ -327,7 +327,7 @@ class CollectorState:
             return {'blocked':phase.get('state')=='blocked','remaining_seconds':remaining}
 
     def capture_progress(self,last,count,pending,*,quarantined=None,invalid=0,history_pending=None,
-                         rejected=None,rejected_messages=()):
+                         rejected=None,rejected_messages=(),first_live=None):
         if type(count) is not int or count<0 or type(pending) is not int or not 0<=pending<=20000:
             raise ValueError('invalid_capture_progress')
         if (quarantined is not None and (type(quarantined) is not int or not 0<=quarantined<=20000)
@@ -364,6 +364,14 @@ class CollectorState:
                     'origin':envelope['origin'] if envelope else
                         'receipt' if capture['kind']=='message_receipt' else 'owner_read_state' if capture['kind']=='owner_read_state' else 'deletion',
                     'mcp_available_after_commit':True,'measurement':'upper_bound_after_archive_commit' if observed else 'capture_time_not_recorded'}
+            # ANYM-813: the first live message committed under the native WhatsApp provider (the drain keeps the
+            # batch's first one, not only its last item); written once. Diagnostics only: a bad candidate is ignored.
+            if (first_live is not None and not previous.get('native_live_since')
+                    and (value.get('provider') or {}).get('name')=='whatsmeow'):
+                with suppress(ValueError,TypeError,KeyError):
+                    item=validate_capture(first_live)
+                    if item.get('envelope',{}).get('origin')=='live':
+                        extra['native_live_since']=datetime.fromisoformat(utc(item['captured_at'])).isoformat()
             held=extra.get('quarantined_captures',previous.get('quarantined_captures',0))
             # Quarantined items no longer block capture, but they need an operator decision.
             self._phase(value,'live_capture','backlogged' if pending else 'receiving',

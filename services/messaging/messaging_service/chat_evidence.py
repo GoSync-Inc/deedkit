@@ -94,6 +94,10 @@ def history(row,lower=None,upper=None):
         complete=progress.get('history_exhausted') is True and not gaps
         state='provider_exhausted' if complete else ('loading' if type(progress.get('history_exhausted')) is bool else 'not_scanned')
         if gaps:state='gaps'
+    span=None
+    if row['platform']=='whatsapp':
+        from .sync_status import unverified_span
+        span=unverified_span(row['wa_progress'])
     error=row['last_error_code']
     if error:state='provider_unavailable' if error=='provider_unavailable' else 'rate_limited'
     range_inside=complete and scanned is not None and not gaps and not row['synthetic'] and not error
@@ -111,7 +115,9 @@ def history(row,lower=None,upper=None):
         'gaps':gaps,'last_error_code':error,'last_error_at':row['last_error_at'],
         'history_traversal_complete':complete,
         'requested_range_traversed':bool(range_inside),'full_history_verified':False,
-        'older_edits_and_deletions_verified':False}
+        'older_edits_and_deletions_verified':False,
+        # ANYM-813: the native catch-up's unverified span; not a gap and no answer caveat.
+        **({'unverified_span':span} if span else {})}
 
 
 def history_pointer(c,p,row,h):

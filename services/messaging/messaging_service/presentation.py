@@ -564,7 +564,7 @@ def render(method, result, detail, include_coverage=False):
                 and v is not None and (k!='qualifications' or v)}
             row['history']={k:v for k,v in source.get('history',{}).items()
                 if k in ('observed_chats','unknown_chats','full_history_verified','gap_chats','gap_cleared_chats',
-                    'catchup_pending_chats','configured_window','last_scan_at','live_only_chats','live_only_chat_ids')
+                    'catchup_pending_chats','unverified_span_chats','configured_window','last_scan_at','live_only_chats','live_only_chat_ids')
                 and (k not in ('live_only_chats','live_only_chat_ids') or v)}
             row['operations']={name:{k:v for k,v in operation.items()
                 if k in ('state','reason_code','pending_events','collector_running','retry_at','next_action',

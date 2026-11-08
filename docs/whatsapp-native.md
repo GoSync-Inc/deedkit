@@ -62,6 +62,14 @@ nothing; its only write is one `repair_progress` row in `capture.sqlite`, and
 rollback to the previous adapter ignores the table. The repair itself is a
 follow-up.
 An exhausted local cache is not a complete WhatsApp history.
+History is partial by contract: the phone's batch after pairing (device props:
+7 recent days, 50 messages per chat), live capture since, and explicit
+`request_chat_history` pages. The collector's catch-up reads only the local cache.
+When that read returns nothing older than the catch-up pointer on two consecutive
+scans, the chat gets an unverified span (COLLECTOR_STATES.md, `history`): the
+interval between the previous head and the pointer, which the archive can neither
+prove missing nor prove covered. No provider request is made for it; closing a
+span needs the phone's correlated answer (ANYM-814).
 
 The account-specific operation manifest reflects the selected provider after
 an identity-verified connection; platform counts are legacy defaults only.
