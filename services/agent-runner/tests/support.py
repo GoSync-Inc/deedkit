@@ -105,7 +105,7 @@ class Container:
     def __init__(self, name, args, env, mounts):
         self.name, self.args, self.env, self.mounts = name, args, env, mounts
         self.proc, self.task_id = None, name.removeprefix("agent-task-")
-        self.visible_at = 0.0
+        self.client = None
 
 
 class FakeDocker:
@@ -122,7 +122,8 @@ class FakeDocker:
         self.lock = threading.Lock()
         self.fail_create, self.config = None, None
         self.unstoppable, self.oneoff_logins, self.hygiene_code = set(), [], None
-        self.daemon_down, self.start_delay = False, 0.0
+        self.daemon_down, self.start_delay, self.remove_fails_until = False, 0.0, 0.0
+        self.daemon_starts = []
         self.on_create = None
         self.codex_login = self.root / "codex-login"
         self.codex_login.mkdir(parents=True, exist_ok=True)
@@ -166,11 +167,36 @@ class FakeDocker:
                "FAKE_OUT": str(self.volume_dir(f"agent-out-{task_id}")),
                "FAKE_STREAMS": str(HERE / "streams"), "FAKE_CODEX_HOME": str(self.codex_login),
                "FAKE_RUNS": str(self.root / "runs.log")}
-        container.visible_at = time.monotonic() + self.start_delay  # a slow daemon: still `created` meanwhile
+        self.starts.append(name)
+        if self.start_delay:
+            # A slow daemon: the start request is taken and cannot be cancelled. The returned process is only
+            # the client; killing it does not stop the daemon from starting the engine later, unless the
+            # container is gone by then.
+            client = subprocess.Popen([sys.executable, "-c", "import sys, time; sys.stdin.read(); time.sleep(600)"],
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            container.client = client
+            timer = threading.Timer(self.start_delay, self._daemon_start, (name, env))
+            timer.daemon = True
+            timer.start()
+            return client
         container.proc = subprocess.Popen([sys.executable, str(FAKE_ENGINE)], env=env, stdin=subprocess.PIPE,
                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
-        self.starts.append(name)
         return container.proc
+
+    def _daemon_start(self, name, env):
+        with self.lock:
+            container = self.containers.get(name)
+            if container is None or container.proc is not None:
+                return
+            container.proc = subprocess.Popen([sys.executable, str(FAKE_ENGINE)], env=env,
+                                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                              stderr=subprocess.DEVNULL, start_new_session=True)
+        self.daemon_starts.append(name)
+
+    def stop_clients(self):
+        for container in self.containers.values():
+            if getattr(container, "client", None) and container.client.poll() is None:
+                container.client.kill()
 
     def running(self, name):
         if self.daemon_down:
@@ -178,7 +204,7 @@ class FakeDocker:
         container = self.containers.get(name)
         if container is None:
             return "missing"
-        if container.proc is None or time.monotonic() < container.visible_at:
+        if container.proc is None:
             return "created"
         return "running" if container.proc.poll() is None else "exited"
 
@@ -208,7 +234,7 @@ class FakeDocker:
         self._signal(name, 9)
 
     def remove(self, name):
-        if self.daemon_down:
+        if self.daemon_down or time.monotonic() < self.remove_fails_until:
             return False
         with self.lock:  # as `docker rm` without force: a running container stays
             container = self.containers.get(name)

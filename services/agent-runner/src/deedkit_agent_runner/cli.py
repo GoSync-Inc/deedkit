@@ -20,7 +20,7 @@ from . import config as cfg
 from .app import PeerGuard, create_app
 from .docker import DockerCLI
 from .hostgate import CommandGate
-from .runner import Runner, claude_token, stop_all
+from .runner import Runner, claude_token, stop_all, stop_unreconciled
 from .store import Store
 
 EXIT_REFUSED = 2
@@ -86,8 +86,14 @@ def command_serve(args):
 def command_stop_all(args):
     config = cfg.load(args.config)
     store = Store(Path(config.state_dir) / "tasks.sqlite3", time.time)
-    stopped = stop_all(store, DockerCLI(config), Path(config.state_dir) / "pause")
+    docker = DockerCLI(config)
+    stopped = stop_all(store, docker, Path(config.state_dir) / "pause")
+    left = stop_unreconciled(store, docker)
     print(f"paused; stopped {len(stopped)} task(s)")
+    if left:  # never report success while a container may still be alive
+        print(f"agent-runner stop-all: {len(left)} container(s) not confirmed gone: {' '.join(left)}",
+              file=sys.stderr)
+        return 1
     return 0
 
 

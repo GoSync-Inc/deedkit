@@ -28,6 +28,7 @@ PROGRESS_EVERY_S = 2.0
 LOGIN_TTL_S = 600
 PREAMBLE_NAME = "preamble.md"
 START_CONFIRM_S = 120.0
+START_RESOLVE_S = 300.0
 START_POLL_S = 0.05
 HYGIENE_PENDING = "codex-hygiene-pending"
 
@@ -278,11 +279,13 @@ class Runner:
                     return
                 process = self.docker.start_attached(name)
                 if not self._confirm_start(name, process):
-                    # The start's outcome is unknown: end the request and remove the created container while
-                    # still holding the lock, so no delayed start can land after a stop-all that follows.
+                    # The start's outcome is unknown, and killing the client does not cancel a start the
+                    # daemon already took. Still holding the lock, stop and remove the container until the
+                    # daemon confirms it is gone, so no start can land after a stop-all that follows.
                     process.kill()
-                    self.docker.remove(name)
-                    if self.store.finish(task_id, "failed", "start_unconfirmed"):
+                    resolved = self._resolve_unconfirmed(name)
+                    reason = "start_unconfirmed" if resolved else "start_unresolved"
+                    if self.store.finish(task_id, "failed", reason):
                         self._audit(task_id)
                     return
             self._audit(task_id)
@@ -314,6 +317,22 @@ class Runner:
                 return True
             if state == "created" and process.poll() is not None:
                 return False  # `docker start` gave up; the container never started
+            time.sleep(START_POLL_S)
+        return False
+
+    def _resolve_unconfirmed(self, name):
+        """Stop and remove the container until the daemon confirms "missing". False after START_RESOLVE_S: the
+        task then ends `start_unresolved`, keeps its container unreconciled (the slot stays held), and the
+        tick and `stop-all` go on stopping and removing it."""
+        deadline = time.monotonic() + START_RESOLVE_S
+        while time.monotonic() < deadline:
+            state = self.docker.running(name)
+            if state == "missing":
+                return True
+            if state in ("running", "restarting", "paused"):
+                self.docker.stop(name)
+            elif state != "unknown":  # created, exited, dead, removing
+                self.docker.remove(name)
             time.sleep(START_POLL_S)
         return False
 
@@ -460,6 +479,20 @@ def stop_all(store, docker, pause_file):
     for name in running:
         docker.stop(name)
     return stopped
+
+
+def stop_unreconciled(store, docker):
+    """stop-all's second part: every container of a terminal task not confirmed gone (a stop that did not land,
+    an unresolved start) is stopped and removed. Returns the names the daemon does not confirm gone."""
+    left = []
+    for task in store.unreconciled():
+        name = task["container"]
+        if docker.running(name) not in ("missing", "exited", "dead", "created"):
+            docker.stop(name)
+        docker.remove(name)
+        if docker.running(name) != "missing":
+            left.append(name)
+    return left
 
 
 def view(task, clock):

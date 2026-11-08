@@ -5,6 +5,7 @@ Tests swap `DockerCLI` for a fake with the same methods; the argv builders are p
 
 import io
 import os
+import re
 import subprocess
 import tarfile
 
@@ -110,6 +111,11 @@ HYGIENE_SCRIPT = (
 CODEX_HYGIENE = ("sh", "-c", HYGIENE_SCRIPT)
 
 
+NOT_FOUND = re.compile(rb"(?m)^(Error: |Error response from daemon: )?No such (container|object): \S")
+TRANSPORT = re.compile(rb"(?i)cannot connect to the docker daemon|error during connect|dial unix|connection refused"
+                       rb"|no such file or directory|is the docker daemon running")
+
+
 class DockerError(Exception):
     pass
 
@@ -161,7 +167,9 @@ class DockerCLI:
             return "unknown"
         if code == 0:
             return out.decode().strip() or "unknown"
-        return "missing" if b"no such" in err.lower() else "unknown"
+        # Only the daemon's own not-found answer; a transport error such as a missing socket ("... connect: no
+        # such file or directory") or a daemon that is down reads unknown.
+        return "missing" if NOT_FOUND.search(err) and not TRANSPORT.search(err) else "unknown"
 
     def exit_code(self, name):
         code, out, _ = self._run(["inspect", "--format", "{{.State.ExitCode}} {{.State.OOMKilled}}", name])

@@ -174,15 +174,89 @@ def test_a_start_not_confirmed_in_time_is_ended_before_the_lock_is_released(tmp_
     from deedkit_agent_runner import runner as runner_module
     monkeypatch.setattr(runner_module, "START_CONFIRM_S", 0.3)
     runner = make_runner(tmp_path, modes={"claude": "sleep"})
-    runner.docker.start_delay = 3.0  # the daemon would start it only after the confirmation window
+    runner.docker.start_delay = 3.0  # the daemon took the start and runs it only after the window
     task, _ = runner.submit("orchestrator-a", "a-run", fields())
     runner.tick()
     assert runner.join(30)
     stop_all(runner.store, runner.docker, runner.pause_file)  # returns after the lock is free
-    time.sleep(3.2)  # past the moment the delayed start would have landed
+    time.sleep(3.2)  # past the moment the delayed daemon-side start would have landed
     row = runner.store.task(task["id"])
     assert (row["state"], row["reason"]) == ("failed", "start_unconfirmed")
+    assert live(runner) == [] and runner.docker.labelled() == [] and runner.docker.daemon_starts == []
+    runner.docker.stop_clients()
+
+
+# spec: ANYM-819
+def test_a_daemon_start_landing_while_removal_fails_is_stopped_before_stop_all_returns(tmp_path, monkeypatch):
+    from deedkit_agent_runner import runner as runner_module
+    monkeypatch.setattr(runner_module, "START_CONFIRM_S", 0.3)
+    runner = make_runner(tmp_path, modes={"claude": "sleep"})
+    runner.docker.start_delay = 0.8  # lands while the runner is still resolving the start
+    runner.docker.remove_fails_until = time.monotonic() + 1.5
+    task, _ = runner.submit("orchestrator-a", "a-run", fields())
+    runner.tick()
+    time.sleep(0.2)
+    other = threading.Thread(target=stop_all, args=(runner.store, runner.docker, runner.pause_file))
+    other.start()  # blocks on the lock until the start is resolved
+    other.join(60)
+    assert runner.join(30)
+    assert runner.docker.daemon_starts  # the uncancellable start did land
     assert live(runner) == [] and runner.docker.labelled() == []
+    assert runner.store.task(task["id"])["reason"] == "start_unconfirmed"
+    runner.docker.stop_clients()
+
+
+# spec: ANYM-819
+def test_an_unresolved_start_keeps_its_slot_and_stop_all_reports_it_until_it_is_gone(tmp_path, monkeypatch):
+    from deedkit_agent_runner import cli
+    from deedkit_agent_runner import runner as runner_module
+    monkeypatch.setattr(runner_module, "START_CONFIRM_S", 0.2)
+    monkeypatch.setattr(runner_module, "START_RESOLVE_S", 0.3)
+    runner = make_runner(tmp_path, modes={"claude": "sleep"})
+    runner.docker.start_delay = 0.8
+    runner.docker.remove_fails_until = time.monotonic() + 3.0
+    task, _ = runner.submit("orchestrator-a", "a-run", fields())
+    second, _ = runner.submit("orchestrator-a", "a-run", fields())
+    runner.tick()
+    assert runner.join(30)
+    row = runner.store.task(task["id"])
+    assert (row["reason"], row["container_gone"]) == ("start_unresolved", 0)
+    time.sleep(1.0)  # the daemon-side start lands after the runner gave up resolving it
+    assert runner.docker.daemon_starts and runner.store.slot_held("claude")
+    monkeypatch.setattr(cli, "DockerCLI", lambda config: runner.docker)
+    assert main(["stop-all", "--config", str(runner.config_path)]) == 1  # stopped, but not confirmed gone
+    assert live(runner) == []
+    time.sleep(max(0.0, runner.docker.remove_fails_until - time.monotonic()) + 0.1)
+    assert main(["stop-all", "--config", str(runner.config_path)]) == 0
+    runner.tick()
+    assert runner.join(30)
+    assert runner.store.task(task["id"])["container_gone"] == 1 and runner.docker.labelled() == []
+    assert runner.store.task(second["id"])["state"] == "stopped"
+    runner.docker.stop_clients()
+
+
+# spec: ANYM-819
+def test_running_reads_missing_only_on_the_daemons_not_found_answer(tmp_path):
+    from deedkit_agent_runner.docker import DockerCLI
+    from support import write_config
+    script = tmp_path / "docker"
+
+    def answer(code, out, err):
+        script.write_text(f"#!/bin/sh\nprintf '%s' '{out}'\nprintf '%s\\n' '{err}' >&2\nexit {code}\n")
+        script.chmod(0o700)
+        _, config = write_config(tmp_path, docker={"binary": str(script)})
+        return DockerCLI(config).running("agent-task-x")
+
+    assert answer(0, "running", "") == "running"
+    assert answer(1, "", "Error: No such container: agent-task-x") == "missing"
+    assert answer(1, "", "Error response from daemon: No such container: agent-task-x") == "missing"
+    socket = ("failed to connect to the docker API at unix:///v/docker.sock; check if the path is correct and if "
+              "the daemon is running: dial unix /v/docker.sock: connect: no such file or directory")
+    assert answer(1, "", socket) == "unknown"
+    assert answer(1, "", "Cannot connect to the Docker daemon at unix:///v/docker.sock. "
+                         "Is the docker daemon running?") == "unknown"
+    assert answer(1, "", "permission denied while trying to connect") == "unknown"
+    assert answer(1, "", "") == "unknown"
 
 
 # spec: ANYM-819
