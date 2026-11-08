@@ -213,6 +213,19 @@ def test_starvation_needs_fifty_rows_sent_between_six_and_forty_eight_hours_ago(
     assert codes(s) == {'enrichment_starved'}
 
 
+# spec: ANYM-812
+def test_starvation_counts_queued_and_due_unconfigured_rows_of_one_kind_together(s):
+    # A claim that takes one unconfigured row and defers it leaves 49 + 1 waiting: still starvation.
+    profile(s);job(s, 'ready', age='1 minute')
+    for _ in range(health.STARVED_ROWS - 1):
+        job(s, 'unconfigured', kind=None, profile_hash=None, provider=None, sent='7 hours')
+    assert codes(s) == set()
+    job(s, sent='7 hours')
+    result = health.evaluate(s)
+    assert result['codes'] == {'enrichment_starved'}
+    assert result['accounts'][TG]['counts']['audio']['sent_6h_to_48h'] == health.STARVED_ROWS
+
+
 # spec: ANYM-785
 def test_an_old_history_backfill_is_not_starvation(s):
     profile(s);job(s, 'ready')

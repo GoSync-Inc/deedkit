@@ -214,6 +214,7 @@ def _files(c, p, *, group_by_chat=False, tallies=None):
     indexed = c.execute('WITH '+coverage.policy_sets(withheld)+'\n    SELECT '+key+''' AS account,'''+coverage.KIND+''' AS kind,
             '''+coverage.extraction_bucket()+''' AS extraction_bucket,
             '''+coverage.recognition_bucket()+''' AS recognition_bucket,
+            coalesce(f.state,'unknown') AS extraction_state,coalesce(e.state,'unknown') AS enrichment_state,
             count(*) AS count,sum(a.bytes) AS bytes,
             count(*) FILTER (WHERE f.state='ready' AND f.truncated) AS extraction_truncated,
             count(*) FILTER (WHERE e.state='ready' AND e.truncated) AS enrichment_truncated,
@@ -226,14 +227,14 @@ def _files(c, p, *, group_by_chat=False, tallies=None):
         LEFT JOIN attachment_enrichment e ON e.attachment=a.id AND e.source_digest=a.digest
             AND e.source_revision=m.revision AND e.state<>'superseded' '''+coverage.POLICY_JOINS+'''
         WHERE a.active AND NOT m.deleted AND '''+where+'''
-        GROUP BY 1,2,3,4''', args)
+        GROUP BY 1,2,3,4,5,6''', args)
     files = {}
     for row in indexed:
         item = files.setdefault(row['account'], empty_files())
         item['stored_files'] += row['count']
         item['stored_bytes'] += int(row['bytes'])
-        extraction = coverage.EXTRACTION_FILES[row['extraction_bucket']]
-        enrichment = coverage.RECOGNITION_FILES[row['recognition_bucket']]
+        extraction = coverage.histogram_key(row['extraction_state'], row['extraction_bucket'], coverage.EXTRACTION_FILES)
+        enrichment = coverage.histogram_key(row['enrichment_state'], row['recognition_bucket'], coverage.RECOGNITION_FILES)
         item['extraction'][extraction] += row['count']
         item['enrichment'][enrichment] += row['count']
         item['extraction_truncated'] += row['extraction_truncated']
@@ -261,19 +262,21 @@ def _eligibility(c, accounts):
         return {}
     from .coverage import WHATSAPP_MEDIA_RETENTION_DAYS
     # ANYM-812: also how many are older than WhatsApp's media retention estimate, and since when due work waits.
-    for row in c.execute('''SELECT m.account,el.claim AS eligibility,j.error_code,count(*) AS count,
+    for row in c.execute('''SELECT m.account,el.claim AS eligibility,j.error_code,j.state,count(*) AS count,
             count(*) FILTER (WHERE m.sent_at<clock_timestamp()-make_interval(days=>%s)) AS old,
             min(j.created_at) AS since
         FROM media_jobs j JOIN messages m ON m.id=j.message AND m.account=j.account
         JOIN chats ch ON ch.id=m.chat AND ch.account=m.account '''+ELIGIBILITY_JOIN+'''
         LEFT JOIN attachments a ON a.id=j.id AND a.message=j.message AND a.active
-        WHERE j.state='queued' AND a.id IS NULL AND NOT m.deleted AND m.account=ANY(%s)
-        GROUP BY 1,2,3''', (WHATSAPP_MEDIA_RETENTION_DAYS, list(result))):
+        WHERE j.state IN ('queued','leased') AND a.id IS NULL AND NOT m.deleted AND m.account=ANY(%s)
+        GROUP BY 1,2,3,4''', (WHATSAPP_MEDIA_RETENTION_DAYS, list(result))):
         item = result[row['account']]
-        codes = item['queued'].setdefault(row['eligibility'], {})
-        codes[row['error_code']] = row['count']
-        expired = item.setdefault('likely_expired', {})
-        expired[row['eligibility']] = expired.get(row['eligibility'], 0) + row['old']
+        if row['state'] == 'queued':
+            codes = item['queued'].setdefault(row['eligibility'], {})
+            codes[row['error_code']] = row['count']
+            expired = item.setdefault('likely_expired', {})
+            expired[row['eligibility']] = expired.get(row['eligibility'], 0) + row['old']
+        # A leased download is still due work waiting since its job was created (Astra r1 finding 4).
         if row['eligibility'] == 'eligible' and row['since'] is not None:
             item['download_since'] = min(item.get('download_since') or row['since'], row['since'])
     return result

@@ -106,6 +106,15 @@ RECOGNITION_FILES = {'unknown': 'unknown', 'ready': 'ready', 'failed_final': 'fa
 EXTRACTION_FILES = {'unknown': 'unknown', 'ready': 'ready', 'unsupported': 'unsupported', 'failed': 'failed',
                     'leased': 'leased', 'withheld': 'available_on_request', 'evicted': 'available_on_request',
                     'due': 'queued'}
+KEPT_STATES = ('leased', 'ready', 'failed', 'unsupported')
+
+
+def histogram_key(state, bucket, mapping):
+    """The files-histogram key of a row: a leased, ready, failed or unsupported row keeps its stored state (a policy
+    exclusion never hides a failure there, Astra r1 finding 3); only queued and unconfigured rows split by bucket."""
+    return state if state in KEPT_STATES else mapping[bucket]
+
+
 RECOGNITION_DUE = ('due', 'failed_retry', 'leased')
 EXTRACTION_DUE = ('due', 'leased')
 ON_REQUEST_DOWNLOADS = ('group_chat_on_request', 'channel_on_request', 'outside_prefetch_window',

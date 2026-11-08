@@ -130,7 +130,10 @@ def evaluate(store):
         counts['sent_6h_to_48h'] += row['window_rows']
         if row['stalled']:
             item['codes'].add(STALLED)
-        if row['window_rows'] >= STARVED_ROWS:
+    # ANYM-812: starvation counts an (account, kind) of the mini as a whole, queued and due unconfigured rows
+    # together, so a claim that moves a row from one to the other (and defers it) does not clear it.
+    for item in accounts.values():
+        if any(counts['sent_6h_to_48h'] >= STARVED_ROWS for counts in item['counts'].values()):
             item['codes'].add(STARVED)
     for row in workers:
         account(row['account'])['codes'].add(NO_WORKER)

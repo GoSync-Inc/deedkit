@@ -11,7 +11,7 @@ SECTIONS = {
                  "key_permission_version", "chat_scope", "auth_mode", "gateway_principal",
                  "backend_principal", "gateway_policy_revision"),
     "accounts": ("accounts",),
-    "coverage": ("synthetic", "sources", "coverage"),
+    "coverage": ("synthetic", "sources", "coverage", "file_policy"),
     "tool_manifest": ("gateway_tools", "backend_tool_manifest"),
     "search_options": ("search_options",),
     "sending": ("sending",),

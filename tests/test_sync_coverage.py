@@ -229,6 +229,40 @@ def test_the_files_histogram_keeps_each_row_once_while_due_work_is_a_separate_ba
         c.execute('DELETE FROM enrichment_budget WHERE day=current_date')
 
 
+# spec: ANYM-812
+def test_a_policy_exclusion_never_hides_a_failure_lease_or_ready_row_in_the_histogram(cov):
+    ar, s, _ = cov
+    profiles(s)
+    publish(ar)
+    ar.ingest(event(chat='200', provider_id='cov-group-seed'))
+    group(s)
+    failed = stored(ar, s, 'image/jpeg', chat='200', enrichment='failed', attempts=1, error='model_timeout')
+    leased = stored(ar, s, 'image/jpeg', enrichment='leased')
+    evict(s, leased)
+    stored(ar, s, 'image/jpeg', chat='200')
+    row = status(s)[0]
+    files, block = row['files'], row['coverage']
+    assert {k: v for k, v in files['enrichment'].items() if v} == {'failed': 1, 'leased': 1, 'available_on_request': 1}
+    # Coverage still files the retryable failure of the group chat under on request, and the lease under due.
+    assert block['available_on_request']['stored_not_recognized'] == 2
+    assert block['due']['to_recognize']['image'] == 1
+    assert failed
+
+
+# spec: ANYM-812
+def test_a_leased_download_keeps_the_account_behind_with_its_waiting_time(cov):
+    ar, s, _ = cov
+    profiles(s)
+    publish(ar)
+    job = message(ar, days=1)[0]
+    with s.pool.connection() as c:
+        c.execute('''UPDATE media_jobs SET state='leased',lease_owner='coverage-owner',
+            lease_until=clock_timestamp()+interval '5 minutes' WHERE id=%s''', (job,))
+        created = c.execute('SELECT created_at FROM media_jobs WHERE id=%s', (job,)).fetchone()['created_at']
+    block = status(s)[0]['coverage']
+    assert block['state'] == 'behind' and block['due']['to_download'] == 1 and block['since'] == created
+
+
 def model_profile(tmp_path, kind):
     key = tmp_path / 'model-key'
     key.write_text('synthetic-key')
