@@ -244,10 +244,27 @@ func TestNativeBotMenusKeepTheirOptionsAndIDs(t *testing.T) {
 	if utf8.RuneCountInString(body) > maxEnvelopeBody || !strings.HasPrefix(body, text+"\n\nMenu:\n1. ") || !strings.HasSuffix(body, " [id: "+long+"]\n(98 more options not shown)") {
 		t.Fatalf("fit: %d runes, tail %q", utf8.RuneCountInString(body), body[len(body)-120:])
 	}
-	// A text that fills the envelope keeps the text and no partial menu.
+	// A text that fills the envelope gives up room for a notice; no partial option line.
+	notice := "\n\n(a menu of 100 options is not shown: the message is too long)"
 	v, _ = NormalizeMessage(groupFixture("FULL", &waE2E.Message{ListMessage: &waE2E.ListMessage{Title: proto.String(strings.Repeat("y", maxEnvelopeBody)), Sections: []*waE2E.ListMessage_Section{{Rows: rows}}}}), types.EmptyJID)
-	if v["body"] != strings.Repeat("y", maxEnvelopeBody) {
-		t.Fatal("a full text lost characters to the menu")
+	if body := v["body"].(string); body != strings.Repeat("y", maxEnvelopeBody-utf8.RuneCountInString(notice))+notice {
+		t.Fatalf("full text: %d runes, tail %q", utf8.RuneCountInString(body), body[len(body)-90:])
+	}
+	// Native-flow selection lists share the budget: inner sections spend it, and decoded parameter bytes are bounded.
+	empty := strings.Repeat(`{"rows":[]},`, 1200)
+	selectButton := &waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton{Name: proto.String("single_select"), ButtonParamsJSON: proto.String(`{"sections":[` + empty + `{"rows":[{"title":"Late","id":"late"}]}]}`)}
+	v, _ = NormalizeMessage(groupFixture("NFSEC", &waE2E.Message{InteractiveMessage: &waE2E.InteractiveMessage{Body: &waE2E.InteractiveMessage_Body{Text: proto.String("Pick")}, InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{Buttons: []*waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton{selectButton}}}}}), types.EmptyJID)
+	if v["body"] != "Pick" {
+		t.Fatalf("nested sections: %q", v["body"])
+	}
+	var many []*waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton
+	params := `{"display_text":"Go","id":"` + strings.Repeat("g", maxMenuParams-40) + `"}`
+	for i := 0; i < 10; i++ {
+		many = append(many, &waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton{Name: proto.String("quick_reply"), ButtonParamsJSON: proto.String(params)})
+	}
+	v, _ = NormalizeMessage(groupFixture("NFBYTES", &waE2E.Message{InteractiveMessage: &waE2E.InteractiveMessage{InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{Buttons: many}}}}), types.EmptyJID)
+	if body := v["body"].(string); strings.Count(body, "\n") != 5 || !strings.HasSuffix(body, "]\n(more options not shown)") {
+		t.Fatalf("param bytes: %q", body[len(body)-60:])
 	}
 }
 

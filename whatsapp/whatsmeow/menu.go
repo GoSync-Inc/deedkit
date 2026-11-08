@@ -25,6 +25,8 @@ const (
 	maxMenuText    = 256
 	maxMenuID      = 256
 	maxMenuParams  = 16384
+	// Native-flow parameter bytes decoded per message, all buttons together.
+	maxMenuParamsTotal = 65536
 	// One work budget per message: sections, buttons and rows examined, also
 	// past the options kept, and native-flow parameter objects decoded.
 	maxMenuScan = 1000
@@ -48,6 +50,7 @@ type menuCollector struct {
 	kept     int
 	options  int  // options examined, kept or not
 	seen     int  // budget spent: sections and options
+	params   int  // native-flow parameter bytes decoded
 	cut      bool // the scan budget ended before the menu did
 }
 
@@ -164,12 +167,12 @@ func withMenu(text, label string, c *menuCollector) string {
 	if label = menuClean(label, maxMenuText); label != "" {
 		header += " (" + label + ")"
 	}
-	if !write(header + ":") {
-		return text
-	}
 	shown, i := 0, 0
-	full := true
+	full := write(header + ":")
 	for _, s := range c.sections {
+		if !full {
+			break
+		}
 		if len(s.options) == 0 {
 			continue
 		}
@@ -189,13 +192,24 @@ func withMenu(text, label string, c *menuCollector) string {
 			break
 		}
 	}
-	if shown == 0 {
-		return text
-	}
 	omitted := c.options - shown
+	if shown == 0 {
+		// Nothing fits after the text: the text gives up room for the notice.
+		notice := fmt.Sprintf("(a menu of %d options is not shown: the message is too long)", c.options)
+		if c.cut {
+			notice = fmt.Sprintf("(a menu of at least %d options is not shown: the message is too long)", c.options)
+		}
+		room := maxEnvelopeBody - utf8.RuneCountInString(notice) - 2
+		if r := []rune(text); len(r) > room {
+			text = strings.TrimSpace(string(r[:room]))
+		}
+		return joinText(text, notice)
+	}
 	switch {
-	case c.cut:
+	case c.cut && omitted > 0:
 		fmt.Fprintf(&b, "\n(at least %d more options not shown)", omitted)
+	case c.cut:
+		b.WriteString("\n(more options not shown)")
 	case omitted > 0:
 		fmt.Fprintf(&b, "\n(%d more options not shown)", omitted)
 	}
@@ -256,6 +270,10 @@ type nativeFlowParams struct {
 // its options in source order. single_select carries a whole list.
 func nativeFlowButton(c *menuCollector, name, raw string) {
 	var p nativeFlowParams
+	if c.params += len(raw); c.params > maxMenuParamsTotal {
+		c.cut = true
+		return
+	}
 	if raw == "" || len(raw) > maxMenuParams || json.Unmarshal([]byte(raw), &p) != nil {
 		c.add(menuOption{title: "(" + menuClean(name, 64) + " button)"})
 		return
@@ -266,6 +284,10 @@ func nativeFlowButton(c *menuCollector, name, raw string) {
 			return
 		}
 		for _, s := range p.Sections {
+			// Inner sections spend the budget like list sections.
+			if !c.spend() {
+				return
+			}
 			st := menuClean(s.Title, maxMenuText)
 			for _, r := range s.Rows {
 				title := joinNonEmpty(" ", menuClean(r.Header, maxMenuText), menuClean(r.Title, maxMenuText))
