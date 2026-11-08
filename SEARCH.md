@@ -286,6 +286,11 @@ true by default and the default lives in messaging (the gateway sends nothing it
   `next_action: retry_search_with_include_media_text=false`.
 - **Live.** `live=auto` and `live=on` are unchanged; live results are provider text only.
 
+File search (`search_files`) carries its own `matched_in` per hit (ANYM-828): `filename`, `caption`, `extracted`,
+`transcript`, `description`. `extracted` and `transcript` mean the same as here; this search's `body` is `caption`
+there. A file hit with `content_searched: false` did not have its own text searched (not ready, or empty); its
+`matched_in` says what matched instead (name, caption or a model description); see [FILE_INDEX.md](FILE_INDEX.md#which-part-of-a-file-matched-anym-828).
+
 ### Forwarded copies in search (ANYM-273)
 
 A `search` with a non-empty `query` returns forwarded copies of one message as

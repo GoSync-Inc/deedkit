@@ -275,6 +275,98 @@ def media_filters(media_kind, ready):
     return classes, values
 
 
+# ANYM-828: what a file hit matched, in this order (ANYM-665's `body` is the file side's `caption`).
+MATCHED_IN = ('filename', 'caption', 'extracted', 'transcript', 'description')
+
+
+def _voice(item):
+    mime = item.get('mime') or ''
+    return mime.startswith('audio/') or mime == 'application/ogg'
+
+
+def _has_text(item):
+    return item.get('extraction_status') == 'ready' and (item.get('extraction_coverage') or {}).get('text_chars', 0) > 0
+
+
+def content_searched(item):
+    """ANYM-828: the file's own text was searchable: ready non-empty extraction or a voice note's ready transcript."""
+    return bool(_has_text(item) or (_voice(item) and item.get('enrichment_status') == 'ready'))
+
+
+def _match_probe(c, p, plan, ids):
+    """One statement for the returned page only, under the search's scope and current-source fence; never in the
+    candidate query, so the search plan is unchanged. A chunk counts as text only when its text, not just its
+    header (the filename, or a model title and summary), matches. None when it is cancelled (a savepoint keeps the
+    search's transaction usable): the caller then lists only the arms match_sources proves and names the rest
+    as unverified."""
+    import psycopg
+    scope, scope_args = scope_filter(p, 'm')
+    def chunks(alias, table):
+        if plan.mode == 'exact':
+            return plan.text_predicate(('f' if alias == 'fc' else 'e') + '.text_content')
+        return ('EXISTS(SELECT FROM ' + table + ' ' + alias + ' WHERE ' + alias + '.attachment=a.id AND ' + alias +
+            '.source_digest=a.digest AND ' + alias + '.source_revision=m.revision AND ' + plan.predicate(alias) +
+            ' AND (NOT ' + plan.text_predicate(alias + '.header') + ' OR ' + plan.text_predicate(alias + '.text_content') + '))')
+    # A document's model text is a description wherever it matched: the parent vector covers its head only, so its
+    # chunks are read too (a chunk's header is the model title and summary, a description for audio as well).
+    tail = '' if plan.mode == 'exact' else (' OR EXISTS(SELECT FROM attachment_enrichment_chunks ed WHERE ed.attachment=a.id'
+        ' AND ed.source_digest=a.digest AND ed.source_revision=m.revision AND ' + plan.predicate('ed') + ')')
+    described = ("(e.state='ready' AND (" + plan.text_predicate("e.title||' '||e.summary||' '||coalesce(e.metadata->>'document_type','')") +
+        ' OR (NOT ' + VOICE + ' AND (' + plan.predicate('e', text_sql=ENRICH_TEXT) + tail + '))))')
+    sql = ('WITH ' + plan.cte + ' SELECT a.id AS attachment_id,'
+        'coalesce(' + plan.text_predicate("a.filename||' '||f.display_name") + ',false) AS filename,'
+        "coalesce(f.state='ready' AND f.text_content<>'' AND " + chunks('fc', 'attachment_text_chunks') + ',false) AS extracted,'
+        "coalesce(e.state='ready' AND " + VOICE + ' AND ' + chunks('ec', 'attachment_enrichment_chunks') + ',false) AS transcript,'
+        '(coalesce(' + described + ',false) OR coalesce(' + UNDERSTANDING_READY + ' AND ' +
+        plan.predicate('u', text_sql=UNDERSTANDING_TEXT) + ',false)) AS description '
+        + SEARCH_JOIN + ' WHERE a.id=ANY(%s) AND ' + CURRENT + ' AND ' + scope)
+    try:
+        with c.transaction():
+            rows = c.execute(sql, [*plan.params, ids, *scope_args]).fetchall()
+    except psycopg.errors.QueryCanceled:
+        return None
+    return {r['attachment_id']: r for r in rows}
+
+
+def _annotate(c, p, plan, items, query):
+    """ANYM-828: matched_in on a query's hits, content_searched on every item, and the excerpt's source."""
+    found = _match_probe(c, p, plan, [i['attachment_id'] for i in items]) if query and items else {}
+    for item in items:
+        item['content_searched'] = content_searched(item)
+        voice = _voice(item)
+        on = set()
+        if query:
+            sources, row = set(item.get('match_sources') or ()), (found or {}).get(item['attachment_id']) or {}
+            on = {name for name in ('filename', 'extracted', 'transcript', 'description') if row.get(name)}
+            if 'message_context' in sources: on.add('caption')
+            if 'understanding' in sources: on.add('description')
+            unverified = set()
+            if found is None:
+                # A cancelled probe proves only what match_sources proves; the arms it cannot tell apart are named,
+                # never asserted (legacy `extracted` includes filenames, `enriched` a voice note's title).
+                if 'extracted' in sources: unverified |= {'filename', *(['extracted'] if _has_text(item) else [])}
+                if 'enriched' in sources:
+                    if voice: unverified |= {'transcript', 'description'}
+                    else: on.add('description')
+            elif 'extracted' in sources and not on & {'filename', 'extracted'}:
+                # An `all` query whose words are split between the name and the text matched both together.
+                on |= {'filename', *(['extracted'] if _has_text(item) else [])}
+            elif 'enriched' in sources and not on & {'transcript', 'description'}:
+                on.add('description')
+            item['matched_in'] = [name for name in MATCHED_IN if name in on]
+            if unverified - on: item['matched_in_unverified'] = [name for name in MATCHED_IN if name in unverified - on]
+        kind = item.get('excerpt_source')
+        text = 'extracted' in on if query else _has_text(item)
+        # An enriched excerpt starts with the model title and summary: a voice note's is its transcript only when
+        # the transcript matched (the voice-without-text branch is `transcript` already).
+        item['excerpt_source'] = {'extracted': 'extracted' if text else 'filename',
+            'enriched': 'transcript' if voice and 'transcript' in on else 'description',
+            'understanding': 'description'}.get(kind, kind)
+        # A cancelled probe cannot tell a name passage from a text one: no source is claimed for it.
+        if query and found is None and kind in ('extracted', 'enriched') and (kind == 'extracted' or voice):
+            item.pop('excerpt_source')
+
+
 def search_files(store, c, p, query='', account='', chat='', sender='', from_time='',
                  to_time='', after='', limit=20, *, accounts=None, chats=None, senders=None,
                  query_mode='all', order='asc', before='', direction='', filename='',
@@ -384,6 +476,7 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
         voice_excerpt = "(coalesce(hit.content,'extracted')='extracted' AND " + voice_excerpt + ')'
         snippet_text = '(CASE WHEN ' + voice_excerpt + ' THEN left(e.text_content,32000) WHEN hit.content IS NOT NULL THEN hit.passage WHEN ' + base_raw + ' THEN ' + raw_preview + ' WHEN ' + base_enriched + ' THEN ' + enriched_preview + ' WHEN '+base_understanding+' THEN '+UNDERSTANDING_TEXT+' ELSE m.body END)'
         match = 'coalesce(hit.match_type,CASE WHEN ' + base_raw + ' THEN ' + plan.match_type('f') + ' WHEN ' + base_enriched + ' THEN ' + plan.match_type('e') + ' WHEN '+base_understanding+' THEN '+plan.match_type('u')+' ELSE ' + plan.match_type('m') + ' END)'
+        excerpt_kind = "CASE WHEN " + voice_excerpt + " THEN 'transcript' WHEN hit.content IS NOT NULL THEN hit.content WHEN " + base_raw + " THEN 'extracted' WHEN " + base_enriched + " THEN 'enriched' WHEN "+base_understanding+" THEN 'understanding' ELSE 'caption' END"
         source = "coalesce(hit.content,CASE WHEN " + base_raw + " THEN 'extracted' WHEN " + base_enriched + " THEN 'enriched' WHEN "+base_understanding+" THEN 'understanding' ELSE 'message_context' END)"
         extra_columns = source + ' AS matched_content,hit.start_offset AS chunk_start,hit.end_offset AS chunk_end'
     else:
@@ -391,9 +484,11 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
         rank = '0::bigint'
         snippet_text = '(CASE WHEN ' + voice_excerpt + ' THEN e.text_content WHEN ' + base_raw + ' THEN ' + raw_text + ' WHEN ' + base_enriched + ' THEN ' + ENRICH_TEXT + ' WHEN '+base_understanding+' THEN '+UNDERSTANDING_TEXT+' ELSE m.body END)'
         match = plan.match_type('f')
+        excerpt_kind = "CASE WHEN " + voice_excerpt + " THEN 'transcript' WHEN " + base_raw + " THEN 'extracted' WHEN " + base_enriched + " THEN 'enriched' WHEN "+base_understanding+" THEN 'understanding' ELSE 'caption' END"
         if query:
             extra_columns = "CASE WHEN " + base_raw + " THEN 'extracted' WHEN " + base_enriched + " THEN 'enriched' WHEN "+base_understanding+" THEN 'understanding' ELSE 'message_context' END AS matched_content,NULL::integer AS chunk_start,NULL::integer AS chunk_end"
-    extra_columns += ",CASE WHEN " + voice_excerpt + " THEN 'transcript' END AS excerpt_source"
+    # ANYM-828: the snippet's branch; _annotate names it (filename, caption, extracted, transcript, description).
+    extra_columns += "," + excerpt_kind + " AS excerpt_source"
     if query:
         extracted_match = '(' + base_raw + (" OR hit.content='extracted'" if query_mode != 'exact' else '') + ')'
         enriched_match = '(' + base_enriched + (" OR hit.content='enriched'" if query_mode != 'exact' else '') + ')'
@@ -448,8 +543,7 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
         ' WHERE ' + ' AND '.join(clauses) + ' ORDER BY ' + ordering + ' LIMIT %s',
         [*plan.params, *candidate_args, *passage_args, *args, limit + 1]).fetchall()
     items = [_response(r) for r in rows[:limit] if _retained_readable(store,c,r)]
-    for item in items:
-        if item.get('excerpt_source') is None:item.pop('excerpt_source',None)
+    _annotate(c, p, plan, items, query)
     from .message_queries import chat_titles
     chat_titles(c, items, p=p)
     targets(p, [r['attachment_id'] for r in items])
@@ -458,7 +552,9 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
         last = rows[limit-1]
         cursor = encode_cursor(binding, {'attachment_id': last['attachment_id'], 'rank': last['rank']}) if order == 'relevance' else last['attachment_id']
     from .chat_evidence import file_query_evidence
-    return serial({'items': items, 'next_cursor': cursor, 'query_mode': query_mode, 'search_language': search_language,
+    pending = sum(1 for i in items if not i['content_searched'] and i.get('extraction_status') in ('queued', 'processing'))
+    return serial({'items': items, 'next_cursor': cursor,
+        **({'search': {'content_pending': {'count': min(pending, 20), 'next_action': 'search again later'}}} if pending else {}), 'query_mode': query_mode, 'search_language': search_language,
         'result_evidence':file_query_evidence(c,p,filters,items,paged=bool(after or before),include=include_coverage),
         'index_coverage': 'bounded_local_extraction_with_optional_enrichment',
         'search_scope': 'retained_document' if query_mode == 'exact' else 'passage',

@@ -94,7 +94,8 @@ def test_search_excerpt_of_a_voice_note_is_its_transcript(seeded):
         if kwargs:
             assert hit['matched_content'] == 'extracted'
         plain = next((r for r in result['items'] if r['attachment_id'] == 'plain-note'), None)
-        assert plain is None or 'excerpt_source' not in plain
+        # ANYM-828 criterion 4: every hit now names its excerpt source; a plain file's is its text or its name.
+        assert plain is None or plain['excerpt_source'] == ('filename' if kwargs else 'extracted')
         compact = render('search_files', {**result, 'items': [dict(r) for r in result['items']]}, 'compact')
         row = next(r for r in compact['items'] if r['attachment_id'] == 'voice-note')
         assert row['snippet'] == TRANSCRIPT[:160] and row['excerpt_source'] == 'transcript'
@@ -127,7 +128,8 @@ def test_voice_excerpt_with_empty_ready_extraction_and_dual_matches(seeded):
     assert hit['excerpt'].startswith(TRANSCRIPT[:40]) and hit['excerpt_source'] == 'transcript'
     # The transcript also matches the name: the existing snippet is kept.
     dual = search(s, b, 'meeting', query_mode='exact')['items'][0]
-    assert dual['attachment_id'] == 'voice-dual' and 'excerpt_source' not in dual
+    # ANYM-828 criterion 4: the kept snippet is the name's, and says so.
+    assert dual['attachment_id'] == 'voice-dual' and dual['excerpt_source'] == 'filename'
 
 
 # spec: ANYM-453

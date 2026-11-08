@@ -361,6 +361,25 @@
   "empty_result_diagnostics": true,
   "file_caption_provenance": "current_parent_message_revision_only",
   "file_content_search": true,
+  "file_hit_fields": {
+   "content_pending_cap": 20,
+   "content_searched": "ready_non_empty_text_or_ready_voice_transcript",
+   "excerpt_sources": [
+    "filename",
+    "caption",
+    "extracted",
+    "transcript",
+    "description"
+   ],
+   "matched_in": [
+    "filename",
+    "caption",
+    "extracted",
+    "transcript",
+    "description"
+   ],
+   "matched_in_unverified": "only_when_the_page_probe_is_cancelled"
+  },
   "file_indexing": "asynchronous_local_worker",
   "file_search_sources": [
    "extracted",
