@@ -254,7 +254,9 @@ def test_production_hint_budgets_default_to_200_per_key_and_300_per_host(monkeyp
 
 
 # spec: ANYM-252
-def test_budget_coalesces_across_subscriptions_and_loses_no_reference(seeded, tmp_path):
+def test_budget_coalesces_across_subscriptions_and_loses_no_reference(seeded, tmp_path, monkeypatch):
+    # The pre-hotfix budget keeps this scenario small; the production default is 200 (test below).
+    monkeypatch.setenv('SUBSCRIPTION_MAX_HINTS_PER_HOUR', '20')
     store, _, _ = seeded
     token = identity(store)
     rid = receiver(store, token, tmp_path)
@@ -351,7 +353,7 @@ def test_policy_changes_are_versioned_validated_and_need_write(seeded, tmp_path)
     reader = identity(store, 'policy-read-only', permissions=('read',))
     with pytest.raises(APIError, match='forbidden'):
         store.configure_subscription_delivery(reader, sid, 2, rid, {'debounce_s': 10})
-    assert store.capabilities(token)['subscriptions']['delivery_policy']['key_budget']['default'] == 20
+    assert store.capabilities(token)['subscriptions']['delivery_policy']['key_budget']['default'] == 200
 
 
 # spec: ANYM-252
