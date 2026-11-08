@@ -9,7 +9,9 @@
   "media_errors": [
     "media_unavailable", "media_reference_changed", "unsupported_media_type", "media_hash_mismatch",
     "media_size_mismatch", "media_size_limit", "media_metadata_unavailable", "invalid_media_path",
-    "media_timeout", "media_network_error", "media_storage_unavailable"
+    "media_timeout", "media_network_error", "media_storage_unavailable", "media_decrypt_failed",
+    "media_http_400", "media_http_401", "media_http_408", "media_http_429", "media_http_500", "media_http_502",
+    "media_http_503", "media_http_504"
   ],
   "supervisor_stop_codes": {
     "telegram": [

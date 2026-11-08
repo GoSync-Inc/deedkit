@@ -35,11 +35,15 @@ func main() {
 	flag.StringVar(&path, "config", "", "private collector config")
 	flag.BoolVar(&pair, "pair", false, "explicit device linking; private QR PNG only")
 	flag.StringVar(&fixture, "normalize-fixture", "", "offline synthetic fixture; no provider/session access")
+	var mediaKeys bool
+	flag.BoolVar(&mediaKeys, "media-keys", false, "read-only capture journal lookup for the operator media inventory; no provider/session access")
 	flag.Parse()
 	code := 0
 	var err error
 	if fixture != "" {
 		err = normalizeFixture(fixture)
+	} else if mediaKeys {
+		err = serveMediaKeys(path, os.Stdin, os.Stdout)
 	} else {
 		err = execute(path, pair)
 	}

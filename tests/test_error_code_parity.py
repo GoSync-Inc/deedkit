@@ -94,6 +94,23 @@ def test_python_constants_are_the_json_lists():
     assert not set(reply['send_rejected']) & operational.CONNECTION_ERRORS
 
 
+# spec: ANYM-815
+def test_fixed_media_codes_reach_every_consumer():
+    from messaging_service import media_retry, status_details
+    new = {'media_decrypt_failed'} | {'media_http_' + str(n) for n in (400, 401, 408, 429, 500, 502, 503, 504)}
+    assert new <= set(CODES['media_errors']) and new <= operational.MEDIA_ERRORS
+    assert new <= _go_safe_errors()
+    assert media_retry.MEDIA_HTTP_CODES == new - {'media_decrypt_failed'}
+    # A decrypt failure repeats on the same copy; an HTTP answer follows the retry schedule.
+    assert 'media_decrypt_failed' in media_retry.MEDIA_PROVIDER_PERMANENT_CODES
+    assert not media_retry.MEDIA_HTTP_CODES & media_retry.MEDIA_PERMANENT_CODES
+    assert not media_retry.MEDIA_HTTP_CODES & media_retry.MEDIA_PROVIDER_PERMANENT_CODES
+    for code in new | {'provider_media_likely_expired'}:
+        assert code in status_details.DETAILS, code
+    # The browser fallback never invents a native-only code.
+    assert not new & _js_set('media.mjs', r"const safe=new Set\(\[(.*?)\]\)")
+
+
 # spec: ANYM-292
 def test_js_connection_errors_are_a_subset_with_the_listed_gap():
     js = _js_set('transport-state.mjs', r'CONNECTION_ERRORS=new Set\(\[(.*?)\]\)')

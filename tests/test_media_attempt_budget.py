@@ -1,9 +1,12 @@
 """A transient media failure is retried over more than a day; a provider wait is not an attempt (ANYM-699)."""
+import asyncio
 from contextlib import contextmanager
 from copy import copy
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import re
+from types import SimpleNamespace
 from uuid import uuid4
 
 import psycopg
@@ -12,7 +15,8 @@ from psycopg import sql
 
 from messaging_service.attachment_metadata import attachment_fields
 from messaging_service.status_details import describe
-from test_archive import archive as archive, media_event
+from test_archive import archive as archive, event, media_event
+from test_collectors import worker as worker, message
 from test_attachment_metadata import pending as pending_row
 from test_media_requests import pending
 
@@ -380,6 +384,101 @@ def test_request_keeps_a_failed_job_failed_and_a_provider_cooldown_running(archi
     failed=s.request_file_download(key,other)
     assert failed['request_status']=='failed' and failed['reason']=='network_error'
     assert job_row(s,other)['state']=='failed'
+
+
+# spec: ANYM-815
+@pytest.mark.parametrize('frame,expected',[
+    ('media_decrypt_failed',('failed',1,'media_decrypt_failed')),
+    ('media_http_503',('queued',1,'media_http_503')),
+    ('media_http_429',('queued',1,'media_http_429')),
+    ('media_unavailable',('failed',1,'media_unavailable')),
+    ('media_network_error',('queued',1,'media_network_error')),
+    ('media_storage_unavailable',('queued',0,'storage_unavailable')),
+])
+def test_adapter_error_frame_reaches_the_stored_job_and_its_status_line(worker,tmp_path,frame,expected):
+    from messaging_service.whatsapp_collector import NodeProvider
+    w,s,_=worker
+    w.retry_connect=True  # The WhatsApp collectors keep the adapter's code.
+    asyncio.run(w.capture(SimpleNamespace(message=message(9,media=True))));w.spool.drain(w.state.apply)
+    async def chunks(*_):
+        adapter=NodeProvider({},tmp_path/'unused',3)
+        adapter.process=SimpleNamespace(stdout=asyncio.StreamReader())
+        adapter.process.stdout.feed_data(json.dumps({'id':1,'error':frame}).encode()+b'\n')
+        await adapter.reply(1)
+        yield b'data'
+    w.provider.chunks=chunks
+    assert asyncio.run(w.media_once())
+    with s.pool.connection() as c:
+        row=c.execute('SELECT state,attempts,error_code FROM media_jobs WHERE account=%s',(w.account,)).fetchone()
+    assert (row['state'],row['attempts'],row['error_code'])==expected
+    media=s.get_sync_status(s.issue_key('budget-ipc-reader',[w.account]))['sources'][0]['operations']['media']
+    line=[d for d in media['diagnostics'] if d['reason_code']==expected[2]]
+    assert line and line[0]['job_state']==expected[0]
+    assert line[0]['explanation']!='Provider or archive observation; inspect the scoped sync evidence.'
+
+
+def wa_failed(ar, s, mid, *, sent_days, queued_days=0, code='media_network_error', platform='whatsapp'):
+    """A failed job of a message sent `sent_days` ago whose job was created `queued_days` ago."""
+    account='budget-wa' if platform=='whatsapp' else 'archive-test'
+    ar.register(account,platform,'Synthetic budget source',discover=True)
+    at=(datetime.now(timezone.utc)-timedelta(days=sent_days)).isoformat()
+    message=ar.ingest(event(account=account,platform=platform,provider_id=mid,sent_at=at,updated_at=at,
+        media=[{'provider_id':'media-'+mid,'filename':'synthetic.jpg','mime':'image/jpeg','bytes':4}]))['message']
+    with s.pool.connection() as c:
+        fid=c.execute('SELECT id FROM media_jobs WHERE message=%s',(message,)).fetchone()['id']
+        c.execute("""UPDATE media_jobs SET state='failed',error_code=%s,attempts=8,
+            created_at=clock_timestamp()-make_interval(days=>%s) WHERE id=%s""",(code,queued_days,fid))
+    return account,fid
+
+
+def wa_media_status(s, account):
+    from messaging_service.sync_status import get_sync_status
+    with s.pool.connection() as c:
+        return get_sync_status(c,{'accounts':[account],'chat_ids':None})['sources'][0]['operations']['media']
+
+
+# spec: ANYM-815
+def test_whatsapp_job_queued_older_than_the_retention_reads_likely_expired_and_keeps_its_code(archive):
+    ar,s,_,_=archive
+    account,fid=wa_failed(ar,s,'false_15551234567@c.us_EXPIRED',sent_days=400)
+    _,young=wa_failed(ar,s,'false_15551234567@c.us_YOUNG',sent_days=10)
+    key=s.issue_key('budget-wa-reader',[account])
+    answer=s.request_file_download(key,fid)
+    assert answer['request_status']=='failed' and answer['reason']=='provider_media_likely_expired'
+    assert answer['recorded_error_code']=='media_network_error' and answer['next_action'] is None
+    assert answer['explanation'].startswith('WhatsApp keeps media about 30 days') and 'lost' not in answer['explanation']
+    # Read-time only: the stored row is not rewritten and nothing is queued.
+    assert (job_row(s,fid)['state'],job_row(s,fid)['error_code'],job_row(s,fid)['attempts'])==('failed','media_network_error',8)
+    assert s.request_file_download(key,young)['reason']=='media_network_error'
+    media=wa_media_status(s,account)
+    assert media['errors']=={'media_network_error':2}
+    assert media['terminal_failed_jobs']==2 and media['needs_attention'] is True and media['state']=='needs_attention'
+    by_reason={d['reason_code']:d for d in media['diagnostics']}
+    assert by_reason['provider_media_likely_expired']['count']==1
+    assert by_reason['provider_media_likely_expired']['recorded_code']=='media_network_error'
+    assert by_reason['provider_media_likely_expired']['next_action'] is None
+    assert by_reason['provider_media_likely_expired']['retry_scheduled'] is False
+    assert by_reason['media_network_error']['count']==1
+    assert by_reason['media_network_error']['next_action']=='inspect_download_failure'
+
+
+# spec: ANYM-815
+def test_job_queued_at_29_days_and_failed_at_31_keeps_its_recorded_wording(archive):
+    ar,s,_,_=archive
+    account,fid=wa_failed(ar,s,'false_15551234567@c.us_EDGE',sent_days=31,queued_days=2)
+    key=s.issue_key('budget-wa-reader',[account])
+    answer=s.request_file_download(key,fid)
+    assert answer['reason']=='media_network_error' and 'recorded_error_code' not in answer
+    assert [d['reason_code'] for d in wa_media_status(s,account)['diagnostics']]==['media_network_error']
+
+
+# spec: ANYM-815
+def test_telegram_failed_file_older_than_30_days_keeps_todays_wording(archive):
+    ar,s,key,_=archive
+    account,fid=wa_failed(ar,s,'4815',sent_days=400,code='network_error',platform='telegram')
+    answer=s.request_file_download(key,fid)
+    assert answer['request_status']=='failed' and answer['reason']=='network_error'
+    assert 'provider_media_likely_expired' not in [d['reason_code'] for d in wa_media_status(s,account)['diagnostics']]
 
 
 # spec: ANYM-699

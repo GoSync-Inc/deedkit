@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,6 +107,16 @@ type boundedMediaFile struct {
 	Limit int64
 	// Optional: last successful I/O (UnixNano) for the media idle watchdog.
 	progress *atomic.Int64
+	// The first failure of the local temporary file itself (ANYM-815): the
+	// download then ends as media_storage_unavailable, not as a provider error.
+	local error
+}
+
+func (f *boundedMediaFile) failed(err error) error {
+	if err != nil && err != io.EOF && f.local == nil {
+		f.local = err
+	}
+	return err
 }
 
 func (f *boundedMediaFile) touch(n int) {
@@ -116,27 +129,33 @@ func (f *boundedMediaFile) idle() time.Duration { return time.Since(time.Unix(0,
 func (f *boundedMediaFile) Read(b []byte) (int, error) {
 	n, e := f.File.Read(b)
 	f.touch(n)
-	return n, e
+	return n, f.failed(e)
 }
 func (f *boundedMediaFile) ReadAt(b []byte, o int64) (int, error) {
 	n, e := f.File.ReadAt(b, o)
 	f.touch(n)
-	return n, e
+	return n, f.failed(e)
 }
-func (f *boundedMediaFile) Seek(o int64, w int) (int64, error) { return f.File.Seek(o, w) }
-func (f *boundedMediaFile) Stat() (os.FileInfo, error)         { return f.File.Stat() }
+func (f *boundedMediaFile) Seek(o int64, w int) (int64, error) {
+	n, e := f.File.Seek(o, w)
+	return n, f.failed(e)
+}
+func (f *boundedMediaFile) Stat() (os.FileInfo, error) {
+	i, e := f.File.Stat()
+	return i, f.failed(e)
+}
 
 func (f *boundedMediaFile) Write(b []byte) (int, error) {
 	o, err := f.File.Seek(0, io.SeekCurrent)
 	if err != nil {
-		return 0, err
+		return 0, f.failed(err)
 	}
 	if o < 0 || int64(len(b)) > f.Limit-o {
 		return 0, errors.New("media_size_limit")
 	}
 	n, err := f.File.Write(b)
 	f.touch(n)
-	return n, err
+	return n, f.failed(err)
 }
 func (f *boundedMediaFile) WriteAt(b []byte, o int64) (int, error) {
 	if o < 0 || int64(len(b)) > f.Limit-o {
@@ -144,13 +163,13 @@ func (f *boundedMediaFile) WriteAt(b []byte, o int64) (int, error) {
 	}
 	n, err := f.File.WriteAt(b, o)
 	f.touch(n)
-	return n, err
+	return n, f.failed(err)
 }
 func (f *boundedMediaFile) Truncate(n int64) error {
 	if n < 0 || n > f.Limit {
 		return errors.New("media_size_limit")
 	}
-	return f.File.Truncate(n)
+	return f.failed(f.File.Truncate(n))
 }
 
 func (p *Provider) Media(ctx context.Context, raw json.RawMessage, emit func([]byte) error) error {
@@ -251,6 +270,10 @@ func downloadMedia(ctx context.Context, req mediaRequest, cfg Config, policy fun
 	stopWatch := watchMediaDownload(ctx, cancel, file, emit)
 	err = func() error {
 		if err := download(ctx, meta.Payload, file); err != nil {
+			if file.local != nil {
+				// A local write failure spends no provider attempt (archive.fail_media).
+				return errors.New("media_storage_unavailable")
+			}
 			return safeMediaError(err)
 		}
 		info, err := tmp.Stat()
@@ -442,19 +465,102 @@ func sweepNativeTemp(cfg Config) {
 	}
 }
 
+// HTTP answers of the media CDN that keep their own code (ANYM-815); any other
+// status, and every error without one, stays media_network_error.
+var mediaHTTPCodes = map[int]string{400: "media_http_400", 401: "media_http_401", 408: "media_http_408", 429: "media_http_429", 500: "media_http_500", 502: "media_http_502", 503: "media_http_503", 504: "media_http_504"}
+
 func safeMediaError(err error) error {
+	var status whatsmeow.DownloadHTTPError
 	switch {
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return errors.New("media_timeout")
-	case errors.Is(err, whatsmeow.ErrInvalidMediaSHA256), errors.Is(err, whatsmeow.ErrInvalidMediaEncSHA256), errors.Is(err, whatsmeow.ErrInvalidUnencryptedMediaSHA256), errors.Is(err, whatsmeow.ErrInvalidMediaHMAC):
+	case errors.Is(err, whatsmeow.ErrInvalidMediaSHA256), errors.Is(err, whatsmeow.ErrInvalidMediaEncSHA256), errors.Is(err, whatsmeow.ErrInvalidUnencryptedMediaSHA256):
 		return errors.New("media_hash_mismatch")
+	case errors.Is(err, whatsmeow.ErrInvalidMediaHMAC), strings.HasPrefix(err.Error(), "failed to decrypt file:"):
+		// The encrypted bytes matched their hash, so the media key does not open them.
+		return errors.New("media_decrypt_failed")
 	case errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403), errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404), errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410):
 		return errors.New("media_unavailable")
 	case err.Error() == "media_size_limit":
 		return errors.New("media_size_limit")
+	case errors.As(err, &status) && status.Response != nil && mediaHTTPCodes[status.StatusCode] != "":
+		return errors.New(mediaHTTPCodes[status.StatusCode])
 	default:
 		return errors.New("media_network_error")
 	}
+}
+
+// At most this many messages per media_keys request.
+const mediaKeysBatch = 200
+
+// serveMediaKeys answers, for an operator inventory, whether the capture journal
+// holds each message's media key (ANYM-815). It opens the journal read-only and
+// never the provider client, the device store or the session owner lock, so it
+// can run beside the collector's adapter. One JSON request per line:
+// {"id":1,"method":"media_keys","params":{"messages":[{"chat":..,"message":..}]}}.
+func serveMediaKeys(path string, in io.Reader, out io.Writer) error {
+	c, e := loadConfig(path)
+	if e != nil {
+		return e
+	}
+	journal := filepath.Join(c.SessionDirectory, "capture.sqlite")
+	if _, e = os.Lstat(journal); e != nil {
+		return errors.New("media_keys_unavailable")
+	}
+	db, e := sql.Open("sqlite3", mediaKeysDSN(journal))
+	if e != nil {
+		return errors.New("media_keys_unavailable")
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	return answerMediaKeys(&CaptureStore{db: db}, in, out)
+}
+
+// Read-only and query-only: the lookup can neither create nor change the journal.
+func mediaKeysDSN(journal string) string {
+	u := url.URL{Scheme: "file", Path: journal}
+	return u.String() + "?mode=ro&_pragma=query_only(1)&_pragma=busy_timeout(1000)"
+}
+
+func answerMediaKeys(s *CaptureStore, in io.Reader, out io.Writer) error {
+	scanner := bufio.NewScanner(in)
+	scanner.Buffer(make([]byte, 4096), 1<<20)
+	enc := json.NewEncoder(out)
+	for scanner.Scan() {
+		var r struct {
+			ID     int64  `json:"id"`
+			Method string `json:"method"`
+			Params struct {
+				Messages []struct {
+					Chat    string `json:"chat"`
+					Message string `json:"message"`
+				} `json:"messages"`
+			} `json:"params"`
+		}
+		if json.Unmarshal(scanner.Bytes(), &r) != nil || r.ID < 1 || r.Method != "media_keys" || len(r.Params.Messages) > mediaKeysBatch {
+			if e := enc.Encode(map[string]any{"id": r.ID, "error": "invalid_request"}); e != nil {
+				return e
+			}
+			continue
+		}
+		held := make([]bool, len(r.Params.Messages))
+		for i, m := range r.Params.Messages {
+			if !validMessageReference(m.Chat, m.Message) {
+				continue
+			}
+			// One journal row per statement; a missing or unreadable row holds no key.
+			msg, e := s.Get(m.Chat, m.Message)
+			if e != nil {
+				continue
+			}
+			meta, e := nativeMediaMetadata(msg)
+			held[i] = e == nil && len(meta.Payload.GetMediaKey()) > 0
+		}
+		if e := enc.Encode(map[string]any{"id": r.ID, "result": map[string]any{"held": held}}); e != nil {
+			return e
+		}
+	}
+	return scanner.Err()
 }
 
 func digestBytes(value []byte) string { h := sha256.Sum256(value); return hex.EncodeToString(h[:]) }

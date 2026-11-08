@@ -8,6 +8,7 @@ from .conflict_classes import grouped, report
 from .enrichment_health import read as enrichment_health
 from .operational import identity_safe, liveness, operations
 from .media_policy import ELIGIBILITY_JOIN, published_window
+from .media_inventory import LIKELY_EXPIRED
 
 
 DOWNLOAD_STATES = ('queued', 'leased', 'ready', 'failed', 'superseded')
@@ -145,6 +146,15 @@ def _files(c, p, *, group_by_chat=False):
             account_errors=errors.setdefault(row['account'],{})
             account_errors[row['error_code']]=account_errors.get(row['error_code'],0)+row['count']
             error_states.setdefault(row['account'],{}).setdefault(row['error_code'],{})[row['state']]=row['count']
+    # ANYM-815: failed WhatsApp jobs queued when their message was older than the estimated media retention;
+    # read-time wording only, the recorded codes and counts above stay as they are.
+    expired={}
+    for row in c.execute('SELECT '+key+''' AS account,j.error_code,count(*) AS count
+        FROM media_jobs j JOIN messages m ON m.id=j.message AND m.account=j.account
+        LEFT JOIN attachments a ON a.id=j.id AND a.message=j.message AND a.active
+        WHERE j.state='failed' AND a.id IS NULL AND j.error_code IS NOT NULL AND NOT m.deleted
+        AND '''+LIKELY_EXPIRED+' AND '+where+' GROUP BY 1,2', args):
+        expired.setdefault(row['account'],{})[row['error_code']]=row['count']
     # Count current occurrences, not global digests. Stale extraction/enrichment
     # rows must never inflate ready counts or expose another chat's derived state.
     indexed = c.execute('SELECT '+key+''' AS account,
@@ -179,6 +189,7 @@ def _files(c, p, *, group_by_chat=False):
         item['current_files']=sum(n for state,n in downloads[account].items() if state!='superseded')
         item['download_errors']=errors.get(account,{})
         item['download_error_states']=error_states.get(account,{})
+        if expired.get(account):item['download_likely_expired']=expired[account]
     return downloads, files
 
 

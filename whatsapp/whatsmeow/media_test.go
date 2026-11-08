@@ -5,9 +5,12 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +19,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"go.mau.fi/whatsmeow/util/cbcutil"
 	"go.mau.fi/whatsmeow/util/hkdfutil"
@@ -419,6 +423,131 @@ func TestNativeMediaUnwritableStorageIsNotANetworkError(t *testing.T) {
 	}
 	if safeError(err) != "media_storage_unavailable" {
 		t.Fatal("storage error not in the safe vocabulary")
+	}
+}
+
+// spec: ANYM-815
+func TestNativeMediaProviderErrorsKeepFixedCodesThroughTheSafeVocabulary(t *testing.T) {
+	status := func(code int) error { return whatsmeow.DownloadHTTPError{Response: &http.Response{StatusCode: code}} }
+	lastHost := func(err error) error { return fmt.Errorf("failed to download media from last host: %w", err) }
+	for _, c := range []struct {
+		err  error
+		code string
+	}{
+		{whatsmeow.ErrMediaDownloadFailedWith403, "media_unavailable"},
+		{whatsmeow.ErrMediaDownloadFailedWith404, "media_unavailable"},
+		{whatsmeow.ErrMediaDownloadFailedWith410, "media_unavailable"},
+		{lastHost(status(500)), "media_http_500"},
+		{lastHost(status(503)), "media_http_503"},
+		{status(429), "media_http_429"},
+		{status(401), "media_http_401"},
+		{lastHost(status(418)), "media_network_error"},
+		{whatsmeow.ErrInvalidMediaHMAC, "media_decrypt_failed"},
+		{fmt.Errorf("failed to decrypt file: %w", errors.New("synthetic padding")), "media_decrypt_failed"},
+		{whatsmeow.ErrInvalidMediaEncSHA256, "media_hash_mismatch"},
+		{errors.New("synthetic unknown failure"), "media_network_error"},
+	} {
+		data := []byte("synthetic-only")
+		req, cfg, m := mediaFixture(t, data)
+		err := downloadMedia(context.Background(), req, cfg, mediaPolicy, mediaGet(m), func(context.Context, whatsmeow.DownloadableMessage, whatsmeow.File) error {
+			return c.err
+		}, func([]byte) error { return nil })
+		requireError(t, err, c.code)
+		// The IPC error frame carries the code itself, never provider_operation_failed.
+		if safeError(err) != c.code {
+			t.Fatalf("%v: %s is not in the safe vocabulary", c.err, c.code)
+		}
+		requireNoNativeTemp(t, cfg.PagesDirectory)
+	}
+}
+
+// spec: ANYM-815
+func TestNativeMediaLocalWriteFailureDuringDownloadIsStorageUnavailable(t *testing.T) {
+	data := []byte("synthetic-only")
+	req, cfg, m := mediaFixture(t, data)
+	err := downloadMedia(context.Background(), req, cfg, mediaPolicy, mediaGet(m), func(_ context.Context, _ whatsmeow.DownloadableMessage, f whatsmeow.File) error {
+		_ = f.(*boundedMediaFile).File.Close()
+		if _, e := f.Write([]byte("x")); e != nil {
+			return fmt.Errorf("failed to write synthetic media: %w", e)
+		}
+		return nil
+	}, func([]byte) error { return nil })
+	requireError(t, err, "media_storage_unavailable")
+}
+
+func mediaKeyMessage(t *testing.T, id string, key []byte) *events.Message {
+	t.Helper()
+	m := operationMessage(operationsChat, id, false, 1700000000)
+	hash := sha256.Sum256([]byte(id))
+	m.Message = &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{FileLength: proto.Uint64(4), FileSHA256: hash[:], FileEncSHA256: hash[:], MediaKey: key, DirectPath: proto.String("/v/t62.7119-24/synthetic"), FileName: proto.String("synthetic.pdf"), Mimetype: proto.String("application/pdf")}}
+	m.RawMessage = m.Message
+	return m
+}
+
+// spec: ANYM-815
+func TestMediaKeysAnswersFromTheJournalReadOnlyBesideTheOwningAdapter(t *testing.T) {
+	config := testConfig(t)
+	s, err := OpenCapture(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	s.Owner = types.NewJID("123456", types.DefaultUserServer)
+	held, none := mediaKeyMessage(t, "KEYHELD", bytes.Repeat([]byte{7}, 32)), mediaKeyMessage(t, "KEYNONE", nil)
+	for _, m := range []*events.Message{held, none} {
+		if err := s.Put(m, "live"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := filepath.Join(filepath.Dir(config.SessionDirectory), "config.json")
+	if err := os.WriteFile(path, mustJSON(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ref := func(m *events.Message) map[string]string {
+		return map[string]string{"chat": LegacyChatID(m.Info.Chat), "message": LegacyMessageID(m)}
+	}
+	missing := map[string]string{"chat": operationsChat, "message": "false_" + operationsChat + "_ABSENT"}
+	invalid := map[string]string{"chat": operationsChat, "message": "not-a-reference"}
+	over := make([]map[string]string, mediaKeysBatch+1)
+	for i := range over {
+		over[i] = missing
+	}
+	in := strings.NewReader(string(mustJSON(map[string]any{"id": 1, "method": "media_keys", "params": map[string]any{"messages": []any{ref(held), ref(none), missing, invalid}}})) + "\n" +
+		string(mustJSON(map[string]any{"id": 2, "method": "media", "params": map[string]any{}})) + "\n" +
+		string(mustJSON(map[string]any{"id": 3, "method": "media_keys", "params": map[string]any{"messages": over}})) + "\n")
+	var out bytes.Buffer
+	if err := serveMediaKeys(path, in, &out); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	want := []string{`{"id":1,"result":{"held":[true,false,false,false]}}`, `{"error":"invalid_request","id":2}`, `{"error":"invalid_request","id":3}`}
+	if strings.Join(lines, "|") != strings.Join(want, "|") {
+		t.Fatalf("got %q", lines)
+	}
+	// The owning adapter keeps writing while the lookup runs, and the lookup's connection cannot write.
+	if err := s.Put(fixtureMessage("AFTER", 1700000002), "live"); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", mediaKeysDSN(filepath.Join(config.SessionDirectory, "capture.sqlite")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("CREATE TABLE inventory_probe(x)"); err == nil {
+		t.Fatal("media_keys journal connection accepted a write")
+	}
+	if _, err := db.Exec("DELETE FROM capture"); err == nil {
+		t.Fatal("media_keys journal connection accepted a delete")
+	}
+	// No session directory journal: the lookup refuses instead of creating one.
+	empty := testConfig(t)
+	emptyPath := filepath.Join(filepath.Dir(empty.SessionDirectory), "config.json")
+	if err := os.WriteFile(emptyPath, mustJSON(empty), 0600); err != nil {
+		t.Fatal(err)
+	}
+	requireError(t, serveMediaKeys(emptyPath, strings.NewReader(""), &out), "media_keys_unavailable")
+	if _, err := os.Stat(filepath.Join(empty.SessionDirectory, "capture.sqlite")); !os.IsNotExist(err) {
+		t.Fatal("media_keys created a journal")
 	}
 }
 

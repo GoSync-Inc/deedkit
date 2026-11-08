@@ -131,11 +131,18 @@ def operations(row, history, files, now=None, *, eligibility=None):
         ineligible={reason:sum(eligibility['queued'].get(reason,{}).values())
             for reason in INELIGIBLE}
     diagnostics=[]
+    # ANYM-815: failed WhatsApp jobs whose message was older than the media retention when queued read as likely
+    # expired; the recorded code stays in `errors` and as `recorded_code`, the counts and needs_attention unchanged.
+    expired=files.get('download_likely_expired',{})
     for code in sorted(errors if eligibility is None else error_states):
         states=error_states.get(code)
         if states:
-            diagnostics.extend({'reason_code':code,'count':number,'job_state':state,
-                **describe(code,job_state=state)} for state,number in sorted(states.items()))
+            for state,number in sorted(states.items()):
+                old=min(number,expired.get(code,0)) if state=='failed' else 0
+                if old:diagnostics.append({'reason_code':'provider_media_likely_expired','count':old,'job_state':state,
+                    'recorded_code':code,**describe('provider_media_likely_expired',job_state=state)})
+                if number-old:diagnostics.append({'reason_code':code,'count':number-old,'job_state':state,
+                    **describe(code,job_state=state)})
         else:diagnostics.append({'reason_code':code,'count':errors[code],**describe(code)})
     diagnostics.extend({'reason_code':reason,'count':number,'job_state':'queued',**describe(reason)}
         for reason,number in ineligible.items() if number)
