@@ -24,6 +24,9 @@ def options(method, arguments):
     arguments=dict(arguments)
     # capabilities keeps its own detail (summary|full) for the store (ANYM-270).
     if method=='capabilities':return arguments,'full'
+    # ANYM-826: subscription pages project in the store (the page and its receipt stay one read).
+    if method in ('get_subscription_events','fetch_subscription_events','wait_for_subscription_events'):
+        return arguments,'full'
     detail=arguments.pop('detail','compact')
     # Explicit legacy options remain valid; otherwise compact is the default.
     if 'compact' in arguments:

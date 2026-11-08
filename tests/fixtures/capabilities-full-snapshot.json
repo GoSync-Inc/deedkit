@@ -85,6 +85,17 @@
   "delivery": "operator_registered_signed_hints",
   "fetch": "fetch_subscription_events",
   "host_turn_verified": false,
+  "page_detail": [
+   "full",
+   "compact"
+  ],
+  "page_detail_default": "full",
+  "page_include": [
+   "subscription",
+   "delivery",
+   "metadata",
+   "reply_evidence"
+  ],
   "test": "test_subscription",
   "wait": "wait_for_subscription_events",
   "wait_max_seconds": 25

@@ -257,6 +257,25 @@ provider read) and `messages_get_attachment` (the original's idle clock and a 12
 download grant). Tests pin the hint for these tools and for fetch and wait in the
 backend, the gateway `catalog.json` and `packages/deedkit/lib/tools.json`.
 
+**Compact pages (ANYM-826).** `get_subscription_events`, `fetch_subscription_events` and
+`wait_for_subscription_events` accept `detail` (`full`, the default, or `compact`) and
+`include`. Pollers should pass `detail='compact'`; the default stays `full`, so existing
+consumers get the same bytes. A compact page keeps every page-level field (`items`,
+`has_more`, `next_after`, `consumption`, `ack_version`, `receipt`, `receipt_expires_at`,
+`acked_through`, `ack_available`, `wait_status`, `module`). Its `subscription` block keeps
+`subscription_id`, `state`, `version`, `label`, `matched_through`, `matcher_caught_up`,
+`acked_through`, `blocked_reason`, `gap` and `scope_masked`, plus `delivery_health: {state}`
+when an endpoint is bound; the selector, `delivery`, counts and constants are left out.
+Compact items keep the IDs, routing and readiness fields and `wake_reason`; `metadata`
+keeps only the keys the server reads (`mentions_owner`, `reply_to_owner`,
+`reply_to_provider_id`, `sender_is_bot`, and `forward_origin.kind`), `reply_evidence` stays
+whole (it is filter evidence), and `matching_basis` is dropped. `include` is a list of
+`subscription`, `delivery`, `metadata` and `reply_evidence` that adds those blocks back in
+full (`reply_evidence` is accepted and already whole); with `detail='full'` it changes nothing. Any other value is `invalid_parameters`.
+`detail` binds no cursor or receipt: a receipt from a compact fetch ACKs exactly the range
+a full fetch of the same state would. A gateway newer than its backend forwards `detail`
+only when the caller passes it, so an older backend fails only such calls (unknown argument).
+
 `wait_for_subscription_events(subscription_id, timeout=25, limit=50)` polls those
 pages for at most 25 seconds. Every read reauthorizes and releases its connection
 before the short sleep. There are at most 32 admitted waits per API process;

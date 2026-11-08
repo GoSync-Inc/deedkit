@@ -79,6 +79,73 @@ def wake_reason(item, selector=None):
     return reasons or ['selected_event']
 
 
+# ANYM-826: the metadata keys the server itself reads (wake_reason above; subscriptions._dynamic_match and
+# _own_send_replies): a compact item keeps exactly these, so routing never depends on an omitted key. reply_evidence
+# is filter evidence and stays whole.
+COMPACT_METADATA = ('mentions_owner', 'reply_to_owner', 'reply_to_provider_id', 'sender_is_bot')
+COMPACT_SUBSCRIPTION = ('subscription_id', 'state', 'version', 'label', 'matched_through', 'matcher_caught_up',
+    'acked_through', 'blocked_reason', 'gap', 'scope_masked')
+COMPACT_ITEM = ('event_id', 'kind', 'origin', 'revision', 'observed_at', 'matched_at', 'delivered_at', 'historical',
+    'wake_reason', 'message', 'account', 'chat', 'sender', 'provider_id', 'sent_at', 'direction', 'deleted',
+    'processing', 'send_id', 'error_code', 'status')
+PAGE_INCLUDE = ('subscription', 'delivery', 'metadata', 'reply_evidence')
+
+
+def page_detail(detail, include):
+    """ANYM-826: validated (detail, include); None means the default full page."""
+    from .store import APIError
+    detail = 'full' if detail is None else detail
+    if detail not in ('full', 'compact') or include is not None and (
+            not isinstance(include, list) or any(not isinstance(name, str) or name not in PAGE_INCLUDE
+                for name in include)):
+        raise APIError('invalid_parameters')
+    return detail, frozenset(include or ())
+
+
+def _compact_item(item, include):
+    view = {key: item[key] for key in COMPACT_ITEM if key in item}
+    metadata = item.get('metadata')
+    if 'metadata' in include:
+        if metadata is not None:
+            view['metadata'] = metadata
+    elif isinstance(metadata, dict):
+        kept = {key: metadata[key] for key in COMPACT_METADATA if key in metadata}
+        origin = metadata.get('forward_origin')
+        if isinstance(origin, dict) and 'kind' in origin:
+            kept['forward_origin'] = {'kind': origin['kind']}
+        if kept:
+            view['metadata'] = kept
+    if 'reply_evidence' in item:
+        view['reply_evidence'] = item['reply_evidence']
+    return view
+
+
+def _compact_subscription(state, include):
+    if 'subscription' in include:
+        return state
+    view = {key: state[key] for key in COMPACT_SUBSCRIPTION if key in state}
+    delivery = state.get('delivery')
+    if 'delivery' in include and delivery is not None:
+        view['delivery'] = delivery
+    elif isinstance(delivery, dict) and isinstance(delivery.get('delivery_health'), dict):
+        # ANYM-520: a compact poller with a bound endpoint still sees that its endpoint is failing.
+        view['delivery_health'] = {'state': delivery['delivery_health'].get('state')}
+    return view
+
+
+def project_page(page, detail='full', include=frozenset()):
+    """ANYM-826: a compact page drops repeated definition, delivery and metadata blocks; cursors, receipt and
+    page-level fields stay as they are, so a compact fetch ACKs exactly what a full one does."""
+    if detail != 'compact':
+        return page
+    view = dict(page)
+    if isinstance(page.get('subscription'), dict):
+        view['subscription'] = _compact_subscription(page['subscription'], include)
+    if isinstance(page.get('items'), list):
+        view['items'] = [_compact_item(item, include) for item in page['items']]
+    return view
+
+
 def _active(row):
     from .store import APIError
     if row['state'] == 'access_changed':
@@ -173,12 +240,20 @@ def ack_subscription_events(store, c, p, subscription_id, receipt, version):
     return result
 
 
-async def wait_for_subscription_events(store, token, subscription_id, *, timeout=25, limit=50):
+async def wait_for_subscription_events(store, token, subscription_id, *, timeout=25, limit=50, detail=None,
+                                       include=None):
     """Each poll authenticates independently and returns its connection before waiting."""
     from .store import APIError, bounded
     bounded(limit)
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 <= timeout <= 25:
         raise APIError('invalid_parameters')
+    view = page_detail(detail, include)
+    # Polls read full pages (the loop reads the subscription state); only the returned page is projected.
+    return project_page(await _wait(store, token, subscription_id, timeout, limit), *view)
+
+
+async def _wait(store, token, subscription_id, timeout, limit):
+    from .store import APIError
     admission = _Admission()
     deadline = time.monotonic() + (timeout or _IMMEDIATE_READ_TIMEOUT_S)
     latest = None

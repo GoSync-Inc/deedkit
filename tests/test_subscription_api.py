@@ -388,6 +388,311 @@ def test_subscriber_waits_fetches_and_acks_over_rest_and_mcp(seeded,transport):
         assert tool('get_subscription',subscription_id=sid)['acked_through']==ack['acked_through']
 
 
+COMPACT_PAGE_SUBSCRIPTION={'subscription_id','state','version','label','matched_through','matcher_caught_up',
+    'acked_through','blocked_reason','gap','scope_masked'}
+
+
+def page_store_call(store,token,method,sid,**kwargs):
+    if method=='wait_for_subscription_events':
+        import asyncio
+        from messaging_service.subscription_consumption import wait_for_subscription_events
+        return asyncio.run(wait_for_subscription_events(store,token,sid,timeout=0,**kwargs))
+    return getattr(store,method)(token,sid,**kwargs)
+
+
+def receipt_range(store,receipt):
+    import hashlib
+    with store.pool.connection() as c:
+        row=c.execute('''SELECT after_position,through_position,module_after_position,module_through_position
+            FROM subscription_receipts WHERE receipt_hash=%s''',(hashlib.sha256(receipt.encode()).hexdigest(),)).fetchone()
+    return dict(row)
+
+
+def static_case(store):
+    from tests.test_event_delivery import identity
+    from tests.test_subscriptions import emit
+    token=identity(store,'compact-static')
+    sid=store.create_subscription(token,['telegram-demo-chat'])['subscription_id']
+    emit(store);emit(store)
+    return token,sid
+
+
+def dynamic_case(store):
+    from messaging_service.subscriptions import match_subscriptions
+    from tests.test_subscriptions import ALL_VISIBLE,chat_message,dynamic_key,emit
+    store.set_dynamic_subscriptions(True)
+    token=dynamic_key(store,'compact-dynamic')
+    chat_message(store,'telegram-demo-chat-826','demo-tg-826')
+    sid=store.create_subscription(token,sources=ALL_VISIBLE)['subscription_id']
+    emit(store);emit(store,'demo-tg-826')
+    match_subscriptions(store)
+    # The second chat leaves the key's scope: its reference is hidden above the visible one.
+    store.set_access('compact-dynamic',chats=['telegram-demo-chat'])
+    return token,sid
+
+
+def resumed_case(store):
+    from tests.test_event_delivery import identity
+    from tests.test_subscriptions import emit
+    token=identity(store,'compact-resumed')
+    sid=store.create_subscription(token,['telegram-demo-chat'])['subscription_id']
+    emit(store)
+    paused=store.update_subscription(token,sid,1,action='pause')
+    emit(store)
+    store.update_subscription(token,sid,paused['version'],action='resume')
+    return token,sid
+
+
+def module_case(store):
+    from tests.test_module_events import beat,call_event,mixed,publish,subscriber
+    from tests.test_subscriptions import emit
+    token=subscriber(store)
+    sid=mixed(store,token)
+    beat(store)
+    publish(store,call_event(1,'call-826'))
+    emit(store)
+    return token,sid
+
+
+# spec: ANYM-826
+@pytest.mark.parametrize('case',['static','dynamic_hidden','paused_resumed','module'])
+def test_compact_and_full_fetches_page_receipt_and_ack_the_same_range(seeded,case):
+    from messaging_service.subscriptions import match_subscriptions
+    store,_,_=seeded
+    try:
+        token,sid={'static':static_case,'dynamic_hidden':dynamic_case,'paused_resumed':resumed_case,
+            'module':module_case}[case](store)
+        match_subscriptions(store)
+        full=store.fetch_subscription_events(token,sid,limit=50)
+        compact=store.fetch_subscription_events(token,sid,limit=50,detail='compact')
+        assert full['items'] or full.get('module',{}).get('items')
+        assert [item['event_id'] for item in compact['items']]==[item['event_id'] for item in full['items']]
+        for field in ('next_after','has_more','ack_version','acked_through','ack_available','consumption'):
+            assert compact[field]==full[field],field
+        assert compact.get('module')==full.get('module')
+        if case=='dynamic_hidden':
+            assert len(full['items'])==1 and full['next_after']>full['items'][-1]['event_id']
+        assert full['receipt'] and compact['receipt'] and compact['receipt']!=full['receipt']
+        assert receipt_range(store,compact['receipt'])==receipt_range(store,full['receipt'])
+        ack=store.ack_subscription_events(token,sid,compact['receipt'],compact['ack_version'])
+        assert ack['acked_through']==full['next_after'] and ack['ack_version']==full['ack_version']+1
+        if case=='module':
+            assert ack['module_acked_through']==full['module']['next_after']
+        # The routing a host acts on is the same in both views.
+        assert [item['wake_reason'] for item in compact['items']]==[item['wake_reason'] for item in full['items']]
+    finally:
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-826
+@pytest.mark.parametrize('method',['get_subscription_events','fetch_subscription_events','wait_for_subscription_events'])
+def test_compact_page_keeps_page_fields_and_only_the_named_blocks(seeded,method):
+    from messaging_service.subscription_consumption import COMPACT_ITEM
+    from messaging_service.subscriptions import match_subscriptions
+    store,_,_=seeded
+    token,sid=static_case(store)
+    match_subscriptions(store)
+    full=page_store_call(store,token,method,sid)
+    compact=page_store_call(store,token,method,sid,detail='compact')
+    assert set(compact)==set(full)
+    assert set(compact['subscription'])==COMPACT_PAGE_SUBSCRIPTION
+    for omitted in ('chat_ids','delivery','freshness_basis','matching_evidence','matched_event_count'):
+        assert omitted in full['subscription'],omitted
+        assert omitted not in compact['subscription'],omitted
+    assert compact['items'] and all(set(item)<=set(COMPACT_ITEM)|{'metadata','reply_evidence'}
+        for item in compact['items'])
+    assert all('matching_basis' in item for item in full['items'])
+    # include re-adds the blocks; with detail=full it changes nothing.
+    added=page_store_call(store,token,method,sid,detail='compact',include=['subscription','metadata'])
+    assert added['subscription']==full['subscription'] and [i.get('metadata') for i in added['items']]==[
+        i.get('metadata') for i in full['items']]
+    delivery=page_store_call(store,token,method,sid,detail='compact',include=['delivery'])
+    assert delivery['subscription']['delivery']==full['subscription']['delivery']
+    same=page_store_call(store,token,method,sid,detail='full',include=['delivery'])
+    for name in ('subscription','items','next_after','has_more'):
+        assert same[name]==full[name],name
+    for bad in ({'detail':'brief'},{'include':['selector']},{'include':'metadata'},{'detail':True}):
+        with pytest.raises(APIError) as error:
+            page_store_call(store,token,method,sid,**bad)
+        assert error.value.code=='invalid_parameters'
+
+
+# spec: ANYM-826
+def test_empty_compact_page_is_the_state_block_and_cursors(seeded):
+    from tests.test_event_delivery import identity
+    store,_,_=seeded
+    token=identity(store,'compact-empty')
+    sid=store.create_subscription(token,['telegram-demo-chat'])['subscription_id']
+    page=store.fetch_subscription_events(token,sid,detail='compact')
+    assert page['items']==[] and page['receipt'] is None
+    assert set(page)=={'subscription','items','has_more','next_after','consumption','scope_masked','ack_version',
+        'receipt','acked_through','receipt_expires_at','ack_available'}
+    assert set(page['subscription'])==COMPACT_PAGE_SUBSCRIPTION
+    passive=store.get_subscription_events(token,sid,detail='compact')
+    assert set(passive)=={'subscription','items','has_more','next_after','consumption','scope_masked'}
+
+
+# spec: ANYM-826
+def test_compact_page_of_fifty_forwarded_media_items_is_smaller(seeded):
+    from messaging_service.subscriptions import match_subscriptions
+    from tests.test_event_delivery import identity
+    from tests.test_subscriptions import chat_message,emit
+    store,_,_=seeded
+    token=identity(store,'compact-bytes')
+    sid=store.create_subscription(token,['telegram-demo-chat'])['subscription_id']
+    for n in range(50):
+        message=chat_message(store,'telegram-demo-chat',f'demo-tg-fwd-{n}',metadata={
+            'forward_origin':{'kind':'user','sender_id':f'synthetic-{n}','sender_name':'Synthetic Author',
+                'sent_at':'2026-01-01T00:00:00Z'},
+            'media':{'kind':'photo','width':1280,'height':720,'mime_type':'image/jpeg','size_bytes':123456},
+            'mentions_owner':False})
+        emit(store,message)
+    match_subscriptions(store)
+    full=store.fetch_subscription_events(token,sid,limit=50)
+    compact=store.fetch_subscription_events(token,sid,limit=50,detail='compact')
+    assert len(full['items'])==len(compact['items'])==50
+    assert compact['items'][0]['metadata']=={'mentions_owner':False,'forward_origin':{'kind':'user'}}
+    full_bytes,compact_bytes=(len(json.dumps(page,separators=(',',':'),default=str).encode())
+        for page in (full,compact))
+    print(f'ANYM-826 page bytes: full={full_bytes} compact={compact_bytes}')
+    assert compact_bytes<full_bytes
+
+
+def tracked_keys(function,item,*args):
+    seen=set()
+
+    class Tracked(dict):
+        def get(self,key,default=None):
+            seen.add(key)
+            return super().get(key,default)
+
+        def __getitem__(self,key):
+            seen.add(key)
+            return super().__getitem__(key)
+
+    return function({**item,'metadata':Tracked(item.get('metadata') or {}),
+        'reply_evidence':Tracked(item.get('reply_evidence') or {})},*args),seen
+
+
+# spec: ANYM-826
+@pytest.mark.parametrize('metadata,proof',[
+    ({'mentions_owner':True,'reply_to_owner':True,'reply_to_provider_id':'p-1','sender_is_bot':True,
+        'forward_origin':{'kind':'channel','chat_id':'c-1'},'media':{'kind':'photo'}},{}),
+    ({'reply_to_owner':False,'reply_to_provider_id':'n-1','unread':True},
+        {'basis':'exact_native_reply_to_archived_outgoing','target_message':'m-2','target_revision':3,
+            'target_provider_id':'p-2'}),
+    ({},{}),
+])
+def test_wake_reason_and_dynamic_match_read_only_compact_keys(metadata,proof):
+    import inspect
+    import re
+    from messaging_service import subscription_consumption as consumption, subscriptions
+    from messaging_service.subscription_consumption import COMPACT_METADATA,project_page
+    item={'event_id':1,'kind':'message.created','direction':'incoming','account':'a','chat':'c','historical':False,
+        'metadata':metadata,'reply_evidence':proof,'matching_basis':'exact_event_revision'}
+    selector={'reply_anchor':{'account':'a','chat':'c','provider_id':'p-1','native_reply_id':'n-1'}}
+    compact=project_page({'items':[item]},'compact')['items'][0]
+    assert 'matching_basis' not in compact and compact.get('reply_evidence')==item['reply_evidence']
+    full_reason,full_seen=tracked_keys(consumption.wake_reason,item,selector)
+    compact_reason,_=tracked_keys(consumption.wake_reason,compact,selector)
+    assert compact_reason==full_reason
+    assert full_seen<=set(COMPACT_METADATA)|{'basis','target_provider_id'}
+    for sources in ({'include_bots':False},{'include_bots':True}):
+        assert subscriptions._dynamic_match(sources,'group',compact)==subscriptions._dynamic_match(sources,'group',item)
+    _,dynamic_seen=tracked_keys(lambda snapshot:subscriptions._dynamic_match({'include_bots':False},'group',snapshot),item)
+    assert dynamic_seen<=set(COMPACT_METADATA)
+    # Every metadata key a server reader names is on the allow-list (reply_evidence is kept whole).
+    for reader in (consumption.wake_reason,subscriptions._dynamic_match,subscriptions._own_send_replies):
+        names=set(re.findall(r"(?:metadata|get\('metadata'\) or \{\}\))\.get\('([a-z_]+)'",inspect.getsource(reader)))
+        assert names and names<=set(COMPACT_METADATA),(reader.__name__,names)
+
+
+# spec: ANYM-826
+def test_compact_subscription_keeps_only_the_delivery_health_state():
+    from messaging_service.subscription_consumption import project_page
+    health={'state':'failing','consecutive_failures':3,'last_success':None,'last_error':'timeout','next_step':'x'}
+    state={'subscription_id':'s','state':'active','version':2,'label':None,'matched_through':5,'matcher_caught_up':True,
+        'acked_through':4,'blocked_reason':None,'gap':None,'scope_masked':False,'chat_ids':['c'],
+        'freshness_basis':'committed_archive_journal_not_provider_freshness','matched_event_count':1,
+        'delivery':{'push':True,'delivery_health':health}}
+    page={'subscription':state,'items':[],'has_more':False,'next_after':4,'positions':{'synthetic':True}}
+    compact=project_page(page,'compact')
+    assert compact['subscription']=={**{key:state[key] for key in COMPACT_PAGE_SUBSCRIPTION},
+        'delivery_health':{'state':'failing'}}
+    assert compact['positions']==page['positions'] and compact['next_after']==4
+    assert project_page(page,'full',frozenset({'delivery'})) is page
+
+
+# spec: ANYM-826
+@pytest.mark.parametrize('method',['get_subscription_events','fetch_subscription_events','wait_for_subscription_events'])
+def test_detail_and_include_reach_the_backend_only_when_given(method,monkeypatch):
+    seen=[]
+
+    class PageStore(RecordingStore):
+        def get_subscription_events(self,token,**params):
+            seen.append(params)
+            return {'items':[]}
+
+        def fetch_subscription_events(self,token,**params):
+            seen.append(params)
+            return {'items':[]}
+
+    async def fake_wait(store,token,subscription_id,**kwargs):
+        seen.append({'subscription_id':subscription_id,**kwargs})
+        return {'items':[]}
+
+    import messaging_service.subscription_consumption as consumption
+    monkeypatch.setattr(consumption,'wait_for_subscription_events',fake_wait)
+    params={'subscription_id':'sub_synthetic'}
+    with TestClient(create_app(PageStore(),['testserver'])) as client:
+        headers={'Authorization':'Bearer synthetic-token'}
+        plain=client.post('/v1/'+method,headers=headers,json=params)
+        compact=client.post('/v1/'+method,headers=headers,json={**params,'detail':'compact','include':['delivery']})
+        over_mcp=rpc(client,method,{**params,'detail':'compact'})
+        wrong=client.post('/v1/'+method,headers=headers,json={**params,'detail':'brief'})
+        wrong_include=rpc(client,method,{**params,'include':['selector']})
+    assert plain.status_code==200 and compact.status_code==200 and not over_mcp.json().get('error')
+    assert 'detail' not in seen[0] and 'include' not in seen[0]
+    assert seen[1]['detail']=='compact' and seen[1]['include']==['delivery'] and seen[2]['detail']=='compact'
+    assert wrong.status_code==400 and wrong.json()['error']=='invalid_parameters'
+    assert wrong_include.json()['error']['code']==-32602 and len(seen)==3
+
+
+# spec: ANYM-826
+def test_page_detail_is_described_alike_in_backend_gateway_and_clients():
+    root=Path(__file__).resolve().parents[1]
+    catalog={row['name']:row for row in json.loads(
+        (root/'services/gateway/src/agent_gateway/catalog.json').read_text())}
+    with TestClient(create_app(RecordingStore(),['testserver'])) as http:
+        listed=http.post('/mcp',headers={'Authorization':'Bearer synthetic-token',
+            'Accept':'application/json, text/event-stream'},json={'jsonrpc':'2.0','id':1,
+            'method':'tools/list','params':{}}).json()['result']['tools']
+    backend={tool['name']:tool for tool in listed}
+    sent=[]
+    def transport(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200,json={'synthetic':True})
+    python=Client('https://archive.example','synthetic-token',transport=httpx.MockTransport(transport))
+    for name in ('get_subscription_events','fetch_subscription_events','wait_for_subscription_events'):
+        properties=backend[name]['inputSchema']['properties']
+        assert 'default' not in properties['detail'] and 'default' not in properties['include']
+        gateway=catalog['messages_'+name]
+        assert gateway['inputSchema']['properties']['detail']==properties['detail']
+        assert gateway['inputSchema']['properties']['include']==properties['include']
+        assert 'detail=compact' in backend[name]['description']
+        assert gateway['description']==backend[name]['description']
+        sent.clear()
+        getattr(python,name)(subscription_id='sub_synthetic')
+        getattr(python,name)(subscription_id='sub_synthetic',detail='compact',include=['metadata'])
+        assert 'detail' not in sent[0] and sent[1]['detail']=='compact' and sent[1]['include']==['metadata']
+        for bad in ({'detail':'brief'},{'include':['selector']}):
+            with pytest.raises(ValueError):
+                getattr(python,name)(subscription_id='sub_synthetic',**bad)
+        assert len(sent)==2
+    readme=(root/'SUBSCRIPTIONS.md').read_text()
+    assert "detail='compact'" in readme and 'the default stays `full`' in readme
+
+
 ENDPOINT_TOOLS=('register_delivery_endpoint','list_delivery_endpoints','update_delivery_endpoint',
     'delete_delivery_endpoint','test_delivery_endpoint')
 

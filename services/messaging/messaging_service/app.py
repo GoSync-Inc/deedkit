@@ -35,7 +35,7 @@ from .send_intent import SEND_BODY_BYTES
 from .tool_types import (  # noqa: F401  (the moved names stay importable from here)
     WaitSeconds, LiveWaitSeconds, WakeRule, WakeRules, SendReference, SubscriptionReceipt,
     ReceiverReference, RequestReference, FeedbackReference, FeedbackReferences, FeedbackDescription,
-    FeedbackOperation, FeedbackStatus, Detail, MessageDetail, ConversationView, QueryMode, SearchLanguage, MediaKindFilter, ReadyFilter,
+    FeedbackOperation, FeedbackStatus, SubscriptionPageDetail, SubscriptionPageInclude, Detail, MessageDetail, ConversationView, QueryMode, SearchLanguage, MediaKindFilter, ReadyFilter,
     EventKind, SubscriptionEventKind, EventOrigin, MessageFormat, SubscriptionReference,
     SubscriptionReferences, SubscriptionKinds, SubscriptionOrigins, SubscriptionLimit, SubscriptionVersion,
     SubscriptionPosition, LocalClock, QuietWindow, QuietHours, DeliveryPolicy, EndpointReference,
@@ -89,6 +89,9 @@ OMITTED_WHEN_NONE = {'create_subscription':('chat_ids','sources','wake_rules','r
     'search_files':('media_kind','ready'),
     'search':('body_format',),'get_messages':('body_format',),'get_context':('body_format',),
     'list_delivery_attempts':('before',),
+    # ANYM-826: an omitted detail keeps every page and audit record as before.
+    'get_subscription_events':('detail','include'),'fetch_subscription_events':('detail','include'),
+    'wait_for_subscription_events':('detail','include'),
     # ANYM-736: an omitted guard keeps every request, hash and stored row as before.
     # ANYM-748: so does an omitted allow_duplicate.
     'send_message':('expected_last_message_id','guard','allow_duplicate'),'get_send_status':('send_id','request_id')}
@@ -1192,7 +1195,8 @@ def register_subscription_tools(mcp, call, async_call, read, upload_write):
     @mcp.tool(structured_output=True,annotations=read)
     def get_subscription_events(ctx: Context,subscription_id: SubscriptionReference,
                                 after: SubscriptionPosition=0,
-                                limit: SubscriptionLimit=50) -> dict[str,Any]:
+                                limit: SubscriptionLimit=50,detail: SubscriptionPageDetail=None,
+                                include: SubscriptionPageInclude=None) -> dict[str,Any]:
         """Inspect bounded durable matches after an event ID; no consumer ACK or push.
 
         Save the returned next boundary locally to page; no server progress is advanced.
@@ -1202,13 +1206,16 @@ def register_subscription_tools(mcp, call, async_call, read, upload_write):
         Matching and live provider freshness are separate; get_sync_status checks chats.
         Each item has sent_at (provider), observed_at (journal commit), matched_at and delivered_at (null until a hint
         covering it was delivered).
+        detail=compact (pollers): same items, cursors and receipt without the definition, delivery and metadata blocks.
         """
-        return call(ctx,'get_subscription_events',subscription_id=subscription_id,after=after,limit=limit)
+        return call(ctx,'get_subscription_events',subscription_id=subscription_id,after=after,limit=limit,detail=detail,
+            include=include)
 
     @mcp.tool(structured_output=True,annotations=read)
-    def fetch_subscription_events(ctx: Context,subscription_id: SubscriptionReference,limit: SubscriptionLimit=50) -> dict[str,Any]:
-        """Fetch an issued event page. Does not advance ACK or mark provider read. With explicit subscription-ack, a non-empty page gets a short-lived receipt (5 minutes). Safe to retry; a retry may evict the oldest receipt beyond 128, which then fails closed when ACKed."""
-        return call(ctx,'fetch_subscription_events',subscription_id=subscription_id,limit=limit)
+    def fetch_subscription_events(ctx: Context,subscription_id: SubscriptionReference,limit: SubscriptionLimit=50,
+                                  detail: SubscriptionPageDetail=None,include: SubscriptionPageInclude=None) -> dict[str,Any]:
+        """Fetch an issued event page. Does not advance ACK or mark provider read. With explicit subscription-ack, a non-empty page gets a short-lived receipt (5 minutes). Safe to retry; a retry may evict the oldest receipt beyond 128, which then fails closed when ACKed. detail=compact (pollers) drops repeated blocks; same items, cursors and receipt."""
+        return call(ctx,'fetch_subscription_events',subscription_id=subscription_id,limit=limit,detail=detail,include=include)
 
     @mcp.tool(structured_output=True,annotations=upload_write)
     def ack_subscription_events(ctx: Context,subscription_id: SubscriptionReference,receipt: SubscriptionReceipt,version: SubscriptionVersion) -> dict[str,Any]:
@@ -1216,9 +1223,11 @@ def register_subscription_tools(mcp, call, async_call, read, upload_write):
         return call(ctx,'ack_subscription_events',subscription_id=subscription_id,receipt=receipt,version=version)
 
     @mcp.tool(structured_output=True,annotations=read)
-    async def wait_for_subscription_events(ctx: Context,subscription_id: SubscriptionReference,timeout: WaitSeconds=25,limit: SubscriptionLimit=50) -> dict[str,Any]:
-        """Wait at most 25 seconds for an authorized event page. No ACK, provider polling or guarantee that a host runs a turn. With explicit subscription-ack, a non-empty page gets a short-lived receipt (5 minutes). Safe to retry; a retry may evict the oldest receipt beyond 128, which then fails closed when ACKed."""
-        return await async_call(ctx,'wait_for_subscription_events',subscription_id=subscription_id,timeout=timeout,limit=limit)
+    async def wait_for_subscription_events(ctx: Context,subscription_id: SubscriptionReference,timeout: WaitSeconds=25,limit: SubscriptionLimit=50,
+                                           detail: SubscriptionPageDetail=None,include: SubscriptionPageInclude=None) -> dict[str,Any]:
+        """Wait at most 25 seconds for an authorized event page. No ACK, provider polling or guarantee that a host runs a turn. With explicit subscription-ack, a non-empty page gets a short-lived receipt (5 minutes). Safe to retry; a retry may evict the oldest receipt beyond 128, which then fails closed when ACKed. detail=compact (pollers) drops repeated blocks; same items, cursors and receipt."""
+        return await async_call(ctx,'wait_for_subscription_events',subscription_id=subscription_id,timeout=timeout,limit=limit,
+            detail=detail,include=include)
 
     @mcp.tool(structured_output=True,annotations=upload_write)
     def configure_subscription_delivery(ctx: Context,subscription_id: SubscriptionReference,version: SubscriptionVersion,receiver_id: ReceiverReference | None=None,delivery_policy: DeliveryPolicy | None=None,endpoint_id: EndpointReference | None=None) -> dict[str,Any]:

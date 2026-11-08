@@ -1131,16 +1131,20 @@ class Store:
             return update_subscription(self, c, p, subscription_id, version,
                 action=action, resume_policy=resume_policy)
 
-    def get_subscription_events(self, token, subscription_id, *, after=0, limit=50, module_after=None):
+    def get_subscription_events(self, token, subscription_id, *, after=0, limit=50, module_after=None, detail=None,
+                                include=None):
+        from .subscription_consumption import page_detail, project_page
         from .subscriptions import get_subscription_events
+        view = page_detail(detail, include)
         with self.authorized(token, 'get_subscription_events') as (c, p):
-            return get_subscription_events(self, c, p, subscription_id, after=after, limit=limit,
-                module_after=module_after)
+            return project_page(get_subscription_events(self, c, p, subscription_id, after=after, limit=limit,
+                module_after=module_after), *view)
 
-    def fetch_subscription_events(self, token, subscription_id, *, limit=50):
-        from .subscription_consumption import fetch_subscription_events
+    def fetch_subscription_events(self, token, subscription_id, *, limit=50, detail=None, include=None):
+        from .subscription_consumption import fetch_subscription_events, page_detail, project_page
+        view = page_detail(detail, include)
         with self.authorized(token, 'fetch_subscription_events') as (c, p):
-            return fetch_subscription_events(self, c, p, subscription_id, limit=limit)
+            return project_page(fetch_subscription_events(self, c, p, subscription_id, limit=limit), *view)
 
     def ack_subscription_events(self, token, subscription_id, receipt, version):
         from .subscription_consumption import ack_subscription_events

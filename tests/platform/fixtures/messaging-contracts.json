@@ -3600,7 +3600,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "Inspect bounded durable matches after an event ID; no consumer ACK or push.\n\nSave the returned next boundary locally to page; no server progress is advanced.\nMessage/original/text/transcript/description readiness are separate event kinds.\nExact event revision and artifact references remain distinct from current content.\nAn empty page with a lagging/paused matcher or a gap does not prove no new data.\nMatching and live provider freshness are separate; get_sync_status checks chats.\nEach item has sent_at (provider), observed_at (journal commit), matched_at and delivered_at (null until a hint\ncovering it was delivered).\n",
+      "description": "Inspect bounded durable matches after an event ID; no consumer ACK or push.\n\nSave the returned next boundary locally to page; no server progress is advanced.\nMessage/original/text/transcript/description readiness are separate event kinds.\nExact event revision and artifact references remain distinct from current content.\nAn empty page with a lagging/paused matcher or a gap does not prove no new data.\nMatching and live provider freshness are separate; get_sync_status checks chats.\nEach item has sent_at (provider), observed_at (journal commit), matched_at and delivered_at (null until a hint\ncovering it was delivered).\ndetail=compact (pollers): same items, cursors and receipt without the definition, delivery and metadata blocks.\n",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -3610,6 +3610,44 @@
             "minimum": 0,
             "title": "After",
             "type": "integer"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "enum": [
+                  "full",
+                  "compact"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "full (default): today's page. compact: subscription state and cursors, items with routing fields only.",
+            "title": "Detail"
+          },
+          "include": {
+            "anyOf": [
+              {
+                "items": {
+                  "enum": [
+                    "subscription",
+                    "delivery",
+                    "metadata",
+                    "reply_evidence"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 4,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Blocks a compact page adds back; ignored with detail=full.",
+            "title": "Include"
           },
           "limit": {
             "default": 50,
@@ -3645,10 +3683,48 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "Fetch an issued event page. Does not advance ACK or mark provider read. With explicit subscription-ack, a non-empty page gets a short-lived receipt (5 minutes). Safe to retry; a retry may evict the oldest receipt beyond 128, which then fails closed when ACKed.",
+      "description": "Fetch an issued event page. Does not advance ACK or mark provider read. With explicit subscription-ack, a non-empty page gets a short-lived receipt (5 minutes). Safe to retry; a retry may evict the oldest receipt beyond 128, which then fails closed when ACKed. detail=compact (pollers) drops repeated blocks; same items, cursors and receipt.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "detail": {
+            "anyOf": [
+              {
+                "enum": [
+                  "full",
+                  "compact"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "full (default): today's page. compact: subscription state and cursors, items with routing fields only.",
+            "title": "Detail"
+          },
+          "include": {
+            "anyOf": [
+              {
+                "items": {
+                  "enum": [
+                    "subscription",
+                    "delivery",
+                    "metadata",
+                    "reply_evidence"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 4,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Blocks a compact page adds back; ignored with detail=full.",
+            "title": "Include"
+          },
           "limit": {
             "default": 50,
             "maximum": 100,
@@ -3729,10 +3805,48 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "Wait at most 25 seconds for an authorized event page. No ACK, provider polling or guarantee that a host runs a turn. With explicit subscription-ack, a non-empty page gets a short-lived receipt (5 minutes). Safe to retry; a retry may evict the oldest receipt beyond 128, which then fails closed when ACKed.",
+      "description": "Wait at most 25 seconds for an authorized event page. No ACK, provider polling or guarantee that a host runs a turn. With explicit subscription-ack, a non-empty page gets a short-lived receipt (5 minutes). Safe to retry; a retry may evict the oldest receipt beyond 128, which then fails closed when ACKed. detail=compact (pollers) drops repeated blocks; same items, cursors and receipt.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "detail": {
+            "anyOf": [
+              {
+                "enum": [
+                  "full",
+                  "compact"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "full (default): today's page. compact: subscription state and cursors, items with routing fields only.",
+            "title": "Detail"
+          },
+          "include": {
+            "anyOf": [
+              {
+                "items": {
+                  "enum": [
+                    "subscription",
+                    "delivery",
+                    "metadata",
+                    "reply_evidence"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 4,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Blocks a compact page adds back; ignored with detail=full.",
+            "title": "Include"
+          },
           "limit": {
             "default": 50,
             "maximum": 100,
