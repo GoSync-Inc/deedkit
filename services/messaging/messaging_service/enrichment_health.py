@@ -5,6 +5,7 @@ import time
 from . import telemetry
 from .file_lifecycle import PROCESSABLE_ORIGINAL
 from .media_policy import RECOGNITION_WITHHELD
+from .coverage import DOCUMENT_TEXT, KIND
 
 MINI_PROVIDER = 'deedkit_inference'
 CHECK_PERIOD_S = 300
@@ -36,12 +37,39 @@ SCOPES_SQL = '''WITH queued AS MATERIALIZED (
         FROM attachment_enrichment e JOIN attachments a ON a.id=e.attachment JOIN messages m ON m.id=a.message
         WHERE e.state='ready' AND e.provider=%(provider)s
             AND (e.kind,e.profile_hash) IN (SELECT kind,profile_hash FROM queued)
-        GROUP BY 1,2,3)
+        GROUP BY 1,2,3),
+    -- ANYM-812: due rows still unconfigured (no claim has touched them yet) are waiting work too. Their scope is
+    -- (account, kind from mime, the provider of the account's enabled profile); progress is any ready row of it.
+    -- A row waits from its updated_at, so a row stored seconds ago does not count at once.
+    waiting AS MATERIALIZED (
+        SELECT m.account,pp.kind,count(*) AS queued,min(e.updated_at) AS oldest,
+            count(*) FILTER (WHERE m.sent_at<=now()-make_interval(secs=>%(stall)s)
+                AND m.sent_at>=now()-make_interval(secs=>%(starved_age)s)) AS window_rows
+        FROM attachment_enrichment e JOIN attachments a ON a.id=e.attachment JOIN messages m ON m.id=a.message
+        JOIN processing_profiles pp ON pp.account=m.account AND pp.enabled AND pp.provider=%(provider)s
+            AND pp.kind='''+KIND+'''
+        LEFT JOIN attachment_text f ON f.attachment=a.id
+        WHERE e.state='unconfigured' AND a.active AND NOT m.deleted AND e.source_digest=a.digest
+            AND e.source_revision=m.revision
+            AND '''+PROCESSABLE_ORIGINAL.replace('%', '%%')+''' AND NOT '''+RECOGNITION_WITHHELD.replace('%', '%%')+'''
+            AND ('''+KIND+"""<>'document' OR coalesce("""+DOCUMENT_TEXT+''',false))
+        GROUP BY 1,2),
+    waiting_ready AS (
+        SELECT m.account,e.kind,max(e.updated_at) AS newest
+        FROM attachment_enrichment e JOIN attachments a ON a.id=e.attachment JOIN messages m ON m.id=a.message
+        WHERE e.state='ready' AND e.provider=%(provider)s AND (m.account,e.kind) IN (SELECT account,kind FROM waiting)
+        GROUP BY 1,2)
     SELECT q.account,q.kind,q.queued,q.window_rows,
         coalesce(p.enabled AND p.expires_at>now(),false)
             AND coalesce(r.newest,q.oldest_queued)<=now()-make_interval(secs=>%(stall)s) AS stalled
     FROM queued q LEFT JOIN ready r USING(account,kind,profile_hash)
-    LEFT JOIN processing_profiles p ON p.account=q.account AND p.kind=q.kind AND p.provider=%(provider)s'''
+    LEFT JOIN processing_profiles p ON p.account=q.account AND p.kind=q.kind AND p.provider=%(provider)s
+    UNION ALL
+    SELECT w.account,w.kind,w.queued,w.window_rows,
+        coalesce(p.enabled AND p.expires_at>now(),false) AND w.oldest<=now()-make_interval(secs=>%(stall)s)
+            AND coalesce(wr.newest,'-infinity')<=now()-make_interval(secs=>%(stall)s) AS stalled
+    FROM waiting w LEFT JOIN waiting_ready wr USING(account,kind)
+    LEFT JOIN processing_profiles p ON p.account=w.account AND p.kind=w.kind AND p.provider=%(provider)s'''
 WORKERS_SQL = '''SELECT account FROM processing_profiles
     WHERE provider=%(provider)s AND NOT (enabled AND expires_at>now())
         AND observed_at<=now()-make_interval(secs=>%(no_worker)s)
