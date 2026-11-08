@@ -18,8 +18,8 @@ def conversation(add, chat, *steps, chat_type='private', newest=1):
     for n,(side,content) in enumerate(steps):
         fields=dict(content) if isinstance(content,dict) else {'body':content}
         hours=newest+len(steps)-1-n
-        if side=='out':add(chat,str(n+1),hours,direction='outgoing',sender=OWNER_SENDER,chat_type=chat_type,**fields)
-        else:add(chat,str(n+1),hours,sender='S'+chat,chat_type=chat_type,**fields)
+        sender=fields.pop('sender',OWNER_SENDER if side=='out' else 'S'+chat)
+        add(chat,str(n+1),hours,direction='outgoing' if side=='out' else 'incoming',sender=sender,chat_type=chat_type,**fields)
 
 
 ASK=('in','Can you send the report today')
@@ -48,6 +48,11 @@ def courtesy_fixture(add):
     conversation(add,'never',('in','Hello there'),('in','спасибо'))
     conversation(add,'grp',('in',{'body':'@owner please review the plan','mentions_owner':True}),ANSWER,
         ('in',{'body':'thanks','mentions_owner':True}),chat_type='group')
+
+
+def stored_gap(add, chat, empties):
+    """A request, the owner's answer, `empties` stored incoming rows that are not meaningful, then a thanks."""
+    conversation(add,chat,ASK,ANSWER,*[('in','')]*empties,('in','спасибо'))
 
 
 def chats(page):
@@ -89,6 +94,19 @@ def test_question_emoji_ask_and_a_gif_is_not_a_courtesy(demote):
     conversation(add,'ownerask',('in','Synthetic peer text'),('out','❓'),newest=30)
     waits=s.list_chats(key,awaiting_their_reply=True,order='waiting_longest',only_questions=True,include_coverage=False,limit=100)
     assert 'ownerask' in chats(waits)
+
+
+# spec: ANYM-810
+def test_the_closing_rule_reads_a_bounded_stored_tail_and_keeps_what_it_cannot_prove(demote):
+    s,ar,key,add,history,queue,rows=demote
+    # Rows that are not meaningful do not count toward the 20 but do toward the 60 stored rows read.
+    stored_gap(add,'short',chat_queries.COURTESY_SCAN-3)
+    stored_gap(add,'long',chat_queries.COURTESY_SCAN+5)
+    # Metadata that states no kind is no sticker: a body-less GIF or a missing kind is X, never a closer.
+    conversation(add,'gifnull',ASK,ANSWER,('in',{'body':'','media_kind':'animation'}))
+    conversation(add,'polldoc',ASK,ANSWER,('in',{'body':'','message_kind':'poll'}))
+    assert chats(queue(limit=100,courtesies='only'))==['short']
+    assert chats(queue(limit=100,courtesies='exclude'))==['gifnull','long','polldoc']
 
 
 # spec: ANYM-810
@@ -158,14 +176,45 @@ def test_muted_and_dismissed_courtesy_rows_follow_the_promotional_precedent(demo
 # spec: ANYM-810
 def test_the_courtesy_count_ignores_the_broadcast_filter_in_the_muted_hint_choice(demote):
     s,ar,key,add,history,queue,rows=demote
-    # A sender-muted fallback: the courtesy came from a muted sender, so the hint falls back to the older request.
-    conversation(add,'mixed',ASK,ANSWER,('in',{'body':'спасибо','sender':'Muted'}))
+    # A sender-muted fallback: the newest courtesy came from a muted sender, so the hint falls back to the
+    # unmuted thanks after the owner's answer; the closing rule reads the whole conversation either way.
+    conversation(add,'mixed',ASK,ANSWER,('in','спасибо'),('in',{'body':'ок','sender':'Muted'}))
     s.mute_reply_source(key,account='demote-tg',sender_id='Muted')
-    plain=queue(include_muted=True,courtesies='exclude')
-    filtered=queue(include_muted=True,courtesies='exclude',exclude_likely_broadcasts=True)
-    assert plain.get('excluded_courtesies_total',0)==filtered.get('excluded_courtesies_total',0)
-    every=queue(include_muted=True)
-    assert plain['awaiting_reply_total']+plain.get('excluded_courtesies_total',0)==every['awaiting_reply_total']
+    hint=next(r for r in queue(limit=100)['items'] if r['provider_chat_id']=='mixed')
+    assert hint['awaiting_reply_snippet']=='спасибо'
+    for muted in (False,True):
+        plain=queue(include_muted=muted,courtesies='exclude')
+        filtered=queue(include_muted=muted,courtesies='exclude',exclude_likely_broadcasts=True)
+        assert plain['excluded_courtesies_total']==filtered['excluded_courtesies_total']==1,muted
+        every=queue(include_muted=muted)
+        assert plain['awaiting_reply_total']+plain['excluded_courtesies_total']==every['awaiting_reply_total'],muted
+        assert chats(queue(include_muted=muted,courtesies='only'))==['mixed'],muted
+
+
+# spec: ANYM-810
+def test_a_whatsapp_phone_and_lid_pair_is_judged_as_one_conversation(seeded):
+    from messaging_service.archive import Archive
+    from test_reply_queue_scale import linked_catalogue
+    s,_,_=seeded
+    Archive(s).register('wa-scale','whatsapp','Synthetic WhatsApp scale',discover=True)
+    linked_catalogue(s,1,2,history=1)
+    key=s.issue_key('wa-courtesy-agent',['wa-scale'])
+    def say(chat, n, minutes_ago, direction, body):
+        c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
+            VALUES (%s,'wa-scale',%s,%s,%s,%s,now()-%s*interval '1 minute',%s)''',
+            (chat+'-c'+str(n),chat,'C'+chat+str(n),'owner' if direction=='outgoing' else chat+'-peer',body,minutes_ago,direction))
+    with s.pool.connection() as c:
+        # Pair 1: request and answer in the phone chat, a new request in the LID chat, then a thanks in the phone chat.
+        say('wa-pn-0001',1,40,'incoming','Synthetic request for the report');say('wa-pn-0001',2,30,'outgoing','Synthetic answer')
+        say('wa-lid-0001',3,20,'incoming','And the March invoice too');say('wa-pn-0001',4,10,'incoming','спасибо')
+        # Pair 2: request in the LID chat, the owner's answer in the phone chat, then a thanks in the LID chat.
+        say('wa-lid-0002',1,40,'incoming','Synthetic request for the report');say('wa-pn-0002',2,30,'outgoing','Synthetic answer')
+        say('wa-lid-0002',3,10,'incoming','спасибо')
+    def listed(courtesies):
+        # One row per pair, whichever chat of it the queue shows.
+        return sorted(r['id'][-4:] for r in s.list_chats(key,awaiting_reply=True,include_coverage=False,courtesies=courtesies)['items'])
+    assert listed('include')==['0001','0002']
+    assert listed('exclude')==['0001'] and listed('only')==['0002']
 
 
 # spec: ANYM-810

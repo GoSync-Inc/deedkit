@@ -111,6 +111,8 @@ PROMOTIONAL=('exclude','include','only')
 COURTESIES=('include','exclude','only')
 # The closing rule reads at most this many meaningful incoming messages back from the head, and as many owner messages after it.
 COURTESY_DEPTH=20
+# ANYM-810: the most stored rows (deleted, empty or service ones included) either closing lookup reads per chat.
+COURTESY_SCAN=3*COURTESY_DEPTH
 # Priority cursors bind the scoring formula: a position from another formula would skip rows after a deploy. Bump with any weight change
 # or a change of the row set (ANYM-810: courtesies, the narrower emoji class and the question emoji).
 SCORE_FORMULA=4
@@ -595,30 +597,43 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
             ')) owner_heads ORDER BY sent_at DESC,numeric_id DESC,id DESC LIMIT 1')
     # ANYM-810: a private chat closes with a courtesy when X, the latest of its last COURTESY_DEPTH meaningful incoming
     # messages that is neither a courtesy nor a body-less sticker, is followed by an owner message, no owner message from
-    # X on has question punctuation, and only courtesies or stickers came in after it. Read only for exclude and only.
+    # X on has question punctuation, and only courtesies or stickers came in after it. Both chats of a WhatsApp pair
+    # count. Each lookup reads at most COURTESY_SCAN stored rows per chat; whatever it cannot prove keeps the chat.
+    # Read only for exclude and only.
     closing=awaiting_reply and courtesies!='include'
     closing_laterals=courtesy_closed=''
     if closing:
-        meta=metadata_sql()
-        closer_sql=f'''SELECT m.id,m.sent_at,CASE WHEN a.platform='telegram' THEN {number('m')} ELSE 0::bigint END AS numeric_id,
-            ({courtesy_sql('m')} OR length(btrim(m.body))=0 AND ({meta}->>'media_kind'='sticker' OR {meta}->>'message_kind'='sticker'))
-              AS closer FROM messages m LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision
-            WHERE m.account=c.account AND m.chat=c.id AND c.chat_type='private' AND m.direction='incoming' AND {meaningful()}'''
-        # The owner's messages from X on, in either chat of a WhatsApp pair; one more than the depth shows an unread rest.
-        owner_after=f'''SELECT m.sent_at,{number('m')} AS numeric_id,{question_sql('m')} AS question FROM messages m
-            LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision
-            WHERE m.account=c.account AND m.chat=c.id AND m.direction='outgoing' AND {meaningful()}
-              AND m.sent_at>=closing_from.sent_at ORDER BY m.sent_at DESC LIMIT {COURTESY_DEPTH+1}'''
-        branches=[owner_after,*([owner_after.replace('m.chat=c.id',"m.chat=(score_clock.aliases->>c.id)")] if aliases else [])]
+        alias_chat="m.chat=(score_clock.aliases->>c.id)"
+        def pair(sql):return [sql,*([sql.replace('m.chat=c.id',alias_chat)] if aliases else [])]
+        def tagged(sqls):return ' UNION ALL '.join(f'SELECT {n} AS b,t.* FROM ({sql}) t' for n,sql in enumerate(sqls))
+        stored=f'''SELECT m.id,m.revision,m.deleted,m.body,m.sent_at,CASE WHEN a.platform='telegram' THEN {number('m')} ELSE 0::bigint END
+              AS numeric_id FROM messages m WHERE m.account=c.account AND m.chat=c.id AND c.chat_type='private' AND m.direction='incoming' '''
+        meta=metadata_sql('p')
+        # A chat whose stored tail filled the scan is known only after its oldest scanned row (the horizon).
+        closing_from=f'''WITH tails AS MATERIALIZED ({tagged([latest_sql(sql,limit=COURTESY_SCAN) for sql in pair(stored)])}),
+          horizon AS (SELECT max(oldest) AS at FROM (SELECT min(sent_at) AS oldest FROM tails GROUP BY b
+            HAVING count(*)>={COURTESY_SCAN}) full_tail),
+          recent AS (SELECT p.id,p.sent_at,p.numeric_id,coalesce({courtesy_sql('p')} OR length(btrim(p.body))=0
+              AND ({meta}->>'media_kind'='sticker' OR {meta}->>'message_kind'='sticker'),false) AS closer
+            FROM tails p LEFT JOIN message_metadata md ON md.message=p.id AND md.revision=p.revision
+            WHERE p.sent_at>coalesce((SELECT at FROM horizon),'-infinity'::timestamptz) AND {meaningful_sql('p','md')}
+            ORDER BY p.sent_at DESC,p.numeric_id DESC,p.id DESC LIMIT {COURTESY_DEPTH})
+          SELECT id,sent_at,numeric_id FROM recent WHERE NOT closer ORDER BY sent_at DESC,numeric_id DESC,id DESC LIMIT 1'''
+        # The owner's stored messages from X on; one row more than the scan in either chat leaves the rest unread.
+        owner_stored=f'''SELECT m.id,m.revision,m.deleted,m.body,m.sent_at,{number('m')} AS numeric_id FROM messages m
+            WHERE m.account=c.account AND m.chat=c.id AND m.direction='outgoing' AND m.sent_at>=closing_from.sent_at
+            ORDER BY m.sent_at DESC LIMIT {COURTESY_SCAN+1}'''
         # A WhatsApp owner message at X's own second is not proven after X, so it never answers (it may still ask).
-        answered="o.sent_at>closing_from.sent_at OR a.platform='telegram' AND o.sent_at=closing_from.sent_at AND o.numeric_id>closing_from.numeric_id"
+        answered="p.sent_at>closing_from.sent_at OR a.platform='telegram' AND p.sent_at=closing_from.sent_at AND p.numeric_id>closing_from.numeric_id"
+        closing_owner=f'''WITH owned AS MATERIALIZED ({tagged(pair(owner_stored))})
+          SELECT coalesce((SELECT max(k) FROM (SELECT count(*) AS k FROM owned GROUP BY b) per_chat),0) AS scanned,
+            count(*) FILTER(WHERE {answered}) AS answered,coalesce(bool_or({question_sql('p')}),false) AS asked
+          FROM owned p LEFT JOIN message_metadata md ON md.message=p.id AND md.revision=p.revision WHERE {meaningful_sql('p','md')}'''
         closing_laterals=f'''
-      LEFT JOIN LATERAL (SELECT tail.id,tail.sent_at,tail.numeric_id FROM ({latest_sql(closer_sql,limit=COURTESY_DEPTH)}) tail
-        WHERE NOT tail.closer ORDER BY tail.sent_at DESC,tail.numeric_id DESC,tail.id DESC LIMIT 1) closing_from ON true
-      LEFT JOIN LATERAL (SELECT count(*) AS n,count(*) FILTER(WHERE {answered}) AS answered,coalesce(bool_or(o.question),false) AS asked
-        FROM ({' UNION ALL '.join('('+b+')' for b in branches)}) o) closing_owner ON true'''
+      LEFT JOIN LATERAL ({closing_from}) closing_from ON true
+      LEFT JOIN LATERAL ({closing_owner}) closing_owner ON true'''
         courtesy_closed=(f"(c.chat_type='private' AND closing_from.id IS NOT NULL AND closing_owner.answered>0"
-            f" AND closing_owner.n<={COURTESY_DEPTH} AND NOT closing_owner.asked)")
+            f" AND closing_owner.scanned<={COURTESY_SCAN} AND NOT closing_owner.asked)")
     def base_for(attention_lookup):return f''' FROM chats c JOIN accounts a ON a.id=c.account
       CROSS JOIN (SELECT %s::timestamptz AS at,%s::jsonb AS owners,%s::jsonb AS aliases) score_clock
       LEFT JOIN LATERAL ({latest_sql(last_sql,both_directions=True)}) last ON true
