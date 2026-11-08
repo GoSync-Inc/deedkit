@@ -21,10 +21,16 @@ import (
 const REPAIR_VERSION = 1
 
 const (
-	repairBatchRows   = 50   // rows classified per tick at most
-	repairWindowSeqs  = 1000 // journal sequence numbers one read may cover
+	repairBatchRows = 50 // rows classified per tick at most
+	// One read covers at most this many journal rows. A journal row is at most
+	// maxCaptureEnvelopeBytes (append empties a larger raw), so a read holds the
+	// shared connection for no more data than one replay batch (replayBatchBytes).
+	repairWindowSeqs  = replayBatchEntries
 	repairTimeSlice   = 200 * time.Millisecond
 	repairStatementTO = 2 * time.Second // bound of every SQLite statement of the pass
+	// Free pages under the capture file's ceiling (max_page_count, store.go) the
+	// pass leaves to live capture: 32 MiB of the 512 MiB file at 4 KiB pages.
+	repairReservePages = 8192
 )
 
 // The fixed set of tallies; anything else is never stored or reported.
@@ -37,13 +43,15 @@ type repairRow struct {
 }
 
 type repairPass struct {
-	s        *CaptureStore
-	version  int
-	slice    time.Duration
-	stmt     time.Duration
-	read     func(ctx context.Context, after, upto int64, limit int) ([]repairRow, error)
-	classify func(repairRow) string
-	now      func() time.Time
+	s            *CaptureStore
+	version      int
+	slice        time.Duration
+	stmt         time.Duration
+	read         func(ctx context.Context, after, upto int64, limit int) ([]repairRow, error)
+	classify     func(repairRow) string
+	now          func() time.Time
+	active       func() bool // false on disconnect, lost lease or shutdown
+	reservePages int64
 
 	loaded    bool
 	done      bool
@@ -55,7 +63,8 @@ type repairPass struct {
 }
 
 func newRepairPass(s *CaptureStore) *repairPass {
-	p := &repairPass{s: s, version: REPAIR_VERSION, slice: repairTimeSlice, stmt: repairStatementTO, now: time.Now}
+	p := &repairPass{s: s, version: REPAIR_VERSION, slice: repairTimeSlice, stmt: repairStatementTO, now: time.Now, reservePages: repairReservePages}
+	p.active = func() bool { return true }
 	p.read = s.repairRows
 	p.classify = func(r repairRow) string { return s.repairState(r) }
 	return p
@@ -136,7 +145,9 @@ func (s *CaptureStore) repairRows(ctx context.Context, after, upto int64, limit 
 }
 
 // captureQueued reports live capture work: a held capture lock, an unexported
-// journal row or a due history download. The pass yields to all of them.
+// journal row or a due history download. The pass yields to all of them, and
+// asks again before each of its statements, so capture waits at most for one
+// bounded repair statement on the shared connection.
 func (p *repairPass) captureQueued(ctx context.Context) (bool, error) {
 	if !p.s.mu.TryLock() {
 		return true, nil
@@ -149,6 +160,40 @@ func (p *repairPass) captureQueued(ctx context.Context) (bool, error) {
 	return n > 0, err
 }
 
+// yield is true when the pass must stop this tick without writing: shutdown,
+// a lost lease or disconnect (inactive), or capture work that arrived.
+func (p *repairPass) yield(ctx context.Context) (bool, string) {
+	if ctx.Err() != nil || !p.active() {
+		return true, ""
+	}
+	busy, err := p.captureQueued(ctx)
+	if err != nil {
+		return true, "repair_read"
+	}
+	return busy, ""
+}
+
+// headroom refuses a repair write unless the capture file keeps at least
+// reservePages free pages under its page ceiling and the disk keeps its
+// reserve. The count never spends the room live capture inserts need.
+func (p *repairPass) headroom(ctx context.Context) error {
+	c, cancel := context.WithTimeout(ctx, p.stmt)
+	defer cancel()
+	var ceiling, pages, free int64
+	for _, q := range []struct {
+		sql string
+		v   *int64
+	}{{"PRAGMA max_page_count", &ceiling}, {"PRAGMA page_count", &pages}, {"PRAGMA freelist_count", &free}} {
+		if err := p.s.db.QueryRowContext(c, q.sql).Scan(q.v); err != nil {
+			return err
+		}
+	}
+	if ceiling-pages+free < p.reservePages {
+		return errors.New("repair_storage")
+	}
+	return p.s.checkDisk(64 << 10)
+}
+
 // repairCountsJSON is the stored counts column: the fixed integers only.
 func repairCountsJSON(scanned int64, counts map[string]int64) []byte {
 	out := map[string]int64{"scanned": scanned}
@@ -158,52 +203,63 @@ func repairCountsJSON(scanned int64, counts map[string]int64) []byte {
 	return mustJSON(out)
 }
 
-// load reads this version's progress, or starts it: older versions' rows are
-// deleted in the same transaction. The table is created here, not at open, so
-// a full database can never stop capture from starting.
-func (p *repairPass) load(ctx context.Context) (string, error) {
+// load reads this version's progress, or starts it in one transaction that
+// creates the table, deletes older versions' rows and inserts this one. The
+// table is created here, not at open, so a full database never stops capture
+// from starting, and only after the headroom check.
+func (p *repairPass) load(ctx context.Context) string {
 	c, cancel := context.WithTimeout(ctx, p.stmt)
 	defer cancel()
-	if _, err := p.s.db.ExecContext(c, `CREATE TABLE IF NOT EXISTS repair_progress(version INTEGER PRIMARY KEY,last_seq INTEGER NOT NULL,done INTEGER NOT NULL,counts TEXT NOT NULL)`); err != nil {
-		return "repair_storage", err
+	var exists int
+	if err := p.s.db.QueryRowContext(c, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='repair_progress'").Scan(&exists); err != nil {
+		return "repair_read"
 	}
-	p.counts = map[string]int64{}
-	var done int
-	var counts []byte
-	err := p.s.db.QueryRowContext(c, "SELECT last_seq,done,counts FROM repair_progress WHERE version=?", p.version).Scan(&p.lastSeq, &done, &counts)
-	if err == nil {
-		var stored map[string]int64
-		if err = json.Unmarshal(counts, &stored); err != nil {
-			return "repair_read", err
+	if exists == 1 {
+		var done int
+		var counts []byte
+		var last int64
+		err := p.s.db.QueryRowContext(c, "SELECT last_seq,done,counts FROM repair_progress WHERE version=?", p.version).Scan(&last, &done, &counts)
+		if err == nil {
+			var stored map[string]int64
+			if json.Unmarshal(counts, &stored) != nil {
+				return "repair_read"
+			}
+			p.counts = map[string]int64{}
+			for _, k := range repairStates {
+				p.counts[k] = stored[k]
+			}
+			p.lastSeq, p.scanned, p.done, p.loaded = last, stored["scanned"], done == 1, true
+			return ""
 		}
-		p.scanned = stored["scanned"]
-		for _, k := range repairStates {
-			p.counts[k] = stored[k]
+		if !errors.Is(err, sql.ErrNoRows) {
+			return "repair_read"
 		}
-		p.done = done == 1
-		p.loaded = true
-		return "", nil
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return "repair_read", err
+	if p.headroom(ctx) != nil {
+		return "repair_storage"
 	}
 	tx, err := p.s.db.BeginTx(c, nil)
 	if err != nil {
-		return "repair_storage", err
+		return "repair_storage"
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(c, "DELETE FROM repair_progress WHERE version<>?", p.version); err != nil {
-		return "repair_storage", err
-	}
-	p.lastSeq, p.scanned, p.done = 0, 0, false
-	if _, err = tx.ExecContext(c, "INSERT INTO repair_progress(version,last_seq,done,counts)VALUES(?,0,0,?)", p.version, repairCountsJSON(0, nil)); err != nil {
-		return "repair_storage", err
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`CREATE TABLE IF NOT EXISTS repair_progress(version INTEGER PRIMARY KEY,last_seq INTEGER NOT NULL,done INTEGER NOT NULL,counts TEXT NOT NULL)`, nil},
+		{"DELETE FROM repair_progress WHERE version<>?", []any{p.version}},
+		{"INSERT INTO repair_progress(version,last_seq,done,counts)VALUES(?,0,0,?)", []any{p.version, repairCountsJSON(0, nil)}},
+	} {
+		if _, err = tx.ExecContext(c, q.sql, q.args...); err != nil {
+			return "repair_storage"
+		}
 	}
 	if err = tx.Commit(); err != nil {
-		return "repair_storage", err
+		return "repair_storage"
 	}
-	p.loaded = true
-	return "", nil
+	p.lastSeq, p.scanned, p.done, p.counts, p.loaded = 0, 0, false, map[string]int64{}, true
+	return ""
 }
 
 // tick classifies at most one bounded batch. Every error is a fixed status
@@ -217,20 +273,20 @@ func (p *repairPass) tick(ctx context.Context) {
 }
 
 func (p *repairPass) step(ctx context.Context) string {
-	if p.done || ctx.Err() != nil {
+	if p.done {
 		return ""
 	}
-	if busy, err := p.captureQueued(ctx); err != nil {
-		return "repair_read"
-	} else if busy {
-		return ""
+	// The time slice covers the pass's reads as well as classification.
+	deadline := p.now().Add(p.slice)
+	if stop, code := p.yield(ctx); stop {
+		return code
 	}
 	if !p.loaded {
-		if code, _ := p.load(ctx); code != "" {
+		if code := p.load(ctx); code != "" || p.done {
 			return code
 		}
-		if p.done {
-			return ""
+		if stop, code := p.yield(ctx); stop {
+			return code
 		}
 	}
 	c, cancel := context.WithTimeout(ctx, p.stmt)
@@ -239,6 +295,9 @@ func (p *repairPass) step(ctx context.Context) string {
 	cancel()
 	if err != nil {
 		return "repair_read"
+	}
+	if stop, code := p.yield(ctx); stop {
+		return code
 	}
 	upto := min(p.lastSeq+repairWindowSeqs, maxSeq)
 	c, cancel = context.WithTimeout(ctx, p.stmt)
@@ -252,10 +311,12 @@ func (p *repairPass) step(ctx context.Context) string {
 	for k, v := range p.counts {
 		counts[k] = v
 	}
-	deadline := p.now().Add(p.slice)
 	complete := true
 	for _, r := range rows {
-		if ctx.Err() != nil || p.now().After(deadline) {
+		if ctx.Err() != nil || !p.active() {
+			return "" // stopped: nothing of this tick is kept
+		}
+		if p.now().After(deadline) {
 			complete = false
 			break
 		}
@@ -273,14 +334,28 @@ func (p *repairPass) step(ctx context.Context) string {
 		next = upto // the whole window was read
 	}
 	done := next >= maxSeq && complete
-	c, cancel = context.WithTimeout(ctx, p.stmt)
-	defer cancel()
+	if stop, code := p.yield(ctx); stop {
+		return code
+	}
+	if next == p.lastSeq && !done {
+		return "" // nothing to record
+	}
+	if p.headroom(ctx) != nil {
+		return "repair_storage"
+	}
 	doneFlag := 0
 	if done {
 		doneFlag = 1
 	}
+	c, cancel = context.WithTimeout(ctx, p.stmt)
+	defer cancel()
 	// Fail closed: the in-memory progress moves only after the row is durable.
-	if _, err = p.s.db.ExecContext(c, "UPDATE repair_progress SET last_seq=?,done=?,counts=? WHERE version=?", next, doneFlag, repairCountsJSON(scanned, counts), p.version); err != nil {
+	result, err := p.s.db.ExecContext(c, "UPDATE repair_progress SET last_seq=?,done=?,counts=? WHERE version=?", next, doneFlag, repairCountsJSON(scanned, counts), p.version)
+	if err != nil {
+		return "repair_storage"
+	}
+	if n, err := result.RowsAffected(); err != nil || n != 1 {
+		p.loaded = false // the row is gone: start the version again from its durable state
 		return "repair_storage"
 	}
 	p.lastSeq, p.scanned, p.counts, p.done = next, scanned, counts, done
@@ -338,6 +413,7 @@ func (p *repairPass) writeStatus() {
 // lease or shutdown all end that context or clear readiness).
 func (p *Provider) repairWorker(ctx context.Context, interval time.Duration) {
 	pass := newRepairPass(p.Capture)
+	pass.active = func() bool { return p.ready.Load() && ctx.Err() == nil }
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {

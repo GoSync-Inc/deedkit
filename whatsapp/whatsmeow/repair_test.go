@@ -251,7 +251,7 @@ func TestRepairGoldenStatesArePinnedToTheVersion(t *testing.T) {
 func TestRepairResumesAfterLastSeqAndAFinishedVersionDoesNotRunAgain(t *testing.T) {
 	s := openTestStore(t)
 	f := repairFixtures()[2]
-	for i := 0; i < repairBatchRows+10; i++ {
+	for i := 0; i < repairWindowSeqs+10; i++ {
 		e := fixtureMessage("P"+string(rune('a'+i%26))+string(rune('a'+i/26)), 1700000000+int64(i))
 		e.Message, e.RawMessage = f.msg.Message, f.msg.Message
 		journalUnknown(t, s, e, nil)
@@ -265,7 +265,7 @@ func TestRepairResumesAfterLastSeqAndAFinishedVersionDoesNotRunAgain(t *testing.
 	}
 	first := newRepairPass(s)
 	first.tick(context.Background())
-	if first.lastError != "" || first.scanned != repairBatchRows || first.done {
+	if first.lastError != "" || first.scanned != repairWindowSeqs || first.done {
 		t.Fatalf("first tick: scanned=%d done=%v err=%s", first.scanned, first.done, first.lastError)
 	}
 	var versions int
@@ -275,8 +275,15 @@ func TestRepairResumesAfterLastSeqAndAFinishedVersionDoesNotRunAgain(t *testing.
 	}
 	// Restart: a new pass resumes after last_seq and counts each row once.
 	second := newRepairPass(s)
+	read := second.read
+	second.read = func(ctx context.Context, after, upto int64, limit int) ([]repairRow, error) {
+		if upto-after > repairWindowSeqs || limit > repairBatchRows {
+			t.Errorf("one read covers %d journal rows, limit %d", upto-after, limit)
+		}
+		return read(ctx, after, upto, limit)
+	}
 	runRepairToEnd(t, second)
-	if second.scanned != repairBatchRows+10 || second.counts["label_only"] != repairBatchRows+10 {
+	if second.scanned != repairWindowSeqs+10 || second.counts["label_only"] != repairWindowSeqs+10 {
 		t.Fatalf("resumed pass: scanned=%d counts=%v", second.scanned, second.counts)
 	}
 	third := newRepairPass(s)
@@ -287,7 +294,7 @@ func TestRepairResumesAfterLastSeqAndAFinishedVersionDoesNotRunAgain(t *testing.
 		return e
 	}(), nil)
 	third.tick(context.Background())
-	if !third.done || third.scanned != repairBatchRows+10 {
+	if !third.done || third.scanned != repairWindowSeqs+10 {
 		t.Fatal("finished version not reloaded as done")
 	}
 }
@@ -407,39 +414,209 @@ func TestRepairYieldsToQueuedCaptureAndKeepsCaptureOrderAndLatency(t *testing.T)
 	}
 }
 
+func pageCount(t *testing.T, s *CaptureStore) int64 {
+	t.Helper()
+	var pages int64
+	if err := s.db.QueryRow("PRAGMA page_count").Scan(&pages); err != nil {
+		t.Fatal(err)
+	}
+	return pages
+}
+
+// setCeiling leaves only extra free pages under the capture file's ceiling:
+// less than the pass's reserve, enough for live capture's next insert.
+func setCeiling(t *testing.T, s *CaptureStore, extra int64) {
+	t.Helper()
+	if _, err := s.db.Exec("PRAGMA max_page_count=" + strconv.FormatInt(pageCount(t, s)+extra, 10)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func durableLastSeq(t *testing.T, s *CaptureStore) int64 {
+	t.Helper()
+	var last int64
+	if err := s.db.QueryRow("SELECT last_seq FROM repair_progress WHERE version=?", REPAIR_VERSION).Scan(&last); err != nil {
+		t.Fatal(err)
+	}
+	return last
+}
+
 // spec: ANYM-809
 func TestRepairProgressAtThePageCeilingFailsClosedAndCaptureStillInserts(t *testing.T) {
 	s := openTestStore(t)
 	for i := 0; i < 20; i++ {
 		journalUnknown(t, s, fixtureMessage("FULL"+string(rune('A'+i)), 1700000000+int64(i)), nil)
 	}
-	// The archive consumer drained the spool, so capture may evict published rows.
-	entries, _ := os.ReadDir(s.Config.EventsDirectory)
-	for _, entry := range entries {
-		if strings.HasSuffix(entry.Name(), ".json") {
-			os.Remove(filepath.Join(s.Config.EventsDirectory, entry.Name()))
-		}
-	}
-	var pages int64
-	if err := s.db.QueryRow("PRAGMA page_count").Scan(&pages); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Exec("PRAGMA max_page_count=" + strconv.FormatInt(pages, 10)); err != nil {
-		t.Fatal(err)
-	}
+	// Near the ceiling, below the eviction threshold (production MaxEntries):
+	// the pass writes nothing, so the insert capture can make still succeeds.
+	setCeiling(t, s, 16)
+	before := pageCount(t, s)
 	p := newRepairPass(s)
 	p.tick(context.Background())
 	if p.lastError != "repair_storage" || p.loaded || p.scanned != 0 {
-		t.Fatalf("progress write at the ceiling: err=%q loaded=%v", p.lastError, p.loaded)
+		t.Fatalf("admission near the ceiling: err=%q loaded=%v", p.lastError, p.loaded)
+	}
+	var tables int
+	s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name='repair_progress'").Scan(&tables)
+	if tables != 0 || pageCount(t, s) != before {
+		t.Fatal("the refused pass allocated pages")
 	}
 	status, raw := readRepairStatus(t, s)
 	if status["last_error"] != "repair_storage" {
 		t.Fatal("unexpected status", string(raw))
 	}
-	var count int
-	s.db.QueryRow("SELECT COUNT(*) FROM capture").Scan(&count)
-	s.MaxEntries = count
+	if s.MaxEntries != 200000 {
+		t.Fatal("test must keep production retention")
+	}
 	if err := s.Put(fixtureMessage("FULLZ", 1700000100), "live"); err != nil {
-		t.Fatal("capture insert failed at the ceiling after the repair pass:", err)
+		t.Fatal("capture insert failed near the ceiling after the repair pass:", err)
+	}
+}
+
+// spec: ANYM-809
+func TestRepairFailedProgressUpdateKeepsTheDurableAndInMemoryPosition(t *testing.T) {
+	s := openTestStore(t)
+	album := repairFixtures()[2].msg.Message
+	journal := func(prefix string, n int) {
+		for i := 0; i < n; i++ {
+			e := fixtureMessage(prefix+string(rune('A'+i%26))+string(rune('A'+i/26)), 1700000000+int64(i))
+			e.Message, e.RawMessage = album, album
+			journalUnknown(t, s, e, nil)
+		}
+	}
+	journal("U", repairWindowSeqs+5)
+	p := newRepairPass(s)
+	p.tick(context.Background()) // loads and records the first window
+	if p.lastError != "" || p.lastSeq == 0 || p.done {
+		t.Fatalf("first tick: err=%q last_seq=%d", p.lastError, p.lastSeq)
+	}
+	last, scanned := p.lastSeq, p.scanned
+	// An established progress row near the ceiling: the update is refused.
+	setCeiling(t, s, 16)
+	p.tick(context.Background())
+	if p.lastError != "repair_storage" || p.lastSeq != last || p.scanned != scanned || durableLastSeq(t, s) != last {
+		t.Fatalf("refused update moved progress: err=%q last=%d durable=%d", p.lastError, p.lastSeq, durableLastSeq(t, s))
+	}
+	if err := s.Put(fixtureMessage("AFTER", 1700000200), "live"); err != nil {
+		t.Fatal("capture insert failed after a refused progress update:", err)
+	}
+	if _, err := s.db.Exec("PRAGMA max_page_count=131072"); err != nil {
+		t.Fatal(err)
+	}
+	// A failing UPDATE statement (its row is gone) keeps the position too.
+	if _, err := s.db.Exec("DELETE FROM repair_progress"); err != nil {
+		t.Fatal(err)
+	}
+	p.lastError = ""
+	p.tick(context.Background())
+	if p.lastError != "repair_storage" || p.lastSeq != last || p.scanned != scanned || p.loaded {
+		t.Fatalf("failed update moved progress: err=%q last=%d loaded=%v", p.lastError, p.lastSeq, p.loaded)
+	}
+}
+
+// spec: ANYM-809
+func TestRepairTimeSliceEndsTheTickAndTheNextTickContinues(t *testing.T) {
+	s := openTestStore(t)
+	album := repairFixtures()[2].msg.Message
+	for i := 0; i < 10; i++ {
+		e := fixtureMessage("S"+string(rune('A'+i)), 1700000000+int64(i))
+		e.Message, e.RawMessage = album, album
+		journalUnknown(t, s, e, nil)
+	}
+	p := newRepairPass(s)
+	clock := time.Unix(1700000000, 0)
+	p.now = func() time.Time { return clock }
+	p.slice = 250 * time.Millisecond
+	p.classify = func(r repairRow) string { clock = clock.Add(100 * time.Millisecond); return s.repairState(r) }
+	p.tick(context.Background())
+	if p.lastError != "" || p.scanned != 3 || p.done {
+		t.Fatalf("one slice: scanned=%d done=%v err=%q", p.scanned, p.done, p.lastError)
+	}
+	var third int64
+	s.db.QueryRow("SELECT seq FROM capture ORDER BY seq LIMIT 1 OFFSET 2").Scan(&third)
+	if p.lastSeq != third || durableLastSeq(t, s) != third {
+		t.Fatalf("slice position %d, want %d", p.lastSeq, third)
+	}
+	runRepairToEnd(t, p)
+	if p.scanned != 10 || p.counts["label_only"] != 10 {
+		t.Fatalf("after slices: scanned=%d counts=%v", p.scanned, p.counts)
+	}
+}
+
+// spec: ANYM-809
+func TestRepairStopsDuringAnActiveTickOnShutdownOrDisconnectAndKeepsNothing(t *testing.T) {
+	for _, stop := range []string{"shutdown", "disconnect"} {
+		t.Run(stop, func(t *testing.T) {
+			s := openTestStore(t)
+			for _, f := range repairFixtures()[:3] {
+				journalUnknown(t, s, f.msg, f.raw)
+			}
+			p := newRepairPass(s)
+			p.tick(context.Background()) // loads, counts all three, done
+			if !p.done {
+				t.Fatal("setup pass did not finish")
+			}
+			if _, err := s.db.Exec("DELETE FROM repair_progress"); err != nil {
+				t.Fatal(err)
+			}
+			p = newRepairPass(s)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			connected := true
+			p.active = func() bool { return connected }
+			calls := 0
+			p.classify = func(r repairRow) string {
+				if calls++; calls == 2 {
+					if stop == "shutdown" {
+						cancel()
+					} else {
+						connected = false
+					}
+				}
+				return s.repairState(r)
+			}
+			p.tick(ctx)
+			if p.lastError != "" || p.lastSeq != 0 || p.scanned != 0 || p.done || durableLastSeq(t, s) != 0 {
+				t.Fatalf("%s mid-tick kept progress: last=%d scanned=%d err=%q", stop, p.lastSeq, p.scanned, p.lastError)
+			}
+			if calls != 2 {
+				t.Fatalf("%s mid-tick classified %d rows", stop, calls)
+			}
+		})
+	}
+}
+
+// spec: ANYM-809
+func TestRepairWorkerRunsOnlyWhileReadyAndEndsWithTheProviderContext(t *testing.T) {
+	s := openTestStore(t)
+	journalUnknown(t, s, repairFixtures()[1].msg, nil)
+	p := &Provider{Capture: s, Config: s.Config}
+	ctx, cancel := context.WithCancel(context.Background())
+	ended := make(chan struct{})
+	go func() { p.repairWorker(ctx, 5*time.Millisecond); close(ended) }()
+	status := filepath.Join(s.Config.EventsDirectory, ".repair-status")
+	time.Sleep(100 * time.Millisecond)
+	if _, err := os.Lstat(status); !os.IsNotExist(err) {
+		t.Fatal("the pass ran while the provider was not ready")
+	}
+	p.ready.Store(true)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Lstat(status); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the pass did not run once ready")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-ended:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the worker outlived the provider context")
+	}
+	if code, _ := p.failure.Load().(string); code != "" {
+		t.Fatal("the repair worker failed the provider:", code)
 	}
 }

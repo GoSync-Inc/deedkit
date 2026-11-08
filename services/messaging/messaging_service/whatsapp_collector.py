@@ -478,7 +478,9 @@ def validate_native_repair_status(value):
         or not isinstance(value['counts'],dict) or set(value['counts'])!=set(NATIVE_REPAIR_STATES)
         or not all(count(x) for x in value['counts'].values())):
         raise ValueError('invalid_native_repair_status')
-    return {**value,'counts':{k:value['counts'][k] for k in NATIVE_REPAIR_STATES},'observed_at':utc(value['observed_at'])}
+    try:observed=utc(value['observed_at'])
+    except (ValueError,TypeError,OverflowError):raise ValueError('invalid_native_repair_status') from None
+    return {**value,'counts':{k:value['counts'][k] for k in NATIVE_REPAIR_STATES},'observed_at':observed}
 
 
 class WhatsmeowProvider(NodeProvider):
@@ -497,8 +499,10 @@ class WhatsmeowProvider(NodeProvider):
         try:return validate_native_history_status(private_json(Path(self.cfg['events_directory'])/'.history-status'))
         except FileNotFoundError:return None
     def repair_status(self):
+        # ANYM-809: an optional diagnostic. A missing, unsafe, unreadable or malformed file
+        # (deep nesting, an out-of-range time) is no report; it never stops the heartbeat.
         try:return validate_native_repair_status(private_json(Path(self.cfg['events_directory'])/'.repair-status'))
-        except FileNotFoundError:return None
+        except Exception:return None
 
 
 def provider_for_config(cfg,path,lock_fd):
@@ -552,9 +556,8 @@ class WhatsAppCollector(TelegramCollector):
                 if status is not None:
                     try:await asyncio.to_thread(self.state.native_history_observation,status)
                     except database_errors():pass  # Diagnostics only; the next heartbeat reports again.
-                # ANYM-809: an invalid or unreadable count file is skipped; it never stops the heartbeat.
-                try:repair=await asyncio.to_thread(self.provider.repair_status)
-                except (OSError,ValueError):repair=None
+                # ANYM-809: repair_status never raises; a lost lease below still ends the heartbeat.
+                repair=await asyncio.to_thread(self.provider.repair_status)
                 if repair is not None:
                     try:await asyncio.to_thread(self.state.native_repair_observation,repair)
                     except database_errors():pass
