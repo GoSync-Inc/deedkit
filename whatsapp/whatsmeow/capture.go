@@ -474,18 +474,18 @@ func NormalizeMessage(e *events.Message, owner types.JID, ownerAliases ...types.
 		case m.GetTemplateMessage() != nil:
 			// A menu's options follow its text (menu.go).
 			kind = "template"
-			body = joinText(templateText(m.GetTemplateMessage()), templateMenu(m.GetTemplateMessage()))
+			body = templateMenu(templateText(m.GetTemplateMessage()), m.GetTemplateMessage())
 		case m.GetInteractiveMessage() != nil:
 			kind = "interactive"
-			body = joinText(interactiveText(m.GetInteractiveMessage()), interactiveMenu(m.GetInteractiveMessage()))
+			body = interactiveMenu(interactiveText(m.GetInteractiveMessage()), m.GetInteractiveMessage())
 		case m.GetButtonsMessage() != nil:
 			v := m.GetButtonsMessage()
 			kind = "buttons"
-			body = joinText(v.GetText(), v.GetContentText(), v.GetFooterText(), buttonsMenu(v))
+			body = buttonsMenu(joinText(v.GetText(), v.GetContentText(), v.GetFooterText()), v)
 		case m.GetListMessage() != nil:
 			v := m.GetListMessage()
 			kind = "list"
-			body = joinText(v.GetTitle(), v.GetDescription(), v.GetFooterText(), listMenu(v))
+			body = listMenu(joinText(v.GetTitle(), v.GetDescription(), v.GetFooterText()), v)
 		case m.GetListResponseMessage() != nil, m.GetButtonsResponseMessage() != nil, m.GetTemplateButtonReplyMessage() != nil, m.GetInteractiveResponseMessage() != nil:
 			kind, body, _ = menuReply(m)
 		case m.GetProductMessage() != nil:

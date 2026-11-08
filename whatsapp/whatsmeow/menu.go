@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 )
@@ -15,14 +16,20 @@ import (
 // options with the IDs a choice answers with, and the chosen option with its
 // ID. The text is sender-controlled data; control characters become spaces so
 // an option cannot fake a line of its own. Link query strings and fragments are
-// dropped: they may carry tokens. Nothing here sends, opens or fetches anything.
+// dropped and copy-button payloads are not read: they may carry tokens or
+// codes. A WhatsApp Flow's form answers are never read. Nothing here sends,
+// opens or fetches anything.
 
 const (
-	maxMenuOptions   = 100
-	maxMenuText      = 256
-	maxMenuID        = 256
-	maxMenuParams    = 16384
-	maxMenuScanItems = 1000
+	maxMenuOptions = 100
+	maxMenuText    = 256
+	maxMenuID      = 256
+	maxMenuParams  = 16384
+	// One work budget per message: sections, buttons and rows examined, also
+	// past the options kept, and native-flow parameter objects decoded.
+	maxMenuScan = 1000
+	// Room kept for the omission line at the end of a cut menu.
+	menuNoticeReserve = 64
 )
 
 type menuOption struct {
@@ -34,6 +41,50 @@ type menuSection struct {
 	options []menuOption
 }
 
+// menuCollector keeps the first maxMenuOptions options in source order and
+// counts the rest within the scan budget.
+type menuCollector struct {
+	sections []menuSection
+	kept     int
+	options  int  // options examined, kept or not
+	seen     int  // budget spent: sections and options
+	cut      bool // the scan budget ended before the menu did
+}
+
+func (c *menuCollector) spend() bool {
+	if c.seen >= maxMenuScan {
+		c.cut = true
+		return false
+	}
+	c.seen++
+	return true
+}
+
+func (c *menuCollector) section(title string) bool {
+	if !c.spend() {
+		return false
+	}
+	c.sections = append(c.sections, menuSection{title: title})
+	return true
+}
+
+// add appends to the current section; false once the scan budget is spent.
+func (c *menuCollector) add(o menuOption) bool {
+	if !c.spend() {
+		return false
+	}
+	if len(c.sections) == 0 {
+		c.sections = append(c.sections, menuSection{})
+	}
+	c.options++
+	if c.kept < maxMenuOptions {
+		last := &c.sections[len(c.sections)-1]
+		last.options = append(last.options, o)
+		c.kept++
+	}
+	return true
+}
+
 func menuClean(s string, limit int) string {
 	var b strings.Builder
 	n := 0
@@ -41,7 +92,7 @@ func menuClean(s string, limit int) string {
 		if n >= limit {
 			break
 		}
-		if r == 0xFFFD || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
+		if r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
 			r = ' '
 		}
 		b.WriteRune(r)
@@ -59,64 +110,6 @@ func menuLink(raw string) string {
 	return menuClean((&url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path}).String(), maxMenuText)
 }
 
-func renderMenu(label string, sections []menuSection) string {
-	var b strings.Builder
-	n, more := 0, 0
-	for _, s := range sections {
-		for range s.options {
-			if n+more >= maxMenuOptions {
-				more++
-			} else {
-				n++
-			}
-		}
-	}
-	if n == 0 {
-		return ""
-	}
-	b.WriteString("Menu")
-	if label = menuClean(label, maxMenuText); label != "" {
-		b.WriteString(" (" + label + ")")
-	}
-	b.WriteString(":")
-	i := 0
-	for _, s := range sections {
-		if i >= maxMenuOptions {
-			break
-		}
-		if t := menuClean(s.title, maxMenuText); t != "" && len(s.options) > 0 {
-			b.WriteString("\n" + t + ":")
-		}
-		for _, o := range s.options {
-			if i >= maxMenuOptions {
-				break
-			}
-			i++
-			line := menuClean(o.title, maxMenuText)
-			if d := menuClean(o.description, maxMenuText); d != "" {
-				line = joinNonEmpty(" - ", line, d)
-			}
-			if line == "" {
-				line = "(no label)"
-			}
-			if id := menuClean(o.id, maxMenuID); id != "" {
-				line += " [id: " + id + "]"
-			}
-			if o.link != "" {
-				line += " [link: " + o.link + "]"
-			}
-			if c := menuClean(o.call, maxMenuText); c != "" {
-				line += " [call: " + c + "]"
-			}
-			fmt.Fprintf(&b, "\n%d. %s", i, line)
-		}
-	}
-	if more > 0 {
-		fmt.Fprintf(&b, "\n(%d more options not shown)", more)
-	}
-	return b.String()
-}
-
 func joinNonEmpty(sep string, parts ...string) string {
 	kept := parts[:0:0]
 	for _, p := range parts {
@@ -127,45 +120,119 @@ func joinNonEmpty(sep string, parts ...string) string {
 	return strings.Join(kept, sep)
 }
 
-func listMenu(v *waE2E.ListMessage) string {
-	var sections []menuSection
-	scanned := 0
-	for _, s := range v.GetSections() {
-		sec := menuSection{title: s.GetTitle()}
-		for _, r := range s.GetRows() {
-			if scanned++; scanned > maxMenuScanItems {
+func optionLine(i int, o menuOption) string {
+	line := joinNonEmpty(" - ", menuClean(o.title, maxMenuText), menuClean(o.description, maxMenuText))
+	if line == "" {
+		line = "(no label)"
+	}
+	if id := menuClean(o.id, maxMenuID); id != "" {
+		line += " [id: " + id + "]"
+	}
+	if o.link != "" {
+		line += " [link: " + o.link + "]"
+	}
+	if c := menuClean(o.call, maxMenuText); c != "" {
+		line += " [call: " + c + "]"
+	}
+	return fmt.Sprintf("\n%d. %s", i, line)
+}
+
+// withMenu appends the rendered menu to a message's text so that the whole body
+// stays within maxEnvelopeBody: only complete option lines are kept, and a cut
+// menu ends with a line saying how many options it does not show.
+func withMenu(text, label string, c *menuCollector) string {
+	text = strings.TrimSpace(text)
+	if c.kept == 0 {
+		return text
+	}
+	budget := maxEnvelopeBody - menuNoticeReserve
+	if text != "" {
+		budget -= utf8.RuneCountInString(text) + 2 // joinText's separator
+	}
+	var b strings.Builder
+	used := 0
+	write := func(s string) bool {
+		n := utf8.RuneCountInString(s)
+		if used+n > budget {
+			return false
+		}
+		b.WriteString(s)
+		used += n
+		return true
+	}
+	header := "Menu"
+	if label = menuClean(label, maxMenuText); label != "" {
+		header += " (" + label + ")"
+	}
+	if !write(header + ":") {
+		return text
+	}
+	shown, i := 0, 0
+	full := true
+	for _, s := range c.sections {
+		if len(s.options) == 0 {
+			continue
+		}
+		if t := menuClean(s.title, maxMenuText); t != "" && !write("\n"+t+":") {
+			full = false
+			break
+		}
+		for _, o := range s.options {
+			i++
+			if !write(optionLine(i, o)) {
+				full = false
 				break
 			}
-			sec.options = append(sec.options, menuOption{title: r.GetTitle(), description: r.GetDescription(), id: r.GetRowID()})
+			shown++
 		}
-		sections = append(sections, sec)
-		if scanned > maxMenuScanItems {
+		if !full {
 			break
 		}
 	}
-	return renderMenu(v.GetButtonText(), sections)
+	if shown == 0 {
+		return text
+	}
+	omitted := c.options - shown
+	switch {
+	case c.cut:
+		fmt.Fprintf(&b, "\n(at least %d more options not shown)", omitted)
+	case omitted > 0:
+		fmt.Fprintf(&b, "\n(%d more options not shown)", omitted)
+	}
+	return joinText(text, b.String())
 }
 
-func buttonsMenu(v *waE2E.ButtonsMessage) string {
-	var options []menuOption
-	for i, btn := range v.GetButtons() {
-		if i >= maxMenuScanItems {
+func listMenu(text string, v *waE2E.ListMessage) string {
+	c := &menuCollector{}
+	for _, s := range v.GetSections() {
+		if !c.section(s.GetTitle()) {
+			break
+		}
+		for _, r := range s.GetRows() {
+			if !c.add(menuOption{title: r.GetTitle(), description: r.GetDescription(), id: r.GetRowID()}) {
+				break
+			}
+		}
+		if c.cut {
+			break
+		}
+	}
+	return withMenu(text, v.GetButtonText(), c)
+}
+
+func buttonsMenu(text string, v *waE2E.ButtonsMessage) string {
+	c := &menuCollector{}
+	for _, btn := range v.GetButtons() {
+		if c.cut {
 			break
 		}
 		if info := btn.GetNativeFlowInfo(); info != nil && btn.GetButtonText().GetDisplayText() == "" {
-			options = append(options, nativeFlowOptions(info.GetName(), info.GetParamsJSON())...)
+			nativeFlowButton(c, info.GetName(), info.GetParamsJSON())
 			continue
 		}
-		options = append(options, menuOption{title: btn.GetButtonText().GetDisplayText(), id: btn.GetButtonID()})
+		c.add(menuOption{title: btn.GetButtonText().GetDisplayText(), id: btn.GetButtonID()})
 	}
-	return renderMenu("", []menuSection{{options: options}})
-}
-
-type nativeFlowRow struct {
-	Header      string `json:"header"`
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	ID          string `json:"id"`
+	return withMenu(text, "", c)
 }
 
 type nativeFlowParams struct {
@@ -173,112 +240,104 @@ type nativeFlowParams struct {
 	ID          string `json:"id"`
 	URL         string `json:"url"`
 	Phone       string `json:"phone_number"`
-	CopyCode    string `json:"copy_code"`
 	Title       string `json:"title"`
 	Sections    []struct {
-		Title string          `json:"title"`
-		Rows  []nativeFlowRow `json:"rows"`
+		Title string `json:"title"`
+		Rows  []struct {
+			Header      string `json:"header"`
+			Title       string `json:"title"`
+			Description string `json:"description"`
+			ID          string `json:"id"`
+		} `json:"rows"`
 	} `json:"sections"`
 }
 
-func parseNativeFlow(raw string) (nativeFlowParams, bool) {
+// nativeFlowButton decodes one native-flow button's parameters once and adds
+// its options in source order. single_select carries a whole list.
+func nativeFlowButton(c *menuCollector, name, raw string) {
 	var p nativeFlowParams
 	if raw == "" || len(raw) > maxMenuParams || json.Unmarshal([]byte(raw), &p) != nil {
-		return p, false
-	}
-	return p, true
-}
-
-// nativeFlowOptions reads one native-flow button. single_select carries a whole
-// list; other names are one option each.
-func nativeFlowOptions(name, raw string) []menuOption {
-	p, ok := parseNativeFlow(raw)
-	if !ok {
-		return []menuOption{{title: "(" + menuClean(name, 64) + " button)"}}
+		c.add(menuOption{title: "(" + menuClean(name, 64) + " button)"})
+		return
 	}
 	switch name {
 	case "single_select":
-		var out []menuOption
+		if !c.section(p.Title) {
+			return
+		}
 		for _, s := range p.Sections {
+			st := menuClean(s.Title, maxMenuText)
 			for _, r := range s.Rows {
-				if len(out) >= maxMenuScanItems {
-					return out
-				}
 				title := joinNonEmpty(" ", menuClean(r.Header, maxMenuText), menuClean(r.Title, maxMenuText))
-				if st := menuClean(s.Title, maxMenuText); st != "" {
-					title = joinNonEmpty(": ", st, title)
+				if !c.add(menuOption{title: joinNonEmpty(": ", st, title), description: r.Description, id: r.ID}) {
+					return
 				}
-				out = append(out, menuOption{title: title, description: r.Description, id: r.ID})
 			}
 		}
-		return out
+		// Buttons after a selection list start an untitled section of their
+		// own; bounded, since each selection list spent a unit for its section.
+		c.sections = append(c.sections, menuSection{})
 	case "cta_url":
-		return []menuOption{{title: p.DisplayText, link: menuLink(p.URL)}}
+		c.add(menuOption{title: p.DisplayText, link: menuLink(p.URL)})
 	case "cta_call":
-		return []menuOption{{title: p.DisplayText, call: p.Phone}}
+		c.add(menuOption{title: p.DisplayText, call: p.Phone})
 	case "cta_copy":
-		return []menuOption{{title: p.DisplayText, description: "copies " + menuClean(p.CopyCode, maxMenuText)}}
+		// The copied code is not read: it may be a credential.
+		c.add(menuOption{title: joinNonEmpty(" ", menuClean(p.DisplayText, maxMenuText), "(copy button)")})
+	case "quick_reply":
+		c.add(menuOption{title: p.DisplayText, id: p.ID})
+	default:
+		c.add(menuOption{title: joinNonEmpty(" ", menuClean(p.DisplayText, maxMenuText), "("+menuClean(name, 64)+" button)")})
 	}
-	return []menuOption{{title: p.DisplayText, id: p.ID}}
 }
 
-func interactiveMenu(v *waE2E.InteractiveMessage) string {
-	nf := v.GetNativeFlowMessage()
-	if nf == nil {
-		return ""
-	}
-	var sections []menuSection
-	var plain []menuOption
-	for i, btn := range nf.GetButtons() {
-		if i >= maxMenuScanItems {
+func interactiveMenu(text string, v *waE2E.InteractiveMessage) string {
+	c := &menuCollector{}
+	for _, btn := range v.GetNativeFlowMessage().GetButtons() {
+		if c.cut {
 			break
 		}
-		if btn.GetName() == "single_select" {
-			p, _ := parseNativeFlow(btn.GetButtonParamsJSON())
-			sections = append(sections, menuSection{title: p.Title, options: nativeFlowOptions("single_select", btn.GetButtonParamsJSON())})
-			continue
-		}
-		plain = append(plain, nativeFlowOptions(btn.GetName(), btn.GetButtonParamsJSON())...)
+		nativeFlowButton(c, btn.GetName(), btn.GetButtonParamsJSON())
 	}
-	return renderMenu("", append([]menuSection{{options: plain}}, sections...))
+	return withMenu(text, "", c)
 }
 
-func templateMenu(v *waE2E.TemplateMessage) string {
+func templateMenu(text string, v *waE2E.TemplateMessage) string {
 	if i := v.GetInteractiveMessageTemplate(); i != nil {
-		return interactiveMenu(i)
+		return interactiveMenu(text, i)
 	}
 	h := v.GetHydratedFourRowTemplate()
 	if h == nil {
 		h = v.GetHydratedTemplate()
 	}
-	var options []menuOption
-	for i, btn := range h.GetHydratedButtons() {
-		if i >= maxMenuScanItems {
-			break
-		}
+	c := &menuCollector{}
+	for _, btn := range h.GetHydratedButtons() {
+		var ok bool
 		switch {
 		case btn.GetQuickReplyButton() != nil:
-			options = append(options, menuOption{title: btn.GetQuickReplyButton().GetDisplayText(), id: btn.GetQuickReplyButton().GetID()})
+			ok = c.add(menuOption{title: btn.GetQuickReplyButton().GetDisplayText(), id: btn.GetQuickReplyButton().GetID()})
 		case btn.GetUrlButton() != nil:
-			options = append(options, menuOption{title: btn.GetUrlButton().GetDisplayText(), link: menuLink(btn.GetUrlButton().GetURL())})
+			ok = c.add(menuOption{title: btn.GetUrlButton().GetDisplayText(), link: menuLink(btn.GetUrlButton().GetURL())})
 		case btn.GetCallButton() != nil:
-			options = append(options, menuOption{title: btn.GetCallButton().GetDisplayText(), call: btn.GetCallButton().GetPhoneNumber()})
+			ok = c.add(menuOption{title: btn.GetCallButton().GetDisplayText(), call: btn.GetCallButton().GetPhoneNumber()})
+		default:
+			ok = c.spend()
+		}
+		if !ok {
+			break
 		}
 	}
-	return renderMenu("", []menuSection{{options: options}})
+	return withMenu(text, "", c)
 }
 
 // menuChoice is the archived text of a reply that chose a menu option.
 func menuChoice(title, description, id string) string {
-	line := joinNonEmpty(" - ", menuClean(title, maxMenuText), menuClean(description, maxMenuText))
-	if line == "" {
-		line = "(no label)"
-	}
-	if id = menuClean(id, maxMenuID); id != "" {
-		line += " [id: " + id + "]"
-	}
-	return "Chose menu option: " + line
+	return "Chose menu option: " + strings.TrimPrefix(optionLine(0, menuOption{title: title, description: description, id: id}), "\n0. ")
 }
+
+// Native-flow responses whose parameters name the chosen option. A Flow's
+// response (another name) carries the user's form answers: never read.
+var optionResponseNames = map[string]bool{"quick_reply": true, "single_select": true}
 
 // menuReply reads the four reply kinds; ok is false for any other message.
 func menuReply(m *waE2E.Message) (kind, body string, ok bool) {
@@ -295,8 +354,7 @@ func menuReply(m *waE2E.Message) (kind, body string, ok bool) {
 	case m.GetInteractiveResponseMessage() != nil:
 		v := m.GetInteractiveResponseMessage()
 		id := ""
-		// Only a quick reply's ID is read; a flow's form answers are not archived here.
-		if nf := v.GetNativeFlowResponseMessage(); nf != nil && len(nf.GetParamsJSON()) <= maxMenuParams {
+		if nf := v.GetNativeFlowResponseMessage(); nf != nil && optionResponseNames[nf.GetName()] && len(nf.GetParamsJSON()) <= maxMenuParams {
 			var p struct {
 				ID string `json:"id"`
 			}
