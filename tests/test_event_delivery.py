@@ -2061,7 +2061,7 @@ def test_dispatcher_heartbeat_reports_version_and_stops_when_a_lane_stalls(seede
     legacy, [component] = rows()
     assert len(legacy) == 1
     # ANYM-825: the package version plus the build's gate features (heartbeats.identity).
-    assert (component['version'], component['schema_version']) == (__version__ + '+source_filters', RUNTIME_SCHEMA)
+    assert (component['version'], component['schema_version']) == (__version__ + '+source-filters', RUNTIME_SCHEMA)
 
 
 # spec: ANYM-534

@@ -1126,7 +1126,7 @@ def set_source_filters(store, enabled, *, verify_components=False):
         if enabled and verify_components:
             from .heartbeats import mismatch
             # The package version alone cannot tell this matcher from the deployed one (both 0.9.19).
-            problem = mismatch(c, features=('source_filters',))
+            problem = mismatch(c, features=('source-filters',))
             if problem is not None:
                 return problem
         c.execute('''INSERT INTO probe_metadata(name,value) VALUES(%s,%s)

@@ -1430,11 +1430,11 @@ is stored: a left-out event creates no match, no hint and no wake, costs none of
 still joins when its type is named, with no update of the subscription. Without `chat_types`
 nothing changes (every type except channels unless `include_channels`). Naming `channel` lets
 channels in; `include_channels: true` with a `chat_types` that lacks `channel` is `invalid_filter`,
-and explicit `chat_ids` subscriptions refuse the field (`invalid_filter`). Over MCP and REST the
-tool schema checks the list first: another value, an empty list or more than 4 entries is
-`invalid_parameters` (field `sources`), and so is the field itself on a backend older than this
-release; a list that passes the schema and still breaks a rule above is `invalid_filter`. Bot
-senders keep their default. Failure events (`send.failed`, `source.health`) keep their own audience rule and are not
+and explicit `chat_ids` subscriptions refuse the field (`invalid_filter`). Any other value, an
+empty list, a repeated value or more than 4 entries is `invalid_filter` too; over MCP and REST
+only a `chat_types` that is not a list of strings stops at the tool schema (`invalid_parameters`).
+A backend older than this release refuses the field itself with `invalid_parameters` (field
+`sources`). Bot senders keep their default. Failure events (`send.failed`, `source.health`) keep their own audience rule and are not
 filtered by `chat_types`.
 
 A chat the server has not typed is `unknown`. Telegram types a chat at its first message; the
@@ -1453,7 +1453,7 @@ until it is closed.
 `chat_types` returns `source_filters_disabled` (409) until the operator runs
 `python -m messaging_service set-source-filters --enable`, which refuses (and changes nothing)
 unless the API, matcher and dispatcher heartbeats report this version on the current schema and
-the build feature `source_filters` (heartbeat version `<version>+source_filters`; the package
+the build feature `source-filters` (heartbeat version `<version>+source-filters`; the package
 version alone does not change per merge, so an older build of the same version reports none and
 is refused with `component_feature_missing`): an older matcher would store matches of every type
 for such a definition, and readers do not filter stored matches by type. The other operator

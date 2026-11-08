@@ -4622,16 +4622,8 @@
             },
             "chat_types": {
               "items": {
-                "enum": [
-                  "private",
-                  "group",
-                  "channel",
-                  "unknown"
-                ],
                 "type": "string"
               },
-              "maxItems": 4,
-              "minItems": 1,
               "title": "Chat Types",
               "type": "array"
             },

@@ -10,7 +10,8 @@ HEARTBEAT_S = 30
 MAX_AGE_S = 120
 # ANYM-825: the package version does not change per merge, so a gate that needs new matcher behaviour names
 # a feature this build reports after a '+' (version text, no schema change); older builds report none.
-FEATURES = ('source_filters',)
+# The text must fit migration 050's CHECK (version ~ '^[0-9A-Za-z.+-]{1,64}$'): no underscores.
+FEATURES = ('source-filters',)
 
 
 def identity():

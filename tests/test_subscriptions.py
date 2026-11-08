@@ -481,6 +481,15 @@ def message_events(store, token, sid):
 
 
 # spec: ANYM-825
+def test_the_heartbeat_identity_fits_the_stored_version_constraint():
+    import re
+    from messaging_service import __version__
+    from messaging_service.heartbeats import identity
+    # Migration 050: version ~ '^[0-9A-Za-z.+-]{1,64}$'; a refused write would silence every heartbeat.
+    assert re.fullmatch(r'[0-9A-Za-z.+-]{1,64}', identity()) and identity().startswith(__version__ + '+')
+
+
+# spec: ANYM-825
 def test_chat_types_validate_their_form_and_wait_for_the_source_filters_switch(seeded):
     from messaging_service import __version__
     from messaging_service.heartbeats import identity
@@ -509,7 +518,7 @@ def test_chat_types_validate_their_form_and_wait_for_the_source_filters_switch(s
             'include_bots': False}
         # Mixed versions: the deployed matcher reports the same package version and no build features; it would
         # store group matches for such a definition. The dynamic and delivery switches still accept it.
-        assert current == __version__ + '+source_filters'
+        assert current == __version__ + '+source-filters'
         beat(__version__)
         assert store.set_source_filters(True, verify_components=True) == {'error': 'component_feature_missing',
             'component': 'matcher', 'version': __version__, 'expected': current}
