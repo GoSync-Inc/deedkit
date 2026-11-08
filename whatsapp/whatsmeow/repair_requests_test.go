@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"reflect"
 	"runtime"
 	"sync"
@@ -17,6 +19,7 @@ import (
 	waHistorySync "go.mau.fi/whatsmeow/proto/waHistorySync"
 	waWeb "go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -474,5 +477,41 @@ func TestGapRepairAndAgentRequestRaceSendOnlyOne(t *testing.T) {
 		if total := int(agent.Load()) + len(f.sent); total != 1 {
 			t.Fatalf("round %d: agent=%d repair=%d", i, agent.Load(), len(f.sent))
 		}
+	}
+}
+
+// spec: ANYM-814
+func TestGapRepairOutstandingLeavesSendsAndMediaRunning(t *testing.T) {
+	p := repairProvider(t)
+	installRepairFake(t)
+	if _, err := askRepair(p, "span-a", ""); err != nil {
+		t.Fatal(err)
+	}
+	// A send completes and its capture write reaches the same store while the repair waits.
+	d := sendFake(t)
+	stored := false
+	d.put = func(*events.Message, string) error {
+		stored = true
+		return p.Capture.Put(fixtureMessage("SENT1", 1700000200), "live")
+	}
+	if _, err := sendText(context.Background(), textFixture(), d); err != nil || !stored {
+		t.Fatalf("send err=%v stored=%v", err, stored)
+	}
+	// A media download streams to the end.
+	data := bytes.Repeat([]byte("synthetic-only "), 100)
+	req, cfg, m := mediaFixture(t, data)
+	var output bytes.Buffer
+	err := downloadMedia(context.Background(), req, cfg, mediaPolicy, mediaGet(m), func(_ context.Context, _ whatsmeow.DownloadableMessage, file whatsmeow.File) error {
+		_, e := io.Copy(file, bytes.NewReader(data))
+		return e
+	}, func(chunk []byte) error {
+		_, e := output.Write(chunk)
+		return e
+	})
+	if err != nil || !bytes.Equal(output.Bytes(), data) {
+		t.Fatalf("media err=%v", err)
+	}
+	if got := repairState(t, p, "REQ1"); got != "sent" {
+		t.Fatalf("state=%s", got)
 	}
 }
