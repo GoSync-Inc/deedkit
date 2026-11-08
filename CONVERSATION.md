@@ -252,9 +252,9 @@ neither a closing courtesy nor a body-less sticker (media kind `sticker`), exist
 the owner has a meaningful message after X; none of the owner's messages from X
 on has question punctuation; and everything that came in after X is a courtesy
 or a sticker. Both chats of a WhatsApp phone/LID pair count as one conversation.
-Each lookup reads at most 60 stored messages per chat, deleted, empty and service
-ones included: a chat whose X or whose owner messages from X on lie beyond them
-stays listed. A chat with no such X within 20 meaningful messages, a chat the
+Each lookup reads at most 60 stored messages per chat and direction, empty and
+service ones included (deleted ones are skipped): a chat whose X or whose owner
+messages from X on lie beyond them stays listed. A chat with no such X within 20 meaningful messages, a chat the
 owner never wrote in, a group, a channel and a self chat are never left out. `courtesies=only` lists just the rows `exclude`
 leaves out, so an agent working the inbox to zero passes `exclude` and reviews
 `only` once. `excluded_courtesies_total` counts the rows `exclude` removed within

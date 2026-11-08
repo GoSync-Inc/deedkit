@@ -6,6 +6,7 @@ from test_search_performance import scans, visited
 CHATS = 2000
 GAPS = 100
 GAP = 300
+BUSY = 100
 
 
 class Statements(ChatMeasured):
@@ -21,14 +22,17 @@ class Statements(ChatMeasured):
 
 def courtesy_catalogue(s):
     """Polite chats: a request, the owner's answer, then a courtesy-only run of 19 (odd) or 25 (even).
-    Gap chats: a request, the owner's answer, GAP stored empty incoming rows, then a courtesy."""
+    Gap chats: a request, the owner's answer, GAP stored empty incoming rows, then a courtesy.
+    Busy chats: a request, GAP owner messages, then a courtesy."""
     with s.pool.connection() as c:
         c.execute("SET LOCAL statement_timeout='120s'")
         c.execute('''INSERT INTO chats(id,account,provider_chat,title,chat_type)
             SELECT 'polite-'||lpad(n::text,4,'0'),'telegram-demo',(60000+n)::text,'Synthetic polite','private'
             FROM generate_series(1,%s) n UNION ALL
             SELECT 'gap-'||lpad(n::text,4,'0'),'telegram-demo',(80000+n)::text,'Synthetic gap','private'
-            FROM generate_series(1,%s) n''', (CHATS, GAPS))
+            FROM generate_series(1,%s) n UNION ALL
+            SELECT 'busy-'||lpad(n::text,4,'0'),'telegram-demo',(85000+n)::text,'Synthetic busy','private'
+            FROM generate_series(1,%s) n''', (CHATS, GAPS, BUSY))
         c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
             SELECT 'polite-'||lpad(n::text,4,'0')||'-'||k,'telegram-demo','polite-'||lpad(n::text,4,'0'),k::text,
                 CASE WHEN k=2 THEN 'fixture-owner' ELSE 'fixture-peer-'||n END,
@@ -41,7 +45,13 @@ def courtesy_catalogue(s):
                 CASE WHEN k=1 THEN 'Synthetic request for the report' WHEN k=2 THEN 'Synthetic answer'
                   WHEN k=%s THEN 'спасибо' ELSE '' END,
                 now()-interval '1 day'+k*interval '1 second',CASE WHEN k=2 THEN 'outgoing' ELSE 'incoming' END
-            FROM generate_series(1,%s) n CROSS JOIN generate_series(1,%s) k''', (CHATS, GAP + 3, GAPS, GAP + 3))
+            FROM generate_series(1,%s) n CROSS JOIN generate_series(1,%s) k UNION ALL
+            SELECT 'busy-'||lpad(n::text,4,'0')||'-'||k,'telegram-demo','busy-'||lpad(n::text,4,'0'),k::text,
+                CASE WHEN k IN (1,%s) THEN 'fixture-busy-'||n ELSE 'fixture-owner' END,
+                CASE WHEN k=1 THEN 'Synthetic request for the report' WHEN k=%s THEN 'спасибо' ELSE 'Synthetic answer' END,
+                now()-interval '1 day'+k*interval '1 second',CASE WHEN k IN (1,%s) THEN 'incoming' ELSE 'outgoing' END
+            FROM generate_series(1,%s) n CROSS JOIN generate_series(1,%s) k''',
+            (CHATS, GAP + 3, GAPS, GAP + 3, GAP + 2, GAP + 2, GAP + 2, BUSY, GAP + 2))
         c.execute('ANALYZE messages'); c.execute('ANALYZE chats')
 
 
@@ -59,7 +69,7 @@ def test_courtesies_exclude_reads_at_most_the_depth_per_chat(seeded, record_prop
     every, plain = measure(s, b)
     shown, closing = measure(s, b, courtesies='exclude')
     # Odd chats find the request at depth 20 and leave; even chats find none within 20 and stay; a gap chat's
-    # request lies past the stored rows read, so it stays.
+    # request lies past the stored rows read, and so do a busy chat's owner messages: both stay.
     left_out, _ = measure(s, b, courtesies='only')
     assert left_out['awaiting_reply_total'] == CHATS // 2 and left_out['items']
     assert all(r['id'].startswith('polite-') and int(r['id'][7:]) % 2 == 1 for r in left_out['items'])
@@ -69,8 +79,10 @@ def test_courtesies_exclude_reads_at_most_the_depth_per_chat(seeded, record_prop
     assert not any('closing_from' in sql for sql in plain.sql)
     assert len(closing.sql) == len(plain.sql) + 1 and len(closing.counts) == 1
     # Per chat the lookups read at most the stored incoming rows (all 20 or 26 of a polite chat, COURTESY_SCAN of a
-    # gap chat) and the owner's rows from X on (1 in an odd chat). An unbounded read takes all GAP+1 gap rows.
-    bound = CHATS // 2 * 21 + CHATS // 2 * 26 + GAPS * COURTESY_SCAN + 2 * (CHATS + GAPS)
+    # gap chat, 2 of a busy chat) and the owner's rows from X on (1 in an odd chat, COURTESY_SCAN+1 in a busy chat).
+    # An unbounded read takes all GAP+1 gap rows and all GAP busy owner rows.
+    bound = (CHATS // 2 * 21 + CHATS // 2 * 26 + GAPS * COURTESY_SCAN + BUSY * (2 + COURTESY_SCAN + 1)
+        + 2 * (CHATS + GAPS + BUSY))
     base = visited(plain.plans[0]['Plan'], {'messages'})
     extra = visited(closing.plans[0]['Plan'], {'messages'}) - base
     counted = visited(closing.counts[0]['Plan'], {'messages'})

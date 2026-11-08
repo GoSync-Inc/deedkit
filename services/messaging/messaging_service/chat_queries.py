@@ -111,7 +111,8 @@ PROMOTIONAL=('exclude','include','only')
 COURTESIES=('include','exclude','only')
 # The closing rule reads at most this many meaningful incoming messages back from the head, and as many owner messages after it.
 COURTESY_DEPTH=20
-# ANYM-810: the most stored rows (deleted, empty or service ones included) either closing lookup reads per chat.
+# ANYM-810: the most stored rows (empty or service ones included) either closing lookup reads per chat and direction;
+# deleted rows are outside message_reply_order (migration 027), so the bound is an index range, not a filter.
 COURTESY_SCAN=3*COURTESY_DEPTH
 # Priority cursors bind the scoring formula: a position from another formula would skip rows after a deploy. Bump with any weight change
 # or a change of the row set (ANYM-810: courtesies, the narrower emoji class and the question emoji).
@@ -607,7 +608,7 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         def pair(sql):return [sql,*([sql.replace('m.chat=c.id',alias_chat)] if aliases else [])]
         def tagged(sqls):return ' UNION ALL '.join(f'SELECT {n} AS b,t.* FROM ({sql}) t' for n,sql in enumerate(sqls))
         stored=f'''SELECT m.id,m.revision,m.deleted,m.body,m.sent_at,CASE WHEN a.platform='telegram' THEN {number('m')} ELSE 0::bigint END
-              AS numeric_id FROM messages m WHERE m.account=c.account AND m.chat=c.id AND c.chat_type='private' AND m.direction='incoming' '''
+              AS numeric_id FROM messages m WHERE m.account=c.account AND m.chat=c.id AND c.chat_type='private' AND m.direction='incoming' AND NOT m.deleted'''
         meta=metadata_sql('p')
         # A chat whose stored tail filled the scan is known only after its oldest scanned row (the horizon).
         closing_from=f'''WITH tails AS MATERIALIZED ({tagged([latest_sql(sql,limit=COURTESY_SCAN) for sql in pair(stored)])}),
@@ -621,8 +622,9 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
           SELECT id,sent_at,numeric_id FROM recent WHERE NOT closer ORDER BY sent_at DESC,numeric_id DESC,id DESC LIMIT 1'''
         # The owner's stored messages from X on; one row more than the scan in either chat leaves the rest unread.
         owner_stored=f'''SELECT m.id,m.revision,m.deleted,m.body,m.sent_at,{number('m')} AS numeric_id FROM messages m
-            WHERE m.account=c.account AND m.chat=c.id AND m.direction='outgoing' AND m.sent_at>=closing_from.sent_at
-            ORDER BY m.sent_at DESC LIMIT {COURTESY_SCAN+1}'''
+            WHERE m.account=c.account AND m.chat=c.id AND m.direction='outgoing' AND NOT m.deleted
+              AND m.sent_at>=closing_from.sent_at ORDER BY m.sent_at DESC,{index_number('m')} DESC NULLS LAST,m.id DESC
+            LIMIT {COURTESY_SCAN+1}'''
         # A WhatsApp owner message at X's own second is not proven after X, so it never answers (it may still ask).
         answered="p.sent_at>closing_from.sent_at OR a.platform='telegram' AND p.sent_at=closing_from.sent_at AND p.numeric_id>closing_from.numeric_id"
         closing_owner=f'''WITH owned AS MATERIALIZED ({tagged(pair(owner_stored))})
