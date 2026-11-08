@@ -191,9 +191,8 @@ def test_chat_types_values_reach_the_store_so_it_answers_invalid_filter():
         for chat_types in ('private',[1]):
             params={'sources':{'all_visible_chats':True,'chat_types':chat_types}}
             rest=client.post('/v1/create_subscription',headers={'Authorization':'Bearer synthetic-token'},json=params)
-            assert rest.json()['error']=='invalid_parameters'
-            mcp=rpc(client,'create_subscription',params)
-            assert mcp.json()['result']['isError'] is True and 'invalid_parameters' in mcp.text
+            assert rest.status_code==400 and rest.json()['error']=='invalid_parameters'
+            assert rpc(client,'create_subscription',params).json()['error']['code']==-32602
     assert store.calls==[]
 
 

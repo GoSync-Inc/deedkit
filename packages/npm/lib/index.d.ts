@@ -299,7 +299,9 @@ export declare class AnyMsgClient {
   /** Read a scoped receipt without another provider request. */
   getMessengerOperation(args: {operation_id:string}): Promise<Record<string,unknown>>;
   /** Requires explicit subscription-write; uncertain creations are never automatically retried. */
-  createSubscription(args: SubscriptionSelection | DynamicSubscriptionSelection): Promise<Record<string,unknown>>;
+  createSubscription(args: SubscriptionSelection): Promise<Record<string,unknown>>;
+  /** Dynamic sources instead of chat_ids (ANYM-522, chat_types ANYM-825). */
+  createSubscription(args: DynamicSubscriptionSelection): Promise<Record<string,unknown>>;
   /** Current credential only; sources are masked after a permission/scope change. */
   listSubscriptions(args?: {limit?:number}): Promise<Record<string,unknown>>;
   /** Matcher catch-up is separate from live provider freshness and complete history. */
