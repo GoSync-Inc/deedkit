@@ -18,8 +18,9 @@ profile row); progress is the newest `ready` row of that scope, any profile hash
 that profile is enabled and unexpired; a cleanly stopped or killed worker is `enrichment_no_worker`.
 Withheld, evicted and not-recognizable rows never count.
 
-`coverage` (each account row, compact and full, ANYM-812; never for a chat-restricted reader) answers
-"is everything due under the current policy done":
+`coverage` (each account row, ANYM-812; never for a chat-restricted reader) answers "is everything due
+under the current policy done". `detail=compact` carries only `state`, `since`, `due` totals
+(`to_download`, `to_index`, `to_recognize`) and the `available_on_request` total; full detail:
 
 - `state`: `done` when every `due.to_*` is 0, `behind` otherwise, `unknown` when the run's window is
   unpublished or the collector lease has expired. A terminal failure never makes it `behind`.
@@ -38,13 +39,15 @@ Withheld, evicted and not-recognizable rows never count.
 - `available_on_request`: not work waiting. `total`; full detail adds `not_downloaded` by reason,
   `stored_not_recognized` (withheld files of on-request chats and evicted originals) and, for
   WhatsApp, `likely_expired` (not downloaded and older than 30 days: no next action);
-  `next_action: request_file_download`. Compact shows `total` only.
+  `next_action: request_file_download`.
 - `not_recognizable`: `no_text` (a document without extracted text), `recognition_off` (no
   configured kind), `unsupported`.
 
 `files.enrichment` and `files.extraction` stay exclusive state histograms that add up to
-`stored_files`; only the old `queued` key split: `queued` is due work, `available_on_request` and
-`not_recognizable` hold the rest. `coverage.due` is a separate backlog (it includes leased and
+`stored_files`; only the old `queued` key split: `queued` is due work, `available_on_request` (withheld,
+evicted) and `not_recognizable` (documents without text) hold the rest, each present only when non-zero;
+`unconfigured` keeps its meaning (no configured profile for the kind). Leased, ready, failed and unsupported
+rows keep their state whatever the policy says. `coverage.due` is a separate backlog (it includes leased and
 retryable failed rows) and is never added to the histogram. One SQL bucket expression per stage
 (`coverage.py`) serves the status and `enrichment_health`; the claims keep their own order and caps.
 

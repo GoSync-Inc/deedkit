@@ -12,9 +12,9 @@ from .media_inventory import LIKELY_EXPIRED
 
 
 DOWNLOAD_STATES = ('queued', 'leased', 'ready', 'failed', 'superseded')
-EXTRACTION_STATES = ('queued', 'leased', 'ready', 'unsupported', 'failed', 'unknown', 'available_on_request')
-ENRICHMENT_STATES = ('unconfigured', 'queued', 'leased', 'ready', 'unsupported', 'failed', 'unknown',
-                     'available_on_request', 'not_recognizable')
+EXTRACTION_STATES = ('queued', 'leased', 'ready', 'unsupported', 'failed', 'unknown')
+ENRICHMENT_STATES = ('unconfigured', 'queued', 'leased', 'ready', 'unsupported', 'failed', 'unknown')
+# ANYM-812 keys, present only when non-zero, so a file block without such rows reads as before (ANYM-667 snapshots).
 # download counts each current file occurrence once: ready equals stored_files;
 # current_files sums every state except superseded (replaced older revisions).
 DOWNLOAD_BASIS = 'current_file_occurrences'
@@ -235,8 +235,8 @@ def _files(c, p, *, group_by_chat=False, tallies=None):
         item['stored_bytes'] += int(row['bytes'])
         extraction = coverage.histogram_key(row['extraction_state'], row['extraction_bucket'], coverage.EXTRACTION_FILES)
         enrichment = coverage.histogram_key(row['enrichment_state'], row['recognition_bucket'], coverage.RECOGNITION_FILES)
-        item['extraction'][extraction] += row['count']
-        item['enrichment'][enrichment] += row['count']
+        item['extraction'][extraction] = item['extraction'].get(extraction, 0) + row['count']
+        item['enrichment'][enrichment] = item['enrichment'].get(enrichment, 0) + row['count']
         item['extraction_truncated'] += row['extraction_truncated']
         item['enrichment_truncated'] += row['enrichment_truncated']
         coverage.add_row(tallies.setdefault(row['account'], coverage.empty_tally()), row)

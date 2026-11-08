@@ -101,7 +101,7 @@ def extraction_bucket():
 # was reported queued splits into due work, work waiting for a request and work no worker can do.
 RECOGNITION_FILES = {'unknown': 'unknown', 'ready': 'ready', 'failed_final': 'failed', 'failed_retry': 'failed',
                      'unsupported': 'unsupported', 'leased': 'leased', 'withheld': 'available_on_request',
-                     'evicted': 'available_on_request', 'recognition_off': 'not_recognizable',
+                     'evicted': 'available_on_request', 'recognition_off': 'unconfigured',
                      'no_text': 'not_recognizable', 'due': 'queued'}
 EXTRACTION_FILES = {'unknown': 'unknown', 'ready': 'ready', 'unsupported': 'unsupported', 'failed': 'failed',
                     'leased': 'leased', 'withheld': 'available_on_request', 'evicted': 'available_on_request',
@@ -211,8 +211,11 @@ def block(row, platform, files, tally, eligibility, health_codes, lease_live):
 
 
 def compact(full):
-    """Compact detail: the verdict, the policy, due counts and one on-request total (ANYM-812 criterion 1)."""
-    result = {k: v for k, v in full.items() if k != 'available_on_request'}
-    result['available_on_request'] = {'total': full['available_on_request']['total'],
-                                      'next_action': full['available_on_request']['next_action']}
-    return result
+    """Compact detail: the verdict and its totals (ANYM-812 criterion 1); detail=full has the policy and every bucket.
+
+    Kept small: the compact account overview has an 8 KiB budget over MCP (tests/test_grok_followup.py)."""
+    due = full['due']
+    return {'state': full['state'], 'since': full['since'],
+            'due': {'to_download': due['to_download'], 'to_index': due['to_index'],
+                    'to_recognize': due['to_recognize']['total']},
+            'available_on_request': full['available_on_request']['total']}

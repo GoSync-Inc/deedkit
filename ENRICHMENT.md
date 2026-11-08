@@ -459,8 +459,8 @@ columns this needs (chat kind, the subscription's state and chats, the job's req
 column grants in their role files.
 
 `get_sync_status` (ANYM-812) reports recognition by the same rule: `files.enrichment.queued` counts
-only due rows; withheld and evicted ones are `available_on_request`, documents without text and kinds
-with no configured profile are `not_recognizable`. A configured kind is a `processing_profiles` row
+only due rows; withheld and evicted ones are `available_on_request`, documents without text
+`not_recognizable`, and kinds with no configured profile stay `unconfigured`. A configured kind is a `processing_profiles` row
 observed within 7 days, enabled or not, so a stopped worker's files stay due (`coverage.state:
 behind`, `enrichment_no_worker`) rather than reading as recognition switched off. A row failed or
 unsupported under an older profile reads as failed or unsupported until the worker with a changed
