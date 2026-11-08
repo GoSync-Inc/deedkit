@@ -63,6 +63,21 @@ rollback to the previous adapter ignores the table. The repair itself is a
 follow-up.
 An exhausted local cache is not a complete WhatsApp history.
 
+A native download maps the media server's answer to a fixed code (ANYM-815): HTTP 403, 404
+and 410 are `media_unavailable`, a key that does not decrypt matching bytes is
+`media_decrypt_failed`, HTTP 400, 401, 408, 429, 500, 502, 503 and 504 are `media_http_<status>`,
+a failure of the local temporary file is `media_storage_unavailable`, and anything else stays
+`media_network_error` (MEDIA_STORAGE.md, failed WhatsApp files). WhatsApp keeps media about 30
+days (an integrator estimate; WhatsApp publishes none), so a file that was already older when it
+was queued usually cannot be fetched from its servers; the phone may still have it.
+`anymsg-whatsmeow --config <file> --media-keys` answers the operator media inventory: it opens
+`capture.sqlite` read-only and query-only, never the provider client, the device store or the
+session owner lock, so it runs beside the collector's adapter. It reads JSON lines
+`{"id":1,"method":"media_keys","params":{"messages":[{"chat":..,"message":..}]}}` (at most 200
+messages each, one journal row per statement) and answers `{"id":1,"result":{"held":[..]}}`,
+true where the journal row holds the message's media key; an invalid line answers
+`invalid_request`. Without a journal it exits with `media_keys_unavailable` and creates none.
+
 The account-specific operation manifest reflects the selected provider after
 an identity-verified connection; platform counts are legacy defaults only.
 Native global revoke uses the explicit revoke operation. It never degrades to
