@@ -1,0 +1,20 @@
+[Unit]
+Description=DeedKit backup alerts: a failed, undelivered or unverified backup raises a Tiden issue (ANYM-807)
+
+[Service]
+Type=oneshot
+# Read-only towards every backup: no lock, no container, one `systemctl show` (10 s) and file reads, then at most 8
+# posts to the Tiden ingest under one 45 s deadline. No ordering or dependency on any backup or verifier unit, so it
+# can never fail, delay or block a backup, a verifier or a deploy. result.json (0644) is what `production.py status`
+# prints from; state.json (0600) holds the episodes. BACKUP.md, Backup alerts.
+ExecStart=/usr/bin/python3 -I /opt/deedkit/backup-health/backup_health.py --config /etc/deedkit-backup-health/config.json
+TimeoutStartSec=90s
+User=root
+UMask=0077
+Nice=10
+StateDirectory=deedkit-backup-health
+StateDirectoryMode=0755
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict

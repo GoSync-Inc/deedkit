@@ -7367,6 +7367,7 @@ def status_with_freshness(tmp_path, monkeypatch, capsys, freshness):
     monkeypatch.setattr(p, "PAUSE", tmp_path / "etc" / "autodeploy.pause")
     monkeypatch.setattr(p, "lock", lambda state: contextlib.nullcontext())
     monkeypatch.setattr(p, "CALENDAR_FRESHNESS", freshness)
+    monkeypatch.setattr(p, "backup_health_lines", lambda: [])  # its own tests below (ANYM-807)
     state = tmp_path / "state"
     state.mkdir(exist_ok=True)
     p.write(state / "current.json", {"sha": "c" * 40, "status": "applied"})
@@ -7451,6 +7452,89 @@ def test_status_prints_the_calendar_backup_freshness_line_beside_the_json_a_read
     checked = freshness_file(result, status="unknown", age=None, last_snapshot_at=None)
     printed = status_with_freshness(tmp_path, monkeypatch, capsys, result)
     assert printed.err == f"calendar backup: UNKNOWN age=? (checked {checked})\n"
+
+
+BACKUP_HINT = "backup: verified state is on backup-1 (backup_health.py --print)"
+
+
+def health_result(path, *, checked_ago=timedelta(minutes=20), profiles=None):
+    checked = (datetime.now(timezone.utc) - checked_ago).strftime("%Y-%m-%dT%H:%M:%SZ")
+    default = {name: {"word": "delivered", "last_snapshot_at": "2026-11-06T18:00:07Z", "age_hours": 3.2}
+               for name in ("messaging", "calendar", "recordings", "calls")}
+    p.write(path, {"v": 1, "side": "producer", "checked_at": checked, "profiles": default if profiles is None else profiles})
+    return checked
+
+
+# spec: ANYM-807
+@pytest.mark.parametrize("word", ["delivered", "FAILED", "STALE", "UNKNOWN"])
+def test_status_prints_one_backup_line_per_profile_with_each_word(tmp_path, word):
+    path = tmp_path / "result.json"
+    checked = health_result(path, profiles={name: {"word": word, "last_snapshot_at": "2026-11-06T18:00:07Z",
+                                                   "age_hours": 3.2} for name in ("messaging", "calendar", "recordings", "calls")})
+    assert p.backup_health_lines(path) == [
+        *(f"backup {name}: {word} last capture 2026-11-06T18:00:07Z age=3.2h (checked {checked})"
+          for name in ("messaging", "calendar", "recordings", "calls")), BACKUP_HINT]
+
+
+# spec: ANYM-807
+def test_a_profile_missing_from_the_result_prints_not_configured(tmp_path):
+    path = tmp_path / "result.json"
+    health_result(path, profiles={"messaging": {"word": "delivered", "last_snapshot_at": None, "age_hours": None}})
+    lines = p.backup_health_lines(path)
+    assert lines[0].startswith("backup messaging: delivered last capture never age=?")
+    assert lines[1:] == ["backup calendar: not configured", "backup recordings: not configured",
+                         "backup calls: not configured", BACKUP_HINT]
+
+
+# spec: ANYM-807
+@pytest.mark.parametrize("case,reason", [("absent", "no recent check"), ("old", "no recent check"),
+                                         ("future", "no recent check"), ("malformed", "result unreadable"),
+                                         ("not_object", "result unreadable")])
+def test_an_absent_old_future_or_malformed_result_prints_four_unknown_lines(tmp_path, case, reason):
+    path = tmp_path / "result.json"
+    if case == "old":
+        health_result(path, checked_ago=timedelta(hours=3, minutes=1))
+    elif case == "future":
+        health_result(path, checked_ago=timedelta(minutes=-10))
+    elif case == "malformed":
+        path.write_text("{not json")
+    elif case == "not_object":
+        path.write_text("[1]")
+    assert p.backup_health_lines(path) == [f"backup {name}: UNKNOWN ({reason})"
+                                           for name in ("messaging", "calendar", "recordings", "calls")] + [BACKUP_HINT]
+
+
+# spec: ANYM-807
+@given(st.binary(max_size=200) | JSON_VALUES.map(lambda value: json.dumps(value).encode()))
+def test_any_backup_result_gives_five_lines_and_no_error(content):
+    with tempfile.NamedTemporaryFile() as handle:
+        handle.write(content)
+        handle.flush()
+        lines = p.backup_health_lines(handle.name)
+    assert len(lines) == 5 and lines[-1] == BACKUP_HINT
+    assert all(line.startswith("backup ") and "\n" not in line for line in lines[:4])
+
+
+# spec: ANYM-807
+def test_status_prints_the_backup_lines_on_stderr_and_keeps_one_json_document(tmp_path, monkeypatch, capsys):
+    result = tmp_path / "result.json"
+    health_result(result)
+    monkeypatch.setattr(p, "BACKUP_HEALTH_RESULT", result)
+    monkeypatch.delenv("DEEDKIT_DEPLOY_CONFIG", raising=False)
+    monkeypatch.setattr(p, "CONFIG_DIRECTORY", tmp_path / "etc")
+    monkeypatch.setattr(p, "PAUSE", tmp_path / "etc" / "autodeploy.pause")
+    monkeypatch.setattr(p, "lock", lambda state: contextlib.nullcontext())
+    monkeypatch.setattr(p, "CALENDAR_FRESHNESS", tmp_path / "none.json")
+    state = tmp_path / "state"
+    state.mkdir()
+    p.write(state / "current.json", {"sha": "c" * 40, "status": "applied"})
+    monkeypatch.setattr(p, "config", lambda path: {"state_directory": str(state)})
+    p.main(["status"])
+    printed = capsys.readouterr()
+    assert json.loads(printed.out)["sha"] == "c" * 40
+    err = printed.err.splitlines()
+    assert err[0] == "calendar backup: no recent freshness check" and err[-1] == INFERENCE_WORKER_LINE
+    assert err[1:6] == p.backup_health_lines(result)
 
 
 # spec: ANYM-794
