@@ -1,8 +1,10 @@
 """Task state in SQLite. Every admission, launch re-check and state change is one `BEGIN IMMEDIATE` transaction,
 which serializes this process's threads and the `agent-runner stop-all` CLI alike."""
 
+import fcntl
 import hashlib
 import json
+import os
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -41,6 +43,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   branch TEXT,
   compare_url TEXT,
   volumes_removed INTEGER NOT NULL DEFAULT 0,
+  -- 1 once the task's container is confirmed gone (or never existed); until then it holds its engine's slot.
+  container_gone INTEGER NOT NULL DEFAULT 0,
   content_deleted INTEGER NOT NULL DEFAULT 0,
   created_at REAL NOT NULL,
   starting_at REAL,
@@ -50,6 +54,19 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 CREATE INDEX IF NOT EXISTS tasks_state ON tasks (engine, state, created_at);
 """
+
+
+@contextmanager
+def launch_lock(state_dir):
+    """The runner's lock: one launch's re-check and `docker start`, `stop`, and `stop-all` (another process)
+    exclude each other, so a stop either lands before the start (nothing runs) or after it (the running
+    container is stopped). flock: separate opens conflict across processes and threads alike."""
+    fd = os.open(Path(state_dir) / "launch.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 class Refused(Exception):
@@ -113,7 +130,7 @@ class Store:
         with self.connect() as db:
             marks = ",".join("?" * len(states))
             return [dict(r) for r in db.execute(
-                f"SELECT * FROM tasks WHERE state IN ({marks}) ORDER BY created_at, id", states)]
+                f"SELECT * FROM tasks WHERE state IN ({marks}) ORDER BY created_at, rowid", states)]
 
     def admit(self, principal, fields, preamble_sha256, *, paused, refusal, daily_cap):
         """Dedup, pause, engine/host refusals, caps and insert in one transaction. Returns (task, created)."""
@@ -217,6 +234,21 @@ class Store:
             used = db.execute("SELECT COUNT(*) FROM tasks WHERE counts_toward_cap = 1 AND created_at > ?",
                               (self.clock() - 86400,)).fetchone()[0]
         return max(0, daily_cap - used)
+
+    def slot_held(self, engine):
+        """An engine's slot is held by an active task and by a terminal one whose container is not confirmed
+        gone, so the next task of that engine never runs beside a container that is still stopping."""
+        with self.connect() as db:
+            return db.execute("SELECT COUNT(*) FROM tasks WHERE engine = ? AND (state IN ('starting', 'running') "
+                              "OR (container IS NOT NULL AND container_gone = 0 AND state NOT IN ('queued')))",
+                              (engine,)).fetchone()[0] > 0
+
+    def unreconciled(self):
+        """Terminal tasks whose container is not confirmed gone (a failed or pending stop)."""
+        with self.connect() as db:
+            return [dict(r) for r in db.execute(
+                "SELECT * FROM tasks WHERE container IS NOT NULL AND container_gone = 0 AND state IN "
+                "('succeeded', 'failed', 'stopped', 'timed_out', 'lost') ORDER BY created_at")]
 
     def counts(self, engine):
         with self.connect() as db:

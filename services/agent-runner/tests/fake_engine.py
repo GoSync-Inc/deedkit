@@ -53,6 +53,16 @@ elif mode == "list_workspace":
     seen = sorted(p.name for p in workspace.iterdir()) + sorted(
         p.name for p in pathlib.Path(os.environ["FAKE_CODEX_HOME"]).iterdir())
     (out / "result.txt").write_text("seen: " + " ".join(seen))
+elif mode == "noline":
+    for _ in range(48):  # 3 MiB without a newline, then an ordinary result line
+        sys.stdout.write("y" * 65536)
+    sys.stdout.flush()
+    emit('\n{"type":"result","subtype":"success","is_error":false,"result":"RESULT: done — after a long line"}')
+elif mode == "malformed":
+    emit('{"type":"assistant","message":"a string where an object belongs"}')
+    emit('{"type":"assistant","message":{"content":"not a list"}}')
+    emit('{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":"x"}]}}')
+    emit('{"type":"result","is_error":false,"result":"RESULT: done — survived"}')
 elif mode == "flood":
     line = '{"type":"assistant","message":{"content":[{"type":"text","text":"' + "x" * 1000 + '"}]}}'
     for _ in range(7000):

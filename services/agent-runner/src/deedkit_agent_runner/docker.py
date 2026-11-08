@@ -66,7 +66,9 @@ def env_args(env):
 def hardening(config):
     return ["--user", config.task_user, "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "--read-only", "--tmpfs", TMP, "--memory", MEMORY, "--memory-swap", MEMORY,
-            "--pids-limit", str(PIDS), "--cpus", str(CPUS)]
+            "--pids-limit", str(PIDS), "--cpus", str(CPUS),
+            # No daemon-side copy of the output: the runner reads the attached stream into its own capped log.
+            "--log-driver", "none"]
 
 
 def login_mount(config, engine):
@@ -86,17 +88,26 @@ def task_create_argv(config, task_id, engine):
             config.image, *(CLAUDE_ARGV if engine == "claude" else CODEX_ARGV)]
 
 
-def oneoff_argv(config, engine, command, network=True):
-    """A throwaway container (help check, login status, Codex login hygiene): same hardening, no task volume."""
+def oneoff_argv(config, engine, command, network=True, login=True):
+    """A throwaway container (help check, login status, Codex login hygiene): same hardening, no task volume.
+    Without `login` it gets neither the Codex login volume nor the Claude login (the help check)."""
+    env = engine_env(engine)
+    if not login:
+        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
     return ["run", "--rm", *hardening(config), "--network", config.network if network else "none",
-            *login_mount(config, engine), *env_args(engine_env(engine)), config.image, *command]
+            *(login_mount(config, engine) if login else []), *env_args(env), config.image, *command]
 
 
 # Removes everything in the Codex login volume except a regular auth.json, so nothing one task writes reaches
-# the next one.
-CODEX_HYGIENE = ("sh", "-c", f'cd {CODEX_HOME} && for f in .[!.]* ..?* *; do [ -e "$f" ] || [ -L "$f" ] || '
-                 'continue; if [ "$f" = auth.json ] && [ -f "$f" ] && [ ! -L "$f" ]; then continue; fi; '
-                 'rm -rf -- "$f"; done')
+# the next one. A task's own files may carry any mode, so each entry is made writable first (never through a
+# symlink operand); any failed removal, or anything left but a regular auth.json, exits non-zero.
+HYGIENE_SCRIPT = (
+    'set -eu; cd "$CODEX_HOME"; '
+    'keep() { [ "$1" = auth.json ] && [ -f "$1" ] && [ ! -L "$1" ]; }; '
+    'for f in .[!.]* ..?* *; do [ -e "$f" ] || [ -L "$f" ] || continue; keep "$f" && continue; '
+    '[ -L "$f" ] || chmod -R u+rwx -- "$f"; rm -rf -- "$f"; done; '
+    'for f in .[!.]* ..?* *; do [ -e "$f" ] || [ -L "$f" ] || continue; keep "$f" || exit 3; done')
+CODEX_HYGIENE = ("sh", "-c", HYGIENE_SCRIPT)
 
 
 class DockerError(Exception):
@@ -184,5 +195,5 @@ class DockerCLI:
         except tarfile.TarError:
             return None
 
-    def oneoff(self, args, engine, timeout=60):
-        return self._run(args, timeout=timeout, env={**self.env, **self.secret_env(engine)})
+    def oneoff(self, args, engine, timeout=60, login=True):
+        return self._run(args, timeout=timeout, env={**self.env, **(self.secret_env(engine) if login else {})})

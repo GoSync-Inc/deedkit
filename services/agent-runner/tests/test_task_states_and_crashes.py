@@ -9,7 +9,7 @@ from support import Gate, fields, make_runner, run_task
 
 def restart(old):
     """A new runner process over the same state directory and the same (surviving) VM containers."""
-    fresh = Runner(old.config, old.docker, Gate(), clock=old.clock)
+    fresh = Runner(old.config, old.docker, Gate(), clock=old.clock, publisher=old.publisher)
     fresh.startup()
     return fresh
 
@@ -116,7 +116,6 @@ def test_lost_tasks_keep_their_volumes_for_the_export(tmp_path):
     runner.tick()
     wait_running(runner, task["id"])
     fresh = restart(runner)
-    fresh.publisher = runner.publisher
     runner.join(30)
     assert fresh.store.task(task["id"])["state"] == "lost"
     assert f"agent-ws-{task['id']}" in fresh.docker.volumes and f"agent-out-{task['id']}" in fresh.docker.volumes

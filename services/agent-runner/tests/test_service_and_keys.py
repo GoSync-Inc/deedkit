@@ -76,13 +76,25 @@ def test_removing_a_key_from_the_private_file_revokes_it_without_a_restart(clien
 
 
 # spec: ANYM-819
+def test_a_revocation_made_while_the_service_starts_holds_at_the_first_request(tmp_path):
+    path, config = write_config(tmp_path)  # serve loaded the config here and is running its startup checks
+    data = document(tmp_path)
+    data["keys"] = [k for k in data["keys"] if k["key_id"] != "b-run"]
+    write_private(path, data)
+    keys = cfg.Keys(path)  # built after the change
+    assert keys.get(sha("key-b-run-0001")) is None
+    assert keys.get(sha("key-a-run-0001")).principal == "orchestrator-a"
+    assert any(k.key_id == "b-run" for k in config.keys)  # the earlier load still had it
+
+
+# spec: ANYM-819
 def test_only_production_peer_is_answered_on_the_tailnet_listener(runner):
-    app = PeerGuard(create_app(runner, cfg.Keys(runner.config_path, runner.config)), [PEER])
+    app = PeerGuard(create_app(runner, cfg.Keys(runner.config_path)), [PEER])
     for peer in ("100.100.1.3", "127.0.0.1", "192.168.1.10"):
         with TestClient(app, client=(peer, 50000)) as other:
             response = other.get("/v1/capabilities", headers=auth("a_run"))
             assert response.status_code == 403 and response.json() == {"error": "peer_refused"}, peer
-    loopback = PeerGuard(create_app(runner, cfg.Keys(runner.config_path, runner.config)), ["127.0.0.1", "::1"])
+    loopback = PeerGuard(create_app(runner, cfg.Keys(runner.config_path)), ["127.0.0.1", "::1"])
     with TestClient(loopback, client=("127.0.0.1", 50000)) as local:
         assert local.get("/v1/capabilities", headers=auth("a_read")).status_code == 200
     with TestClient(loopback, client=(PEER, 50000)) as remote:

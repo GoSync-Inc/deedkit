@@ -44,10 +44,13 @@ class Stream:
             event = json.loads(line)
         except ValueError:
             event = None
-        if not isinstance(event, dict):
-            text = line.strip()
-            return [("tool", clip(text, TEXT_LIMIT))] if text else []
-        return (self._claude if self.engine == "claude" else self._codex)(event)
+        if isinstance(event, dict):
+            try:
+                return (self._claude if self.engine == "claude" else self._codex)(event)
+            except (AttributeError, TypeError, ValueError, KeyError):
+                pass  # an event of an unexpected shape is logged as text, never fatal to monitoring
+        text = line.strip()
+        return [("tool", clip(text, TEXT_LIMIT))] if text else []
 
     def _text(self, text):
         if text and text.strip():

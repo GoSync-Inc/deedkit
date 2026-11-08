@@ -24,7 +24,7 @@ def runner(tmp_path, clock):
 
 @pytest.fixture
 def client(runner):
-    app = PeerGuard(create_app(runner, cfg.Keys(runner.config_path, runner.config)), [PEER])
+    app = PeerGuard(create_app(runner, cfg.Keys(runner.config_path)), [PEER])
     with TestClient(app, client=(PEER, 50000)) as value:
         yield value
 

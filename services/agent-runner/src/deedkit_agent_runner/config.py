@@ -190,8 +190,11 @@ class Config(Strict):
 def parse(raw):
     try:
         return Config.model_validate(json.loads(raw))
-    except (ValueError, ValidationError) as error:
-        raise ConfigError("config_invalid", str(error).splitlines()[0] if str(error) else "") from None
+    except ValidationError as error:
+        detail = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in error.errors())
+        raise ConfigError("config_invalid", detail[:500]) from None
+    except ValueError:
+        raise ConfigError("config_invalid", "not JSON") from None
 
 
 def load(path):
@@ -204,12 +207,21 @@ def load(path):
 class Keys:
     """The key table, re-read when the file changes, so a revocation takes effect without a restart.
 
-    An unreadable or invalid file after a change authorizes nobody until it is valid again.
+    An unreadable or invalid file after a change authorizes nobody until it is valid again. The table and its
+    change mark come from this object's own reads (mark first, then the file), never from an earlier load, so a
+    change made while the service was starting is seen at the first request.
     """
 
-    def __init__(self, path, config):
+    def __init__(self, path):
         self.path, self._lock = Path(path), threading.Lock()
-        self._mark, self._keys = self._stat(), {k.sha256: k for k in config.keys}
+        self._mark = self._stat()
+        self._keys = self._read()
+
+    def _read(self):
+        try:
+            return {k.sha256: k for k in load(self.path).keys}
+        except ConfigError:
+            return {}
 
     def _stat(self):
         try:
@@ -223,8 +235,5 @@ class Keys:
             mark = self._stat()
             if mark != self._mark:
                 self._mark = mark
-                try:
-                    self._keys = {k.sha256: k for k in load(self.path).keys}
-                except ConfigError:
-                    self._keys = {}
+                self._keys = self._read()
             return self._keys.get(sha256)

@@ -119,6 +119,7 @@ class FakeDocker:
         self.secret_values = []
         self.lock = threading.Lock()
         self.fail_create, self.config = None, None
+        self.unstoppable, self.oneoff_logins, self.hygiene_code = set(), [], None
         self.on_create = None
         self.codex_login = self.root / "codex-login"
         self.codex_login.mkdir(parents=True, exist_ok=True)
@@ -184,6 +185,8 @@ class FakeDocker:
 
     def _signal(self, name, sig):
         container = self.containers.get(name)
+        if name in self.unstoppable:  # a stop or kill that does not land (a hung daemon)
+            return
         if container and container.proc and container.proc.poll() is None:
             try:
                 os.killpg(container.proc.pid, sig)  # the container's whole process tree, as the cgroup kill does
@@ -199,7 +202,10 @@ class FakeDocker:
         self._signal(name, 9)
 
     def remove(self, name):
-        with self.lock:
+        with self.lock:  # as `docker rm` without force: a running container stays
+            container = self.containers.get(name)
+            if container and container.proc and container.proc.poll() is None:
+                return
             self.containers.pop(name, None)
 
     def labelled(self):
@@ -212,18 +218,23 @@ class FakeDocker:
         target = self.volume_dir(f"agent-out-{container.task_id}") / Path(path).name
         return target.read_bytes()[:limit] if target.exists() else None
 
-    def oneoff(self, args, engine, timeout=60):
+    def oneoff(self, args, engine, timeout=60, login=True):
         self.oneoffs.append(args)
+        self.oneoff_logins.append((args[-1], login))
+        if login and engine == "claude":
+            from deedkit_agent_runner.runner import claude_token
+            claude_token(self.config)  # the CLI's secret_env reads the login file only for a login run
         if args[-1] == "--help":
             return 0, self.help_text[engine].encode(), b""
         if args[-1] == "status":
             return (0, b"Logged in", b"") if self.login_code == 0 else (1, b"Not logged in. Please run /login", b"")
         if args[-3:-1] == ["sh", "-c"]:
-            for entry in self.codex_login.iterdir():
-                if entry.name == "auth.json" and entry.is_file() and not entry.is_symlink():
-                    continue
-                shutil.rmtree(entry) if entry.is_dir() and not entry.is_symlink() else entry.unlink()
-            return 0, b"", b""
+            if self.hygiene_code is not None:
+                return self.hygiene_code, b"", b""
+            # The real script, under this account, on the fake login volume.
+            done = subprocess.run(["sh", "-c", args[-1]], env={"PATH": os.environ.get("PATH", ""),
+                                  "CODEX_HOME": str(self.codex_login)}, capture_output=True, timeout=60)
+            return done.returncode, done.stdout, done.stderr
         return 0, b"", b""
 
     def runs(self):

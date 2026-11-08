@@ -100,13 +100,20 @@ def test_live_the_container_is_non_root_without_capabilities_and_read_only(live,
     assert not any(m.startswith(("/Users", "/home", "/root", "/var/run")) for m in found["mounts"])
     ours = {"HOME", "DISABLE_AUTOUPDATER", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "CLAUDE_CODE_OAUTH_TOKEN",
             "CODEX_HOME"}
-    image_env = {"PATH", "LANG", "GPG_KEY", "PYTHON_VERSION", "PYTHON_SHA256", "HOSTNAME"}
+    image_env = {"PATH", "LANG", "GPG_KEY", "PYTHON_VERSION", "PYTHON_SHA256", "HOSTNAME", "LC_CTYPE", "PWD"}
     assert set(found["env"]) <= ours | image_env, set(found["env"]) - ours - image_env
     if engine == "claude":
         assert found["token"] == TOKEN and "CODEX_HOME" not in found["env"]
         assert "/codex-home" not in found["mounts"]
     else:
         assert found["token"] is None and "/codex-home" in found["mounts"]
+
+
+# spec: ANYM-819
+def test_live_the_codex_login_volume_is_emptied_under_the_container_uid(live):
+    assert run(live, "codex", "poison")["state"] == "succeeded"
+    found = report(run(live, "codex", "listhome"))
+    assert found == {"codex_home": []}  # no login file here, and nothing the first task left
 
 
 # spec: ANYM-819

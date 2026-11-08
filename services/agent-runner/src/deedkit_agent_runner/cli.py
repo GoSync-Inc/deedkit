@@ -78,7 +78,7 @@ def command_serve(args):
     runner.startup()
     worker = threading.Thread(target=runner.serve_forever, name="agent-scheduler", daemon=True)
     worker.start()
-    asyncio.run(serve(runner, cfg.Keys(args.config, config), config))
+    asyncio.run(serve(runner, cfg.Keys(args.config), config))
     worker.join(5)
     return 0
 

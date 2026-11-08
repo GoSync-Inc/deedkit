@@ -34,22 +34,32 @@ key, 404 another principal's task, 409 `request_id_conflict` / `engine_not_confi
   socket, runner config or a GitHub credential. Environment names are allowlisted in
   `src/deedkit_agent_runner/docker.py`.
 - The prompt is `preamble.md` (versioned; each task records its SHA-256) followed by the instruction, on stdin.
-- Logs are at most 5 MiB per task, then a marker line.
+- Logs are at most 5 MiB per task, then a marker line. A single output line is cut at 16 KiB and the rest of
+  it dropped, so a container that never prints a newline cannot grow the runner's memory.
 
 ## Kill switch
 
 `agent-runner stop-all --config <file>` creates the `pause` file in the state directory, then stops every
-queued, starting and running task. `agent-runner resume --config <file>` removes the file. Immediately before
-the container starts, the launch re-checks, in one SQLite transaction, that the task is still `starting`, not
-cancelled, and that no pause file exists.
+queued, starting and running task. `agent-runner resume --config <file>` removes the file. The launch takes the
+runner's lock (`launch.lock` in the state directory, `flock`) for two steps: it re-checks in one SQLite
+transaction that the task is still `starting`, not cancelled, and that no pause file exists, and then it starts
+the container. `stop` and `stop-all` take the same lock. A stop therefore lands either before the start, and
+no engine runs, or after it, and the running container is stopped.
+
+A stopped or timed-out task keeps its engine's slot until its container is confirmed gone. The scheduler
+retries the stop and removal on every tick, so a second task of that engine never runs beside a container
+that is still stopping.
 
 ## Storage and retention
 
 The state directory holds SQLite task rows, logs, patches (S4) and the audit file. The task container is
 removed at its terminal state. Its volumes are removed once publication settles. Instruction, owner
 instruction, summary, log and patch go 14 days after the terminal state. Dedup rows and the audit (hashes,
-never the texts) go after 365 days. Only the engines' login files persist across tasks: the Codex login volume
-is emptied of everything except `auth.json` before each Codex task.
+never the texts) go after 365 days. Containers run with `--log-driver none`: Docker keeps no copy of their
+output, and the runner's capped log is the only one. Only the engines' login files persist across tasks. The
+Codex login volume is emptied of everything except a regular `auth.json` before each Codex task, after it,
+at restart and at the hourly sweep. Any entry the cleanup cannot remove fails the next Codex task before it
+starts.
 
 ## Hooks the later slices fill
 

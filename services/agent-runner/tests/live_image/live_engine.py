@@ -64,6 +64,19 @@ elif mode == "probe":
         "prompt_has_preamble": "agent-runner preamble v1" in prompt,
     }
     finish(json.dumps(report))
+elif mode == "poison":
+    # Files a task leaves in the Codex login volume that a plain non-root `rm -rf` cannot remove.
+    os.makedirs("/codex-home/a-locked/inner")
+    with open("/codex-home/a-locked/inner/secret.txt", "w") as handle:
+        handle.write("synthetic")
+    os.chmod("/codex-home/a-locked/inner", 0)
+    os.chmod("/codex-home/a-locked", 0)
+    with open("/codex-home/b-file", "w") as handle:
+        handle.write("x")
+    os.symlink("/workspace", "/codex-home/link")
+    finish("poisoned\nRESULT: done — poisoned")
+elif mode == "listhome":
+    finish(json.dumps({"codex_home": sorted(os.listdir("/codex-home"))}))
 elif mode == "detached":
     child = subprocess.Popen(["sleep", "600"], start_new_session=True)  # setsid: outside the engine's group
     with open("/out/child.pid", "w") as handle:

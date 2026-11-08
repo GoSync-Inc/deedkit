@@ -73,6 +73,42 @@ def test_summary_and_last_text_are_capped():
 
 
 # spec: ANYM-819
+def test_a_line_without_a_newline_is_cut_at_the_raw_limit_and_the_task_goes_on(tmp_path):
+    from deedkit_agent_runner.runner import RAW_LIMIT
+    runner = make_runner(tmp_path, modes={"claude": "noline"})
+    task = run_task(runner)
+    assert task["state"] == "succeeded" and task["outcome"] == "done"
+    lines = [json.loads(x) for x in (runner.state_dir / "logs" / f"{task['id']}.jsonl").read_text().splitlines()]
+    cut = [x for x in lines if x["text"].endswith("[line cut]")]
+    assert len(cut) == 1 and len(cut[0]["raw"]) <= RAW_LIMIT
+    assert all(len(x["raw"]) <= RAW_LIMIT for x in lines)
+
+
+# spec: ANYM-819
+def test_events_of_an_unexpected_shape_are_logged_as_text_and_never_stop_monitoring(tmp_path):
+    runner = make_runner(tmp_path, modes={"claude": "malformed"})
+    task = run_task(runner)
+    assert (task["state"], task["outcome"]) == ("succeeded", "done")
+    stream = engines.Stream("claude")
+    assert stream.feed('{"type":"assistant","message":"x"}') == [("tool", '{"type":"assistant","message":"x"}')]
+    codex = engines.Stream("codex")
+    assert codex.feed('{"type":"item.completed","item":{"type":"file_change","changes":"x"}}')
+
+
+# spec: ANYM-819
+def test_a_monitoring_failure_still_stops_and_removes_the_container(tmp_path):
+    runner = make_runner(tmp_path, modes={"claude": "sleep"})
+
+    def broken(*args):
+        raise RuntimeError("synthetic monitor failure")
+
+    runner.monitor = broken
+    task = run_task(runner)
+    assert (task["state"], task["reason"]) == ("failed", "runner_error")
+    assert runner.docker.labelled() == [] and task["container_gone"] == 1
+
+
+# spec: ANYM-819
 def test_log_pages_are_at_most_64_kib_with_an_opaque_cursor(tmp_path):
     runner = make_runner(tmp_path, modes={"claude": "flood"})
     task = run_task(runner)
@@ -99,7 +135,7 @@ def test_a_bad_cursor_is_422_and_a_running_task_says_wait(tmp_path):
     from deedkit_agent_runner.app import PeerGuard, create_app
     from support import PEER
     runner = make_runner(tmp_path, modes={"claude": "sleep"})
-    app = PeerGuard(create_app(runner, cfg.Keys(runner.config_path, runner.config)), [PEER])
+    app = PeerGuard(create_app(runner, cfg.Keys(runner.config_path)), [PEER])
     task, _ = runner.submit("orchestrator-a", "a-run", fields())
     runner.tick()
     with TestClient(app, client=(PEER, 1)) as client:

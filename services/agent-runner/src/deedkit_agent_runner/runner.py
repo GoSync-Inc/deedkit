@@ -19,7 +19,7 @@ from . import docker as dk
 from . import engines
 from .config import ENGINES, ConfigError, read_private
 from .journal import Audit, TaskLog, page
-from .store import ACTIVE, SETTLED, TERMINAL, Refused, Store
+from .store import ACTIVE, SETTLED, TERMINAL, Refused, Store, launch_lock
 
 log = logging.getLogger(__name__)
 HOST_WAIT_S = 3600
@@ -42,13 +42,17 @@ def iso(value):
     return datetime.datetime.fromtimestamp(value, datetime.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+class LoginUnavailable(ValueError):
+    """The runner's own copy of an engine's login is missing or unreadable."""
+
+
 def claude_token(config):
     try:
         value = read_private(config.engines.claude.token_file, 4096).decode().strip()
-    except (OSError, UnicodeDecodeError):
-        raise ValueError("claude_token_unreadable") from None
+    except (OSError, UnicodeDecodeError, ConfigError):
+        raise LoginUnavailable("claude_token_unreadable") from None
     if not value or any(c.isspace() for c in value):
-        raise ValueError("claude_token_unreadable")
+        raise LoginUnavailable("claude_token_unreadable")
     return {"CLAUDE_CODE_OAUTH_TOKEN": value}
 
 
@@ -80,10 +84,11 @@ class Runner:
     def _help_check(self, engine):
         if self.config.engine(engine) is None:
             return False
-        try:
-            code, out, err = self.docker.oneoff(dk.oneoff_argv(self.config, engine, dk.HELP_ARGV[engine], False),
-                                                engine)
-        except dk.DockerError:
+        try:  # no login of any kind: a missing or broken login never disables an engine or stops the service
+            code, out, err = self.docker.oneoff(
+                dk.oneoff_argv(self.config, engine, dk.HELP_ARGV[engine], network=False, login=False), engine,
+                login=False)
+        except (dk.DockerError, ConfigError, ValueError, OSError):
             return False
         ok = code == 0 and engines.help_ok(engine, (out + err).decode(errors="replace"), dk.REQUIRED_FLAGS)
         if not ok:
@@ -99,6 +104,11 @@ class Runner:
         for name, _task_id in self.docker.labelled():
             self.docker.kill(name)
             self.docker.remove(name)
+        remaining = {name for name, _ in self.docker.labelled()}
+        self.codex_hygiene()  # the last Codex task's files, before any slot frees
+        for task in self.store.unreconciled():
+            if task["container"] not in remaining:
+                self.store.update(task["id"], container_gone=1)
         for task in self.store.rows(*TERMINAL):
             if task["publish_state"] == "pending" or not task["volumes_removed"]:
                 self.settle(task["id"])
@@ -128,13 +138,15 @@ class Runner:
             if task["started_at"] and now >= task["started_at"] + task["max_minutes"] * 60:
                 if self.store.finish(task["id"], "timed_out", "max_minutes"):
                     self._audit(task["id"])
-                    self._spawn(f"stop-{task['id']}", self.docker.stop, task["container"])
+        # Every terminal task whose container is not confirmed gone (a stop, a timeout, a failed stop earlier)
+        # is stopped and removed here; its engine's slot stays held until then.
+        for task in self.store.unreconciled():
+            self._spawn_once(f"reconcile-{task['id']}", self._reconcile, task["id"], task["container"])
         if self.paused():
             return
         for engine in ENGINES:
-            counts = self.store.counts(engine)
             queued = [t for t in self.store.rows("queued") if t["engine"] == engine]
-            if counts["running"] or not queued:
+            if self.store.slot_held(engine) or not queued:
                 continue
             task = queued[0]
             if not self.configured.get(engine):
@@ -160,6 +172,38 @@ class Runner:
         with self._lock:
             self.threads[key] = thread
         thread.start()
+
+    def _spawn_once(self, key, target, *args):
+        """Spawn unless a thread with this key is still alive."""
+        with self._lock:
+            thread = self.threads.get(key)
+            if thread is not None and thread.is_alive():
+                return
+        self._spawn(key, target, *args)
+
+    def _reconcile(self, task_id, name):
+        if self.docker.running(name) not in ("missing", "exited", "dead"):
+            self.docker.stop(name)
+        self._end(task_id, name)
+
+    def codex_hygiene(self):
+        """Empty the Codex login volume of everything but a regular auth.json. True when it verifiably did.
+
+        Under the runner's lock, and never while a Codex task runs: a late cleanup of an earlier task can then
+        not touch the files of the task that uses the volume now (that task's own launch emptied it before)."""
+        if self.config.engine("codex") is None:
+            return True
+        with launch_lock(self.state_dir):
+            if any(t["engine"] == "codex" for t in self.store.rows("running")):
+                return True
+            try:
+                code, _, _ = self.docker.oneoff(
+                    dk.oneoff_argv(self.config, "codex", dk.CODEX_HYGIENE, network=False), "codex")
+            except (dk.DockerError, OSError):
+                code = -1
+        if code:
+            log.warning("codex login hygiene failed (exit %s)", code)
+        return code == 0
 
     def _guard(self, target, *args):
         try:
@@ -200,50 +244,76 @@ class Runner:
         try:
             self.docker.volume_create(dk.workspace_volume(task_id), self.config.workspace_volume, task_id)
             self.docker.volume_create(dk.out_volume(task_id), self.config.out_volume, task_id)
-            if engine == "codex":
-                code, _, _ = self.docker.oneoff(dk.oneoff_argv(self.config, engine, dk.CODEX_HYGIENE, False), engine)
-                if code:
-                    raise dk.DockerError("codex_login_hygiene_failed")
+            if engine == "codex" and not self.codex_hygiene():
+                raise dk.DockerError("codex_login_hygiene_failed")
             if self.preparer is not None:
                 self.preparer(task, dk.workspace_volume(task_id))
             self.docker.create(dk.task_create_argv(self.config, task_id, engine), engine)
-        except (ConfigError, ValueError) as error:  # the engine's login file is missing or unreadable
+        except LoginUnavailable as error:  # the engine's login file is missing or unreadable
             log.warning("task %s did not start: %s", task_id, error)
             self.store.finish(task_id, "failed", "login_required", counts_toward_cap=0)
             self._end(task_id, name)
             return
-        except (dk.DockerError, OSError) as error:
+        except Exception as error:  # Docker, the volumes, or a preparer hook: never left in `starting`
             log.warning("task %s did not start: %s", task_id, error)
             self.store.finish(task_id, "failed", "container_failed")
             self._end(task_id, name)
             return
-        if not self.store.commit_launch(task_id, self.paused):
-            self._end(task_id, name)
-            return
-        self._audit(task_id)
-        process = self.docker.start_attached(name)
+        process = None
         try:
-            process.stdin.write(f"{self.preamble}\n\n{task['instruction']}\n".encode())
-            process.stdin.close()
-        except OSError:
-            pass
-        # A stop or stop-all that landed between the re-check and the start: the container is stopped now.
-        for _ in range(200):
-            if self.docker.running(name) != "created":
-                break
-            time.sleep(0.05)
-        if self.store.task(task_id)["state"] != "running":
+            # The re-check and the start under the runner's lock: a stop or stop-all either lands first (the
+            # re-check sees it and nothing runs) or waits until the container runs (and then stops it).
+            with launch_lock(self.state_dir):
+                if not self.store.commit_launch(task_id, self.paused):
+                    return
+                process = self.docker.start_attached(name)
+                for _ in range(200):
+                    if self.docker.running(name) != "created":
+                        break
+                    time.sleep(0.05)
+            self._audit(task_id)
+            if self.store.task(task_id)["state"] == "running":
+                try:
+                    process.stdin.write(f"{self.preamble}\n\n{task['instruction']}\n".encode())
+                except OSError:
+                    pass
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+            self.monitor(task_id, engine, name, process)
+        except Exception:
+            log.exception("task %s: launch or monitoring failed", task_id)
+            if self.store.finish(task_id, "failed", "runner_error"):
+                self._audit(task_id)
             self.docker.stop(name)
-        self.monitor(task_id, engine, name, process)
+        finally:
+            self._end(task_id, name)
+
+    def _lines(self, stream):
+        """The engine's output in lines of at most RAW_LIMIT bytes: a longer line is cut there and the rest of
+        it read and dropped, so a container that never prints a newline cannot grow the runner's memory."""
+        while True:
+            chunk = stream.readline(RAW_LIMIT)
+            if not chunk:
+                return
+            if chunk.endswith(b"\n"):
+                yield chunk[:-1].decode(errors="replace"), False
+                continue
+            while True:
+                rest = stream.readline(RAW_LIMIT)
+                if not rest or rest.endswith(b"\n"):
+                    break
+            yield chunk.decode(errors="replace"), True
 
     def monitor(self, task_id, engine, name, process):
         stream = engines.Stream(engine)
         task_log = TaskLog(self.state_dir / "logs" / f"{task_id}.jsonl", self.clock)
         last = 0.0
-        for raw in process.stdout:
-            line = raw.decode(errors="replace").rstrip("\n")
-            for kind, text in stream.feed(line):
-                task_log.write(kind, text, line[:RAW_LIMIT])
+        for line, cut in self._lines(process.stdout):
+            entries = [("tool", engines.clip(line, engines.TEXT_LIMIT) + " [line cut]")] if cut else stream.feed(line)
+            for kind, text in entries:
+                task_log.write(kind, text, line)
             if time.monotonic() - last > PROGRESS_EVERY_S:
                 self._progress(task_id, **stream.progress())
                 last = time.monotonic()
@@ -262,12 +332,19 @@ class Runner:
             self.store.update(task_id, **fields)
         self._progress(task_id, **stream.progress())
         self._audit(task_id)
-        self._end(task_id, name)
 
     def _end(self, task_id, name):
-        """The container goes at the terminal state; its volumes when publication settles."""
+        """The container goes at the terminal state; its volumes when publication settles. The engine's slot is
+        released only once the container is confirmed gone, and for Codex after the login volume is emptied."""
+        task = self.store.get(task_id)
+        if task is None:
+            return
         if name:
             self.docker.remove(name)
+        if not name or self.docker.running(name) == "missing":
+            if task["engine"] == "codex":
+                self.codex_hygiene()  # a failure here fails the next task's own hygiene, before it starts
+            self.store.update(task_id, container_gone=1)
         self.settle(task_id)
 
     def settle(self, task_id):
@@ -318,6 +395,8 @@ class Runner:
         for task in self.store.rows(*TERMINAL):
             if task["id"] not in busy and (task["publish_state"] not in SETTLED or not task["volumes_removed"]):
                 self.settle(task["id"])
+        if not self.store.slot_held("codex"):
+            self.codex_hygiene()  # nothing a Codex task wrote outlives it, even with no later Codex task
         for task_id in self.store.expired_content():
             (self.state_dir / "logs" / f"{task_id}.jsonl").unlink(missing_ok=True)
             shutil.rmtree(self.state_dir / "patches" / task_id, ignore_errors=True)
@@ -327,28 +406,32 @@ class Runner:
 
     # -- stop ------------------------------------------------------------------------------------------------
     def stop(self, task_id, key_id=None):
-        before = self.store.request_stop(task_id)
+        with launch_lock(self.state_dir):
+            before = self.store.request_stop(task_id)
         task = self.store.task(task_id)
         if before in ACTIVE:
             self.audit.record(task, task["state"], key_id)
             if before == "running" and task["container"]:
-                self._spawn(f"stop-{task_id}", self.docker.stop, task["container"])
+                self._spawn_once(f"reconcile-{task_id}", self._reconcile, task_id, task["container"])
             elif before == "queued":
                 self.settle(task_id)
         return task
 
 
 def stop_all(store, docker, pause_file):
-    """`agent-runner stop-all`: the pause file first, then every queued, starting and running task is stopped.
-    Runs in its own process; the server's launch re-check and post-start check see what it wrote."""
-    pause_file.touch(mode=0o600, exist_ok=True)
-    stopped = []
-    for task in store.rows(*ACTIVE):
-        before = store.request_stop(task["id"])
-        if before in ("starting", "running") and task["container"]:
-            docker.stop(task["container"])
-        if before in ACTIVE:
-            stopped.append(task["id"])
+    """`agent-runner stop-all`: under the runner's lock, the pause file first, then every queued, starting and
+    running task is marked stopped; then the running containers are stopped. Runs in its own process."""
+    stopped, running = [], []
+    with launch_lock(pause_file.parent):
+        pause_file.touch(mode=0o600, exist_ok=True)
+        for task in store.rows(*ACTIVE):
+            before = store.request_stop(task["id"])
+            if before == "running" and task["container"]:
+                running.append(task["container"])
+            if before in ACTIVE:
+                stopped.append(task["id"])
+    for name in running:
+        docker.stop(name)
     return stopped
 
 
@@ -389,7 +472,9 @@ def capabilities(runner):
                     code, out, err = runner.docker.oneoff(
                         dk.oneoff_argv(runner.config, engine, dk.LOGIN_ARGV[engine]), engine, timeout=30)
                     state = engines.login_state(code, (out + err).decode(errors="replace"))
-                except (dk.DockerError, OSError, ValueError):
+                except LoginUnavailable:  # the runner's own login file is missing or unreadable
+                    state = "login_required"
+                except (dk.DockerError, OSError):
                     state = "unknown"
             cached = runner.logins[engine] = (state, now)
         counts = runner.store.counts(engine)
