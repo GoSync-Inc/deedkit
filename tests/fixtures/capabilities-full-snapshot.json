@@ -816,5 +816,33 @@
   "schedules",
   "oauth"
  ],
- "version": "<version>"
+ "version": "<version>",
+ "file_policy": {
+  "telegram-demo": {
+   "messages_since": null,
+   "messages_source": "provider_history",
+   "files_auto_days": null,
+   "files_auto_chats": "personal_and_subscribed",
+   "files_other": "on_request",
+   "files_request_call": "request_file_download",
+   "older_messages_call": "request_chat_history",
+   "recognition": [],
+   "provider_media_retention_days": null,
+   "published": false,
+   "status_call": "get_sync_status"
+  },
+  "whatsapp-demo-1": {
+   "messages_since": null,
+   "messages_source": "phone_pairing_batch_and_live",
+   "files_auto_days": null,
+   "files_auto_chats": "personal_and_subscribed",
+   "files_other": "on_request",
+   "files_request_call": "request_file_download",
+   "older_messages_call": "request_chat_history",
+   "recognition": [],
+   "provider_media_retention_days": 30,
+   "published": false,
+   "status_call": "get_sync_status"
+  }
+ }
 }
