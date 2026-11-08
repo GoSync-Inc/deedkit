@@ -385,7 +385,8 @@ def test_dynamic_sources_wait_for_the_operator_switch_and_validate_their_form(se
                 ({'chat_ids': ['telegram-demo-chat'], 'sources': ALL_VISIBLE}, 'invalid_filter'),
                 ({}, 'invalid_filter'),
                 ({'sources': {'all_visible_chats': False}}, 'invalid_filter'),
-                ({'sources': {**ALL_VISIBLE, 'chat_types': ['group']}}, 'invalid_filter'),
+                # ANYM-825: a valid chat_types waits for its own operator switch.
+                ({'sources': {**ALL_VISIBLE, 'chat_types': ['group']}}, 'source_filters_disabled'),
                 ({'sources': {**ALL_VISIBLE, 'include_bots': 'yes'}}, 'invalid_filter'),
                 ({'sources': {**ALL_VISIBLE, 'account_ids': ['whatsapp-demo-2']}}, 'not_found'),
                 ({'sources': ALL_VISIBLE, 'sender_ids': ['demo-person-1']}, 'invalid_filter'),
@@ -424,6 +425,344 @@ def test_dynamic_sources_leave_out_channels_and_bots_unless_included(seeded):
         assert event_ids(store, token, everything) == [person, channel, bot]
     finally:
         store.set_dynamic_subscriptions(False)
+
+
+class source_filters:
+    """ANYM-825: both operator switches on for the block, off afterwards."""
+    def __init__(self, store):
+        self.store = store
+
+    def __enter__(self):
+        self.store.set_dynamic_subscriptions(True)
+        self.store.set_source_filters(True)
+
+    def __exit__(self, *exc):
+        self.store.set_source_filters(False)
+        self.store.set_dynamic_subscriptions(False)
+
+
+def typed_archive(store):
+    """Synthetic accounts whose chats are created by the real adapters and archive ingest path."""
+    from messaging_service.archive import Archive
+    archive = Archive(store)
+    archive.register('tg-types', 'telegram', 'Synthetic typed chats', discover=True)
+    archive.register('wa-types', 'whatsapp', 'Synthetic typed chats', discover=True)
+    return archive
+
+
+def telegram_in(archive, chat, number, *, group=False):
+    """An incoming Telegram message through telegram_message: the adapter types the chat private or group."""
+    from types import SimpleNamespace
+    from telethon import types
+    from messaging_service.adapters import telegram_message
+    entity = types.Chat(id=chat, title='Synthetic group', photo=types.ChatPhotoEmpty(), participants_count=3,
+        date=None, version=1) if group else None
+    message = SimpleNamespace(id=number, chat_id=-chat if group else chat, sender_id=4242, message='Synthetic text',
+        entities=[], out=False, peer_id=types.PeerChat(chat) if group else types.PeerUser(chat), chat=entity,
+        date=datetime(2026, 11, 8, 9, number % 60, tzinfo=timezone.utc), edit_date=None, file=None, document=None,
+        photo=None, media=None)
+    return archive.ingest(telegram_message('tg-types', message))['message']
+
+
+def whatsapp_in(archive, chat, number):
+    """An incoming WhatsApp bridge event through whatsapp_message: the adapter emits no chat type."""
+    from messaging_service.adapters import whatsapp_message
+    event = {'messageId': 'false_%s_SYNTHETIC%d' % (chat, number), 'chatId': chat, 'senderId': '4242@c.us',
+        'timestamp': 1794128400 + number, 'body': 'Synthetic text', 'hasMedia': False}
+    return archive.ingest(whatsapp_message('wa-types', event))['message']
+
+
+def typed_key(store, principal='types-reader'):
+    return dynamic_key(store, principal, accounts=('tg-types', 'wa-types'))
+
+
+def message_events(store, token, sid):
+    """Message references only: a send.failed item names a send, not a message."""
+    return [item['message'] for item in store.get_subscription_events(token, sid)['items'] if 'message' in item]
+
+
+# spec: ANYM-825
+def test_the_heartbeat_identity_fits_the_stored_version_constraint():
+    import re
+    from messaging_service import __version__
+    from messaging_service.heartbeats import identity
+    # Migration 050: version ~ '^[0-9A-Za-z.+-]{1,64}$'; a refused write would silence every heartbeat.
+    assert re.fullmatch(r'[0-9A-Za-z.+-]{1,64}', identity()) and identity().startswith(__version__ + '+')
+
+
+# spec: ANYM-825
+def test_chat_types_validate_their_form_and_wait_for_the_source_filters_switch(seeded):
+    from messaging_service import __version__
+    from messaging_service.heartbeats import identity
+    from messaging_service.store import RUNTIME_SCHEMA
+    store, _, _ = seeded
+    token = dynamic_key(store)
+    private = {**ALL_VISIBLE, 'chat_types': ['private']}
+    with pytest.raises(APIError, match='dynamic_sources_disabled'):
+        store.create_subscription(token, sources=private)
+    store.set_dynamic_subscriptions(True)
+    with store.pool.connection() as c:
+        saved = c.execute('SELECT * FROM component_heartbeats').fetchall()
+    current = identity()
+    def beat(matcher_version):
+        with store.pool.connection() as c:
+            for component, version in (('api', current), ('matcher', matcher_version), ('dispatcher', current)):
+                c.execute('''INSERT INTO component_heartbeats(component,version,schema_version,beat_at)
+                    VALUES(%s,%s,%s,clock_timestamp()) ON CONFLICT(component) DO UPDATE SET version=EXCLUDED.version,
+                    schema_version=EXCLUDED.schema_version,beat_at=EXCLUDED.beat_at''', (component, version, RUNTIME_SCHEMA))
+    try:
+        with pytest.raises(APIError, match='source_filters_disabled'):
+            store.create_subscription(token, sources=private)
+        # Without chat_types nothing changes: no second switch, the stored selector has no new key.
+        plain = store.create_subscription(token, sources=ALL_VISIBLE)
+        assert plain['sources'] == {'all_visible_chats': True, 'account_ids': None, 'include_channels': False,
+            'include_bots': False}
+        # Mixed versions: the deployed matcher reports the same package version and no build features; it would
+        # store group matches for such a definition. The dynamic and delivery switches still accept it.
+        assert current == __version__ + '+source-filters'
+        beat(__version__)
+        assert store.set_source_filters(True, verify_components=True) == {'error': 'component_feature_missing',
+            'component': 'matcher', 'version': __version__, 'expected': current}
+        assert store.set_dynamic_subscriptions(True, verify_components=True) == {'dynamic_subscriptions': 'enabled'}
+        with pytest.raises(APIError, match='source_filters_disabled'):
+            store.create_subscription(token, sources=private)
+        beat(current)
+        assert store.set_source_filters(True, verify_components=True) == {'source_filters': 'enabled'}
+        for chat_types, extra in [([], {}), (['private'] * 2, {}), (['private', 'group', 'channel', 'unknown', 'bot'], {}),
+                (['bot'], {}), ('private', {}), ([1], {}), (['private'], {'include_channels': True})]:
+            with pytest.raises(APIError, match='invalid_filter'):
+                store.create_subscription(token, sources={**ALL_VISIBLE, 'chat_types': chat_types, **extra})
+        # Explicit chats refuse it with every other dynamic source option.
+        with pytest.raises(APIError, match='invalid_filter'):
+            store.create_subscription(token, ['telegram-demo-chat'], sources=private)
+        created = store.create_subscription(token, sources={**ALL_VISIBLE, 'chat_types': ['unknown', 'private']})
+        assert created['sources']['chat_types'] == ['private', 'unknown']
+        channels = store.create_subscription(token, sources={**ALL_VISIBLE, 'include_channels': True,
+            'chat_types': ['channel', 'private']})
+        assert store.get_subscription(token, channels['subscription_id'])['sources']['chat_types'] == ['channel', 'private']
+        only_channels = store.create_subscription(token, sources={**ALL_VISIBLE, 'chat_types': ['channel']})
+        channel = emit(store, chat_message(store, 'telegram-demo-channel', 'demo-tg-channel', chat_type='channel'))
+        untyped = emit(store)
+        match_subscriptions(store)
+        # Naming channel lets channels in without include_channels; the seeded chat is untyped (unknown).
+        assert event_ids(store, token, only_channels['subscription_id']) == [channel]
+        assert event_ids(store, token, created['subscription_id']) == [untyped]
+        assert event_ids(store, token, channels['subscription_id']) == [channel]
+    finally:
+        store.set_source_filters(False)
+        store.set_dynamic_subscriptions(False)
+        with store.pool.connection() as c:
+            c.execute('DELETE FROM component_heartbeats')
+            for row in saved:
+                c.execute('INSERT INTO component_heartbeats(component,version,schema_version,beat_at) VALUES(%s,%s,%s,%s)',
+                    (row['component'], row['version'], row['schema_version'], row['beat_at']))
+
+
+# spec: ANYM-825
+def test_chat_types_leave_out_groups_before_the_match_on_both_platforms(seeded, tmp_path, monkeypatch):
+    from messaging_service import subscriptions
+    store, _, _ = seeded
+    archive = typed_archive(store)
+    left = []
+    monkeypatch.setattr(subscriptions, 'left_out', lambda row, event, reason: left.append(
+        (str(row['id']), event['id'], reason)))
+    # One stored match per definition: a group event that took the budget would block the private one.
+    monkeypatch.setenv('SUBSCRIPTION_MAX_MATCHES', '1')
+    with source_filters(store):
+        token = typed_key(store)
+        private = store.create_subscription(token, sources={**ALL_VISIBLE, 'chat_types': ['private']})['subscription_id']
+        untyped = store.create_subscription(token, sources={**ALL_VISIBLE, 'chat_types': ['private', 'unknown']},
+            kinds=['message.created'])['subscription_id']
+        bind(store, token, private, tmp_path, 'types-reader')
+        tg_group = telegram_in(archive, 500, 1, group=True)
+        wa_group = whatsapp_in(archive, '120363000000000001@g.us', 2)
+        wa_private = whatsapp_in(archive, '4243@c.us', 3)
+        with store.pool.connection() as c:
+            head = c.execute('SELECT value FROM feed_counter WHERE id=1').fetchone()['value']
+            typed = {row['provider_chat']: row['chat_type'] for row in c.execute(
+                "SELECT provider_chat,chat_type FROM chats WHERE account IN ('tg-types','wa-types')").fetchall()}
+        # Telegram types the group at its first message; WhatsApp chats are stored untyped (unknown).
+        assert typed == {'-500': 'group', '120363000000000001@g.us': None, '4243@c.us': None}
+        match_subscriptions(store)
+        view = store.get_subscription(token, private)
+        assert view['matched_event_count'] == 0 and view['matched_through'] == head and view['blocked_reason'] is None
+        assert store.get_subscription(token, private)['delivery']['hint_counts'] == {}
+        assert message_events(store, token, untyped) == [wa_group]
+        assert store.get_subscription(token, untyped)['blocked_reason'] == 'match_budget'
+        tg_private = telegram_in(archive, 4244, 4)
+        match_subscriptions(store)
+        view = store.get_subscription(token, private)
+        assert message_events(store, token, private) == [tg_private] and view['matched_event_count'] == 1
+        assert view['blocked_reason'] is None and view['delivery']['hint_counts'] == {'pending': 1}
+        with store.pool.connection() as c:
+            events = {row['message']: row['id'] for row in c.execute(
+                'SELECT id,message FROM events WHERE message=ANY(%s)', ([tg_group, wa_group, wa_private],)).fetchall()}
+        # The hook gets the reason for every left-out event, once per definition and pass.
+        assert sorted((sid, event) for sid, event, reason in left if sid == private and reason == 'chat_type') == sorted(
+            (private, events[message]) for message in (tg_group, wa_group, wa_private))
+        assert [(sid, event, reason) for sid, event, reason in left if sid == untyped] == [
+            (untyped, events[tg_group], 'chat_type')]
+
+
+# spec: ANYM-825
+def test_whatsapp_chats_count_as_unknown_and_failure_events_keep_their_own_rule(seeded, monkeypatch):
+    from messaging_service import subscriptions
+    from messaging_service.subscriptions import journal_send_failures
+    store, _, _ = seeded
+    archive = typed_archive(store)
+    left = []
+    monkeypatch.setattr(subscriptions, 'left_out', lambda row, event, reason: left.append(reason))
+    with source_filters(store):
+        token = typed_key(store)
+        private = store.create_subscription(token, sources={**ALL_VISIBLE, 'chat_types': ['private']},
+            kinds=['message.created', 'send.failed'])['subscription_id']
+        untyped = store.create_subscription(token, sources={**ALL_VISIBLE, 'chat_types': ['private', 'unknown']})[
+            'subscription_id']
+        wa_private, wa_group = whatsapp_in(archive, '4245@c.us', 5), whatsapp_in(archive, '120363000000000002@g.us', 6)
+        tg_group = telegram_in(archive, 501, 7, group=True)
+        with store.authorized(token) as (_, p):
+            owner = p
+        with store.pool.connection() as c:
+            group_chat = c.execute("SELECT id FROM chats WHERE account='tg-types' AND provider_chat='-501'").fetchone()['id']
+            journal_send_failures(c, [{'status': 'failed', 'account': 'tg-types', 'chat': group_chat,
+                'id': 'send_synthetic_group', 'error_code': 'send_not_started', 'principal': owner['id'],
+                'key_id': owner['key_id']}])
+        match_subscriptions(store)
+        assert message_events(store, token, untyped) == [wa_private, wa_group]
+        items = store.get_subscription_events(token, private)['items']
+        # A send.failed in a group chat matches by its own audience rule; the group messages do not.
+        assert [(item['kind'], item.get('send_id')) for item in items] == [('send.failed', 'send_synthetic_group')]
+        assert tg_group not in message_events(store, token, private)
+        assert left.count('chat_type') == 4
+
+
+# spec: ANYM-825
+def test_a_private_chat_first_seen_after_creation_matches_on_both_platforms(seeded):
+    store, _, _ = seeded
+    archive = typed_archive(store)
+    with source_filters(store):
+        token = typed_key(store)
+        private = store.create_subscription(token, sources={**ALL_VISIBLE, 'chat_types': ['private']})['subscription_id']
+        untyped = store.create_subscription(token, sources={**ALL_VISIBLE, 'chat_types': ['private', 'unknown']})[
+            'subscription_id']
+        before = store.get_subscription(token, private)['version']
+        # Neither chat existed at creation.
+        tg_new, wa_new = telegram_in(archive, 4246, 8), whatsapp_in(archive, '4247@c.us', 9)
+        match_subscriptions(store)
+        assert message_events(store, token, private) == [tg_new]
+        assert message_events(store, token, untyped) == [tg_new, wa_new]
+        assert store.get_subscription(token, private)['version'] == before
+
+
+SHAPES = ('plain', 'mention', 'reply', 'photo', 'document', 'voice', 'forwarded')
+WAKE_CASES = {
+    # rule: the message shapes that wake it; media kinds and forwarding never change the result.
+    'incoming_message': list(SHAPES),
+    'owner_mention': ['mention'],
+    'reply_to_owner': ['reply'],
+    'reply_to_own_send': list(SHAPES),
+}
+
+
+def every_arrival_replies_to_an_own_send(monkeypatch):
+    """reply_to_own_send: every arrival carries the evidence, so only chat_types can leave a group out."""
+    from messaging_service import subscriptions
+    monkeypatch.setattr(subscriptions, '_own_send_replies', lambda c, row, events, visible: {e['id'] for e in events})
+
+
+# spec: ANYM-825
+@pytest.mark.parametrize('rule', sorted(WAKE_CASES))
+def test_chat_types_with_each_wake_rule_match_telegram_private_messages_only(seeded, monkeypatch, rule):
+    store, _, _ = seeded
+    every_arrival_replies_to_an_own_send(monkeypatch)
+    metadata = {'plain': {}, 'mention': {'mentions_owner': True}, 'reply': {'reply_to_owner': True},
+        'photo': {'message_kind': 'photo'}, 'document': {'message_kind': 'document'},
+        'voice': {'message_kind': 'voice'}, 'forwarded': {'message_kind': 'photo', 'forwarded': True}}
+    with source_filters(store):
+        token = dynamic_key(store)
+        sid = store.create_subscription(token, sources={**ALL_VISIBLE, 'chat_types': ['private']},
+            wake_rules=[rule])['subscription_id']
+        expected = {}
+        for kind in ('private', 'group'):
+            for shape in SHAPES:
+                message = chat_message(store, 'telegram-demo-%s-chat' % kind, 'demo-tg-%s-%s' % (kind, shape),
+                    chat_type=kind, metadata=metadata[shape])
+                expected[(kind, shape)] = emit(store, message)
+        # Channels and bot senders keep their defaults, also with every wake evidence present.
+        emit(store, chat_message(store, 'telegram-demo-channel', 'demo-tg-channel-1', chat_type='channel',
+            metadata={'mentions_owner': True, 'reply_to_owner': True}))
+        emit(store, chat_message(store, 'telegram-demo-private-chat', 'demo-tg-bot-1', chat_type='private',
+            metadata={'mentions_owner': True, 'reply_to_owner': True, 'sender_is_bot': True}))
+        match_subscriptions(store)
+        assert event_ids(store, token, sid) == [expected[('private', shape)] for shape in WAKE_CASES[rule]]
+
+
+# spec: ANYM-825
+@pytest.mark.parametrize('rule', sorted(WAKE_CASES))
+def test_whatsapp_wake_rules_with_chat_types_follow_the_unknown_type(seeded, monkeypatch, rule):
+    from messaging_service.adapters import whatsapp_message
+    store, _, _ = seeded
+    archive = typed_archive(store)
+    every_arrival_replies_to_an_own_send(monkeypatch)
+    fields = {'plain': {}, 'mention': {'mentionsOwner': True}, 'reply': {'replyToOwner': True},
+        'photo': {'mediaKind': 'photo'}, 'document': {'mediaKind': 'document'}, 'voice': {'mediaKind': 'voice'},
+        'forwarded': {'mediaKind': 'photo', 'forwarded': True}}
+    with source_filters(store):
+        token = typed_key(store)
+        private = store.create_subscription(token, sources={**ALL_VISIBLE, 'chat_types': ['private']},
+            wake_rules=[rule])['subscription_id']
+        untyped = store.create_subscription(token, sources={**ALL_VISIBLE, 'chat_types': ['private', 'unknown']},
+            wake_rules=[rule])['subscription_id']
+        expected = {}
+        for number, (chat, shape) in enumerate([(chat, shape) for chat in ('4248@c.us', '120363000000000003@g.us')
+                for shape in SHAPES]):
+            event = {'messageId': 'false_%s_SYNTHETIC%d' % (chat, number), 'chatId': chat, 'senderId': '4242@c.us',
+                'timestamp': 1794128500 + number, 'body': 'Synthetic text', 'hasMedia': False, **fields[shape]}
+            expected[(chat, shape)] = archive.ingest(whatsapp_message('wa-types', event))['message']
+        match_subscriptions(store)
+        # Every WhatsApp chat is unknown: [private] takes none, [private, unknown] groups and private chats alike.
+        assert message_events(store, token, private) == []
+        assert message_events(store, token, untyped) == [expected[(chat, shape)]
+            for chat in ('4248@c.us', '120363000000000003@g.us') for shape in WAKE_CASES[rule]]
+
+
+# spec: ANYM-825
+def test_disabling_source_filters_masks_chat_type_definitions_and_cancels_their_hints(seeded, tmp_path):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    with source_filters(store):
+        token = dynamic_key(store)
+        sid = store.create_subscription(token, sources={**ALL_VISIBLE, 'chat_types': ['private', 'unknown']},
+            label='Synthetic filtered')['subscription_id']
+        plain = store.create_subscription(token, sources=ALL_VISIBLE)['subscription_id']
+        explicit = create(store, token)['subscription_id']
+        bind(store, token, sid, tmp_path, 'dynamic-reader')
+        emit(store)
+        group = emit(store, chat_message(store, 'telegram-demo-group', 'demo-tg-group', chat_type='group'))
+        match_subscriptions(store)
+        # What an older matcher would have stored for the definition: the group event, which readers do not filter.
+        with store.pool.connection() as c:
+            c.execute('''INSERT INTO subscription_matches(subscription,event,account,chat,own_send_reply)
+                VALUES(%s,%s,'telegram-demo','telegram-demo-group',false)''', (sid, group))
+        assert store.get_subscription(token, sid)['delivery']['hint_counts'] == {'pending': 1}
+        result = store.set_source_filters(False)
+        assert result['source_filters'] == 'disabled' and result['access_changed'] == [sid]
+        assert len(result['cancelled_hints']) == 1
+        view = store.get_subscription(token, sid)
+        assert set(view) == {'subscription_id', 'state', 'version', 'recreate_required', 'scope_masked'}
+        assert view['state'] == 'access_changed' and 'Synthetic filtered' not in str(store.list_subscriptions(token))
+        page = store.get_subscription_events(token, sid)
+        assert page['items'] == [] and page['scope_masked']
+        with pytest.raises(APIError, match='subscription_access_changed'):
+            store.update_subscription(token, sid, view['version'], action='resume')
+        with pytest.raises(APIError, match='source_filters_disabled'):
+            store.create_subscription(token, sources={**ALL_VISIBLE, 'chat_types': ['private']})
+        # Definitions without chat_types are untouched.
+        assert store.get_subscription(token, plain)['state'] == 'active'
+        assert store.get_subscription(token, explicit)['state'] == 'active'
+        posts = []
+        dispatch_hints(store, transport=lambda *a, **k: posts.append(a) or 204, resolver=lambda *a, **k: ['93.184.216.34'])
+        assert posts == []
 
 
 # spec: ANYM-522

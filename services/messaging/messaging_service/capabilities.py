@@ -179,6 +179,9 @@ def capabilities(self, token, detail='full', sections=None):
                 'send_via':'preview_and_execute_messenger_operation_send_file'},
             'subscriptions':{'implemented':True,'definitions':True,'passive_events':True,
                 'source_selection':'frozen_explicit_chats_and_account_scoped_sender_ids',
+                # ANYM-825: dynamic sources may keep only some chat types; WhatsApp chats are untyped (unknown).
+                'source_chat_types':{'field':'sources.chat_types','values':['private','group','channel','unknown'],
+                    'untyped':'unknown','disabled_error':'source_filters_disabled'},
                 'event_selection':'structural_exact_revision','origin_default':'live',
                 'mutation_permission':'subscription-write','read_permission_required':True,
                 'ownership':'originating_credential_and_principal','new_permission_inherited':False,

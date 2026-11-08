@@ -70,6 +70,27 @@ for(const [index,[method,extra]] of invalid.entries())test(`subscription input b
   assert.equal(calls,0);
 });
 
+// spec: ANYM-825
+test('dynamic sources pass chat_types through and bad forms fail before transport',async()=>{
+  const seen=[];
+  const client=new AnyMsgClient({...options,fetch:async(_,request)=>{
+    seen.push(JSON.parse(request.body));return Response.json({});
+  }});
+  const sources={all_visible_chats:true,chat_types:['private','unknown']};
+  await client.createSubscription({sources,wake_rules:['incoming_message','reply_to_own_send']});
+  await client.createSubscription({sources:{all_visible_chats:true,include_channels:true,chat_types:['channel']}});
+  assert.deepEqual(seen,[{sources,wake_rules:['incoming_message','reply_to_own_send']},
+    {sources:{all_visible_chats:true,include_channels:true,chat_types:['channel']}}]);
+  for(const args of [{},{chat_ids:['chat_synthetic'],sources},{sources:{chat_types:['private']}},
+      {sources:{all_visible_chats:true,chat_types:[]}},{sources:{all_visible_chats:true,chat_types:['private','private']}},
+      {sources:{all_visible_chats:true,chat_types:['bot']}},{sources:{all_visible_chats:true,chat_types:'private'}},
+      {sources:{all_visible_chats:true,include_channels:true,chat_types:['private']}},
+      {sources:{all_visible_chats:true,chat_types:['private','group','channel','unknown','private']}},
+      {sources:{all_visible_chats:true,unknown_option:true}}])
+    assert.throws(()=>client.createSubscription(args),TypeError);
+  assert.equal(seen.length,2);
+});
+
 test('local SDK accepts independent readiness kinds and explicit zoned expiry',async()=>{
   const seen=[];
   const client=new AnyMsgClient({...options,fetch:async(_,request)=>{

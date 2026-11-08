@@ -92,6 +92,9 @@ class SubscriptionSources(TypedDict, total=False):
     account_ids: SubscriptionReferences
     include_channels: StrictBool
     include_bots: StrictBool
+    # ANYM-825: 1-4 distinct of private, group, channel, unknown, before any match; behind the operator's
+    # source_filters switch. The values are checked by the server (invalid_filter), not by this schema.
+    chat_types: list[StrictStr]
 class SubscriptionEndpoint(TypedDict, total=False):
     __pydantic_config__ = ConfigDict(extra='forbid')
     endpoint_id: Required[EndpointReference]

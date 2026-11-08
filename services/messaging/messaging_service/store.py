@@ -1220,6 +1220,11 @@ class Store:
         from .subscriptions import set_dynamic_subscriptions
         return set_dynamic_subscriptions(self, enabled, verify_components=verify_components)
 
+    def set_source_filters(self, enabled, *, verify_components=False):
+        # Operator only (`set-source-filters`, ANYM-825); disabling is the rollback before older code runs.
+        from .subscriptions import set_source_filters
+        return set_source_filters(self, enabled, verify_components=verify_components)
+
     def set_delivery_features(self, enabled, *, verify_components=False):
         # Operator only (`set-delivery-features`, ANYM-534); disabling cancels queued endpoint hints and tests.
         from .delivery_endpoints import set_delivery_features

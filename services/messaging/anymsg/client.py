@@ -138,7 +138,7 @@ _MESSENGER_FIELDS = {
 }
 _OMITTED = object()
 _SUBSCRIPTION_FIELDS = {
-    'create_subscription': ({'chat_ids'}, {'chat_ids','sender_ids','kinds','direction','origins','label','expires_at',
+    'create_subscription': (set(), {'chat_ids','sources','sender_ids','kinds','direction','origins','label','expires_at',
         'wake_rules','reply_to_send','delivery'}),
     'list_subscriptions': (set(), {'limit'}),
     'get_subscription': ({'subscription_id'}, {'subscription_id'}),
@@ -167,7 +167,28 @@ _SUBSCRIPTION_KINDS = frozenset({'message.created','message.edited','message.del
     'attachment.ready','file.text.ready','file.transcript.ready','file.description.ready','file.processing.failed',
     'send.failed','source.health'})
 _SUBSCRIPTION_ORIGINS = frozenset({'live','live_recovered','backfill','reconcile','fixture'})
-_WAKE_RULES = frozenset({'incoming_message','owner_mention','reply_to_owner','reply_to_confirmed_send'})
+_WAKE_RULES = frozenset({'incoming_message','owner_mention','reply_to_owner','reply_to_confirmed_send',
+    'reply_to_own_send'})
+_SOURCE_OPTIONS = frozenset({'all_visible_chats','account_ids','include_channels','include_bots','chat_types'})
+_SOURCE_CHAT_TYPES = frozenset({'private','group','channel','unknown'})
+
+
+def _subscription_sources(value):
+    """ANYM-522 dynamic sources; chat_types (ANYM-825): 1-4 distinct types, include_channels needs channel."""
+    if not isinstance(value,dict) or value.keys()-_SOURCE_OPTIONS or value.get('all_visible_chats') is not True:
+        return False
+    accounts=value.get('account_ids')
+    if accounts is not None and not (isinstance(accounts,list) and 1<=len(accounts)<=64 and
+            all(_subscription_reference(item) for item in accounts)):
+        return False
+    if any(name in value and type(value[name]) is not bool for name in ('include_channels','include_bots')):
+        return False
+    if 'chat_types' not in value:
+        return True
+    named=value['chat_types']
+    return (isinstance(named,list) and 1<=len(named)<=4 and all(isinstance(t,str) and t in _SOURCE_CHAT_TYPES
+        for t in named) and len(set(named))==len(named) and (value.get('include_channels') is not True or
+        'channel' in named))
 
 
 def _subscription_reference(value):
@@ -229,6 +250,7 @@ def _subscription_parameters(operation, parameters):
             valid=value is None or (isinstance(value,dict) and 'endpoint_id' in value
                 and not value.keys()-{'endpoint_id','delivery_policy'} and _uuid(value['endpoint_id'])
                 and isinstance(value.get('delivery_policy',{}),dict) and len(json.dumps(value))<=4096)
+        elif name=='sources':valid=_subscription_sources(value)
         elif name=='reply_to_send':valid=value is None or isinstance(value,str) and 1<=len(value)<=128
         # The server validates fields and bounds (invalid_delivery_policy); the envelope is a small object.
         elif name=='delivery_policy':valid=value is None or isinstance(value,dict) and len(json.dumps(value))<=4096
@@ -248,6 +270,9 @@ def _subscription_parameters(operation, parameters):
                     valid=parsed.tzinfo is not None and parsed.utcoffset() is not None
                 except ValueError:valid=False
         if not valid:raise ValueError('invalid_parameters')
+    # Exactly one of frozen chat_ids or dynamic sources (ANYM-522).
+    if operation=='create_subscription' and ('chat_ids' in parameters)==('sources' in parameters):
+        raise ValueError('invalid_parameters')
     if ('reply_to_confirmed_send' in (parameters.get('wake_rules') or [])
             and parameters.get('reply_to_send') is None):
         raise ValueError('invalid_parameters')
@@ -619,17 +644,23 @@ class Client:
         """Read this key's scoped operation receipt without invoking the provider again."""
         return self.call('get_messenger_operation', {'operation_id': operation_id})
 
-    def create_subscription(self, *, chat_ids, sender_ids=None, kinds=None,
+    def create_subscription(self, *, chat_ids=None, sources=None, sender_ids=None, kinds=None,
                             direction='incoming', origins=None, label='', expires_at=None,
                             wake_rules=None, reply_to_send=None, delivery=None):
-        """Persist explicit archived sources from the committed boundary; no push or provider action.
+        """Persist archived sources from the committed boundary; no push or provider action.
 
-        Requires read and explicit subscription-write. A timeout can leave creation
-        uncertain: inspect list_subscriptions before retrying. Names are not sender IDs.
+        Exactly one of chat_ids (explicit) or sources={'all_visible_chats': True, 'account_ids'?,
+        'include_channels'?, 'include_bots'?, 'chat_types'?} (dynamic, dynamic_sources_disabled until
+        the operator's switch). chat_types (1-4 of private, group, channel, unknown) keeps only those
+        chats before any match; WhatsApp chats are untyped (unknown) today; it needs a second switch
+        (source_filters_disabled). Requires read and explicit subscription-write. A timeout can leave
+        creation uncertain: inspect list_subscriptions before retrying. Names are not sender IDs.
         delivery={'endpoint_id': ..., 'delivery_policy': ...} binds your own endpoint (delivery-write).
         """
-        parameters=dict(chat_ids=chat_ids,sender_ids=sender_ids,kinds=kinds,direction=direction,
+        parameters=dict(sender_ids=sender_ids,kinds=kinds,direction=direction,
             origins=origins,label=label,expires_at=expires_at)
+        if chat_ids is not None or sources is None:parameters['chat_ids']=chat_ids
+        if sources is not None:parameters['sources']=sources
         if wake_rules is not None:parameters['wake_rules']=wake_rules
         if reply_to_send is not None:parameters['reply_to_send']=reply_to_send
         if delivery is not None:parameters['delivery']=delivery

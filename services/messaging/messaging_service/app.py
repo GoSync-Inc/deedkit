@@ -1125,10 +1125,16 @@ def register_subscription_tools(mcp, call, async_call, read, upload_write):
         Requires read + explicit subscription-write. The subscription belongs to the
         originating credential; another key for the same principal cannot adopt it.
         Exactly one of chat_ids (1–64 archive IDs from list_chats/resolve_reference, frozen)
-        or sources={all_visible_chats: true, account_ids?, include_channels?, include_bots?}:
+        or sources={all_visible_chats: true, account_ids?, include_channels?, include_bots?, chat_types?}:
         every chat the key can see at the moment of each read, count and hint, so a scope
         change neither invalidates it nor needs a new one; channels and bot senders stay out
         unless included. Dynamic sources need the operator's switch (dynamic_sources_disabled).
+        chat_types (1-4 distinct of private, group, channel, unknown) keeps only those chats before
+        any match, hint or budget; new chats of those types still join. An untyped chat is unknown,
+        and WhatsApp chats are untyped today: [private] leaves out every WhatsApp chat, [private,
+        unknown] keeps Telegram private chats and all WhatsApp chats. Naming channel lets channels in;
+        include_channels without channel is invalid_filter. It needs a second operator switch
+        (source_filters_disabled).
         Recommended wake_rules for them: [reply_to_owner, owner_mention, reply_to_own_send];
         reply_to_own_send (dynamic only) catches an exact native reply to any confirmed send of
         this key. Optional sender_ids (explicit chats only) are exact account-scoped IDs from search_people.

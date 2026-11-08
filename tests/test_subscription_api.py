@@ -172,6 +172,34 @@ def test_subscription_backend_conflict_returns_safe_actionable_errors():
     assert 'subscription_conflict' in mcp.text
 
 
+# spec: ANYM-825
+def test_chat_types_values_reach_the_store_so_it_answers_invalid_filter():
+    store=RecordingStore()
+    # The schema takes any list of strings: the store checks values, count, duplicates and the channel rule
+    # and answers invalid_filter (tests/test_subscriptions.py), over REST and MCP alike.
+    lists=[['private','unknown'],['bot'],[],['private']*5,['private','private']]
+    crossed={'all_visible_chats':True,'include_channels':True,'chat_types':['private']}
+    sent=[{'all_visible_chats':True,'chat_types':chat_types} for chat_types in lists]+[crossed]
+    with TestClient(create_app(store,['testserver'])) as client:
+        for sources in sent:
+            assert client.post('/v1/create_subscription',headers={'Authorization':'Bearer synthetic-token'},
+                json={'sources':sources}).status_code==200
+            assert mcp_result(rpc(client,'create_subscription',{'sources':sources})).get('isError') is not True
+        assert [params['sources'] for _,params in store.calls]==[sources for sources in sent for _ in range(2)]
+        store.calls.clear()
+        # Only a value that is not a list of strings stops at the schema.
+        for chat_types in ('private',[1]):
+            params={'sources':{'all_visible_chats':True,'chat_types':chat_types}}
+            rest=client.post('/v1/create_subscription',headers={'Authorization':'Bearer synthetic-token'},json=params)
+            assert rest.status_code==400 and rest.json()['error']=='invalid_parameters'
+            assert rpc(client,'create_subscription',params).json()['error']['code']==-32602
+    assert store.calls==[]
+
+
+def mcp_result(response):
+    return response.json()['result']
+
+
 @pytest.mark.parametrize('method',METHODS)
 def test_python_subscription_helpers_preserve_exact_parameters(method):
     seen=[]

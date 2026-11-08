@@ -130,7 +130,19 @@ export type SubscriptionEventKind = 'message.created' | 'message.edited' | 'mess
   'message.status' | 'attachment.ready' | 'file.text.ready' | 'file.transcript.ready' |
   'file.description.ready' | 'file.processing.failed' | 'send.failed' | 'source.health';
 export type SubscriptionOrigin = 'live' | 'live_recovered' | 'backfill' | 'reconcile' | 'fixture';
-export type SubscriptionWakeRule = 'incoming_message' | 'owner_mention' | 'reply_to_owner' | 'reply_to_confirmed_send';
+export type SubscriptionWakeRule = 'incoming_message' | 'owner_mention' | 'reply_to_owner' | 'reply_to_confirmed_send' |
+  'reply_to_own_send';
+export type SubscriptionChatType = 'private' | 'group' | 'channel' | 'unknown';
+export interface SubscriptionSources {
+  all_visible_chats: true;
+  /** 1–64 account IDs inside the key's scope. */
+  account_ids?: string[];
+  include_channels?: boolean;
+  include_bots?: boolean;
+  /** 1–4 distinct types kept before any match (source_filters_disabled until the operator's switch).
+   * WhatsApp chats are untyped (unknown) today; include_channels needs channel listed. */
+  chat_types?: SubscriptionChatType[];
+}
 export interface SubscriptionSelection {
   /** Frozen 1–64 authorized archive chat IDs, never names or arbitrary provider references. */
   chat_ids: string[];
@@ -151,6 +163,10 @@ export interface SubscriptionSelection {
   reply_to_send?: string | null;
   /** Your own endpoint from registerDeliveryEndpoint; needs delivery-write. */
   delivery?: {endpoint_id: string; delivery_policy?: Record<string,unknown>} | null;
+}
+/** Every chat the key can see now instead of chat_ids (dynamic_sources_disabled until the operator's switch). */
+export interface DynamicSubscriptionSelection extends Omit<SubscriptionSelection,'chat_ids'|'sender_ids'|'reply_to_send'> {
+  sources: SubscriptionSources;
 }
 export interface SubscriptionLifecycleAction {
   subscription_id: string;
@@ -284,6 +300,8 @@ export declare class AnyMsgClient {
   getMessengerOperation(args: {operation_id:string}): Promise<Record<string,unknown>>;
   /** Requires explicit subscription-write; uncertain creations are never automatically retried. */
   createSubscription(args: SubscriptionSelection): Promise<Record<string,unknown>>;
+  /** Dynamic sources instead of chat_ids (ANYM-522, chat_types ANYM-825). */
+  createSubscription(args: DynamicSubscriptionSelection): Promise<Record<string,unknown>>;
   /** Current credential only; sources are masked after a permission/scope change. */
   listSubscriptions(args?: {limit?:number}): Promise<Record<string,unknown>>;
   /** Matcher catch-up is separate from live provider freshness and complete history. */

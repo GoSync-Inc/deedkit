@@ -59,7 +59,12 @@ WAKE_RULES = frozenset(('incoming_message', 'owner_mention', 'reply_to_owner', '
 # the shared lock, so --disable waits for every creation that read it enabled.
 DYNAMIC_GATE = 'dynamic_subscriptions'
 DYNAMIC_LOCK = 'dynamic-subscriptions'
-SOURCE_OPTIONS = frozenset(('all_visible_chats', 'account_ids', 'include_channels', 'include_bots'))
+SOURCE_OPTIONS = frozenset(('all_visible_chats', 'account_ids', 'include_channels', 'include_bots', 'chat_types'))
+# ANYM-825: the chat types of a dynamic definition (the ANYM-272 vocabulary; an untyped chat is unknown) and
+# the operator's second switch (set-source-filters), read and fenced like the dynamic one.
+CHAT_TYPES = frozenset(('private', 'group', 'channel', 'unknown'))
+SOURCE_FILTER_GATE = 'source_filters'
+SOURCE_FILTER_LOCK = 'source-filters'
 
 
 def _bound_setting(name, default, minimum, maximum):
@@ -101,6 +106,13 @@ def dynamic_gate_on(c, *, fence=True):
         c.execute('SELECT pg_advisory_xact_lock_shared(hashtextextended(%s,0))', (DYNAMIC_LOCK,))
     return c.execute("""SELECT EXISTS(SELECT FROM probe_metadata WHERE name=%s AND value='enabled')
         AS enabled""", (DYNAMIC_GATE,)).fetchone()['enabled']
+
+
+def source_filters_on(c, *, fence=True):
+    if fence:
+        c.execute('SELECT pg_advisory_xact_lock_shared(hashtextextended(%s,0))', (SOURCE_FILTER_LOCK,))
+    return c.execute("""SELECT EXISTS(SELECT FROM probe_metadata WHERE name=%s AND value='enabled')
+        AS enabled""", (SOURCE_FILTER_GATE,)).fetchone()['enabled']
 
 
 def scope(row, p):
@@ -398,8 +410,17 @@ def _sources(p, sources, sender_ids, reply_to_send):
     accounts = _ids(sources.get('account_ids'))
     if accounts is not None and set(accounts) - set(p['accounts']):
         raise APIError('not_found', 404)
-    return {'all_visible_chats': True, 'account_ids': accounts,
+    result = {'all_visible_chats': True, 'account_ids': accounts,
         'include_channels': sources.get('include_channels', False), 'include_bots': sources.get('include_bots', False)}
+    if 'chat_types' in sources:
+        # ANYM-825: absent keeps today's rule; naming channel is what lets channels in.
+        named = sources['chat_types']
+        if (not isinstance(named, list) or not 1 <= len(named) <= 4 or any(not isinstance(t, str) for t in named) or
+                len(set(named)) != len(named) or set(named) - CHAT_TYPES or
+                result['include_channels'] and 'channel' not in named):
+            raise APIError('invalid_filter')
+        result['chat_types'] = sorted(named)
+    return result
 
 
 def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=None, kinds=None,
@@ -436,6 +457,9 @@ def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=
     if dynamic_sources and not dynamic_gate_on(c):
         # Until the operator enables them after the API, matcher and dispatcher run this version.
         raise APIError('dynamic_sources_disabled', 409)
+    if dynamic_sources and 'chat_types' in dynamic_sources and not source_filters_on(c):
+        # An older matcher would store every type's matches for it, and readers do not filter stored ones.
+        raise APIError('source_filters_disabled', 409)
     sources = c.execute('SELECT id,account FROM chats WHERE id=ANY(%s) AND account=ANY(%s)',
         (chats, p['accounts'])).fetchall()
     if (len(sources) != len(chats) or
@@ -771,7 +795,10 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                     matches = (selected and event['kind'] in selector['kinds'] and
                         origin_selected(event['origin'], selector['origins']))
                     if matches and visible is not None:
-                        matches = _dynamic_match(selector['sources'], visible[source], snapshot)
+                        left = _dynamic_match(selector['sources'], visible[source], snapshot)
+                        if left is not None:
+                            left_out(row, event, left)
+                            matches = False
                     if matches and selector['direction']:
                         if 'direction' not in snapshot:
                             missing += 1
@@ -871,10 +898,23 @@ def _batch_scope(c, row, p, events):
 
 
 def _dynamic_match(sources, chat_type, snapshot):
-    """Channels (Telegram broadcast channels have chat_type channel) and bot senders stay out unless asked for."""
-    if chat_type == 'channel' and not sources['include_channels']:
-        return False
-    return sources['include_bots'] or (snapshot.get('metadata') or {}).get('sender_is_bot') is not True
+    """None when the event passes, else why it is left out. Channels (Telegram broadcast channels have
+    chat_type channel) and bot senders stay out unless asked for; chat_types (ANYM-825) takes only the
+    named types, an untyped chat (NULL, e.g. every WhatsApp chat today) as unknown."""
+    allowed = sources.get('chat_types')
+    if allowed is not None:
+        if (chat_type or 'unknown') not in allowed:
+            return 'chat_type'
+    elif chat_type == 'channel' and not sources['include_channels']:
+        return 'channel'
+    if not sources['include_bots'] and (snapshot.get('metadata') or {}).get('sender_is_bot') is True:
+        return 'bot'
+    return None
+
+
+def left_out(row, event, reason):
+    """ANYM-825: the matcher reports each event a dynamic rule left out (no match, no hint, no budget);
+    ANYM-824 counts it as left_out_<reason>. No-op until then."""
 
 
 def _own_send_replies(c, row, events, visible):
@@ -1071,3 +1111,34 @@ def set_dynamic_subscriptions(store, enabled, *, verify_components=False):
             WHERE subscription IN (SELECT id FROM subscriptions WHERE selector ? 'sources')
             AND state IN ('pending','leased') RETURNING id""").fetchall()]
     return {'dynamic_subscriptions': 'disabled', 'access_changed': sorted(moved), 'cancelled_hints': sorted(cancelled)}
+
+
+def set_source_filters(store, enabled, *, verify_components=False):
+    """Operator only (ANYM-825), built like set_dynamic_subscriptions. With verify_components (the CLI),
+    enabling refuses unless the API, matcher and dispatcher heartbeats report this version, because an older
+    matcher would store matches of every chat type for a definition with chat_types and readers do not filter
+    stored matches by type. Disabling is the rollback before older code is deployed: every such definition
+    becomes access_changed (masked by older code, refused on resume) and its queued hints are cancelled;
+    agents recreate them after a new enable."""
+    with store.pool.connection() as c:
+        # Waits for every creation that read the switch enabled.
+        c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))', (SOURCE_FILTER_LOCK,))
+        if enabled and verify_components:
+            from .heartbeats import mismatch
+            # The package version alone cannot tell this matcher from the deployed one (both 0.9.19).
+            problem = mismatch(c, features=('source-filters',))
+            if problem is not None:
+                return problem
+        c.execute('''INSERT INTO probe_metadata(name,value) VALUES(%s,%s)
+            ON CONFLICT(name) DO UPDATE SET value=EXCLUDED.value''', (SOURCE_FILTER_GATE, 'enabled' if enabled else 'disabled'))
+        if enabled:
+            return {'source_filters': 'enabled'}
+        # The row lock waits for a hint in flight under the dispatcher's fence; the version bump cancels held ones.
+        moved = [str(row['id']) for row in c.execute("""UPDATE subscriptions SET state='access_changed',
+            version=version+1,updated_at=clock_timestamp() WHERE selector->'sources' ? 'chat_types'
+            AND state<>'access_changed' RETURNING id""").fetchall()]
+        cancelled = [str(row['id']) for row in c.execute("""UPDATE subscription_outbox SET state='cancelled',
+            finished_at=clock_timestamp(),error_code='source_filters_disabled',lease_token=NULL,lease_until=NULL
+            WHERE subscription IN (SELECT id FROM subscriptions WHERE selector->'sources' ? 'chat_types')
+            AND state IN ('pending','leased') RETURNING id""").fetchall()]
+    return {'source_filters': 'disabled', 'access_changed': sorted(moved), 'cancelled_hints': sorted(cancelled)}

@@ -143,7 +143,7 @@ const MESSENGER_FIELDS = Object.freeze({
   get_messenger_operation: [['operation_id'],['operation_id']],
 });
 const SUBSCRIPTION_FIELDS = Object.freeze({
-  create_subscription: [['chat_ids'],['chat_ids','sender_ids','kinds','direction','origins','label','expires_at',
+  create_subscription: [[],['chat_ids','sources','sender_ids','kinds','direction','origins','label','expires_at',
     'wake_rules','reply_to_send','delivery']],
   list_subscriptions: [[],['limit']],
   get_subscription: [['subscription_id'],['subscription_id']],
@@ -171,7 +171,8 @@ const SUBSCRIPTION_KINDS = new Set(['message.created','message.edited','message.
   'message.status','attachment.ready','file.text.ready','file.transcript.ready',
   'file.description.ready','file.processing.failed','send.failed','source.health']);
 const SUBSCRIPTION_ORIGINS = new Set(['live','live_recovered','backfill','reconcile','fixture']);
-const WAKE_RULES = new Set(['incoming_message','owner_mention','reply_to_owner','reply_to_confirmed_send']);
+const WAKE_RULES = new Set(['incoming_message','owner_mention','reply_to_owner','reply_to_confirmed_send',
+  'reply_to_own_send']);
 function plainObject(value) {
   return value !== null && typeof value === 'object' &&
     [Object.prototype,null].includes(Object.getPrototypeOf(value));
@@ -225,6 +226,19 @@ function messengerArguments(method,args) {
 }
 function subscriptionReference(value) {
   return typeof value==='string' && value.length>0 && [...value].length<=256 && !/[\x00-\x20\x7f]/.test(value);
+}
+const SOURCE_CHAT_TYPES = new Set(['private','group','channel','unknown']);
+function subscriptionSources(value) {
+  // ANYM-522 dynamic sources; chat_types (ANYM-825): 1-4 distinct types, include_channels needs channel.
+  if (!plainObject(value) || value.all_visible_chats!==true || Object.keys(value).some(name=>
+      !['all_visible_chats','account_ids','include_channels','include_bots','chat_types'].includes(name))) return false;
+  if (value.account_ids!==undefined && !(Array.isArray(value.account_ids) && value.account_ids.length>=1 &&
+      value.account_ids.length<=64 && value.account_ids.every(subscriptionReference))) return false;
+  if (['include_channels','include_bots'].some(name=>value[name]!==undefined && typeof value[name]!=='boolean')) return false;
+  const types=value.chat_types;
+  if (types===undefined) return true;
+  return Array.isArray(types) && types.length>=1 && types.length<=4 && new Set(types).size===types.length &&
+    types.every(item=>SOURCE_CHAT_TYPES.has(item)) && (value.include_channels!==true || types.includes('channel'));
 }
 function subscriptionExpiry(value) {
   if (typeof value!=='string' || value.length<20 || value.length>64) return false;
@@ -296,6 +310,7 @@ function subscriptionArguments(method,args) {
     else if (key==='delivery') valid=value===null || plainObject(value) && Object.hasOwn(value,'endpoint_id') &&
       Object.keys(value).every(name=>['endpoint_id','delivery_policy'].includes(name)) && uuid(value.endpoint_id) &&
       (value.delivery_policy===undefined || plainObject(value.delivery_policy)) && JSON.stringify(value).length<=4096;
+    else if (key==='sources') valid=subscriptionSources(value);
     else if (key==='reply_to_send') valid=value===null || typeof value==='string' && [...value].length>=1 && [...value].length<=128;
     else if (key==='label') valid=typeof value==='string' && [...value].length<=128 && !/[\x00-\x1f\x7f]/.test(value);
     else if (['action','direction','resume_policy'].includes(key))
@@ -308,6 +323,9 @@ function subscriptionArguments(method,args) {
     }
     if (!valid) throw new TypeError('Invalid subscription arguments');
   }
+  // Exactly one of frozen chat_ids or dynamic sources (ANYM-522).
+  if (method==='create_subscription' && Object.hasOwn(args,'chat_ids')===Object.hasOwn(args,'sources'))
+    throw new TypeError('Invalid subscription arguments');
   if (args.wake_rules?.includes('reply_to_confirmed_send') && args.reply_to_send==null)
     throw new TypeError('Confirmed-send wake rule requires a send reference');
   return args;

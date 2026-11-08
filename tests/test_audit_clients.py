@@ -173,6 +173,39 @@ def test_python_wake_rules_reject_malformed_selection_before_transport(extra):
             client.create_subscription(chat_ids=['chat_synthetic'], **extra)
 
 
+# spec: ANYM-825
+def test_python_dynamic_sources_pass_chat_types_and_reply_to_own_send_through():
+    seen = []
+    def transport(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={})
+    sources = {'all_visible_chats': True, 'chat_types': ['private', 'unknown']}
+    with Client('https://archive.example', 'synthetic-token', transport=httpx.MockTransport(transport)) as client:
+        client.create_subscription(sources=sources, wake_rules=['incoming_message', 'reply_to_own_send'])
+        client.create_subscription(sources={'all_visible_chats': True, 'include_channels': True, 'chat_types': ['channel']})
+    assert seen[0]['sources'] == sources and 'chat_ids' not in seen[0]
+    assert seen[0]['wake_rules'] == ['incoming_message', 'reply_to_own_send']
+    assert seen[1]['sources']['chat_types'] == ['channel']
+
+
+# spec: ANYM-825
+@pytest.mark.parametrize('arguments', [
+    {}, {'chat_ids': ['chat_synthetic'], 'sources': {'all_visible_chats': True}},
+    {'sources': {'chat_types': ['private']}}, {'sources': {'all_visible_chats': True, 'chat_types': []}},
+    {'sources': {'all_visible_chats': True, 'chat_types': ['private', 'private']}},
+    {'sources': {'all_visible_chats': True, 'chat_types': ['bot']}},
+    {'sources': {'all_visible_chats': True, 'chat_types': 'private'}},
+    {'sources': {'all_visible_chats': True, 'include_channels': True, 'chat_types': ['private']}},
+    {'sources': {'all_visible_chats': True, 'chat_types': ['private', 'group', 'channel', 'unknown', 'private']}},
+    {'sources': {'all_visible_chats': True, 'unknown_option': True}},
+], ids=['none', 'both', 'not-all', 'empty', 'duplicate', 'value', 'string', 'channels', 'five', 'option'])
+def test_python_dynamic_sources_reject_bad_chat_types_before_transport(arguments):
+    with Client('https://archive.example', 'synthetic-token', transport=httpx.MockTransport(
+            lambda _: pytest.fail('Invalid selection reached transport'))) as client:
+        with pytest.raises(ValueError):
+            client.call('create_subscription', arguments)
+
+
 @pytest.mark.parametrize('wait_s', [-1, 25.1, False, True, '1', math.nan, math.inf])
 def test_python_send_wait_rejects_invalid_bound_before_transport(wait_s):
     with Client('https://archive.example', 'synthetic-token', transport=httpx.MockTransport(
