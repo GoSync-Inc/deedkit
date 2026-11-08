@@ -178,6 +178,10 @@ export interface SubscriptionPage {
   subscription_id: string;
   /** 1–100 references; default 50. Fetching never acknowledges them. */
   limit?: number;
+  /** full (default) or compact: the same items, cursors and receipt without repeated blocks (recommended for pollers). */
+  detail?: 'full'|'compact';
+  /** Blocks a compact page adds back; ignored with detail full. */
+  include?: Array<'subscription'|'delivery'|'metadata'|'reply_evidence'>;
 }
 export interface SubscriptionPageAck {
   subscription_id: string;
@@ -309,7 +313,7 @@ export declare class AnyMsgClient {
   /** Version-checked local lifecycle operation; no messenger action or agent wake-up. */
   updateSubscription(args: SubscriptionLifecycleAction): Promise<Record<string,unknown>>;
   /** Passive matched-reference inspection, independent of the durable ACK position. */
-  getSubscriptionEvents(args: {subscription_id:string; after?:number; limit?:number}): Promise<Record<string,unknown>>;
+  getSubscriptionEvents(args: SubscriptionPage & {after?:number}): Promise<Record<string,unknown>>;
   /** Fetch an unacknowledged page; receipt issuance requires explicit subscription-ack. */
   fetchSubscriptionEvents(args: SubscriptionPage, options?: {signal?:AbortSignal}): Promise<Record<string,unknown>>;
   /** ACK one issued page; no provider read-state change or automatic retry. */

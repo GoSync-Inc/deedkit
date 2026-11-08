@@ -148,10 +148,10 @@ const SUBSCRIPTION_FIELDS = Object.freeze({
   list_subscriptions: [[],['limit']],
   get_subscription: [['subscription_id'],['subscription_id']],
   update_subscription: [['subscription_id','version','action'],['subscription_id','version','action','resume_policy']],
-  get_subscription_events: [['subscription_id'],['subscription_id','after','limit']],
-  fetch_subscription_events: [['subscription_id'],['subscription_id','limit']],
+  get_subscription_events: [['subscription_id'],['subscription_id','after','limit','detail','include']],
+  fetch_subscription_events: [['subscription_id'],['subscription_id','limit','detail','include']],
   ack_subscription_events: [['subscription_id','receipt','version'],['subscription_id','receipt','version']],
-  wait_for_subscription_events: [['subscription_id'],['subscription_id','timeout','limit']],
+  wait_for_subscription_events: [['subscription_id'],['subscription_id','timeout','limit','detail','include']],
   configure_subscription_delivery: [['subscription_id','version'],['subscription_id','version','receiver_id','endpoint_id']],
   test_subscription: [['subscription_id','request_id'],['subscription_id','request_id']],
   // ANYM-519: the caller's own webhook endpoints. Secrets and header values are write-only.
@@ -311,6 +311,10 @@ function subscriptionArguments(method,args) {
       Object.keys(value).every(name=>['endpoint_id','delivery_policy'].includes(name)) && uuid(value.endpoint_id) &&
       (value.delivery_policy===undefined || plainObject(value.delivery_policy)) && JSON.stringify(value).length<=4096;
     else if (key==='sources') valid=subscriptionSources(value);
+    // ANYM-826: subscription page projection.
+    else if (key==='detail') valid=value==='full' || value==='compact';
+    else if (key==='include') valid=Array.isArray(value) && value.length<=4 &&
+      value.every(item=>['subscription','delivery','metadata','reply_evidence'].includes(item));
     else if (key==='reply_to_send') valid=value===null || typeof value==='string' && [...value].length>=1 && [...value].length<=128;
     else if (key==='label') valid=typeof value==='string' && [...value].length<=128 && !/[\x00-\x1f\x7f]/.test(value);
     else if (['action','direction','resume_policy'].includes(key))

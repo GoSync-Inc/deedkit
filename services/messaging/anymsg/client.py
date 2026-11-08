@@ -144,10 +144,10 @@ _SUBSCRIPTION_FIELDS = {
     'get_subscription': ({'subscription_id'}, {'subscription_id'}),
     'update_subscription': ({'subscription_id','version','action'},
         {'subscription_id','version','action','resume_policy'}),
-    'get_subscription_events': ({'subscription_id'}, {'subscription_id','after','limit'}),
-    'fetch_subscription_events': ({'subscription_id'}, {'subscription_id','limit'}),
+    'get_subscription_events': ({'subscription_id'}, {'subscription_id','after','limit','detail','include'}),
+    'fetch_subscription_events': ({'subscription_id'}, {'subscription_id','limit','detail','include'}),
     'ack_subscription_events': ({'subscription_id','receipt','version'}, {'subscription_id','receipt','version'}),
-    'wait_for_subscription_events': ({'subscription_id'}, {'subscription_id','timeout','limit'}),
+    'wait_for_subscription_events': ({'subscription_id'}, {'subscription_id','timeout','limit','detail','include'}),
     'configure_subscription_delivery': ({'subscription_id','version'}, {'subscription_id','version','receiver_id','delivery_policy','endpoint_id'}),
     'test_subscription': ({'subscription_id','request_id'}, {'subscription_id','request_id'}),
     # ANYM-519: the caller's own webhook endpoints. Secrets and header values are write-only.
@@ -214,6 +214,13 @@ def _request_id(value):
     return isinstance(value,str) and bool(re.fullmatch(r'[a-zA-Z0-9_.:-]{8,128}',value))
 
 
+def _page_view(arguments, detail, include):
+    """ANYM-826: omitted options stay out of the request, so an older server sees today's call."""
+    if detail is not None:arguments['detail']=detail
+    if include is not None:arguments['include']=include
+    return arguments
+
+
 def _subscription_parameters(operation, parameters):
     """Strict structural envelope checks; authorization and lifecycle stay on the server."""
     required,allowed=_SUBSCRIPTION_FIELDS[operation]
@@ -252,6 +259,10 @@ def _subscription_parameters(operation, parameters):
                 and isinstance(value.get('delivery_policy',{}),dict) and len(json.dumps(value))<=4096)
         elif name=='sources':valid=_subscription_sources(value)
         elif name=='reply_to_send':valid=value is None or isinstance(value,str) and 1<=len(value)<=128
+        # ANYM-826: subscription page projection.
+        elif name=='detail':valid=value in ('full','compact')
+        elif name=='include':valid=isinstance(value,list) and len(value)<=4 and all(
+            item in ('subscription','delivery','metadata','reply_evidence') for item in value)
         # The server validates fields and bounds (invalid_delivery_policy); the envelope is a small object.
         elif name=='delivery_policy':valid=value is None or isinstance(value,dict) and len(json.dumps(value))<=4096
         elif name=='label':valid=isinstance(value,str) and len(value)<=128 and not re.search(r'[\x00-\x1f\x7f]',value)
@@ -679,21 +690,27 @@ class Client:
         return self.call('update_subscription',dict(subscription_id=subscription_id,version=version,
             action=action,resume_policy=resume_policy))
 
-    def get_subscription_events(self, *, subscription_id, after=0, limit=50):
-        """Inspect durable matched references; never ACK, wake an agent or mark provider read."""
-        return self.call('get_subscription_events',dict(subscription_id=subscription_id,after=after,limit=limit))
+    def get_subscription_events(self, *, subscription_id, after=0, limit=50, detail=None, include=None):
+        """Inspect durable matched references; never ACK, wake an agent or mark provider read.
+        detail='compact' (pollers) drops the repeated definition, delivery and metadata blocks; include re-adds them."""
+        return self.call('get_subscription_events',_page_view(dict(subscription_id=subscription_id,after=after,
+            limit=limit),detail,include))
 
-    def fetch_subscription_events(self, *, subscription_id, limit=50):
-        """Read an unacknowledged page; an explicit ACK grant may issue a short-lived receipt."""
-        return self.call('fetch_subscription_events',dict(subscription_id=subscription_id,limit=limit))
+    def fetch_subscription_events(self, *, subscription_id, limit=50, detail=None, include=None):
+        """Read an unacknowledged page; an explicit ACK grant may issue a short-lived receipt.
+        detail='compact' returns the same items, cursors and receipt with fewer fields."""
+        return self.call('fetch_subscription_events',_page_view(dict(subscription_id=subscription_id,limit=limit),
+            detail,include))
 
     def ack_subscription_events(self, *, subscription_id, receipt, version):
         """ACK exactly the issued page and ack_version; never changes provider read state."""
         return self.call('ack_subscription_events',dict(subscription_id=subscription_id,receipt=receipt,version=version))
 
-    def wait_for_subscription_events(self, *, subscription_id, timeout=25, limit=50):
-        """Wait up to 25 seconds without ACK or provider polling. Explicit client timeouts apply."""
-        return self.call('wait_for_subscription_events',dict(subscription_id=subscription_id,timeout=timeout,limit=limit))
+    def wait_for_subscription_events(self, *, subscription_id, timeout=25, limit=50, detail=None, include=None):
+        """Wait up to 25 seconds without ACK or provider polling. Explicit client timeouts apply.
+        detail='compact' returns the same items, cursors and receipt with fewer fields."""
+        return self.call('wait_for_subscription_events',_page_view(dict(subscription_id=subscription_id,
+            timeout=timeout,limit=limit),detail,include))
 
     def configure_subscription_delivery(self, *, subscription_id, version, receiver_id=None, delivery_policy=None,
                                         endpoint_id=None):

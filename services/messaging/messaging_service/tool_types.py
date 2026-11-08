@@ -56,6 +56,12 @@ SubscriptionOrigins = Annotated[list[SubscriptionOrigin], Field(min_length=1,max
 SubscriptionLimit = Annotated[StrictInt, Field(ge=1,le=100)]
 SubscriptionVersion = Annotated[StrictInt, Field(ge=1,le=9007199254740991)]
 SubscriptionPosition = Annotated[StrictInt, Field(ge=0,le=9007199254740991)]
+# ANYM-826: no schema default, so a gateway never inserts the argument and an old backend sees none.
+SubscriptionPageDetail = Annotated[Literal['full','compact'] | None, Field(json_schema_extra=lambda schema: schema.pop('default',None),
+    description="full (default): today's page. compact: subscription state and cursors, items with routing fields only.")]
+SubscriptionPageInclude = Annotated[list[Literal['subscription','delivery','metadata','reply_evidence']] | None,
+    Field(max_length=4,json_schema_extra=lambda schema: schema.pop('default',None),
+        description='Blocks a compact page adds back; ignored with detail=full.')]
 # Hint timing only (delivery_policy.py validates again): never changes matches, ACK or passive reads.
 LocalClock = Annotated[StrictStr, Field(pattern=r'^(?:[01][0-9]|2[0-3]):[0-5][0-9]$')]
 class QuietWindow(TypedDict):
