@@ -2060,7 +2060,8 @@ def test_dispatcher_heartbeat_reports_version_and_stops_when_a_lane_stalls(seede
     assert delivery_worker.pulse(store, {'operator': now - 5, 'endpoint-0': now}, now=now) is True
     legacy, [component] = rows()
     assert len(legacy) == 1
-    assert (component['version'], component['schema_version']) == (__version__, RUNTIME_SCHEMA)
+    # ANYM-825: the package version plus the build's gate features (heartbeats.identity).
+    assert (component['version'], component['schema_version']) == (__version__ + '+source_filters', RUNTIME_SCHEMA)
 
 
 # spec: ANYM-534

@@ -130,7 +130,8 @@ export type SubscriptionEventKind = 'message.created' | 'message.edited' | 'mess
   'message.status' | 'attachment.ready' | 'file.text.ready' | 'file.transcript.ready' |
   'file.description.ready' | 'file.processing.failed' | 'send.failed' | 'source.health';
 export type SubscriptionOrigin = 'live' | 'live_recovered' | 'backfill' | 'reconcile' | 'fixture';
-export type SubscriptionWakeRule = 'incoming_message' | 'owner_mention' | 'reply_to_owner' | 'reply_to_confirmed_send';
+export type SubscriptionWakeRule = 'incoming_message' | 'owner_mention' | 'reply_to_owner' | 'reply_to_confirmed_send' |
+  'reply_to_own_send';
 export type SubscriptionChatType = 'private' | 'group' | 'channel' | 'unknown';
 export interface SubscriptionSources {
   all_visible_chats: true;

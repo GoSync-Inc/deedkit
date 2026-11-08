@@ -483,6 +483,7 @@ def message_events(store, token, sid):
 # spec: ANYM-825
 def test_chat_types_validate_their_form_and_wait_for_the_source_filters_switch(seeded):
     from messaging_service import __version__
+    from messaging_service.heartbeats import identity
     from messaging_service.store import RUNTIME_SCHEMA
     store, _, _ = seeded
     token = dynamic_key(store)
@@ -492,9 +493,10 @@ def test_chat_types_validate_their_form_and_wait_for_the_source_filters_switch(s
     store.set_dynamic_subscriptions(True)
     with store.pool.connection() as c:
         saved = c.execute('SELECT * FROM component_heartbeats').fetchall()
+    current = identity()
     def beat(matcher_version):
         with store.pool.connection() as c:
-            for component, version in (('api', __version__), ('matcher', matcher_version), ('dispatcher', __version__)):
+            for component, version in (('api', current), ('matcher', matcher_version), ('dispatcher', current)):
                 c.execute('''INSERT INTO component_heartbeats(component,version,schema_version,beat_at)
                     VALUES(%s,%s,%s,clock_timestamp()) ON CONFLICT(component) DO UPDATE SET version=EXCLUDED.version,
                     schema_version=EXCLUDED.schema_version,beat_at=EXCLUDED.beat_at''', (component, version, RUNTIME_SCHEMA))
@@ -505,13 +507,16 @@ def test_chat_types_validate_their_form_and_wait_for_the_source_filters_switch(s
         plain = store.create_subscription(token, sources=ALL_VISIBLE)
         assert plain['sources'] == {'all_visible_chats': True, 'account_ids': None, 'include_channels': False,
             'include_bots': False}
-        # Mixed versions: an older matcher would store group matches for such a definition.
-        beat('0.0.1')
-        assert store.set_source_filters(True, verify_components=True) == {'error': 'component_version_mismatch',
-            'component': 'matcher', 'version': '0.0.1', 'expected': __version__}
+        # Mixed versions: the deployed matcher reports the same package version and no build features; it would
+        # store group matches for such a definition. The dynamic and delivery switches still accept it.
+        assert current == __version__ + '+source_filters'
+        beat(__version__)
+        assert store.set_source_filters(True, verify_components=True) == {'error': 'component_feature_missing',
+            'component': 'matcher', 'version': __version__, 'expected': current}
+        assert store.set_dynamic_subscriptions(True, verify_components=True) == {'dynamic_subscriptions': 'enabled'}
         with pytest.raises(APIError, match='source_filters_disabled'):
             store.create_subscription(token, sources=private)
-        beat(__version__)
+        beat(current)
         assert store.set_source_filters(True, verify_components=True) == {'source_filters': 'enabled'}
         for chat_types, extra in [([], {}), (['private'] * 2, {}), (['private', 'group', 'channel', 'unknown', 'bot'], {}),
                 (['bot'], {}), ('private', {}), ([1], {}), (['private'], {'include_channels': True})]:
@@ -525,6 +530,14 @@ def test_chat_types_validate_their_form_and_wait_for_the_source_filters_switch(s
         channels = store.create_subscription(token, sources={**ALL_VISIBLE, 'include_channels': True,
             'chat_types': ['channel', 'private']})
         assert store.get_subscription(token, channels['subscription_id'])['sources']['chat_types'] == ['channel', 'private']
+        only_channels = store.create_subscription(token, sources={**ALL_VISIBLE, 'chat_types': ['channel']})
+        channel = emit(store, chat_message(store, 'telegram-demo-channel', 'demo-tg-channel', chat_type='channel'))
+        untyped = emit(store)
+        match_subscriptions(store)
+        # Naming channel lets channels in without include_channels; the seeded chat is untyped (unknown).
+        assert event_ids(store, token, only_channels['subscription_id']) == [channel]
+        assert event_ids(store, token, created['subscription_id']) == [untyped]
+        assert event_ids(store, token, channels['subscription_id']) == [channel]
     finally:
         store.set_source_filters(False)
         store.set_dynamic_subscriptions(False)
@@ -631,24 +644,28 @@ def test_a_private_chat_first_seen_after_creation_matches_on_both_platforms(seed
         assert store.get_subscription(token, private)['version'] == before
 
 
+SHAPES = ('plain', 'mention', 'reply', 'photo', 'document', 'voice', 'forwarded')
 WAKE_CASES = {
-    # rule: messages of the fixture that wake it in a private chat.
-    'incoming_message': ['plain', 'mention', 'reply', 'photo'],
+    # rule: the message shapes that wake it; media kinds and forwarding never change the result.
+    'incoming_message': list(SHAPES),
     'owner_mention': ['mention'],
     'reply_to_owner': ['reply'],
-    'reply_to_own_send': ['plain', 'mention', 'reply', 'photo'],
+    'reply_to_own_send': list(SHAPES),
 }
+
+
+def every_arrival_replies_to_an_own_send(monkeypatch):
+    """reply_to_own_send: every arrival carries the evidence, so only chat_types can leave a group out."""
+    from messaging_service import subscriptions
+    monkeypatch.setattr(subscriptions, '_own_send_replies', lambda c, row, events, visible: {e['id'] for e in events})
 
 
 # spec: ANYM-825
 @pytest.mark.parametrize('rule', sorted(WAKE_CASES))
-@pytest.mark.parametrize('account', ['telegram-demo', 'whatsapp-demo-1'])
-def test_chat_types_with_each_wake_rule_match_private_messages_only(seeded, monkeypatch, rule, account):
-    from messaging_service import subscriptions
+def test_chat_types_with_each_wake_rule_match_telegram_private_messages_only(seeded, monkeypatch, rule):
     store, _, _ = seeded
-    # reply_to_own_send: every arrival carries the evidence, so only chat_types can leave a group out.
-    monkeypatch.setattr(subscriptions, '_own_send_replies', lambda c, row, events, visible: {e['id'] for e in events})
-    shapes = {'plain': {}, 'mention': {'mentions_owner': True}, 'reply': {'reply_to_owner': True},
+    every_arrival_replies_to_an_own_send(monkeypatch)
+    metadata = {'plain': {}, 'mention': {'mentions_owner': True}, 'reply': {'reply_to_owner': True},
         'photo': {'message_kind': 'photo'}, 'document': {'message_kind': 'document'},
         'voice': {'message_kind': 'voice'}, 'forwarded': {'message_kind': 'photo', 'forwarded': True}}
     with source_filters(store):
@@ -657,18 +674,46 @@ def test_chat_types_with_each_wake_rule_match_private_messages_only(seeded, monk
             wake_rules=[rule])['subscription_id']
         expected = {}
         for kind in ('private', 'group'):
-            chat = '%s-%s-chat' % (account, kind)
-            for shape in (['plain', 'mention', 'reply', 'photo'] if kind == 'private' else list(shapes)):
-                message = chat_message(store, chat, '%s-%s-%s' % (account, kind, shape), chat_type=kind,
-                    metadata=shapes[shape], account=account)
+            for shape in SHAPES:
+                message = chat_message(store, 'telegram-demo-%s-chat' % kind, 'demo-tg-%s-%s' % (kind, shape),
+                    chat_type=kind, metadata=metadata[shape])
                 expected[(kind, shape)] = emit(store, message)
         # Channels and bot senders keep their defaults, also with every wake evidence present.
-        emit(store, chat_message(store, account + '-channel', account + '-channel-1', chat_type='channel',
-            metadata={'mentions_owner': True, 'reply_to_owner': True}, account=account))
-        emit(store, chat_message(store, account + '-private-chat', account + '-bot-1', chat_type='private',
-            metadata={'mentions_owner': True, 'reply_to_owner': True, 'sender_is_bot': True}, account=account))
+        emit(store, chat_message(store, 'telegram-demo-channel', 'demo-tg-channel-1', chat_type='channel',
+            metadata={'mentions_owner': True, 'reply_to_owner': True}))
+        emit(store, chat_message(store, 'telegram-demo-private-chat', 'demo-tg-bot-1', chat_type='private',
+            metadata={'mentions_owner': True, 'reply_to_owner': True, 'sender_is_bot': True}))
         match_subscriptions(store)
         assert event_ids(store, token, sid) == [expected[('private', shape)] for shape in WAKE_CASES[rule]]
+
+
+# spec: ANYM-825
+@pytest.mark.parametrize('rule', sorted(WAKE_CASES))
+def test_whatsapp_wake_rules_with_chat_types_follow_the_unknown_type(seeded, monkeypatch, rule):
+    from messaging_service.adapters import whatsapp_message
+    store, _, _ = seeded
+    archive = typed_archive(store)
+    every_arrival_replies_to_an_own_send(monkeypatch)
+    fields = {'plain': {}, 'mention': {'mentionsOwner': True}, 'reply': {'replyToOwner': True},
+        'photo': {'mediaKind': 'photo'}, 'document': {'mediaKind': 'document'}, 'voice': {'mediaKind': 'voice'},
+        'forwarded': {'mediaKind': 'photo', 'forwarded': True}}
+    with source_filters(store):
+        token = typed_key(store)
+        private = store.create_subscription(token, sources={**ALL_VISIBLE, 'chat_types': ['private']},
+            wake_rules=[rule])['subscription_id']
+        untyped = store.create_subscription(token, sources={**ALL_VISIBLE, 'chat_types': ['private', 'unknown']},
+            wake_rules=[rule])['subscription_id']
+        expected = {}
+        for number, (chat, shape) in enumerate([(chat, shape) for chat in ('4248@c.us', '120363000000000003@g.us')
+                for shape in SHAPES]):
+            event = {'messageId': 'false_%s_SYNTHETIC%d' % (chat, number), 'chatId': chat, 'senderId': '4242@c.us',
+                'timestamp': 1794128500 + number, 'body': 'Synthetic text', 'hasMedia': False, **fields[shape]}
+            expected[(chat, shape)] = archive.ingest(whatsapp_message('wa-types', event))['message']
+        match_subscriptions(store)
+        # Every WhatsApp chat is unknown: [private] takes none, [private, unknown] groups and private chats alike.
+        assert message_events(store, token, private) == []
+        assert message_events(store, token, untyped) == [expected[(chat, shape)]
+            for chat in ('4248@c.us', '120363000000000003@g.us') for shape in WAKE_CASES[rule]]
 
 
 # spec: ANYM-825

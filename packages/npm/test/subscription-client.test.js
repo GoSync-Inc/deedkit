@@ -77,9 +77,9 @@ test('dynamic sources pass chat_types through and bad forms fail before transpor
     seen.push(JSON.parse(request.body));return Response.json({});
   }});
   const sources={all_visible_chats:true,chat_types:['private','unknown']};
-  await client.createSubscription({sources,wake_rules:['incoming_message']});
+  await client.createSubscription({sources,wake_rules:['incoming_message','reply_to_own_send']});
   await client.createSubscription({sources:{all_visible_chats:true,include_channels:true,chat_types:['channel']}});
-  assert.deepEqual(seen,[{sources,wake_rules:['incoming_message']},
+  assert.deepEqual(seen,[{sources,wake_rules:['incoming_message','reply_to_own_send']},
     {sources:{all_visible_chats:true,include_channels:true,chat_types:['channel']}}]);
   for(const args of [{},{chat_ids:['chat_synthetic'],sources},{sources:{chat_types:['private']}},
       {sources:{all_visible_chats:true,chat_types:[]}},{sources:{all_visible_chats:true,chat_types:['private','private']}},

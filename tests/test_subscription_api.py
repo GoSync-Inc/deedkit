@@ -172,6 +172,32 @@ def test_subscription_backend_conflict_returns_safe_actionable_errors():
     assert 'subscription_conflict' in mcp.text
 
 
+# spec: ANYM-825
+def test_chat_types_reach_the_store_exactly_and_bad_shapes_stop_at_the_schema():
+    store=RecordingStore()
+    passed={'sources':{'all_visible_chats':True,'chat_types':['private','unknown']}}
+    # A cross-field rule passes the schema: the store answers invalid_filter (tests/test_subscriptions.py).
+    crossed={'sources':{'all_visible_chats':True,'include_channels':True,'chat_types':['private']}}
+    with TestClient(create_app(store,['testserver'])) as client:
+        for params in (passed,crossed):
+            assert client.post('/v1/create_subscription',headers={'Authorization':'Bearer synthetic-token'},
+                json=params).status_code==200
+            assert mcp_result(rpc(client,'create_subscription',params)).get('isError') is not True
+        assert [params['sources'] for _,params in store.calls]==[passed['sources']]*2+[crossed['sources']]*2
+        store.calls.clear()
+        for chat_types in (['bot'],[],['private']*5,'private'):
+            params={'sources':{'all_visible_chats':True,'chat_types':chat_types}}
+            rest=client.post('/v1/create_subscription',headers={'Authorization':'Bearer synthetic-token'},json=params)
+            assert rest.json()['error']=='invalid_parameters'
+            mcp=rpc(client,'create_subscription',params)
+            assert mcp.json()['result']['isError'] is True and 'invalid_parameters' in mcp.text
+    assert store.calls==[]
+
+
+def mcp_result(response):
+    return response.json()['result']
+
+
 @pytest.mark.parametrize('method',METHODS)
 def test_python_subscription_helpers_preserve_exact_parameters(method):
     seen=[]
