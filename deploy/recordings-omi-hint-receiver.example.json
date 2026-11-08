@@ -3,6 +3,6 @@
   "path_token_sha256": [
     "0000000000000000000000000000000000000000000000000000000000000000"
   ],
-  "channel_url": "http://recordings-hint-channel:13235/omi-hint",
+  "channel_socket": "/run/deedkit/omi-hint-channel/channel.sock",
   "channel_key_file": "/run/deedkit/omi-hint/channel.key"
 }

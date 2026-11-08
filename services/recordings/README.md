@@ -540,11 +540,15 @@ The receiver (`--omi-hint-receiver`, its own container, `deploy/compose.recordin
 `uid=<owner uid>`, a JSON body of at most 4 MiB and a 2-second deadline: 200, or 503 when the backend cannot take the hint, 400 and 413
 (Omi does not retry those) and 408 (it does). Any other method, path or token gets one identical 404 before the body is read. It parses
 the body, takes `id` and drops the rest: no body, id, uid, token or header value reaches a log, a file or a response, only counters by
-reason (`omi_hint_receiver`, at most one line per 5 minutes). It has no archive, no provider token and one connection out.
+reason (`omi_hint_receiver`, at most one line per 5 minutes). It has no archive, no provider token and no network at all
+(`network_mode: none`): it serves on a Unix socket (`--unix`) that only the relay (`--omi-hint-relay`, a bounded byte pipe that parses nothing)
+reads, and its one connection goes to the channel's socket file, which it mounts read-only.
 
-The channel is the backend's second listener, on the internal `recordings-hint` network: `POST /omi-hint` with a credential of its
+The channel is the backend's second listener, on a Unix socket file in a volume only the backend writes (`RECORDINGS_HINT_LISTEN` names
+the path; a socket it cannot open leaves the backend and polling running): `POST /omi-hint` with a credential of its
 own (`archive.omi_hint`: `account`, `uid`, `channel_key_sha256`, `path_token_sha256`, `expires_at`; one or two digests each), up to
-16 ids, 2 requests at once, 20 a minute, 2 seconds. It shares nothing with the main listener, and the main API answers 404 on that address.
+16 ids, 2 requests at once, 20 a minute, 2 seconds. It shares nothing with the main listener; the older `host:port` form, whose
+address the main API refuses with 404, is kept only for a host still on the 11-05 overlay.
 
 A hint wakes the collector's sleep. After a 15-second settle (Omi caches a list for 10 s) a pass for that one account lists the newest page from
 the start, inserts unseen conversations of the last 24 hours with their fingerprints and reads up to 3 never-fetched ones of the last 24
