@@ -169,8 +169,10 @@ def producer(profile, entry, states, now):
         raised.add('backup_stale')
     word = ('FAILED' if 'backup_failed' in raised else 'STALE' if stale
             else 'UNKNOWN' if unknown else 'delivered')
-    return {'raised': raised, 'unknown': unknown, 'word': word,
-            'last_snapshot_at': last if isinstance(last, str) and parse_time(last) else None, 'age_hours': age}
+    # The runner writes microseconds and +00:00; the result carries whole seconds in UTC, as `status` prints it.
+    captured = parse_time(last)
+    shown = captured.astimezone(timezone.utc).strftime(TIME_FORMAT) if captured else None
+    return {'raised': raised, 'unknown': unknown, 'word': word, 'last_snapshot_at': shown, 'age_hours': age}
 
 
 def verified_capture(profile, directory, success):

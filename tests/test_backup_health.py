@@ -527,6 +527,19 @@ def test_a_later_code_is_sent_although_the_first_sends_keep_timing_out(tmp_path)
 
 
 # spec: ANYM-807
+def test_the_runners_microsecond_time_reaches_the_status_line_in_whole_seconds(tmp_path):
+    from scripts import production
+    cfg = config(tmp_path, profiles=['messaging'])
+    status(tmp_path, 'messaging', state='ok', last_snapshot_at='2026-11-06T18:00:19.126354+00:00',
+           last_success_at='2026-11-06T19:10:02.000001+00:00')
+    h.check(cfg, now=NOW, run=systemctl(), send=lambda *a: True)
+    result = tmp_path / 'state' / 'result.json'
+    assert json.loads(result.read_text())['profiles']['messaging']['last_snapshot_at'] == '2026-11-06T18:00:19Z'
+    line = production.backup_health_lines(result, at=NOW)[0]
+    assert line == 'backup messaging: delivered last capture 2026-11-06T18:00:19Z age=3.6h (checked 2026-11-06T21:37:02Z)'
+
+
+# spec: ANYM-807
 def test_the_result_file_is_written_before_any_send_and_is_readable_by_status(tmp_path):
     cfg = config(tmp_path, profiles=['messaging'])
     status(tmp_path, 'messaging', state='error')
