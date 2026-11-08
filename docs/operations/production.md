@@ -1237,8 +1237,10 @@ host: install `services/messaging/messaging_service/backup_health.py` from the m
 `deploy/backup-health-backup1.example.json` on backup-1, with `release_sha` set to that commit; copy
 `deploy/deedkit-backup-health.service` and `.timer` to `/etc/systemd/system/` (`0644`); `systemctl daemon-reload`;
 `systemctl enable --now deedkit-backup-health.timer`. Production's `dsn_file` is the ingest DSN the API's telemetry
-overlay already mounts (no copy). On backup-1 the same DSN is copied to `/etc/deedkit-backup-health/tiden.dsn` (root
-`0600`) over the tailnet without printing it; read back by comparing the sha256 of both files. Read back:
+overlay already mounts, `/opt/personal-os-probe/private/tiden-runtime.dsn` (the `source` in the personal-os-probe
+stack's resolved Compose file; no copy). On backup-1 the same DSN is copied to `/etc/deedkit-backup-health/tiden.dsn` (root
+`0600`) over the tailnet without printing it; read back by comparing the sha256 of both files. The agents'
+secret-read hook refuses that copy (11-08), so the owner runs it. Read back:
 `systemctl start deedkit-backup-health.service` exits 0, `production.py status` prints the five `backup` lines,
 `--print` on backup-1 prints four. The copy does not follow later releases: reinstall it when `backup_health.py`
 changes. Undo per host: `systemctl disable --now deedkit-backup-health.timer`; remove the two unit files,

@@ -2,7 +2,7 @@
   "side": "producer",
   "environment": "production",
   "release_sha": "0000000000000000000000000000000000000000",
-  "dsn_file": "/opt/deedkit/deploy/private/tiden.dsn",
+  "dsn_file": "/opt/personal-os-probe/private/tiden-runtime.dsn",
   "state_directory": "/var/lib/deedkit-backup-health",
   "profiles": {
     "messaging": {"units": ["personal-os-backup.service"], "status": "/opt/personal-os-probe/backups/status.json"},

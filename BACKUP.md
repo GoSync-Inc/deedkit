@@ -817,5 +817,6 @@ and undo: `docs/operations/production.md`, "Backup alerts".
   - A failure cleared with `systemctl reset-failed` before the next check, with no `error` in `status.json`, is not
     reported.
   - Nothing reports a stopped checker except the `UNKNOWN (no recent check)` lines.
-  - The Tiden sweep reads component `backup`. Whether a new event reopens a resolved issue is recorded here after the
-    first drill.
+  - The Tiden sweep reads component `backup`. A new event reopens a resolved issue: the production drill on 11-08
+    resolved `backup_failed.messaging` (`local-synthetic`) and then started a new episode, and the issue read
+    `unresolved` again. So resolving an issue after the fix is safe, and a later failure shows again.
