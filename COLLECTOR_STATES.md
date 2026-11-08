@@ -296,7 +296,8 @@ again cannot reach the head sets the flag again.
 `--media-inventory` (with an optional `--collector-config`) prints a read-only count of the
 account's failed WhatsApp files by cause, age and whether the native journal holds their media
 key (MEDIA_STORAGE.md, failed WhatsApp files). It writes nothing and asks no provider; it prints
-`invalid_account` or `media_inventory_failed` (exit 1) when it cannot answer.
+`invalid_account`, `collector_config_mismatch` or `media_inventory_failed` (exit 1) when it
+cannot answer.
 
 `last_commit` distinguishes `captured_at` from provider message time and gives
 `committed_by`, an upper bound recorded after the archive transaction returns.

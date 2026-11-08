@@ -56,8 +56,11 @@ def failed_jobs(c, account):
         ORDER BY j.id''', (RETENTION_DAYS, account)).fetchall()
 
 
+KEY_STATES = ('held', 'none', 'unknown')
+
+
 def adapter_keys(executable, config, refs, *, run=None):
-    """held/none per (chat, message) from the native adapter's journal lookup, None when it cannot answer.
+    """held/none/unknown per (chat, message) from the native adapter's journal lookup, None when it cannot answer.
 
     One request line per batch of at most KEY_BATCH ids; the adapter opens its journal read-only and no client."""
     if not refs: return []
@@ -72,23 +75,27 @@ def adapter_keys(executable, config, refs, *, run=None):
         return None
     answers = done.stdout.splitlines() if done.returncode == 0 else []
     if len(answers) != len(lines): return None
-    held = []
+    keys = []
     for n, (line, start) in enumerate(zip(answers, range(0, len(refs), KEY_BATCH))):
         try: reply = json.loads(line)
         except ValueError: return None
-        values = reply.get('result', {}).get('held') if isinstance(reply, dict) and reply.get('id') == n+1 else None
+        result = reply.get('result') if isinstance(reply, dict) and reply.get('id') == n+1 else None
+        values = result.get('keys') if isinstance(result, dict) else None
         if not isinstance(values, list) or len(values) != min(KEY_BATCH, len(refs)-start) or \
-                not all(type(v) is bool for v in values):
+                not all(v in KEY_STATES for v in values):
             return None
-        held.extend(values)
-    return held
+        keys.extend(values)
+    return keys
 
 
-def native_adapter(config):
-    """(executable, config path) of a native WhatsApp collector config, or None."""
+def native_adapter(config, account):
+    """(executable, config path) of the account's native WhatsApp collector config, or None.
+
+    A config of another account is refused: its journal would answer for the wrong messages."""
     if config is None: return None
     try: value = json.loads(private_text(config, 1 << 20))
     except (OSError, ValueError): return None
+    if isinstance(value, dict) and value.get('account') != account: raise ValueError('collector_config_mismatch')
     if not isinstance(value, dict) or value.get('provider') != 'whatsmeow' or not isinstance(value.get('native_executable'), str):
         return None
     return value['native_executable'], config
@@ -109,7 +116,7 @@ def inventory(c, account, *, adapter=None, run=None):
         item['jobs'] += 1
         if row['bytes'] is not None:
             item['bytes_known'] += 1; item['bytes'] += int(row['bytes'])
-        item['media_key_'+('unknown' if keys is None else 'held' if keys[n] else 'none')] += 1
+        item['media_key_'+('unknown' if keys is None else keys[n])] += 1
     return {'account': account, 'failed_jobs': len(rows), 'retention_days_estimate': RETENTION_DAYS,
         'age_basis': 'age_when_queued', 'media_key_basis': 'native_journal' if keys is not None else 'unavailable',
         'groups': [groups[k] for k in sorted(groups)]}
@@ -122,4 +129,4 @@ def run_inventory(dsn_file, account, config=None):
         c.read_only = True
         if not c.execute("SELECT 1 FROM accounts WHERE id=%s AND platform='whatsapp'", (account,)).fetchone():
             raise ValueError('invalid_account')
-        return inventory(c, account, adapter=native_adapter(config))
+        return inventory(c, account, adapter=native_adapter(config, account))

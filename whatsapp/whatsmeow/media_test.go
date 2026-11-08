@@ -444,6 +444,8 @@ func TestNativeMediaProviderErrorsKeepFixedCodesThroughTheSafeVocabulary(t *test
 		{lastHost(status(418)), "media_network_error"},
 		{whatsmeow.ErrInvalidMediaHMAC, "media_decrypt_failed"},
 		{fmt.Errorf("failed to decrypt file: %w", errors.New("synthetic padding")), "media_decrypt_failed"},
+		{lastHost(fmt.Errorf("failed to decrypt file: %w", errors.New("synthetic padding"))), "media_decrypt_failed"},
+		{lastHost(whatsmeow.ErrInvalidMediaHMAC), "media_decrypt_failed"},
 		{whatsmeow.ErrInvalidMediaEncSHA256, "media_hash_mismatch"},
 		{errors.New("synthetic unknown failure"), "media_network_error"},
 	} {
@@ -520,7 +522,7 @@ func TestMediaKeysAnswersFromTheJournalReadOnlyBesideTheOwningAdapter(t *testing
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
-	want := []string{`{"id":1,"result":{"held":[true,false,false,false]}}`, `{"error":"invalid_request","id":2}`, `{"error":"invalid_request","id":3}`}
+	want := []string{`{"id":1,"result":{"keys":["held","none","none","none"]}}`, `{"error":"invalid_request","id":2}`, `{"error":"invalid_request","id":3}`}
 	if strings.Join(lines, "|") != strings.Join(want, "|") {
 		t.Fatalf("got %q", lines)
 	}
@@ -548,6 +550,108 @@ func TestMediaKeysAnswersFromTheJournalReadOnlyBesideTheOwningAdapter(t *testing
 	requireError(t, serveMediaKeys(emptyPath, strings.NewReader(""), &out), "media_keys_unavailable")
 	if _, err := os.Stat(filepath.Join(empty.SessionDirectory, "capture.sqlite")); !os.IsNotExist(err) {
 		t.Fatal("media_keys created a journal")
+	}
+}
+
+// spec: ANYM-815
+func TestMediaKeysAnswersUnknownWhenTheJournalCannotBeReadInTime(t *testing.T) {
+	m := mediaKeyMessage(t, "KEYHELD", bytes.Repeat([]byte{7}, 32))
+	chat, id := LegacyChatID(m.Info.Chat), LegacyMessageID(m)
+	var deadline time.Duration
+	slow := func(ctx context.Context, _, _ string) ([]byte, error) {
+		d, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("journal lookup without a deadline")
+		}
+		deadline = time.Until(d)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if got := mediaKeyState(slow, chat, id); got != "unknown" {
+		t.Fatalf("slow lookup answered %s", got)
+	}
+	if deadline <= 0 || deadline > mediaKeyLookupTimeout || mediaKeyLookupTimeout >= time.Second {
+		t.Fatalf("lookup deadline %s, bound %s: must stay far below the writer's 5 s busy timeout", deadline, mediaKeyLookupTimeout)
+	}
+	broken := func(context.Context, string, string) ([]byte, error) {
+		return nil, errors.New("database disk image is malformed")
+	}
+	garbled := func(context.Context, string, string) ([]byte, error) { return []byte("not a message"), nil }
+	missing := func(context.Context, string, string) ([]byte, error) { return nil, nil }
+	for name, c := range map[string]struct {
+		lookup mediaKeyLookup
+		want   string
+	}{"error": {broken, "unknown"}, "undecodable": {garbled, "unknown"}, "missing": {missing, "none"}} {
+		if got := mediaKeyState(c.lookup, chat, id); got != c.want {
+			t.Fatalf("%s: got %s, want %s", name, got, c.want)
+		}
+	}
+}
+
+// spec: ANYM-815
+func TestMediaKeysLookupsNeverMakeCaptureWritesFail(t *testing.T) {
+	config := testConfig(t)
+	s, err := OpenCapture(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	s.Owner = types.NewJID("123456", types.DefaultUserServer)
+	for i := 0; i < 200; i++ {
+		if err := s.Put(mediaKeyMessage(t, fmt.Sprintf("SEED%03d", i), bytes.Repeat([]byte{7}, 32)), "live"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db, err := sql.Open("sqlite3", mediaKeysDSN(filepath.Join(config.SessionDirectory, "capture.sqlite")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	lookup := journalKeyLookup(db)
+	stop := make(chan struct{})
+	done := make(chan int)
+	go func() {
+		n := 0
+		for {
+			select {
+			case <-stop:
+				done <- n
+				return
+			default:
+			}
+			mediaKeyState(lookup, operationsChat, fmt.Sprintf("false_%s_SEED%03d", operationsChat, n%200))
+			n++
+		}
+	}()
+	// The owning adapter keeps capturing while the inventory reads in a tight loop.
+	for i := 0; i < 100; i++ {
+		if err := s.Put(fixtureMessage(fmt.Sprintf("LIVE%03d", i), 1700000100+int64(i)), "live"); err != nil {
+			close(stop)
+			t.Fatalf("capture write %d failed beside the lookup: %v", i, err)
+		}
+	}
+	close(stop)
+	if n := <-done; n == 0 {
+		t.Fatal("no lookup ran during capture")
+	}
+}
+
+// spec: ANYM-815
+func TestMediaKeysCreatesNoDirectoryForAMissingSession(t *testing.T) {
+	root := t.TempDir()
+	_ = os.Chmod(root, 0700)
+	c := Config{Account: "test", ExpectedWID: "123456@c.us", SessionDirectory: filepath.Join(root, "session"), EventsDirectory: filepath.Join(root, "events"), PagesDirectory: filepath.Join(root, "pages")}
+	path := filepath.Join(root, "config.json")
+	if err := os.WriteFile(path, mustJSON(c), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	requireError(t, serveMediaKeys(path, strings.NewReader(""), &out), "media_keys_unavailable")
+	for _, d := range []string{c.SessionDirectory, c.EventsDirectory, c.PagesDirectory} {
+		if _, err := os.Stat(d); !os.IsNotExist(err) {
+			t.Fatal("media_keys created", d)
+		}
 	}
 }
 

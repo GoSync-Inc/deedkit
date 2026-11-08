@@ -39,8 +39,8 @@ def inventory_archive(archive):
 
 class FakeAdapter:
     """Answers media_keys lines like the native adapter's journal lookup; records every call."""
-    def __init__(self, held):
-        self.held, self.calls = held, []
+    def __init__(self, held, unknown=()):
+        self.held, self.unknown, self.calls = held, set(unknown), []
 
     def __call__(self, argv, *, input, timeout, **_):
         assert timeout <= 60
@@ -49,8 +49,9 @@ class FakeAdapter:
         for line in input.splitlines():
             request = json.loads(line)
             assert request['method'] == 'media_keys' and len(request['params']['messages']) <= 200
-            out.append(json.dumps({'id': request['id'], 'result': {
-                'held': [m['message'] in self.held for m in request['params']['messages']]}}))
+            out.append(json.dumps({'id': request['id'], 'result': {'keys': [
+                'held' if m['message'] in self.held else 'unknown' if m['message'] in self.unknown else 'none'
+                for m in request['params']['messages']]}}))
         return subprocess.CompletedProcess(argv, 0, '\n'.join(out)+'\n', '')
 
 
@@ -74,7 +75,7 @@ def test_inventory_groups_failed_whatsapp_jobs_by_code_kind_age_mime_and_media_k
     failed(ar, s, 'false_'+CHAT+'_ALIVE', sent_days=400, state='queued', attempts=2)  # still retried: not listed
     with s.pool.connection() as c:
         c.execute("UPDATE chats SET chat_type='group' WHERE provider_chat='1203630000@g.us' AND account=%s", (ACCOUNT,))
-    adapter = FakeAdapter({'false_'+CHAT+'_OLD1', 'false_1203630000@g.us_GROUP'})
+    adapter = FakeAdapter({'false_'+CHAT+'_OLD1', 'false_1203630000@g.us_GROUP'}, unknown={'false_'+CHAT+'_SPENT'})
     with s.pool.connection() as c:
         result = media_inventory.inventory(c, ACCOUNT, adapter=('/synthetic/anymsg-whatsmeow', '/synthetic/config.json'),
             run=adapter)
@@ -86,7 +87,8 @@ def test_inventory_groups_failed_whatsapp_jobs_by_code_kind_age_mime_and_media_k
     assert (old['media_key_held'], old['media_key_none'], old['media_key_unknown']) == (1, 1, 0)
     young = g[('media_unavailable', 'automatic', 'under_30d', 'audio')]
     assert young['jobs'] == 1 and young['now_age'] == 'under_30d' and young['media_key_none'] == 1
-    assert g[('retry_exhausted', 'automatic', 'over_30d', 'document')]['jobs'] == 1
+    spent = g[('retry_exhausted', 'automatic', 'over_30d', 'document')]
+    assert spent['jobs'] == 1 and spent['media_key_unknown'] == 1  # an unreadable journal row is never "none"
     group = g[('media_network_error', 'on_request', 'over_30d', 'image')]
     assert group['jobs'] == 1 and group['media_key_held'] == 1
     # One adapter run, one request line for these five, never a provider method; no identity is printed.
@@ -100,14 +102,15 @@ def test_media_keys_are_asked_in_batches_of_at_most_200(inventory_archive):
     ar, s = inventory_archive
     refs = [('c%d@c.us' % n, 'false_c%d@c.us_M' % n) for n in range(401)]
     adapter = FakeAdapter({refs[0][1], refs[400][1]})
-    held = media_inventory.adapter_keys('/synthetic/anymsg-whatsmeow', '/synthetic/config.json', refs, run=adapter)
-    assert len(held) == 401 and sum(held) == 2 and held[0] and held[400]
+    keys = media_inventory.adapter_keys('/synthetic/anymsg-whatsmeow', '/synthetic/config.json', refs, run=adapter)
+    assert len(keys) == 401 and keys.count('held') == 2 and keys[0] == keys[400] == 'held'
     assert [len(json.loads(line)['params']['messages']) for line in adapter.calls[0][1].splitlines()] == [200, 200, 1]
 
 
 # spec: ANYM-815
 @pytest.mark.parametrize('reply', ['', 'not json\n', '{"id":1,"error":"invalid_request"}\n',
-    '{"id":1,"result":{"held":[true,true]}}\n', 'exit'])
+    '{"id":1,"result":{"keys":["held","held"]}}\n', '{"id":1,"result":null}\n', '{"id":1,"result":[]}\n',
+    '{"id":1,"result":{"keys":[true]}}\n', '{"id":1,"result":{"held":[true]}}\n', 'exit'])
 def test_media_key_is_unknown_when_the_adapter_cannot_answer(inventory_archive, reply):
     ar, s = inventory_archive
     failed(ar, s, 'false_'+CHAT+'_OLD1', sent_days=400)
@@ -135,7 +138,8 @@ def test_inventory_runs_inside_a_read_only_transaction_and_changes_nothing(inven
     monkeypatch.setattr(media_inventory.psycopg, 'connect', connect)
     dsn_file = tmp_path/'dsn'; dsn_file.write_text(dsn); dsn_file.chmod(0o600)
     config = tmp_path/'collector.json'
-    config.write_text(json.dumps({'provider': 'whatsmeow', 'native_executable': '/synthetic/anymsg-whatsmeow'}))
+    config.write_text(json.dumps({'provider': 'whatsmeow', 'account': ACCOUNT,
+        'native_executable': '/synthetic/anymsg-whatsmeow'}))
     config.chmod(0o600)
     adapter = FakeAdapter(set())
     monkeypatch.setattr(media_inventory.subprocess, 'run', adapter)
@@ -164,3 +168,19 @@ def test_inventory_refuses_an_unknown_or_non_whatsapp_account(inventory_archive,
         with pytest.raises(SystemExit):
             collector_control.run_media_inventory(dsn_file, account, None)
         assert capsys.readouterr().out.strip() == 'invalid_account'
+
+
+# spec: ANYM-815
+def test_inventory_refuses_the_collector_config_of_another_account(inventory_archive, tmp_path, monkeypatch, capsys):
+    ar, s = inventory_archive
+    failed(ar, s, 'false_'+CHAT+'_OLD1', sent_days=400)
+    dsn_file = tmp_path/'dsn'; dsn_file.write_text(probe_dsn()); dsn_file.chmod(0o600)
+    config = tmp_path/'collector.json'
+    config.write_text(json.dumps({'provider': 'whatsmeow', 'account': 'other-wa',
+        'native_executable': '/synthetic/anymsg-whatsmeow'}))
+    config.chmod(0o600)
+    adapter = FakeAdapter({'false_'+CHAT+'_OLD1'})
+    monkeypatch.setattr(media_inventory.subprocess, 'run', adapter)
+    with pytest.raises(SystemExit):
+        collector_control.run_media_inventory(dsn_file, ACCOUNT, config)
+    assert capsys.readouterr().out.strip() == 'collector_config_mismatch' and adapter.calls == []

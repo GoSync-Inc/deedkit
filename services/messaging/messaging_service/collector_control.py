@@ -66,7 +66,7 @@ def run_media_inventory(dsn_file,account,config):
     from .media_inventory import run_inventory
     try:result=run_inventory(dsn_file,account,config)
     except ValueError as e:
-        print('invalid_account' if str(e)=='invalid_account' else 'media_inventory_failed')
+        print(str(e) if str(e) in ('invalid_account','collector_config_mismatch') else 'media_inventory_failed')
         raise SystemExit(1) from None
     except (OSError,psycopg.Error):
         print('media_inventory_failed')

@@ -586,7 +586,8 @@ No chat, message or file identity is printed. The media key column comes from th
 adapter's journal lookup (`anymsg-whatsmeow --config <file> --media-keys`, one request line per
 batch of at most 200 messages, docs/whatsapp-native.md); without `--collector-config`, for a
 browser-engine account, or when the lookup cannot answer, every job reads `media_key_unknown`
-(`media_key_basis: unavailable`). A message captured only by the browser engine has no key in the
+(`media_key_basis: unavailable`); a journal row the lookup could not read in time also counts as
+unknown, never as none. A config of another account is refused (`collector_config_mismatch`). A message captured only by the browser engine has no key in the
 native journal, so neither a native retry nor a phone re-upload can bring it back.
 
 `outside_history_bounds` is deliberate (ANYM-477), not a failure. Such a job is
