@@ -27,29 +27,42 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+      # Cached downloads are used without any download; each is accepted only with its pinned SHA-256
+      # (.github/scripts/fetch-release-asset.sh: cache, release download, then the GitHub API asset; outage 2026-11-08).
+      - name: Restore the cached pinned scanner downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-assets
+          key: release-assets-security-zizmor-1.30.1-e65324f4430c2717591937edcec90ccbefaf14c174f8ec9415e03ca875b46e1a-actionlint-1.7.12-8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8-hadolint-2.15.1-c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507-gitleaks-8.30.1-551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb-osv-scanner-2.6.0-ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d97485b108
       - name: Install pinned scanners
         id: install
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           bin="$RUNNER_TEMP/security-bin"
-          mkdir -p "$bin"
+          assets="$RUNNER_TEMP/release-assets"
+          mkdir -p "$bin" "$assets"
           fetch() {
-            curl --fail --silent --show-error --location --retry 3 -o "$3" "$1"
-            echo "$2  $3" | sha256sum --check --strict
+            .github/scripts/fetch-release-asset.sh "$1" "$2" "$assets/$3"
+            echo "$2  $assets/$3" | sha256sum --check --strict
           }
           fetch https://github.com/zizmorcore/zizmor/releases/download/v1.30.1/zizmor-x86_64-unknown-linux-gnu.tar.gz \
-            e65324f4430c2717591937edcec90ccbefaf14c174f8ec9415e03ca875b46e1a "$RUNNER_TEMP/zizmor.tar.gz"
-          tar -xzf "$RUNNER_TEMP/zizmor.tar.gz" -C "$bin" zizmor
+            e65324f4430c2717591937edcec90ccbefaf14c174f8ec9415e03ca875b46e1a zizmor.tar.gz
+          tar -xzf "$assets/zizmor.tar.gz" -C "$bin" zizmor
           fetch https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
-            8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 "$RUNNER_TEMP/actionlint.tar.gz"
-          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$bin" actionlint
+            8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 actionlint.tar.gz
+          tar -xzf "$assets/actionlint.tar.gz" -C "$bin" actionlint
           fetch https://github.com/hadolint/hadolint/releases/download/v2.15.1/hadolint-linux-x86_64 \
-            c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507 "$bin/hadolint"
+            c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507 hadolint
+          cp "$assets/hadolint" "$bin/hadolint"
           fetch https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
-            551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb "$RUNNER_TEMP/gitleaks.tar.gz"
-          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$bin" gitleaks
+            551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb gitleaks.tar.gz
+          tar -xzf "$assets/gitleaks.tar.gz" -C "$bin" gitleaks
           fetch https://github.com/google/osv-scanner/releases/download/v2.6.0/osv-scanner_linux_amd64 \
-            ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d97485b108 "$bin/osv-scanner"
+            ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d97485b108 osv-scanner
+          cp "$assets/osv-scanner" "$bin/osv-scanner"
           chmod 0755 "$bin"/*
           echo "$bin" >> "$GITHUB_PATH"
       - name: zizmor (workflow security)
