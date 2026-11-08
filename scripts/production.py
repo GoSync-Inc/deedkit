@@ -2946,23 +2946,50 @@ def copy_scratch(copy, image, directory, timeout, paths, superuser):
     return scratch_container, scratch_sql, psql
 
 
+def sql_lines(data):
+    """The lines of `pg_dumpall` output, each with whether it starts outside every string literal, quoted identifier
+    and comment: `'...'` and `"..."` (a doubled quote stays inside; `pg_dumpall` sets standard_conforming_strings),
+    `--` to the end of the line."""
+    state, found = None, []
+    for line in data.splitlines(keepends=True):
+        found.append((line, state is None))
+        index = 0
+        while index < len(line):
+            char = line[index:index + 1]
+            if state is None and line.startswith(b"--", index):
+                break
+            if state is None and char in (b"'", b'"'):
+                state = char
+            elif char == state:
+                state = None
+            index += 1
+    return found
+
+
 def scratch_roles(copy, source, target, bootstrap):
     """`roles.sql` without its `CREATE ROLE` of the bootstrap superuser, whom the scratch server already has (its
-    ALTER ROLE still applies); `pg_dumpall` writes that statement for every role. Only that one statement on a line
-    of its own outside a string literal is left out (`pg_dumpall` sets standard_conforming_strings, so a literal's
-    quotes come in pairs); every other byte stays."""
-    own, inside, kept, dropped = {f"CREATE ROLE {bootstrap};".encode(), f'CREATE ROLE "{bootstrap}";'.encode()}, False, [], False
+    ALTER ROLE still applies); `pg_dumpall` writes that statement for every role. Only that one statement, a line of
+    its own at the top level (`sql_lines`), is left out; every other byte stays."""
+    own, kept, dropped = {f"CREATE ROLE {bootstrap};".encode(), f'CREATE ROLE "{bootstrap}";'.encode()}, [], False
     try:
-        for line in Path(source).read_bytes().splitlines(keepends=True):
-            if not inside and not dropped and line.rstrip(b"\n") in own:
+        for line, top in sql_lines(Path(source).read_bytes()):
+            if top and not dropped and line.rstrip(b"\n") in own:
                 dropped = True
                 continue
             kept.append(line)
-            inside ^= line.count(b"'") % 2 == 1
         with os.fdopen(new_file(target), "wb") as handle:
             handle.writelines(kept)
     except OSError as exc:
         raise CopyFailed(copy["id"], "restore_failed") from exc
+
+
+def discard(copy, path, failed):
+    """Remove a working file of the copy; its error is `restore_failed`, unless the step already failed."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        if not failed:
+            raise CopyFailed(copy["id"], "restore_failed") from exc
 
 
 def copy_verify(copy, directory, database, found, reference, scratch_container, scratch_sql, psql, timeout, watch):
@@ -2972,8 +2999,10 @@ def copy_verify(copy, directory, database, found, reference, scratch_container, 
         scratch_roles(copy, directory / "roles.sql", roles, found["bootstrap"])
         restored(copy, copy_exec(copy, "roles", scratch_container, *psql, "-d", "postgres"), roles,
                  failure="restore_failed", **watch)
-    finally:
-        roles.unlink(missing_ok=True)
+    except BaseException:
+        discard(copy, roles, True)
+        raise
+    discard(copy, roles, False)
     def create(name):
         helper_output(copy, copy_exec(copy, "create", scratch_container, *psql, "-d", "postgres"), timeout=timeout,
                       failure="restore_failed",
@@ -2997,19 +3026,22 @@ def copy_verify(copy, directory, database, found, reference, scratch_container, 
         name = SCHEMA_ROUND_TRIP if database != SCHEMA_ROUND_TRIP else SCHEMA_ROUND_TRIP + "_2"
         round_trip = directory / "round-trip.schema"
         try:
-            create(name)
-            restored(copy, copy_exec(copy, "reference", scratch_container, *psql, "-d", name),
-                     directory / "reference.schema", failure="restore_failed", **watch)
-            dumped(copy, copy_exec(copy, "round", scratch_container, "pg_dump", "--schema-only", *scratch_sql, "-d",
-                                   name), round_trip, failure="restore_failed", **watch)
-            helper_output(copy, copy_exec(copy, "drop", scratch_container, *psql, "-d", "postgres"), timeout=timeout,
-                          failure="restore_failed", text=f"DROP DATABASE \"{name}\";")
-            if schema_lines(directory / "restored.schema") != schema_lines(round_trip):
-                raise CopyFailed(copy["id"], "schema_mismatch")
-        except (OSError, UnicodeDecodeError) as exc:
-            raise CopyFailed(copy["id"], "restore_failed") from exc
-        finally:
-            round_trip.unlink(missing_ok=True)
+            try:
+                create(name)
+                restored(copy, copy_exec(copy, "reference", scratch_container, *psql, "-d", name),
+                         directory / "reference.schema", failure="restore_failed", **watch)
+                dumped(copy, copy_exec(copy, "round", scratch_container, "pg_dump", "--schema-only", *scratch_sql,
+                                       "-d", name), round_trip, failure="restore_failed", **watch)
+                helper_output(copy, copy_exec(copy, "drop", scratch_container, *psql, "-d", "postgres"),
+                              timeout=timeout, failure="restore_failed", text=f"DROP DATABASE \"{name}\";")
+                if schema_lines(directory / "restored.schema") != schema_lines(round_trip):
+                    raise CopyFailed(copy["id"], "schema_mismatch")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise CopyFailed(copy["id"], "restore_failed") from exc
+        except BaseException:
+            discard(copy, round_trip, True)
+            raise
+        discard(copy, round_trip, False)
     (directory / "restored.schema").unlink()
 
 

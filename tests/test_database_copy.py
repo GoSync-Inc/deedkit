@@ -202,8 +202,28 @@ def test_only_the_top_level_create_role_of_the_bootstrap_superuser_is_left_out(t
     p.scratch_roles({"id": "x"}, source, target, "boss")
     assert target.read_bytes() == dumped.replace(b"kept';\nCREATE ROLE boss;\n", b"kept';\n")
     assert target.stat().st_mode & 0o777 == 0o600
+    # Sol r2 (PR #726): an apostrophe in a quoted identifier or a comment opens no literal.
+    quoted = (b'CREATE ROLE "a\'b";\nALTER ROLE "a\'b" WITH NOLOGIN;\nCOMMENT ON ROLE "a\'b" IS \'x\';\n'
+              b'-- User Config "a\'b"\nALTER ROLE "a\'b" SET work_mem TO \'1MB\';\nCREATE ROLE boss;\n'
+              b'ALTER ROLE boss WITH SUPERUSER;\n')
+    source.write_bytes(quoted)
+    target.unlink()
+    p.scratch_roles({"id": "x"}, source, target, "boss")
+    assert target.read_bytes() == quoted.replace(b"CREATE ROLE boss;\n", b"")
     with pytest.raises(p.CopyFailed, match="restore_failed"):
         p.scratch_roles({"id": "x"}, tmp_path / "missing.sql", tmp_path / "other.sql", "boss")
+
+
+# spec: ANYM-588
+def test_a_working_file_that_cannot_be_removed_ends_in_a_fixed_code_unless_the_step_failed(tmp_path, monkeypatch):
+    path = tmp_path / "scratch-roles.sql"
+    path.write_text("synthetic")
+    def refuse(self, missing_ok=False):
+        raise PermissionError("synthetic")
+    monkeypatch.setattr(Path, "unlink", refuse)
+    with pytest.raises(p.CopyFailed, match="restore_failed"):
+        p.discard({"id": "x"}, path, False)
+    p.discard({"id": "x"}, path, True)  # the step's own failure keeps its code
 
 
 def fail_dump(copy, argv):
