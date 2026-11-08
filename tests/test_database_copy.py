@@ -41,9 +41,9 @@ def psql(database, text):
 
 
 def scratch_sql(copy_id, database, text):
-    subprocess.run(["docker", "exec", "-i", "deedkit-copy-" + copy_id, "psql", "-X", "-q", "-v", "ON_ERROR_STOP=1",
-                    "-h", "127.0.0.1", "-U", p.COPY_USER, "-d", database], input=text, text=True, capture_output=True,
-                   check=True, timeout=60)
+    return subprocess.run(["docker", "exec", "-i", "deedkit-copy-" + copy_id, "psql", "-X", "-q", "-A", "-t", "-v",
+                           "ON_ERROR_STOP=1", "-h", "127.0.0.1", "-U", OWNER, "-d", database], input=text, text=True,
+                          capture_output=True, check=True, timeout=60).stdout.strip()
 
 
 def copy_sessions(copy_id, step=""):
@@ -132,6 +132,98 @@ def test_copy_holds_the_snapshot_counts_while_a_writer_inserts_and_restores_them
         assert (directory / name).stat().st_mode & 0o777 == 0o600
         assert record["files"][name] == p.file_digest(directory / name)
     assert record["server_version"].startswith("18") and record["database_bytes"] > 0
+
+
+# spec: ANYM-588
+def test_a_role_membership_the_bootstrap_superuser_granted_restores_in_the_copy(source):
+    # Incident 11-06: pg_dumpall writes `GRANTED BY <bootstrap superuser>`; PostgreSQL 16+ refuses that grant from a
+    # role without ADMIN OPTION, and the scratch server's bootstrap superuser had another name: restore_failed.
+    settings, database = source
+    group, member = ("anymsg_copy_" + uuid4().hex[:10] + suffix for suffix in ("_g", "_m"))
+    psql("postgres", f"CREATE ROLE {group} NOLOGIN; CREATE ROLE {member} NOLOGIN; GRANT {group} TO {member};")
+    membership = (f"SELECT pg_get_userbyid(grantor) || ' ' || (grantor = 10) FROM pg_auth_members"
+                  f" WHERE roleid = '{group}'::regrole AND member = '{member}'::regrole")
+    try:
+        bootstrap = psql("postgres", "SELECT rolname FROM pg_roles WHERE oid = 10")
+        assert psql("postgres", membership) == bootstrap + " true"
+        with p.database_copy(settings, "main", SHA, keep=True) as record:
+            assert record["verified"] and record["scratch_user"] == bootstrap
+            # The copy's membership keeps its grantor: the scratch server's own bootstrap superuser of that name.
+            assert scratch_sql(record["id"], "postgres", membership) == bootstrap + " true"
+        released(settings, record["id"])
+    finally:
+        psql("postgres", f"DROP ROLE IF EXISTS {member}; DROP ROLE IF EXISTS {group};")
+
+
+# spec: ANYM-588
+def test_a_check_whose_text_reads_back_flattened_still_verifies_the_copy(source):
+    # Incident 11-06: a BETWEEN inside an AND is stored nested and prints `((a) AND (b)) AND (c)`; parsed again it
+    # prints `(a) AND (b) AND (c)`, so the restored schema text differed from the live one: schema_mismatch.
+    settings, database = source
+    psql(database, "CREATE TABLE notes (note text CHECK (length(note) BETWEEN 1 AND 200 AND note !~ '[x]'));"
+                   " INSERT INTO notes VALUES ('synthetic');")
+    assert ")) AND (" in psql(database, "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = "
+                                        "'notes_note_check'")
+    with p.database_copy(settings, "main", SHA) as record:
+        assert record["verified"] and record["counts"]["public.notes"] == 1
+    directory = released(settings, record["id"])
+    assert not (directory / "restored.schema").exists() and not (directory / "round-trip.schema").exists()
+
+
+# spec: ANYM-588
+def test_a_database_named_like_the_bootstrap_superuser_is_copied(tmp_path, monkeypatch):
+    # Astra r1 (PR #726): the image creates a database named POSTGRES_USER unless POSTGRES_DB names another.
+    live()
+    bootstrap = psql("postgres", "SELECT rolname FROM pg_roles WHERE oid = 10")
+    created = psql("postgres", f"SELECT count(*) FROM pg_database WHERE datname = '{bootstrap}'") == "0"
+    if created:
+        psql("postgres", f"CREATE DATABASE {bootstrap}")
+    try:
+        psql(bootstrap, "CREATE TABLE anymsg_copy_named (id int); INSERT INTO anymsg_copy_named VALUES (1);")
+        monkeypatch.setattr(p, "filesystem", lambda path: PLENTY)
+        settings = settings_for(tmp_path, bootstrap)
+        with p.database_copy(settings, "main", SHA) as record:
+            assert record["verified"] and record["counts"]["public.anymsg_copy_named"] == 1
+        released(settings, record["id"])
+    finally:
+        if created:
+            psql("postgres", f"DROP DATABASE {bootstrap} WITH (FORCE)")
+        else:
+            psql(bootstrap, "DROP TABLE IF EXISTS anymsg_copy_named")
+
+
+# spec: ANYM-588
+def test_only_the_top_level_create_role_of_the_bootstrap_superuser_is_left_out(tmp_path):
+    source, target = tmp_path / "roles.sql", tmp_path / "scratch-roles.sql"
+    dumped = ("SET standard_conforming_strings = on;\nCREATE ROLE helper;\nALTER ROLE helper WITH NOLOGIN;\n"
+              "COMMENT ON ROLE helper IS 'it''s\nCREATE ROLE boss;\nkept';\nCREATE ROLE boss;\n"
+              "ALTER ROLE boss WITH SUPERUSER;\nGRANT helper TO boss GRANTED BY boss;\n").encode() + b"\xff\n"
+    source.write_bytes(dumped)
+    p.scratch_roles({"id": "x"}, source, target, "boss")
+    assert target.read_bytes() == dumped.replace(b"kept';\nCREATE ROLE boss;\n", b"kept';\n")
+    assert target.stat().st_mode & 0o777 == 0o600
+    # Sol r2 (PR #726): an apostrophe in a quoted identifier or a comment opens no literal.
+    quoted = (b'CREATE ROLE "a\'b";\nALTER ROLE "a\'b" WITH NOLOGIN;\nCOMMENT ON ROLE "a\'b" IS \'x\';\n'
+              b'-- User Config "a\'b"\nALTER ROLE "a\'b" SET work_mem TO \'1MB\';\nCREATE ROLE boss;\n'
+              b'ALTER ROLE boss WITH SUPERUSER;\n')
+    source.write_bytes(quoted)
+    target.unlink()
+    p.scratch_roles({"id": "x"}, source, target, "boss")
+    assert target.read_bytes() == quoted.replace(b"CREATE ROLE boss;\n", b"")
+    with pytest.raises(p.CopyFailed, match="restore_failed"):
+        p.scratch_roles({"id": "x"}, tmp_path / "missing.sql", tmp_path / "other.sql", "boss")
+
+
+# spec: ANYM-588
+def test_a_working_file_that_cannot_be_removed_ends_in_a_fixed_code_unless_the_step_failed(tmp_path, monkeypatch):
+    path = tmp_path / "scratch-roles.sql"
+    path.write_text("synthetic")
+    def refuse(self, missing_ok=False):
+        raise PermissionError("synthetic")
+    monkeypatch.setattr(Path, "unlink", refuse)
+    with pytest.raises(p.CopyFailed, match="restore_failed"):
+        p.discard({"id": "x"}, path, False)
+    p.discard({"id": "x"}, path, True)  # the step's own failure keeps its code
 
 
 def fail_dump(copy, argv):
@@ -499,7 +591,7 @@ def test_free_space_read_while_the_restore_runs_cancels_it_below_the_reserve(sou
         # A restore that is still running at the next 2 s read.
         if "pg_restore" in argv:
             reads.append("start")
-            return [*argv[:6], "psql", "-X", "-q", "-h", "127.0.0.1", "-U", p.COPY_USER, "-d", "postgres", "-c",
+            return [*argv[:6], "psql", "-X", "-q", "-h", "127.0.0.1", "-U", OWNER, "-d", "postgres", "-c",
                     "SELECT pg_sleep(60)"]
     wrap_watched(monkeypatch, before=slow)
     started = time.monotonic()

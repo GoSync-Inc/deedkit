@@ -757,11 +757,18 @@ Steps, all through `docker exec -i -e PGAPPNAME=deedkit-copy-<id>-<step> <contai
    the keeper commits.
 5. A scratch PostgreSQL from the database container's own image ID: `--rm --network none --log-driver
    none --memory 1g --cpus 1 --pids-limit 256 --shm-size 256m`, label `deedkit-copy=<id>`, trust
-   authentication (no network: only `docker exec` reaches it), data in `<id>/scratch`. Roles, then the
-   database with the live owner, encoding and locale, then `pg_restore --exit-on-error
+   authentication (no network: only `docker exec` reaches it), data in `<id>/scratch`. Its bootstrap
+   superuser has the live server's bootstrap name (the keeper reads `pg_roles` OID 10): `pg_dumpall` writes
+   `GRANTED BY <bootstrap>` on the role memberships that role granted, PostgreSQL 16+ refuses such a grant
+   from any other role without ADMIN OPTION (incident 11-06, `restore_failed`), and equal names keep the
+   copy's grantors equal to the live ones. Roles (`roles.sql` without the bootstrap's own `CREATE ROLE`),
+   then the database with the live owner, encoding and locale, then `pg_restore --exit-on-error
    --single-transaction`.
 6. Every count and the schema-only dump (its random `\restrict` lines excepted) must equal the reference;
-   then `copy.json` (`verified`, counts, file hashes and sizes, snapshot time, server version).
+   when the text differs, the reference schema alone is restored into an empty scratch database
+   (`deedkit_copy_reference`, dropped after) and the copy's dump must equal that one's, because parsing a
+   printed expression does not always print it back the same (incident 11-06: a BETWEEN inside an AND
+   reads back as one flat AND); then `copy.json` (`verified`, counts, file hashes and sizes, snapshot time, server version).
 
 A failure is one fixed code: `dump_failed`, `restore_failed`, `count_mismatch`, `schema_mismatch`,
 `disk_reserve` or `deadline`; no `copy.json` is written. No helper's output is kept or printed: stderr is
