@@ -102,7 +102,7 @@ def oneoff_argv(config, engine, command, network=True, login=True):
 # the next one. A task's own files may carry any mode, so each entry is made writable first (never through a
 # symlink operand); any failed removal, or anything left but a regular auth.json, exits non-zero.
 HYGIENE_SCRIPT = (
-    'set -eu; cd "$CODEX_HOME"; '
+    'set -eu; chmod u+rwx -- "$CODEX_HOME"; cd "$CODEX_HOME"; '
     'keep() { [ "$1" = auth.json ] && [ -f "$1" ] && [ ! -L "$1" ]; }; '
     'for f in .[!.]* ..?* *; do [ -e "$f" ] || [ -L "$f" ] || continue; keep "$f" && continue; '
     '[ -L "$f" ] || chmod -R u+rwx -- "$f"; rm -rf -- "$f"; done; '
@@ -152,8 +152,16 @@ class DockerCLI:
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
     def running(self, name):
-        code, out, _ = self._run(["inspect", "--format", "{{.State.Status}}", name], timeout=20)
-        return out.decode().strip() if code == 0 else "missing"
+        """The container's status; "missing" only when the daemon says there is no such container, "unknown"
+        when it could not be asked (a daemon or socket error), so absence is never assumed."""
+        try:
+            code, out, err = self._run(["inspect", "--type", "container", "--format", "{{.State.Status}}", name],
+                                       timeout=20)
+        except DockerError:
+            return "unknown"
+        if code == 0:
+            return out.decode().strip() or "unknown"
+        return "missing" if b"no such" in err.lower() else "unknown"
 
     def exit_code(self, name):
         code, out, _ = self._run(["inspect", "--format", "{{.State.ExitCode}} {{.State.OOMKilled}}", name])
@@ -171,7 +179,11 @@ class DockerCLI:
         self._run(["kill", name], timeout=30)
 
     def remove(self, name):
-        self._run(["rm", name], timeout=60)  # named volumes stay for the export (S4)
+        try:
+            code, _, _ = self._run(["rm", name], timeout=60)  # named volumes stay for the export (S4)
+        except DockerError:
+            return False
+        return code == 0
 
     def labelled(self):
         code, out, _ = self._run(["ps", "--all", "--filter", f"label={LABEL}", "--format",

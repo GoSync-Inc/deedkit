@@ -27,6 +27,9 @@ RAW_LIMIT = 16 * 1024
 PROGRESS_EVERY_S = 2.0
 LOGIN_TTL_S = 600
 PREAMBLE_NAME = "preamble.md"
+START_CONFIRM_S = 120.0
+START_POLL_S = 0.05
+HYGIENE_PENDING = "codex-hygiene-pending"
 
 
 def load_preamble():
@@ -142,6 +145,8 @@ class Runner:
         # is stopped and removed here; its engine's slot stays held until then.
         for task in self.store.unreconciled():
             self._spawn_once(f"reconcile-{task['id']}", self._reconcile, task["id"], task["container"])
+        if (self.state_dir / HYGIENE_PENDING).exists() and not self.store.slot_held("codex"):
+            self._spawn_once("codex-hygiene", self.codex_hygiene)
         if self.paused():
             return
         for engine in ENGINES:
@@ -201,8 +206,13 @@ class Runner:
                     dk.oneoff_argv(self.config, "codex", dk.CODEX_HYGIENE, network=False), "codex")
             except (dk.DockerError, OSError):
                 code = -1
+        pending = self.state_dir / HYGIENE_PENDING
         if code:
+            # Retried on every tick until it succeeds; until then every Codex task fails before it starts.
             log.warning("codex login hygiene failed (exit %s)", code)
+            pending.touch(mode=0o600, exist_ok=True)
+        else:
+            pending.unlink(missing_ok=True)
         return code == 0
 
     def _guard(self, target, *args):
@@ -267,10 +277,14 @@ class Runner:
                 if not self.store.commit_launch(task_id, self.paused):
                     return
                 process = self.docker.start_attached(name)
-                for _ in range(200):
-                    if self.docker.running(name) != "created":
-                        break
-                    time.sleep(0.05)
+                if not self._confirm_start(name, process):
+                    # The start's outcome is unknown: end the request and remove the created container while
+                    # still holding the lock, so no delayed start can land after a stop-all that follows.
+                    process.kill()
+                    self.docker.remove(name)
+                    if self.store.finish(task_id, "failed", "start_unconfirmed"):
+                        self._audit(task_id)
+                    return
             self._audit(task_id)
             if self.store.task(task_id)["state"] == "running":
                 try:
@@ -289,6 +303,19 @@ class Runner:
             self.docker.stop(name)
         finally:
             self._end(task_id, name)
+
+    def _confirm_start(self, name, process):
+        """True once the container has left `created` (it runs, or already ran and exited). False when the
+        start request ended without starting it, or when nothing is confirmed within START_CONFIRM_S."""
+        deadline = time.monotonic() + START_CONFIRM_S
+        while time.monotonic() < deadline:
+            state = self.docker.running(name)
+            if state in ("running", "exited", "dead", "paused", "restarting"):
+                return True
+            if state == "created" and process.poll() is not None:
+                return False  # `docker start` gave up; the container never started
+            time.sleep(START_POLL_S)
+        return False
 
     def _lines(self, stream):
         """The engine's output in lines of at most RAW_LIMIT bytes: a longer line is cut there and the rest of

@@ -42,7 +42,7 @@ class Stream:
     def feed(self, line):
         try:
             event = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):  # not JSON, or nested past the decoder's depth
             event = None
         if isinstance(event, dict):
             try:

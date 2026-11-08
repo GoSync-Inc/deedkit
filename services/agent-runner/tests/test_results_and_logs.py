@@ -93,6 +93,11 @@ def test_events_of_an_unexpected_shape_are_logged_as_text_and_never_stop_monitor
     assert stream.feed('{"type":"assistant","message":"x"}') == [("tool", '{"type":"assistant","message":"x"}')]
     codex = engines.Stream("codex")
     assert codex.feed('{"type":"item.completed","item":{"type":"file_change","changes":"x"}}')
+    # Nested past the decoder's depth but well under the line limit: text, and the next result still counts.
+    deep = "[" * 5000 + "]" * 5000
+    assert stream.feed(deep) == [("tool", engines.clip(deep, engines.TEXT_LIMIT))]
+    stream.feed('{"type":"result","is_error":false,"result":"RESULT: partial — after a deep line"}')
+    assert engines.outcome(engines.summary(stream, None)) == "partial"
 
 
 # spec: ANYM-819

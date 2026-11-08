@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -104,6 +105,7 @@ class Container:
     def __init__(self, name, args, env, mounts):
         self.name, self.args, self.env, self.mounts = name, args, env, mounts
         self.proc, self.task_id = None, name.removeprefix("agent-task-")
+        self.visible_at = 0.0
 
 
 class FakeDocker:
@@ -120,6 +122,7 @@ class FakeDocker:
         self.lock = threading.Lock()
         self.fail_create, self.config = None, None
         self.unstoppable, self.oneoff_logins, self.hygiene_code = set(), [], None
+        self.daemon_down, self.start_delay = False, 0.0
         self.on_create = None
         self.codex_login = self.root / "codex-login"
         self.codex_login.mkdir(parents=True, exist_ok=True)
@@ -163,16 +166,19 @@ class FakeDocker:
                "FAKE_OUT": str(self.volume_dir(f"agent-out-{task_id}")),
                "FAKE_STREAMS": str(HERE / "streams"), "FAKE_CODEX_HOME": str(self.codex_login),
                "FAKE_RUNS": str(self.root / "runs.log")}
+        container.visible_at = time.monotonic() + self.start_delay  # a slow daemon: still `created` meanwhile
         container.proc = subprocess.Popen([sys.executable, str(FAKE_ENGINE)], env=env, stdin=subprocess.PIPE,
                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
         self.starts.append(name)
         return container.proc
 
     def running(self, name):
+        if self.daemon_down:
+            return "unknown"
         container = self.containers.get(name)
         if container is None:
             return "missing"
-        if container.proc is None:
+        if container.proc is None or time.monotonic() < container.visible_at:
             return "created"
         return "running" if container.proc.poll() is None else "exited"
 
@@ -185,7 +191,7 @@ class FakeDocker:
 
     def _signal(self, name, sig):
         container = self.containers.get(name)
-        if name in self.unstoppable:  # a stop or kill that does not land (a hung daemon)
+        if name in self.unstoppable or self.daemon_down:  # a stop or kill that does not land
             return
         if container and container.proc and container.proc.poll() is None:
             try:
@@ -202,11 +208,14 @@ class FakeDocker:
         self._signal(name, 9)
 
     def remove(self, name):
+        if self.daemon_down:
+            return False
         with self.lock:  # as `docker rm` without force: a running container stays
             container = self.containers.get(name)
             if container and container.proc and container.proc.poll() is None:
-                return
+                return False
             self.containers.pop(name, None)
+        return True
 
     def labelled(self):
         return [(name, c.task_id) for name, c in self.containers.items()]

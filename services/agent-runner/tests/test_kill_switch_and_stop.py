@@ -170,6 +170,50 @@ def test_a_timed_out_container_also_holds_the_slot_until_it_is_gone(tmp_path):
 
 
 # spec: ANYM-819
+def test_a_start_not_confirmed_in_time_is_ended_before_the_lock_is_released(tmp_path, monkeypatch):
+    from deedkit_agent_runner import runner as runner_module
+    monkeypatch.setattr(runner_module, "START_CONFIRM_S", 0.3)
+    runner = make_runner(tmp_path, modes={"claude": "sleep"})
+    runner.docker.start_delay = 3.0  # the daemon would start it only after the confirmation window
+    task, _ = runner.submit("orchestrator-a", "a-run", fields())
+    runner.tick()
+    assert runner.join(30)
+    stop_all(runner.store, runner.docker, runner.pause_file)  # returns after the lock is free
+    time.sleep(3.2)  # past the moment the delayed start would have landed
+    row = runner.store.task(task["id"])
+    assert (row["state"], row["reason"]) == ("failed", "start_unconfirmed")
+    assert live(runner) == [] and runner.docker.labelled() == []
+
+
+# spec: ANYM-819
+def test_a_docker_outage_never_reads_as_a_gone_container(tmp_path):
+    runner = make_runner(tmp_path, modes={"claude": "sleep"})
+    first, _ = runner.submit("orchestrator-a", "a-run", fields())
+    second, _ = runner.submit("orchestrator-a", "a-run", fields())
+    runner.tick()
+    row = wait_running(runner, first["id"])
+    runner.docker.daemon_down = True  # inspect and rm now fail; the old container is still there
+    runner.docker.containers[row["container"]].proc.kill()
+    deadline = time.monotonic() + 10
+    while runner.store.task(first["id"])["state"] == "running" and time.monotonic() < deadline:
+        time.sleep(0.05)
+    for _ in range(3):
+        runner.tick()
+        time.sleep(0.1)
+    assert runner.store.task(first["id"])["container_gone"] == 0
+    assert runner.store.slot_held("claude") and runner.store.task(second["id"])["state"] == "queued"
+    runner.docker.daemon_down = False  # the daemon is back: reconciliation confirms the absence
+    runner.docker.modes["claude"] = "claude_ok"
+    deadline = time.monotonic() + 20
+    while runner.store.task(second["id"])["state"] != "succeeded" and time.monotonic() < deadline:
+        runner.tick()
+        time.sleep(0.1)
+    assert runner.store.task(first["id"])["container_gone"] == 1
+    assert runner.store.task(second["id"])["state"] == "succeeded"
+    assert runner.join(30)
+
+
+# spec: ANYM-819
 def test_a_stop_that_wins_the_lock_runs_no_engine_at_all(runner):
     from deedkit_agent_runner.store import launch_lock
     task, _ = runner.submit("orchestrator-a", "a-run", fields())

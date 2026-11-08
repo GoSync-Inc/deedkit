@@ -197,6 +197,31 @@ def test_a_symlinked_or_directory_auth_json_is_removed_too(runner, tmp_path):
 
 
 # spec: ANYM-819
+def test_hygiene_restores_the_volume_roots_own_permissions_first(runner):
+    login = runner.docker.codex_login
+    (login / "auth.json").write_text("{}")
+    (login / "left.txt").write_text("x")
+    login.chmod(0o500)  # a task made the volume root read-only for its own user
+    try:
+        assert runner.codex_hygiene() is True
+        assert sorted(p.name for p in login.iterdir()) == ["auth.json"]
+    finally:
+        login.chmod(0o700)
+
+
+# spec: ANYM-819
+def test_a_failed_hygiene_is_retried_until_it_succeeds(runner):
+    pending = runner.state_dir / "codex-hygiene-pending"
+    runner.docker.hygiene_code = 3
+    assert runner.codex_hygiene() is False and pending.exists()
+    runner.tick()
+    assert runner.join(30) and pending.exists()
+    runner.docker.hygiene_code = None
+    runner.tick()
+    assert runner.join(30) and not pending.exists()
+
+
+# spec: ANYM-819
 def test_a_failed_hygiene_stops_the_codex_task_before_it_starts(runner):
     runner.docker.hygiene_code = 3
     task = run_task(runner, "codex")
