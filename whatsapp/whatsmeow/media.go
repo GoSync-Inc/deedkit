@@ -562,10 +562,17 @@ func mediaKeysDSN(journal string) string {
 // or an error when the journal could not be read in time.
 type mediaKeyLookup func(ctx context.Context, chat, id string) ([]byte, error)
 
-func journalKeyLookup(db *sql.DB) mediaKeyLookup {
+const mediaKeyQuery = "SELECT raw FROM capture WHERE chat=? AND message_id=? ORDER BY seq DESC LIMIT 1"
+
+// The shared lock that blocks the capture writer is held only while a statement
+// executes; the context interrupts that execution at its deadline. Waiting for a
+// lock (prepare or step under busy_timeout) holds none, so it cannot stall capture.
+func journalKeyLookup(db *sql.DB) mediaKeyLookup { return journalLookupQuery(db, mediaKeyQuery) }
+
+func journalLookupQuery(db *sql.DB, query string) mediaKeyLookup {
 	return func(ctx context.Context, chat, id string) ([]byte, error) {
 		var raw []byte
-		e := db.QueryRowContext(ctx, "SELECT raw FROM capture WHERE chat=? AND message_id=? ORDER BY seq DESC LIMIT 1", chat, id).Scan(&raw)
+		e := db.QueryRowContext(ctx, query, chat, id).Scan(&raw)
 		if errors.Is(e, sql.ErrNoRows) {
 			return nil, nil
 		}

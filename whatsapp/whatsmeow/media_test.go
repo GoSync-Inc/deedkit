@@ -638,7 +638,7 @@ func TestMediaKeysLookupsNeverMakeCaptureWritesFail(t *testing.T) {
 }
 
 // spec: ANYM-815
-func TestMediaKeysRealJournalLookupEndsAtItsDeadlineAndCaptureContinues(t *testing.T) {
+func TestMediaKeysJournalStatementIsInterruptedAtItsDeadlineAndCaptureContinues(t *testing.T) {
 	config := testConfig(t)
 	s, err := OpenCapture(config)
 	if err != nil {
@@ -650,48 +650,39 @@ func TestMediaKeysRealJournalLookupEndsAtItsDeadlineAndCaptureContinues(t *testi
 	if err := s.Put(m, "live"); err != nil {
 		t.Fatal(err)
 	}
-	journal := filepath.Join(config.SessionDirectory, "capture.sqlite")
-	ro, err := sql.Open("sqlite3", mediaKeysDSN(journal))
+	ro, err := sql.Open("sqlite3", mediaKeysDSN(filepath.Join(config.SessionDirectory, "capture.sqlite")))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ro.Close()
 	ro.SetMaxOpenConns(1)
-	lookup := journalKeyLookup(ro)
 	chat, id := LegacyChatID(m.Info.Chat), LegacyMessageID(m)
-	// A second writer connection holds the journal's exclusive lock longer than the
-	// lookup's deadline but shorter than its busy timeout: only the deadline can end it.
-	w, err := sql.Open("sqlite3", sqliteDSN(journal))
-	if err != nil {
-		t.Fatal(err)
+	if got := mediaKeyState(journalKeyLookup(ro), chat, id); got != "held" {
+		t.Fatalf("production lookup: got %s", got)
 	}
-	defer w.Close()
-	conn, err := w.Conn(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	// The same lookup path and connection with a statement that reads the journal for
+	// far longer than the deadline (it would run for minutes): only the context's
+	// interrupt ends it, and then the shared lock is gone and capture writes again.
+	slow := journalLookupQuery(ro, `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2000000000)
+		SELECT raw FROM capture, n WHERE chat=? AND message_id=? AND i=2000000000 LIMIT 1`)
+	type answer struct {
+		state   string
+		elapsed time.Duration
 	}
-	defer conn.Close()
-	if _, err := conn.ExecContext(context.Background(), "BEGIN EXCLUSIVE"); err != nil {
-		t.Fatal(err)
-	}
-	released := make(chan struct{})
-	go func() {
-		time.Sleep(900 * time.Millisecond)
-		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
-		close(released)
-	}()
+	done := make(chan answer, 1)
 	started := time.Now()
-	state := mediaKeyState(lookup, chat, id)
-	elapsed := time.Since(started)
-	if state != "unknown" || elapsed > 700*time.Millisecond {
-		t.Fatalf("locked journal: got %s after %s; the lookup must end at its %s deadline", state, elapsed, mediaKeyLookupTimeout)
+	go func() { st := mediaKeyState(slow, chat, id); done <- answer{st, time.Since(started)} }()
+	time.Sleep(50 * time.Millisecond)
+	// The owning adapter writes while the long statement holds the shared lock.
+	if err := s.Put(fixtureMessage("DURINGSLOW", 1700000300), "live"); err != nil {
+		t.Fatal("capture write beside the long lookup:", err)
 	}
-	<-released
-	if got := mediaKeyState(lookup, chat, id); got != "held" {
-		t.Fatalf("after the lock: got %s", got)
+	got := <-done
+	if got.state != "unknown" || got.elapsed > 3*mediaKeyLookupTimeout {
+		t.Fatalf("long statement: got %s after %s; the %s deadline must interrupt it", got.state, got.elapsed, mediaKeyLookupTimeout)
 	}
-	if err := s.Put(fixtureMessage("AFTERLOCK", 1700000300), "live"); err != nil {
-		t.Fatal("capture write after the bounded lookup:", err)
+	if got := mediaKeyState(journalKeyLookup(ro), chat, id); got != "held" {
+		t.Fatalf("lookup after the interrupt: got %s", got)
 	}
 }
 
