@@ -5,6 +5,8 @@ Files the policy leaves to an agent's request are counted apart as available on 
 The SQL fragments below are the one definition of each bucket; sync status and enrichment_health both use them.
 The workers' claims keep their own order, caps and leases (tests/test_sync_coverage.py holds them to the same rows).
 """
+from datetime import datetime, timedelta, timezone
+
 from .file_lifecycle import PROCESSABLE_ORIGINAL
 
 # WhatsApp publishes no media retention; integrators report about 30 days (an estimate, not a provider guarantee).
@@ -16,12 +18,52 @@ RECOGNITION_KINDS = ('audio', 'image', 'document')
 # statements that carry parameters.
 KIND = ("CASE WHEN a.mime LIKE 'audio/%%' OR a.mime='application/ogg' THEN 'audio' "
         "WHEN a.mime LIKE 'image/%%' THEN 'image' ELSE 'document' END")
-# An enabled profile for the attachment's kind on the message's account (alias m).
-PROFILE_ON = ('EXISTS(SELECT FROM processing_profiles cpp WHERE cpp.account=m.account AND cpp.enabled AND cpp.kind='
-              + KIND + ')')
+# A configured kind: the account has a processing_profiles row for it observed within CONFIGURED_DAYS, enabled or
+# not. A clean worker stop sets enabled=false (EnrichmentWorker.unpublish_profiles) and must read as a stopped worker
+# whose files are still due, not as recognition switched off. Same bound as enrichment_health.NO_WORKER_MAX_AGE_S.
+CONFIGURED_DAYS = 7
 # Extracted text a document description can start from (alias f: the attachment's current text row).
 DOCUMENT_TEXT = "(f.state='ready' AND f.source_digest=a.digest AND f.source_revision=m.revision AND f.text_content<>'')"
 EVICTED = 'NOT ' + PROCESSABLE_ORIGINAL
+
+
+# Criterion 6. Production 2026-11-08: the policy predicates as per-row CASE subplans took 3.6-5.7 s against the
+# 0.5 s of the statements before this card, and even alone, applied row by row, the withheld rule costs about 1.1 s.
+# So each set is computed once per statement and a row reads hash-joined flags:
+# - on-request chats: media_policy.ON_REQUEST_CHATS verbatim (about 0.2 s, ANYM-806's lane: imported, not copied);
+# - withheld (media_policy.RECOGNITION_WITHHELD): the row's chat is in that set and its media job carries no
+#   request; the job is joined by its id, which is the attachment's id;
+# - evicted: file_lifecycle.PROCESSABLE_ORIGINAL verbatim, applied to attachment_residency (alias a: digest, bytes).
+# tests/test_sync_coverage.py holds these flags to the claims, which apply the predicates themselves.
+def exclusion_sets(withheld):
+    """The `on_request_chats` and `evicted_originals` CTEs, escaped for parameterized statements.
+
+    `withheld` is media_policy.recognition_withheld(c): the on-request rule, or 'false' for a login that cannot
+    read its columns (then no chat is on request, as for the claims)."""
+    from .media_policy import ON_REQUEST_CHATS
+    chats = ('SELECT DISTINCT orc.chat FROM (' + ON_REQUEST_CHATS + ') orc' if withheld != 'false'
+             else 'SELECT NULL::text AS chat WHERE false')
+    return ('on_request_chats AS MATERIALIZED (' + chats.replace('%', '%%') + '),'
+            '\n    evicted_originals AS MATERIALIZED (SELECT a.digest,a.bytes FROM attachment_residency a WHERE '
+            + EVICTED.replace('%', '%%') + ')')
+
+
+def policy_sets(withheld):
+    """Every CTE the bucket expressions read (sync status)."""
+    return (exclusion_sets(withheld) + ',\n    configured_kinds AS MATERIALIZED (SELECT account,kind'
+            " FROM processing_profiles WHERE observed_at>=clock_timestamp()-interval '"
+            + str(CONFIGURED_DAYS) + " days')")
+
+
+# The joins that give a row its flags (aliases a, m); each matches at most one row (chat id, job id, residency
+# digest, profile key), so no row is counted twice.
+EXCLUSION_JOINS = ('\n        LEFT JOIN on_request_chats orq ON orq.chat=m.chat'
+                   '\n        LEFT JOIN media_jobs wj ON wj.id=a.id'
+                   '\n        LEFT JOIN evicted_originals eo ON eo.digest=a.digest AND eo.bytes=a.bytes')
+POLICY_JOINS = (EXCLUSION_JOINS
+                + '\n        LEFT JOIN configured_kinds ck ON ck.account=m.account AND ck.kind=' + KIND)
+WITHHELD_ROW = '(orq.chat IS NOT NULL AND wj.id IS NOT NULL AND wj.request_key_digest IS NULL)'
+EVICTED_ROW, CONFIGURED_ROW = 'eo.digest IS NOT NULL', 'ck.kind IS NOT NULL'
 
 
 # enrichment.FINAL_LIMIT_CODES: a failure the same profile never retries (a test keeps the two equal, so the API
@@ -29,11 +71,8 @@ EVICTED = 'NOT ' + PROCESSABLE_ORIGINAL
 FINAL_LIMIT_CODES = ('original_size_limit', 'audio_duration_limit', 'audio_transcode_size_limit')
 
 
-def recognition_bucket(withheld):
-    """The bucket of one enrichment row e (aliases a, m, e, f), first match wins (card ANYM-812, precedence).
-
-    `withheld` is media_policy.recognition_withheld(c): the on-request rule, or 'false' for a login that cannot
-    read its columns."""
+def recognition_bucket():
+    """The bucket of one enrichment row e (aliases a, m, e, f and POLICY_JOINS), first match wins (ANYM-812)."""
     final = ','.join("'" + code + "'" for code in FINAL_LIMIT_CODES)
     return ('''CASE WHEN e.state IS NULL THEN 'unknown'
         WHEN e.state='ready' THEN 'ready'
@@ -41,20 +80,20 @@ def recognition_bucket(withheld):
             + final + ''')) THEN 'failed_final'
         WHEN e.state='unsupported' THEN 'unsupported'
         WHEN e.state='leased' THEN 'leased'
-        WHEN ''' + withheld + ''' THEN 'withheld'
-        WHEN ''' + EVICTED + ''' THEN 'evicted'
-        WHEN NOT ''' + PROFILE_ON + ''' THEN 'recognition_off'
+        WHEN ''' + WITHHELD_ROW + ''' THEN 'withheld'
+        WHEN ''' + EVICTED_ROW + ''' THEN 'evicted'
+        WHEN NOT ''' + CONFIGURED_ROW + ''' THEN 'recognition_off'
         WHEN ''' + KIND + "='document' AND NOT coalesce(" + DOCUMENT_TEXT + ''',false) THEN 'no_text'
         WHEN e.state='failed' THEN 'failed_retry'
         ELSE 'due' END''')
 
 
-def extraction_bucket(withheld):
-    """The bucket of one text row f (aliases a, m, f)."""
+def extraction_bucket():
+    """The bucket of one text row f (aliases a, m, f and POLICY_JOINS)."""
     return ('''CASE WHEN f.state IS NULL THEN 'unknown'
         WHEN f.state IN ('ready','unsupported','failed','leased') THEN f.state
-        WHEN ''' + withheld + ''' THEN 'withheld'
-        WHEN ''' + EVICTED + ''' THEN 'evicted'
+        WHEN ''' + WITHHELD_ROW + ''' THEN 'withheld'
+        WHEN ''' + EVICTED_ROW + ''' THEN 'evicted'
         ELSE 'due' END''')
 
 
@@ -62,7 +101,7 @@ def extraction_bucket(withheld):
 # was reported queued splits into due work, work waiting for a request and work no worker can do.
 RECOGNITION_FILES = {'unknown': 'unknown', 'ready': 'ready', 'failed_final': 'failed', 'failed_retry': 'failed',
                      'unsupported': 'unsupported', 'leased': 'leased', 'withheld': 'available_on_request',
-                     'evicted': 'available_on_request', 'recognition_off': 'unconfigured',
+                     'evicted': 'available_on_request', 'recognition_off': 'not_recognizable',
                      'no_text': 'not_recognizable', 'due': 'queued'}
 EXTRACTION_FILES = {'unknown': 'unknown', 'ready': 'ready', 'unsupported': 'unsupported', 'failed': 'failed',
                     'leased': 'leased', 'withheld': 'available_on_request', 'evicted': 'available_on_request',
@@ -108,7 +147,9 @@ def policy(platform, history_since, prefetch_days, kinds):
 
 def _policy(row, platform, eligibility):
     published = ((row.get('operations') or {}).get('media_policy') or {}) if eligibility is not None else {}
-    kinds = [p['kind'] for p in row.get('processing_profiles') or [] if p.get('configured')]
+    now = datetime.now(timezone.utc)
+    kinds = [p['kind'] for p in row.get('processing_profiles') or []
+             if p.get('observed_at') and now - p['observed_at'] <= timedelta(days=CONFIGURED_DAYS)]
     return policy(platform, published.get('history_since'),
                   eligibility['prefetch_days'] if eligibility is not None else None, kinds), published
 

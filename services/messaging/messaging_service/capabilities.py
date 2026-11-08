@@ -55,14 +55,15 @@ def capability_view(full, detail='full', sections=None, permitted=None):
 
 def _file_policy(c, p, account_ids):
     """ANYM-812: each permitted account's collection policy, from the run's published window and the enabled
-    recognition profiles only (no queue query); None for a chat-scoped key (account-wide facts)."""
+    configured recognition kinds only (no queue query); None for a chat-scoped key (account-wide facts)."""
     if p['chat_ids'] is not None:
         return None
-    from .coverage import policy
+    from .coverage import CONFIGURED_DAYS,policy
     from .media_policy import published_window
     rows=c.execute('''SELECT a.id,a.platform,coalesce(mp.published,false) AS published,mp.days,mp.since,
-            ARRAY(SELECT pp.kind FROM processing_profiles pp WHERE pp.account=a.id AND pp.enabled ORDER BY pp.kind) AS kinds
-        FROM accounts a '''+published_window('a.id')+''' WHERE a.id=ANY(%s) ORDER BY a.id''',(account_ids,)).fetchall()
+            ARRAY(SELECT pp.kind FROM processing_profiles pp WHERE pp.account=a.id
+                AND pp.observed_at>=clock_timestamp()-make_interval(days=>%s) ORDER BY pp.kind) AS kinds
+        FROM accounts a '''+published_window('a.id')+''' WHERE a.id=ANY(%s) ORDER BY a.id''',(CONFIGURED_DAYS,account_ids)).fetchall()
     return {r['id']:{**policy(r['platform'],r['since'].isoformat() if r['since'] else None,
             int(r['days']) if r['published'] and r['days'] is not None else None,r['kinds']),
         'published':r['published'],'status_call':'get_sync_status'} for r in rows}

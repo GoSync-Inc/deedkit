@@ -983,6 +983,7 @@ def register_archive_tools(mcp, call, async_call, read):
     def get_sync_status(ctx: Context,chat_id: str='',from_time: str='',to_time: str='',refresh: bool=False,
                         detail: Detail='compact') -> dict[str, Any]:
         """Account summary, or one chat's history traversal, scan times, gaps and file states.
+        Files: available_on_request is not work waiting; coverage says per account if everything due under the current policy is done.
         Optional UTC [from_time,to_time) tests traversal of a finite range, not full provider history.
         Account summaries cache for at most 10s with observed_at/cache age; refresh=true bypasses.
         detail=compact is the default overview; full includes complete account diagnostics.

@@ -5,7 +5,7 @@ import time
 from . import telemetry
 from .file_lifecycle import PROCESSABLE_ORIGINAL
 from .media_policy import RECOGNITION_WITHHELD
-from .coverage import DOCUMENT_TEXT, KIND
+from .coverage import DOCUMENT_TEXT, EVICTED_ROW, EXCLUSION_JOINS, KIND, WITHHELD_ROW, exclusion_sets
 
 MINI_PROVIDER = 'deedkit_inference'
 CHECK_PERIOD_S = 300
@@ -23,7 +23,8 @@ STALLED, STARVED, NO_WORKER = 'enrichment_stalled', 'enrichment_starved', 'enric
 # A scope is (account, kind, profile_hash). Only current rows a claim could take count (a withheld file of an
 # on-request chat no agent asked for, ANYM-805, is not one): a row of a
 # replaced revision, a deleted message or an evicted original waits forever and would alert forever.
-SCOPES_SQL = '''WITH queued AS MATERIALIZED (
+SCOPES_SQL = 'WITH '+exclusion_sets(RECOGNITION_WITHHELD)+''',
+    queued AS MATERIALIZED (
         SELECT m.account,e.kind,e.profile_hash,count(*) AS queued,min(e.updated_at) AS oldest_queued,
             count(*) FILTER (WHERE m.sent_at<=now()-make_interval(secs=>%(stall)s)
                 AND m.sent_at>=now()-make_interval(secs=>%(starved_age)s)) AS window_rows
@@ -39,19 +40,21 @@ SCOPES_SQL = '''WITH queued AS MATERIALIZED (
             AND (e.kind,e.profile_hash) IN (SELECT kind,profile_hash FROM queued)
         GROUP BY 1,2,3),
     -- ANYM-812: due rows still unconfigured (no claim has touched them yet) are waiting work too. Their scope is
-    -- (account, kind from mime, the provider of the account's enabled profile); progress is any ready row of it.
-    -- A row waits from its updated_at, so a row stored seconds ago does not count at once.
+    -- (account, kind from mime, the provider of the account's configured profile); progress is any ready row of it.
+    -- It stalls only while that profile is enabled and unexpired; a stopped worker is enrichment_no_worker.
+    -- A row waits from its updated_at, so a row stored seconds ago does not count at once. The withheld and evicted
+    -- rules are read from their sets (coverage.exclusion_sets), joined once by hash. The set counts every account's
+    -- due unconfigured rows in one pass, like sync status's file pass; the mini's profiles select scopes below
+    -- (production 2026-11-08: a profile join inside this pass made the planner probe row by row, 16 s).
     waiting AS MATERIALIZED (
-        SELECT m.account,pp.kind,count(*) AS queued,min(e.updated_at) AS oldest,
+        SELECT m.account,'''+KIND+''' AS kind,count(*) AS queued,min(e.updated_at) AS oldest,
             count(*) FILTER (WHERE m.sent_at<=now()-make_interval(secs=>%(stall)s)
                 AND m.sent_at>=now()-make_interval(secs=>%(starved_age)s)) AS window_rows
-        FROM attachment_enrichment e JOIN attachments a ON a.id=e.attachment JOIN messages m ON m.id=a.message
-        JOIN processing_profiles pp ON pp.account=m.account AND pp.enabled AND pp.provider=%(provider)s
-            AND pp.kind='''+KIND+'''
-        LEFT JOIN attachment_text f ON f.attachment=a.id
-        WHERE e.state='unconfigured' AND a.active AND NOT m.deleted AND e.source_digest=a.digest
-            AND e.source_revision=m.revision
-            AND '''+PROCESSABLE_ORIGINAL.replace('%', '%%')+''' AND NOT '''+RECOGNITION_WITHHELD.replace('%', '%%')+'''
+        FROM attachments a JOIN messages m ON m.id=a.message
+        JOIN attachment_enrichment e ON e.attachment=a.id AND e.source_digest=a.digest AND e.source_revision=m.revision
+        LEFT JOIN attachment_text f ON f.attachment=a.id'''+EXCLUSION_JOINS+'''
+        WHERE e.state='unconfigured' AND a.active AND NOT m.deleted
+            AND NOT '''+WITHHELD_ROW+''' AND NOT '''+EVICTED_ROW+'''
             AND ('''+KIND+"""<>'document' OR coalesce("""+DOCUMENT_TEXT+''',false))
         GROUP BY 1,2),
     waiting_ready AS (
@@ -68,8 +71,9 @@ SCOPES_SQL = '''WITH queued AS MATERIALIZED (
     SELECT w.account,w.kind,w.queued,w.window_rows,
         coalesce(p.enabled AND p.expires_at>now(),false) AND w.oldest<=now()-make_interval(secs=>%(stall)s)
             AND coalesce(wr.newest,'-infinity')<=now()-make_interval(secs=>%(stall)s) AS stalled
-    FROM waiting w LEFT JOIN waiting_ready wr USING(account,kind)
-    LEFT JOIN processing_profiles p ON p.account=w.account AND p.kind=w.kind AND p.provider=%(provider)s'''
+    FROM waiting w JOIN processing_profiles p ON p.account=w.account AND p.kind=w.kind AND p.provider=%(provider)s
+        AND p.observed_at>=now()-make_interval(secs=>%(no_worker_age)s)
+    LEFT JOIN waiting_ready wr ON wr.account=w.account AND wr.kind=w.kind'''
 WORKERS_SQL = '''SELECT account FROM processing_profiles
     WHERE provider=%(provider)s AND NOT (enabled AND expires_at>now())
         AND observed_at<=now()-make_interval(secs=>%(no_worker)s)
@@ -102,6 +106,8 @@ def read_only(store):
         c.execute('SET TRANSACTION READ ONLY')
         c.execute(f'SET LOCAL statement_timeout={int(STATEMENT_TIMEOUT_MS)}')
         c.execute(f'SET LOCAL lock_timeout={int(LOCK_TIMEOUT_MS)}')
+        # ANYM-812 (production 2026-11-08): JIT compilation of SCOPES_SQL took about 4 s of its 5 s budget.
+        c.execute('SET LOCAL jit=off')
         yield c
 
 

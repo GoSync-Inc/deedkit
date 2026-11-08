@@ -205,12 +205,15 @@ def _files(c, p, *, group_by_chat=False, tallies=None):
     from .media_policy import recognition_withheld
     from . import coverage
     withheld = recognition_withheld(c)
+    # ANYM-812 criterion 6 (production 2026-11-08): this statement's expressions push its cost over the JIT
+    # thresholds, and JIT inlining and optimization then took 4-5 s of a 0.8 s pass. Off for this transaction only.
+    c.execute("SELECT set_config('jit','off',true)")
     # ANYM-812: each row's bucket under the current policy (coverage.py); `files` keeps leased, ready, failed and
     # unsupported counts and splits what was reported queued into due work, work waiting for a request and work no
     # worker can do.
-    indexed = c.execute('SELECT '+key+''' AS account,'''+coverage.KIND+''' AS kind,
-            '''+coverage.extraction_bucket(withheld)+''' AS extraction_bucket,
-            '''+coverage.recognition_bucket(withheld)+''' AS recognition_bucket,
+    indexed = c.execute('WITH '+coverage.policy_sets(withheld)+'\n    SELECT '+key+''' AS account,'''+coverage.KIND+''' AS kind,
+            '''+coverage.extraction_bucket()+''' AS extraction_bucket,
+            '''+coverage.recognition_bucket()+''' AS recognition_bucket,
             count(*) AS count,sum(a.bytes) AS bytes,
             count(*) FILTER (WHERE f.state='ready' AND f.truncated) AS extraction_truncated,
             count(*) FILTER (WHERE e.state='ready' AND e.truncated) AS enrichment_truncated,
@@ -221,7 +224,7 @@ def _files(c, p, *, group_by_chat=False, tallies=None):
             AND f.source_revision=m.revision AND f.source_filename=a.filename
             AND f.source_mime=a.mime AND f.source_bytes=a.bytes AND f.state<>'superseded'
         LEFT JOIN attachment_enrichment e ON e.attachment=a.id AND e.source_digest=a.digest
-            AND e.source_revision=m.revision AND e.state<>'superseded'
+            AND e.source_revision=m.revision AND e.state<>'superseded' '''+coverage.POLICY_JOINS+'''
         WHERE a.active AND NOT m.deleted AND '''+where+'''
         GROUP BY 1,2,3,4''', args)
     files = {}
