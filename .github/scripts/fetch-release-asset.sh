@@ -20,10 +20,16 @@ if [[ ! $sum =~ ^[0-9a-f]{64}$ ]]; then echo "not a SHA-256: $sum" >&2; exit 2; 
 
 part="$dest.part"
 matches() { echo "$sum  $1" | sha256sum --check --strict --status; }
-# Every attempt is bounded: 5 tries per source (curl backs off 1, 2, 4, 8 s and retries 5xx and timeouts).
-get() { curl --fail --silent --show-error --location --connect-timeout 20 --max-time 120 --retry 4 "$@"; }
+# Every request is bounded: at most 4 tries (curl backs off 1, 2, 4 s and retries 5xx and timeouts), each try at
+# most 60 s, and no new try after 40 s, so one source costs at most about 100 s.
+get() {
+  curl --fail --silent --show-error --location --connect-timeout 15 --max-time 60 --retry 3 --retry-max-time 40 "$@"
+}
+# Once the release download fails in a job, later calls of the same job go straight to the API, so a releases
+# outage costs the primary budget once per job, not once per tool.
+down="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/fetch-release-asset.primary-down"
 keep() {
-  if matches "$part"; then mv -- "$part" "$dest"; echo "$asset: $1"; exit 0; fi
+  if matches "$part"; then mv -- "$part" "$dest"; [ -z "${release:-}" ] || rm -f -- "$release"; echo "$asset: $1"; exit 0; fi
   echo "$asset from $1 does not match the pinned SHA-256; discarded" >&2
   rm -- "$part"
 }
@@ -34,16 +40,25 @@ if [ -f "$dest" ]; then
   rm -- "$dest"
 fi
 
-if get -o "$part" "$url"; then keep "release download"; else echo "release download of $asset failed" >&2; fi
+if [ -f "$down" ]; then
+  echo "release download failed earlier in this job; using the GitHub API for $asset" >&2
+elif get -o "$part" "$url"; then
+  keep "release download"
+else
+  echo "release download of $asset failed" >&2
+  : > "$down"
+fi
 rm -f -- "$part"
 
 auth=()
 if [ -n "${GH_TOKEN:-}" ]; then auth=(-H "Authorization: Bearer $GH_TOKEN"); fi
 api="https://api.github.com/repos/$repo"
-if id=$(get "${auth[@]}" -H 'Accept: application/vnd.github+json' "$api/releases/tags/$tag" \
-    | jq -r --arg name "$asset" '[.assets[] | select(.name == $name) | .id] | if length == 1 then .[0] else empty end') \
-    && [[ $id =~ ^[0-9]+$ ]]; then
-  if get "${auth[@]}" -H 'Accept: application/octet-stream' -o "$part" "$api/releases/assets/$id"; then
+# The release JSON goes to a file, never a pipe: a retried request restarts the file instead of appending to it.
+release="$dest.release.json"
+if get ${auth[@]+"${auth[@]}"} -H 'Accept: application/vnd.github+json' -o "$release" "$api/releases/tags/$tag" \
+    && id=$(jq -r --arg name "$asset" '[.assets[] | select(.name == $name) | .id] | if length == 1 then .[0] else empty end' \
+      "$release") && [[ $id =~ ^[0-9]+$ ]]; then
+  if get ${auth[@]+"${auth[@]}"} -H 'Accept: application/octet-stream' -o "$part" "$api/releases/assets/$id"; then
     keep "GitHub API asset"
   else
     echo "GitHub API download of $asset failed" >&2
@@ -51,6 +66,6 @@ if id=$(get "${auth[@]}" -H 'Accept: application/vnd.github+json' "$api/releases
 else
   echo "GitHub API lookup of $asset in $repo $tag failed" >&2
 fi
-rm -f -- "$part"
+rm -f -- "$part" "$release"
 echo "no source returned $asset with the pinned SHA-256" >&2
 exit 1

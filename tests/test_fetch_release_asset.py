@@ -24,21 +24,22 @@ needs_tools = pytest.mark.skipif(not all(shutil.which(t) for t in ("bash", "jq",
 FAKE_CURL = r"""#!/usr/bin/env bash
 out= url=
 while [ $# -gt 0 ]; do
-  case $1 in -o) out=$2; shift;; -H|--connect-timeout|--max-time|--retry) shift;; https://*) url=$1;; esac
+  case $1 in -o) out=$2; shift;; -H|--connect-timeout|--max-time|--retry|--retry-max-time) shift;; https://*) url=$1;; esac
   shift
 done
 echo "$url" >> "$FAKE_LOG"
 case $url in
-  https://github.com/*/releases/download/*) mode=$MODE_DOWNLOAD;;
-  https://api.github.com/repos/example/tool/releases/tags/v1.2.3) mode=$MODE_LOOKUP;;
-  https://api.github.com/repos/example/tool/releases/assets/42) mode=$MODE_ASSET;;
-  *) mode=fail;;
+  https://github.com/*/releases/download/*) route=download mode=$MODE_DOWNLOAD;;
+  https://api.github.com/repos/example/tool/releases/tags/v1.2.3) route=lookup mode=$MODE_LOOKUP;;
+  https://api.github.com/repos/example/tool/releases/assets/42) route=asset mode=$MODE_ASSET;;
+  *) route=other mode=fail;;
 esac
 case $mode in
   fail) echo "curl: (22) The requested URL returned error: 504" >&2; exit 22;;
   bad) printf 'tampered\n' > "$out";;
-  ok) if [ -n "$out" ]; then cp "$FAKE_GOOD" "$out"; \
-      else printf '{"assets":[{"name":"other.tar.gz","id":7},{"name":"tool_linux_amd64.tar.gz","id":42}]}'; fi;;
+  ok) if [ "$route" = lookup ]; then
+        printf '{"assets":[{"name":"other.tar.gz","id":7},{"name":"tool_linux_amd64.tar.gz","id":42}]}' > "$out"
+      else cp "$FAKE_GOOD" "$out"; fi;;
 esac
 """
 
@@ -53,7 +54,7 @@ def _run(tmp_path, dest, pin=PIN, download="ok", lookup="ok", asset="ok"):
     log = tmp_path / "curl.log"
     log.write_text("")
     env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "FAKE_LOG": str(log),
-           "FAKE_GOOD": str(good), "MODE_DOWNLOAD": download, "MODE_LOOKUP": lookup, "MODE_ASSET": asset}
+           "FAKE_GOOD": str(good), "RUNNER_TEMP": str(tmp_path), "MODE_DOWNLOAD": download, "MODE_LOOKUP": lookup, "MODE_ASSET": asset}
     env.pop("GH_TOKEN", None)
     result = subprocess.run(["bash", str(SCRIPT), URL, pin, str(dest)], env=env, capture_output=True, text=True,
                             timeout=60)
@@ -70,6 +71,16 @@ def test_a_releases_outage_falls_back_to_the_same_asset_through_the_api(tmp_path
     assert urls == [URL, "https://api.github.com/repos/example/tool/releases/tags/v1.2.3",
                     "https://api.github.com/repos/example/tool/releases/assets/42"]
     assert "GitHub API asset" in result.stdout
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith("tool")) == ["tool.tar.gz"]
+
+
+# spec: ANYM-137
+@needs_tools
+def test_after_one_failed_release_download_the_job_goes_straight_to_the_api(tmp_path):
+    first, _ = _run(tmp_path, tmp_path / "tool.tar.gz", download="fail")
+    second, urls = _run(tmp_path, tmp_path / "again.tar.gz", download="ok")
+    assert first.returncode == 0 and second.returncode == 0, second.stderr
+    assert URL not in urls and (tmp_path / "again.tar.gz").read_bytes() == GOOD
 
 
 # spec: ANYM-137

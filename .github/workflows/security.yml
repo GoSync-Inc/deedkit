@@ -113,6 +113,11 @@ jobs:
         if: ${{ !cancelled() }}
         working-directory: whatsapp/whatsmeow
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+      # The runner's own Python 3.13 (tool cache, as in checks.yml), so uv downloads no interpreter from
+      # GitHub releases (outage 2026-11-08: python-build-standalone answered 504).
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        if: ${{ !cancelled() }}
+        with: {python-version: '3.13'}
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         if: ${{ !cancelled() }}
         with: {version: '0.9.26', enable-cache: false}
