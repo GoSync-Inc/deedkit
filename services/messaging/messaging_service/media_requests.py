@@ -8,10 +8,12 @@ import psycopg
 
 from .attachment_metadata import attachment_fields, processing_phases
 from .file_index import _available,_absent
+from .media_inventory import LIKELY_EXPIRED
 from .media_policy import ELIGIBILITY_JOIN
 from .media_retry import MEDIA_MAX_ATTEMPTS,MEDIA_REQUEST_WAKE_SECONDS
 from .policy import scope_filter, targets
 from .storage_admission import cold_grant
+from .status_details import describe
 from .store import APIError, serial
 
 PER_KEY_LIMIT=32
@@ -38,7 +40,7 @@ def occurrence(c,p,attachment_id,*,lock=False):
         m.revision AS message_revision,ch.provider_chat AS provider_chat_id,
         a.digest,a.filename,a.mime,a.bytes,a.id AS registered_id,
         p.enabled AS collection_enabled,p.include_chats,p.exclude_chats,p.discover_chats,
-        el.occurrence AS download_eligibility,el.history_bound
+        el.occurrence AS download_eligibility,el.history_bound,'''+LIKELY_EXPIRED+''' AS likely_expired
         FROM media_jobs j JOIN messages m ON m.id=j.message AND m.account=j.account
         JOIN chats ch ON ch.id=m.chat AND ch.account=m.account
         JOIN account_policies p ON p.account=m.account
@@ -191,6 +193,11 @@ def _request(store,c,p,attachment_id):
     if row['job_state']=='failed' or row['attempts']>=MEDIA_MAX_ATTEMPTS:
         result.update(request_status='failed',reason=row['error_code'] or 'retry_exhausted',
             requested_until=None)
+        if row.get('likely_expired'):
+            # ANYM-815: read-time wording; the recorded code stays as evidence and nothing is queued.
+            detail=describe('provider_media_likely_expired',job_state='failed')
+            result.update(reason='provider_media_likely_expired',recorded_error_code=result['reason'],
+                explanation=detail['explanation'],next_action=detail['next_action'])
         return serial(result)
     active=c.execute('SELECT %s::timestamptz>clock_timestamp() AS active',
         (row['requested_until'],)).fetchone()['active']

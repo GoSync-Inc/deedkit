@@ -545,6 +545,51 @@ code. So a `failed` original with `network_error` or `rate_limited` is not proof
 longer has the file. Attachment status reports `queued`, not `failed`, while attempts remain;
 `operations.media.retry_queued_jobs` counts the waiting jobs.
 
+Failed WhatsApp files (ANYM-815). Each adapter maps the media server's answer to a fixed
+code. HTTP 403, 404 and 410 are all `media_unavailable` (permanent: the copy is gone from the
+CDN), on the native adapter and on the browser fallback alike. The native adapter also reports
+`media_decrypt_failed` (the bytes matched their hash but the media key does not open them;
+permanent, since the same copy fails again) and `media_http_<status>` for 400, 401, 408, 429,
+500, 502, 503 and 504 (transient, on the schedule above). A failure of the local temporary file
+during the download is `media_storage_unavailable`, stored as `storage_unavailable`, and spends no
+provider attempt. Any other error stays `media_network_error`. The codes are in the shared
+allowlist (`error_codes.json`, the Go and JS copies; `tests/test_error_code_parity.py`).
+
+WhatsApp publishes no media retention; integrators report about 30 days
+(`PROVIDER_MEDIA_RETENTION_DAYS`, `media_retry.py`, an estimate). A file older than that usually
+cannot be fetched from WhatsApp's servers any more, although the owner's phone may still hold it.
+Schema 67 records no first-attempt time, so the only basis is `age_when_queued`: the message's
+age when its job was created (`created_at`). A failed WhatsApp job queued when its message was
+already older than 30 days, with a fetch code (`media_unavailable`, `media_network_error`,
+`media_timeout`, `media_http_*`, `network_error`, `unavailable` or `retry_exhausted`), reads
+`reason_code: provider_media_likely_expired` in `operations.media.diagnostics` (with
+`recorded_code`) and in a `request_file_download` answer (`request_status: failed`,
+`recorded_error_code`), with `next_action: null` while no recovery is enabled. This is read-time
+wording only: no row is rewritten, the recorded code stays in `errors`, and the jobs stay counted
+in `terminal_failed_jobs` and `needs_attention`. A job queued while its message was younger than
+30 days keeps its recorded code's wording even if it failed later. "Lost" is never said here;
+only the phone's own "not found" answer may say it. Telegram's failed files are unchanged.
+
+The operator inventory counts an account's failed WhatsApp jobs; it is read-only (a read-only
+database session) and makes no provider request:
+
+```sh
+python -m messaging_service.collector_control --dsn-file /run/secrets/owner.dsn \
+  --account example-whatsapp --media-inventory --collector-config /run/secrets/whatsapp.json
+```
+
+It prints one JSON object: `failed_jobs`, and `groups` by `code`, `chat_kind` (`on_request` for
+a group or channel chat without an active subscription, else `automatic`), `age_when_queued`
+(`under_30d` or `over_30d`), `now_age`, `mime_class`, with `jobs`, `bytes` (of the `bytes_known`
+jobs whose descriptor knows it) and `media_key_held`, `media_key_none` or `media_key_unknown`.
+No chat, message or file identity is printed. The media key column comes from the native
+adapter's journal lookup (`anymsg-whatsmeow --config <file> --media-keys`, one request line per
+batch of at most 200 messages, docs/whatsapp-native.md); without `--collector-config`, for a
+browser-engine account, or when the lookup cannot answer, every job reads `media_key_unknown`
+(`media_key_basis: unavailable`); a journal row the lookup could not read in time also counts as
+unknown, never as none. A config of another account is refused (`collector_config_mismatch`). A message captured only by the browser engine has no key in the
+native journal, so neither a native retry nor a phone re-upload can bring it back.
+
 `outside_history_bounds` is deliberate (ANYM-477), not a failure. Such a job is
 `queued`, is never claimed by the collector alone, does not set `needs_attention`
 (only `terminal_failed_jobs` does) and is counted in `operations.media` as

@@ -310,6 +310,12 @@ change). This is a judgement based on the archive, not on the provider: the chat
 then reads as if it had no gap, and `exhausted` keeps its meaning. A later pass that
 again cannot reach the head sets the flag again.
 
+`--media-inventory` (with an optional `--collector-config`) prints a read-only count of the
+account's failed WhatsApp files by cause, age and whether the native journal holds their media
+key (MEDIA_STORAGE.md, failed WhatsApp files). It writes nothing and asks no provider; it prints
+`invalid_account`, `collector_config_mismatch` or `media_inventory_failed` (exit 1) when it
+cannot answer.
+
 `last_commit` distinguishes `captured_at` from provider message time and gives
 `committed_by`, an upper bound recorded after the archive transaction returns.
 `capture_to_commit_seconds` includes durable queue delay and replay downtime;

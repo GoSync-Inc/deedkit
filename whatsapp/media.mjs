@@ -54,6 +54,12 @@ export async function* decrypt(source,metadata,maxBytes) {
   if(metadata.size!==null && metadata.size!==undefined && total!==metadata.size)throw new Error('media_size_mismatch');
   if(final.length)yield final;
 }
+// ANYM-815: 403, 404 and 410 all mean the CDN no longer serves this copy (whatsmeow
+// treats them alike); any other non-200 answer stays a network error.
+export function statusError(status) {
+  if(status===200)return null;
+  return status===403 || status===404 || status===410?'media_unavailable':'media_network_error';
+}
 export async function* download(metadata,maxBytes) {
   // No cookies, auth headers, proxies, arbitrary hosts, redirects or full buffers.
   keys(metadata); bytes32(metadata.filehash);bytes32(metadata.encFilehash);
@@ -70,8 +76,8 @@ export async function* download(metadata,maxBytes) {
   },60000);
   try {
     response=await new Promise((resolve,reject)=>{request.once('response',resolve);request.once('error',reject);});
-    if(response.statusCode===404 || response.statusCode===410)throw new Error('media_unavailable');
-    if(response.statusCode!==200)throw new Error('media_network_error');
+    const failure=statusError(response.statusCode);
+    if(failure)throw new Error(failure);
     const length=Number(response.headers['content-length']);
     if(Number.isFinite(length) && length>maxBytes+26)throw new Error('media_size_limit');
     yield* decrypt(response,metadata,maxBytes);

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createCipheriv,createHash,createHmac,hkdfSync} from 'node:crypto';
-import {decrypt,mediaUrl} from '../media.mjs';
+import {decrypt,mediaUrl,statusError} from '../media.mjs';
 
 // Test encryption is independent from the production keys() helper.
 function encrypted(plain,type='Document') {
@@ -33,6 +33,12 @@ test('host is fixed and redirect/URL injection is rejected',()=>{
     assert.equal(mediaUrl(path).hostname,'mmg.whatsapp.net');
   for(const path of ['https://evil.test/a','//evil.test','/v/\\evil','/v/file\nHost: evil','/v/file#frag'])
     assert.throws(()=>mediaUrl(path),/invalid_media_path/);
+});
+// spec: ANYM-815
+test('403, 404 and 410 mean the copy is gone; other answers stay network errors',()=>{
+  assert.equal(statusError(200),null);
+  for(const status of [403,404,410])assert.equal(statusError(status),'media_unavailable');
+  for(const status of [301,400,429,500,503])assert.equal(statusError(status),'media_network_error');
 });
 test('32MiB original emits bounded chunks and verifies hashes',async()=>{
   const {execFile}=await import('node:child_process');

@@ -42,7 +42,7 @@ EXPECTED_GO_SAFE_ONLY = {
 
 
 def _strings(text, quote):
-    return set(re.findall(quote + r'([a-z_]+)' + quote, text))
+    return set(re.findall(quote + r'([a-z][a-z0-9_]*)' + quote, text))  # media_http_<status> has digits
 
 
 def _js_set(source, pattern):
@@ -92,6 +92,24 @@ def test_python_constants_are_the_json_lists():
     assert not set(reply['command_rejected']) & set(reply['send_rejected'])
     assert not set(reply['command_rejected']) & operational.CONNECTION_ERRORS
     assert not set(reply['send_rejected']) & operational.CONNECTION_ERRORS
+
+
+# spec: ANYM-815
+def test_fixed_media_codes_reach_every_consumer():
+    from messaging_service import media_retry, status_details
+    new = {'media_decrypt_failed'} | {'media_http_' + str(n) for n in (400, 401, 408, 429, 500, 502, 503, 504)}
+    assert new <= set(CODES['media_errors']) and new <= operational.MEDIA_ERRORS
+    assert new <= _go_safe_errors()
+    assert media_retry.MEDIA_HTTP_CODES == new - {'media_decrypt_failed'}
+    # A decrypt failure repeats on the same copy; an HTTP answer follows the retry schedule.
+    assert 'media_decrypt_failed' in media_retry.MEDIA_PROVIDER_PERMANENT_CODES
+    assert not media_retry.MEDIA_HTTP_CODES & media_retry.MEDIA_PERMANENT_CODES
+    assert not media_retry.MEDIA_HTTP_CODES & media_retry.MEDIA_PROVIDER_PERMANENT_CODES
+    for code in new:
+        assert code in status_details.DETAILS, code
+    assert status_details.describe('provider_media_likely_expired', job_state='failed')['next_action'] is None
+    # The browser fallback never invents a native-only code.
+    assert not new & _js_set('media.mjs', r"const safe=new Set\(\[(.*?)\]\)")
 
 
 # spec: ANYM-292

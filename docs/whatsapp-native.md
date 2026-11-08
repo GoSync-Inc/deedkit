@@ -71,6 +71,26 @@ interval between the previous head and the pointer, which the archive can neithe
 prove missing nor prove covered. No provider request is made for it; closing a
 span needs the phone's correlated answer (ANYM-814).
 
+A native download maps the media server's answer to a fixed code (ANYM-815): HTTP 403, 404
+and 410 are `media_unavailable`, a key that does not decrypt matching bytes is
+`media_decrypt_failed`, HTTP 400, 401, 408, 429, 500, 502, 503 and 504 are `media_http_<status>`,
+a failure of the local temporary file is `media_storage_unavailable`, and anything else stays
+`media_network_error` (MEDIA_STORAGE.md, failed WhatsApp files). WhatsApp keeps media about 30
+days (an integrator estimate; WhatsApp publishes none), so a file that was already older when it
+was queued usually cannot be fetched from its servers; the phone may still have it.
+`anymsg-whatsmeow --config <file> --media-keys` answers the operator media inventory: it reads
+the config without creating or changing any directory, opens `capture.sqlite` read-only and
+query-only, and never the provider client, the device store or the session owner lock, so it
+runs beside the collector's adapter. It reads JSON lines
+`{"id":1,"method":"media_keys","params":{"messages":[{"chat":..,"message":..}]}}` (at most 200
+messages each, one journal row per statement) and answers
+`{"id":1,"result":{"keys":["held"|"none"|"unknown",..]}}`: `held` where the newest journal row
+holds the message's media key, `none` where the journal has no row or the row no key, `unknown`
+where the row could not be read or decoded. Each lookup is bounded to 200 ms, so its shared
+SQLite lock never outlasts the capture writer's 5 s busy timeout; a slower one answers
+`unknown`. An invalid line answers `invalid_request`. Without a journal it exits with
+`media_keys_unavailable` and creates nothing.
+
 The account-specific operation manifest reflects the selected provider after
 an identity-verified connection; platform counts are legacy defaults only.
 Native global revoke uses the explicit revoke operation. It never degrades to

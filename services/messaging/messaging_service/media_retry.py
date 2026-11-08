@@ -11,6 +11,18 @@ MEDIA_RETRY_JITTER = 0.10
 MEDIA_RATE_LIMIT_FREE_DAYS = 7
 # Codes that end the job at the first failure.
 MEDIA_PERMANENT_CODES = frozenset({'unavailable', 'size_limit'})
+# WhatsApp adapter codes that end the job at the first failure: the same answer would come again (ANYM-815:
+# media_decrypt_failed means the stored media key does not open bytes whose hash matched).
+MEDIA_PROVIDER_PERMANENT_CODES = frozenset({'media_unavailable', 'media_reference_changed', 'unsupported_media_type',
+    'media_size_limit', 'invalid_media_path', 'media_decrypt_failed'})
+# CDN answers the native adapter reports by status (ANYM-815); each is transient and follows the schedule.
+MEDIA_HTTP_CODES = frozenset('media_http_'+str(status) for status in (400, 401, 408, 429, 500, 502, 503, 504))
+# WhatsApp publishes no media retention; integrators report about 30 days (ANYM-815). An estimate, not a promise.
+PROVIDER_MEDIA_RETENTION_DAYS = {'whatsapp': 30}
+# Recorded codes of a failed WhatsApp fetch that an expired CDN copy explains (NULL reads as retry_exhausted).
+# Local, size, integrity and reference codes have their own cause and keep their wording.
+LIKELY_EXPIRED_CODES = frozenset({'media_unavailable', 'media_network_error', 'media_timeout', 'network_error',
+    'unavailable', 'retry_exhausted'}) | MEDIA_HTTP_CODES
 # A code with a smaller budget than MEDIA_MAX_ATTEMPTS: the last attempt that may fail and retry.
 # media_reference_expired: every attempt reads the message again, so a fresh reference gets two quick retries
 # (30 s, 5 min) and a third failure ends the job; the 32.6 h schedule would only spin on it.

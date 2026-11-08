@@ -79,9 +79,11 @@ def test_media_storage_pause_and_terminal_failures_remain_independent(wa):
     media = source(w, s)['operations']['media']
     assert media['storage_paused_jobs'] == media['terminal_failed_jobs'] == media['retry_queued_jobs'] == 1
     assert media['needs_attention'] is True and media['storage_paused'] is True
-    network = [d for d in media['diagnostics'] if d['reason_code'] == 'network_error']
-    assert {(d['job_state'], d['retry_scheduled'], d['count']) for d in network} == {
-        ('queued', True, 1), ('failed', False, 1)}
+    network = [d for d in media['diagnostics'] if d['reason_code'] == 'network_error'
+        or d.get('recorded_code') == 'network_error']
+    # ANYM-815: the fixture messages were years old when queued, so the failed line reads as likely expired.
+    assert {(d['reason_code'], d['job_state'], d['retry_scheduled'], d['count']) for d in network} == {
+        ('network_error', 'queued', True, 1), ('provider_media_likely_expired', 'failed', False, 1)}
     with s.pool.connection() as c:
         c.execute("UPDATE media_jobs SET error_code='storage_unavailable' WHERE id=%s", (jobs[0]['id'],))
     unavailable = source(w, s)['operations']['media']

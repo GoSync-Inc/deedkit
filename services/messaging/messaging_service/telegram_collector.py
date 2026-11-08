@@ -33,6 +33,7 @@ from .telegram_governor import LIVE_BUDGETS,LIVE_STATE,ProviderRateLimited,Reque
 from .operational import CONNECTION_ERRORS,MEDIA_ERRORS,collector_stop
 from .storage_admission import MEDIA_RESERVE_BYTES
 from .media_policy import MEDIA_POLICY_FIELDS,configure_media_policy,validate_prefetch_days
+from .media_retry import MEDIA_PROVIDER_PERMANENT_CODES
 
 log=logging.getLogger(__name__)
 # Seconds before a live read's deadline in which no archive write starts (ANYM-477).
@@ -1066,8 +1067,7 @@ class TelegramCollector:
             else: code,permanent='network_error',False
             if self.retry_connect and str(exc) in MEDIA_ERRORS:
                 code=str(exc)
-                permanent=code in ('media_unavailable','media_reference_changed','unsupported_media_type',
-                    'media_size_limit','invalid_media_path')
+                permanent=code in MEDIA_PROVIDER_PERMANENT_CODES
             with suppress(RuntimeError):
                 await asyncio.to_thread(self.archive.fail_media,job,code,permanent=permanent,
                     retry_after=exc.seconds if isinstance(exc,ProviderRateLimited) else None,collector_lease=self.state.lease)
