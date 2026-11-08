@@ -510,7 +510,8 @@ def test_telegram_anchor_with_only_usernames_elsewhere_gets_the_newest_username(
 
 
 # spec: ANYM-831
-@pytest.mark.parametrize('case',['hidden_chat','deleted_source','outgoing_source','other_account','profile_mismatch'])
+@pytest.mark.parametrize('case',['hidden_chat','deleted_source','outgoing_source','other_account','profile_mismatch',
+    'source_by_other_sender_same_chat','source_in_other_chat_same_sender','hidden_profile_readable_source'])
 def test_telegram_anchor_never_takes_a_name_the_key_may_not_read(tg_names,case):
     s,key,say,anchor=tg_names
     source=say('g1',name='Synthetic Hidden',username='hidden_user',day=2,
@@ -522,7 +523,20 @@ def test_telegram_anchor_never_takes_a_name_the_key_may_not_read(tg_names,case):
             # The profile row points at a message of another sender: the source does not name 4242.
             other=say('g2',sender='777',day=3)
             c.execute("UPDATE sender_profiles SET source_message=%s WHERE source_message=%s",(other,source))
+        if case=='source_by_other_sender_same_chat':
+            # Same chat, another sender: only the sender guard rejects it.
+            other=say('g1',sender='777',day=3)
+            c.execute("UPDATE sender_profiles SET source_message=%s WHERE source_message=%s",(other,source))
+        if case in ('source_in_other_chat_same_sender','hidden_profile_readable_source'):
+            # Same sender, another readable chat: only the chat guard rejects it.
+            other=say('g2',day=3)
+            c.execute("UPDATE sender_profiles SET source_message=%s WHERE source_message=%s",(other,source))
     if case=='hidden_chat':s.set_access('tg-names-reader',chats=[anchor(mid)['message']['chat']])
+    if case=='hidden_profile_readable_source':
+        # The profile's own chat is hidden; the message it points at is readable.
+        with s.pool.connection() as c:
+            readable=[r['chat'] for r in c.execute('SELECT chat FROM messages WHERE id=ANY(%s)',([mid,other],))]
+        s.set_access('tg-names-reader',chats=readable)
     for detail in ('full','compact'):
         row=anchor(mid,detail)['message']
         assert {k:row.get(k) for k in NAME_AID if k!='sender_name_basis'}=={'sender_name':None,'username':None,
