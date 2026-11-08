@@ -650,6 +650,7 @@ class WhatsAppCollector(TelegramCollector):
     coverage_code='whatsapp_history_partial'
     connect_timeout=300
     retry_connect=True
+    gap_repair=False  # ANYM-814: also off for an instance built without __init__.
     @property
     def history_spool(self):
         # WhatsApp pages already have their own spool; live events use events_spool.
