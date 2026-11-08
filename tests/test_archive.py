@@ -883,6 +883,12 @@ def test_whatsapp_business_text_completes_an_empty_unknown_revision(archive,kind
     assert archive_state(s,mid)[1]==snapshots and message_events(s,mid)==[('message.created',1),('message.edited',2)]
 
 
+# spec: ANYM-471
+@pytest.mark.parametrize('kind',['list_response','buttons_response','template_reply','interactive_response'])
+def test_whatsapp_menu_reply_text_completes_an_empty_unknown_revision(archive,kind):
+    # A menu choice archived before its text was read is completed like a business message (ANYM-560).
+    test_whatsapp_business_text_completes_an_empty_unknown_revision(archive,kind,{'message_kind':'unknown','chat_type':'private'})
+
 # spec: ANYM-560
 @pytest.mark.parametrize('retained,candidate,outcome',[
     # Kinds outside the explicit list, including a plain chat message and a document (criterion 6).
