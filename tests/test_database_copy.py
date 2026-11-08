@@ -170,6 +170,42 @@ def test_a_check_whose_text_reads_back_flattened_still_verifies_the_copy(source)
     assert not (directory / "restored.schema").exists() and not (directory / "round-trip.schema").exists()
 
 
+# spec: ANYM-588
+def test_a_database_named_like_the_bootstrap_superuser_is_copied(tmp_path, monkeypatch):
+    # Astra r1 (PR #726): the image creates a database named POSTGRES_USER unless POSTGRES_DB names another.
+    live()
+    bootstrap = psql("postgres", "SELECT rolname FROM pg_roles WHERE oid = 10")
+    created = psql("postgres", f"SELECT count(*) FROM pg_database WHERE datname = '{bootstrap}'") == "0"
+    if created:
+        psql("postgres", f"CREATE DATABASE {bootstrap}")
+    try:
+        psql(bootstrap, "CREATE TABLE anymsg_copy_named (id int); INSERT INTO anymsg_copy_named VALUES (1);")
+        monkeypatch.setattr(p, "filesystem", lambda path: PLENTY)
+        settings = settings_for(tmp_path, bootstrap)
+        with p.database_copy(settings, "main", SHA) as record:
+            assert record["verified"] and record["counts"]["public.anymsg_copy_named"] == 1
+        released(settings, record["id"])
+    finally:
+        if created:
+            psql("postgres", f"DROP DATABASE {bootstrap} WITH (FORCE)")
+        else:
+            psql(bootstrap, "DROP TABLE IF EXISTS anymsg_copy_named")
+
+
+# spec: ANYM-588
+def test_only_the_top_level_create_role_of_the_bootstrap_superuser_is_left_out(tmp_path):
+    source, target = tmp_path / "roles.sql", tmp_path / "scratch-roles.sql"
+    dumped = ("SET standard_conforming_strings = on;\nCREATE ROLE helper;\nALTER ROLE helper WITH NOLOGIN;\n"
+              "COMMENT ON ROLE helper IS 'it''s\nCREATE ROLE boss;\nkept';\nCREATE ROLE boss;\n"
+              "ALTER ROLE boss WITH SUPERUSER;\nGRANT helper TO boss GRANTED BY boss;\n").encode() + b"\xff\n"
+    source.write_bytes(dumped)
+    p.scratch_roles({"id": "x"}, source, target, "boss")
+    assert target.read_bytes() == dumped.replace(b"kept';\nCREATE ROLE boss;\n", b"kept';\n")
+    assert target.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(p.CopyFailed, match="restore_failed"):
+        p.scratch_roles({"id": "x"}, tmp_path / "missing.sql", tmp_path / "other.sql", "boss")
+
+
 def fail_dump(copy, argv):
     if "-Fc" in argv:
         return [*argv, "--no-such-option"]
