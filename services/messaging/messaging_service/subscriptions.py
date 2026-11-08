@@ -164,10 +164,14 @@ def hide_out_of_scope(c, principal, accounts, chats):
 
 
 def protection_lock(c):
-    """ANYM-806: a state change of a subscription that names chats can start or end the protection of their files
-    (media_policy.ON_REQUEST_CHATS reads state, expires_at and closed_at). Serialize it with the lifecycle
-    worker's recheck and unlink, which hold the same lock. It is the last lock a subscription transaction takes
-    (after subscription rows, principal, endpoint and module locks); its holders never wait for those."""
+    """ANYM-806: serialize a change that starts the protection of named chats' files (media_policy.ON_REQUEST_CHATS)
+    with the lifecycle worker's recheck and unlink, which hold the same lock: create with named chats, an owner's
+    pause, resume or close, and the operator's retention release. It is the last lock those transactions take.
+
+    Lazy expiry and access invalidation (_state, the matcher) take no lock: they run under many other locks, and they
+    never protect a chat that was unprotected except through the 24-hour grace of a subscription that was already
+    not protecting it (paused, or expired more than 24 hours before). An eviction racing them loses nothing the
+    verified R2 copy cannot restore on request."""
     from .file_lifecycle import lifecycle_lock
     lifecycle_lock(c)
 
@@ -221,13 +225,11 @@ def _state(c, row, p):
         changed = any(source['account'] not in p['accounts'] or
             p['chat_ids'] is not None and source['chat'] not in p['chat_ids'] for source in sources)
     if changed and row['state'] != 'access_changed':
-        protection_lock(c)
         row = c.execute("""UPDATE subscriptions SET state='access_changed',
             version=version+1,updated_at=clock_timestamp() WHERE id=%s RETURNING *""",
             (row['id'],)).fetchone()
     elif (row['state'] in ('active', 'paused') and row['expires_at'] is not None and
             row['expires_at'] <= c.execute('SELECT clock_timestamp() AS t').fetchone()['t']):
-        protection_lock(c)
         row = c.execute("""UPDATE subscriptions SET state='expired',version=version+1,
             updated_at=clock_timestamp() WHERE id=%s RETURNING *""", (row['id'],)).fetchone()
     return row
@@ -698,7 +700,6 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                 continue
             stats['checked'] += 1
             if p is None:
-                protection_lock(c)
                 c.execute("""UPDATE subscriptions SET state='access_changed',version=version+1,
                     updated_at=clock_timestamp() WHERE id=%s""", (row['id'],))
                 stats['access_changed'] += 1
@@ -713,7 +714,6 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
             # defensive boundary if records are restored or repaired externally.
             if any(source['account'] not in p['accounts'] or
                     p['chat_ids'] is not None and source['chat'] not in p['chat_ids'] for source in sources):
-                protection_lock(c)
                 c.execute("""UPDATE subscriptions SET state='access_changed',version=version+1,
                     updated_at=clock_timestamp() WHERE id=%s""", (row['id'],))
                 stats['access_changed'] += 1

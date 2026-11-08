@@ -21,10 +21,11 @@ agent asked for (`request_file_download`) is pending, the original stays: enrich
 occurrence limit, identity, in-flight lease, open request window, live download grant, the integrity
 hash and journal replay. An original with any occurrence in a personal, unknown-kind or subscribed
 chat, or with an occurrence that has no media job (a legacy or restored original, which a request cannot
-restore from the cold copy), keeps the 30-day rule. Every subscription state change that can start or
-end that protection takes the lifecycle lock: create with named chats, pause, resume, close, lazy
-expiry, access change and the operator's retention release. So the recheck before unlink and the
-unlink itself are serialized with it. Attachment items of
+restore from the cold copy), keeps the 30-day rule. A change that starts that protection takes the
+lifecycle lock, so the recheck before unlink and the unlink itself are serialized with it: create with
+named chats, an owner's pause, resume or close, and the operator's retention release. Lazy expiry and
+access invalidation take no lock. They protect an unprotected chat only through the 24-hour grace of a
+subscription that already did not protect it, and an eviction racing them is restored from R2 on request. Attachment items of
 on-request chats carry `original_retention_hours: 24`. An evicted file whose requested recognition never
 finished (queued, leased, failed or unconfigured work) reads `enrichment_status: available_on_request` with `recognition_next_action:
 request_file_download`. The daemon's daily pass includes the class within its `--limit`/`--max-bytes`
