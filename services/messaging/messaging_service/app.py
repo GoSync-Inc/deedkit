@@ -989,6 +989,7 @@ def register_archive_tools(mcp, call, async_call, read):
         Chat status is uncached. No provider requests; scans do not verify older edits/deletions.
         A Telegram chat whose traversal is incomplete adds history.next_call, the request_chat_history call that loads older history.
         With no call to offer, only history.history_hint {coverage: unknown, reason} is added.
+        WhatsApp: history.unverified_span_chats counts chats whose catch-up stalled on the local cache; full lists unverified_spans {chat_id, from, to, days}, gap_chat_ids and sources (7-day/50-message pairing batch, live_since, older_messages_call request_chat_history); a span is unverified, not a gap.
         Unscoped keys: each account row has an outbound block (full always; compact only when the sender is not ready,
         sends wait or an outbound alert fires): sender ready, cooling_down, not_ready or unavailable, queued sends, age,
         time to expiry. Alerts outbound_queue_stalled, outbound_sender_not_ready. Never answer a waiting send by sending again.

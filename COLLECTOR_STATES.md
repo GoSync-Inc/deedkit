@@ -38,7 +38,24 @@ check is failing (log line `enrichment_health_unavailable`).
   below, never by a later traversal. `history.gap_cleared_chats` counts chats
   without a flag whose last gap was cleared by hand; a clear is a judgement from
   the archive, not a continuity claim. `catchup_pending_chats`
-  is a different count: chats whose catch-up is still walking back.
+  is a different count: chats whose catch-up pointer moved in its last scan.
+  WhatsApp history is partial for good (`whatsapp_history_partial`): WhatsApp keeps
+  no server history, so the archive holds the phone's batch after pairing, live
+  capture since and what `request_chat_history` brings (`history.sources`:
+  `pairing_batch_days`, `pairing_batch_per_chat`, `live_since`, the first live
+  message committed under the native engine since ANYM-813, `older_messages_call`).
+  A native catch-up whose page before the pointer returns nothing older on two
+  consecutive scans records an *unverified span* on the chat's checkpoint
+  (`unverified_span` {`from`: the previous head's time, `to`: the pointer's time,
+  `stalled_since`}) and leaves `catchup_pending_chats`. The span is neither a proven
+  hole nor proven covered: the native cache mixes live and loaded messages, so only
+  the owner's phone can tell (ANYM-814). It is written once and kept when a later
+  cached page completes the catch-up. `history.unverified_span_chats` counts these
+  chats (compact and full); full detail lists `unverified_spans` (the first 20 by
+  length: `chat_id`, `from`, `to`, `days`) and `gap_chat_ids` (the first 20 flagged
+  chats, span `unknown`). A chat's own status shows its span. A span is not a gap:
+  it sets or clears no flag, adds no alert and no answer caveat; a flagged chat gets
+  no span.
   Reconciliation and backfill pages use their own durable spool (WhatsApp pages,
   Telegram `history/` beside the live spool); `history.pending_events` counts them,
   so they never make `live_capture` look backlogged.

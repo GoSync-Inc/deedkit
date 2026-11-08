@@ -91,7 +91,10 @@ takes the account's archive lock before it writes, so a new mapping commits
 before or after an ingest's check, never in between.
 
 This release does not repair history gaps, change collection checkpoints or
-claim complete WhatsApp history. Production acceptance must measure actual cache
+claim complete WhatsApp history. WhatsApp history stays partial (the pairing
+batch, live capture and explicit `request_chat_history` pages); a native catch-up
+that stalls on the local cache is reported as an unverified span, not as a gap
+(ANYM-813, COLLECTOR_STATES.md `history`). Production acceptance must measure actual cache
 availability on both existing collectors, check original IDs and revisions and
 exercise the API with its real least-privilege roles. Backup inventories must
 include the new table; collectors need SELECT/INSERT/UPDATE and the gateway only

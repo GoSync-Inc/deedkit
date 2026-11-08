@@ -99,6 +99,28 @@ def position(event):
     return [event['timestamp'],event['messageId']]
 
 
+def stalled_catchup(progress,before,head,moved):
+    """ANYM-813: a native catch-up whose pointer stays put on two consecutive scans records its span.
+
+    The span [previous head, catchup_before] is unverified, neither a hole nor covered: it is written once,
+    kept when the catch-up later completes and never replaced; a flagged gap chat gets none (ANYM-700)."""
+    if not before or moved or progress.get('catchup_before')!=before:
+        progress.pop('catchup_stalled_scans',None);progress.pop('catchup_stalled_since',None);return
+    scans=progress.get('catchup_stalled_scans');scans=scans+1 if type(scans) is int else 1
+    progress['catchup_stalled_scans']=scans
+    if type(progress.get('catchup_stalled_since')) not in (int,float):
+        progress['catchup_stalled_since']=progress.get('last_attempt_at')
+    if scans<2 or progress.get('gap') is True or 'unverified_span' in progress:return
+    from datetime import datetime,timezone
+    def at(value):
+        with suppress(TypeError,ValueError,OverflowError,OSError):return datetime.fromtimestamp(value,timezone.utc).isoformat()
+    since=progress.get('catchup_stalled_since')
+    span={'from':at(head[0]) if isinstance(head,list) and head else None,
+        'to':at(before[0]) if isinstance(before,list) and before else None,
+        'stalled_since':at(since) if type(since) in (int,float) else None}
+    if span['from'] and span['to']:progress['unverified_span']=span
+
+
 def merge_gap_clear(progress,stored,gap_set):
     """ANYM-700: keep an operator's clear committed after this pass began (progress is written back whole).
     Anything unexpected leaves progress as it is: the flag stays, the page is not failed."""
@@ -205,6 +227,8 @@ def whatsapp_asset(name):
 
 
 class NodeProvider:
+    # ANYM-813: only the native cache can stall a catch-up for good (it never reports exhausted).
+    native_history=False
     def __init__(self,cfg,config_path,lock_fd,*,script=None):
         self.cfg,self.config_path,self.lock_fd=cfg,str(config_path),lock_fd
         self.script=script or whatsapp_asset('provider.mjs')
@@ -489,6 +513,7 @@ class WhatsmeowProvider(NodeProvider):
     Only process launch differs. This class never starts Node or touches Chromium
     profile locks, and an error never switches it to another provider/session.
     """
+    native_history=True
     def __init__(self,cfg,config_path,lock_fd):
         super().__init__(cfg,config_path,lock_fd,script=Path(cfg['native_executable']))
     def command(self):
@@ -602,6 +627,7 @@ class WhatsAppCollector(TelegramCollector):
             elif points:
                 if points[0]!=before:catchup_moved=True
                 progress['catchup_before']=points[0];progress['catchup_head']=target
+            if getattr(self.provider,'native_history',False) is True:stalled_catchup(progress,before,head,catchup_moved)
             if not progress.get('catchup_before') and not progress.get('history_exhausted') and progress.get('history_before'):
                 old=await self.provider.page(chat,limit=self.batch_size,before=progress['history_before'])
                 old_points=await self.commit_page_wa(old,chat,title,'backfill')

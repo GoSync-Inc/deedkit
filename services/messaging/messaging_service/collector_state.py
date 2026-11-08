@@ -364,6 +364,10 @@ class CollectorState:
                     'origin':envelope['origin'] if envelope else
                         'receipt' if capture['kind']=='message_receipt' else 'owner_read_state' if capture['kind']=='owner_read_state' else 'deletion',
                     'mcp_available_after_commit':True,'measurement':'upper_bound_after_archive_commit' if observed else 'capture_time_not_recorded'}
+                # ANYM-813: the first live message committed under the native WhatsApp provider; written once.
+                if (envelope and envelope.get('origin')=='live' and not previous.get('native_live_since')
+                        and (value.get('provider') or {}).get('name')=='whatsmeow'):
+                    extra['native_live_since']=(observed or now).isoformat()
             held=extra.get('quarantined_captures',previous.get('quarantined_captures',0))
             # Quarantined items no longer block capture, but they need an operator decision.
             self._phase(value,'live_capture','backlogged' if pending else 'receiving',

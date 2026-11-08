@@ -61,7 +61,9 @@ def _history(platform, catalog_ids, rows):
     elif platform == 'whatsapp':
         result['checkpoint_chats'] = sum(isinstance(row['wa_progress'], dict) for row in rows)
         result.update(successful_scan_chats=0, not_scanned_chats=0,
-                      provider_history_exhausted=0, catchup_pending_chats=0, gap_chats=0, gap_cleared_chats=0)
+                      provider_history_exhausted=0, catchup_pending_chats=0, gap_chats=0, gap_cleared_chats=0,
+                      unverified_span_chats=0)
+        spans, gap_ids = [], []
         for row in rows:
             progress = row['wa_progress']
             if not isinstance(progress, dict):
@@ -76,12 +78,51 @@ def _history(platform, catalog_ids, rows):
             result['successful_scan_chats'] += 1
             result['last_scan_at'] = _latest(result['last_scan_at'], row['wa_last_scan_at'])
             result['provider_history_exhausted'] += progress['history_exhausted']
-            result['catchup_pending_chats'] += bool(progress.get('catchup_before'))
+            # ANYM-813: a catch-up whose pointer did not move in its last scan is not pending; once stalled
+            # it is listed by its unverified span instead.
+            result['catchup_pending_chats'] += bool(progress.get('catchup_before')) and not progress.get('catchup_stalled_scans')
             result['gap_chats'] += progress.get('gap') is True
+            chat_id = stable_id('chat', row['account'], row['provider_chat'])
+            if progress.get('gap') is True:
+                gap_ids.append(chat_id)
+            span = unverified_span(progress)
+            if span:
+                spans.append({'chat_id': chat_id, **span})
             result['gap_cleared_chats'] += progress.get('gap') is not True and progress.get('gap_cleared_at') is not None
+        result['unverified_span_chats'] = len(spans)
+        spans.sort(key=lambda span: (-span['days'], span['chat_id']))
+        result['unverified_spans'] = spans[:20]
+        # A flagged gap has no recorded span: the archive cannot say how much is missing (ANYM-700).
+        result['gap_chat_ids'] = [{'chat_id': chat_id, 'span': 'unknown'} for chat_id in sorted(gap_ids)[:20]]
     else:
         result['unknown_chats'] = result['observed_chats']
     return result
+
+
+def unverified_span(progress):
+    """The chat's recorded unverified span (ANYM-813) with its length in days, or None when absent or malformed."""
+    span = progress.get('unverified_span') if isinstance(progress, dict) else None
+    if not isinstance(span, dict):
+        return None
+    try:
+        start, end = (datetime.fromisoformat(span[k]) for k in ('from', 'to'))
+        days = round(max(0, (end-start).total_seconds())/86400, 1)
+    except (KeyError, TypeError, ValueError):
+        return None
+    return {'from': span['from'], 'to': span['to'], 'days': days,
+            'stalled_since': span.get('stalled_since') if isinstance(span.get('stalled_since'), str) else None}
+
+
+# ANYM-813: what a WhatsApp archive is built from. WhatsApp keeps no server history to list: the phone's
+# batch after pairing (device props, whatsapp/whatsmeow/runtime.go), live capture since, explicit requests.
+PAIRING_BATCH_DAYS, PAIRING_BATCH_PER_CHAT = 7, 50
+
+
+def whatsapp_sources(operations):
+    live = (operations or {}).get('live_capture') or {}
+    since = live.get('native_live_since')
+    return {'pairing_batch_days': PAIRING_BATCH_DAYS, 'pairing_batch_per_chat': PAIRING_BATCH_PER_CHAT,
+            'live_since': since if isinstance(since, str) else None, 'older_messages_call': 'request_chat_history'}
 
 
 def _live_only(c, account, rows):
@@ -269,6 +310,8 @@ def get_sync_status(c, p):
             if row.get('archive_detail_code')=='version_conflict' and not row['active_conflicts']:
                 row['archive_detail_code']='coverage_not_reconciled'
             row['deletions']=deletion_status.get(account) or {}
+            if row['platform'] == 'whatsapp':
+                row['history']['sources'] = whatsapp_sources(row.get('operations'))
             # ANYM-809: the native journal's repair count, per account and repair version; full detail only.
             row['native_repair']=dict(row.get('operations') or {}).get('provider_repair')
             if row.get('operations'):row['operations']={k:v for k,v in row['operations'].items() if k!='provider_repair'}
