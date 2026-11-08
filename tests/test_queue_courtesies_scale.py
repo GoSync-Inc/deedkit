@@ -90,3 +90,45 @@ def test_courtesies_exclude_reads_at_most_the_depth_per_chat(seeded, record_prop
     record_property('count_message_rows_visited', counted)
     assert 0 < extra <= bound, scans(closing.plans[0]['Plan'])
     assert counted <= base + bound, scans(closing.counts[0]['Plan'])
+
+
+TIES = 100
+
+
+def tied_catalogue(s):
+    """WhatsApp and Telegram chats (nonnumeric IDs): a request, the owner's answer, then GAP courtesies at one second."""
+    with s.pool.connection() as c:
+        c.execute("SET LOCAL statement_timeout='120s'")
+        c.execute('''INSERT INTO chats(id,account,provider_chat,title,chat_type)
+            SELECT 'tie-wa-'||lpad(n::text,4,'0'),'whatsapp-demo-1',(20000000+n)||'@c.us','Synthetic tie','private'
+            FROM generate_series(1,%s) n UNION ALL
+            SELECT 'tie-tg-'||lpad(n::text,4,'0'),'telegram-demo',(90000+n)::text,'Synthetic tie','private'
+            FROM generate_series(1,%s) n''', (TIES, TIES))
+        c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
+            SELECT 'tie-'||side||'-'||lpad(n::text,4,'0')||'-'||k,CASE side WHEN 'wa' THEN 'whatsapp-demo-1' ELSE 'telegram-demo' END,
+                'tie-'||side||'-'||lpad(n::text,4,'0'),'z'||k,CASE WHEN k=2 THEN 'fixture-owner' ELSE 'fixture-tie-'||n END,
+                CASE k WHEN 1 THEN 'Synthetic request for the report' WHEN 2 THEN 'Synthetic answer' ELSE 'спасибо' END,
+                date_trunc('second',now())-interval '1 day'+least(k,3)*interval '1 second',
+                CASE WHEN k=2 THEN 'outgoing' ELSE 'incoming' END
+            FROM generate_series(1,%s) n CROSS JOIN generate_series(1,%s) k CROSS JOIN unnest(ARRAY['wa','tg']) side''',
+            (TIES, GAP + 2))
+        c.execute('ANALYZE messages'); c.execute('ANALYZE chats')
+
+
+# spec: ANYM-810
+def test_courtesy_tails_stay_bounded_on_timestamp_ties(seeded, record_property):
+    s, a, _ = seeded
+    tied_catalogue(s)
+    every, plain = measure(s, a)
+    shown, closing = measure(s, a, courtesies='exclude')
+    # GAP courtesies share one second past the scan: the request cannot be proven X, so every tied chat stays.
+    left_out, _ = measure(s, a, courtesies='only')
+    assert not any(r['id'].startswith('tie-') for r in left_out['items'])
+    assert shown['awaiting_reply_total'] + shown.get('excluded_courtesies_total', 0) == every['awaiting_reply_total']
+    # Tied rows are read in the index's key order, never sorted as a whole timestamp group.
+    bound = 2 * TIES * (COURTESY_SCAN + 2)
+    extra = visited(closing.plans[0]['Plan'], {'messages'}) - visited(plain.plans[0]['Plan'], {'messages'})
+    counted = visited(closing.counts[0]['Plan'], {'messages'})
+    record_property('extra_message_rows_visited', extra)
+    assert extra <= bound, scans(closing.plans[0]['Plan'])
+    assert counted <= visited(plain.plans[0]['Plan'], {'messages'}) + bound, scans(closing.counts[0]['Plan'])
