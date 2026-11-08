@@ -64,7 +64,8 @@ vision-model description of a photo remains an owner opt-in (ANYM-69).
 ## Retrieval contract
 
 `search_files` uses the same account/chat ACL and `read` permission as message
-search. It supports `query_mode=all|any|phrase|web|exact` (`any`: at least one word, ranked by distinct terms under `order=relevance`; see SEARCH.md),
+search. Each hit says what matched (`matched_in`) and whether the file's own text was searched (`content_searched`); see
+[Which part of a file matched](#which-part-of-a-file-matched-anym-828). It supports `query_mode=all|any|phrase|web|exact` (`any`: at least one word, ranked by distinct terms under `order=relevance`; see SEARCH.md),
 `search_language=auto|simple|russian|english|indonesian`, scalar/list account,
 chat and sender filters, `[from_time,to_time)` dates and direction. Lists are OR
 within one dimension and AND across dimensions; empty lists match nothing.
@@ -321,11 +322,33 @@ and language configurations. This uses existing message indexes; no provider
 request, model invocation or duplicate caption index is needed.
 `matched_content` identifies the excerpt source (`extracted`, `enriched`, or
 `message_context`); `match_sources` lists the matching sources. `extracted`
-includes indexed filenames as well as parser output. File passages are preferred
+includes indexed filenames as well as parser output (the legacy label; `matched_in` separates them, below). File passages are preferred
 for the excerpt when both a file and its caption match. A voice note without
 extracted text shows its ready transcript as the excerpt when the query is empty
 or matches only the name; such hits carry `excerpt_source: "transcript"` and keep
 their `matched_content`.
+
+### Which part of a file matched (ANYM-828)
+
+`matched_content` and `match_sources` keep their legacy values (`extracted` there still includes filenames). Every
+item of a query search also carries `matched_in`, all that matched, in this order: `filename` (the source filename
+or display name), `caption` (the parent message body, today's `message_context`), `extracted` (parser output, OCR
+included), `transcript` (a voice note's ready transcript) and `description` (a ready model title, summary or
+description, from enrichment or from file understanding). Message search's `matched_in` (ANYM-665) uses the same
+words where they overlap; its `body` is `caption` here. An empty-query listing has no `matched_in`. It is computed
+for the returned page only, by one statement under the same scope and current-source fence; a chunk counts as
+`extracted` only when its text, not its filename header, matches. A query whose words are split between the name
+and the text, or a probe cancelled by the statement timeout, falls back to the legacy source (`filename` plus
+`extracted` when the file has ready text).
+
+Every item carries `content_searched`: true when the file's own text was part of what this search could match
+(`extraction_status: "ready"` with `extraction_coverage.text_chars > 0`, or a voice note's ready transcript); false
+for `queued`, `processing`, `failed`, `unsupported`, not downloaded, or ready with empty text (a scanned PDF with no
+recognised text keeps its `extraction_quality`). A false item whose `matched_in` is `filename` or `caption` only was
+found by name or caption; its contents were not searched. When such items are `queued` or `processing`, the result
+carries `search.content_pending: {count, next_action: "search again later"}` (count capped at 20); the status values
+are unchanged. `excerpt_source` names where `snippet`/`text_excerpt` came from: `filename`, `caption`, `extracted`,
+`transcript` or `description`.
 
 A caption match includes `message_context={message_id,revision,field:"body"}`
 in both compact and full replies. It does not mean that OCR, transcription or

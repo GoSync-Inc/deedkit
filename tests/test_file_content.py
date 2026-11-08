@@ -206,6 +206,144 @@ def test_cache_does_not_reuse_smaller_text_cap_and_bounds_full_claim(seeded):
     assert text(s, b, 'large-cap')['content_chars'] == len(content)
 
 
+def hits(result):
+    return {x['attachment_id']: x for x in result['items']}
+
+
+def match_files(s):
+    """One synthetic file per matched_in source (ANYM-828), all readable by both keys except the private one."""
+    from test_search_v2 import add
+    from test_voice_transcript_reading import voice
+    add_file(s, 'm-name', 'demo-tg-1', b'synthetic body words', 'zebranamex notes.txt')
+    add_file(s, 'm-text', 'demo-tg-1', b'quokkatextx inside the file', 'plain.txt')
+    add_file(s, 'm-both', 'demo-tg-1', b'wombatboth again in the text', 'wombatboth notes.txt')
+    add(s, 'm-cap-msg', 'ocelotcaption on the parent message')
+    add_file(s, 'm-cap', 'm-cap-msg', b'unrelated synthetic words', 'scan notes.txt')
+    add_file(s, 'm-desc', 'demo-tg-1', b'nothing relevant', 'desc.txt')
+    add_file(s, 'm-und', 'demo-tg-1', b'nothing relevant either', 'und.txt')
+    add_file(s, 'm-private', 'demo-wa-1', b'zebranamex private', 'zebranamex private.txt')
+    drain(worker_for(s))
+    voice(s, 'm-voice', transcript='Synthetic lynxtranscript notes')
+    with s.pool.connection() as c:
+        c.execute("""UPDATE attachment_enrichment SET state='ready',kind='document',provider='test-local',model='fixture',
+            title='Synthetic',summary='pangolindesc summary',text_content='',indexed_at=clock_timestamp() WHERE attachment='m-desc'""")
+        # Understanding only: no ANYM-69 enrichment is ready for this file.
+        c.execute("""UPDATE attachment_understanding SET state='ready',source_artifact_hash=repeat('a',64),
+            published_profile_hash=repeat('b',64),title='Synthetic',summary='tapirunderstood summary',
+            indexed_at=clock_timestamp() WHERE attachment='m-und'""")
+
+
+# spec: ANYM-828
+@pytest.mark.parametrize('query,attachment,matched,excerpt', [
+    ('zebranamex', 'm-name', ['filename'], 'filename'),
+    ('ocelotcaption', 'm-cap', ['caption'], 'caption'),
+    ('quokkatextx', 'm-text', ['extracted'], 'extracted'),
+    ('lynxtranscript', 'm-voice', ['transcript'], 'transcript'),
+    ('pangolindesc', 'm-desc', ['description'], 'description'),
+    ('tapirunderstood', 'm-und', ['description'], 'description'),
+    ('wombatboth', 'm-both', ['filename', 'extracted'], 'extracted'),
+])
+def test_file_hit_matched_in_names_each_source_and_the_excerpt_source(seeded, query, attachment, matched, excerpt):
+    s, _, b = seeded
+    match_files(s)
+    for mode in ('all', 'exact'):
+        hit = hits(search(s, b, query, query_mode=mode))[attachment]
+        assert hit['matched_in'] == matched, mode
+        assert hit['excerpt_source'] == excerpt, mode
+    legacy = hits(search(s, b, query))[attachment]
+    # The legacy labels are unchanged: extracted still includes filenames.
+    assert legacy['matched_content'] == {'filename': 'extracted', 'extracted': 'extracted', 'caption': 'message_context',
+        'transcript': 'enriched', 'description': 'understanding' if attachment == 'm-und' else 'enriched'}[matched[0]]
+    assert 'matched_in' not in hits(search(s, b, '', limit=100))[attachment]
+
+
+# spec: ANYM-828
+def test_file_hit_match_probe_is_one_page_statement_under_the_search_scope(seeded, monkeypatch):
+    import messaging_service.file_index as module
+    from messaging_service.search_query import compile_query
+    s, a, b = seeded
+    match_files(s)
+
+    class Counted:
+        def __init__(self, connection): self.connection = connection; self.statements = []
+        def execute(self, sql, args=None):
+            self.statements.append(sql); return self.connection.execute(sql, args)
+        def __getattr__(self, name): return getattr(self.connection, name)
+
+    def count(probe):
+        monkeypatch.setattr(module, '_match_probe', probe)
+        with s.authorized(b, 'search') as (c, p):
+            counted = Counted(c)
+            module.search_files(s, counted, p, 'zebranamex')
+        return counted.statements
+    real = module._match_probe
+    without, with_probe = count(lambda *args: {}), count(real)
+    assert len(with_probe) == len(without) + 1
+    added = [q for q in with_probe if q not in without]
+    assert len(added) == 1 and 'a.id=ANY(%s)' in added[0]
+    # A file of a chat outside the key's scope is never probed, even when its ID is passed.
+    plan = compile_query('zebranamex', 'all', 'auto')
+    for token, visible in [(a, {'m-name', 'm-private'}), (b, {'m-name'})]:
+        with s.authorized(token, 'search') as (c, p):
+            assert set(real(c, p, plan, ['m-name', 'm-private'])) == visible
+
+
+# spec: ANYM-828
+def test_content_searched_and_pending_note_follow_the_extraction_state(seeded):
+    from messaging_service.file_index import content_searched
+    from messaging_service.presentation import render
+    from test_voice_transcript_reading import voice
+    s, _, b = seeded
+    for name in ('ready', 'empty', 'failed', 'unsupported', 'processing'):
+        add_file(s, 'cs-' + name, 'demo-tg-1', ('synthetic text of ' + name).encode(), 'capybarastate ' + name + '.txt')
+    drain(worker_for(s))
+    voice(s, 'cs-voice', filename='capybarastate voice.ogg')
+    add_file(s, 'cs-queued', 'demo-tg-1', b'synthetic queued text', 'capybarastate queued.txt')
+    with s.pool.connection() as c:
+        c.execute("UPDATE attachment_text SET text_content='' WHERE attachment='cs-empty'")
+        c.execute("UPDATE attachment_text SET state='failed',error_code='synthetic_failure',text_content='' WHERE attachment='cs-failed'")
+        c.execute("UPDATE attachment_text SET state='unsupported',error_code='unsupported_type',text_content='' WHERE attachment='cs-unsupported'")
+        c.execute("UPDATE attachment_text SET state='leased',lease_token=gen_random_uuid(),lease_until=now()+interval '1 hour',text_content='' WHERE attachment='cs-processing'")
+    result = search(s, b, 'capybarastate')
+    found = hits(result)
+    expected = {'cs-ready': True, 'cs-empty': False, 'cs-failed': False, 'cs-unsupported': False,
+                'cs-processing': False, 'cs-queued': False, 'cs-voice': True}
+    assert {k: found[k]['content_searched'] for k in expected} == expected
+    assert found['cs-empty']['extraction_status'] == 'ready' and found['cs-processing']['extraction_status'] == 'processing'
+    # Found by name only: the contents were not searched.
+    assert found['cs-queued']['matched_in'] == ['filename'] and found['cs-failed']['matched_in'] == ['filename']
+    assert result['search'] == {'content_pending': {'count': 2, 'next_action': 'search again later'}}
+    assert render('search_files', {**result, 'items': [dict(r) for r in result['items']]}, 'compact')['search'] == result['search']
+    assert 'content_pending' not in search(s, b, 'capybarastate ready').get('search', {})
+    # A file that is not downloaded has no extraction to search.
+    assert content_searched({'download_status': 'not_downloaded', 'extraction_status': 'not_queued'}) is False
+    assert content_searched({'extraction_status': 'ready', 'extraction_coverage': {'text_chars': 0}}) is False
+    listing = hits(search(s, b, '', filename='capybarastate'))
+    assert listing['cs-ready']['content_searched'] is True and 'matched_in' not in listing['cs-ready']
+
+
+# spec: ANYM-828
+def test_file_hit_new_fields_are_additive_in_compact_and_full(seeded):
+    from messaging_service.presentation import render
+    s, _, b = seeded
+    add_file(s, 'shape-file', 'demo-tg-1', b'okapishape synthetic text', 'okapishape notes.txt')
+    drain(worker_for(s))
+    result = search(s, b, 'okapishape')
+    full = hits(result)['shape-file']
+    assert {k: full[k] for k in ('download_status', 'download_filename', 'display_name', 'source_filename')} == {
+        'download_status': 'ready', 'download_filename': 'okapishape notes.txt', 'display_name': 'okapishape notes.txt',
+        'source_filename': 'okapishape notes.txt'}
+    compact = hits(render('search_files', {**result, 'items': [dict(r) for r in result['items']]}, 'compact'))['shape-file']
+    assert compact['matched_in'] == ['filename', 'extracted'] and compact['content_searched'] is True
+    old = {k: v for k, v in compact.items() if k not in ('matched_in', 'content_searched', 'excerpt_source')}
+    assert old == {'attachment_id': 'shape-file', 'message_id': 'demo-tg-1', 'account': 'telegram-demo',
+        'chat': compact['chat'], 'revision': full['revision'], 'sha256': full['sha256'], 'mime': 'text/plain', 'bytes': 25,
+        'display_name': 'okapishape notes.txt', 'download_status': 'ready', 'extraction_status': 'ready',
+        'enrichment_status': 'not_configured', 'truncated': False, 'title': '', 'snippet': compact['snippet'],
+        'match_type': full['match_type'], 'matched_content': 'extracted', 'media_class': 'document',
+        'match_sources': ['extracted'], 'chat_title': compact['chat_title'], 'sent_at': compact['sent_at']}
+
+
 def test_pdf_ocr_preserves_synthetic_table_rows(tmp_path):
     if not all(shutil.which(tool, path='/usr/local/bin:/usr/bin:/bin')
                for tool in ('pdftotext','pdftoppm','tesseract')):

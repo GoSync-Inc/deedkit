@@ -141,6 +141,10 @@ def capabilities(self, token, detail='full', sections=None):
                 'model_processing':'optional_operator_configured_local_or_api',
                 'file_content_search':True,'file_indexing':'asynchronous_local_worker',
                 'file_search_sources':['extracted','enriched','understanding','message_context'],
+                # ANYM-828: per-hit match arms (filename vs caption vs the file's own text) and whether the text was searched.
+                'file_hit_fields':{'matched_in':['filename','caption','extracted','transcript','description'],
+                    'content_searched':'ready_non_empty_text_or_ready_voice_transcript','content_pending_cap':20,
+                    'excerpt_sources':['filename','caption','extracted','transcript','description']},
                 'file_caption_provenance':'current_parent_message_revision_only',
                 'chat_coverage':True,'provider_id_lookup':'resolve_reference',
                 'empty_result_diagnostics':True,'message_conflicts':'scoped_active_and_historical',

@@ -899,6 +899,10 @@ def register_archive_tools(mcp, call, async_call, read):
         and message_context. The latter is a caption match, never proof of file contents;
         message_context carries the exact source message/revision. A voice note's excerpt is its ready
         transcript when the query is empty or matches only the name (excerpt_source=transcript).
+        Each query hit has matched_in: filename, caption, extracted, transcript, description (what matched;
+        message search's body is caption here). content_searched=false: the file's own text was not searched
+        (not ready, or empty); such a hit was found by name or caption only. excerpt_source names the excerpt's
+        source; search.content_pending counts queued/processing hits (search again later).
         media_kind and ready narrow by media kind and by what is ready (see their descriptions);
         each row has media_class; the filters never hide a file's original or its availability fields.
         Read text via get_file_text, original via
