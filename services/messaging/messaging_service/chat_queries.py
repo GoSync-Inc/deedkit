@@ -634,11 +634,12 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
       LEFT JOIN LATERAL ({closing_owner}) closing_owner ON true'''
         courtesy_closed=(f"(c.chat_type='private' AND closing_from.id IS NOT NULL AND closing_owner.answered>0"
             f" AND closing_owner.scanned<={COURTESY_SCAN} AND NOT closing_owner.asked)")
-    def base_for(attention_lookup):return f''' FROM chats c JOIN accounts a ON a.id=c.account
+    # The broadcast and promotional counts run before the courtesy filter, so they never read its lookups.
+    def base_for(attention_lookup,closing=True):return f''' FROM chats c JOIN accounts a ON a.id=c.account
       CROSS JOIN (SELECT %s::timestamptz AS at,%s::jsonb AS owners,%s::jsonb AS aliases) score_clock
       LEFT JOIN LATERAL ({latest_sql(last_sql,both_directions=True)}) last ON true
       LEFT JOIN LATERAL ({owner_lookup}) own_last ON true
-      LEFT JOIN LATERAL ({latest_sql(select_message+" AND m.direction='incoming'")}) incoming ON true{closing_laterals}
+      LEFT JOIN LATERAL ({latest_sql(select_message+" AND m.direction='incoming'")}) incoming ON true{closing_laterals if closing else ''}
       LEFT JOIN chat_read_observations ro ON ro.account=c.account AND ro.chat=c.id
       LEFT JOIN reply_dismissals d ON d.key_id=%s AND d.chat=c.id
       LEFT JOIN LATERAL ({attention_lookup}) attention ON true
@@ -652,12 +653,12 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     excluded=None
     if exclude_likely_broadcasts:
         # Counted in the caller's scope and filters only, then removed from the rows, the totals and the cursor.
-        excluded=c.execute('SELECT count(*) AS n'+(base_for(ranked_for(promotional_rows=None)) if attention_lookup is ranked else base)+' AND '.join([*clauses,broadcast,*([unread+' IS TRUE'] if only_unread else [])]),[*base_args,*args]).fetchone()['n']
+        excluded=c.execute('SELECT count(*) AS n'+base_for(ranked_for(promotional_rows=None) if attention_lookup is ranked else attention_lookup,False)+' AND '.join([*clauses,broadcast,*([unread+' IS TRUE'] if only_unread else [])]),[*base_args,*args]).fetchone()['n']
         clauses.append('NOT '+broadcast)
     excluded_promotional=None
     if promotional=='exclude' and awaiting_reply:
         # Counted before the broadcast filter, also in the muted hint choice, so each total is what its own filter removes (ANYM-427).
-        excluded_promotional=c.execute('SELECT count(*) AS n'+(base_for(ranked_for(broadcasts=False)) if attention_lookup is ranked else base)+' AND '.join([*(v for v in clauses if v!='NOT '+broadcast),
+        excluded_promotional=c.execute('SELECT count(*) AS n'+base_for(ranked_for(broadcasts=False) if attention_lookup is ranked else attention_lookup,False)+' AND '.join([*(v for v in clauses if v!='NOT '+broadcast),
             likely_promotional,*([unread+' IS TRUE'] if only_unread else [])]),[*base_args,*args]).fetchone()['n']
     if promotional_filter:clauses.append(promotional_filter)
     excluded_courtesies=None
