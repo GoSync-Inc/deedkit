@@ -15,14 +15,18 @@ leaves the disk **24 hours after its last read** instead of 30 days, and needs n
 is what moves `last_accessed_at`: an original request, a download grant or served bytes. Metadata reads,
 search and text reads do not. The class always requires a verified cold copy. While a recognition an
 agent asked for (`request_file_download`) is pending, the original stays: enrichment `unconfigured`,
-`queued`, `leased` or `failed` with fewer than 3 attempts, or text `queued`/`leased`. That wait ends
+`queued`, `leased` or `failed` (a changed profile retries even an exhausted failure), or text
+`queued`/`leased`. That wait ends
 7 days after the pending work last changed. All other protections apply unchanged: backup fence, pin,
 occurrence limit, identity, in-flight lease, open request window, live download grant, the integrity
 hash and journal replay. An original with any occurrence in a personal, unknown-kind or subscribed
-chat keeps the 30-day rule. Subscription create (with named chats) and resume take the lifecycle lock,
-so the recheck before unlink sees a chat that has just become subscribed. Attachment items of
+chat, or with an occurrence that has no media job (a legacy or restored original, which a request cannot
+restore from the cold copy), keeps the 30-day rule. Every subscription state change that can start or
+end that protection takes the lifecycle lock: create with named chats, pause, resume, close, lazy
+expiry, access change and the operator's retention release. So the recheck before unlink and the
+unlink itself are serialized with it. Attachment items of
 on-request chats carry `original_retention_hours: 24`. An evicted file whose requested recognition never
-finished reads `enrichment_status: available_on_request` with `recognition_next_action:
+finished (queued, leased, failed or unconfigured work) reads `enrichment_status: available_on_request` with `recognition_next_action:
 request_file_download`. The daemon's daily pass includes the class within its `--limit`/`--max-bytes`
 bounds. `--chat-policy-only` runs one pass over this class only; without `--apply` it prints the
 counts, bytes and blocked reasons it would remove.

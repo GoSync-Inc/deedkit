@@ -998,7 +998,7 @@ def name_in_subscription(s,provider_chat='100'):
         key_permissions=['read','subscription-write'])
     with s.pool.connection() as c:
         chat=c.execute("SELECT id FROM chats WHERE account='archive-test' AND provider_chat=%s",(provider_chat,)).fetchone()['id']
-    return s.create_subscription(token,[chat])
+    return token,s.create_subscription(token,[chat])
 
 
 # spec: ANYM-806
@@ -1019,7 +1019,7 @@ def test_a_group_original_leaves_the_disk_a_day_after_its_last_read_and_keeps_it
 # spec: ANYM-806
 @pytest.mark.parametrize('keeper,reason',[('read_recently',None),('personal',None),('unknown_kind',None),
     ('subscribed',None),('shared_with_personal',None),('pinned',None),('no_cold_copy','cold_copy_missing'),
-    ('download_grant','inflight'),('request_window','inflight')])
+    ('download_grant','inflight'),('request_window','inflight'),('legacy',None),('shared_with_legacy',None)])
 def test_a_group_original_stays_while_a_rule_protects_it(archive,keeper,reason):
     _,s,key,_=archive;api=lifecycle()
     fid,blob=chat_original(archive,idle_hours=23 if keeper=='read_recently' else 25,copy=keeper!='no_cold_copy',
@@ -1030,7 +1030,14 @@ def test_a_group_original_stays_while_a_rule_protects_it(archive,keeper,reason):
         chat_original(archive,mid='personal-1',chat='101',chat_type='private',payload=b'Synthetic group photo',copy=False)
         with s.pool.connection() as c:
             c.execute("UPDATE attachment_residency SET last_accessed_at=clock_timestamp()-interval '25 hours' WHERE digest=%s",(blob.digest,))
+    if keeper=='shared_with_legacy':
+        # A second occurrence of the same bytes without a media job: a request could not restore it from R2.
+        other,_=chat_original(archive,mid='group-legacy',payload=b'Synthetic group photo',copy=False)
+        with s.pool.connection() as c:
+            c.execute('DELETE FROM media_jobs WHERE id=%s',(other,))
+            c.execute("UPDATE attachment_residency SET last_accessed_at=clock_timestamp()-interval '25 hours' WHERE digest=%s",(blob.digest,))
     with s.pool.connection() as c:
+        if keeper=='legacy':c.execute('DELETE FROM media_jobs WHERE id=%s',(fid,))
         if keeper=='pinned':api.pin_original(c,blob.digest)
         if keeper=='download_grant':
             c.execute('''INSERT INTO download_grants SELECT %s,digest,1,%s,clock_timestamp()+interval '2 minutes'
@@ -1044,13 +1051,14 @@ def test_a_group_original_stays_while_a_rule_protects_it(archive,keeper,reason):
 
 
 # spec: ANYM-806
-@pytest.mark.parametrize('requested',[True,False])
-def test_a_requested_recognition_holds_a_group_original_for_at_most_seven_days(archive,requested):
+@pytest.mark.parametrize('requested,attempts',[(True,1),(True,3),(False,1)])
+def test_a_requested_recognition_holds_a_group_original_for_at_most_seven_days(archive,requested,attempts):
     _,s,key,_=archive;fid,blob=chat_original(archive);api=lifecycle()
     with s.pool.connection() as c:
         c.execute("UPDATE media_jobs SET request_key_digest=%s WHERE id=%s",('r'*64 if requested else None,fid))
-        # A retryable failure is still pending recognition.
-        c.execute("UPDATE attachment_enrichment SET state='failed',attempts=1,error_code='provider_unavailable' WHERE attachment=%s",(fid,))
+        # A failure is still pending recognition, an exhausted one too: a changed profile retries it.
+        c.execute("UPDATE attachment_enrichment SET state='failed',attempts=%s,error_code='provider_unavailable' WHERE attachment=%s",
+            (attempts,fid))
     report=api.LifecycleWorker(s,require_cold_copy=True,chat_policy_only=True).run_once(apply=True)
     if not requested:
         # Nobody asked: the withheld recognition does not hold the original.
@@ -1062,14 +1070,17 @@ def test_a_requested_recognition_holds_a_group_original_for_at_most_seven_days(a
 
 
 # spec: ANYM-806
-@pytest.mark.parametrize('finished',[True,False])
-def test_a_removed_group_file_shows_what_an_agent_can_do(archive,finished):
+@pytest.mark.parametrize('state',['ready','queued','failed','leased'])
+def test_a_removed_group_file_shows_what_an_agent_can_do(archive,state):
     _,s,key,_=archive;fid,blob=chat_original(archive);api=lifecycle()
+    finished=state=='ready'
     with s.pool.connection() as c:
         c.execute("UPDATE media_jobs SET request_key_digest=%s WHERE id=%s",('r'*64,fid))
-        c.execute('''UPDATE attachment_enrichment SET state=%s,kind='image',text_content=%s,
+        # Unfinished work older than the 7-day cap; a leased row's lease has expired.
+        c.execute('''UPDATE attachment_enrichment SET state=%s,kind='image',text_content=%s,attempts=CASE WHEN %s='failed' THEN 3 ELSE attempts END,
+            lease_until=CASE WHEN %s='leased' THEN clock_timestamp()-interval '1 hour' END,
             updated_at=clock_timestamp()-interval '8 days' WHERE attachment=%s''',
-            ('ready' if finished else 'queued','A synthetic harbour photo' if finished else '',fid))
+            (state,'A synthetic harbour photo' if finished else '',state,state,fid))
     assert api.LifecycleWorker(s,require_cold_copy=True).run_once(apply=True)['evicted']==1
     item=s.get_attachment(key,fid)
     assert item['original_residency']=='evicted' and item['next_action']=='request_file_download'
@@ -1096,10 +1107,34 @@ def test_a_subscription_created_between_prepare_and_unlink_cancels_the_eviction(
 
 
 # spec: ANYM-806
+def test_a_subscription_change_during_the_recheck_waits_for_the_unlink(archive,monkeypatch):
+    import threading
+    _,s,_,_=archive;fid,blob=chat_original(archive);api=lifecycle()
+    token,sub=name_in_subscription(s)
+    paused=s.update_subscription(token,sub['subscription_id'],1,action='pause')
+    # Paused: the chat is on request again, so the original is in the class.
+    worker=api.LifecycleWorker(s,require_cold_copy=True);eligible=worker._eligible;closed=threading.Event()
+    def close():
+        s.update_subscription(token,sub['subscription_id'],paused['version'],action='close');closed.set()
+    def recheck(c,row):
+        reason=eligible(c,row)
+        if row['state']=='evicting':
+            # _complete's recheck under the lifecycle lock, before unlink: a close (which starts the chat's
+            # 24-hour grace) waits for this transaction instead of committing between the recheck and the unlink.
+            threading.Thread(target=close,daemon=True).start()
+            assert not closed.wait(1.0)
+        return reason
+    monkeypatch.setattr(worker,'_eligible',recheck)
+    assert worker.run_once(apply=True)['evicted']==1
+    assert closed.wait(10)
+
+
+# spec: ANYM-806
 def test_chat_policy_dry_run_reports_what_bounded_apply_passes_then_remove(archive,capsys):
     _,s,_,_=archive;api=lifecycle()
     blobs=[chat_original(archive,mid=f'group-{n}',payload=f'Synthetic group photo {n}'.encode())[1] for n in range(3)]
-    _,personal=processed(archive,mid='personal-old',payload=b'Synthetic old personal contract');cold_copy(s,personal)
+    _,personal=chat_original(archive,mid='personal-old',chat='101',chat_type='private',idle_hours=31*24,
+        payload=b'Synthetic old personal photo')
     dsn=['--dsn-file',os.environ['PROBE_TEST_DSN_FILE'],'--files',str(s.files),'--chat-policy-only']
     assert api.main(dsn)==0
     report=json.loads(capsys.readouterr().out.strip().splitlines()[-1])

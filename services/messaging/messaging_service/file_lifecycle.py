@@ -117,9 +117,14 @@ class LifecycleWorker:
 
     @staticmethod
     def _chat_policy(c,digest):
-        """Every current occurrence of the original is in an on-request chat (ANYM-806); there is at least one."""
+        """Every current occurrence of the original is in an on-request chat (ANYM-806); there is at least one.
+
+        An occurrence without a media job (a legacy or restored original) keeps the 30-day rule for the whole
+        original: request_file_download cannot restore it from the cold copy (provider_source_unavailable).
+        """
         from .media_policy import ON_REQUEST_CHAT
-        row=c.execute('''SELECT count(*) AS occurrences,count(*) FILTER (WHERE NOT '''+ON_REQUEST_CHAT+''') AS kept
+        row=c.execute('''SELECT count(*) AS occurrences,count(*) FILTER (WHERE NOT '''+ON_REQUEST_CHAT+'''
+                OR NOT EXISTS(SELECT FROM media_jobs j WHERE j.id=a.id)) AS kept
             FROM attachments a JOIN messages m ON m.id=a.message WHERE a.digest=%s AND a.active AND NOT m.deleted''',
             (digest,)).fetchone()
         return row['occurrences']>0 and row['kept']==0
@@ -128,16 +133,16 @@ class LifecycleWorker:
     def _recognition_pending(c,digest):
         """An occurrence an agent asked to recognize (ANYM-805: its job's request key digest) still waits for it.
 
-        Pending: enrichment unconfigured, queued, leased or failed with retries left, or text queued or leased, that
-        changed in the last RECOGNITION_WAIT_DAYS; older pending work no longer holds the original (it can be asked
-        for again).
+        Pending: enrichment unconfigured, queued, leased or failed (a changed profile retries even an exhausted one), or
+        text queued or leased, that changed in the last RECOGNITION_WAIT_DAYS; older pending work no longer holds the
+        original (it can be asked for again).
         """
         return c.execute('''SELECT EXISTS(SELECT FROM attachments a JOIN messages m ON m.id=a.message
             JOIN media_jobs j ON j.id=a.id AND j.request_key_digest IS NOT NULL
             WHERE a.digest=%s AND a.active AND NOT m.deleted AND (
                 EXISTS(SELECT FROM attachment_enrichment e WHERE e.attachment=a.id AND e.source_digest=a.digest
                     AND e.source_revision=m.revision AND e.updated_at>clock_timestamp()-%s*interval '1 day'
-                    AND (e.state IN ('unconfigured','queued','leased') OR (e.state='failed' AND e.attempts<3)))
+                    AND e.state IN ('unconfigured','queued','leased','failed'))
                 OR EXISTS(SELECT FROM attachment_text f WHERE f.attachment=a.id AND f.source_digest=a.digest
                     AND f.updated_at>clock_timestamp()-%s*interval '1 day' AND f.state IN ('queued','leased')))) AS pending''',
             (digest,RECOGNITION_WAIT_DAYS,RECOGNITION_WAIT_DAYS)).fetchone()['pending']
@@ -338,7 +343,8 @@ class LifecycleWorker:
                 AND EXISTS(SELECT FROM attachments ca JOIN messages cm ON cm.id=ca.message
                     WHERE ca.digest=r.digest AND ca.active AND NOT cm.deleted)
                 AND NOT EXISTS(SELECT FROM attachments ca JOIN messages cm ON cm.id=ca.message
-                    WHERE ca.digest=r.digest AND ca.active AND NOT cm.deleted AND NOT cm.chat=ANY(%(waiting)s::text[])))'''
+                    WHERE ca.digest=r.digest AND ca.active AND NOT cm.deleted AND (NOT cm.chat=ANY(%(waiting)s::text[])
+                        OR NOT EXISTS(SELECT FROM media_jobs cj WHERE cj.id=ca.id))))'''
             retention=chat_policy if self.chat_policy_only else (
                 "(r.last_accessed_at<=clock_timestamp()-interval '30 days' OR "+chat_policy+')')
             rows=c.execute("SELECT r.* FROM attachment_residency r WHERE r.state='resident' AND NOT r.pinned AND "+retention
@@ -451,7 +457,7 @@ def main(argv=None):
             print(json.dumps({'operation':'pin' if args.pin else 'unpin',**result}),flush=True)
             return 0
         worker=LifecycleWorker(store,expire_unprocessed=args.expire_unprocessed,require_cold_copy=True,
-            chat_policy_only=args.chat_policy_only)
+            **({'chat_policy_only':True} if args.chat_policy_only else {}))
         while not stopped.is_set():
             try:result=worker.run_once(apply=args.apply,limit=args.limit,max_bytes=args.max_bytes)
             except Exception:

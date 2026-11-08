@@ -1328,6 +1328,9 @@ class Store:
         with self.pool.connection() as c:
             # ANYM-447: from schema 62 a closed definition's 30 days count from its release.
             closure = ',closed_at=clock_timestamp()' if schema_version(c) >= 62 else ''
+            # A new closed_at restarts the 24-hour file protection of the named chats (ANYM-806).
+            from .subscriptions import protection_lock
+            protection_lock(c)
             released = c.execute('''UPDATE subscriptions SET retention_hold=false''' + closure + '''
                 WHERE retention_hold AND (%s::uuid[] IS NULL OR id=ANY(%s::uuid[])) RETURNING id''',
                 (ids, ids)).fetchall()

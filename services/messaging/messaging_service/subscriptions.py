@@ -163,6 +163,14 @@ def hide_out_of_scope(c, principal, accounts, chats):
                     error_code='scope_changed',lease_token=NULL,lease_until=NULL WHERE id=%s''', (hint['id'],))
 
 
+def protection_lock(c):
+    """ANYM-806: a state change of a subscription that names chats can start or end the protection of their files
+    (media_policy.ON_REQUEST_CHATS reads state, expires_at and closed_at). Serialize it with the lifecycle
+    worker's recheck and unlink, which hold the same lock; the lock is always taken after subscription locks."""
+    from .file_lifecycle import lifecycle_lock
+    lifecycle_lock(c)
+
+
 def invalidate_dynamic(c, principal, key_id=None):
     """ANYM-522, in the operator's change under the exclusive principal lock: losing read or subscription-write
     (or a disabled principal) ends the dynamic definitions at once, so restoring the right cannot revive them."""
@@ -212,11 +220,13 @@ def _state(c, row, p):
         changed = any(source['account'] not in p['accounts'] or
             p['chat_ids'] is not None and source['chat'] not in p['chat_ids'] for source in sources)
     if changed and row['state'] != 'access_changed':
+        protection_lock(c)
         row = c.execute("""UPDATE subscriptions SET state='access_changed',
             version=version+1,updated_at=clock_timestamp() WHERE id=%s RETURNING *""",
             (row['id'],)).fetchone()
     elif (row['state'] in ('active', 'paused') and row['expires_at'] is not None and
             row['expires_at'] <= c.execute('SELECT clock_timestamp() AS t').fetchone()['t']):
+        protection_lock(c)
         row = c.execute("""UPDATE subscriptions SET state='expired',version=version+1,
             updated_at=clock_timestamp() WHERE id=%s RETURNING *""", (row['id'],)).fetchone()
     return row
@@ -559,10 +569,8 @@ def update_subscription(store, c, p, subscription_id, version, *, action, resume
             gap = {'reason': 'explicit_resume_skip', 'after': position, 'through': head,
                 'recoverable': False, 'intentional': True}
         position = head
-    if action == 'resume':
-        # ANYM-805/806: a resumed subscription protects its chats' originals again (see create).
-        from .file_lifecycle import lifecycle_lock
-        lifecycle_lock(c)
+    # ANYM-805/806: resume protects its chats' originals again, and close starts their 24-hour grace (see create).
+    protection_lock(c)
     row = c.execute('''UPDATE subscriptions SET state=%s,version=version+1,
         matched_through=%s,gap=%s,blocked_reason=NULL,updated_at=clock_timestamp()
         WHERE id=%s RETURNING *''', (state, position, Jsonb(gap) if gap else None, row['id'])).fetchone()
@@ -690,6 +698,7 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                 continue
             stats['checked'] += 1
             if p is None:
+                protection_lock(c)
                 c.execute("""UPDATE subscriptions SET state='access_changed',version=version+1,
                     updated_at=clock_timestamp() WHERE id=%s""", (row['id'],))
                 stats['access_changed'] += 1
@@ -704,6 +713,7 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
             # defensive boundary if records are restored or repaired externally.
             if any(source['account'] not in p['accounts'] or
                     p['chat_ids'] is not None and source['chat'] not in p['chat_ids'] for source in sources):
+                protection_lock(c)
                 c.execute("""UPDATE subscriptions SET state='access_changed',version=version+1,
                     updated_at=clock_timestamp() WHERE id=%s""", (row['id'],))
                 stats['access_changed'] += 1

@@ -111,9 +111,14 @@ def attachment_fields(row, *, original_present=None):
     # request, which restores it from the R2 copy; it is not queued work while the original is away.
     evicted_wait=(registered and original_present is False and row.get('original_residency')=='evicted'
         and bool(row.get('recognition_reason')))
-    if withheld or evicted_wait:
+    if withheld:
         extraction='available_on_request' if extraction=='queued' else extraction
         enrichment='available_on_request' if enrichment in ('queued','unconfigured') else enrichment
+    if evicted_wait:
+        # Unfinished work of any kind (queued, leased, failed, unconfigured) waits for the restore; a finished or
+        # unsupported result stays as it is.
+        extraction=extraction if extraction in ('ready','unsupported') else 'available_on_request'
+        enrichment=enrichment if enrichment in ('ready','unsupported') else 'available_on_request'
     coverage={key:row[key] for key in ('text_chars','processor_version','truncated','extraction_metadata','extractor')
         if registered and key in row}
     # ANYM-669: a message read selects only the two OCR counters (ocr_metadata); they join the coverage for OCR rows
