@@ -97,6 +97,11 @@ func OpenCapture(c Config) (*CaptureStore, error) {
 		db.Close()
 		return nil, e
 	}
+	// ANYM-814: also releases or marks uncertain the repair requests of a previous process.
+	if e = ensureRepairRequests(db); e != nil {
+		db.Close()
+		return nil, e
+	}
 	s := &CaptureStore{db: db, Config: c, MaxEntries: 200000, MaxSpoolBytes: 256 << 20, MaxSpoolEntries: 10000}
 	return s, nil
 }

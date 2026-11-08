@@ -21,6 +21,8 @@ type Config struct {
 	PagesDirectory   string `json:"pages_directory"`
 	MaxMediaBytes    int64  `json:"max_media_bytes"`
 	DiskReserveBytes int64  `json:"disk_reserve_bytes"`
+	// ANYM-814: the collector's opt-in phone repair of unverified spans (default off).
+	GapRepair bool `json:"whatsapp_gap_repair"`
 }
 type Policy struct {
 	Enabled           bool     `json:"enabled"`

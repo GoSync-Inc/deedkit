@@ -68,8 +68,40 @@ History is partial by contract: the phone's batch after pairing (device props:
 When that read returns nothing older than the catch-up pointer on two consecutive
 scans, the chat gets an unverified span (COLLECTOR_STATES.md, `history`): the
 interval between the previous head and the pointer, which the archive can neither
-prove missing nor prove covered. No provider request is made for it; closing a
-span needs the phone's correlated answer (ANYM-814).
+prove missing nor prove covered. No provider request is made for it unless the
+phone repair below is switched on; closing a span needs the phone's correlated answer.
+
+Phone repair of unverified spans (ANYM-814), collector config
+`whatsapp_gap_repair: true` (default `false`; the adapter reads the same key and
+refuses `gap_repair` with `gap_repair_disabled` when it is off, before any
+reservation). After each scan the collector reads `gap_repair_status` and asks
+for at most one span through `gap_repair` on the background lane. Contract:
+- What the phone sees: a history-sync request (`BuildHistorySyncRequest`, 50
+  messages before an anchor) from its own linked device, sent as a peer message to
+  the owner's own primary device. The phone uploads up to 50 messages of that chat
+  for this device. No chat message, no contact notification, no read receipt.
+- Durability: `repair_requests` in `capture.sqlite` keeps account, chat, span id,
+  anchor, the request id and `reserved` → `sending` → `sent` → `answered` |
+  `no_answer` | `uncertain`. The request id is generated before the send and
+  `sending` is committed before any network I/O. On adapter start a `reserved` row
+  is released without a send and a `sending` row becomes `uncertain`; a failed or
+  unknown send is `uncertain`. An uncertain anchor is never asked again and its
+  span ends `request_uncertain` (ANYM-441).
+- Bounds: one outstanding request per account; the account's history request row
+  is shared with `request_chat_history`, at least 5 minutes after either; a 10-minute
+  answer deadline, then `no_answer`; per anchor at most 2 `no_answer`, 24 hours
+  apart; per span at most 10 answered requests; two consecutive `no_answer` pause
+  the repair for 6 hours (`phone_unreachable`), spending no answer budget.
+- Correlation: only an ON_DEMAND history sync whose `PeerDataRequestSessionID`
+  equals the reserved request id is recorded as its answer (count and oldest
+  message). A cache page, a catch-up reaching the head, a pairing batch or an
+  agent's own request closes nothing. If the phone does not echo the id, nothing
+  closes and requests end `no_answer` (fail closed). The answer's messages are
+  captured by the existing history worker like any history sync; the next request
+  anchors on the answer's oldest message. The first anchor is the oldest cached
+  message at or after the span's `to`.
+- Waiting holds no lock: the request returns after the send; live capture, sends,
+  other history and media continue.
 
 A native download maps the media server's answer to a fixed code (ANYM-815): HTTP 403, 404
 and 410 are `media_unavailable`, a key that does not decrypt matching bytes is
