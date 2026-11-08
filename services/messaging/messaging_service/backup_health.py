@@ -171,7 +171,10 @@ def producer(profile, entry, states, now):
             else 'UNKNOWN' if unknown else 'delivered')
     # The runner writes microseconds and +00:00; the result carries whole seconds in UTC, as `status` prints it.
     captured = parse_time(last)
-    shown = captured.astimezone(timezone.utc).strftime(TIME_FORMAT) if captured else None
+    try:
+        shown = captured.astimezone(timezone.utc).strftime(TIME_FORMAT) if captured else None
+    except (OverflowError, ValueError):  # a time past year 9999 in UTC: already stale, shown as none
+        shown = None
     return {'raised': raised, 'unknown': unknown, 'word': word, 'last_snapshot_at': shown, 'age_hours': age}
 
 

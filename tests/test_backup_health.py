@@ -540,6 +540,14 @@ def test_the_runners_microsecond_time_reaches_the_status_line_in_whole_seconds(t
 
 
 # spec: ANYM-807
+def test_a_capture_time_that_overflows_in_utc_still_raises_stale(tmp_path):
+    cfg = config(tmp_path, profiles=['messaging'])
+    status(tmp_path, 'messaging', state='error', last_snapshot_at='9999-12-31T23:59:59-01:00')
+    reading = readings(cfg)['messaging']
+    assert reading['raised'] == {'backup_failed', 'backup_stale'} and reading['last_snapshot_at'] is None
+
+
+# spec: ANYM-807
 def test_the_result_file_is_written_before_any_send_and_is_readable_by_status(tmp_path):
     cfg = config(tmp_path, profiles=['messaging'])
     status(tmp_path, 'messaging', state='error')
