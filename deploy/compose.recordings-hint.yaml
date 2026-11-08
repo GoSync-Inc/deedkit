@@ -1,40 +1,45 @@
 # The Omi webhook receiver (ANYM-760), added after compose.recordings.yaml in the same `deedkit-recordings` project. Nothing here is
-# enabled by itself: it needs the receiver's private directory, `archive.omi_hint`, the two hand-made networks, the host rules and
-# a proxy route (docs/operations/production.md, "Omi webhook receiver"). The receiver has no archive, no provider token and no way
-# out: the proxy reaches it over `recordings-hook`, and the one connection it starts goes over `recordings-hint` to the backend's
-# second listener. The backend gains that one network and no published port.
+# enabled by itself: it needs the receiver's private directory, `archive.omi_hint`, the hand-made hook network and a proxy route
+# (docs/operations/production.md, "Omi webhook receiver").
+# Containment is the topology, not a filter: the receiver, which parses what the internet sends, runs with no network at all
+# (`network_mode: none`, loopback only). Its two paths are Unix socket files on two tmpfs volumes: it serves on `recordings-hint-hook`,
+# which only the relay reads, and its one connection goes to the backend's channel socket on `recordings-hint-channel`. So no
+# firewall rule, resolver answer or kernel module decides whether it can reach the backend's main listener or the proxy: it has
+# no route to either. The relay is the only part on a network the proxy shares; it copies bounded bytes to one socket and parses
+# nothing. The backend gains one volume and no network, no published port.
 services:
   recordings-api:
     environment:
-      RECORDINGS_HINT_LISTEN: recordings-hint-channel:13235
-    networks:
-      recordings-hint:
-        aliases: [recordings-hint-channel]
+      RECORDINGS_HINT_LISTEN: /run/deedkit/omi-hint-channel/channel.sock
+    volumes:
+      - recordings-hint-channel:/run/deedkit/omi-hint-channel
   recordings-omi-hint:
     image: deedkit-recordings:${DEEDKIT_VERSION:-0.1.0}
-    command: [--config, /run/deedkit/omi-hint/receiver.json, --omi-hint-receiver, --host, 0.0.0.0, --port, "13236"]
+    command: [--config, /run/deedkit/omi-hint/receiver.json, --omi-hint-receiver, --unix]
+    network_mode: none
     volumes:
       # The DIRECTORY, never a single file: an atomic replace inside it reaches the running receiver. It holds receiver.json and
       # channel.key only (0700 and 0600, owner 10001), nothing of the backend's private directory.
       - ${RECORDINGS_HINT_STATE_DIR:?Set the receiver's private directory}:/run/deedkit/omi-hint:ro
-    networks:
-      recordings-hint: {}
-      recordings-hook:
-        aliases: [recordings-omi-hint]
+      # Read-only: the receiver can connect to the backend's socket but never replace it.
+      - recordings-hint-channel:/run/deedkit/omi-hint-channel:ro
+      - recordings-hint-hook:/run/deedkit/omi-hook
     restart: unless-stopped
-    # Liveness only: one request on no route must get the 404 every other request gets. It proves the app answers and carries no token.
+    # Liveness only: one request on no route, over the socket, must get the 404 every other request gets. It carries no token.
     healthcheck:
       test:
         - CMD
         - python
         - -c
         - |
-          import sys, urllib.error, urllib.request
+          import socket, sys
+          from deedkit_recordings.hint import RECEIVER_SOCKET
           try:
-              urllib.request.build_opener(urllib.request.ProxyHandler({})).open("http://127.0.0.1:13236/", timeout=4)
-              healthy = False
-          except urllib.error.HTTPError as error:
-              healthy = error.code == 404
+              with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                  s.settimeout(4)
+                  s.connect(RECEIVER_SOCKET)
+                  s.sendall(b"GET / HTTP/1.1\r\nHost: health\r\nConnection: close\r\n\r\n")
+                  healthy = s.recv(64).startswith(b"HTTP/1.1 404 ")
           except Exception:
               healthy = False
           sys.exit(0 if healthy else 1)
@@ -54,12 +59,56 @@ services:
     logging:
       driver: json-file
       options: {max-size: 5m, max-file: "2"}
+  recordings-omi-relay:
+    image: deedkit-recordings:${DEEDKIT_VERSION:-0.1.0}
+    command: [--omi-hint-relay, --host, 0.0.0.0, --port, "13236"]
+    volumes:
+      - recordings-hint-hook:/run/deedkit/omi-hook:ro
+    networks:
+      # The proxy's route names `recordings-omi-hint:13236`; the alias keeps it.
+      recordings-hook:
+        aliases: [recordings-omi-hint]
+    restart: unless-stopped
+    # Liveness of the whole path: the same request through the relay must reach the receiver's 404.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import socket, sys
+          try:
+              with socket.create_connection(("127.0.0.1", 13236), timeout=4) as s:
+                  s.sendall(b"GET / HTTP/1.1\r\nHost: health\r\nConnection: close\r\n\r\n")
+                  healthy = s.recv(64).startswith(b"HTTP/1.1 404 ")
+          except Exception:
+              healthy = False
+          sys.exit(0 if healthy else 1)
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 15s
+    read_only: true
+    user: "10001:10001"
+    cpu_shares: 256
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:size=4m,noexec,nosuid"]
+    mem_limit: 128m
+    pids_limit: 16
+    stop_grace_period: 5s
+    logging:
+      driver: json-file
+      options: {max-size: 5m, max-file: "2"}
+volumes:
+  # In memory, owner 10001, mode 0700: each holds one socket file. Emptied when no container holds it.
+  recordings-hint-channel:
+    driver: local
+    driver_opts: {type: tmpfs, device: tmpfs, o: "size=64k,uid=10001,gid=10001,mode=0700"}
+  recordings-hint-hook:
+    driver: local
+    driver_opts: {type: tmpfs, device: tmpfs, o: "size=64k,uid=10001,gid=10001,mode=0700"}
 networks:
-  # Created once by hand: docker network create --internal -o com.docker.network.bridge.name=dk-rechint0
-  #   -o com.docker.network.bridge.gateway_mode_ipv4=isolated deedkit-recordings-hint
-  recordings-hint:
-    external: true
-    name: ${RECORDINGS_HINT_NETWORK:-deedkit-recordings-hint}
   # Created once by hand: docker network create --internal -o com.docker.network.bridge.name=dk-rechook0
   #   -o com.docker.network.bridge.gateway_mode_ipv4=isolated deedkit-recordings-hook
   recordings-hook:

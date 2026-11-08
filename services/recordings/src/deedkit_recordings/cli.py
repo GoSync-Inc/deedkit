@@ -87,27 +87,45 @@ def issue_hint(parser, args):
                       'path_token_sha256': hashlib.sha256(token.encode()).hexdigest()}, sort_keys=True))
 
 
-def run_receiver(args):
-    """ANYM-760: the internet-facing receiver, the same image with another command. No archive, no provider, no admission probe."""
+def run_receiver(parser, args):
+    """ANYM-760: the internet-facing receiver, the same image with another command. No archive, no provider, no admission probe.
+    With `--unix` (the deployed form) it serves on `hint.RECEIVER_SOCKET` only, in a container without a network. The paths are
+    constants, not arguments: the promotion tool refuses a mounted path in a command."""
     import uvicorn
-    from .hint import CONNECTION_LIFETIME, RECEIVER_CONNECTIONS, Receiver, bounded_protocol
+    from . import hint
+    from .hint import CONNECTION_LIFETIME, RECEIVER_CONNECTIONS, Receiver, bounded_protocol, unix_socket
     for name in ('httpx', 'httpcore'):
         logging.getLogger(name).setLevel(logging.CRITICAL)
     # Secret path: no request line is logged, and the proxy's access log carries none either.
-    uvicorn.run(Receiver(args.config), host=args.host, port=args.port, workers=1, access_log=False, lifespan='off', log_level='warning',
-                server_header=False, date_header=False, proxy_headers=False, limit_concurrency=RECEIVER_CONNECTIONS, timeout_keep_alive=1,
-                http=bounded_protocol(RECEIVER_CONNECTIONS, CONNECTION_LIFETIME),
-                h11_max_incomplete_event_size=16384)
+    options = dict(workers=1, access_log=False, lifespan='off', log_level='warning', server_header=False, date_header=False,
+                   proxy_headers=False, limit_concurrency=RECEIVER_CONNECTIONS, timeout_keep_alive=1,
+                   http=bounded_protocol(RECEIVER_CONNECTIONS, CONNECTION_LIFETIME), h11_max_incomplete_event_size=16384)
+    if not args.unix:
+        uvicorn.run(Receiver(args.config), host=args.host, port=args.port, **options)
+        return
+    try:
+        listening = unix_socket(hint.RECEIVER_SOCKET)
+    except (OSError, ValueError):
+        parser.exit(1, 'Omi hint receiver refused: socket_unavailable\n')
+    uvicorn.Server(uvicorn.Config(Receiver(args.config), **options)).run(sockets=[listening])
+
+
+def run_relay(parser, args):
+    """ANYM-760: the byte relay between the proxy and the receiver's socket. No configuration, no secret, nothing parsed."""
+    from . import hint
+    hint.run_relay(args.host, args.port, hint.RECEIVER_SOCKET)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Private recordings backend; no provider login or activation')
-    parser.add_argument('--config', help='Absolute path to a private owner-installed configuration (required but for --omi-hint-issue)')
+    parser.add_argument('--config', help='Absolute path to a private owner-installed configuration (required but for --omi-hint-issue and --omi-hint-relay)')
     parser.add_argument('--omi-hint-receiver', action='store_true', help='Run the Omi webhook receiver: --config names its own private file')
     parser.add_argument('--omi-hint-issue', action='store_true', help='Make a webhook path token and channel credential (private files only; prints digests)')
     parser.add_argument('--public-origin', help='With --omi-hint-issue: the https origin of the existing proxy')
     parser.add_argument('--url-file', help='With --omi-hint-issue: a new file for the full webhook URL, in a 0700 directory')
     parser.add_argument('--channel-key-file', help="With --omi-hint-issue: a new file for the channel credential, in the receiver's 0700 directory")
+    parser.add_argument('--unix', action='store_true', help="With --omi-hint-receiver: serve on the receiver's Unix socket only, not --host/--port")
+    parser.add_argument('--omi-hint-relay', action='store_true', help="Pipe TCP connections on --host/--port to the receiver's Unix socket")
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', default=13234, type=int)
     parser.add_argument('--backup-to', help='Create a private, consistent text archive snapshot at a new absolute path')
@@ -123,10 +141,12 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.omi_hint_issue:
         return issue_hint(parser, args)
+    if args.omi_hint_relay:
+        return run_relay(parser, args)
     if not args.config:
         parser.error('the following arguments are required: --config')
     if args.omi_hint_receiver:
-        return run_receiver(args)
+        return run_receiver(parser, args)
     if args.delete or args.lift_tombstone:
         if args.backup_to or (args.delete and args.lift_tombstone):
             parser.error('--delete, --lift-tombstone and --backup-to are separate commands')

@@ -1,7 +1,9 @@
 """Omi `memory_created` webhook as a wake-up hint (ANYM-760). Three parts, one contract: an id brings the next list forward.
 
 `Receiver` is the internet-facing process of its own container: one secret route, the id taken from the body and everything
-else dropped. `Channel` is the backend's second listener, on an internal network, with its own admission. `Hints` is the
+else dropped. It has no network at all: it serves on a Unix socket that only `relay` reads, and its one connection goes to the
+backend's channel socket. `relay` is a byte pipe with bounds, the only part on a network the proxy shares; it parses nothing.
+`Channel` is the backend's second listener, on that socket (or an address), with its own admission. `Hints` is the
 in-memory queue the collector's sleep wakes on: it lists the newest page once, outside the regular pass, and reads only
 never-fetched conversations of the last 24 hours. No hint names a record to read, stores an id or spends above `omi_budget`;
 polling stays the source of truth. Nothing of a request but counters by reason is ever logged or kept.
@@ -17,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import stat
 import time
 from typing import Annotated
 from urllib.parse import parse_qs
@@ -50,6 +53,14 @@ CHANNEL_CONNECTIONS = 16
 RECEIVER_CONNECTIONS = 64
 CONNECTION_LIFETIME = 5  # seconds any connection may live: above one request's deadline, so idle and half-sent ones end too
 LISTEN_ENV = 'RECORDINGS_HINT_LISTEN'
+CHANNEL_URL = 'http://' + CHANNEL_ALIAS + CHANNEL_PATH  # over the socket: the host is a label, never resolved
+SOCKET_PATH = re.compile(r'/[A-Za-z0-9._/-]{1,90}\.sock')  # inside AF_UNIX's 104-byte limit on every platform
+RECEIVER_SOCKET = '/run/deedkit/omi-hook/receiver.sock'  # on the tmpfs volume only the receiver writes and the relay reads
+CHANNEL_SOCKET = '/run/deedkit/omi-hint-channel/channel.sock'  # on the tmpfs volume only the backend writes and the receiver reads
+RELAY_CONNECTIONS = RECEIVER_CONNECTIONS
+RELAY_UP = MAX_BODY + 65536  # bytes from the proxy per connection: one capped body and its headers
+RELAY_DOWN = 16384  # bytes back per connection: the receiver's answers are fixed and short
+RELAY_CHUNK = 65536
 
 SETTLE = 15  # Omi caches a list for 10 s
 RETRIES = (60, 300)  # a hinted id the list does not show is looked for again this long after the hint, then polling has it
@@ -151,7 +162,7 @@ class ReceiverSettings(Strict):
     """The receiver's own private file. The backend's configuration, archive and provider tokens are not in its mount."""
     uid: str = Field(pattern=r'^[A-Za-z0-9_-]{1,128}$')
     path_token_sha256: list[Annotated[str, Field(pattern=r'^[0-9a-f]{64}$')]] = Field(min_length=1, max_length=2)
-    channel_url: str = Field(pattern=r'^http://[a-z0-9.-]{1,253}:[0-9]{1,5}/omi-hint$')
+    channel_socket: str = Field(pattern=SOCKET_PATH.pattern.join('^$'))
     channel_key_file: str
 
 
@@ -267,15 +278,16 @@ class Receiver:
             self.keys.popitem(last=False)
 
     async def forward(self, settings, ident, seconds):
-        """The one connection this process starts. Only the id crosses it."""
+        """The one connection this process starts, to the channel's socket file: the receiver has no network. Only the id crosses it."""
         if seconds <= 0:
             raise Reject(503, 'channel_failed')
         try:
             credential = private(settings.channel_key_file, 1024).decode().strip()
+            transport = self.transport or httpx.AsyncHTTPTransport(uds=settings.channel_socket)
             async with asyncio.timeout(seconds):
-                async with httpx.AsyncClient(transport=self.transport, trust_env=False, follow_redirects=False,
+                async with httpx.AsyncClient(transport=transport, trust_env=False, follow_redirects=False,
                                              timeout=seconds) as client:
-                    response = await client.post(settings.channel_url, content=json.dumps({'ids': [ident]}, separators=(',', ':')),
+                    response = await client.post(CHANNEL_URL, content=json.dumps({'ids': [ident]}, separators=(',', ':')),
                                                  headers={'Authorization': 'Bearer ' + credential, 'Content-Type': 'application/json'})
         except (OSError, ValueError, TimeoutError, httpx.HTTPError):
             raise Reject(503, 'channel_failed') from None
@@ -355,8 +367,8 @@ class MainGuard:
 
 
 class Listener:
-    def __init__(self, hints, server, task, port):
-        self.hints, self.server, self.task, self.port = hints, server, task, port
+    def __init__(self, hints, server, task, port, path=None):
+        self.hints, self.server, self.task, self.port, self.path = hints, server, task, port, path
 
     async def stop(self):
         self.server.should_exit = True
@@ -369,7 +381,38 @@ class Listener:
                 await self.task
             except (asyncio.CancelledError, Exception):
                 pass
+        if self.path is not None:
+            try:
+                if stat.S_ISSOCK(os.lstat(self.path).st_mode):
+                    os.unlink(self.path)
+            except OSError:
+                pass
         self.hints.address, self.hints.listener = None, None
+
+
+def unix_socket(value):
+    """A listening socket at `value`, an absolute `.sock` path in a directory only this user can enter. A stale socket there is
+    replaced; any other file is refused, never removed. Nothing is resolved, so nothing here waits on a name or a network."""
+    if not isinstance(value, str) or not SOCKET_PATH.fullmatch(value) or '/../' in value + '/' or '/./' in value + '/':
+        raise ValueError('socket path')
+    parent = os.lstat(os.path.dirname(value))
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.geteuid() or parent.st_mode & 0o077:
+        raise ValueError('socket directory not private')
+    try:
+        if not stat.S_ISSOCK(os.lstat(value).st_mode):
+            raise ValueError('not a socket')
+        os.unlink(value)
+    except FileNotFoundError:
+        pass
+    listening = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        listening.bind(value)
+        os.chmod(value, 0o600)
+        listening.setblocking(False)
+    except OSError:
+        listening.close()
+        raise
+    return listening
 
 
 async def bound_socket(value):
@@ -398,7 +441,8 @@ async def bound_socket(value):
 
 async def start_listener(runtime, environ=None):
     """The second listener, or None: without the variable or the object nothing listens. A failure here leaves the backend as it
-    is and is named in the status. Binding here, not in uvicorn, because uvicorn exits the process on a failed bind."""
+    is and is named in the status. Binding here, not in uvicorn, because uvicorn exits the process on a failed bind. An absolute
+    path is a Unix socket (the deployed form: the receiver shares no network with the backend); `host:port` is the older form."""
     environ = os.environ if environ is None else environ
     hints = runtime.hints
     value = environ.get(LISTEN_ENV)
@@ -408,8 +452,11 @@ async def start_listener(runtime, environ=None):
         archive = runtime.document().archive
         if archive is None or archive.omi_hint is None:
             return None
-        async with asyncio.timeout(5):
-            listening, address = await bound_socket(value)
+        if value.startswith('/'):
+            listening, address = unix_socket(value), None
+        else:
+            async with asyncio.timeout(5):
+                listening, address = await bound_socket(value)
     except (Failure, OSError, ValueError, TimeoutError):
         hints.listener_error = 'listener_unavailable'
         return None
@@ -425,7 +472,8 @@ async def start_listener(runtime, environ=None):
                             timeout_keep_alive=1, limit_concurrency=CHANNEL_CONNECTIONS, proxy_headers=False,
                             h11_max_incomplete_event_size=16384)
     server = Quiet(config)
-    port = listening.getsockname()[1]
+    unix = listening.family == socket.AF_UNIX
+    port = None if unix else listening.getsockname()[1]
 
     async def serve():
         try:
@@ -440,8 +488,75 @@ async def start_listener(runtime, environ=None):
         listening.close()
         return None
     hints.address, hints.listener_error = address, None
-    hints.listener = Listener(hints, server, task, port)
+    hints.listener = Listener(hints, server, task, port, value if unix else None)
     return hints.listener
+
+
+# --- The relay: the proxy's side of the receiver
+
+async def pipe(source, target, limit):
+    """Copy bytes one way until end of file, at most `limit` of them; past that the connection is cut. Nothing is parsed or kept.
+    No half-close is passed on: uvicorn ends a connection on end of file, which would drop an answer still on its way."""
+    total = 0
+    while chunk := await source.read(RELAY_CHUNK):
+        total += len(chunk)
+        if total > limit:
+            raise ValueError('relay limit')
+        target.write(chunk)
+        await target.drain()
+
+
+async def serve_relay(host, port, upstream, *, limit=None, lifetime=None):
+    """A TCP listener whose every connection is piped to the receiver's socket, and nothing else: the receiver itself has no
+    network, so even a compromised receiver opens no connection to the proxy or anything on its network. Bounded at the transport:
+    at most `limit` connections, each living at most `lifetime` seconds, capped bytes each way."""
+    limit = RELAY_CONNECTIONS if limit is None else limit
+    lifetime = CONNECTION_LIFETIME if lifetime is None else lifetime
+    active = set()
+
+    async def handle(reader, writer):
+        if len(active) >= limit:
+            writer.transport.abort()
+            return
+        task = asyncio.current_task()
+        active.add(task)
+        upstream_writer, legs, clean = None, (), False
+        writer.transport.set_write_buffer_limits(0)  # drain() returns only once every byte went to the kernel
+        try:
+            async with asyncio.timeout(lifetime):
+                upstream_reader, upstream_writer = await asyncio.open_unix_connection(upstream)
+                upstream_writer.transport.set_write_buffer_limits(0)
+                legs = (asyncio.create_task(pipe(reader, upstream_writer, RELAY_UP)),
+                        asyncio.create_task(pipe(upstream_reader, writer, RELAY_DOWN)))
+                up, down = legs
+                await asyncio.wait(legs, return_when=asyncio.FIRST_COMPLETED)
+                if up.done() and up.exception() is None and not down.done():
+                    await down  # the proxy is done sending; the answer may still be on its way
+                clean = down.done() and down.exception() is None  # the receiver ended it after a whole answer
+        except (OSError, ValueError, TimeoutError):
+            pass
+        finally:
+            for leg in legs:
+                leg.cancel()
+            await asyncio.gather(*legs, return_exceptions=True)
+            if upstream_writer is not None:
+                upstream_writer.transport.abort()
+            if clean:
+                writer.close()  # every byte is already with the kernel (no buffer above): a normal close delivers it
+            else:
+                writer.transport.abort()
+            active.discard(task)
+    server = await asyncio.start_server(handle, host, port, limit=RELAY_CHUNK)
+    server.relay_active = active
+    return server
+
+
+def run_relay(host, port, upstream):
+    async def forever():
+        server = await serve_relay(host, port, upstream)
+        async with server:
+            await server.serve_forever()
+    asyncio.run(forever())
 
 
 # --- The collector's side

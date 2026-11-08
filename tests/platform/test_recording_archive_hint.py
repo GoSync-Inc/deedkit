@@ -1,6 +1,8 @@
 """Omi `memory_created` webhook as a hint (ANYM-760). Synthetic Omi and a synthetic channel only; no firewall is touched."""
 import asyncio
 from collections import Counter
+import contextlib
+from contextlib import contextmanager
 import hashlib
 import json
 import logging
@@ -10,8 +12,10 @@ import re
 import shutil
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 from hypothesis import given, settings, strategies as st
@@ -60,13 +64,13 @@ def rewrite(path, doc):
     path.write_text(json.dumps(doc))
 
 
-def receiver_files(tmp_path, *, digests=None, key=CHANNEL_KEY):
+def receiver_files(tmp_path, *, digests=None, key=CHANNEL_KEY, channel_socket=None):
     tmp_path = tmp_path.resolve()
     key_file = tmp_path / 'channel.key'
     key_file.write_text(key + '\n'); key_file.chmod(0o600)
     config = tmp_path / 'receiver.json'
     config.write_text(json.dumps({'uid': UID, 'path_token_sha256': digests or [digest(PATH_TOKEN)],
-                                  'channel_url': 'http://recordings-hint-channel:13235/omi-hint',
+                                  'channel_socket': channel_socket or hint.CHANNEL_SOCKET,
                                   'channel_key_file': str(key_file)}))
     config.chmod(0o600)
     return config
@@ -286,21 +290,22 @@ def test_the_receiver_container_is_closed_and_the_overlay_adds_only_the_channel_
     unit = document['services']['recordings-omi-hint']
     base = yaml.safe_load((ROOT / 'deploy/compose.recordings.yaml').read_text())['services']['recordings-api']
     assert unit['image'] == base['image'] and 'build' not in unit  # the same published image, another command
-    assert unit['command'][:3] == ['--config', '/run/deedkit/omi-hint/receiver.json', '--omi-hint-receiver']
+    assert unit['command'] == ['--config', '/run/deedkit/omi-hint/receiver.json', '--omi-hint-receiver', '--unix']
     assert unit['read_only'] is True and unit['user'] == '10001:10001' and unit['cap_drop'] == ['ALL']
-    assert unit['security_opt'] == ['no-new-privileges:true'] and not unit.get('ports') and 'network_mode' not in unit
+    assert unit['security_opt'] == ['no-new-privileges:true'] and not unit.get('ports')
     assert 'mem_limit' in unit and 'pids_limit' in unit
-    assert len(unit['volumes']) == 1 and unit['volumes'][0].endswith(':/run/deedkit/omi-hint:ro')
+    assert unit['volumes'][0].endswith(':/run/deedkit/omi-hint:ro')
     assert unit['volumes'][0].startswith('${RECORDINGS_HINT_STATE_DIR:?')
     assert not {'RECORDINGS_EGRESS_ADMISSION'} & set(unit.get('environment') or {}) and 'dns' not in unit
-    assert set(unit['networks']) == {'recordings-hint', 'recordings-hook'}  # no backend, no egress, no router
+    # No network at all: no backend, no egress, no router, no hook.
+    assert unit['network_mode'] == 'none' and 'networks' not in unit
     api = document['services']['recordings-api']
-    assert set(api) == {'environment', 'networks'} and set(api['networks']) == {'recordings-hint'}
-    assert api['networks']['recordings-hint']['aliases'] == [hint.CHANNEL_ALIAS]
-    assert api['environment'] == {hint.LISTEN_ENV: f'{hint.CHANNEL_ALIAS}:{hint.CHANNEL_PORT}'}
-    assert not api.get('ports')
-    for name in ('recordings-hint', 'recordings-hook'):
-        assert document['networks'][name]['external'] is True and set(document['networks'][name]) == {'external', 'name'}
+    assert set(api) == {'environment', 'volumes'} and not api.get('ports') and 'networks' not in api
+    assert api['environment'] == {hint.LISTEN_ENV: hint.CHANNEL_SOCKET}
+    assert api['volumes'] == ['recordings-hint-channel:' + os.path.dirname(hint.CHANNEL_SOCKET)]
+    assert set(document['networks']) == {'recordings-hook'}
+    hook = document['networks']['recordings-hook']
+    assert hook['external'] is True and set(hook) == {'external', 'name'}
     assert not re.search(r'(?i)(token|secret|password)\s*[:=]\s*\S{8,}', OVERLAY.read_text())
 
     class Loose(yaml.SafeLoader):  # other overlays use Compose tags such as `!override`; only the structure matters here
@@ -314,8 +319,33 @@ def test_the_receiver_container_is_closed_and_the_overlay_adds_only_the_channel_
             for network in members:
                 if network in (service.get('networks') or []):
                     members[network].append(name)
-    assert sorted(members['recordings-hint']) == ['recordings-api', 'recordings-omi-hint']
-    assert members['recordings-hook'] == ['recordings-omi-hint']  # the proxy joins it by hand, nothing else
+    assert members['recordings-hint'] == []  # the backend and the receiver share no network any more
+    assert members['recordings-hook'] == ['recordings-omi-relay']  # the proxy joins it by hand, nothing else
+
+
+# spec: ANYM-760
+def test_the_receiver_reaches_the_backend_and_the_proxy_only_through_two_socket_files_and_the_relay_holds_no_secret():
+    document = yaml.safe_load(OVERLAY.read_text())
+    services = document['services']
+    receiver_unit, relay_unit = services['recordings-omi-hint'], services['recordings-omi-relay']
+    channel_dir, hook_dir = os.path.dirname(hint.CHANNEL_SOCKET), os.path.dirname(hint.RECEIVER_SOCKET)
+    # The backend writes the channel socket, the receiver only connects to it; the receiver writes its own, the relay only reads it.
+    assert receiver_unit['volumes'][1:] == [f'recordings-hint-channel:{channel_dir}:ro', f'recordings-hint-hook:{hook_dir}']
+    assert relay_unit['volumes'] == [f'recordings-hint-hook:{hook_dir}:ro']  # no private directory, no channel, no archive
+    assert relay_unit['networks'] == {'recordings-hook': {'aliases': ['recordings-omi-hint']}} and not relay_unit.get('ports')
+    assert relay_unit['command'] == ['--omi-hint-relay', '--host', '0.0.0.0', '--port', str(hint.RECEIVER_PORT)]
+    assert relay_unit['image'] == receiver_unit['image'] and relay_unit['read_only'] is True
+    assert relay_unit['user'] == '10001:10001' and relay_unit['cap_drop'] == ['ALL']
+    assert relay_unit['security_opt'] == ['no-new-privileges:true'] and 'environment' not in relay_unit
+    for name in ('recordings-hint-channel', 'recordings-hint-hook'):
+        volume = document['volumes'][name]
+        assert volume['driver'] == 'local' and volume['driver_opts']['type'] == 'tmpfs'
+        assert set(volume['driver_opts']['o'].split(',')) == {'size=64k', 'uid=10001', 'gid=10001', 'mode=0700'}
+    # Every socket path fits AF_UNIX, and the deployed paths are constants: the promotion tool refuses a mounted path in a command.
+    for path in (hint.CHANNEL_SOCKET, hint.RECEIVER_SOCKET):
+        assert hint.SOCKET_PATH.fullmatch(path) and len(path.encode()) < 104
+    named = json.dumps([receiver_unit['command'], relay_unit['command'], receiver_unit['healthcheck'], relay_unit['healthcheck']])
+    assert hint.CHANNEL_SOCKET not in named and hint.RECEIVER_SOCKET not in named and '/run/deedkit/omi-hook' not in named
 
 
 # --- criterion 2: the id and nothing else
@@ -1130,6 +1160,288 @@ def test_the_app_starts_the_listener_only_when_named_and_the_main_api_refuses_th
     asyncio.run(scenario())
 
 
+@pytest.fixture
+def sockets():
+    """A short private directory for socket files: AF_UNIX paths are limited to 104 bytes, and pytest's own are longer."""
+    directory = Path(tempfile.mkdtemp(prefix='dkh', dir='/tmp'))
+    directory.chmod(0o700)
+    yield directory
+    shutil.rmtree(directory, ignore_errors=True)
+
+
+class QuietServer:
+    """uvicorn in the test's loop, on a socket made by `hint.unix_socket`; the signals stay with pytest."""
+    def __init__(self, app, path):
+        import uvicorn
+
+        class Quiet(uvicorn.Server):
+            def install_signal_handlers(self):
+                pass
+
+            @contextmanager
+            def capture_signals(self):
+                yield
+        self.listening = hint.unix_socket(path)
+        self.server = Quiet(uvicorn.Config(app, lifespan='off', log_config=None, access_log=False, timeout_keep_alive=1,
+                                           http=hint.bounded_protocol(hint.RECEIVER_CONNECTIONS, hint.CONNECTION_LIFETIME)))
+
+    async def __aenter__(self):
+        self.task = asyncio.create_task(self.server.serve(sockets=[self.listening]))
+        while not self.server.started and not self.task.done():
+            await asyncio.sleep(0.005)
+        assert self.server.started
+        return self
+
+    async def __aexit__(self, *_):
+        self.server.should_exit = True
+        await asyncio.wait_for(self.task, 5)
+
+
+# spec: ANYM-760
+def test_the_channel_on_a_socket_file_answers_only_its_route_replaces_a_stale_socket_and_removes_it_on_stop(tmp_path, sockets):
+    async def scenario():
+        r, _, _, _ = backend(tmp_path)
+        path = sockets / 'channel.sock'
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(str(path))
+        stale.close()  # what a killed backend leaves behind
+        listener = await hint.start_listener(r, {hint.LISTEN_ENV: str(path)})
+        assert listener is not None and listener.port is None and r.hints.address is None
+        assert stat.S_ISSOCK(os.lstat(path).st_mode) and stat.S_IMODE(os.lstat(path).st_mode) == 0o600
+        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=str(path)), trust_env=False) as client:
+            answer = await client.post(hint.CHANNEL_URL, headers=dict(channel_headers()), content=b'{"ids":["viasocketfile"]}')
+            assert answer.status_code == 200 and 'viasocketfile' in r.hints.pending
+            answer = await client.post('http://recordings-hint-channel/v1/capabilities', headers={'Authorization': 'Bearer backend-a'},
+                                       content=b'{}')
+            assert answer.status_code == 404  # the main API is not on this socket
+            answer = await client.post(hint.CHANNEL_URL, headers=dict(channel_headers(OLD_CHANNEL_KEY)), content=b'{"ids":["no"]}')
+            assert answer.status_code == 401 and 'no' not in r.hints.pending
+        await listener.stop()
+        assert not os.path.lexists(path) and r.hints.listener is None
+    asyncio.run(scenario())
+
+
+# spec: ANYM-760
+@pytest.mark.parametrize('case', ['open_directory', 'regular_file', 'missing_directory', 'dot_segment', 'no_suffix'])
+def test_a_channel_socket_it_cannot_open_safely_is_absent_and_a_file_in_its_place_is_kept(tmp_path, sockets, case):
+    async def scenario():
+        r, _, _, _ = backend(tmp_path)
+        path = str(sockets / 'channel.sock')
+        if case == 'open_directory':
+            sockets.chmod(0o755)
+        elif case == 'regular_file':
+            Path(path).write_text('kept')
+        elif case == 'missing_directory':
+            path = str(sockets / 'missing' / 'channel.sock')
+        elif case == 'dot_segment':
+            path = f'{sockets}/../{sockets.name}/channel.sock'
+        else:
+            path = str(sockets / 'channel')
+        assert await hint.start_listener(r, {hint.LISTEN_ENV: path}) is None
+        assert r.hints.listener is None and r.hints.listener_error == 'listener_unavailable'
+        if case == 'regular_file':
+            assert Path(path).read_text() == 'kept'
+        elif case != 'missing_directory':
+            assert not os.path.lexists(path)
+    asyncio.run(scenario())
+
+
+# spec: ANYM-760
+def test_a_channel_socket_that_cannot_be_opened_never_stops_the_backend_or_its_polling(tmp_path, sockets, monkeypatch):
+    async def scenario():
+        path, _ = build(tmp_path, omi_hint=hint_section())
+        monkeypatch.setenv(hint.LISTEN_ENV, str(sockets / 'missing' / 'channel.sock'))  # nothing to resolve, nothing to wait for
+        omi = Omi(count=1, created=FRESH)
+        app = create_app(path, transport=httpx.MockTransport(omi), archive_background=False)
+        async with app.router.lifespan_context(app):
+            runtime = app.state.archive
+            assert runtime.hints.listener is None and runtime.hints.listener_error == 'listener_unavailable'
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+                answer = await client.post('/v1/capabilities', headers={'Authorization': 'Bearer backend-a'}, content=b'{}')
+            assert answer.status_code == 200
+            await runtime.run_once(now=T0)
+            assert runtime.error is None and lists(omi)  # the regular pass lists as ever
+    asyncio.run(scenario())
+
+
+# spec: ANYM-760
+def test_a_hint_crosses_relay_receiver_and_channel_over_socket_files_only(tmp_path, sockets):
+    async def scenario():
+        r, _, _, _ = backend(tmp_path / 'backend')
+        channel_path, receiver_path = str(sockets / 'channel.sock'), str(sockets / 'receiver.sock')
+        listener = await hint.start_listener(r, {hint.LISTEN_ENV: channel_path})
+        (tmp_path / 'receiver').mkdir(mode=0o700)
+        config = receiver_files(tmp_path / 'receiver', channel_socket=channel_path)
+        async with QuietServer(hint.Receiver(config), receiver_path):
+            relay = await hint.serve_relay('127.0.0.1', 0, receiver_path)
+            port = relay.sockets[0].getsockname()[1]
+            async with httpx.AsyncClient(trust_env=False, base_url=f'http://127.0.0.1:{port}') as client:
+                answer = await client.post(ROUTE, params={'uid': UID}, content=b'{"id":"viarelay","transcript_segments":[]}')
+                assert answer.status_code == 200 and list(r.hints.pending) == ['viarelay']
+                wrong = await client.post('/omi/memory/' + OLD_PATH_TOKEN, params={'uid': UID}, content=b'{"id":"other"}')
+                health = await client.get('/')
+                assert wrong.status_code == health.status_code == 404 and wrong.content == health.content == hint.BODIES[404]
+                assert list(r.hints.pending) == ['viarelay']
+            relay.close()
+            await relay.wait_closed()
+        await listener.stop()
+    asyncio.run(scenario())
+
+
+# spec: ANYM-760
+def test_the_relay_bounds_connections_lifetime_and_bytes_and_closes_at_once_without_the_receiver(sockets, monkeypatch):
+    monkeypatch.setattr(hint, 'RELAY_UP', 1000)
+
+    async def ended(reader):
+        try:
+            async with asyncio.timeout(4):
+                return await reader.read()
+        except ConnectionError:
+            return b''
+
+    async def scenario():
+        upstream, taken = str(sockets / 'receiver.sock'), []
+
+        async def silent(reader, writer):  # takes bytes, never answers
+            try:
+                while chunk := await reader.read(65536):
+                    taken.append(len(chunk))
+            except ConnectionError:
+                pass
+        receiver_side = await asyncio.start_unix_server(silent, path=upstream)
+        relay = await hint.serve_relay('127.0.0.1', 0, upstream, limit=3, lifetime=0.6)
+        port = relay.sockets[0].getsockname()[1]
+        opened = [await asyncio.open_connection('127.0.0.1', port) for _ in range(5)]
+        await asyncio.sleep(0.2)
+        assert len(relay.relay_active) == 3  # the two beyond the limit were closed on arrival
+        started = time.monotonic()
+        assert [await ended(reader) for reader, _ in opened] == [b''] * 5
+        assert time.monotonic() - started < 2 and not relay.relay_active  # held ones end by themselves at the lifetime
+        for _, writer in opened:
+            writer.close()
+        # Past the byte cap the connection is cut long before its lifetime, and no more than the cap reached the receiver.
+        capped = await hint.serve_relay('127.0.0.1', 0, upstream, lifetime=10)
+        taken.clear()
+        reader, writer = await asyncio.open_connection('127.0.0.1', capped.sockets[0].getsockname()[1])
+        writer.write(b'x' * 50000)
+        started = time.monotonic()
+        assert await ended(reader) == b'' and time.monotonic() - started < 3
+        assert sum(taken) <= 1000
+        writer.close()
+        # No receiver: the connection closes at once, nothing else is tried.
+        receiver_side.close()
+        await receiver_side.wait_closed()
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(upstream)
+        reader, writer = await asyncio.open_connection('127.0.0.1', capped.sockets[0].getsockname()[1])
+        started = time.monotonic()
+        assert await ended(reader) == b'' and time.monotonic() - started < 1
+        writer.close()
+        for server in (relay, capped):
+            server.close()
+            await server.wait_closed()
+    asyncio.run(scenario())
+
+
+# spec: ANYM-760
+def test_the_receiver_mode_with_unix_serves_only_on_its_socket_file(tmp_path, sockets, monkeypatch):
+    served = {}
+    monkeypatch.setattr(hint, 'RECEIVER_SOCKET', str(sockets / 'receiver.sock'))
+    monkeypatch.setattr('uvicorn.run', lambda *a, **k: served.update(tcp=True))
+    monkeypatch.setattr('uvicorn.Server.run', lambda self, sockets=None: served.update(app=self.config.app, sockets=sockets,
+                                                                                         config=self.config))
+    cli.main(['--config', str(receiver_files(tmp_path)), '--omi-hint-receiver', '--unix'])
+    assert 'tcp' not in served and isinstance(served['app'], hint.Receiver)
+    (listening,) = served['sockets']
+    assert listening.family == socket.AF_UNIX and listening.getsockname() == hint.RECEIVER_SOCKET
+    assert served['config'].access_log is False and served['config'].server_header is False
+    listening.close()
+    sockets.chmod(0o755)  # a directory others can enter: refused before anything serves
+    with pytest.raises(SystemExit) as stop:
+        cli.main(['--config', str(receiver_files(tmp_path)), '--omi-hint-receiver', '--unix'])
+    assert stop.value.code == 1
+
+
+NETNS_HELPER = r'''
+import json, os, socket, sys
+path, host, port, key = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+out = {'interfaces': sorted(name for _, name in socket.if_nameindex())}
+for label, target in (('host', host), ('loopback', '127.0.0.1')):
+    try:
+        socket.create_connection((target, port), timeout=2).close()
+        out[label] = 'connected'
+    except OSError:
+        out[label] = 'unreachable'
+try:
+    with open(os.path.join(os.path.dirname(path), 'planted'), 'w'):
+        out['write'] = 'written'
+except OSError:
+    out['write'] = 'denied'
+try:
+    os.unlink(path)
+    out['unlink'] = 'removed'
+except OSError:
+    out['unlink'] = 'denied'
+body = b'{"ids":["fromnetns"]}'
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+    s.settimeout(5)
+    s.connect(path)
+    s.sendall(b'POST /omi-hint HTTP/1.1\r\nHost: c\r\nAuthorization: Bearer ' + key.encode() + b'\r\nContent-Type: application/json\r\n'
+              b'Content-Length: ' + str(len(body)).encode() + b'\r\nConnection: close\r\n\r\n' + body)
+    out['status'] = s.recv(64).split(b' ')[1].decode()
+print(json.dumps(out))
+'''
+
+
+def mount_namespace_ready():
+    if sys.platform != 'linux' or not all(shutil.which(tool) for tool in ('sudo', 'unshare', 'mount')):
+        return False
+    return subprocess.run(['sudo', '-n', 'unshare', '-n', '-m', 'true'], capture_output=True).returncode == 0
+
+
+# spec: ANYM-760
+def test_with_no_network_the_receiver_side_reaches_only_the_channel_socket_through_a_read_only_mount(tmp_path, sockets):
+    if not mount_namespace_ready():
+        if os.environ.get('GITHUB_ACTIONS'):
+            pytest.fail('criterion 4 (iv) must run in CI: sudo, unshare or mount is missing')
+        pytest.skip('needs sudo, unshare and mount on Linux')
+    view = Path(tempfile.mkdtemp(prefix='dkv', dir='/tmp'))
+    helper = tmp_path / 'netns.py'
+    helper.write_text(NETNS_HELPER)
+
+    async def scenario():
+        r, _, _, _ = backend(tmp_path / 'backend')
+        listener = await hint.start_listener(r, {hint.LISTEN_ENV: str(sockets / 'channel.sock')})
+        main_api = await asyncio.start_server(lambda reader, writer: writer.close(), '0.0.0.0', 0)  # the main listener's stand-in
+        port = main_api.sockets[0].getsockname()[1]
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(('192.0.2.1', 9))  # no packet: only picks the host's own address
+            host = probe.getsockname()[0]
+        assert host != '127.0.0.1'
+        # As `network_mode: none` plus the `:ro` volume: a fresh network namespace (loopback only) and a read-only view of the directory.
+        script = (f'mount --bind {sockets} {view} && mount -o remount,bind,ro {view} && '
+                  f'exec {sys.executable} -I {helper} {view}/channel.sock {host} {port} {CHANNEL_KEY}')
+        child = await asyncio.create_subprocess_exec('sudo', '-n', 'unshare', '-n', '-m', 'sh', '-ec', script,
+                                                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, err = await asyncio.wait_for(child.communicate(), 60)
+        assert child.returncode == 0, err.decode()
+        seen = json.loads(out)
+        seen['pending'] = list(r.hints.pending)
+        main_api.close()
+        await main_api.wait_closed()
+        await listener.stop()
+        return seen
+    try:
+        seen = asyncio.run(scenario())
+    finally:
+        shutil.rmtree(view, ignore_errors=True)
+    assert seen['interfaces'] == ['lo']
+    assert seen['host'] == seen['loopback'] == 'unreachable'  # no TCP listener of the host or the backend is reachable at all
+    assert seen['write'] == seen['unlink'] == 'denied'  # it cannot plant or replace the backend's socket
+    assert seen['status'] == '200'  # and the one channel still works, over the file
+    assert seen['pending'] == ['fromnetns']
+
+
 # spec: ANYM-760
 def test_without_configuration_the_backend_has_no_listener_and_no_guard(tmp_path, monkeypatch):
     async def scenario():
@@ -1482,7 +1794,7 @@ def test_the_examples_are_synthetic_and_the_archive_example_stays_dark():
     settings = hint.ReceiverSettings.model_validate(example)
     assert all(re.fullmatch(r'0{64}', value) for value in settings.path_token_sha256)
     assert settings.channel_key_file.startswith('/run/deedkit/omi-hint/')
-    assert settings.channel_url == f'http://{hint.CHANNEL_ALIAS}:{hint.CHANNEL_PORT}{hint.CHANNEL_PATH}'
+    assert settings.channel_socket == hint.CHANNEL_SOCKET
     archived = json.loads((ROOT / 'deploy/recordings-archive.example.json').read_text())
     assert 'omi_hint' not in archived['archive']
     assert Document.model_validate(archived).archive.omi_hint is None
