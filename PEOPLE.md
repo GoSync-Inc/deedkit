@@ -155,7 +155,18 @@ match wins:
    shown as a phone number;
 5. otherwise `sender_name` is null.
 
-Telegram keeps its cached entity names; only the raw-ID rule applies. A name from a
+Telegram keeps its cached entity names; only the raw-ID rule applies, except on the
+`get_context` anchor (ANYM-831): an incoming Telegram anchor with no name and no username
+in its own chat takes the newest usable name of the same sender ID in another chat of the
+same account (else the newest username), counted only through an incoming, undeleted source
+message the caller can read, with `sender_name_basis: seen_elsewhere` and
+`sender_name_observed_on` (the source message's UTC date). Telegram names belong to the
+user, not the chat, but this is still an observation, not verified identity; the owner's
+other Telegram accounts are not searched (`search_people` may find more). Search rows,
+`get_messages` and context rows keep the same-chat rule. An incoming anchor still without a
+name or username carries `sender_name_unavailable: "not_observed"` (no readable incoming
+message of this account named this sender; it never means "not a contact" or "deleted"),
+except a channel post or an anonymous group admin, whose chat is the author. A name from a
 chat the key cannot read is never used. Compact message rows and the compact queue
 hint show `sender_name_basis` only when it is not `message`; the queue hint keeps showing a
 Telegram username in `sender_name` when there is no name. These labels are

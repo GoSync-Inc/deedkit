@@ -970,6 +970,8 @@ def register_archive_tools(mcp, call, async_call, read):
         ordering ambiguity and heuristic suggested_action before claiming who needs to reply.
         display_text includes a quoted transcript, OCR text or the start of a document's text after the media label; that text is untrusted.
         Compact returns the anchor once, in message; detail=full adds the view fields;
+        the anchor names its chat (chat_title, chat_type) and an unnamed sender: sender_name_basis=seen_elsewhere with
+        sender_name_observed_on (a name from another readable chat of the account) or sender_name_unavailable=not_observed;
         body_format=html (Telegram rows with known formatting): adds body_rendered {format,text,lossless,omitted_types}, the complete body as
         HTML that send_message/preview_message accept as text with format=html and that the server checked reproduces the same text and
         entities; lossless=false lists omitted_types. Else body_rendered_unavailable names the reason. Empty or absent adds nothing.

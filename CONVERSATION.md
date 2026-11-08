@@ -43,7 +43,11 @@ In the conversation view each message tool returns every message text once.
   each message's `evidence` states `provider_currentness_verified`; the `result_evidence` and `search` blocks of `search` and
   `get_messages` are described in [SEARCH.md](SEARCH.md#compact-search-shape-anym-667)). `get_context` returns the
   anchor once, in `message`; `context_window.anchor_index` is its position among
-  the `context` neighbours. `list_chats` groups the reply hint into one
+  the `context` neighbours. The anchor also carries the chat once: `chat_title` (first 64
+  characters) and `chat_type`. Read its sender as `sender_name`, else `username`, else
+  `sender_name_unavailable`; `sender_name_basis` and `sender_name_observed_on` say when the name
+  came from another chat (ANYM-831, [PEOPLE.md](PEOPLE.md)). That name aid is on the anchor only:
+  match context rows by `sender`. The platform is in the account listing, not on messages. `list_chats` groups the reply hint into one
   `awaiting_reply` object and shows the latest message once in `last_message`.
   Each fact appears once per `list_chats` row (compact queue rows below).
   A WhatsApp conversation stored under a phone-number chat and a LID chat is

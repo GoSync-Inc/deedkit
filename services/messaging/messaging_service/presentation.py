@@ -3,7 +3,7 @@ import re
 
 MESSAGE_FIELDS = ('id','message','account','chat','sender','sent_at','revision','direction',
     'provider_message_id','kind','origin','historical','is_backfill','event_sequence','sender_name','sender_name_basis','username',
-    'chat_title','chat_type','reply_to_provider_id','reply_to','mentions_owner','reply_to_owner','forwarded','media_kind','body_truncated',
+    'sender_name_observed_on','sender_name_unavailable','chat_title','chat_type','reply_to_provider_id','reply_to','mentions_owner','reply_to_owner','forwarded','media_kind','body_truncated',
     'sender_identity_basis','agent_send','delivery_receipt','formatting','body_rendered','body_rendered_unavailable','matched_in','media_matches')
 CONVERSATION_FIELDS = ('body','kind','is_service','display_text','position','order_basis',
     'order_status','timestamp_resolution','first_observed_at','first_observed_basis',
@@ -133,7 +133,10 @@ def lean_message(row, *, search=False, files=True):
     result={k:row[k] for k in ('id','account','chat','sender','sender_name','sent_at','direction','kind','revision')
         if row.get(k) is not None}
     if 'sender_name' not in result and row.get('username'):result['username']=row['username']
-    if result.get('sender_name') and _fallback_basis(row):result['sender_name_basis']=row['sender_name_basis']
+    if (result.get('sender_name') or result.get('username')) and _fallback_basis(row):result['sender_name_basis']=row['sender_name_basis']
+    # ANYM-831: only a get_context anchor carries these (sender_names.anchor).
+    for key in ('sender_name_observed_on','sender_name_unavailable'):
+        if row.get(key):result[key]=row[key]
     for key,maximum in [('sender_name',64),('username',64)]:
         if key in result:result[key]=result[key][:maximum]
     if search:
@@ -454,6 +457,9 @@ def lean(method, result, include_coverage=False):
         anchor=result['message']
         rows=result['context']
         result['message']=lean_message(anchor,files=False)
+        # ANYM-831: the chat once, on the anchor; context rows share it.
+        for key in ('chat_title','chat_type'):
+            if anchor.get(key):result['message'][key]=anchor[key][:64]
         # The anchor is returned once; anchor_index says where it sits in context.
         result['context']=[lean_message(row) for row in rows if row['id']!=anchor['id']]
         window={k:v for k,v in result['context_window'].items()
@@ -598,6 +604,7 @@ def render(method, result, detail, include_coverage=False):
         result['items']=[message_summary(row) for row in result['items']]
     elif method=='get_context':
         result['message']=message_summary(result['message'])
+        if result['message'].get('chat_title'):result['message']['chat_title']=result['message']['chat_title'][:64]  # ANYM-831
         result['context']=[message_summary(row) for row in result['context']]
         for key in ('attachments','pending_attachments'):
             result[key]=[file_summary(row) for row in result[key]]

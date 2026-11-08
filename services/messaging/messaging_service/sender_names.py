@@ -104,3 +104,39 @@ def resolve(c,p,rows,*,account='account',chat='chat',sender='sender',name='sende
             row.update({name:linked[(row[account],partner)][0]['display_name'],basis:'linked_identity'})
         elif identity.endswith('@c.us'):row.update({name:'+'+identity.split('@')[0],basis:'phone_number'})
     return rows
+
+
+def _elsewhere(c,p,row):
+    """ANYM-831: the newest usable name, else username, of this Telegram sender in another chat of its account.
+
+    One statement. A profile counts only through its own incoming, undeleted source message that
+    the key can read (the checks of `_names`). There is no (account, sender) index: the account
+    prefilter bounds the scan, as in `_names`.
+    """
+    where,args=scope_filter(p,'m')
+    return c.execute('''SELECT CASE WHEN NOT '''+RAW_NAME_SQL+''' THEN sp.display_name END AS name,nullif(sp.username,'') AS username,
+          to_char(sp.source_sent_at AT TIME ZONE 'UTC','YYYY-MM-DD') AS observed_on
+        FROM sender_profiles sp JOIN messages m ON m.id=sp.source_message
+        WHERE '''+where+''' AND m.account=sp.account AND m.chat=sp.chat AND m.sender=sp.sender AND NOT m.deleted
+          AND m.direction='incoming' AND sp.account=%s AND sp.sender=%s AND sp.chat<>%s
+          AND (NOT '''+RAW_NAME_SQL+''' OR nullif(sp.username,'') IS NOT NULL)
+        ORDER BY (NOT '''+RAW_NAME_SQL+''') DESC,sp.source_sent_at DESC,sp.id LIMIT 1''',
+        [*args,row['account'],row['sender'],row['chat']]).fetchone()
+
+
+def anchor(c,p,row):
+    """ANYM-831: the get_context anchor only, after `resolve`. Search and other rows keep the same-chat rule.
+
+    An unnamed incoming Telegram sender takes `_elsewhere` with basis seen_elsewhere and the source
+    date; an anchor still unnamed says not_observed, unless the chat is its own author (a channel
+    post, an anonymous group admin).
+    """
+    if row.get('direction')!='incoming' or not row.get('sender') or row.get('sender_name') or row.get('username'):
+        return row
+    found=_elsewhere(c,p,row) if row.get('platform')=='telegram' else None
+    if found:
+        row.update(sender_name=found['name'],username=found['username'],sender_name_basis='seen_elsewhere',
+            sender_name_observed_on=found['observed_on'])
+    elif not (row.get('chat_type')=='channel' or row.get('chat_type')=='group' and row['sender']==row.get('provider_chat_id')):
+        row['sender_name_unavailable']='not_observed'
+    return row
