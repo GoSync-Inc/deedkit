@@ -42,7 +42,7 @@ EXPECTED_GO_SAFE_ONLY = {
 
 
 def _strings(text, quote):
-    return set(re.findall(quote + r'([a-z_]+)' + quote, text))
+    return set(re.findall(quote + r'([a-z][a-z0-9_]*)' + quote, text))  # media_http_<status> has digits
 
 
 def _js_set(source, pattern):
