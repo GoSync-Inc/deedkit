@@ -2597,8 +2597,9 @@ COPY_RESERVE = 10 << 30
 COPY_TIMEOUT = 1800
 COPY_OUTPUT = 16 << 20
 COPY_STOP_READBACK = 30
-COPY_USER = "deedkit_copy"
 COPY_DATA = "/deedkit-copy"
+# The scratch database the reference schema alone is restored into when the restore prints its expressions otherwise.
+SCHEMA_ROUND_TRIP = "deedkit_copy_reference"
 COPY_CODES = ("dump_failed", "restore_failed", "count_mismatch", "schema_mismatch", "disk_reserve", "deadline")
 COPY_NAME = re.compile(r"[a-z][a-z0-9]{0,11}")
 COPY_ID = re.compile(r"[0-9a-f]{12}-[a-z][a-z0-9]{0,11}-([0-9]{8}T[0-9]{6}Z)")
@@ -2892,9 +2893,11 @@ def copy_dumps(copy, keeper, timeout, catalog, container, owner, database, direc
     found = json.loads(keeper.query(
         "SELECT json_build_object('snapshot', pg_export_snapshot(), 'at', now(), 'version',"
         " current_setting('server_version'), 'bytes', pg_database_size(d.oid), 'owner', pg_get_userbyid(d.datdba),"
-        " 'encoding', pg_encoding_to_char(d.encoding), 'collate', d.datcollate, 'ctype', d.datctype)"
+        " 'encoding', pg_encoding_to_char(d.encoding), 'collate', d.datcollate, 'ctype', d.datctype,"
+        " 'bootstrap', (SELECT rolname FROM pg_roles WHERE oid = 10))"
         " FROM pg_database d WHERE d.datname = current_database();")[0])
-    if (not SNAPSHOT_ID.fullmatch(found["snapshot"]) or not SQL_NAME.fullmatch(found["owner"])
+    if (not SNAPSHOT_ID.fullmatch(found["snapshot"])
+            or not all(SQL_NAME.fullmatch(found[key] or "") for key in ("owner", "bootstrap"))
             or not all(LOCALE.fullmatch(found[key]) for key in ("encoding", "collate", "ctype"))):
         raise CopyFailed(copy["id"], "dump_failed")
     for path in paths:
@@ -2914,9 +2917,12 @@ def copy_dumps(copy, keeper, timeout, catalog, container, owner, database, direc
     return found, reference, shape
 
 
-def copy_scratch(copy, image, directory, timeout, paths):
+def copy_scratch(copy, image, directory, timeout, paths, superuser):
     """Start the scratch PostgreSQL and wait until its final server answers; returns its container name and the
-    client arguments to reach it."""
+    client arguments to reach it. Its bootstrap superuser is `superuser`, the live server's (incident 11-06): pg_dumpall
+    writes `GRANTED BY <bootstrap>` on the memberships that role granted, and PostgreSQL 16+ refuses such a grant
+    from any other role without ADMIN OPTION; the same name also keeps the copy's grantors equal to the live ones,
+    which the rehearsal's catalog compares."""
     scratch, scratch_container = directory / "scratch", copy["container"]
     scratch.mkdir(mode=0o700)
     # A root operator lets the image's entrypoint own the data directory; anyone else runs PostgreSQL as itself, so
@@ -2924,9 +2930,9 @@ def copy_scratch(copy, image, directory, timeout, paths):
     user = ["--user", f"{os.geteuid()}:{os.getegid()}"] if os.geteuid() else []
     run(["docker", "run", "-d", "--rm", "--name", scratch_container, "--label", "deedkit-copy=" + copy["id"],
          "--network", "none", "--log-driver", "none", "--memory", "1g", "--cpus", "1", "--pids-limit", "256",
-         "--shm-size", "256m", *user, "-e", "POSTGRES_HOST_AUTH_METHOD=trust", "-e", "POSTGRES_USER=" + COPY_USER,
+         "--shm-size", "256m", *user, "-e", "POSTGRES_HOST_AUTH_METHOD=trust", "-e", "POSTGRES_USER=" + superuser,
          "-e", "PGDATA=" + COPY_DATA, "-v", f"{scratch}:{COPY_DATA}", image], timeout=120)
-    scratch_sql = ("-h", "127.0.0.1", "-U", COPY_USER)
+    scratch_sql = ("-h", "127.0.0.1", "-U", superuser)
     deadline = copy_clock() + timeout
     # The entrypoint's initialisation server listens on no TCP address: 127.0.0.1 answers only the final server.
     while subprocess.run(copy_exec(copy, "ready", scratch_container, "pg_isready", "-q", *scratch_sql, "-d",
@@ -2939,14 +2945,28 @@ def copy_scratch(copy, image, directory, timeout, paths):
     return scratch_container, scratch_sql, psql
 
 
+def scratch_roles(source, target, bootstrap):
+    """`roles.sql` without its `CREATE ROLE` of the bootstrap superuser, whom the scratch server already has (its
+    ALTER ROLE still applies); `pg_dumpall` writes that line for every role."""
+    own = {f"CREATE ROLE {bootstrap};", f'CREATE ROLE "{bootstrap}";'}
+    with os.fdopen(new_file(target), "w") as handle:
+        handle.writelines(line for line in Path(source).read_text().splitlines(keepends=True)
+                          if line.rstrip("\n") not in own)
+
+
 def copy_verify(copy, directory, database, found, reference, scratch_container, scratch_sql, psql, timeout, watch):
     """Restore the dumps into the scratch server and compare counts and schema with the live reference."""
-    restored(copy, copy_exec(copy, "roles", scratch_container, *psql, "-d", "postgres"), directory / "roles.sql",
+    roles = directory / "scratch-roles.sql"
+    scratch_roles(directory / "roles.sql", roles, found["bootstrap"])
+    restored(copy, copy_exec(copy, "roles", scratch_container, *psql, "-d", "postgres"), roles,
              failure="restore_failed", **watch)
-    helper_output(copy, copy_exec(copy, "create", scratch_container, *psql, "-d", "postgres"), timeout=timeout,
-                  failure="restore_failed",
-                  text=f"CREATE DATABASE \"{database}\" OWNER \"{found['owner']}\" TEMPLATE template0 ENCODING"
-                       f" '{found['encoding']}' LC_COLLATE '{found['collate']}' LC_CTYPE '{found['ctype']}';")
+    roles.unlink()
+    def create(name):
+        helper_output(copy, copy_exec(copy, "create", scratch_container, *psql, "-d", "postgres"), timeout=timeout,
+                      failure="restore_failed",
+                      text=f"CREATE DATABASE \"{name}\" OWNER \"{found['owner']}\" TEMPLATE template0 ENCODING"
+                           f" '{found['encoding']}' LC_COLLATE '{found['collate']}' LC_CTYPE '{found['ctype']}';")
+    create(database)
     restored(copy, copy_exec(copy, "restore", scratch_container, "pg_restore", "--exit-on-error",
                              "--single-transaction", *scratch_sql, "-d", database), directory / f"{database}.dump",
              failure="restore_failed", **watch)
@@ -2958,7 +2978,20 @@ def copy_verify(copy, directory, database, found, reference, scratch_container, 
     dumped(copy, copy_exec(copy, "verify", scratch_container, "pg_dump", "--schema-only", *scratch_sql,
                            "-d", database), directory / "restored.schema", failure="restore_failed", **watch)
     if schema_lines(directory / "restored.schema") != schema_lines(directory / "reference.schema"):
-        raise CopyFailed(copy["id"], "schema_mismatch")
+        # Parsing an expression pg_dump printed does not always print it back the same (incident 11-06: a BETWEEN
+        # inside an AND reads back as one flat AND). The reference schema alone, restored into an empty database of
+        # the scratch server, then takes the same round trip; the restore must print exactly that.
+        name = SCHEMA_ROUND_TRIP if database != SCHEMA_ROUND_TRIP else SCHEMA_ROUND_TRIP + "_2"
+        create(name)
+        restored(copy, copy_exec(copy, "reference", scratch_container, *psql, "-d", name),
+                 directory / "reference.schema", failure="restore_failed", **watch)
+        dumped(copy, copy_exec(copy, "round", scratch_container, "pg_dump", "--schema-only", *scratch_sql, "-d", name),
+               directory / "round-trip.schema", failure="restore_failed", **watch)
+        helper_output(copy, copy_exec(copy, "drop", scratch_container, *psql, "-d", "postgres"), timeout=timeout,
+                      failure="restore_failed", text=f"DROP DATABASE \"{name}\";")
+        if schema_lines(directory / "restored.schema") != schema_lines(directory / "round-trip.schema"):
+            raise CopyFailed(copy["id"], "schema_mismatch")
+        (directory / "round-trip.schema").unlink()
     (directory / "restored.schema").unlink()
 
 
@@ -2983,11 +3016,12 @@ def snapshot_copy(copy, timeout, keep, catalog=None):
         keeper.close()
     files = {name: file_digest(directory / name) for name in (f"{database}.dump", "roles.sql", "reference.schema")}
     image = inspected["Image"]
-    scratch_container, scratch_sql, psql = copy_scratch(copy, image, directory, timeout, paths)
+    scratch_container, scratch_sql, psql = copy_scratch(copy, image, directory, timeout, paths, found["bootstrap"])
     copy_verify(copy, directory, database, found, reference, scratch_container, scratch_sql, psql, timeout, watch)
     record = {"id": copy["id"], "verified": True, "database": database, "counts": reference, "files": files,
               "snapshot_at": found["at"], "server_version": found["version"], "database_bytes": found["bytes"],
-              "image": image, "scratch_container": scratch_container if keep else None, "verified_at": now()}
+              "image": image, "scratch_container": scratch_container if keep else None,
+              "scratch_user": found["bootstrap"], "verified_at": now()}
     if shape is not None:
         record["catalog_sha256"] = hashlib.sha256("\n".join(shape).encode()).hexdigest()
     write_record(directory / "copy.json", record)
@@ -3946,7 +3980,7 @@ def scratch_lines(copy, copied, step, text):
     try:
         return [line for line in helper_output(copy, copy_exec(
             copy, step, copied["scratch_container"], "psql", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-h",
-            "127.0.0.1", "-U", COPY_USER, "-d", copied["database"]), timeout=60, failure="restore_failed",
+            "127.0.0.1", "-U", copied["scratch_user"], "-d", copied["database"]), timeout=60, failure="restore_failed",
             text=text).splitlines() if line]
     except CopyFailed as exc:
         raise MigrationRefused(f"the rehearsal could not read the copy ({step})") from exc
