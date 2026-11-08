@@ -477,7 +477,8 @@ def typed_key(store, principal='types-reader'):
 
 
 def message_events(store, token, sid):
-    return [item['message'] for item in store.get_subscription_events(token, sid)['items']]
+    """Message references only: a send.failed item names a send, not a message."""
+    return [item['message'] for item in store.get_subscription_events(token, sid)['items'] if 'message' in item]
 
 
 # spec: ANYM-825
