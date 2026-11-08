@@ -144,11 +144,8 @@ export interface SubscriptionSources {
   chat_types?: SubscriptionChatType[];
 }
 export interface SubscriptionSelection {
-  /** Frozen 1–64 authorized archive chat IDs, never names or arbitrary provider references.
-   * Exactly one of chat_ids and sources. */
-  chat_ids?: string[];
-  /** Every chat the key can see now (dynamic_sources_disabled until the operator's switch). */
-  sources?: SubscriptionSources;
+  /** Frozen 1–64 authorized archive chat IDs, never names or arbitrary provider references. */
+  chat_ids: string[];
   /** Exact verified account-scoped IDs in those chats, resolved through searchPeople. */
   sender_ids?: string[] | null;
   /** Defaults to message.created; file readiness is independent of message arrival. */
@@ -166,6 +163,10 @@ export interface SubscriptionSelection {
   reply_to_send?: string | null;
   /** Your own endpoint from registerDeliveryEndpoint; needs delivery-write. */
   delivery?: {endpoint_id: string; delivery_policy?: Record<string,unknown>} | null;
+}
+/** Every chat the key can see now instead of chat_ids (dynamic_sources_disabled until the operator's switch). */
+export interface DynamicSubscriptionSelection extends Omit<SubscriptionSelection,'chat_ids'|'sender_ids'|'reply_to_send'> {
+  sources: SubscriptionSources;
 }
 export interface SubscriptionLifecycleAction {
   subscription_id: string;
@@ -298,7 +299,7 @@ export declare class AnyMsgClient {
   /** Read a scoped receipt without another provider request. */
   getMessengerOperation(args: {operation_id:string}): Promise<Record<string,unknown>>;
   /** Requires explicit subscription-write; uncertain creations are never automatically retried. */
-  createSubscription(args: SubscriptionSelection): Promise<Record<string,unknown>>;
+  createSubscription(args: SubscriptionSelection | DynamicSubscriptionSelection): Promise<Record<string,unknown>>;
   /** Current credential only; sources are masked after a permission/scope change. */
   listSubscriptions(args?: {limit?:number}): Promise<Record<string,unknown>>;
   /** Matcher catch-up is separate from live provider freshness and complete history. */
