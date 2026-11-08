@@ -31,9 +31,6 @@ DETAILS={
     'media_decrypt_failed':('The downloaded bytes matched their hash but the message\'s media key does not decrypt them; the same copy fails again, so automatic retry is stopped.','inspect_source_attachment'),
     **{'media_http_'+str(status):('The media server answered HTTP '+str(status)+'; bounded retry is scheduled.','wait_for_media_retry')
         for status in (400,401,408,429,500,502,503,504)},
-    # ANYM-815: read-time wording of a failed WhatsApp job queued when its message was already older than the
-    # estimated retention; the recorded error_code stays as evidence. No recovery is enabled yet: no next action.
-    'provider_media_likely_expired':('WhatsApp keeps media about 30 days; this file was already older when it was queued. The phone may still have it.',None),
     'media_reference_changed':('The current provider attachment differs from the queued reference.','reread_message'),
     'invalid_media_path':('The provider media path failed the fixed-host validation.','check_collector_health'),
     'media_size_limit':('The original exceeds the configured download size bound.','inspect_download_limits'),
@@ -61,12 +58,18 @@ DETAILS={
 }
 
 
+# Read-time wordings without a tool to suggest (next_action None), kept apart from DETAILS, whose every step names
+# a registered tool. ANYM-815: a failed WhatsApp job queued when its message was already older than the estimated
+# retention; the recorded error_code stays as evidence. No recovery is enabled yet.
+NO_ACTION_DETAILS={
+    'provider_media_likely_expired':('WhatsApp keeps media about 30 days; this file was already older when it was queued. The phone may still have it.',None),
+}
 # Codes whose own wording already describes a failed job, so the generic failed text does not replace it.
-KEEP_WHEN_FAILED=frozenset({'provider_media_likely_expired'})
+KEEP_WHEN_FAILED=frozenset(NO_ACTION_DETAILS)
 
 
 def describe(code, *, job_state=None):
-    explanation,action=DETAILS.get(code,('No specific diagnosis recorded.' if not code else
+    explanation,action=DETAILS.get(code) or NO_ACTION_DETAILS.get(code) or (('No specific diagnosis recorded.' if not code else
         'Provider or archive observation; inspect the scoped sync evidence.','get_sync_status_for_chat'))
     if job_state is not None:
         retry=job_state=='queued' and code!='retry_exhausted'

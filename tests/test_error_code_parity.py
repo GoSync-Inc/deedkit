@@ -105,8 +105,9 @@ def test_fixed_media_codes_reach_every_consumer():
     assert 'media_decrypt_failed' in media_retry.MEDIA_PROVIDER_PERMANENT_CODES
     assert not media_retry.MEDIA_HTTP_CODES & media_retry.MEDIA_PERMANENT_CODES
     assert not media_retry.MEDIA_HTTP_CODES & media_retry.MEDIA_PROVIDER_PERMANENT_CODES
-    for code in new | {'provider_media_likely_expired'}:
+    for code in new:
         assert code in status_details.DETAILS, code
+    assert status_details.describe('provider_media_likely_expired', job_state='failed')['next_action'] is None
     # The browser fallback never invents a native-only code.
     assert not new & _js_set('media.mjs', r"const safe=new Set\(\[(.*?)\]\)")
 
