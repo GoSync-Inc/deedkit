@@ -576,6 +576,11 @@ def render(method, result, detail, include_coverage=False):
             row['files']={k:v for k,v in source.get('files',{}).items()
                 if k in ('download','download_errors','download_error_states','extraction','enrichment')
                 and (k!='download_error_states' or v)}
+            # ANYM-812: the policy verdict, due counts and one on-request total.
+            if source.get('coverage'):
+                from .coverage import compact as coverage_compact
+                block=coverage_compact(source['coverage'])
+                if block is not None:row['coverage']=block
             compact['sources'].append(row)
         # ANYM-785: the compact budget names only accounts with something to report.
         health=result.get('enrichment_health')

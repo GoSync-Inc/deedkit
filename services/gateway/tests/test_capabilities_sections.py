@@ -37,6 +37,18 @@ def test_gateway_capabilities_unknown_section_names_the_field_and_the_allowed_se
         assert empty.status_code == 422 and empty.json()["error"] == "invalid_arguments"
 
 
+# spec: ANYM-812
+def test_the_coverage_section_keeps_the_backends_file_policy():
+    from agent_gateway.sections import capabilities_view
+    policy = {"synthetic": {"files_auto_days": 7, "status_call": "get_sync_status"}}
+    backend = {"synthetic": True, "sources": [], "coverage": "partial", "file_policy": policy, "limits": {}}
+    assert capabilities_view(backend, {"sections": ["coverage"]}) == {k: backend[k] for k in
+                                                                      ("synthetic", "sources", "coverage", "file_policy")}
+    # A chat-scoped key's backend sends no file_policy; the section then has none either.
+    scoped = {k: v for k, v in backend.items() if k != "file_policy"}
+    assert "file_policy" not in capabilities_view(scoped, {"sections": ["coverage"]})
+
+
 # spec: ANYM-270
 def test_gateway_capabilities_summary_sections_and_full(tmp_path):
     app, seen = capabilities(tmp_path, SUPPORTED)

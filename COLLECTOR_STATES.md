@@ -12,6 +12,45 @@ account queues, processing profile summaries or lease observations.
 generation's first check and for a chat-restricted reader. An old `checked_at` means the
 check is failing (log line `enrichment_health_unavailable`).
 `detail=compact` names only accounts with codes or counts and omits the key when none has any.
+Since ANYM-812 the check also counts due rows still `unconfigured` (a stored original of a configured
+kind no claim has touched yet). Their scope is (account, kind from mime, provider of the account's
+profile row); progress is the newest `ready` row of that scope, any profile hash. They stall only while
+that profile is enabled and unexpired; a cleanly stopped or killed worker is `enrichment_no_worker`.
+Withheld, evicted and not-recognizable rows never count.
+
+`coverage` (each account row, ANYM-812; never for a chat-restricted reader) answers "is everything due
+under the current policy done". `detail=compact` carries, while `behind`, only `state`, `since`, `due`
+totals (`to_download`, `to_index`, `to_recognize`) and the `available_on_request` total; while `done`, the
+state and that total; while `unknown`, nothing (the 8 KiB compact budget). Full detail:
+
+- `state`: `done` when every `due.to_*` is 0, `behind` otherwise, `unknown` when the run's window is
+  unpublished or the collector lease has expired. A terminal failure never makes it `behind`.
+  `since` is the oldest waiting due item (null when not behind); `as_of` the policy's publication
+  time; `health` the account's `enrichment_health` codes.
+- `policy`: `messages_since` (the history bound, null = none), `messages_source`
+  (`provider_history` for Telegram, `phone_pairing_batch_and_live` for WhatsApp), `files_auto_days`,
+  `files_auto_chats: personal_and_subscribed`, `files_other: on_request`, `files_request_call`,
+  `older_messages_call`, `recognition` (the configured kinds: a profile row observed within 7 days,
+  enabled or not) and `provider_media_retention_days` (30 for WhatsApp, an integrators' estimate;
+  null for Telegram).
+- `due`: `to_download` (eligible queued or leased downloads), `to_index`, `to_recognize` by kind
+  with `total`, and `failed` (terminal failures per stage). Due is the policy backlog: a row the
+  worker takes after a daily cap, a pause, a backoff or a lease expiry is still due.
+- `done`: totals `stored`, `indexed`, `transcribed`, `described`, `ready_last_24h`.
+- `available_on_request`: not work waiting. `total`; full detail adds `not_downloaded` by reason,
+  `stored_not_recognized` (withheld files of on-request chats and evicted originals) and, for
+  WhatsApp, `likely_expired` (not downloaded and older than 30 days: no next action);
+  `next_action: request_file_download`.
+- `not_recognizable`: `no_text` (a document without extracted text), `recognition_off` (no
+  configured kind), `unsupported`.
+
+`files.enrichment` and `files.extraction` stay exclusive state histograms that add up to
+`stored_files`; only the old `queued` key split: `queued` is due work, `available_on_request` (withheld,
+evicted) and `not_recognizable` (documents without text) hold the rest, each present only when non-zero;
+`unconfigured` keeps its meaning (no configured profile for the kind). Leased, ready, failed and unsupported
+rows keep their state whatever the policy says. `coverage.due` is a separate backlog (it includes leased and
+retryable failed rows) and is never added to the histogram. One SQL bucket expression per stage
+(`coverage.py`) serves the status and `enrichment_health`; the claims keep their own order and caps.
 
 - `connection`: connected/connecting, retry wait, owner block or stopped. Includes
   `reason_code`, `changed_at`, `observed_at`, `retry_at`, `retry_attempts`,

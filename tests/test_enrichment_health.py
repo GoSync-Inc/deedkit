@@ -38,7 +38,7 @@ def profile(s, account=TG, kind='audio', provider=MINI, enabled=True, expires='1
 
 
 def job(s, state='queued', account=TG, kind='audio', provider=MINI, age='1 minute', profile_hash=HASH,
-        sent='1 minute', active=True):
+        sent='1 minute', active=True, mime='audio/wav'):
     """One attachment on its own message, so each row carries its own sent_at."""
     n = next(_serial)
     identifier, message = f'health-{n}', f'health-message-{n}'
@@ -52,7 +52,7 @@ def job(s, state='queued', account=TG, kind='audio', provider=MINI, age='1 minut
         c.execute('UPDATE messages SET sent_at=clock_timestamp()-%s::interval WHERE id=%s', (sent, message))
         revision = c.execute('SELECT revision FROM messages WHERE id=%s', (message,)).fetchone()['revision']
         c.execute('''INSERT INTO attachments(id,message,digest,filename,mime,bytes,active)
-            VALUES(%s,%s,%s,'synthetic.wav','audio/wav',1,%s)''', (identifier, message, digest, active))
+            VALUES(%s,%s,%s,'synthetic.wav',%s,1,%s)''', (identifier, message, digest, mime, active))
         c.execute('''INSERT INTO attachment_enrichment(attachment,source_digest,source_revision,state,profile_hash,
                 kind,provider,model,updated_at)
             VALUES(%s,%s,%s,%s,%s,%s,%s,'synthetic',clock_timestamp()-%s::interval)
@@ -129,7 +129,61 @@ def test_a_paused_scope_past_six_hours_is_a_stall(s):
 def test_another_providers_backlog_and_unconfigured_rows_count_for_nothing(s):
     profile(s)
     job(s, provider='openai', age='7 hours', sent='7 hours')
-    job(s, 'unconfigured', age='7 hours', sent='7 hours')
+    # ANYM-812: an unconfigured row of a kind with no configured profile is no work for the mini.
+    job(s, 'unconfigured', kind=None, profile_hash=None, provider=None, age='7 hours', sent='7 hours', mime='image/png')
+    assert codes(s) == set()
+
+
+# spec: ANYM-812
+def test_fresh_successful_work_beside_old_unconfigured_rows_does_not_stall(s):
+    profile(s)
+    job(s, 'ready', age='1 minute')
+    job(s, 'unconfigured', kind=None, profile_hash=None, provider=None, age='7 hours', sent='7 hours')
+    assert codes(s) == set()
+
+
+# spec: ANYM-812
+def test_a_hung_worker_with_due_unconfigured_rows_stalls(s):
+    profile(s)
+    job(s, 'unconfigured', kind=None, profile_hash=None, provider=None, age='7 hours', sent='7 hours')
+    result = health.evaluate(s)
+    assert result['codes'] == {'enrichment_stalled'}
+    assert result['accounts'][TG]['counts']['audio']['queued'] == 1
+
+
+# spec: ANYM-812
+def test_a_cleanly_stopped_worker_with_due_rows_is_no_worker_not_a_stall(s):
+    profile(s, enabled=False, observed='31 minutes')
+    job(s, 'unconfigured', kind=None, profile_hash=None, provider=None, age='7 hours', sent='7 hours')
+    assert codes(s) == {'enrichment_no_worker'}
+
+
+# spec: ANYM-812
+def test_withheld_evicted_and_not_recognizable_unconfigured_rows_never_alarm(s):
+    from uuid import uuid4
+    profile(s)
+    profile(s, kind='document')
+    with s.pool.connection() as c:
+        chat = c.execute("SELECT chat FROM messages WHERE id=%s", (MESSAGE[TG],)).fetchone()['chat']
+    evicted = job(s, 'unconfigured', kind=None, profile_hash=None, provider=None, age='7 hours', sent='7 hours')
+    job(s, 'unconfigured', kind=None, profile_hash=None, provider=None, age='7 hours', sent='7 hours',
+        mime='application/pdf')
+    job(s, 'unconfigured', kind=None, profile_hash=None, provider=None, age='7 hours', sent='7 hours',
+        mime='image/png')
+    with s.pool.connection() as c:
+        digest = c.execute('SELECT digest FROM attachments WHERE id=%s', (evicted,)).fetchone()['digest']
+        eviction = uuid4()
+        c.execute('''INSERT INTO attachment_eviction_journal(id,digest,bytes,root_device,root_inode,state,completed_at)
+            VALUES(%s,%s,1,1,1,'completed',clock_timestamp())''', (eviction, digest))
+        c.execute('''UPDATE attachment_residency SET state='evicted',eviction_id=%s,evicted_at=clock_timestamp()
+            WHERE digest=%s''', (eviction, digest))
+    assert codes(s) == set()
+    # The same rows in a group chat no agent asked for are withheld (ANYM-805): still no alarm.
+    withheld = job(s, 'unconfigured', kind=None, profile_hash=None, provider=None, age='7 hours', sent='7 hours')
+    with s.pool.connection() as c:
+        c.execute('''INSERT INTO media_jobs(id,account,message,descriptor,state)
+            SELECT id,%s,message,'{}'::jsonb,'ready' FROM attachments WHERE id=%s''', (TG, withheld))
+        c.execute("UPDATE chats SET chat_type='group' WHERE id=%s", (chat,))
     assert codes(s) == set()
 
 
@@ -157,6 +211,19 @@ def test_starvation_needs_fifty_rows_sent_between_six_and_forty_eight_hours_ago(
     assert codes(s) == set()
     job(s, sent='7 hours')
     assert codes(s) == {'enrichment_starved'}
+
+
+# spec: ANYM-812
+def test_starvation_counts_queued_and_due_unconfigured_rows_of_one_kind_together(s):
+    # A claim that takes one unconfigured row and defers it leaves 49 + 1 waiting: still starvation.
+    profile(s);job(s, 'ready', age='1 minute')
+    for _ in range(health.STARVED_ROWS - 1):
+        job(s, 'unconfigured', kind=None, profile_hash=None, provider=None, sent='7 hours')
+    assert codes(s) == set()
+    job(s, sent='7 hours')
+    result = health.evaluate(s)
+    assert result['codes'] == {'enrichment_starved'}
+    assert result['accounts'][TG]['counts']['audio']['sent_6h_to_48h'] == health.STARVED_ROWS
 
 
 # spec: ANYM-785
@@ -335,6 +402,17 @@ def test_the_transaction_is_read_only_and_bounded(s):
         row = c.execute("""SELECT current_setting('transaction_read_only') AS ro,current_setting('statement_timeout') AS st,
             current_setting('lock_timeout') AS lt""").fetchone()
     assert row == {'ro': 'on', 'st': '5s', 'lt': '1s'}
+
+
+# spec: ANYM-812
+def test_the_check_and_the_status_file_pass_run_without_jit(s):
+    # Production 2026-11-08: JIT compilation alone took about 4 s of the check's 5 s budget.
+    from messaging_service.sync_status import _files
+    with health.read_only(s) as c:
+        assert c.execute("SELECT current_setting('jit') AS jit").fetchone()['jit'] == 'off'
+    with s.pool.connection() as c:
+        _files(c, {'accounts': [TG], 'chat_ids': None})
+        assert c.execute("SELECT current_setting('jit') AS jit").fetchone()['jit'] == 'off'
 
 
 class LifespanStore:

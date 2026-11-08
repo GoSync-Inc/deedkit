@@ -425,6 +425,12 @@ Jobs of personal, unknown-kind and subscribed chats are claimed as before, the 7
 so naming a busy group in a subscription downloads its last week of files. Telegram and both WhatsApp
 collectors share this path. Messages of on-request chats are still captured and searchable.
 
+The account's `get_sync_status` row counts these files under `coverage.available_on_request`
+(COLLECTOR_STATES.md), never as due work: `coverage.due` holds only what the policy downloads,
+indexes and recognizes by itself. A WhatsApp file not downloaded and older than about 30 days is
+`likely_expired` there (WhatsApp publishes no retention; integrators report about 30 days) and is not
+counted as requestable.
+
 What an agent sees for such a file not yet downloaded: `download_phase: available_on_request`,
 `download_reason` `group_chat_on_request` or `channel_on_request`, `next_action:
 request_file_download`, in `get_attachment` and in the attachment items of message reads,

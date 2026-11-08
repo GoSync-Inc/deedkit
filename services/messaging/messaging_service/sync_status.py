@@ -14,6 +14,7 @@ from .media_inventory import LIKELY_EXPIRED
 DOWNLOAD_STATES = ('queued', 'leased', 'ready', 'failed', 'superseded')
 EXTRACTION_STATES = ('queued', 'leased', 'ready', 'unsupported', 'failed', 'unknown')
 ENRICHMENT_STATES = ('unconfigured', 'queued', 'leased', 'ready', 'unsupported', 'failed', 'unknown')
+# ANYM-812 keys, present only when non-zero, so a file block without such rows reads as before (ANYM-667 snapshots).
 # download counts each current file occurrence once: ready equals stored_files;
 # current_files sums every state except superseded (replaced older revisions).
 DOWNLOAD_BASIS = 'current_file_occurrences'
@@ -164,7 +165,8 @@ def empty_files():
             'extraction_truncated': 0, 'enrichment_truncated': 0}
 
 
-def _files(c, p, *, group_by_chat=False):
+def _files(c, p, *, group_by_chat=False, tallies=None):
+    tallies = {} if tallies is None else tallies
     where, args = scope_filter(p, alias='m')
     key = "m.chat" if group_by_chat else "m.account"
     # One row per file occurrence of a non-deleted message, in exactly one state
@@ -200,33 +202,44 @@ def _files(c, p, *, group_by_chat=False):
         expired.setdefault(row['account'],{})[row['error_code']]=row['count']
     # Count current occurrences, not global digests. Stale extraction/enrichment
     # rows must never inflate ready counts or expose another chat's derived state.
-    indexed = c.execute('SELECT '+key+''' AS account,
-            coalesce(f.state,'unknown') AS extraction_state,
-            CASE WHEN e.state='unconfigured' AND EXISTS(SELECT FROM processing_profiles pp
-                WHERE pp.account=m.account AND pp.enabled AND pp.kind=CASE
-                    WHEN a.mime LIKE 'audio/%%' OR a.mime='application/ogg' THEN 'audio'
-                    WHEN a.mime LIKE 'image/%%' THEN 'image' ELSE 'document' END)
-                THEN 'queued' ELSE coalesce(e.state,'unknown') END AS enrichment_state,
+    from .media_policy import recognition_withheld
+    from . import coverage
+    withheld = recognition_withheld(c)
+    # ANYM-812 criterion 6 (production 2026-11-08): this statement's expressions push its cost over the JIT
+    # thresholds, and JIT inlining and optimization then took 4-5 s of a 0.8 s pass. Off for this transaction only.
+    c.execute("SELECT set_config('jit','off',true)")
+    # ANYM-812: each row's bucket under the current policy (coverage.py); `files` keeps leased, ready, failed and
+    # unsupported counts and splits what was reported queued into due work, work waiting for a request and work no
+    # worker can do.
+    indexed = c.execute('WITH '+coverage.policy_sets(withheld)+'\n    SELECT '+key+''' AS account,'''+coverage.KIND+''' AS kind,
+            '''+coverage.extraction_bucket()+''' AS extraction_bucket,
+            '''+coverage.recognition_bucket()+''' AS recognition_bucket,
+            coalesce(f.state,'unknown') AS extraction_state,coalesce(e.state,'unknown') AS enrichment_state,
             count(*) AS count,sum(a.bytes) AS bytes,
             count(*) FILTER (WHERE f.state='ready' AND f.truncated) AS extraction_truncated,
-            count(*) FILTER (WHERE e.state='ready' AND e.truncated) AS enrichment_truncated
+            count(*) FILTER (WHERE e.state='ready' AND e.truncated) AS enrichment_truncated,
+            count(*) FILTER (WHERE e.state='ready' AND e.updated_at>=clock_timestamp()-interval '1 day') AS ready_last_24h,
+            min(e.updated_at) AS recognition_waiting_since,min(f.updated_at) AS extraction_waiting_since
         FROM attachments a JOIN messages m ON m.id=a.message
         LEFT JOIN attachment_text f ON f.attachment=a.id AND f.source_digest=a.digest
             AND f.source_revision=m.revision AND f.source_filename=a.filename
             AND f.source_mime=a.mime AND f.source_bytes=a.bytes AND f.state<>'superseded'
         LEFT JOIN attachment_enrichment e ON e.attachment=a.id AND e.source_digest=a.digest
-            AND e.source_revision=m.revision AND e.state<>'superseded'
+            AND e.source_revision=m.revision AND e.state<>'superseded' '''+coverage.POLICY_JOINS+'''
         WHERE a.active AND NOT m.deleted AND '''+where+'''
-        GROUP BY '''+key+',f.state,enrichment_state', args)
+        GROUP BY 1,2,3,4,5,6''', args)
     files = {}
     for row in indexed:
         item = files.setdefault(row['account'], empty_files())
         item['stored_files'] += row['count']
         item['stored_bytes'] += int(row['bytes'])
-        item['extraction'][row['extraction_state']] += row['count']
-        item['enrichment'][row['enrichment_state']] += row['count']
+        extraction = coverage.histogram_key(row['extraction_state'], row['extraction_bucket'], coverage.EXTRACTION_FILES)
+        enrichment = coverage.histogram_key(row['enrichment_state'], row['recognition_bucket'], coverage.RECOGNITION_FILES)
+        item['extraction'][extraction] = item['extraction'].get(extraction, 0) + row['count']
+        item['enrichment'][enrichment] = item['enrichment'].get(enrichment, 0) + row['count']
         item['extraction_truncated'] += row['extraction_truncated']
         item['enrichment_truncated'] += row['enrichment_truncated']
+        coverage.add_row(tallies.setdefault(row['account'], coverage.empty_tally()), row)
     for account in downloads:
         item=files.setdefault(account,empty_files())
         item['current_files']=sum(n for state,n in downloads[account].items() if state!='superseded')
@@ -247,14 +260,25 @@ def _eligibility(c, accounts):
             +' WHERE a.id=ANY(%s) AND mp.published', (accounts,))}
     if not result:
         return {}
-    for row in c.execute('''SELECT m.account,el.claim AS eligibility,j.error_code,count(*) AS count
+    from .coverage import WHATSAPP_MEDIA_RETENTION_DAYS
+    # ANYM-812: also how many are older than WhatsApp's media retention estimate, and since when due work waits.
+    for row in c.execute('''SELECT m.account,el.claim AS eligibility,j.error_code,j.state,count(*) AS count,
+            count(*) FILTER (WHERE m.sent_at<clock_timestamp()-make_interval(days=>%s)) AS old,
+            min(j.created_at) AS since
         FROM media_jobs j JOIN messages m ON m.id=j.message AND m.account=j.account
         JOIN chats ch ON ch.id=m.chat AND ch.account=m.account '''+ELIGIBILITY_JOIN+'''
         LEFT JOIN attachments a ON a.id=j.id AND a.message=j.message AND a.active
-        WHERE j.state='queued' AND a.id IS NULL AND NOT m.deleted AND m.account=ANY(%s)
-        GROUP BY 1,2,3''', (list(result),)):
-        codes = result[row['account']]['queued'].setdefault(row['eligibility'], {})
-        codes[row['error_code']] = row['count']
+        WHERE j.state IN ('queued','leased') AND a.id IS NULL AND NOT m.deleted AND m.account=ANY(%s)
+        GROUP BY 1,2,3,4''', (WHATSAPP_MEDIA_RETENTION_DAYS, list(result))):
+        item = result[row['account']]
+        if row['state'] == 'queued':
+            codes = item['queued'].setdefault(row['eligibility'], {})
+            codes[row['error_code']] = row['count']
+            expired = item.setdefault('likely_expired', {})
+            expired[row['eligibility']] = expired.get(row['eligibility'], 0) + row['old']
+        # A leased download is still due work waiting since its job was created (Astra r1 finding 4).
+        if row['eligibility'] == 'eligible' and row['since'] is not None:
+            item['download_since'] = min(item.get('download_since') or row['since'], row['since'])
     return result
 
 
@@ -288,7 +312,8 @@ def get_sync_status(c, p):
             row['catalog_chats'] = catalogs.get(row['account'], {}).get('catalog_chats', 0)
     if sources:
         checkpoints = _checkpoints(c, p, {row['id'] for row in catalog})
-        downloads, files = _files(c, p)
+        tallies = {}
+        downloads, files = _files(c, p, tallies=tallies)
     conflicts = {}
     reevaluations = {}
     eligibility = {}
@@ -307,6 +332,7 @@ def get_sync_status(c, p):
     if sources and not scoped:
         from .message_purge import deletions
         deletion_status = deletions(c, [row['account'] for row in sources])
+    health = None if scoped else enrichment_health(p['accounts'])
     for row in sources:
         account = row['account']
         data = messages.get(account, {})
@@ -356,7 +382,14 @@ def get_sync_status(c, p):
                 observed_at,expires_at,expires_at>clock_timestamp() AND enabled AS worker_current,
                 pause_reason,paused_until
                 FROM processing_profiles WHERE account=%s ORDER BY kind''',(account,)).fetchall()
+            # ANYM-812: one verdict under the current policy; account-wide, so never for a chat-scoped key.
+            from . import coverage
+            lease = row.get('collector_lease_until')
+            lease_live = lease is not None and lease > datetime.now(timezone.utc)
+            codes = ((health or {}).get('accounts') or {}).get(account, {}).get('codes', [])
+            row['coverage'] = coverage.block(row, row['platform'], row['files'], tallies.get(account) or coverage.empty_tally(),
+                eligibility.get(account), codes, lease_live)
     return {'scope': 'permitted_chats' if scoped else 'permitted_accounts',
             'coverage': 'partial', 'sources': sources,
             # Account-wide queue facts: never for a chat-restricted principal (ANYM-785).
-            'enrichment_health': None if scoped else enrichment_health(p['accounts'])}
+            'enrichment_health': health}
