@@ -48,7 +48,7 @@ message is read again at the same provider time: a new revision with a media
 job, the empty revision stays readable, and no version conflict is raised. It
 is no later evidence, so it resolves no open conflict; any other shape keeps
 today's outcome (ANYM-808).
-Rows captured before that change stay `unknown` in the archive. While the
+Rows captured before ANYM-471 stay `unknown` in the archive. While the
 provider is connected, the adapter counts them once per `REPAIR_VERSION`
 (`repair.go`, ANYM-809): it runs the current classifier on each retained raw
 (at most 32 journal rows a tick, each read in a statement of its own; it

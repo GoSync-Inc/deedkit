@@ -22,9 +22,9 @@ const REPAIR_VERSION = 1
 
 const (
 	repairBatchRows = 50 // rows classified per tick at most
-	// One tick covers at most this many journal rows (the replay batch). It
-	// lists their keys, then reads each row in a statement of its own, so live
-	// capture waits for at most one row read (append caps a row at 512 KiB).
+	// One tick covers at most this many journal keys (the replay batch) and
+	// reads each row in a single-row key lookup of its own, so live capture
+	// waits for at most one row read (append caps a row at 512 KiB).
 	repairWindowSeqs  = replayBatchEntries
 	repairTimeSlice   = 200 * time.Millisecond
 	repairStatementTO = 2 * time.Second // bound of every SQLite statement of the pass
@@ -47,7 +47,6 @@ type repairPass struct {
 	version      int
 	slice        time.Duration
 	stmt         time.Duration
-	seqs         func(ctx context.Context, after, upto int64, limit int) ([]int64, error)
 	row          func(ctx context.Context, seq int64) (repairRow, bool, error)
 	classify     func(repairRow) string
 	now          func() time.Time
@@ -66,7 +65,7 @@ type repairPass struct {
 func newRepairPass(s *CaptureStore) *repairPass {
 	p := &repairPass{s: s, version: REPAIR_VERSION, slice: repairTimeSlice, stmt: repairStatementTO, now: time.Now, reservePages: repairReservePages}
 	p.active = func() bool { return true }
-	p.seqs, p.row = s.repairSeqs, s.repairRow
+	p.row = s.repairRow
 	p.classify = func(r repairRow) string { return s.repairState(r) }
 	return p
 }
@@ -125,28 +124,11 @@ func (s *CaptureStore) repairState(r repairRow) (state string) {
 	return "same"
 }
 
-// repairSeqs lists the journal sequence numbers in (after, upto]. It reads
-// only the table's keys, never a row's raw or envelope.
-func (s *CaptureStore) repairSeqs(ctx context.Context, after, upto int64, limit int) ([]int64, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT seq FROM capture WHERE seq>? AND seq<=? ORDER BY seq LIMIT ?", after, upto, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []int64
-	for rows.Next() {
-		var seq int64
-		if err = rows.Scan(&seq); err != nil {
-			return nil, err
-		}
-		out = append(out, seq)
-	}
-	return out, rows.Err()
-}
-
 // repairRow reads one journal row by its key: one statement holds the shared
 // connection for at most one row, which append caps at maxCaptureEnvelopeBytes.
-// A row evicted since repairSeqs is reported as absent.
+// The pass has no multi-row iterator: the driver steps rows after QueryContext
+// returns, outside its context interrupt, so the only uninterruptible work is
+// this one key lookup. An evicted or never-used key is reported as absent.
 func (s *CaptureStore) repairRow(ctx context.Context, seq int64) (repairRow, bool, error) {
 	r := repairRow{Seq: seq}
 	err := s.db.QueryRowContext(ctx, "SELECT envelope,raw FROM capture WHERE seq=?", seq).Scan(&r.Envelope, &r.Raw)
@@ -215,10 +197,10 @@ func repairCountsJSON(scanned int64, counts map[string]int64) []byte {
 	return mustJSON(out)
 }
 
-// load reads this version's progress, or starts it in one transaction that
-// creates the table, deletes older versions' rows and inserts this one. The
-// table is created here, not at open, so a full database never stops capture
-// from starting, and only after the headroom check.
+// load reads this version's progress, or starts it: it creates the table,
+// deletes older versions' rows and inserts this one. The table is created
+// here, not at open, so a full database never stops capture from starting,
+// and only after the headroom check.
 func (p *repairPass) load(ctx context.Context) string {
 	c, cancel := context.WithTimeout(ctx, p.stmt)
 	defer cancel()
@@ -250,25 +232,28 @@ func (p *repairPass) load(ctx context.Context) string {
 	if p.headroom(ctx) != nil {
 		return "repair_storage"
 	}
-	tx, err := p.s.db.BeginTx(c, nil)
-	if err != nil {
-		return "repair_storage"
-	}
-	defer tx.Rollback()
+	// Three autocommit statements, each under the driver's exec interrupt, with
+	// capture priority between them; no explicit transaction, whose commit the
+	// driver runs without the context. Each one is idempotent, so a stop after any
+	// of them resumes on the next tick: a table without this version's row is
+	// started again, and older versions' rows are only ever discarded.
 	for _, q := range []struct {
 		sql  string
 		args []any
 	}{
 		{`CREATE TABLE IF NOT EXISTS repair_progress(version INTEGER PRIMARY KEY,last_seq INTEGER NOT NULL,done INTEGER NOT NULL,counts TEXT NOT NULL)`, nil},
 		{"DELETE FROM repair_progress WHERE version<>?", []any{p.version}},
-		{"INSERT INTO repair_progress(version,last_seq,done,counts)VALUES(?,0,0,?)", []any{p.version, repairCountsJSON(0, nil)}},
+		{"INSERT OR IGNORE INTO repair_progress(version,last_seq,done,counts)VALUES(?,0,0,?)", []any{p.version, repairCountsJSON(0, nil)}},
 	} {
-		if _, err = tx.ExecContext(c, q.sql, q.args...); err != nil {
+		if stop, code := p.yield(ctx); stop {
+			return code
+		}
+		c, cancel := context.WithTimeout(ctx, p.stmt)
+		_, err := p.s.db.ExecContext(c, q.sql, q.args...)
+		cancel()
+		if err != nil {
 			return "repair_storage"
 		}
-	}
-	if err = tx.Commit(); err != nil {
-		return "repair_storage"
 	}
 	p.lastSeq, p.scanned, p.done, p.counts, p.loaded = 0, 0, false, map[string]int64{}, true
 	return ""
@@ -312,21 +297,15 @@ func (p *repairPass) step(ctx context.Context) string {
 		return code
 	}
 	upto := min(p.lastSeq+repairWindowSeqs, maxSeq)
-	c, cancel = context.WithTimeout(ctx, p.stmt)
-	seqs, err := p.seqs(c, p.lastSeq, upto, repairBatchRows)
-	cancel()
-	if err != nil {
-		return "repair_read"
-	}
 	next, scanned := p.lastSeq, p.scanned
 	counts := map[string]int64{}
 	for k, v := range p.counts {
 		counts[k] = v
 	}
 	complete := true
-	for i, seq := range seqs {
+	for seq := p.lastSeq + 1; seq <= upto; seq++ {
 		// At least one row per tick, so a slow read can never stall the count.
-		if i > 0 && p.now().After(deadline) {
+		if seq > p.lastSeq+1 && p.now().After(deadline) {
 			complete = false
 			break
 		}
@@ -342,6 +321,9 @@ func (p *repairPass) step(ctx context.Context) string {
 		r, ok, err := p.row(c, seq)
 		cancel()
 		if err != nil {
+			if ctx.Err() != nil || !p.active() {
+				return "" // stopped, not a read failure
+			}
 			return "repair_read"
 		}
 		if ok {
@@ -356,7 +338,7 @@ func (p *repairPass) step(ctx context.Context) string {
 		}
 		next = seq
 	}
-	if complete && len(seqs) < repairBatchRows {
+	if complete {
 		next = upto // the whole window was read
 	}
 	done := next >= maxSeq && complete

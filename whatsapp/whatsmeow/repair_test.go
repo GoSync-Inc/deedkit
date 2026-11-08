@@ -232,12 +232,8 @@ func TestRepairGoldenStatesArePinnedToTheVersion(t *testing.T) {
 	for _, f := range repairFixtures() {
 		journalUnknown(t, s, f.msg, f.raw)
 	}
-	seqs, err := s.repairSeqs(context.Background(), 0, 1<<40, 100)
-	if err != nil {
-		t.Fatal(err)
-	}
 	var rows []repairRow
-	for _, seq := range seqs {
+	for seq := int64(1); seq <= int64(len(repairFixtures())); seq++ {
 		r, ok, err := s.repairRow(context.Background(), seq)
 		if err != nil || !ok {
 			t.Fatal(err, ok)
@@ -285,14 +281,19 @@ func TestRepairResumesAfterLastSeqAndAFinishedVersionDoesNotRunAgain(t *testing.
 	}
 	// Restart: a new pass resumes after last_seq and counts each row once.
 	second := newRepairPass(s)
-	list := second.seqs
-	second.seqs = func(ctx context.Context, after, upto int64, limit int) ([]int64, error) {
-		if upto-after > repairWindowSeqs || limit > repairBatchRows {
-			t.Errorf("one tick covers %d journal rows, limit %d", upto-after, limit)
-		}
-		return list(ctx, after, upto, limit)
+	row := second.row
+	reads := 0
+	second.row = func(ctx context.Context, seq int64) (repairRow, bool, error) {
+		reads++
+		return row(ctx, seq)
 	}
-	runRepairToEnd(t, second)
+	for i := 0; i < 1000 && !second.done; i++ {
+		reads = 0
+		second.tick(context.Background())
+		if second.lastError != "" || reads > repairWindowSeqs || repairWindowSeqs > repairBatchRows {
+			t.Fatalf("one tick read %d journal rows (err %q)", reads, second.lastError)
+		}
+	}
 	if second.scanned != repairWindowSeqs+10 || second.counts["label_only"] != repairWindowSeqs+10 {
 		t.Fatalf("resumed pass: scanned=%d counts=%v", second.scanned, second.counts)
 	}
@@ -678,7 +679,7 @@ func TestRepairSlowReadsStillAdvanceTheCountEveryTick(t *testing.T) {
 func TestRepairCaptureArrivingMidTickWaitsForAtMostOneRowRead(t *testing.T) {
 	s := openTestStore(t)
 	// Rows near the journal's size bound: a large raw behind a small envelope.
-	big := &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: proto.String(strings.Repeat("x", 400<<10))}}
+	big := &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: proto.String(strings.Repeat("x", 300<<10))}}
 	for i := 0; i < repairWindowSeqs; i++ {
 		e := fixtureMessage("B"+string(rune('A'+i%26))+string(rune('A'+i/26)), 1700000000+int64(i))
 		e.Message, e.RawMessage = big, big
@@ -717,7 +718,12 @@ func TestRepairCaptureArrivingMidTickWaitsForAtMostOneRowRead(t *testing.T) {
 		return s.repairState(r)
 	}
 	p.tick(context.Background())
-	got := <-arrived
+	var got result
+	select {
+	case got = <-arrived:
+	case <-time.After(10 * time.Second):
+		t.Fatal("capture did not finish") // also when the tick ended before the second row
+	}
 	if got.err != nil {
 		t.Fatal(got.err)
 	}
@@ -732,5 +738,83 @@ func TestRepairCaptureArrivingMidTickWaitsForAtMostOneRowRead(t *testing.T) {
 	runRepairToEnd(t, p)
 	if p.scanned != repairWindowSeqs || p.counts["would_add_content"] != repairWindowSeqs {
 		t.Fatalf("count with capture mid-tick: scanned=%d counts=%v", p.scanned, p.counts)
+	}
+}
+
+// spec: ANYM-809
+func TestRepairCaptureQueuedBehindARepairStatementIsReleasedOnCancel(t *testing.T) {
+	s := openTestStore(t)
+	album := repairFixtures()[2].msg.Message
+	for i := 0; i < 4; i++ {
+		e := fixtureMessage("O"+string(rune('A'+i)), 1700000000+int64(i))
+		e.Message, e.RawMessage = album, album
+		journalUnknown(t, s, e, nil)
+	}
+	p := newRepairPass(s)
+	p.tick(context.Background()) // loads and counts the four rows
+	if !p.done {
+		t.Fatal("setup pass did not finish")
+	}
+	if _, err := s.db.Exec("DELETE FROM repair_progress"); err != nil {
+		t.Fatal(err)
+	}
+	p = newRepairPass(s)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type result struct {
+		err     error
+		latency time.Duration
+	}
+	arrived := make(chan result, 1)
+	var released time.Time
+	row := p.row
+	p.row = func(c context.Context, seq int64) (repairRow, bool, error) {
+		if seq != 2 {
+			return row(c, seq)
+		}
+		// The repair statement owns the only connection and stalls in it.
+		conn, err := s.db.Conn(c)
+		if err != nil {
+			return repairRow{}, false, err
+		}
+		waits := s.db.Stats().WaitCount
+		go func() {
+			started := time.Now()
+			err := s.Put(fixtureMessage("QUEUED", 1700100000), "live")
+			arrived <- result{err, time.Since(started)}
+		}()
+		for s.db.Stats().WaitCount == waits {
+			time.Sleep(time.Millisecond) // until capture is queued on the connection
+		}
+		cancel() // shutdown during ownership
+		<-c.Done()
+		released = time.Now()
+		conn.Close()
+		return repairRow{}, false, c.Err()
+	}
+	started := time.Now()
+	p.tick(ctx)
+	if time.Since(started) > 3*time.Second {
+		t.Fatal("the stalled statement was not released")
+	}
+	var got result
+	select {
+	case got = <-arrived:
+	case <-time.After(10 * time.Second):
+		t.Fatal("queued capture never ran")
+	}
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	if got.latency > 3*time.Second || released.IsZero() {
+		t.Fatal("capture was not released with the repair statement", got.latency)
+	}
+	if p.lastError != "" || p.lastSeq != 0 || p.scanned != 0 || durableLastSeq(t, s) != 0 {
+		t.Fatalf("progress kept after a cancelled tick: last=%d scanned=%d", p.lastSeq, p.scanned)
+	}
+	var last string
+	s.db.QueryRow("SELECT message_id FROM capture ORDER BY seq DESC LIMIT 1").Scan(&last)
+	if !strings.Contains(last, "QUEUED") {
+		t.Fatal("capture order changed under the repair pass")
 	}
 }
