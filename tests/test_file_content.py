@@ -246,7 +246,7 @@ def match_files(s):
 def test_file_hit_matched_in_names_each_source_and_the_excerpt_source(seeded, query, attachment, matched, excerpt):
     s, _, b = seeded
     match_files(s)
-    for mode in ('all', 'exact'):
+    for mode in ('all', 'any', 'phrase', 'web', 'exact'):
         hit = hits(search(s, b, query, query_mode=mode))[attachment]
         assert hit['matched_in'] == matched, mode
         assert hit['excerpt_source'] == excerpt, mode
@@ -255,6 +255,54 @@ def test_file_hit_matched_in_names_each_source_and_the_excerpt_source(seeded, qu
     assert legacy['matched_content'] == {'filename': 'extracted', 'extracted': 'extracted', 'caption': 'message_context',
         'transcript': 'enriched', 'description': 'understanding' if attachment == 'm-und' else 'enriched'}[matched[0]]
     assert 'matched_in' not in hits(search(s, b, '', limit=100))[attachment]
+
+
+# spec: ANYM-828
+def test_a_document_description_past_its_parent_vector_and_an_audio_title_are_descriptions(seeded):
+    from test_voice_transcript_reading import voice
+    s, _, b = seeded
+    add_file(s, 'd-long', 'demo-tg-1', b'heronneedle ' * 50 + b'synthetic text', 'long.txt')
+    drain(worker_for(s))
+    voice(s, 'd-audio', transcript='Synthetic plain words')
+    with s.pool.connection() as c:
+        # The model text matches only past the parent vector's 32,000 characters; the extracted passage ranks higher.
+        c.execute("""UPDATE attachment_enrichment SET state='ready',kind='document',provider='test-local',model='fixture',
+            title='Synthetic',summary='Synthetic',text_content=%s,indexed_at=clock_timestamp() WHERE attachment='d-long'""",
+            ('padding ' * 5000 + 'heronneedle',))
+        c.execute("UPDATE attachment_enrichment SET title='Synthetic egrettitle' WHERE attachment='d-audio'")
+    long = hits(search(s, b, 'heronneedle', order='relevance'))['d-long']
+    assert long['matched_content'] == 'extracted' and 'enriched' not in long['match_sources']
+    assert long['matched_in'] == ['extracted', 'description']
+    for mode in ('all', 'exact'):
+        audio = hits(search(s, b, 'egrettitle', query_mode=mode))['d-audio']
+        assert audio['matched_in'] == ['description'] and audio['excerpt_source'] == 'description', mode
+
+
+# spec: ANYM-828
+def test_a_cancelled_match_probe_names_unverified_arms_and_the_search_still_answers(seeded):
+    import messaging_service.file_index as module
+    s, _, b = seeded
+    match_files(s)
+
+    class Cancelling:
+        def __init__(self, connection): self.connection = connection
+        def execute(self, sql, args=None):
+            if 'a.id=ANY(%s)' in sql:
+                self.connection.execute("SET LOCAL statement_timeout='50ms'")
+                return self.connection.execute('SELECT pg_sleep(1)')
+            return self.connection.execute(sql, args)
+        def __getattr__(self, name): return getattr(self.connection, name)
+
+    with s.authorized(b, 'search') as (c, p):
+        result = module.search_files(s, Cancelling(c), p, 'zebranamex quokkatextx ocelotcaption', query_mode='any')
+        # The savepoint rolled back the probe and its timeout; the search's transaction stays usable.
+        assert c.execute('SHOW statement_timeout').fetchone()['statement_timeout'] == '5s'
+    found = hits(result)
+    for attachment in ('m-name', 'm-text'):
+        assert found[attachment]['matched_in'] == [] and found[attachment]['matched_in_unverified'] == ['filename', 'extracted']
+    assert found['m-cap']['matched_in'] == ['caption'] and 'matched_in_unverified' not in found['m-cap']
+    assert 'excerpt_source' not in found['m-name'] and 'excerpt_source' not in found['m-text']
+    assert found['m-cap']['excerpt_source'] == 'caption'
 
 
 # spec: ANYM-828

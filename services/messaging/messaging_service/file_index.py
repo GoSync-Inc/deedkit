@@ -296,8 +296,9 @@ def content_searched(item):
 def _match_probe(c, p, plan, ids):
     """One statement for the returned page only, under the search's scope and current-source fence; never in the
     candidate query, so the search plan is unchanged. A chunk counts as text only when its text, not just its
-    header (the filename, or a model title and summary), matches. None when it is cancelled: the caller derives
-    the arms from match_sources instead, and the search itself still answers."""
+    header (the filename, or a model title and summary), matches. None when it is cancelled (a savepoint keeps the
+    search's transaction usable): the caller then lists only the arms match_sources proves and names the rest
+    as unverified."""
     import psycopg
     scope, scope_args = scope_filter(p, 'm')
     def chunks(alias, table):
@@ -306,8 +307,12 @@ def _match_probe(c, p, plan, ids):
         return ('EXISTS(SELECT FROM ' + table + ' ' + alias + ' WHERE ' + alias + '.attachment=a.id AND ' + alias +
             '.source_digest=a.digest AND ' + alias + '.source_revision=m.revision AND ' + plan.predicate(alias) +
             ' AND (NOT ' + plan.text_predicate(alias + '.header') + ' OR ' + plan.text_predicate(alias + '.text_content') + '))')
+    # A document's model text is a description wherever it matched: the parent vector covers its head only, so its
+    # chunks are read too (a chunk's header is the model title and summary, a description for audio as well).
+    tail = '' if plan.mode == 'exact' else (' OR EXISTS(SELECT FROM attachment_enrichment_chunks ed WHERE ed.attachment=a.id'
+        ' AND ed.source_digest=a.digest AND ed.source_revision=m.revision AND ' + plan.predicate('ed') + ')')
     described = ("(e.state='ready' AND (" + plan.text_predicate("e.title||' '||e.summary||' '||coalesce(e.metadata->>'document_type','')") +
-        ' OR (NOT ' + VOICE + ' AND ' + plan.predicate('e', text_sql=ENRICH_TEXT) + ')))')
+        ' OR (NOT ' + VOICE + ' AND (' + plan.predicate('e', text_sql=ENRICH_TEXT) + tail + '))))')
     sql = ('WITH ' + plan.cte + ' SELECT a.id AS attachment_id,'
         'coalesce(' + plan.text_predicate("a.filename||' '||f.display_name") + ',false) AS filename,'
         "coalesce(f.state='ready' AND f.text_content<>'' AND " + chunks('fc', 'attachment_text_chunks') + ',false) AS extracted,'
@@ -334,17 +339,32 @@ def _annotate(c, p, plan, items, query):
             sources, row = set(item.get('match_sources') or ()), (found or {}).get(item['attachment_id']) or {}
             on = {name for name in ('filename', 'extracted', 'transcript', 'description') if row.get(name)}
             if 'message_context' in sources: on.add('caption')
-            # A match the probe cannot place in one arm (an `all` query split across the name and the text, or a
-            # cancelled probe) keeps the legacy source's meaning: `extracted` there includes filenames.
-            if 'extracted' in sources and not on & {'filename', 'extracted'}:
-                on |= {'filename', *(['extracted'] if _has_text(item) else [])}
-            if 'enriched' in sources and not on & {'transcript', 'description'}: on.add('transcript' if voice else 'description')
             if 'understanding' in sources: on.add('description')
+            unverified = set()
+            if found is None:
+                # A cancelled probe proves only what match_sources proves; the arms it cannot tell apart are named,
+                # never asserted (legacy `extracted` includes filenames, `enriched` a voice note's title).
+                if 'extracted' in sources: unverified |= {'filename', *(['extracted'] if _has_text(item) else [])}
+                if 'enriched' in sources:
+                    if voice: unverified |= {'transcript', 'description'}
+                    else: on.add('description')
+            elif 'extracted' in sources and not on & {'filename', 'extracted'}:
+                # An `all` query whose words are split between the name and the text matched both together.
+                on |= {'filename', *(['extracted'] if _has_text(item) else [])}
+            elif 'enriched' in sources and not on & {'transcript', 'description'}:
+                on.add('description')
             item['matched_in'] = [name for name in MATCHED_IN if name in on]
+            if unverified - on: item['matched_in_unverified'] = [name for name in MATCHED_IN if name in unverified - on]
         kind = item.get('excerpt_source')
         text = 'extracted' in on if query else _has_text(item)
+        # An enriched excerpt starts with the model title and summary: a voice note's is its transcript only when
+        # the transcript matched (the voice-without-text branch is `transcript` already).
         item['excerpt_source'] = {'extracted': 'extracted' if text else 'filename',
-            'enriched': 'transcript' if voice else 'description', 'understanding': 'description'}.get(kind, kind)
+            'enriched': 'transcript' if voice and 'transcript' in on else 'description',
+            'understanding': 'description'}.get(kind, kind)
+        # A cancelled probe cannot tell a name passage from a text one: no source is claimed for it.
+        if query and found is None and kind in ('extracted', 'enriched') and (kind == 'extracted' or voice):
+            item.pop('excerpt_source')
 
 
 def search_files(store, c, p, query='', account='', chat='', sender='', from_time='',

@@ -337,15 +337,19 @@ included), `transcript` (a voice note's ready transcript) and `description` (a r
 description, from enrichment or from file understanding). Message search's `matched_in` (ANYM-665) uses the same
 words where they overlap; its `body` is `caption` here. An empty-query listing has no `matched_in`. It is computed
 for the returned page only, by one statement under the same scope and current-source fence; a chunk counts as
-`extracted` only when its text, not its filename header, matches. A query whose words are split between the name
-and the text, or a probe cancelled by the statement timeout, falls back to the legacy source (`filename` plus
-`extracted` when the file has ready text).
+`extracted` or `transcript` only when its text, not its header (the filename, or the model title and summary),
+matches, and a document's model text counts as `description` in any of its chunks. A query whose words are split
+between the name and the text lists both. If that statement is cancelled by the statement timeout, the search
+still answers: `matched_in` lists only what `match_sources` proves (`caption`, an understanding `description`, a
+document's enrichment `description`), and `matched_in_unverified` names the arms it could not tell apart; an excerpt it cannot place carries no
+`excerpt_source`.
 
 Every item carries `content_searched`: true when the file's own text was part of what this search could match
 (`extraction_status: "ready"` with `extraction_coverage.text_chars > 0`, or a voice note's ready transcript); false
 for `queued`, `processing`, `failed`, `unsupported`, not downloaded, or ready with empty text (a scanned PDF with no
-recognised text keeps its `extraction_quality`). A false item whose `matched_in` is `filename` or `caption` only was
-found by name or caption; its contents were not searched. When such items are `queued` or `processing`, the result
+recognised text keeps its `extraction_quality`). A false item's `matched_in` says what matched instead: `filename`
+or `caption` only means it was found by name or caption, and its contents were not searched; a model
+`description` can also match. When such items are `queued` or `processing`, the result
 carries `search.content_pending: {count, next_action: "search again later"}` (count capped at 20); the status values
 are unchanged. `excerpt_source` names where `snippet`/`text_excerpt` came from: `filename`, `caption`, `extracted`,
 `transcript` or `description`.

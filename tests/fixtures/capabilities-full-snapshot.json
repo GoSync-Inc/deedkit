@@ -377,7 +377,8 @@
     "extracted",
     "transcript",
     "description"
-   ]
+   ],
+   "matched_in_unverified": "only_when_the_page_probe_is_cancelled"
   },
   "file_indexing": "asynchronous_local_worker",
   "file_search_sources": [
