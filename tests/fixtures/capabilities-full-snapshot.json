@@ -683,6 +683,17 @@
   "provider_polling": false,
   "push": "operator_registered_signed_hints",
   "read_permission_required": true,
+  "source_chat_types": {
+   "disabled_error": "source_filters_disabled",
+   "field": "sources.chat_types",
+   "untyped": "unknown",
+   "values": [
+    "private",
+    "group",
+    "channel",
+    "unknown"
+   ]
+  },
   "source_scope_change": "masked_access_changed_recreate_required",
   "source_selection": "frozen_explicit_chats_and_account_scoped_sender_ids",
   "start_boundary": "committed_archive_frontier",

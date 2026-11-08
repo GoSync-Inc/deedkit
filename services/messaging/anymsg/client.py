@@ -619,17 +619,22 @@ class Client:
         """Read this key's scoped operation receipt without invoking the provider again."""
         return self.call('get_messenger_operation', {'operation_id': operation_id})
 
-    def create_subscription(self, *, chat_ids, sender_ids=None, kinds=None,
+    def create_subscription(self, *, chat_ids=None, sources=None, sender_ids=None, kinds=None,
                             direction='incoming', origins=None, label='', expires_at=None,
                             wake_rules=None, reply_to_send=None, delivery=None):
-        """Persist explicit archived sources from the committed boundary; no push or provider action.
+        """Persist archived sources from the committed boundary; no push or provider action.
 
-        Requires read and explicit subscription-write. A timeout can leave creation
-        uncertain: inspect list_subscriptions before retrying. Names are not sender IDs.
+        Exactly one of chat_ids (explicit) or sources={'all_visible_chats': True, 'account_ids'?,
+        'include_channels'?, 'include_bots'?, 'chat_types'?} (dynamic, dynamic_sources_disabled until
+        the operator's switch). chat_types (1-4 of private, group, channel, unknown) keeps only those
+        chats before any match; WhatsApp chats are untyped (unknown) today; it needs a second switch
+        (source_filters_disabled). Requires read and explicit subscription-write. A timeout can leave
+        creation uncertain: inspect list_subscriptions before retrying. Names are not sender IDs.
         delivery={'endpoint_id': ..., 'delivery_policy': ...} binds your own endpoint (delivery-write).
         """
         parameters=dict(chat_ids=chat_ids,sender_ids=sender_ids,kinds=kinds,direction=direction,
             origins=origins,label=label,expires_at=expires_at)
+        if sources is not None:parameters['sources']=sources
         if wake_rules is not None:parameters['wake_rules']=wake_rules
         if reply_to_send is not None:parameters['reply_to_send']=reply_to_send
         if delivery is not None:parameters['delivery']=delivery

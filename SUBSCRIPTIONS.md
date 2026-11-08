@@ -1406,7 +1406,7 @@ key's budget; `batch` events are hinted after each matcher pass and wait for qui
 ## Dynamic sources: all visible chats (schema 60)
 
 ANYM-522. Instead of `chat_ids`, `create_subscription` accepts
-`sources={all_visible_chats: true, account_ids?, include_channels?, include_bots?}`: every chat
+`sources={all_visible_chats: true, account_ids?, include_channels?, include_bots?, chat_types?}`: every chat
 the key can see, optionally limited to some of its accounts (1–64 account IDs inside the key's
 scope, else `not_found`). Exactly one of `chat_ids` and `sources` is required. The definition
 stores no chat list (`get_subscription` shows `sources` instead of `chat_ids`), so a principal
@@ -1421,6 +1421,40 @@ Channels (Telegram broadcast channels have `chat_type` `channel`) and messages f
 `true`. WhatsApp status and broadcast lists are not collected at all. Kinds, direction, origins
 and the existing wake rules apply unchanged; `reply_to_confirmed_send` still needs its explicit
 anchor.
+
+**Only some chat types (ANYM-825).** `sources.chat_types` is a list of 1–4 distinct values of
+`private`, `group`, `channel` and `unknown` (the `list_chats`/`search` vocabulary). The matcher
+reads each chat's type in the same scope query and leaves out every other type before anything
+is stored: a left-out event creates no match, no hint and no wake, costs none of the match budget
+(`SUBSCRIPTION_MAX_MATCHES`), and the checkpoint moves past it. A chat first seen after creation
+still joins when its type is named, with no update of the subscription. Without `chat_types`
+nothing changes (every type except channels unless `include_channels`). Naming `channel` lets
+channels in; `include_channels: true` with a `chat_types` that lacks `channel` is `invalid_filter`,
+and explicit `chat_ids` subscriptions refuse the field (`invalid_filter`). Bot senders keep their
+default. Failure events (`send.failed`, `source.health`) keep their own audience rule and are not
+filtered by `chat_types`.
+
+A chat the server has not typed is `unknown`. Telegram types a chat at its first message; the
+WhatsApp adapter sends no type, so **every WhatsApp chat is `unknown` today**:
+`chat_types=['private']` leaves out all WhatsApp chats, and `['private','unknown']` takes Telegram
+private chats and WhatsApp chats of every kind, groups included. A private-only agent that must
+not lose a first message from an untyped chat lists `['private','unknown']`. Private-only on
+WhatsApp is not possible until WhatsApp chats are typed (a separate change).
+
+Selectors are immutable, so switching an existing subscription to `chat_types` is: create the new
+subscription with the same wake rules and delivery policy, read one page of it
+(`get_subscription_events`) to verify, then close the old one. The new one starts at the current
+head with a fresh ACK position; references the old one stored are unaffected and stay readable
+until it is closed.
+
+`chat_types` returns `source_filters_disabled` (409) until the operator runs
+`python -m messaging_service set-source-filters --enable`, which refuses (and changes nothing)
+unless the API, matcher and dispatcher heartbeats report this version on the current schema: an
+older matcher would store matches of every type for such a definition, and readers do not filter
+stored matches by type. Rollback, before any older code is deployed: `--disable` moves every
+definition that carries `chat_types` to `access_changed` (masked in get, list and passive reads,
+refused on resume), cancels its queued hints (`source_filters_disabled`) under the fence and
+prints the definition and hint IDs; agents recreate them after a new `--enable`.
 
 **Authorization at every disclosure point.** The matcher reads one scope snapshot per event batch
 (one `chats` query, under the shared principal lock it holds for the batch) and never matches an

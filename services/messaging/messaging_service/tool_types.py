@@ -92,6 +92,8 @@ class SubscriptionSources(TypedDict, total=False):
     account_ids: SubscriptionReferences
     include_channels: StrictBool
     include_bots: StrictBool
+    # ANYM-825: only these distinct chat types, before any match; behind the operator's source_filters switch.
+    chat_types: Annotated[list[Literal['private','group','channel','unknown']], Field(min_length=1,max_length=4)]
 class SubscriptionEndpoint(TypedDict, total=False):
     __pydantic_config__ = ConfigDict(extra='forbid')
     endpoint_id: Required[EndpointReference]

@@ -131,9 +131,23 @@ export type SubscriptionEventKind = 'message.created' | 'message.edited' | 'mess
   'file.description.ready' | 'file.processing.failed' | 'send.failed' | 'source.health';
 export type SubscriptionOrigin = 'live' | 'live_recovered' | 'backfill' | 'reconcile' | 'fixture';
 export type SubscriptionWakeRule = 'incoming_message' | 'owner_mention' | 'reply_to_owner' | 'reply_to_confirmed_send';
+export type SubscriptionChatType = 'private' | 'group' | 'channel' | 'unknown';
+export interface SubscriptionSources {
+  all_visible_chats: true;
+  /** 1–64 account IDs inside the key's scope. */
+  account_ids?: string[];
+  include_channels?: boolean;
+  include_bots?: boolean;
+  /** 1–4 distinct types kept before any match (source_filters_disabled until the operator's switch).
+   * WhatsApp chats are untyped (unknown) today; include_channels needs channel listed. */
+  chat_types?: SubscriptionChatType[];
+}
 export interface SubscriptionSelection {
-  /** Frozen 1–64 authorized archive chat IDs, never names or arbitrary provider references. */
-  chat_ids: string[];
+  /** Frozen 1–64 authorized archive chat IDs, never names or arbitrary provider references.
+   * Exactly one of chat_ids and sources. */
+  chat_ids?: string[];
+  /** Every chat the key can see now (dynamic_sources_disabled until the operator's switch). */
+  sources?: SubscriptionSources;
   /** Exact verified account-scoped IDs in those chats, resolved through searchPeople. */
   sender_ids?: string[] | null;
   /** Defaults to message.created; file readiness is independent of message arrival. */
