@@ -276,6 +276,29 @@ full (`reply_evidence` is accepted and already whole); with `detail='full'` it c
 a full fetch of the same state would. A gateway newer than its backend forwards `detail`
 only when the caller passes it, so an older backend fails only such calls (unknown argument).
 
+**Four boundaries and an idempotent consumer (ANYM-827).** An event passes four positions:
+journaled (the event exists in the journal), matched (`matched_through`: the matcher has
+evaluated it for this subscription), fetched (a receipt covers it: `fetched_through`) and ACKed
+(`acked_through`: the consumer confirmed it). `get_subscription`, `fetch_subscription_events`
+and every event page (full and compact) carry `positions: {acked_through, fetched_through,
+open_receipts, oldest_open_receipt_expires_at, expired_unacked}`. `fetched_through` is the
+highest `through_position` among the subscription's retained receipts and never below
+`acked_through`; a definition never fetched shows both at `start_position`. `open_receipts`
+counts unexpired receipts without an ACK; `expired_unacked` counts expired receipts that never
+got one. An expired receipt is kept one hour after its expiry (still inside the cap of 128) so
+`positions` can name it; it never becomes ACKable. The string `consumption` is unchanged.
+
+Transport is at-least-once. A consumer that must not repeat a side effect:
+- keys every downstream effect by `(account, message, event_id, revision)`;
+- handles `attachment.ready` as its own event for the same message, not as a repeat;
+- ACKs only after the effect is durable;
+- treats `invalid_receipt` as "fetch again; you may see the same events", then compares
+  `positions` after the refetch: an `expired_unacked` count names an expired receipt, a higher
+  `acked_through` a receipt already superseded, and neither a receipt that never existed.
+
+The server cannot know the consumer's local cursor: a local cursor ahead of `acked_through`
+means the consumer handled events it never ACKed, and they will be offered again.
+
 `wait_for_subscription_events(subscription_id, timeout=25, limit=50)` polls those
 pages for at most 25 seconds. Every read reauthorizes and releases its connection
 before the short sleep. There are at most 32 admitted waits per API process;

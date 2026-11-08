@@ -174,6 +174,16 @@ export interface SubscriptionLifecycleAction {
   action: 'pause' | 'resume' | 'close';
   resume_policy?: 'catch_up' | 'skip';
 }
+/** ANYM-827: where the server stands, on get_subscription, fetch and event pages; the server never sees your local cursor. */
+export interface SubscriptionPositions {
+  acked_through: number;
+  /** Highest through_position of a retained receipt; never below acked_through. */
+  fetched_through: number;
+  open_receipts: number;
+  oldest_open_receipt_expires_at: string|null;
+  /** Retained (up to one hour) expired receipts that never got an ACK. */
+  expired_unacked: number;
+}
 export interface SubscriptionPage {
   subscription_id: string;
   /** 1–100 references; default 50. Fetching never acknowledges them. */

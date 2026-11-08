@@ -285,6 +285,31 @@ def test_concurrent_ack_and_pruning_never_delete_above_acked_through(seeded):
     assert refs(store, sid) == events[3:] and floor(store, sid) == events[2]
 
 
+# spec: ANYM-827
+def test_retirement_deletes_the_full_receipt_cap_including_retained_expired_receipts(seeded):
+    from messaging_service.subscriptions import retire_subscriptions
+    store, _, _ = seeded
+    token, sid, _ = acked_subscription(store, name='receipt-retirement-reader')
+    for _ in range(200):
+        call(store, token, 'fetch_subscription_events', sid)
+    with store.pool.connection() as c:
+        # Expired within the hour: retained, still inside the cap.
+        c.execute("UPDATE subscription_receipts SET expires_at=clock_timestamp()-interval '10 minutes' WHERE subscription=%s",
+            (sid,))
+    call(store, token, 'fetch_subscription_events', sid)
+    view = store.get_subscription(token, sid)
+    assert view['positions']['expired_unacked'] == 127 and view['positions']['open_receipts'] == 1
+    store.update_subscription(token, sid, view['version'], action='close')
+    with store.pool.connection() as c:
+        assert c.execute('SELECT count(*) AS n FROM subscription_receipts WHERE subscription=%s',
+            (sid,)).fetchone()['n'] == 128
+        c.execute("UPDATE subscriptions SET closed_at=clock_timestamp()-interval '30 days 1 minute' WHERE id=%s", (sid,))
+    assert retire_subscriptions(store)['tombstoned'] == 1
+    with store.pool.connection() as c:
+        assert c.execute('SELECT count(*) AS n FROM subscription_receipts WHERE subscription=%s',
+            (sid,)).fetchone()['n'] == 0
+
+
 # spec: ANYM-446
 def test_pruning_runs_as_the_real_worker_role_with_only_the_named_grants(seeded):
     store, _, _ = seeded

@@ -201,7 +201,7 @@ def capabilities(self, token, detail='full', sections=None):
                         'scope':'every_hint_of_the_key','applies_without_policy':True,'over_budget':'coalesced_never_dropped'},
                     'held_reasons':['debounce','batch','quiet_hours','budget'],'clock':'database_utc',
                     'idempotency':'one_hint_per_subscription_version_window'}},
-            'events':{'fetch':'fetch_subscription_events','ack':'ack_subscription_events','wait':'wait_for_subscription_events','wait_max_seconds':25,'page_detail':['full','compact'],'page_detail_default':'full','page_include':['subscription','delivery','metadata','reply_evidence'],'test':'test_subscription','delivery':'operator_registered_signed_hints','host_turn_verified':False},
+            'events':{'fetch':'fetch_subscription_events','ack':'ack_subscription_events','wait':'wait_for_subscription_events','wait_max_seconds':25,'page_detail':['full','compact'],'page_detail_default':'full','page_include':['subscription','delivery','metadata','reply_evidence'],'positions':['acked_through','fetched_through','open_receipts','oldest_open_receipt_expires_at','expired_unacked'],'test':'test_subscription','delivery':'operator_registered_signed_hints','host_turn_verified':False},
             'feedback':{'implemented':True,'write_permission':'feedback-write','ownership':'exact_credential','external_delivery':False},
             'sending':{'implemented':True,'wait_max_seconds':25,'approval_mode':'acting_agent_obtains_exact_owner_confirmation',
                 'server_approval_gate':False,'text_only':False,'legacy_send_message_text_only':True,

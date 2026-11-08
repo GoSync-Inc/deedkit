@@ -526,10 +526,10 @@ def test_empty_compact_page_is_the_state_block_and_cursors(seeded):
     page=store.fetch_subscription_events(token,sid,detail='compact')
     assert page['items']==[] and page['receipt'] is None
     assert set(page)=={'subscription','items','has_more','next_after','consumption','scope_masked','ack_version',
-        'receipt','acked_through','receipt_expires_at','ack_available'}
+        'receipt','acked_through','receipt_expires_at','ack_available','positions'}
     assert set(page['subscription'])==COMPACT_PAGE_SUBSCRIPTION
     passive=store.get_subscription_events(token,sid,detail='compact')
-    assert set(passive)=={'subscription','items','has_more','next_after','consumption','scope_masked'}
+    assert set(passive)=={'subscription','items','has_more','next_after','consumption','scope_masked','positions'}
 
 
 # spec: ANYM-826
@@ -691,6 +691,150 @@ def test_page_detail_is_described_alike_in_backend_gateway_and_clients():
         assert len(sent)==2
     readme=(root/'SUBSCRIPTIONS.md').read_text()
     assert "detail='compact'" in readme and 'the default stays `full`' in readme
+
+
+POSITION_FIELDS={'acked_through','fetched_through','open_receipts','oldest_open_receipt_expires_at','expired_unacked'}
+
+
+def receipt_rows(store,sid):
+    with store.pool.connection() as c:
+        return c.execute('SELECT count(*) AS n FROM subscription_receipts WHERE subscription=%s',(sid,)).fetchone()['n']
+
+
+def expire_receipts(store,sid,interval):
+    with store.pool.connection() as c:
+        c.execute('UPDATE subscription_receipts SET expires_at=clock_timestamp()-%s::interval WHERE subscription=%s',
+            (interval,sid))
+
+
+# spec: ANYM-827
+def test_positions_name_acked_fetched_open_and_expired_receipts(seeded):
+    from messaging_service.subscriptions import match_subscriptions
+    from tests.test_event_delivery import call,identity
+    from tests.test_subscriptions import emit
+    store,_,_=seeded
+    token=identity(store,'positions-reader')
+    sid=store.create_subscription(token,['telegram-demo-chat'])['subscription_id']
+    start=store.get_subscription(token,sid)['positions']
+    assert set(start)==POSITION_FIELDS
+    assert start['fetched_through']==start['acked_through'] and start['open_receipts']==0
+    assert start['expired_unacked']==0 and start['oldest_open_receipt_expires_at'] is None
+    first,second=emit(store),emit(store)
+    match_subscriptions(store)
+    one=call(store,token,'fetch_subscription_events',sid,limit=1)
+    two=call(store,token,'fetch_subscription_events',sid,limit=2)
+    assert two['positions']=={**two['positions'],'acked_through':start['acked_through'],'fetched_through':second,
+        'open_receipts':2,'expired_unacked':0}
+    assert two['positions']['oldest_open_receipt_expires_at']==one['receipt_expires_at']
+    ack=call(store,token,'ack_subscription_events',sid,one['receipt'],one['ack_version'])
+    assert ack['acked_through']==first
+    after=store.get_subscription(token,sid)['positions']
+    assert after=={'acked_through':first,'fetched_through':second,'open_receipts':1,
+        'oldest_open_receipt_expires_at':two['receipt_expires_at'],'expired_unacked':0}
+    # Pages carry the same block, full and compact; consumption keeps its string.
+    passive=store.get_subscription_events(token,sid)
+    assert passive['positions']==after and passive['consumption']=='passive_read_no_ack'
+    assert store.get_subscription_events(token,sid,detail='compact')['positions']==after
+    expire_receipts(store,sid,'1 second')
+    expired=store.get_subscription(token,sid)['positions']
+    assert expired['open_receipts']==0 and expired['expired_unacked']==1 and expired['fetched_through']==second
+
+
+# spec: ANYM-827
+def test_an_expired_receipt_is_refused_counted_for_an_hour_then_removed_within_the_cap(seeded):
+    from messaging_service.subscriptions import match_subscriptions
+    from tests.test_event_delivery import call,identity
+    from tests.test_subscriptions import emit
+    store,_,_=seeded
+    token=identity(store,'expiry-reader')
+    sid=store.create_subscription(token,['telegram-demo-chat'])['subscription_id']
+    emit(store)
+    match_subscriptions(store)
+    page=call(store,token,'fetch_subscription_events',sid)
+    expire_receipts(store,sid,'1 second')
+    with pytest.raises(APIError,match='invalid_receipt'):
+        call(store,token,'ack_subscription_events',sid,page['receipt'],page['ack_version'])
+    # A fetch within the hour keeps the expired receipt; it is still named and still never ACKs.
+    kept=call(store,token,'fetch_subscription_events',sid)
+    assert receipt_rows(store,sid)==2 and kept['positions']['expired_unacked']==1
+    with pytest.raises(APIError,match='invalid_receipt'):
+        call(store,token,'ack_subscription_events',sid,page['receipt'],page['ack_version'])
+    expire_receipts(store,sid,'61 minutes')
+    later=call(store,token,'fetch_subscription_events',sid)
+    assert receipt_rows(store,sid)==1 and later['positions']['expired_unacked']==0
+    for _ in range(200):
+        call(store,token,'fetch_subscription_events',sid)
+    assert receipt_rows(store,sid)==128
+    expire_receipts(store,sid,'10 minutes')
+    call(store,token,'fetch_subscription_events',sid)
+    assert receipt_rows(store,sid)==128
+    assert store.get_subscription(token,sid)['positions']['expired_unacked']==127
+
+
+# spec: ANYM-827
+def test_one_receipt_acked_twice_stores_one_result(seeded):
+    from messaging_service.subscriptions import match_subscriptions
+    from tests.test_event_delivery import call,identity
+    from tests.test_subscriptions import emit
+    store,_,_=seeded
+    token=identity(store,'replay-reader')
+    sid=store.create_subscription(token,['telegram-demo-chat'])['subscription_id']
+    emit(store)
+    match_subscriptions(store)
+    page=call(store,token,'fetch_subscription_events',sid)
+    first=call(store,token,'ack_subscription_events',sid,page['receipt'],page['ack_version'])
+    again=call(store,token,'ack_subscription_events',sid,page['receipt'],page['ack_version'])
+    assert again==first
+    with store.pool.connection() as c:
+        stored=c.execute('''SELECT ack_result FROM subscription_receipts WHERE subscription=%s
+            AND ack_result IS NOT NULL''',(sid,)).fetchall()
+    assert [row['ack_result'] for row in stored]==[first]
+    assert store.get_subscription(token,sid)['positions']['open_receipts']==0
+
+
+# spec: ANYM-827
+def test_positions_are_read_only_for_the_owning_key(seeded):
+    from messaging_service.subscriptions import match_subscriptions
+    from tests.test_event_delivery import call,identity
+    from tests.test_subscriptions import emit
+    store,_,_=seeded
+    owner,other=identity(store,'positions-owner'),identity(store,'positions-other')
+    sid=store.create_subscription(owner,['telegram-demo-chat'])['subscription_id']
+    emit(store)
+    match_subscriptions(store)
+    call(store,owner,'fetch_subscription_events',sid)
+    for read in (lambda:store.get_subscription(other,sid),lambda:store.get_subscription_events(other,sid),
+            lambda:call(store,other,'fetch_subscription_events',sid)):
+        with pytest.raises(APIError,match='not_found'):
+            read()
+    assert store.get_subscription(owner,sid)['positions']['open_receipts']==1
+
+
+# spec: ANYM-827
+def test_positions_and_the_consumer_recipe_are_described_in_every_mirror():
+    root=Path(__file__).resolve().parents[1]
+    catalog={row['name']:row for row in json.loads(
+        (root/'services/gateway/src/agent_gateway/catalog.json').read_text())}
+    with TestClient(create_app(RecordingStore(),['testserver'])) as http:
+        listed=http.post('/mcp',headers={'Authorization':'Bearer synthetic-token',
+            'Accept':'application/json, text/event-stream'},json={'jsonrpc':'2.0','id':1,
+            'method':'tools/list','params':{}}).json()['result']['tools']
+    backend={tool['name']:tool for tool in listed}
+    for name in ('get_subscription','fetch_subscription_events'):
+        assert 'positions' in backend[name]['description'],name
+        assert catalog['messages_'+name]['description']==backend[name]['description'],name
+    declared=(root/'packages/npm/lib/index.d.ts').read_text()
+    for field in POSITION_FIELDS:
+        assert field+':' in declared,field
+    python=(root/'services/messaging/anymsg/client.py').read_text()
+    assert 'fetched_through' in python and 'expired_unacked' in python
+    snapshot=json.loads((root/'tests/fixtures/capabilities-full-snapshot.json').read_text())
+    assert set(snapshot['events']['positions'])==POSITION_FIELDS
+    readme=(root/'SUBSCRIPTIONS.md').read_text()
+    for phrase in ('journaled','`matched_through`','`fetched_through`','`acked_through`','at-least-once',
+            '(account, message, event_id, revision)','`attachment.ready`','ACKs only after the effect is durable',
+            '`invalid_receipt`','`expired_unacked`','local cursor'):
+        assert phrase in readme,phrase
 
 
 ENDPOINT_TOOLS=('register_delivery_endpoint','list_delivery_endpoints','update_delivery_endpoint',

@@ -1172,6 +1172,8 @@ def register_subscription_tools(mcp, call, async_call, read, upload_write):
         complete history, downloaded originals or completed file processing. Use chat
         get_sync_status and file tools for those independent states. No ACK or push.
         delivery.lag: unfinished push hints, the oldest one's age and seconds to the next attempt.
+        positions: acked_through, fetched_through (highest retained receipt), open_receipts,
+        oldest_open_receipt_expires_at, expired_unacked; the server cannot know your local cursor.
         """
         return call(ctx,'get_subscription',subscription_id=subscription_id)
 
@@ -1214,7 +1216,7 @@ def register_subscription_tools(mcp, call, async_call, read, upload_write):
     @mcp.tool(structured_output=True,annotations=read)
     def fetch_subscription_events(ctx: Context,subscription_id: SubscriptionReference,limit: SubscriptionLimit=50,
                                   detail: SubscriptionPageDetail=None,include: SubscriptionPageInclude=None) -> dict[str,Any]:
-        """Fetch an issued event page. Does not advance ACK or mark provider read. With explicit subscription-ack, a non-empty page gets a short-lived receipt (5 minutes). Safe to retry; a retry may evict the oldest receipt beyond 128, which then fails closed when ACKed. detail=compact (pollers) drops repeated blocks; same items, cursors and receipt."""
+        """Fetch an issued event page. Does not advance ACK or mark provider read. With explicit subscription-ack, a non-empty page gets a short-lived receipt (5 minutes). Safe to retry; a retry may evict the oldest receipt beyond 128, which then fails closed when ACKed. detail=compact (pollers) drops repeated blocks; same items, cursors and receipt. positions: acked, fetched and open/expired receipts; after invalid_receipt, fetch again (events may repeat) and compare positions."""
         return call(ctx,'fetch_subscription_events',subscription_id=subscription_id,limit=limit,detail=detail,include=include)
 
     @mcp.tool(structured_output=True,annotations=upload_write)

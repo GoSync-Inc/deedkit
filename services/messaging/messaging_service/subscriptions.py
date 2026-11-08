@@ -553,7 +553,12 @@ def list_subscriptions(store, c, p, *, limit=50):
 
 
 def get_subscription(store, c, p, subscription_id):
-    return _view(c, _owned(c, p, subscription_id), p)
+    row = _owned(c, p, subscription_id)
+    view = _view(c, row, p)
+    if row['state'] != 'access_changed' and row.get('tombstoned_at') is None:
+        from .subscription_consumption import server_positions
+        view['positions'] = server_positions(c, row, view['acked_through'])
+    return view
 
 
 def update_subscription(store, c, p, subscription_id, version, *, action, resume_policy='catch_up'):
@@ -603,7 +608,8 @@ def update_subscription(store, c, p, subscription_id, version, *, action, resume
     return _view(c, row, p)
 
 
-def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, module_after=None):
+def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, module_after=None,
+                            with_positions=True):
     from .store import APIError, bounded, serial
     bounded(limit)
     if type(after) is not int or not 0 <= after <= 2**53 - 1:
@@ -623,6 +629,10 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
         raise APIError('invalid_version')
     # Each stream pages, gaps and advances on its own positions (ANYM-562).
     modules = {} if module is None else {'module': module_events.page(c, row, module, module_after, limit)}
+    if with_positions:
+        # ANYM-827: the server's positions on every event page (a fetch adds them after its receipt).
+        from .subscription_consumption import server_positions
+        modules['positions'] = server_positions(c, row, state['acked_through'])
     if after < floor:
         state['gap'] = {'reason': 'retention_gap', 'after': after, 'through': floor,
             'recoverable': False, 'floor': floor}

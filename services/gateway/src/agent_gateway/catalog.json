@@ -2201,7 +2201,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Read your definition, lifecycle/version and archive matcher boundary.\n\nmatcher_caught_up covers committed archive events, not live-provider freshness,\ncomplete history, downloaded originals or completed file processing. Use chat\nget_sync_status and file tools for those independent states. No ACK or push.\ndelivery.lag: unfinished push hints, the oldest one's age and seconds to the next attempt.\n",
+    "description": "Read your definition, lifecycle/version and archive matcher boundary.\n\nmatcher_caught_up covers committed archive events, not live-provider freshness,\ncomplete history, downloaded originals or completed file processing. Use chat\nget_sync_status and file tools for those independent states. No ACK or push.\ndelivery.lag: unfinished push hints, the oldest one's age and seconds to the next attempt.\npositions: acked_through, fetched_through (highest retained receipt), open_receipts,\noldest_open_receipt_expires_at, expired_unacked; the server cannot know your local cursor.\n",
     "inputSchema": {
       "properties": {
         "subscription_id": {
@@ -6748,7 +6748,7 @@
       "read"
     ],
     "required_manifest": true,
-    "description": "Fetch an issued event page. Does not advance ACK or mark provider read. With explicit subscription-ack, a non-empty page gets a short-lived receipt (5 minutes). Safe to retry; a retry may evict the oldest receipt beyond 128, which then fails closed when ACKed. detail=compact (pollers) drops repeated blocks; same items, cursors and receipt.",
+    "description": "Fetch an issued event page. Does not advance ACK or mark provider read. With explicit subscription-ack, a non-empty page gets a short-lived receipt (5 minutes). Safe to retry; a retry may evict the oldest receipt beyond 128, which then fails closed when ACKed. detail=compact (pollers) drops repeated blocks; same items, cursors and receipt. positions: acked, fetched and open/expired receipts; after invalid_receipt, fetch again (events may repeat) and compare positions.",
     "inputSchema": {
       "properties": {
         "subscription_id": {

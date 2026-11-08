@@ -11,6 +11,8 @@ from .subscriptions import _owned, dynamic, get_subscription_events
 _WAIT_SLOTS = threading.BoundedSemaphore(32)
 _IMMEDIATE_READ_TIMEOUT_S = 5
 _RECEIPT_LIMIT = 128
+# ANYM-827: an expired receipt is kept this long after its expiry, so positions can still name it; it never ACKs.
+_EXPIRED_RECEIPT_KEPT = '1 hour'
 
 
 class _Admission:
@@ -146,6 +148,19 @@ def project_page(page, detail='full', include=frozenset()):
     return view
 
 
+def server_positions(c, row, acked_through):
+    """ANYM-827: where the server stands for this definition: ACKed, fetched (the highest retained receipt) and
+    the receipts still open or expired without an ACK. Numbers and one time only; no receipt or hash."""
+    found = c.execute('''SELECT max(through_position) AS fetched,
+        count(*) FILTER (WHERE expires_at>clock_timestamp() AND ack_result IS NULL) AS open,
+        min(expires_at) FILTER (WHERE expires_at>clock_timestamp() AND ack_result IS NULL) AS oldest,
+        count(*) FILTER (WHERE expires_at<=clock_timestamp() AND ack_result IS NULL) AS expired
+        FROM subscription_receipts WHERE subscription=%s''', (row['id'],)).fetchone()
+    return {'acked_through': acked_through, 'fetched_through': max(acked_through, found['fetched'] or acked_through),
+        'open_receipts': found['open'], 'oldest_open_receipt_expires_at':
+            found['oldest'].isoformat() if found['oldest'] else None, 'expired_unacked': found['expired']}
+
+
 def _active(row):
     from .store import APIError
     if row['state'] == 'access_changed':
@@ -166,7 +181,7 @@ def fetch_subscription_events(store, c, p, subscription_id, *, limit=50):
     from . import module_events
     module = module_events.stream(c, row['id'], lock=True)
     page = get_subscription_events(store, c, p, subscription_id, after=consumption['acked_through'], limit=limit,
-        module_after=module['acked_through'] if module else None)
+        module_after=module['acked_through'] if module else None, with_positions=False)
     if module is not None:
         page['module'].update(acked_through=module['acked_through'])
     page.update(consumption='explicit_subscription_ack', ack_version=consumption['version'], receipt=None,
@@ -176,9 +191,10 @@ def fetch_subscription_events(store, c, p, subscription_id, *, limit=50):
     moved = (module is not None and page['module']['next_after'] != module['acked_through'] or
         dynamic(row) and page['next_after'] != consumption['acked_through'])
     if not page['items'] and not moved or 'subscription-ack' not in p['permissions']:
+        page['positions'] = server_positions(c, row, consumption['acked_through'])
         return page
-    c.execute('DELETE FROM subscription_receipts WHERE subscription=%s AND expires_at<=clock_timestamp()',
-        (row['id'],))
+    c.execute('''DELETE FROM subscription_receipts WHERE subscription=%s
+        AND expires_at<=clock_timestamp()-%s::interval''', (row['id'], _EXPIRED_RECEIPT_KEPT))
     # Repeated unacknowledged polls must not lock the consumer out: the newest page always
     # gets a receipt, and the oldest outstanding receipts are evicted to stay within the cap.
     c.execute('''DELETE FROM subscription_receipts WHERE receipt_hash IN (
@@ -193,7 +209,8 @@ def fetch_subscription_events(store, c, p, subscription_id, *, limit=50):
          p['scope_version'], p['key_permission_version'], row['version'], consumption['version'],
          consumption['acked_through'], page['next_after'],
          *((module['acked_through'], page['module']['next_after']) if module else ()))).fetchone()
-    page.update(receipt=receipt, receipt_expires_at=issued['expires_at'].isoformat())
+    page.update(receipt=receipt, receipt_expires_at=issued['expires_at'].isoformat(),
+        positions=server_positions(c, row, consumption['acked_through']))
     return page
 
 
