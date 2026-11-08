@@ -41,7 +41,8 @@ def exit_detail(returncode):
     return {0:'exit_clean',1:'exit_error',2:'exit_panic'}.get(returncode,'exit_other')
 # How long history waits for whatsmeow's own auto-reconnect: the connect_timeout a fresh start gets.
 NOT_READY_WAIT_SECONDS=300
-HISTORY_READS=('dialogs','page')
+# ANYM-814: the repair calls are refused before any send while not ready, like a page read.
+HISTORY_READS=('dialogs','page','gap_repair_status','gap_repair')
 
 
 class ProviderOperationError(RuntimeError): pass
@@ -71,7 +72,7 @@ def configuration(path):
     fields={'enabled','account','expected_wid','permit_file','session_directory','events_directory',
         'pages_directory','chromium_executable','node_executable','batch_size','scan_interval_seconds',
         'max_media_bytes','disk_reserve_bytes','max_dialogs',
-        'provider','native_executable'}|MEDIA_POLICY_FIELDS
+        'provider','native_executable','whatsapp_gap_repair'}|MEDIA_POLICY_FIELDS
     validate_common(cfg,fields)
     if not re.fullmatch(r'[0-9]{5,20}@c.us',cfg.get('expected_wid','')): raise ValueError('invalid_whatsapp_identity')
     # Legacy configs retain their existing session; new setup templates select native.
@@ -87,6 +88,9 @@ def configuration(path):
             ('max_media_bytes',512*1024**2,1,4*1024**3),('disk_reserve_bytes',1024**3,1024**3,100*1024**3),
             ('max_dialogs',2000,1,10000)])
     configure_media_policy(cfg)
+    # ANYM-814: the phone repair of unverified spans is opt-in; the native adapter reads the same key.
+    if type(cfg.setdefault('whatsapp_gap_repair',False)) is not bool:raise ValueError('invalid_whatsapp_gap_repair')
+    if cfg['whatsapp_gap_repair'] and provider!='whatsmeow':raise ValueError('invalid_whatsapp_gap_repair')
     permit=private_json(cfg['permit_file'])
     if not isinstance(permit,dict) or permit.get('account')!=cfg['account'] or permit.get('expected_wid')!=cfg['expected_wid'] or permit.get('prior_clients_stopped') is not True:
         raise RuntimeError('session_handover_not_confirmed')
@@ -131,13 +135,81 @@ def merge_gap_clear(progress,stored,gap_set):
     if not gap_set:progress.pop('gap',None)
 
 
+GAP_REPAIR_TERMINAL=frozenset({'verified','phone_has_no_older','budget_exhausted','request_uncertain','incomplete_answer'})
+GAP_REPAIR_SPAN_ANSWERS=10
+
+
+def gap_span_id(chat,span):
+    """ANYM-814: a stable id of one recorded span; the span itself is immutable (ANYM-813)."""
+    import hashlib
+    return hashlib.sha256('\n'.join((chat,span['from'],span['to'])).encode()).hexdigest()[:32]
+
+
+def clean_repair(repair):
+    repair=dict(repair) if isinstance(repair,dict) else {}
+    repair['state']=repair.get('state') if isinstance(repair.get('state'),str) else 'waiting'
+    for key in ('request_ids','no_answer_ids'):
+        repair[key]=[v for v in repair.get(key) or [] if isinstance(v,str)]
+    repair['answered']=repair.get('answered') if type(repair.get('answered')) is int else 0
+    return repair
+
+
+def advance_gap_repair(span,repair,rows):
+    """ANYM-814: apply the adapter's request rows of one span to its repair record (a new dict).
+
+    Only an answered row counts: the adapter marks a row answered on the ON_DEMAND history sync whose
+    PeerDataRequestSessionID is that request's id. The span closes only on such an answer that reaches
+    its `from`; the cursor moves to the answer's oldest message, the span stays as recorded."""
+    from datetime import datetime,timezone
+    repair=clean_repair(repair)
+    if repair['state'] in GAP_REPAIR_TERMINAL:return repair
+    start=datetime.fromisoformat(span['from']).timestamp()
+    seen=set(repair['request_ids'])|set(repair['no_answer_ids'])
+    outstanding=False
+    for row in rows:
+        rid,state=row['request_id'],row['state']
+        if state in ('reserved','sending','sent'):outstanding=True;continue
+        if rid in seen:continue
+        seen.add(rid)
+        if state=='no_answer':repair['no_answer_ids'].append(rid);continue
+        if state=='uncertain':
+            repair['request_ids'].append(rid);repair['state']='request_uncertain';break
+        if state!='answered':continue
+        repair['request_ids'].append(rid);repair['answered']+=1
+        oldest,got,count=row['oldest_ts'],row['got'],row['count']
+        # A message the adapter's capture did not keep breaks continuity: never verified (Astra r1 B3).
+        if row.get('skipped',0):
+            repair.update(state='incomplete_answer',remaining={'from':span['from'],'to':span['to']});break
+        if got>0 and oldest<=start:
+            repair.update(state='verified',verified_by='phone_history');break
+        if got<count:repair['state']='phone_has_no_older';break
+        repair['cursor_request']=rid
+        if repair['answered']>=GAP_REPAIR_SPAN_ANSWERS:
+            repair.update(state='budget_exhausted',
+                remaining={'from':span['from'],'to':datetime.fromtimestamp(oldest,timezone.utc).isoformat()})
+            break
+    if repair['state'] not in GAP_REPAIR_TERMINAL:repair['state']='outstanding' if outstanding else 'waiting'
+    return repair
+
+
+def valid_gap_status(status):
+    """The adapter's gap_repair_status reply, or None: a malformed reply is no report and asks nothing."""
+    if not isinstance(status,dict) or not isinstance(status.get('requests'),list):return None
+    if type(status.get('outstanding')) is not int or type(status.get('paused_until_ms')) is not int:return None
+    for row in status['requests']:
+        if (not isinstance(row,dict) or not all(isinstance(row.get(k),str) for k in ('request_id','span_id','state'))
+                or not all(type(row.get(k)) is int for k in ('count','got','oldest_ts'))
+                or type(row.get('skipped',0)) is not int):return None
+    return status
+
+
 class WhatsAppState(CollectorState):
     def provider_observation(self,name):
         if name not in ('webjs','whatsmeow'):raise ValueError('invalid_whatsapp_provider')
         with self.archive.store.pool.connection() as c:
             row=self._operations(c);value=row['operations']
             value['provider']={'name':name,'contract_version':1,'observed_at':row['observed'].isoformat()}
-            value.pop('provider_history',None);value.pop('provider_repair',None)
+            value.pop('provider_history',None);value.pop('provider_repair',None);value.pop('gap_repair',None)
             self._save_operations(c,value)
 
     def native_history_observation(self,status):
@@ -177,6 +249,32 @@ class WhatsAppState(CollectorState):
             return c.execute("""UPDATE whatsapp_checkpoints SET progress=jsonb_set(progress,
                 '{last_attempt_at}',to_jsonb(extract(epoch FROM clock_timestamp())))
                 WHERE account=%s AND provider_chat=%s RETURNING progress""",(self.account,chat)).fetchone()['progress']
+
+    def gap_repair_targets(self):
+        """ANYM-814: chats with a recorded unverified span (a flagged gap with one included)."""
+        with self.archive.store.pool.connection() as c:
+            self.archive.fence(c,self.account,self.lease)
+            return c.execute("""SELECT provider_chat,progress FROM whatsapp_checkpoints
+                WHERE account=%s AND progress ? 'unverified_span' ORDER BY provider_chat""",(self.account,)).fetchall()
+
+    def save_gap_repair(self,chat,repair):
+        # Only this key: the span, the gap flag and an operator's clear stay as they are (ANYM-700).
+        with self.archive.store.pool.connection() as c:
+            self.archive.fence(c,self.account,self.lease)
+            c.execute("""UPDATE whatsapp_checkpoints SET progress=jsonb_set(progress,'{gap_repair}',%s)
+                WHERE account=%s AND provider_chat=%s""",(Jsonb(repair),self.account,chat))
+
+    def gap_repair_observation(self,status):
+        from datetime import datetime,timezone
+        paused=status['paused_until_ms']
+        with self.archive.store.pool.connection() as c:
+            row=self._operations(c);value=row['operations']
+            if value.get('provider',{}).get('name')!='whatsmeow':return
+            value['gap_repair']={'enabled':status.get('enabled') is True,'outstanding':status['outstanding'],
+                'paused_until':datetime.fromtimestamp(paused/1000,timezone.utc).isoformat() if paused else None,
+                'reason':'phone_unreachable' if status.get('reason')=='phone_unreachable' else None,
+                'checked_at':row['observed'].isoformat()}
+            self._save_operations(c,value)
 
     def scan_order(self,dialogs):
         with self.archive.store.pool.connection() as c:
@@ -557,13 +655,17 @@ class WhatsAppCollector(TelegramCollector):
     coverage_code='whatsapp_history_partial'
     connect_timeout=300
     retry_connect=True
+    gap_repair=False  # ANYM-814: also off for an instance built without __init__.
+    gap_repair_reported=False
     @property
     def history_spool(self):
         # WhatsApp pages already have their own spool; live events use events_spool.
         return self.spool
-    def __init__(self,*args,events_spool,**kwargs):
+    def __init__(self,*args,events_spool,gap_repair=False,**kwargs):
         kwargs.setdefault('max_dialogs',2000)
         super().__init__(*args,**kwargs); self.events_spool=events_spool
+        # ANYM-814: off unless the collector config says true; off means no repair call of any kind.
+        self.gap_repair=gap_repair is True
         from .spool import DurableSpool
         from .outgoing import validate_send_receipt
         self.send_receipts=DurableSpool(events_spool.path/'send-receipts',validator=validate_send_receipt,
@@ -661,6 +763,46 @@ class WhatsAppCollector(TelegramCollector):
              ('dialog_discovery_limited' if len(dialogs)>=self.max_dialogs else self.coverage_code)))
         await asyncio.to_thread(self.state.status,'degraded' if missing or unavailable else 'receiving',code)
         await asyncio.to_thread(self.state.phase,'history','waiting','history_scan_finished')
+        if self.gap_repair:await self.repair_gaps()
+        elif not self.gap_repair_reported and getattr(self.provider,'native_history',False) is True:
+            # Off: say so locally, once per process, without any adapter call (Astra r1 M1).
+            await asyncio.to_thread(self.state.gap_repair_observation,{'enabled':False,'outstanding':0,'paused_until_ms':0})
+            self.gap_repair_reported=True
+    async def repair_gaps(self):
+        """ANYM-814: one step of the phone repair: read the adapter's requests, update each span, ask for at
+        most one. The request returns after the send; the answer arrives through the adapter's history worker.
+        A provider refusal or a malformed reply ends this step only: the scan above is already committed."""
+        if getattr(self.provider,'native_history',False) is not True:return
+        from .commands import CommandRejected
+        # Expected adapter refusals (rate limit, anchor, caps) end this step only (Astra r1 B1).
+        refused=(ProviderOperationError,ProviderUnavailable,CommandRejected)
+        try:status=valid_gap_status(await self.provider.call('gap_repair_status',{}))
+        except refused:return
+        if status is None:return
+        rows={}
+        for row in status['requests']:rows.setdefault(row['span_id'],[]).append(row)
+        from .sync_status import unverified_span
+        candidates=[]
+        for target in await asyncio.to_thread(self.state.gap_repair_targets):
+            chat,stored=target['provider_chat'],target['progress']
+            if not unverified_span(stored):continue
+            span=stored['unverified_span'];span_id=gap_span_id(chat,span)
+            old=stored.get('gap_repair')
+            repair={**advance_gap_repair(span,old,rows.get(span_id,[])),'span_id':span_id}
+            if repair!=old:await asyncio.to_thread(self.state.save_gap_repair,chat,repair)
+            if repair['state']=='waiting' and self.state.allows(self.policy,chat):candidates.append((chat,span,repair))
+        await asyncio.to_thread(self.state.gap_repair_observation,status)
+        if status['outstanding'] or status['paused_until_ms']>time.time()*1000 or not candidates:return
+        from datetime import datetime
+        # The least recently asked span first: a span the adapter refuses rotates to the back.
+        chat,span,repair=min(candidates,key=lambda c:(c[2].get('asked_at') or 0,c[0]))
+        repair={**repair,'asked_at':time.time()}
+        await asyncio.to_thread(self.state.save_gap_repair,chat,repair)
+        params={'chat':chat,'span_id':repair['span_id'],'before_ts':int(datetime.fromisoformat(span['to']).timestamp()),
+            'after_request':repair.get('cursor_request') or ''}
+        try:await self.provider.call('gap_repair',params)
+        except refused:return
+        await asyncio.to_thread(self.state.save_gap_repair,chat,{**repair,'state':'outstanding'})
     async def reconcile_loop(self):
         from .telegram_collector import database_errors
         backoff=DbBackoff(self)
@@ -725,6 +867,7 @@ async def run_config(path):
                 owner='whatsapp-'+secrets.token_hex(12),
                 media_prefetch_days=cfg['media_prefetch_days'],live_writer=live_writer,
                 live_window_seconds=cfg['media_live_window_seconds'],
+                gap_repair=cfg['whatsapp_gap_repair'],
                 writer=BlobWriter(store.files,max_bytes=cfg['max_media_bytes'],reserve_bytes=cfg['media_disk_reserve_bytes']))
             loop=asyncio.get_running_loop()
             for sig in [signal.SIGTERM,signal.SIGINT]: loop.add_signal_handler(sig,worker.stopping.set)

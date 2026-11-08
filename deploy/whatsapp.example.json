@@ -16,5 +16,6 @@
   "media_live_disk_reserve_bytes": null,
   "media_live_max_bytes": 33554432,
   "media_live_window_seconds": 86400,
-  "max_dialogs": 2000
+  "max_dialogs": 2000,
+  "whatsapp_gap_repair": false
 }

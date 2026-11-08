@@ -92,7 +92,7 @@ func execute(path string, pair bool) error {
 	defer p.Close()
 	lanes := make(chan error, 2)
 	go func() {
-		lanes <- runLane(ctx, p, input, output, map[string]bool{"start": true, "policy": true, "dialogs": true, "page": true, "media": true, "request_history": true})
+		lanes <- runLane(ctx, p, input, output, map[string]bool{"start": true, "policy": true, "dialogs": true, "page": true, "media": true, "request_history": true, "gap_repair": true, "gap_repair_status": true})
 	}()
 	go func() {
 		lanes <- runLane(ctx, p, sending, sending, map[string]bool{"send_text": true, "messenger_operation": true})

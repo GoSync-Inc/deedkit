@@ -65,7 +65,7 @@ def _history(platform, catalog_ids, rows):
         result.update(successful_scan_chats=0, not_scanned_chats=0,
                       provider_history_exhausted=0, catchup_pending_chats=0, gap_chats=0, gap_cleared_chats=0,
                       unverified_span_chats=0)
-        spans, gap_ids = [], []
+        spans, gap_ids, repair_counts, gap_spans = [], [], {}, {}
         for row in rows:
             progress = row['wa_progress']
             if not isinstance(progress, dict):
@@ -89,7 +89,11 @@ def _history(platform, catalog_ids, rows):
                 gap_ids.append(chat_id)
             span = unverified_span(progress)
             if span:
-                spans.append({'chat_id': chat_id, **span})
+                repair = gap_repair_state(progress)
+                spans.append({'chat_id': chat_id, **span, 'repair': repair})
+                repair_counts[repair['state']] = repair_counts.get(repair['state'], 0)+1
+                if progress.get('gap') is True:
+                    gap_spans[chat_id] = repair
             result['gap_cleared_chats'] += progress.get('gap') is not True and progress.get('gap_cleared_at') is not None
         result['unverified_span_chats'] = len(spans)
         # Longest first by the exact interval; `days` is rounded for display only.
@@ -97,7 +101,13 @@ def _history(platform, catalog_ids, rows):
                                      span['chat_id']))
         result['unverified_spans'] = spans[:20]
         # A flagged gap has no recorded span: the archive cannot say how much is missing (ANYM-700).
-        result['gap_chat_ids'] = [{'chat_id': chat_id, 'span': 'unknown'} for chat_id in sorted(gap_ids)[:20]]
+        # ANYM-814: a flagged gap whose recorded span the phone verified keeps its flag; the entry names the
+        # evidence so the owner can decide on --clear-gap (the only clear).
+        result['gap_chat_ids'] = [{'chat_id': chat_id, 'span': 'recorded' if chat_id in gap_spans else 'unknown',
+                                   **({'repair': gap_spans[chat_id]} if chat_id in gap_spans else {})}
+                                  for chat_id in sorted(gap_ids)[:20]]
+        result['gap_repair'] = {'enabled': False, 'paused_until': None,
+                                **{state: repair_counts.get(state, 0) for state in GAP_REPAIR_STATES}}
     else:
         result['unknown_chats'] = result['observed_chats']
     return result
@@ -115,6 +125,31 @@ def unverified_span(progress):
         return None
     return {'from': span['from'], 'to': span['to'], 'days': days,
             'stalled_since': span.get('stalled_since') if isinstance(span.get('stalled_since'), str) else None}
+
+
+GAP_REPAIR_STATES = ('waiting', 'outstanding', 'verified', 'phone_has_no_older', 'budget_exhausted',
+                     'request_uncertain', 'incomplete_answer')
+
+
+def gap_repair_state(progress):
+    """ANYM-814: one span's phone repair state; `waiting` until the repair has asked, also with the flag off."""
+    repair = progress.get('gap_repair') if isinstance(progress.get('gap_repair'), dict) else {}
+    state = repair.get('state') if repair.get('state') in GAP_REPAIR_STATES else 'waiting'
+    ids = [v for v in repair.get('request_ids') or [] if isinstance(v, str)][:10]
+    value = {'state': state, 'request_ids': ids}
+    if state == 'verified':
+        value['verified_by'] = 'phone_history'
+    if state in ('budget_exhausted', 'incomplete_answer') and isinstance(repair.get('remaining'), dict):
+        value['remaining'] = {k: repair['remaining'].get(k) for k in ('from', 'to')}
+    return value
+
+
+def whatsapp_gap_repair(history, operations):
+    """ANYM-814: the account's switch and pause from the collector's last repair step."""
+    repair = (operations or {}).get('gap_repair') or {}
+    if isinstance(history.get('gap_repair'), dict) and isinstance(repair, dict):
+        history['gap_repair'].update(enabled=repair.get('enabled') is True,
+            paused_until=repair.get('paused_until') if isinstance(repair.get('paused_until'), str) else None)
 
 
 # ANYM-813: what a WhatsApp archive is built from. WhatsApp keeps no server history to list: the phone's
@@ -351,6 +386,7 @@ def get_sync_status(c, p):
             row['deletions']=deletion_status.get(account) or {}
             if row['platform'] == 'whatsapp':
                 row['history']['sources'] = whatsapp_sources(row.get('operations'))
+                whatsapp_gap_repair(row['history'], row.get('operations'))
             # ANYM-809: the native journal's repair count, per account and repair version; full detail only.
             row['native_repair']=dict(row.get('operations') or {}).get('provider_repair')
             if row.get('operations'):row['operations']={k:v for k,v in row['operations'].items() if k!='provider_repair'}

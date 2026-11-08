@@ -95,6 +95,23 @@ retryable failed rows) and is never added to the histogram. One SQL bucket expre
   chats, span `unknown`). A chat's own status shows its span. A span is not a gap:
   it sets or clears no flag, adds no alert and no answer caveat; a flagged chat gets
   no span.
+  `history.gap_repair` (ANYM-814) reports the opt-in phone repair of these spans
+  (collector config `whatsapp_gap_repair`, default `false`): `enabled`,
+  `paused_until` (set for 6 hours after two consecutive unanswered requests, reason
+  `phone_unreachable`) and the number of spans per repair state: `waiting` (not
+  asked yet, or between requests), `outstanding` (one request sent, no answer yet),
+  `verified` (a correlated phone answer reached the span's `from`),
+  `phone_has_no_older` (a correlated answer brought fewer than the 50 messages
+  asked and did not reach `from`), `budget_exhausted` (ten answers did not reach
+  it; the record keeps the `remaining` interval, an agent may continue with
+  `request_chat_history`), `request_uncertain` (a send whose result is unknown;
+  never repeated) and `incomplete_answer` (a correlated answer held a message the
+  adapter's capture did not keep, so continuity is unproven; `remaining` is the
+  whole span). Each listed span carries `repair` {`state`, `request_ids`,
+  `verified_by: phone_history` when verified}. A flagged chat whose recorded span
+  was verified keeps its flag: its `gap_chat_ids` entry reads span `recorded` with
+  that `repair` evidence, and the owner's `--clear-gap` stays the only clear. With
+  the switch off the states stay `waiting` and nothing is asked.
   Reconciliation and backfill pages use their own durable spool (WhatsApp pages,
   Telegram `history/` beside the live spool); `history.pending_events` counts them,
   so they never make `live_capture` look backlogged.

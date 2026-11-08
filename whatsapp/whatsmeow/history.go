@@ -406,6 +406,9 @@ func (p *Provider) historyWorker(ctx context.Context) {
 			}
 			return
 		}
+		// ANYM-814: a correlated phone answer to a gap repair request. Its own
+		// failure leaves the request unanswered; capture continues.
+		_ = p.Capture.repairAnswer(notif, data, time.Now())
 		if _, err = p.Capture.db.Exec("UPDATE history_jobs SET state='captured',error='',next_attempt_ms=0 WHERE stanza=?", job.Stanza); err != nil {
 			p.fail("durable_capture_failed")
 			return

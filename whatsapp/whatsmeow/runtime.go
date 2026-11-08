@@ -443,6 +443,10 @@ func (p *Provider) handle(ctx context.Context, r request, emit func(any) error) 
 		return map[string]any{"messages": normalized, "exhausted": false, "pending": len(messages) < v.Limit}, nil
 	case "request_history":
 		return p.requestHistory(ctx, r.Params, policy)
+	case "gap_repair":
+		return p.gapRepairRequest(ctx, r.Params, policy)
+	case "gap_repair_status":
+		return p.Capture.repairStatus(p.Config.GapRepair, time.Now())
 	case "send_text":
 		return p.SendText(ctx, r.Params)
 	case "messenger_operation":
@@ -464,7 +468,7 @@ func init() {
 }
 
 func init() {
-	for _, v := range []string{"invalid_request", "unsupported_method", "provider_not_ready", "provider_already_started", "whatsapp_logged_out", "whatsapp_pairing_required", "provider_auth_failed", "whatsapp_identity_mismatch", "provider_disconnected", "provider_initialization_failed", "durable_capture_failed", "spool_full", "disk_reserve", "capture_overload", "collector_disabled", "invalid_policy", "policy_expired", "chat_excluded", "send_expired", "sending_disabled", "send_target_invalid", "send_receipt_mismatch", "message_target_unavailable", "media_unavailable", "media_timeout", "media_network_error", "media_storage_unavailable", "media_decrypt_failed", "media_http_400", "media_http_401", "media_http_408", "media_http_429", "media_http_500", "media_http_502", "media_http_503", "media_http_504", "media_metadata_unavailable", "media_reference_changed", "unsupported_media_type", "media_hash_mismatch", "media_size_mismatch", "media_size_limit", "invalid_media_path", "provider_response_too_large", "invalid_limit", "invalid_cursor", "history_rate_limited", "history_anchor_unavailable", "history_request_unknown", "operation_disabled", "operation_unsupported", "operation_expired", "operation_invalid", "operation_outcome_unknown", "operation_target_invalid", "invalid_phone", "identity_unresolved", "chat_not_collected", "provider_timeout", "rate_limited"} {
+	for _, v := range []string{"invalid_request", "unsupported_method", "provider_not_ready", "provider_already_started", "whatsapp_logged_out", "whatsapp_pairing_required", "provider_auth_failed", "whatsapp_identity_mismatch", "provider_disconnected", "provider_initialization_failed", "durable_capture_failed", "spool_full", "disk_reserve", "capture_overload", "collector_disabled", "invalid_policy", "policy_expired", "chat_excluded", "send_expired", "sending_disabled", "send_target_invalid", "send_receipt_mismatch", "message_target_unavailable", "media_unavailable", "media_timeout", "media_network_error", "media_storage_unavailable", "media_decrypt_failed", "media_http_400", "media_http_401", "media_http_408", "media_http_429", "media_http_500", "media_http_502", "media_http_503", "media_http_504", "media_metadata_unavailable", "media_reference_changed", "unsupported_media_type", "media_hash_mismatch", "media_size_mismatch", "media_size_limit", "invalid_media_path", "provider_response_too_large", "invalid_limit", "invalid_cursor", "history_rate_limited", "history_anchor_unavailable", "history_request_unknown", "gap_repair_disabled", "gap_repair_paused", "gap_repair_outstanding", "gap_repair_uncertain", "gap_repair_budget_exhausted", "gap_repair_no_answer_limit", "gap_repair_retry_not_due", "operation_disabled", "operation_unsupported", "operation_expired", "operation_invalid", "operation_outcome_unknown", "operation_target_invalid", "invalid_phone", "identity_unresolved", "chat_not_collected", "provider_timeout", "rate_limited"} {
 		safeErrors[v] = true
 	}
 }
