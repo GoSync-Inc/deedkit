@@ -48,6 +48,19 @@ message is read again at the same provider time: a new revision with a media
 job, the empty revision stays readable, and no version conflict is raised. It
 is no later evidence, so it resolves no open conflict; any other shape keeps
 today's outcome (ANYM-808).
+Rows captured before ANYM-471 stay `unknown` in the archive. While the
+provider is connected, the adapter counts them once per `REPAIR_VERSION`
+(`repair.go`, ANYM-809): it runs the current classifier on each retained raw
+(at most 32 journal rows a tick, each read in a statement of its own; it
+yields before each statement when capture has queued work, and writes nothing unless
+8,192 free pages stay under the file's page ceiling for capture) and tallies
+`would_add_content`, `label_only`, `same`, `no_raw`, `placeholder`,
+`sender_key_only` or `parse_error`. It rewrites no journal row and publishes
+nothing; its only write is one `repair_progress` row in `capture.sqlite`, and
+`.repair-status` carries counts and a fixed error code (`repair_read`,
+`repair_storage`) to `get_sync_status` (detail=full, `native_repair`). A
+rollback to the previous adapter ignores the table. The repair itself is a
+follow-up.
 An exhausted local cache is not a complete WhatsApp history.
 
 The account-specific operation manifest reflects the selected provider after
