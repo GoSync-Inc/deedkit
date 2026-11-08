@@ -608,10 +608,13 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         def pair(sql):return [sql,*([sql.replace('m.chat=c.id',alias_chat)] if aliases else [])]
         def tagged(sqls):return ' UNION ALL '.join(f'SELECT {n} AS b,t.* FROM ({sql}) t' for n,sql in enumerate(sqls))
         stored=f'''SELECT m.id,m.revision,m.deleted,m.body,m.sent_at,CASE WHEN a.platform='telegram' THEN {number('m')} ELSE 0::bigint END
-              AS numeric_id FROM messages m WHERE m.account=c.account AND m.chat=c.id AND c.chat_type='private' AND m.direction='incoming' AND NOT m.deleted'''
+              AS numeric_id FROM messages m WHERE m.account=c.account AND m.chat=c.id AND c.chat_type='private' AND m.direction='incoming' AND NOT m.deleted
+            ORDER BY m.sent_at DESC,{index_number('m')} DESC NULLS LAST,m.id DESC LIMIT {COURTESY_SCAN}'''
         meta=metadata_sql('p')
-        # A chat whose stored tail filled the scan is known only after its oldest scanned row (the horizon).
-        closing_from=f'''WITH tails AS MATERIALIZED ({tagged([latest_sql(sql,limit=COURTESY_SCAN) for sql in pair(stored)])}),
+        # Each tail is one range of message_reply_order in its full key order, whatever the platform's tie rules, so
+        # it reads at most COURTESY_SCAN rows. A tail that filled the scan is known only after its oldest scanned
+        # timestamp (the horizon): rows at it may tie with unread ones, so they are dropped too.
+        closing_from=f'''WITH tails AS MATERIALIZED ({tagged(pair(stored))}),
           horizon AS (SELECT max(oldest) AS at FROM (SELECT min(sent_at) AS oldest FROM tails GROUP BY b
             HAVING count(*)>={COURTESY_SCAN}) full_tail),
           recent AS (SELECT p.id,p.sent_at,p.numeric_id,coalesce({courtesy_sql('p')} OR length(btrim(p.body))=0
