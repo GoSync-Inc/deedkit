@@ -193,7 +193,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=python-dependencies /usr/local /usr/local
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-RUN python -c "import hashlib,io,tarfile,urllib.request; b=urllib.request.urlopen('https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz').read(); assert hashlib.sha256(b).hexdigest()=='cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10'; t=tarfile.open(fileobj=io.BytesIO(b)); m=t.getmember('age/age'); assert m.isfile(); f=open('/usr/local/bin/age','xb'); f.write(t.extractfile(m).read()); f.close()" \
+# age: the release download, else the same asset through the GitHub API (outage 2026-11-08: releases answered
+# 504); bounded retries; only the pinned SHA-256 is installed.
+RUN for source in https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz \
+        https://api.github.com/repos/FiloSottile/age/releases/assets/535541903; do \
+      for pause in 1 2 4 0; do \
+        python -c "import sys,urllib.request as u; r=u.urlopen(u.Request(sys.argv[1],headers={'Accept':'application/octet-stream'}),timeout=60).read(); open('/tmp/age.tar.gz','wb').write(r)" "$source" && break 2; \
+        sleep "$pause"; \
+      done; \
+    done \
+    && python -c "import hashlib,io,tarfile; b=open('/tmp/age.tar.gz','rb').read(); assert hashlib.sha256(b).hexdigest()=='cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10'; t=tarfile.open(fileobj=io.BytesIO(b)); m=t.getmember('age/age'); assert m.isfile(); f=open('/usr/local/bin/age','xb'); f.write(t.extractfile(m).read()); f.close()" \
+    && rm /tmp/age.tar.gz \
     && chmod 0755 /usr/local/bin/age && age --version && pg_dump --version
 COPY services/messaging/messaging_service ./messaging_service
 # The receiver lock its update follow checks a staged release against (BACKUP_R2.md, ANYM-597).
