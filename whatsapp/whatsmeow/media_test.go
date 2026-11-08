@@ -638,6 +638,64 @@ func TestMediaKeysLookupsNeverMakeCaptureWritesFail(t *testing.T) {
 }
 
 // spec: ANYM-815
+func TestMediaKeysRealJournalLookupEndsAtItsDeadlineAndCaptureContinues(t *testing.T) {
+	config := testConfig(t)
+	s, err := OpenCapture(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	s.Owner = types.NewJID("123456", types.DefaultUserServer)
+	m := mediaKeyMessage(t, "KEYHELD", bytes.Repeat([]byte{7}, 32))
+	if err := s.Put(m, "live"); err != nil {
+		t.Fatal(err)
+	}
+	journal := filepath.Join(config.SessionDirectory, "capture.sqlite")
+	ro, err := sql.Open("sqlite3", mediaKeysDSN(journal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	ro.SetMaxOpenConns(1)
+	lookup := journalKeyLookup(ro)
+	chat, id := LegacyChatID(m.Info.Chat), LegacyMessageID(m)
+	// A second writer connection holds the journal's exclusive lock longer than the
+	// lookup's deadline but shorter than its busy timeout: only the deadline can end it.
+	w, err := sql.Open("sqlite3", sqliteDSN(journal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	conn, err := w.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(context.Background(), "BEGIN EXCLUSIVE"); err != nil {
+		t.Fatal(err)
+	}
+	released := make(chan struct{})
+	go func() {
+		time.Sleep(900 * time.Millisecond)
+		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		close(released)
+	}()
+	started := time.Now()
+	state := mediaKeyState(lookup, chat, id)
+	elapsed := time.Since(started)
+	if state != "unknown" || elapsed > 700*time.Millisecond {
+		t.Fatalf("locked journal: got %s after %s; the lookup must end at its %s deadline", state, elapsed, mediaKeyLookupTimeout)
+	}
+	<-released
+	if got := mediaKeyState(lookup, chat, id); got != "held" {
+		t.Fatalf("after the lock: got %s", got)
+	}
+	if err := s.Put(fixtureMessage("AFTERLOCK", 1700000300), "live"); err != nil {
+		t.Fatal("capture write after the bounded lookup:", err)
+	}
+}
+
+// spec: ANYM-815
 func TestMediaKeysCreatesNoDirectoryForAMissingSession(t *testing.T) {
 	root := t.TempDir()
 	_ = os.Chmod(root, 0700)
