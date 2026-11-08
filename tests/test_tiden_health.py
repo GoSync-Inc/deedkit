@@ -563,6 +563,11 @@ def test_inference_service_cases_belong_to_their_own_suite_and_are_not_unassigne
     assert metric["numbers"]["suites"]["unassigned"]["cases"] == 0
 
 
+# spec: ANYM-819
+def test_agent_runner_cases_belong_to_their_own_suite():
+    assert suite({"filePath": "services/agent-runner/tests/test_task_admission.py", "externalId": ""}) == "agent-runner"
+
+
 # Every tracked test file and every CI module path has a suite (ANYM-703). Tiden health measures the same invariant one
 # merge later (scripts/tiden_health.py, "unlinked_tests"); here the pull request that adds the file is the one that fails.
 TEST_FILE = re.compile(r"(^|/)(test_[^/]*\.py|[^/]*_test\.py|[^/]*\.test\.(js|jsx|ts|tsx|mjs)|[^/]*\.spec\.[^/]*|[^/]*_test\.go)$")

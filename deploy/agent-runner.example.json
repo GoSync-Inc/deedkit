@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "listen": {
+    "tailnet_host": "100.64.0.20",
+    "port": 8448,
+    "tls_cert": "/Library/Application Support/DeedKit/agent-runner/tls/mini.tailnet.crt",
+    "tls_key": "/Library/Application Support/DeedKit/agent-runner/tls/mini.tailnet.key",
+    "loopback_host": "127.0.0.1",
+    "loopback_port": 8449
+  },
+  "production_peer": "100.64.0.10",
+  "state_dir": "/Library/Application Support/DeedKit/agent-runner/state",
+  "image": "deedkit-agent-task@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "task_user": "1000:1000",
+  "network": "agents",
+  "docker": {"binary": "docker", "host": "unix:///var/empty/replace-with-the-agents-vm-socket"},
+  "engines": {
+    "claude": {"enabled": true, "token_file": "/Library/Application Support/DeedKit/agent-runner/claude-token"},
+    "codex": {"enabled": true, "login_volume": "agent-codex-login"}
+  },
+  "workspace_volume": {"driver": "local", "options": {"size": "3g"}},
+  "out_volume": {"driver": "local", "options": {"type": "tmpfs", "device": "tmpfs", "o": "size=16m"}},
+  "daily_starts": 10,
+  "host_gate": {"argv": ["/usr/local/libexec/deedkit/agent-host-gate"], "timeout_s": 10},
+  "host_check": {"argv": ["/usr/local/libexec/deedkit/agent-host-check"], "timeout_s": 60},
+  "keys": [
+    {"key_id": "gateway-agents", "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+     "principal": "owner-orchestrator", "operations": ["read", "run"]},
+    {"key_id": "gateway-agents-read", "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+     "principal": "owner-orchestrator", "operations": ["read"]}
+  ]
+}
