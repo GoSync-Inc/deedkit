@@ -287,7 +287,7 @@ def test_a_cancelled_match_probe_names_unverified_arms_and_the_search_still_answ
     class Cancelling:
         def __init__(self, connection): self.connection = connection
         def execute(self, sql, args=None):
-            if 'a.id=ANY(%s)' in sql:
+            if ' AS filename,' in sql:  # the match probe only; store.dataset also filters a.id=ANY(%s)
                 self.connection.execute("SET LOCAL statement_timeout='50ms'")
                 return self.connection.execute('SELECT pg_sleep(1)')
             return self.connection.execute(sql, args)
@@ -328,7 +328,7 @@ def test_file_hit_match_probe_is_one_page_statement_under_the_search_scope(seede
     without, with_probe = count(lambda *args: {}), count(real)
     assert len(with_probe) == len(without) + 1
     added = [q for q in with_probe if q not in without]
-    assert len(added) == 1 and 'a.id=ANY(%s)' in added[0]
+    assert len(added) == 1 and ' AS filename,' in added[0] and 'a.id=ANY(%s)' in added[0]
     # A file of a chat outside the key's scope is never probed, even when its ID is passed.
     plan = compile_query('zebranamex', 'all', 'auto')
     for token, visible in [(a, {'m-name', 'm-private'}), (b, {'m-name'})]:
