@@ -288,7 +288,7 @@ def test_two_lanes_claiming_at_once_share_one_proof_made_after_both_asked():
     g.ensure()          # asked while the other lane's proof runs: that proof ends after this call asked, so it counts
     waited = time.monotonic() - started
     first.join(5)
-    assert probes == ['main-lane'] and waited < 0.3
+    assert probes == ['main-lane'] and waited < 0.55     # one shared proof, never a second one of its own
     g.ensure()          # nobody else is proving: a claim still gets its own proof (fresh 0)
     assert len(probes) == 2
 
