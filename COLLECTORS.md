@@ -93,8 +93,15 @@ accounts and chats it may read, and only its own subscriptions in the `match` an
 How exact the numbers are:
 - Provider `sent_at` has 1 s resolution and comes from the provider's own clock, so arrival values
   under 1 s are indicative.
-- The window is read from the first event committed up to an hour before its start (a binary
-  search over event IDs). A match counts only when its event falls inside that range.
+- The window filters each stage by its own commit time: `events.created_at`, served by the
+  `events_created_at` index from migration 073. `match` and `hint` filter by `matched_at`, so a
+  late match of an old event still counts.
+- One budget covers the whole block: 2 s up to 24 h, 5 s for 72 and 168 h. A group that starts with
+  the budget spent is named in `latency_unavailable`.
+- A match whose first covering hint the retention worker already deleted has no hint sample. It is
+  not pending either.
+- A queued download with an unknown claim (no published policy or history bound) is `unknown_n`. It
+  is not counted as pending.
 
 Operators get the same rows, for every account and subscription, as one table:
 `python -m messaging_service sync-latency [--window-h 24]` (operator DSN in `DATABASE_URL_FILE`).

@@ -10,13 +10,16 @@ from starlette.testclient import TestClient
 from messaging_service import stage_latency
 from messaging_service.app import create_app
 from messaging_service.store import APIError
+from messaging_service.envelope import stable_id
+from messaging_service.subscriptions import match_subscriptions
 from test_archive import archive as archive, event
 from test_delivery_policy import bound, identity, local_window, matched
 from test_sync_coverage import ACCOUNT, cov as cov, group, message, publish, stored
 
 ROOT = Path(__file__).resolve().parents[1]
 UTC = timezone.utc
-PENDING_KEYS = {'account', 'stage', 'pending', 'on_request_n', 'held_n'}
+PENDING_KEYS = {'account', 'stage', 'pending', 'on_request_n', 'unknown_n', 'held_n'}
+SUBSCRIBER = ('read', 'subscription-write', 'subscription-ack')
 
 
 def latency(s, key, window=24):
@@ -24,7 +27,7 @@ def latency(s, key, window=24):
 
 
 def age_journal(s):
-    """Events the fixtures wrote before the test's own timeline move 400 h back, so ids keep their commit order."""
+    """Events the fixtures wrote before the test's own timeline move 400 h back, out of every window."""
     with s.pool.connection() as c:
         c.execute("UPDATE events SET created_at=clock_timestamp()-interval '400 hours'")
 
@@ -58,7 +61,6 @@ def timeline(ar, s):
         created(s, mid, sent + timedelta(seconds=lag), sent)
         return mid
 
-    old = ingest(6, now - timedelta(hours=30, seconds=5), 5)
     mids = [ingest(n, base + timedelta(seconds=10 * n), lag) for n, lag in ((1, 1), (2, 2), (3, 10), (4, -1))]
     ingest(5, base + timedelta(seconds=50), 3, metadata={'is_service': True, 'message_kind': 'system'})
     with s.pool.connection() as c:
@@ -71,7 +73,8 @@ def timeline(ar, s):
     stage_event(s, mids[0], 'file.text.ready', 'lat-a1', first + timedelta(seconds=8))
     stage_event(s, mids[1], 'file.transcript.ready', 'lat-a2', second + timedelta(seconds=19))
     stage_event(s, mids[0], 'file.processing.failed', 'lat-a1', first + timedelta(seconds=9), state='failed')
-    return old
+    # Ingested last on purpose: the highest event id carries the oldest commit time (ids do not order created_at).
+    return ingest(6, now - timedelta(hours=30, seconds=5), 5)
 
 
 def rows(result, account=ACCOUNT):
@@ -146,9 +149,19 @@ def test_a_stuck_description_and_queued_downloads_show_in_the_now_view(cov):
     assert description['pending']['n'] == 1 and description['pending']['oldest_s'] >= 7200
     assert description['on_request_n'] == 0
     download = pending['download']
-    assert download['pending']['n'] == 1 and download['on_request_n'] == 1
+    assert download['pending']['n'] == 1 and download['on_request_n'] == 1 and download['unknown_n'] == 0
     assert 0 <= download['pending']['oldest_s'] < 600
     assert 'hint' not in pending
+
+
+# spec: ANYM-865
+def test_a_download_whose_eligibility_is_unknown_is_neither_pending_nor_on_request(cov):
+    # No published policy: the collector claims nothing (archive.claim_media), so the job is not a stall.
+    ar, s, key = cov
+    message(ar)
+    download = next(r for r in latency(s, key)['latency_pending'] if r['stage'] == 'download')
+    assert download == {'account': ACCOUNT, 'stage': 'download', 'pending': {'n': 0, 'oldest_s': None},
+                        'on_request_n': 0, 'unknown_n': 1}
 
 
 # spec: ANYM-865
@@ -189,17 +202,86 @@ def test_hint_rows_split_by_policy_hold_quiet_hours_and_show_only_the_callers_su
 
 
 # spec: ANYM-865
+def test_a_late_match_of_an_old_event_counts_in_the_window_of_its_match(seeded, tmp_path):
+    # The match stage is windowed by matched_at: a matcher backlog over events committed long ago stays visible.
+    store, _, _ = seeded
+    age_journal(store)
+    key = identity(store)
+    bound(store, key, tmp_path, None)
+    event_id = matched(store)
+    with store.pool.connection() as c:
+        c.execute("UPDATE events SET created_at=clock_timestamp()-interval '48 hours' WHERE id=%s", (event_id,))
+    row = next(r for r in latency(store, key)['latency'] if r['stage'] == 'match')
+    assert row['n'] == 1 and 172790 < row['p50_s'] < 172900
+
+
+# spec: ANYM-865
+def test_a_key_narrowed_to_one_chat_no_longer_counts_the_other_chats_matches(archive):
+    ar, s, _, _ = archive
+    ar.register(ACCOUNT, 'telegram', 'Synthetic archive', include_chats=['100', '200'])
+    token = s.issue_key('lat-subscriber', [ACCOUNT], permissions=list(SUBSCRIBER), key_permissions=list(SUBSCRIBER))
+    for chat in ('100', '200'):
+        ar.ingest(event(chat=chat, provider_id='lat-seed-' + chat))
+    chats = [stable_id('chat', ACCOUNT, chat) for chat in ('100', '200')]
+    s.create_subscription(token, chats)
+    for chat in ('100', '200'):
+        ar.ingest(event(chat=chat, provider_id='lat-new-' + chat))
+    match_subscriptions(s)
+
+    def matches():
+        return sum(r['n'] for r in latency(s, token)['latency'] if r['stage'] == 'match')
+
+    assert matches() == 2
+    s.set_access('lat-subscriber', chats=chats[:1])
+    assert matches() == 1
+
+
+# spec: ANYM-865
+def test_hints_the_retention_worker_deleted_are_not_pending_again(seeded, tmp_path):
+    store, _, _ = seeded
+    age_journal(store)
+    key = identity(store)
+    sid = bound(store, key, tmp_path, None)
+    events = [matched(store) for _ in range(3)]
+    with store.pool.connection() as c:
+        c.execute("DELETE FROM subscription_outbox WHERE subscription=%s", (sid,))
+        c.execute("UPDATE subscriptions SET hints_deleted_through=%s,hints_deleted_at=clock_timestamp()"
+                  " WHERE id=%s", (events[-1], sid))
+    result = latency(store, key)
+    assert not any(r['stage'] == 'hint' for r in result['latency_pending'])
+    # Their first covering hint is gone: no hint sample, never a later hint's time; the matches still count.
+    assert [(r['stage'], r['n']) for r in result['latency'] if r['stage'] in ('match', 'hint')] == [('match', 3)]
+
+
+# spec: ANYM-865
 def test_a_timed_out_stage_group_is_named_and_the_rest_of_the_status_stays(archive, monkeypatch):
     ar, s, key, _ = archive
     timeline(ar, s)
-    monkeypatch.setitem(stage_latency.TIMEOUTS, 24, '200ms')
+    # The block's budget is shared: the stalled group spends it, so the group after it is named too.
+    monkeypatch.setitem(stage_latency.TIMEOUTS, 24, 0.3)
     monkeypatch.setattr(stage_latency, '_files', lambda _withheld: 'SELECT pg_sleep(2) AS row')
     result = latency(s, key)
-    assert result['latency_unavailable'] == ['text', 'transcript', 'description', 'failed']
+    assert result['latency_unavailable'] == ['text', 'transcript', 'description', 'failed', 'match', 'hint']
     assert {r['stage'] for r in result['latency']} == {'arrival', 'download'}
     assert [r['account'] for r in result['sources']] == [ACCOUNT] and 'enrichment_health' in result
     with s.pool.connection() as c:
-        assert c.execute("SELECT current_setting('statement_timeout') AS v").fetchone()['v'] == '5s'
+        audited = c.execute("""SELECT outcome FROM audit_log WHERE operation='get_sync_status'
+            ORDER BY id DESC LIMIT 1""").fetchone()
+    assert audited == {'outcome': 'ok'}
+
+
+# spec: ANYM-865
+def test_a_bounded_group_restores_the_callers_timeout_after_success_and_after_a_timeout(archive):
+    import psycopg
+    _, s, _, _ = archive
+    with s.pool.connection() as c:
+        c.execute("SELECT set_config('statement_timeout','4s',true)")
+        assert stage_latency._bounded(c, 1.0, lambda: c.execute('SELECT 1 AS v').fetchone()) == {'v': 1}
+        assert c.execute("SELECT current_setting('statement_timeout') AS v").fetchone()['v'] == '4s'
+        with pytest.raises(psycopg.errors.QueryCanceled):
+            stage_latency._bounded(c, 0.05, lambda: c.execute('SELECT pg_sleep(1)').fetchone())
+        assert c.execute("SELECT current_setting('statement_timeout') AS v").fetchone()['v'] == '4s'
+        assert c.execute('SELECT 2 AS v').fetchone() == {'v': 2}
 
 
 # spec: ANYM-865
@@ -224,7 +306,7 @@ def test_the_operator_table_prints_the_same_rows(archive, tmp_path, monkeypatch,
     cli.main()
     lines = capsys.readouterr().out.splitlines()
     assert lines[0].split() == ['account', 'stage', 'origin', 'chat_type', 'message_kind', 'policy', 'n', 'p50_s',
-                                'p90_s', 'pending_n', 'oldest_s', 'on_request_n', 'held_n']
+                                'p90_s', 'pending_n', 'oldest_s', 'on_request_n', 'unknown_n', 'held_n']
     assert [ACCOUNT, 'arrival', 'live', 'private', 'message', '4', '1.5', '7.6'] in [line.split() for line in lines]
     assert lines[-1] == 'window_h=24'
     printed = [line.split() for line in lines[1:-1]]
@@ -237,3 +319,42 @@ def test_the_gateway_catalog_accepts_the_latency_arguments():
     schema = next(t for t in catalog if t['name'] == 'messages_get_sync_status')['inputSchema']['properties']
     assert schema['include_latency'] == {'default': False, 'title': 'Include Latency', 'type': 'boolean'}
     assert schema['latency_window_h'] == {'default': 24, 'title': 'Latency Window H', 'type': 'integer'}
+
+
+def migration_073():
+    return ROOT / 'services/messaging/messaging_service/migrations/073_events_created_at.sql'
+
+
+# spec: ANYM-865
+def test_migration_073_is_a_manual_non_critical_file_that_migrate_expand_still_runs_unattended():
+    from messaging_service import migration_rollout as rollout
+    text = migration_073().read_text()
+    assert rollout.rollout_class(text) == 'manual'
+    assert rollout.unattended_class(text) == 'expand'
+    assert rollout.risk_class(text) == ('non-critical', None, None)
+
+
+# spec: ANYM-865
+@pytest.mark.parametrize('shape', ['invalid', 'partial', 'other_keys', 'descending', 'unique', 'hash'])
+def test_migration_073_refuses_an_unusable_index_of_its_name_and_builds_it_once_dropped(database, tmp_path, shape):
+    import psycopg
+    from test_extend_key import old_schema_store
+    with old_schema_store(database, tmp_path, 72) as store:
+        with store.pool.connection() as c:
+            c.execute(('CREATE UNIQUE INDEX' if shape == 'unique' else 'CREATE INDEX') + ' events_created_at ON events ' + {
+                'invalid': '(created_at)', 'partial': "(created_at) WHERE kind='message.created'",
+                'other_keys': '(kind)', 'descending': '(created_at DESC)', 'unique': '(id,created_at)',
+                'hash': 'USING hash (created_at)'}[shape])
+            if shape == 'invalid':
+                c.execute("UPDATE pg_index SET indisvalid=false WHERE indexrelid='events_created_at'::regclass")
+        with pytest.raises(psycopg.errors.RaiseException, match='not a valid btree index on events\\(created_at\\)'):
+            store.migrate()
+        with store.pool.connection() as c:
+            assert c.execute('SELECT max(version) AS v FROM archive_migrations').fetchone()['v'] == 72
+            c.execute('DROP INDEX events_created_at')
+        store.migrate()
+        store.migrate()
+        with store.pool.connection() as c:
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '73'
+            assert c.execute("SELECT pg_get_indexdef('public.events_created_at'::regclass) AS d").fetchone()['d'] == (
+                'CREATE INDEX events_created_at ON public.events USING btree (created_at)')

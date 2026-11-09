@@ -1034,7 +1034,8 @@ def register_archive_tools(mcp, call, async_call, read):
         include_latency=true (account summary only) adds latency: per account, stage (arrival, download, text, transcript,
         description, failed, match, hint), origin, chat_type, message_kind and hint policy, n, p50_s and p90_s over
         latency_window_h (1, 24, 72 or 168; default 24); latency_pending: per stage what waits now, pending {n, oldest_s},
-        on_request_n (waits for a request by policy) or held_n (your own debounce, batch or quiet hours); and
+        on_request_n (waits for a request by policy), unknown_n (download claim not known yet) or held_n (your own
+        debounce, batch or quiet hours); and
         latency_unavailable: stages whose bounded read timed out. Counts and seconds only; match and hint rows cover
         your own subscriptions. Arrival under 1 s is indicative (provider times have 1 s resolution).
         """
