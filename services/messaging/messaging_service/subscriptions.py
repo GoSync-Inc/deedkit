@@ -735,6 +735,10 @@ def _set_exclusions(c, p, row, pairs, revision):
     return _view(c, row, p)
 
 
+# ANYM-866: per statement of the page's file lookup (two statements): far below a wait's 5 s deadline.
+MEDIA_BUDGET = '500ms'
+
+
 def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, module_after=None,
                             with_positions=True):
     from .store import APIError, bounded, serial
@@ -813,12 +817,20 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
         'matched_at': event['matched_at'], 'delivered_at': delivered_at(event),
         'historical': origin in ('backfill', 'reconcile'),
         'matching_basis': 'exact_event_revision'} for event, origin in zip(events, seen)]
-    # ANYM-866: each file's state as a message read shows it now. The lookup runs in a savepoint: a failure (timeout,
-    # bad row) leaves the page and its transaction whole, without attachments, and is counted.
+    # ANYM-866: each file's state as a message read shows it now. The lookup runs in a savepoint under its own lock
+    # and statement timeouts (the caller's are restored after): a failure (a held lock, a slow plan, a bad row) leaves
+    # the page, its receipt and the subscription row lock's holding time within the budget, without attachments,
+    # and is counted.
     from . import result_evidence
     try:
         with c.transaction():
+            before = c.execute('''SELECT current_setting('statement_timeout') AS statement,
+                current_setting('lock_timeout') AS lock''').fetchone()
+            c.execute("SELECT set_config('statement_timeout',%s,true),set_config('lock_timeout',%s,true)",
+                (MEDIA_BUDGET, MEDIA_BUDGET))
             result_evidence.event_attachments(c, items)
+            c.execute("SELECT set_config('statement_timeout',%s,true),set_config('lock_timeout',%s,true)",
+                (before['statement'], before['lock']))
     except Exception:
         from .attachment_metadata import count_media_error
         count_media_error('lookup_failed')

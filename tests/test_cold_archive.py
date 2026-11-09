@@ -1055,6 +1055,28 @@ def test_cold_copy_is_retried_after_the_provider_failed(env,archive):
     assert job_state(s,fid)=='failed'
 
 
+# spec: ANYM-866
+def test_a_failed_provider_job_of_an_evicted_original_offers_the_request_that_restores_it(env,archive):
+    from messaging_service.result_evidence import event_attachments
+    ar,_,key,_=archive;s,_,_,_=env;fid,blob=evicted_copy(env,archive)
+    with s.pool.connection() as c:
+        c.execute("UPDATE media_jobs SET state='failed',error_code='synthetic_gone' WHERE id=%s",(fid,))
+        mid=c.execute('SELECT message FROM media_jobs WHERE id=%s',(fid,)).fetchone()['message']
+    def states():
+        with s.pool.connection() as c:
+            item={'kind':'attachment.ready','event_id':1,'message':mid,'processing':{'attachment_id':fid}}
+            event_attachments(c,[item])
+        [read]=[f['media'] for group in ('attachments','pending_attachments')
+            for f in s.get_context(key,mid).get(group,[])]
+        event={k:item['attachments'][0][k] for k in ('media_state','next_action','processing')}
+        assert event==read
+        return event['media_state'],event['next_action']
+    assert states()==('available_on_request','request_file_download')
+    assert s.request_file_download(key,fid)['rehydration_source']=='cold_archive'
+    assert restorer(env).run_once()['restored']==1 and resident(s,blob.digest)
+    assert states()==('ready','get_attachment') and job_state(s,fid)=='failed'
+
+
 # spec: ANYM-350
 def test_reserved_fallbacks_count_against_provider_quotas(env,archive,monkeypatch):
     from messaging_service import media_requests

@@ -3,7 +3,7 @@ import hashlib
 import re
 from contextvars import ContextVar
 
-from .attachment_metadata import attachment_fields, media_fields, media_unavailable
+from .attachment_metadata import attachment_fields, count_media_error, media_fields, media_unavailable
 from .file_extract import ocr_quality
 from .media_policy import DESCRIPTION_WAITS, ELIGIBILITY_JOIN, ENRICHMENT_REASON, RECOGNITION_REASON, RECOGNITION_WITHHELD
 
@@ -17,11 +17,12 @@ _TRANSCRIPT="(a.mime LIKE 'audio/%%' OR a.mime='application/ogg') AND e.state='r
 _TEXT='(CASE WHEN '+_EXTRACTED+' THEN f.text_content WHEN '+_TRANSCRIPT+' THEN e.text_content END)'
 EXCERPT_COLUMNS=(',CASE WHEN '+_EXTRACTED+" THEN 'extracted' WHEN "+_TRANSCRIPT+" THEN 'transcript' END AS excerpt_source,"
     'left('+_TEXT+',%s) AS excerpt_head,length('+_TEXT+') AS excerpt_total,'
-    'CASE WHEN '+_EXTRACTED+' THEN f.truncated WHEN '+_TRANSCRIPT+' THEN e.truncated END AS excerpt_source_truncated,'
-    # ANYM-664: is_managed_evicted's rule inside this read, so a pending label adds no query per file.
-    "CASE WHEN EXISTS(SELECT FROM attachment_residency r JOIN attachment_eviction_journal ej ON ej.id=r.eviction_id"
+    'CASE WHEN '+_EXTRACTED+' THEN f.truncated WHEN '+_TRANSCRIPT+' THEN e.truncated END AS excerpt_source_truncated,')
+# ANYM-664: is_managed_evicted's rule inside this read, so a pending label adds no query per file.
+RESIDENCY_COLUMN=("CASE WHEN EXISTS(SELECT FROM attachment_residency r JOIN attachment_eviction_journal ej ON ej.id=r.eviction_id"
     " WHERE r.digest=a.digest AND r.bytes=a.bytes AND r.state='evicted' AND ej.state='completed'"
     " AND ej.digest=r.digest AND ej.bytes=r.bytes) THEN 'evicted' END AS original_residency")
+EXCERPT_COLUMNS+=RESIDENCY_COLUMN
 
 
 # A media job's file row as a message read builds it (decorate) and the event stream reads it (event_attachments).
@@ -227,6 +228,10 @@ def decorate(c,rows,*,order_key=None,with_body=False,media=False):
     return rows
 
 
+# ANYM-866: the files one event page reads (a page has at most 100 items of up to 32 files each).
+PAGE_FILES=200
+
+
 def event_attachments(c,items):
     """ANYM-866: the files of already visible message.created, message.edited and attachment.ready items, each with
     the state a message read shows now (media_fields). A message event names its own revision's files, so a file an
@@ -245,9 +250,20 @@ def event_attachments(c,items):
     for i in items:
         ident=(i.get('processing') or {}).get('attachment_id') if i['kind']=='attachment.ready' else None
         if isinstance(ident,str):files[('ready',i['event_id'])]=[ident]
-    ids=sorted({f for v in files.values() for f in v})
-    rows={r['attachment_id']:r for r in c.execute('SELECT '+JOB_FILE_COLUMNS+JOB_FILE_FROM+' WHERE j.id=ANY(%s)',
-        (ids,))} if ids else {}
+    # A bounded page: at most PAGE_FILES files; the items past the bound carry no attachments, counted once.
+    def key_of(i):
+        return ('ready',i['event_id']) if i['kind']=='attachment.ready' else (i.get('message'),i.get('revision'))
+    kept,total=set(),0
+    for key in dict.fromkeys(key_of(i) for i in items if key_of(i) in files):  # page order
+        total+=len(files[key])
+        if total>PAGE_FILES:
+            files.pop(key)
+        else:
+            kept.update(files[key])
+    if total>PAGE_FILES:count_media_error('page_file_limit')
+    ids=sorted(kept)
+    rows={r['attachment_id']:r for r in c.execute('SELECT '+JOB_FILE_COLUMNS+','+RESIDENCY_COLUMN+JOB_FILE_FROM+
+        ' WHERE j.id=ANY(%s)',(ids,))} if ids else {}
 
     def view(ident,message):
         row=rows.get(ident)
@@ -257,6 +273,6 @@ def event_attachments(c,items):
         return {'attachment_id':ident,'mime':row['mime'] if row['mime'] is not None else descriptor.get('mime'),
             'bytes':row['bytes'] if row['bytes'] is not None else descriptor.get('bytes'),**media_fields(row)}
     for i in items:
-        key=('ready',i['event_id']) if i['kind']=='attachment.ready' else (i.get('message'),i.get('revision'))
+        key=key_of(i)
         if i['kind'] in ('message.created','message.edited','attachment.ready') and key in files:
             i['attachments']=[view(f,i.get('message')) for f in files[key]]

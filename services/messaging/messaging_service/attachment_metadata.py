@@ -204,34 +204,40 @@ def media_view(item, row):
     state, phase = item['state'], item['download_phase']
     if state not in ('queued', 'leased', 'ready', 'failed', 'superseded'):
         raise ValueError('unknown_job_state')
+    registered = item['download_status'] == 'ready' and bool(item.get('digest'))
     if state == 'superseded':
         media = 'superseded'
+    elif registered:
+        # A stored original is the file whatever its provider job says (a failed re-download keeps a restored
+        # cold copy, ANYM-350); an evicted one comes back on request (media_requests.request restores it).
+        media = 'available_on_request' if row.get('original_residency') == 'evicted' else 'ready'
     elif phase == 'blocked':
         media = 'blocked'
     elif phase == 'available_on_request':
         media = 'available_on_request'
     elif state == 'failed' or state == 'queued' and (item.get('attempts') or 0) >= MEDIA_MAX_ATTEMPTS:
         media = 'failed'
-    elif item['download_status'] == 'ready':
-        media = 'ready'
     elif state in ('queued', 'leased'):
         media = 'queued'
     else:
         raise ValueError('original_not_registered')
-    # A request never revives a failed or exhausted job (media_requests.request answers request_status=failed), so
-    # a failed file has no next action.
+    # A request never revives a failed or exhausted job with no stored original (media_requests.request answers
+    # request_status=failed), so a failed file has no next action; a stored one is handled above.
     view = {'media_state': media,
         'next_action': {'ready': 'get_attachment', 'available_on_request': 'request_file_download'}.get(media)}
     if media == 'blocked':
         view['reason'] = BLOCKED_REASONS.get(item['download_reason']) or BLOCKED_REASONS.get(
             item.get('error_code')) or 'policy'
     kind = _profile_kind(item.get('mime'))
+    kinds = row.get('profile_kinds')
     if item.get('digest'):
         text, model = _STAGE.get(item['extraction_status'], 'queued'), _STAGE.get(item['enrichment_status'], 'queued')
     else:
-        # Before the download: text is tried for every file; a model stage only where the account has a profile.
-        kinds = row.get('profile_kinds')
-        text, model = 'queued', 'queued' if kinds is None or kind in kinds else 'not_applicable'
+        # Before the download text is tried for every file.
+        text, model = 'queued', 'queued'
+    if kinds is not None and kind not in kinds and model not in ('ready', 'failed', 'unsupported'):
+        # A model stage runs only where the account has an enabled profile of the kind; a finished result stays.
+        model = 'not_applicable'
     later = _LATER.get(media)
 
     def stage(value):

@@ -83,7 +83,7 @@ def watched(archive):
     ar.ingest(event(provider_id='synthetic-seed', sent_at=recent(5), updated_at=recent(5)))
     store.set_dynamic_subscriptions(True)
     try:
-        permissions = ['read', 'subscription-write']
+        permissions = ['read', 'subscription-write', 'subscription-ack']
         token = store.issue_key('media-state-watcher', ['archive-test'], permissions=permissions,
             key_permissions=permissions)
         sid = store.create_subscription(token, sources={'all_visible_chats': True},
@@ -154,6 +154,34 @@ def test_a_voice_note_of_an_on_request_group_waits_for_a_request_in_the_stream_a
     assert state_of(file) == {'media_state': 'available_on_request', 'next_action': 'request_file_download',
         'processing': {'text': 'available_on_request', 'transcript': 'not_applicable', 'description': 'not_applicable'}}
     assert read_state(store, key, mid, 'pending_attachments') == state_of(file)
+
+
+# spec: ANYM-866
+def test_a_download_that_failed_for_good_shows_failed_and_no_action_in_the_stream_and_the_read(watched):
+    ar, store, key, token, sid = watched
+    sent = recent()
+    mid = ar.ingest(media_event(sent_at=sent, updated_at=sent))['message']
+    with store.pool.connection() as c:
+        c.execute("UPDATE media_jobs SET state='failed',error_code='network_error' WHERE message=%s", (mid,))
+    [file] = stream(store, token, sid, mid, 'message.created')['attachments']
+    assert state_of(file) == {'media_state': 'failed', 'next_action': None,
+        'processing': {'text': 'failed', 'transcript': 'not_applicable', 'description': 'not_applicable'}}
+    assert read_state(store, key, mid, 'pending_attachments') == state_of(file)
+
+
+# spec: ANYM-866
+def test_a_downloaded_voice_note_of_an_on_request_group_without_an_audio_profile_expects_no_transcript(watched):
+    from test_media_policy import set_kind
+    ar, store, key, token, sid = watched
+    sent = recent()
+    mid = ar.ingest(event(media=[VOICE], sent_at=sent, updated_at=sent))['message']
+    download(ar, store)
+    set_kind(store, mid, 'group')  # e.g. its subscription ended: recognition now waits for a request (ANYM-805)
+    [file] = stream(store, token, sid, mid, 'attachment.ready')['attachments']
+    assert state_of(file) == {'media_state': 'ready', 'next_action': 'get_attachment',
+        'processing': {'text': 'available_on_request', 'transcript': 'not_applicable',
+            'description': 'not_applicable'}}
+    assert read_state(store, key, mid, 'attachments') == state_of(file)
 
 
 # spec: ANYM-866
@@ -232,6 +260,41 @@ def test_a_failed_media_lookup_never_fails_the_event_page(watched, monkeypatch, 
     assert 'attachments' not in item and item['message'] == mid
     assert MEDIA_STATE_ERRORS['lookup_failed'] == before + 1
     assert '"lookup_failed"' in capsys.readouterr().out
+
+
+# spec: ANYM-866
+@pytest.mark.parametrize('method', ['get_subscription_events', 'fetch_subscription_events',
+    'wait_for_subscription_events'])
+def test_a_held_lock_on_a_table_the_lookup_reads_never_holds_the_page_its_receipt_or_the_ack(watched, method):
+    import asyncio
+    import time
+    import psycopg
+    from messaging_service.attachment_metadata import MEDIA_STATE_ERRORS
+    from messaging_service.subscription_consumption import wait_for_subscription_events
+    from messaging_service.subscriptions import match_subscriptions
+    ar, store, _, token, sid = watched
+    sent = recent()
+    mid = ar.ingest(media_event(sent_at=sent, updated_at=sent))['message']
+    match_subscriptions(store)
+    before = MEDIA_STATE_ERRORS['lookup_failed']
+    with psycopg.connect(store.pool.conninfo) as holder:
+        holder.execute('LOCK TABLE processing_profiles IN ACCESS EXCLUSIVE MODE')
+        started = time.monotonic()
+        if method == 'wait_for_subscription_events':
+            page = asyncio.run(wait_for_subscription_events(store, token, sid, timeout=0))
+        else:
+            page = getattr(store, method)(token, sid)
+        elapsed = time.monotonic() - started
+        holder.rollback()
+    assert elapsed < 2.5  # the lookup's own 500 ms budgets, not the pool's 5 s statement timeout
+    [item] = [i for i in page['items'] if i.get('message') == mid and i['kind'] == 'message.created']
+    assert 'attachments' not in item and MEDIA_STATE_ERRORS['lookup_failed'] == before + 1
+    if method != 'get_subscription_events':
+        store.ack_subscription_events(token, sid, page['receipt'], page['ack_version'])
+        assert store.get_subscription_events(token, sid)['subscription']['acked_through'] >= item['event_id']
+    # The next page, with no lock held, carries the files again.
+    [again] = [i for i in store.get_subscription_events(token, sid)['items'] if i.get('event_id') == item['event_id']]
+    assert again['attachments'][0]['media_state'] == 'queued'
 
 
 def test_text_ready_dedup_reuse_is_scoped_and_legacy_updates_are_unchanged(seeded):

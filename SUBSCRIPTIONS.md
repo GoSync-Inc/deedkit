@@ -1774,23 +1774,26 @@ the two agree for the same file at the same moment. No file name, provider ID or
 | `media_state` | `next_action` | Example |
 |---|---|---|
 | `queued` | null | a private chat's voice note while the collector downloads it |
-| `available_on_request` | `request_file_download` | a voice note in a group no subscription names (ANYM-805) |
+| `available_on_request` | `request_file_download` | a voice note in a group no subscription names (ANYM-805), or a stored original evicted from disk (the request restores it) |
 | `ready` | `get_attachment` | the same note after `attachment.ready` |
-| `failed` | null | a download whose retries ran out: a request does not revive a failed job |
+| `failed` | null | a download whose retries ran out and no stored original: a request does not revive a failed job |
 | `superseded` | null | the photo an edit replaced: the `message.edited` item carries the new file's state |
 | `blocked` | null | a file of an excluded chat: `reason` is `collection_excluded`, `size_limit` or `policy` (storage paused or reserve) |
 
 `processing` is `{text, transcript, description}`. Each value is `queued`, `available_on_request`, `ready`, `failed`,
 `unsupported` or `not_applicable`. `transcript` applies to audio only and `description` to images and
-documents. A model stage is `not_applicable` when the account has no processing profile for that kind. Stages of
+documents. A model stage is `not_applicable` when the account has no enabled processing profile for that kind,
+before and after the download; a finished result (`ready`, `failed`, `unsupported`) stays. A stored original is
+`ready` (or `available_on_request` when evicted) whatever its provider job says. Stages of
 a file waiting for a request read `available_on_request`, and stages of a failed download read `failed`.
 Stages of a superseded or blocked file read `not_applicable`. For example, a voice note in a chat with no audio
 profile has `transcript: not_applicable`, and a photo always has `transcript: not_applicable`.
 
 A file whose state cannot be computed (a missing or unreadable job row) has `media_state`, `next_action` and
 `processing` null and a `media_error` code. The rest of the page is unaffected. The service counts each code and
-logs one `attachment_media_state_unavailable` line with it. If the whole lookup fails, the page has no
-`attachments` and the code is `lookup_failed`. A deleted message's wait ends with its `message.deleted` event
+logs one `attachment_media_state_unavailable` line with it. The lookup runs under its own 500 ms lock and statement timeouts: if
+it fails (a held lock, a slow plan), the page and its receipt come back without `attachments` and the code is
+`lookup_failed`. A page reads at most 200 files; items past that carry no `attachments` (`page_file_limit`). A deleted message's wait ends with its `message.deleted` event
 ([Deleted messages](#deleted-messages-schema-45)).
 
 ## Remaining extensions and verification boundaries
