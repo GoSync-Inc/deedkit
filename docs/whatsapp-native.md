@@ -47,11 +47,12 @@ the holder. Without the key the collector runs child mode unchanged; that is the
   `anymsg-whatsmeow --version`. A release that changes only `messaging_service` keeps the holders (ANYM-895). It is
   built on the host, not published by CI. Labels: `io.deedkit.holder.protocol.{min,max}` on the holder image and
   `io.deedkit.collector.protocol.{min,max}` on `whatsapp-native`.
-- Overlay `deploy/compose.whatsapp-holder.yaml` after `compose.whatsapp-native.yaml`: services `whatsapp1-holder` and
-  `whatsapp2-holder` own the session directory, the `session-locks` bind, the holder DSN file, the socket directory
-  `./private/whatsapp<n>-holder` and the account's spool volume (the events directory both use), with
-  `stop_grace_period: 25s`. The collectors keep their DSN, config, permit, spool and files mounts and add the socket
-  directory; they lose the session and `session-locks` binds.
+- Overlays `deploy/compose.whatsapp1-holder.yaml` and `compose.whatsapp2-holder.yaml`, one per account, after
+  `compose.whatsapp-native.yaml`: `whatsapp<n>-holder` owns the session directory, the `session-locks` bind, the holder
+  DSN file, the socket directory `./private/whatsapp<n>-holder` and the account's spool volume (the events directory
+  both use), reads `files` and `file_uploads` read-only at the collector's paths (send_file), and has
+  `stop_grace_period: 25s`. Its collector keeps its DSN, config, permit, spool and files mounts and adds the socket
+  directory; it loses the session and `session-locks` binds. The other account is untouched.
 - Source status: `collector_health.operations.holder` holds `{state: attached|refused|disconnected, generation,
   protocol, holder_source_sha, code, reason, planned_end, observed_at}`. A refusal (`holder_unavailable`,
   `holder_busy`, `collector_lease_unverified`, a protocol mismatch) is written once and retried in-process: every 60 s
@@ -62,35 +63,43 @@ the holder. Without the key the collector runs child mode unchanged; that is the
 
 The cutover stops and starts provider sessions: it runs only on the owner's exact confirmation through the
 orchestrator (AGENTS.md section 1), asked once for both accounts, never during a call, and after ANYM-896 (session
-marks, pair rule, night window) and ANYM-936's hand release (the holder logins) are live. Each host step is read back
-and has its undo; `$F` is the project's Compose file list.
+marks, pair rule, night window) and ANYM-936's hand release (the holder logins) are live. The plan gets its own plan
+review before it runs. Each step is read back and has its undo; `S` is the serving release's SHA (`production.py
+status`), so no other change rides along.
 
 0. Preconditions, read-only: the installed host tool comes from a release that contains ANYM-937 part 2 (its
-   `production.py` names the `whatsapp-holder` target in BUILDS; an older tool refuses a `services` entry it does not
-   know). Pause autodeploy with `/etc/deedkit/autodeploy.pause` (reason: holder cutover) for steps 3-8, so no release
-   runs between the configuration change and the holders' start; remove it after step 8 or after the undo.
+   `production.py` BUILDS names `whatsapp-holder`; an older tool refuses a `services` entry it does not know). Pause
+   autodeploy with `/etc/deedkit/autodeploy.pause` (reason: holder cutover) until the last step or the undo.
 1. Holder logins: the DSN files `deploy/private/whatsapp1-holder.dsn` and `whatsapp2-holder.dsn` (0600, UID 10001)
    from ANYM-936's release. Read back: `stat -c '%a %u' <file>` prints `600 10001`. Undo: remove the files.
 2. Socket directories: `install -d -m 0700 -o 10001 -g 10001 deploy/private/whatsapp1-holder` (and `whatsapp2-holder`).
    Read back with `stat`. Undo: `rmdir` them.
-3. Configs: back up `whatsapp<n>.json`, then add `"holder_socket_directory": "/run/deedkit/holder"` and
-   `"holder_dsn_file": "/run/secrets/holder_dsn"`. Read back the two keys with `jq 'keys'`. Undo: restore the backup.
-   (Until step 6 the running collectors keep their already-read child-mode config.)
-4. `/etc/deedkit/production.json` (backup first): append `/srv/deedkit/deploy/compose.whatsapp-holder.yaml` after the
-   native overlay in the project's `files`, and add `"whatsapp1-holder": "whatsapp-holder"`, `"whatsapp2-holder":
-   "whatsapp-holder"` to `services` with ANYM-896's marks. Read back with `jq`. Undo: restore the backup.
-5. Read-only: no active call (the calls service's active-call check, production.md).
-6. `whatsapp1`: `docker compose $F stop whatsapp1`; `docker compose $F up -d --no-deps whatsapp1-holder`; wait for
-   `holder.claimed` in its log; `docker compose $F up -d --no-deps whatsapp1`. Verify: source status shows
-   `operations.provider.name = whatsmeow` and `operations.holder` `state=attached`, `generation=1`; the holder logs one
-   `holder.provider_connected` with generation 1; one live event is captured (`last_ingest_at` moves).
-7. `whatsapp2`: the same steps.
-8. Receipt: per account the stop/start times, the holder's `holder.claimed` and `holder.provider_connected` lines and
-   the generation (ANYM-937 criterion 10 evidence).
 
-Undo (either account, also after the cutover): `docker compose $F stop whatsapp<n> whatsapp<n>-holder`; restore the
-config and `production.json` backups (steps 3-4); `docker compose $F up -d --no-deps whatsapp<n>`: child mode, one
-WhatsApp reconnect. The session store is never copied or converted; it stays in `whatsapp<n>-session`.
+Then per account, `whatsapp1` first and `whatsapp2` only after `whatsapp1` verified:
+
+3. Back up `whatsapp<n>.json` and `/etc/deedkit/production.json` (a per-account copy, `.before-holder<n>`). Add
+   `"holder_socket_directory": "/run/deedkit/holder"` and `"holder_dsn_file": "/run/secrets/holder_dsn"` to
+   `whatsapp<n>.json`; append `/srv/deedkit/deploy/compose.whatsapp<n>-holder.yaml` after the native overlay in the
+   project's `files` and add `"whatsapp<n>-holder": "whatsapp-holder"` (with ANYM-896's marks) to `services`. Read
+   back with `jq`.
+4. Read-only: no active call (production.md, the active-call check).
+5. `production.py prepare --sha S`: it builds and smoke-checks `deedkit-production-whatsapp-holder:S` from the
+   release checkout and resolves the candidate. Review it: only `whatsapp<n>` (new mounts) and `whatsapp<n>-holder`
+   (new) change. A refusal stops here: undo step 3.
+6. `production.py apply --sha S`. Order does not matter for safety: a holder started before the child-mode collector
+   stopped waits in-process for the session locks, and an attach-mode collector retries until the holder serves.
+7. Verify: source status shows `operations.provider.name = whatsmeow` and `operations.holder` `state=attached`,
+   `generation=1`; the holder logs `holder.claimed` and one `holder.provider_connected` with generation 1; one live
+   event is captured (`last_ingest_at` moves). Receipt: times, those log lines and the generation (criterion 10).
+
+Last: remove the autodeploy pause.
+
+Undo of one account (also after the cutover; the other account's holder and configuration stay): `docker compose $F
+stop whatsapp<n> whatsapp<n>-holder` ($F: the current file list); restore that account's two `.before-holder<n>`
+copies (for `whatsapp2` this keeps `whatsapp1`'s holder entries, taken after its cutover); `production.py prepare
+--sha S` and `apply --sha S` recreate `whatsapp<n>` in child mode (one WhatsApp reconnect); then `docker compose
+$F rm --stop whatsapp<n>-holder` ($F as before the restore, so it still names the overlay). The session store is never copied or converted; it stays in
+`whatsapp<n>-session`.
 
 Measurement (criterion 11, 7 days after the cutover, read-only): every `whatsapp1`/`whatsapp2` recreate in the
 release receipts leaves the holder's generation unchanged (`.holder-generation` and `operations.holder.generation`);

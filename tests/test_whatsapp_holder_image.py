@@ -15,7 +15,7 @@ from messaging_service import whatsapp_holder
 from scripts import production as p
 
 ROOT = Path(__file__).resolve().parents[1]
-HOLDER = 'compose.whatsapp-holder.yaml'
+HOLDERS = ['compose.whatsapp1-holder.yaml', 'compose.whatsapp2-holder.yaml']
 
 
 def go_image(dockerfile):
@@ -74,14 +74,14 @@ def rendered(tmp_path):
     for name in ('whatsapp1-holder.dsn', 'whatsapp2-holder.dsn'):
         (private / name).write_text('synthetic\n')
     stack.new_project()
-    return stack, stack.render(BASE + [NATIVE, HOLDER])
+    return stack, {files: stack.render(BASE + [NATIVE, *files]) for files in (tuple(HOLDERS), (HOLDERS[0],))}
 
 
 # spec: ANYM-937
 def test_the_rendered_holder_overlay_passes_the_session_locks_check_and_the_collectors_mount_no_session(rendered,
                                                                                                        monkeypatch):
-    stack, config = rendered
-    services = config['services']
+    _, configs = rendered
+    services = configs[tuple(HOLDERS)]['services']
     monkeypatch.setattr(p, 'SESSION_OWNER', (os.getuid(), os.getgid()))
     named = sorted(services.items())
     p.provide_session_locks(named, required=True)
@@ -98,6 +98,17 @@ def test_the_rendered_holder_overlay_passes_the_session_locks_check_and_the_coll
                 and any(v.get('target') == '/spool' for v in collector['volumes']))
         assert [v['source'] for v in holder['volumes'] if v['target'] == '/spool'] == [
             v['source'] for v in collector['volumes'] if v['target'] == '/spool']  # one events spool
+        # send_file: registered files and uploads at the command worker's paths, read-only in the holder.
+        shared = {v['target']: v for v in holder['volumes'] if v['target'] in ('/data', '/data/files/.uploads')}
+        assert set(shared) == {'/data', '/data/files/.uploads'} and all(v.get('read_only') for v in shared.values())
+        assert {v['source'] for v in shared.values()} == {
+            v['source'] for v in collector['volumes'] if v['target'] in ('/data', '/data/files/.uploads')}
+    # One account's overlay leaves the other account in child mode: its session and lock binds stay.
+    alone = configs[(HOLDERS[0],)]['services']
+    assert 'whatsapp2-holder' not in alone and 'whatsapp1-holder' in alone
+    second = {target for _, target in p.binds(alone['whatsapp2'])}
+    assert '/sessions' in second and p.SESSION_LOCKS in second
+    p.provide_session_locks(sorted(alone.items()), required=True)
     # A holder that lost the lock bind is refused before anything stops: the check covers the holder unit.
     broken = dict(services['whatsapp1-holder'])
     broken['volumes'] = [v for v in broken['volumes'] if v['target'] != p.SESSION_LOCKS]
