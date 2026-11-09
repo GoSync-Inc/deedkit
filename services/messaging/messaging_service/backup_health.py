@@ -1,5 +1,6 @@
 #!/usr/bin/python3 -I
-"""Hourly backup alert checker: a failed, undelivered or unverified daily backup becomes a Tiden issue (ANYM-807).
+"""Hourly backup alert checker: a failed, undelivered or unverified daily backup becomes a Tiden issue (ANYM-807), and so
+does an autodeploy halt on the production host (ci-deploy-speed 11-09: a halt waited until a person happened to look).
 
 Standard library only and no package import, so the same file runs as a host copy
 (``/usr/bin/python3 -I /opt/deedkit/backup-health/backup_health.py --config <file>``) on the production host (side
@@ -27,6 +28,19 @@ import uuid
 PROFILES = ('messaging', 'calendar', 'recordings', 'calls')
 KINDS = {'producer': ('backup_failed', 'backup_stale'), 'verifier': ('backup_verify_failed', 'backup_unverified')}
 CODES = frozenset(f'{kind}.{profile}' for kinds in KINDS.values() for kind in kinds for profile in PROFILES)
+# The deployer's halt codes (scripts/production.py HALTS; a test keeps them equal) and `other` for one this copy does
+# not know. Only a pause `deploy` wrote names a code; a hand-written one raises nothing: its writer is on the host.
+HALT_CODES = ('attempt_unresolved', 'call_wait_exhausted', 'configuration_drift', 'copies_unreconciled',
+              'deploy_receipt_malformed', 'deploy_refused', 'deploy_unknown_state', 'enroll_required',
+              'host_locks_failed', 'http_release_unsettled', 'http_retirement_failed', 'main_unreadable',
+              'manifest_invalid', 'migration_by_hand', 'migration_refused', 'migration_unsettled',
+              'migration_wait_exhausted', 'plan_a_preparation_unfinished', 'plan_a_refused', 'plan_a_rolled_back',
+              'plan_a_unknown_state', 'plan_b_preparation_unfinished', 'plan_b_stopped', 'registry_unreachable',
+              'release_not_applied', 'release_not_on_main', 'rollback_failed', 'tool_blob_mismatch', 'tool_by_hand',
+              'tool_not_descended', 'tool_release_mismatch', 'tool_rolled_back', 'tool_self_test_failed',
+              'tool_switch_failed', 'tool_update_stopped', 'tool_update_unresolved', 'other')
+DEPLOY_CODES = frozenset(f'deploy_halted.{code}' for code in HALT_CODES)
+PAUSE_FILE = '/etc/deedkit/autodeploy.pause'
 # Policy limits from capture, the normal day plus margin (ANYM-807 criterion 6); BACKUP.md, Backup alerts.
 LIMIT_HOURS = {'messaging': 30, 'calendar': 32, 'recordings': 30, 'calls': 36}
 # The proof of these profiles carries the capture time; messaging's and calendar's take the backup ID's job time.
@@ -221,6 +235,20 @@ def verifier(profile, entry, states, now):
             'last_snapshot_at': captured.strftime(TIME_FORMAT) if captured else None, 'age_hours': age}
 
 
+def halted(path=None):
+    """`deploy_halted.<code>` while the autodeploy pause names a code, else None (no pause, a hand-written one, or a
+    file that cannot be read). Only the code leaves the host, never the pause's reason."""
+    try:
+        with open(path or PAUSE_FILE, 'rb') as handle:
+            pause = json.loads(handle.read(READ_LIMIT))
+    except (OSError, ValueError, RecursionError):
+        return None
+    code = pause.get('code') if isinstance(pause, dict) else None
+    if type(code) is not str:
+        return None
+    return 'deploy_halted.' + (code if code in HALT_CODES else 'other')
+
+
 def evaluate(config, now, run=None):
     """{profile: reading}; one profile's failure leaves it UNKNOWN and the others evaluated."""
     side, entries = config['side'], config['profiles']
@@ -258,18 +286,19 @@ def ingest_url(dsn):
 
 def build_event(code, config, timestamp):
     """The event telemetry.safe_event + before_send produce for this code (ANYM-807 criterion 8)."""
-    if code not in CODES:
+    if code not in CODES and code not in DEPLOY_CODES:
         raise ValueError('unknown code')
+    component = 'deploy' if code in DEPLOY_CODES else 'backup'
     try:
         raise RuntimeError(code)
     except RuntimeError as error:
         trace = error.__traceback__
         lineno = trace.tb_lineno if trace is not None else 1
     return {'platform': 'python', 'level': 'error', 'release': 'deedkit@' + config['release_sha'],
-            'tags': {'component': 'backup', 'error_code': code},
+            'tags': {'component': component, 'error_code': code},
             'exception': {'values': [{'type': 'RuntimeError', 'value': code,
                                       'stacktrace': {'frames': [{'filename': FRAME, 'lineno': lineno, 'in_app': True}]}}]},
-            'fingerprint': ['backup-health', 'backup', code],
+            'fingerprint': ['backup-health', component, code],
             'event_id': uuid.uuid4().hex, 'timestamp': timestamp, 'environment': config['environment'], 'sdk': dict(SDK)}
 
 
@@ -331,7 +360,7 @@ def read_state(path):
         return {}
     good = {}
     for code, entry in codes.items():
-        if code not in CODES or not isinstance(entry, dict):
+        if (code not in CODES and code not in DEPLOY_CODES) or not isinstance(entry, dict):
             continue
         sent, attempted = (moment_value(entry.get(k)) for k in ('sent', 'attempted'))
         if (sent is None) != (entry.get('sent') is None) or (attempted is None) != (entry.get('attempted') is None):
@@ -383,6 +412,8 @@ def check(config, *, now=None, clock=time.monotonic, run=None, send=None, wall=t
         p: {k: r[k] for k in ('word', 'last_snapshot_at', 'age_hours')} for p, r in readings.items()}}, 0o644)
     previous = read_state(state_dir / 'state.json')
     active = active_codes(readings, previous)
+    if config['side'] == 'producer' and (code := halted()):
+        active.add(code)
     state = {code: previous.get(code, {'sent': None, 'attempted': None}) for code in active}
     stamp = moment.timestamp()
     due = due_codes(active, state, stamp)
