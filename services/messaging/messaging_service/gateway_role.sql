@@ -139,5 +139,5 @@ GRANT SELECT ON negotiations,negotiation_sources,negotiation_times TO messaging_
 GRANT SELECT ON attachment_structure,structure_profiles TO messaging_gateway;
 -- Schema 78 (ANYM-914): source status shows which host owns each provider session; read only.
 GRANT SELECT ON session_claims TO messaging_gateway;
--- Schema 82 (ANYM-921): message reads show a poll's counts and who chose which option; read only.
+-- Schema 83 (ANYM-921): message reads show a poll's counts and who chose which option; read only.
 GRANT SELECT ON poll_results,poll_voters TO messaging_gateway;

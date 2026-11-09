@@ -89,7 +89,10 @@ V77_TABLES={'attachment_structure':'attachment','structure_profiles':'account'}
 V78_TABLES={'session_claims':'account'}
 # ANYM-936: which holder login is bound to which account (role names only; no credential).
 V82_TABLES={'session_holder_accounts':'role_name'}
-SCHEMAS=range(2,83)
+# ANYM-921: each poll's option counts, who chose which option and each voter's newest vote time (archive sender
+# IDs and times; no message text).
+V83_TABLES={'poll_results':'message,option_index','poll_voters':'message,voter,option_index','poll_votes':'message,voter'}
+SCHEMAS=range(2,84)
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
 V17_TABLES={'message_conflicts':'receipt_digest'}
@@ -113,7 +116,7 @@ def database_manifest(c):
                        **(V35_TABLES if version>=35 else {}),
                        **(V37_TABLES if version>=37 else {}),
                        **(V38_TABLES if version>=38 else {}),**(V41_TABLES if version>=41 else {}),**(V42_TABLES if version>=42 else {}),**(V43_TABLES if version>=43 else {}),
-                       **(V44_TABLES if version>=44 else {}),**(V45_TABLES if version>=45 else {}),**(V48_TABLES if version>=48 else {}),**(V49_TABLES if version>=49 else {}),**(V50_TABLES if version>=50 else {}),**(V51_TABLES if version>=51 else {}),**(V53_TABLES if version>=53 else {}),**(V56_TABLES if version>=56 else {}),**(V57_TABLES if version>=57 else {}),**(V58_TABLES if version>=58 else {}),**(V61_TABLES if version>=61 else {}),**(V69_TABLES if version>=69 else {}),**(V70_TABLES if version>=70 else {}),**(V73_TABLES if version>=73 else {}),**(V76_TABLES if version>=76 else {}),**(V77_TABLES if version>=77 else {}),**(V78_TABLES if version>=78 else {}),**(V82_TABLES if version>=82 else {})}.items():
+                       **(V44_TABLES if version>=44 else {}),**(V45_TABLES if version>=45 else {}),**(V48_TABLES if version>=48 else {}),**(V49_TABLES if version>=49 else {}),**(V50_TABLES if version>=50 else {}),**(V51_TABLES if version>=51 else {}),**(V53_TABLES if version>=53 else {}),**(V56_TABLES if version>=56 else {}),**(V57_TABLES if version>=57 else {}),**(V58_TABLES if version>=58 else {}),**(V61_TABLES if version>=61 else {}),**(V69_TABLES if version>=69 else {}),**(V70_TABLES if version>=70 else {}),**(V73_TABLES if version>=73 else {}),**(V76_TABLES if version>=76 else {}),**(V77_TABLES if version>=77 else {}),**(V78_TABLES if version>=78 else {}),**(V82_TABLES if version>=82 else {}),**(V83_TABLES if version>=83 else {})}.items():
         query=sql.SQL('SELECT row_to_json(t) AS record FROM {} t ORDER BY {}').format(
             sql.Identifier(name),sql.SQL(',').join(sql.Identifier(part) for part in order.split(',')))
         sha=hashlib.sha256(); count=0

@@ -1,12 +1,13 @@
 -- rollout: manual
 -- Risk tier: non-critical (three new tables with row-level security and a policy on each; no existing row, column
 -- or grant changes; grants only on these tables in the role files; docs/operations/production.md "Migration risk
--- tiers"). Manual only because the expand form names no row-level security or policy statement: released by hand
--- at once (production.md "Migration releases" item 4), no backup needed.
+-- tiers"). The declared header is manual because the expand header's `classify` names no row-level security or
+-- policy statement; migrate-expand's `unattended_class` calls this file `expand` and the role files only append
+-- grants, so unattended deploy releases it ("Unattended migrations"), no backup needed.
 -- ANYM-921 (the tables of ANYM-920): a poll message's current results and who chose which option.
 -- poll_results: one row per option of the poll with its voter count. poll_voters: one row per voter and chosen
 -- option. poll_votes: the newest vote time of each voter, kept for a retracted (empty) vote too, so an older vote
--- delivered late never wins. Voter IDs are the archive's sender IDs; no message text. A schema-81 runtime never
+-- delivered late never wins. Voter IDs are the archive's sender IDs; no message text. A schema-82 runtime never
 -- names these tables; purge (message_purge.py) deletes a purged poll's rows. A bound collector (037's binding
 -- function, for the current role and the login, as 057's CHECK) sees, updates and deletes only its own account's rows
 -- and writes a row only for a message of that account: row-level security on each new table, one policy for every
