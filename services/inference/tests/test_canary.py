@@ -82,6 +82,92 @@ def test_canary_loads_each_modality_once_before_the_timed_items_and_judges_the_c
     assert canary.score(fine, EXPECTED, TRUTH) == []
 
 
+DOCUMENTS = CANARY / "documents"
+DOC_TRUTH = json.loads((DOCUMENTS / "truth.json").read_text())
+
+
+def recorded():
+    """What `canary.documents` recorded from the real Docling venv on 11-09 (laptop, the pinned models, network
+    denied by the audit hook): every fixture a fresh child, 3.9 to 12.3 s, peak RSS 0.93 to 1.84 GB."""
+    return json.loads((DOCUMENTS / "recorded.json").read_text())
+
+
+# spec: ANYM-850
+def test_document_canary_passes_the_recorded_docling_run_and_fails_each_regression():
+    bound = EXPECTED["documents"]
+    assert bound["max_seconds"] == 120 and bound["max_rss_mb"] == 2560  # the card's 120 s and 2.5 GB
+    assert canary.score_documents(recorded(), DOC_TRUTH, bound) == []
+    bad = recorded()
+    table = bad["table.pdf"]
+    table["markdown"] = "\n".join(line for line in table["markdown"].splitlines() if "D-4007" not in line)
+    text = bad["text.pdf"]
+    text["markdown"] = text["markdown"].replace("## Обязанности сторон", "Обязанности сторон")
+    text["page_spans"][0], text["page_spans"][1] = text["page_spans"][1], text["page_spans"][0]
+    deck = bad["deck.pptx"]
+    deck["network_attempts"], deck["seconds"], deck["peak_rss_mb"] = 1, 121.0, 2561
+    docx = bad["doc.docx"]
+    docx["markdown"] = docx["markdown"].replace("маркер альфа", "marker").replace("маркер бета", "маркер альфа")
+    failures = "\n".join(canary.score_documents(bad, DOC_TRUTH, bound))
+    for fragment in ("table.pdf: table rows 7/8", "text.pdf: headings 2/3", "text.pdf: page spans [2, 1, 3], not pages 1..3",
+                     "deck.pptx: 1 outbound attempts", "deck.pptx: 121.0 s > 120", "deck.pptx: peak RSS 2561 MB",
+                     "doc.docx: markers out of order"):
+        assert fragment in failures, fragment
+    lost = recorded()
+    lost["doc.docx"]["markdown"] = canary.CYRILLIC.sub("?", lost["doc.docx"]["markdown"])
+    assert any(f.startswith("doc.docx: Russian words kept") for f in canary.score_documents(lost, DOC_TRUTH, bound))
+    moved = recorded()  # a marker on the wrong slide although the spans are in order
+    spans = moved["deck.pptx"]["page_spans"]
+    spans[0]["end"], spans[1]["start"] = spans[0]["start"], spans[0]["start"]
+    assert any(f.startswith("deck.pptx: markers not on their pages") for f in canary.score_documents(moved, DOC_TRUTH, bound))
+    assert canary.score_documents({"text.pdf": {"error": "HTTP 503"}}, DOC_TRUTH, bound)[0] == "text.pdf: no answer: HTTP 503"
+
+
+# spec: ANYM-850
+def test_document_canary_judges_pages_by_their_numbers_and_each_fixture_by_its_own_page_count():
+    """Astra r1: no spans used to pass as a DOCX, and pages shifted by ten passed as long as the markers matched by
+    position. Now every fixture has its page count in expected.json and marker n must sit on page n."""
+    bound = EXPECTED["documents"]
+    assert set(bound["pages"]) == set(DOC_TRUTH) and bound["pages"]["doc.docx"] is None
+    cases = {
+        "no spans": lambda got: got.update(page_spans=[]),
+        "shifted": lambda got: [span.update(page=span["page"] + 10) for span in got["page_spans"]],
+        "last page left out": lambda got: got["page_spans"].pop(),
+    }
+    for label, change in cases.items():
+        for name in ("text.pdf", "deck.pptx"):
+            outputs = recorded()
+            change(outputs[name])
+            assert any(f.startswith(f"{name}: page spans") for f in canary.score_documents(outputs, DOC_TRUTH, bound)), (label, name)
+    outputs = recorded()
+    outputs["doc.docx"]["page_spans"] = [{"page": 1, "start": 0, "end": 10}]
+    assert "doc.docx: page spans for a document without pages" in canary.score_documents(outputs, DOC_TRUTH, bound)
+    outputs = recorded()  # the rouble sign is dropped for the PDF only: a DOCX cell without it is a lost row
+    outputs["doc.docx"]["markdown"] = outputs["doc.docx"]["markdown"].replace("₽", "")
+    assert "doc.docx: table rows 4/5" in canary.score_documents(outputs, DOC_TRUTH, bound)
+
+
+# spec: ANYM-850
+def test_document_canary_posts_each_committed_fixture_to_the_document_route(monkeypatch):
+    calls = []
+
+    def fake_post(url, key, body, content_type, timeout=3600):
+        calls.append((url, body, timeout))
+        if b"deck.pptx" in body:
+            raise RuntimeError("HTTP 502 engine_failed")
+        got = recorded()[next(n for n in DOC_TRUTH if f'filename="{n}"'.encode() in body)]
+        return {"markdown": got["markdown"], "truncated": False, "page_spans": got["page_spans"], "coverage": got["coverage"],
+                "engine": {"name": "docling", "network_attempts": 0, "peak_rss_mb": 900}}, 5.0
+
+    monkeypatch.setattr(canary, "post", fake_post)
+    outputs = canary.documents("http://x", "k", DOCUMENTS, DOC_TRUTH, EXPECTED["documents"])
+    assert [url for url, _, _ in calls] == ["http://x/v1/documents/convert"] * 4
+    assert all(b'name="model"\r\n\r\ndocument-structure\r\n' in body and timeout == 180 for _, body, timeout in calls)
+    assert outputs["deck.pptx"] == {"error": "HTTP 502 engine_failed"}
+    assert outputs["table.pdf"]["peak_rss_mb"] == 900 and outputs["table.pdf"]["seconds"] == 5.0
+    failures = canary.score_documents(outputs, DOC_TRUTH, EXPECTED["documents"])
+    assert failures == ["deck.pptx: no answer: HTTP 502 engine_failed"]
+
+
 # spec: ANYM-683
 def test_canary_voice_notes_are_ogg_opus_not_vorbis():
     """Live install 11-02: ffmpeg 8.1 on the mini has libopus and no libvorbis; Ogg/Opus is also what Telegram voice

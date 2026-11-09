@@ -95,6 +95,70 @@ class ChatResult(Strict):
     usage: Usage = Field(default_factory=Usage)
 
 
+class DocumentForm(Strict):
+    model: str
+
+
+# --- documents (ANYM-850): the typed result ANYM-851 stores; tests/test_inference_contract.py keeps the messaging copy
+# of these limits equal. Offsets are Unicode code points into `markdown`, `start` inclusive, `end` exclusive.
+DOCUMENT_MAX_BYTES = 32 * 1024 * 1024
+DOCUMENT_MAX_PAGES = 100
+DOCUMENT_MAX_CHARS = 1_000_000
+DOCUMENT_REFUSALS = ("unsupported_format", "page_limit", "invalid_document")
+
+
+class PageSpan(Strict):
+    page: int = Field(ge=1, le=DOCUMENT_MAX_PAGES, strict=True)  # 1-based: a PDF page or a PPTX slide
+    start: int = Field(ge=0, le=DOCUMENT_MAX_CHARS, strict=True)
+    end: int = Field(ge=0, le=DOCUMENT_MAX_CHARS, strict=True)
+
+
+class Coverage(Strict):
+    pages: int | None = Field(default=None, ge=0, le=DOCUMENT_MAX_PAGES)  # None: a DOCX has no pages
+    pages_with_text: int = Field(ge=0, le=DOCUMENT_MAX_PAGES)
+    tables: int = Field(ge=0)
+    headings: int = Field(ge=0)
+
+
+class EngineInfo(Strict):
+    name: Literal["docling"]
+    version: Annotated[str, StringConstraints(pattern=r"^[0-9][0-9A-Za-z.]{0,31}$")]
+    models: dict[Annotated[str, StringConstraints(pattern=r"^[a-z0-9_]{1,16}$")],
+                 Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]] = Field(max_length=8)
+    # Outbound attempts the child's audit hook saw during this job (connect, getaddrinfo, sendto, urllib); the
+    # canary requires 0, and the service refuses any other figure as a failed engine.
+    network_attempts: int = Field(ge=0)
+    # The child's peak resident memory for this job, model load included (one child per job); the canary bounds it.
+    peak_rss_mb: int = Field(ge=0, le=1_048_576)
+
+
+class DocumentResult(Strict):
+    """What the document engine child prints on stdout, and the body of POST /v1/documents/convert."""
+
+    markdown: Annotated[str, StringConstraints(max_length=DOCUMENT_MAX_CHARS)]
+    truncated: bool
+    page_spans: list[PageSpan] = Field(max_length=DOCUMENT_MAX_PAGES)
+    coverage: Coverage
+    engine: EngineInfo
+
+    @field_validator("page_spans")
+    @classmethod
+    def ordered(cls, spans, info):
+        markdown = info.data.get("markdown")
+        previous_end, previous_page = 0, 0
+        for span in spans:
+            if span.start < previous_end or span.end < span.start or span.page <= previous_page:
+                raise ValueError("page_spans_not_ordered")
+            if markdown is not None and span.end > len(markdown):
+                raise ValueError("page_span_past_markdown")
+            previous_end, previous_page = span.end, span.page
+        return spans
+
+
+def document_response(result):
+    return result.model_dump()
+
+
 def chat_response(job_id, created, alias, result):
     usage = result.usage
     return {

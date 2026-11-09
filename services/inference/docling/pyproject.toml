@@ -1,0 +1,33 @@
+# The Docling engine's own environment (ANYM-850). docling 2.149.0 needs huggingface-hub<2 (docling-ibm-models 4.0.x),
+# the service pins 2.4.0 (../pyproject.toml), so the engine child runs from this venv: the service package (for the
+# worker protocol, editable) plus docling, Apple silicon only, wheels with locked hashes only.
+# The release deploy runs `uv sync --locked` here after the service sync (scripts/inference_deploy.py).
+[project]
+name = "deedkit-inference-docling"
+version = "0.1.0"
+requires-python = ">=3.13,<3.14"
+dependencies = ["deedkit-inference", "docling==2.149.0"]
+
+[tool.uv]
+package = false
+environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
+no-build-package = [
+  "accelerate", "annotated-doc", "annotated-types", "anyio", "attrs", "beautifulsoup4", "certifi",
+  "charset-normalizer", "click", "colorlog", "defusedxml", "dill", "doclang", "docling", "docling-core",
+  "docling-ibm-models", "docling-parse", "docling-slim", "et-xmlfile", "faker", "fastapi", "filelock",
+  "filetype", "fsspec", "h11", "hf-xet", "httpcore", "httpx", "huggingface-hub", "idna", "jinja2", "jsonref",
+  "jsonschema", "jsonschema-specifications", "langcodes", "latex2mathml", "lxml", "mail-parser",
+  "markdown-it-py", "marko", "markupsafe", "mdurl", "mpire", "mpmath", "multiprocess", "networkx", "numpy",
+  "olefile", "omegaconf", "opencv-python-headless", "openpyxl", "opentelemetry-api", "packaging", "pandas",
+  "pillow", "pluggy", "polyfactory", "psutil", "pyclipper", "pydantic", "pydantic-core", "pydantic-settings",
+  "pygments", "pylatexenc", "pypdfium2", "python-dateutil", "python-docx", "python-dotenv",
+  "python-multipart", "python-oxmsg", "python-pptx", "pyyaml", "rapidocr", "referencing", "regex",
+  "requests", "rich", "rpds-py", "rtree", "safetensors", "scipy", "semchunk", "setuptools", "shapely",
+  "shellingham", "six", "soupsieve", "starlette", "sympy", "tabulate", "tokenizers", "torch", "torchvision",
+  "tqdm", "transformers", "tree-sitter", "tree-sitter-c", "tree-sitter-javascript", "tree-sitter-python",
+  "tree-sitter-typescript", "typer", "typing-extensions", "typing-inspection", "tzdata", "urllib3",
+  "uvicorn", "websockets", "xlsxwriter",
+]
+
+[tool.uv.sources]
+deedkit-inference = { path = "..", editable = true }

@@ -1,6 +1,8 @@
 """A runtime for CI: no library, no model. The uploaded file steers it like the fake engine's: `FAKE {json}` at the
 start of the file sets `mode` (ok | crash | hang), `sleep`, `language`, `chars` and `segments` (a transcript of that
-many segments of that many characters), `answer` (the chat model's raw text), `echo_env`, `pidfile`."""
+many segments of that many characters), `answer` (the chat model's raw text), `echo_env`, `pidfile`. A document
+(ANYM-850) carries the line after its magic bytes (`%PDF-1.7 FAKE {...}`): `refused`, `pages`, `markdown`,
+`network_attempts`, `peak_rss_mb`, `raw` (printed as the whole result), `alloc_mb` (memory held while it sleeps)."""
 
 import json
 import os
@@ -44,6 +46,48 @@ def text_directive(path):
     return value if isinstance(value, dict) else {}
 
 
+def embedded_directive(path):
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(4096)
+    except OSError:
+        return {}
+    index = head.find(b"FAKE ")
+    if index < 0:
+        return {}
+    try:
+        value = json.loads(head[index + 5:].split(b"\n", 1)[0])
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def document(d, jobs):
+    if d.get("refused"):
+        return {"refused": d["refused"]}
+    if "raw" in d:
+        return d["raw"]
+    if d.get("alloc_mb"):
+        held = bytearray(int(d["alloc_mb"]) * 1024 * 1024)  # touched, so it is resident
+        for i in range(0, len(held), 4096):
+            held[i] = 1
+        time.sleep(float(d.get("hold", 30)))
+    pages = int(d.get("pages", 2))
+    parts = [d.get("markdown", f"## Страница {n}\n\n| a | b |\n|---|---|\n| {n} | {jobs} |") for n in range(1, pages + 1)]
+    markdown, spans, offset = "", [], 0
+    for n, part in enumerate(parts, 1):
+        if n > 1:
+            markdown += "\n\n"
+            offset += 2
+        spans.append({"page": n, "start": offset, "end": offset + len(part)})
+        markdown += part
+        offset += len(part)
+    return {"markdown": markdown, "truncated": False, "page_spans": spans,
+            "coverage": {"pages": pages, "pages_with_text": pages, "tables": pages, "headings": pages},
+            "engine": {"name": "docling", "version": "2.149.0", "models": {"layout": "a" * 40},
+                       "network_attempts": int(d.get("network_attempts", 0)), "peak_rss_mb": int(d.get("peak_rss_mb", 120))}}
+
+
 class Runtime:
     def __init__(self, paths, options):
         self.paths, self.options = paths, options
@@ -54,6 +98,8 @@ class Runtime:
     def run(self, job):
         if "max_tokens" in job:  # a chat: the steering line sits in the prompt text
             d = text_directive(os.path.join(job["directory"], "prompt.txt"))
+        elif "max_pages" in job:  # a document: the steering line follows the magic bytes
+            d = embedded_directive(job["file"])
         else:
             d = directive(job["files"][0])
         if d.get("pidfile"):
@@ -80,6 +126,8 @@ class Runtime:
         time.sleep(float(d.get("sleep", 0)))
         phase = job["phase"]
         self.cache["jobs"] = self.cache.get("jobs", 0) + 1
+        if "max_pages" in job:
+            return document(d, self.cache["jobs"])
         if d.get("echo_env"):
             env = {k: os.environ.get(k, "") for k in d["echo_env"]}
             return {"text": json.dumps(env), "segments": [{"start": 0, "end": 1, "text": json.dumps(env)}],

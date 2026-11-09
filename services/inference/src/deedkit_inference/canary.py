@@ -15,6 +15,7 @@ from .segments import MAX_SECONDS, MAX_TOTAL_CHARS
 
 CYRILLIC = re.compile("[А-Яа-яЁё]")
 JSON_KEYS = ("title", "summary", "document_type", "text")
+DOCUMENT_ALIAS = "document-structure"
 
 
 def norm(text):
@@ -115,6 +116,78 @@ def score_long(got, bound):
     return problems
 
 
+# --- documents (ANYM-850): the committed fixtures of tests/canary/documents through `document-structure` -------------
+HEADING = re.compile(r"^#{1,6}[ \t]+(.+?)[ \t#]*$")
+
+
+def fold(cell, pdf):
+    """A cell as the scorer compares it: whitespace folded, lowercased; in a PDF also without the rouble sign (the
+    set's PDF text layer does not carry it, so make_documents.py says the scorer drops it; DOCX and PPTX keep it)."""
+    return " ".join((cell.replace("₽", "") if pdf else cell).split()).lower()
+
+
+def table_rows(markdown, pdf):
+    """The rows of every Markdown table, cells folded; separator lines are not rows."""
+    return [[fold(cell, pdf) for cell in line.strip().strip("|").split("|")] for line in markdown.splitlines()
+            if line.lstrip().startswith("|") and not re.fullmatch(r"[\s|:\-]*", line)]
+
+
+def score_documents(outputs, truth, bound):
+    """The list of failures of the document check. `outputs` is what `documents` records, `truth` the fixtures'
+    truth.json, `bound` the `documents` section of expected.json. Every fixture: no outbound attempt, under the time and
+    memory bounds, its Russian words kept; its table rows and page order where its truth names them, its headings
+    where `bound["headings"]` names the fixture (table.pdf's two titles come back as plain paragraphs: Docling's layout
+    model labels them text, 11-09, and the card asks headings of text.pdf and titles of deck.pptx)."""
+    failures = []
+    for name, want in truth.items():
+        got = (outputs or {}).get(name)
+        if not got or "error" in got:
+            failures.append(f"{name}: no answer{': ' + got['error'] if got else ''}")
+            continue
+        markdown = got["markdown"]
+        if got["network_attempts"]:
+            failures.append(f"{name}: {got['network_attempts']} outbound attempts")
+        if got["seconds"] > bound["max_seconds"]:
+            failures.append(f"{name}: {got['seconds']:.1f} s > {bound['max_seconds']} s")
+        if got["peak_rss_mb"] > bound["max_rss_mb"]:
+            failures.append(f"{name}: peak RSS {got['peak_rss_mb']} MB > {bound['max_rss_mb']} MB")
+        if want.get("table"):
+            pdf = name.endswith(".pdf")
+            rows = table_rows(markdown, pdf)
+            found = sum(1 for row in want["table"] if [fold(cell, pdf) for cell in row] in rows)
+            if found < len(want["table"]):
+                failures.append(f"{name}: table rows {found}/{len(want['table'])}")
+        if want.get("headings") and name in bound["headings"]:
+            headings = {norm(m.group(1)) for m in map(HEADING.match, markdown.splitlines()) if m}
+            found = sum(1 for heading in want["headings"] if norm(heading) in headings)
+            if found < len(want["headings"]):
+                failures.append(f"{name}: headings {found}/{len(want['headings'])}")
+        words = set(norm(markdown).split())
+        russian = [word for word in norm(want["text"]).split() if CYRILLIC.search(word)]
+        kept = sum(1 for word in russian if word in words) / max(1, len(russian))
+        if kept < bound["min_ru_word_recall"]:
+            failures.append(f"{name}: Russian words kept {kept:.3f} < {bound['min_ru_word_recall']}")
+        failures += page_order(name, markdown, got["page_spans"], want.get("markers") or [], bound["pages"][name])
+    return failures
+
+
+def page_order(name, markdown, spans, markers, pages):
+    """The spans are pages 1..`pages` in order (a PDF page, a slide), and marker n is on page n + 1. `pages` None is a
+    DOCX: no spans at all, and the markers in order in the text."""
+    if pages is None:
+        if spans:
+            return [f"{name}: page spans for a document without pages"]
+        text = norm(markdown)
+        places = [text.find(norm(m)) for m in markers]
+        return [] if -1 not in places and places == sorted(places) else [f"{name}: markers out of order {places}"]
+    numbers = [span["page"] for span in spans]
+    if numbers != list(range(1, pages + 1)):
+        return [f"{name}: page spans {numbers}, not pages 1..{pages}"]
+    texts = {span["page"]: norm(markdown[span["start"]:span["end"]]) for span in spans}
+    missing = [m for n, m in enumerate(markers, 1) if norm(m) not in texts.get(n, "")]
+    return [f"{name}: markers not on their pages {missing}"] if missing else []
+
+
 # --- talking to the live service ---------------------------------------------------------------------------------
 def post(url, key, body, content_type, timeout=3600):
     request = urllib.request.Request(url, data=body, method="POST", headers={
@@ -173,4 +246,28 @@ def run(base, key, directory, expected, prompt):
     answer, seconds = transcribe(base, key, directory / expected["long"]["file"], verbose=True)
     outputs["long"] = {"segments": [{k: s[k] for k in ("start", "end", "text")} for s in answer["segments"]],
                        "duration": answer["duration"], "seconds": seconds}
+    return outputs
+
+
+def convert(base, key, path, timeout):
+    boundary = uuid.uuid4().hex
+    body = (f'--{boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n{DOCUMENT_ALIAS}\r\n'
+            f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{path.name}"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n").encode() + path.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
+    return post(base + "/v1/documents/convert", key, body, f"multipart/form-data; boundary={boundary}", timeout=timeout)
+
+
+def documents(base, key, directory, truth, bound):
+    """Record each fixture's answer. The engine stops its child after each job, so every figure is a cold one:
+    interpreter start, model verify and load, conversion."""
+    outputs = {}
+    for name in truth:
+        try:
+            answer, seconds = convert(base, key, Path(directory) / name, bound["max_seconds"] + 60)
+        except (RuntimeError, OSError) as error:
+            outputs[name] = {"error": str(error)[:300]}
+            continue
+        outputs[name] = {"markdown": answer["markdown"], "page_spans": answer["page_spans"],
+                         "coverage": answer["coverage"], "network_attempts": answer["engine"]["network_attempts"],
+                         "peak_rss_mb": answer["engine"]["peak_rss_mb"], "seconds": round(seconds, 2)}
     return outputs

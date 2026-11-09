@@ -28,10 +28,13 @@ class PhaseSpec(Strict):
     share: Annotated[float, Field(gt=0, le=1)] = 1.0
     # A phase that only some jobs run (the engine picks the route: Russian speech takes one, other languages another).
     route: Annotated[str, Field(pattern=r"^[a-z0-9_]{1,16}$")] | None = None
+    # A hard per-child memory limit (ANYM-850): the supervisor kills the phase's child (one-shot or warm) whose RSS is
+    # above it. Without it a warm worker keeps the MEMORY_SHARE_FACTOR rule and a one-shot child only the hard cap.
+    rss_limit_gb: Annotated[float, Field(gt=0, le=64)] | None = None
 
 
 class AliasSpec(Strict):
-    kind: Literal["audio", "chat"]
+    kind: Literal["audio", "chat", "document"]  # document: a file converted to Markdown (ANYM-850)
     scope: Literal["audio", "image", "document"]
     # More scopes the alias serves (a chat alias that reads images and text-only documents); a key needs the
     # scope of the request: `image` when it carries an image, else `document`.
@@ -53,6 +56,8 @@ class AliasSpec(Strict):
                 raise ValueError("phase_shares_must_sum_to_one")
         if self.extra_scopes and self.kind != "chat":
             raise ValueError("extra_scopes_need_a_chat_alias")
+        if self.kind == "document" and self.scope != "document":
+            raise ValueError("kind_scope_mismatch")
         if len({p.name for p in self.phases}) != len(self.phases):
             raise ValueError("duplicate_phase_name")
         return self
@@ -106,6 +111,8 @@ class Config(Strict):
     work_dir_max_bytes: Annotated[int, Field(ge=1)] = 512 * MIB
     audio_body_max_bytes: Annotated[int, Field(ge=1)] = 32 * MIB
     chat_body_max_bytes: Annotated[int, Field(ge=1)] = 44 * MIB
+    # A document of at most DOCUMENT_MAX_BYTES (32 MiB) plus its multipart framing (ANYM-850).
+    document_body_max_bytes: Annotated[int, Field(ge=1)] = 33 * MIB
     drain_seconds: Annotated[float, Field(ge=0, le=86400)] = 900
     # Housekeeping cadence; tests shorten these, production keeps the defaults.
     pump_interval_seconds: Annotated[float, Field(gt=0, le=60)] = 0.5

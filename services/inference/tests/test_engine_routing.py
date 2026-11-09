@@ -79,7 +79,7 @@ async def test_shipped_aliases_load_and_every_phase_is_pinned(env):
     from deedkit_inference.config import Config
 
     config = Config.model_validate({**env.config_dict(), "aliases": {}})
-    assert set(config.aliases) == {"audio-default", "vision-default"}
+    assert set(config.aliases) == {"audio-default", "vision-default", "document-structure"}  # ANYM-850
     assert config.aliases["vision-default"].scopes == ["image", "document"]
     models = pins.load_models()
     for alias, spec in config.aliases.items():

@@ -104,9 +104,10 @@ Every route is under `/v1`, except `GET /health`. Every error the service itself
 | route | auth | body |
 |---|---|---|
 | `GET /health` | none | `{"status": "ok"\|"draining", "queue": {"depth", "active", "capacity"}, "admission": "open"\|"closed"}` and nothing else |
-| `GET /v1/models` | key | `{"object": "list", "data": [{"id", "object": "model", "scopes", "engine", "revision"}], "key_expires_at", "release"}`, only aliases the key's scopes allow |
+| `GET /v1/models` | key | `{"object": "list", "data": [{"id", "object": "model", "scopes", "engine", "revision", "available"}], "key_expires_at", "release"}`, only aliases the key's scopes allow |
 | `POST /v1/audio/transcriptions` | key | multipart: `file`, `model`, optional `language`, optional `response_format` (`json` \| `verbose_json`) |
 | `POST /v1/chat/completions` | key | JSON: `model`, `messages` (text and `image_url` data URLs), optional `max_tokens` 1..16000 |
+| `POST /v1/documents/convert` | key (scope `document`) | multipart: `file` (a PDF, DOCX or PPTX, at most 32 MiB, 100 pages or slides), `model`; answers `DocumentResult` (`schemas.py`): `markdown`, `truncated`, `page_spans`, `coverage`, `engine` (ANYM-850) |
 
 The key travels only in `Authorization: Bearer <key>`. A request header `X-Request-Deadline-Seconds: <n>`
 states the client's own deadline (the enrichment provider sends its `timeout_seconds`). Unknown request
@@ -268,6 +269,7 @@ engine must name phases that `models.json` pins (`<alias>/<phase>`), else the se
 | alias | scopes | phases (slot, `resident_gb`) |
 |---|---|---|
 | `audio-default` | `audio` | `langid` (gpu, 0.3: Whisper base, first 30 s, **skipped when the request names `language`**), then one route: Russian -> `gigaam` (cpu, 1.6: GigaAM v3 e2e-RNNT, onnx-asr, its Silero VAD for audio over 60 s), any other language -> `whisper` (gpu, 2.7: Whisper large-v3-turbo, mlx-whisper) |
+| `document-structure` | `document` | `docling` (gpu, 2.5, also its hard `rss_limit_gb`: Docling 2.149.0, layout heron and TableFormer accurate, OCR off; one child per job from its own venv, below) |
 | `vision-default` | `image`, `document` | `vlm` (gpu, 4.5: Qwen3.5-4B MLX 4-bit, mlx-vlm; measured 3.90 GB peak on the mini 11-02, plus 15 percent); an image chat needs scope `image`, a text-only chat scope `document` |
 
 `resident_gb` is the measured peak of the research run (local-inference-11-01) plus headroom; each phase is admitted
@@ -327,6 +329,21 @@ of them. `[tool.uv] no-build = true`: wheels with locked hashes only. On the min
 `mlx-whisper` declares `torch` as a dependency (never imported at run time); the supply-chain report is in the pull
 request.
 
+**Docling's own venv (ANYM-850).** `docling==2.149.0` needs `huggingface-hub<2`, which the service's pin excludes, so
+Docling lives in its own uv project, `docling/` (`pyproject.toml`, `uv.lock`: darwin/arm64 only, wheels with locked
+hashes, no `nvidia-*` package, the same torch as the service lock; `tests/test_engines_dependencies.py` keeps that).
+The deploy runs `uv sync --locked --compile-bytecode` there after the service sync and refuses the release if it fails.
+The `docling` engine starts `docling/.venv/bin/python` as the child of one job (stopped after it, so no memory stays
+between jobs); the child sniffs the file (zip members, encryption, page count) before any model runs and answers 422
+`unsupported_format`, `page_limit` or `invalid_document`; the service itself checks only the magic bytes. A Python
+audit hook in the child counts and refuses every outbound attempt from the Docling import on; an answer whose
+`engine.network_attempts` is not 0 is 502 `engine_failed`. The phase's `rss_limit_gb` (2.5) kills that child alone
+(502, refusal `memory_limit`). `/v1/models` lists the alias as `available` only when that venv's own package metadata
+matches the pins in `models.json` and the model files as they are now passed a full sha256 check (run in a thread,
+once per file stat). A request needs only a stat (names, sizes) and the full check its load runs anyway; a check that
+found the files wrong keeps the alias unavailable until they change, a cancelled one changes nothing. A Docling
+FAILURE on an input it could open is 502, never a final 422, and a refusal also fails when the child tried the network.
+
 ### Canary and egress probe
 
 `deedkit-inference canary --key-file F [--url U] [--set DIR] [--generate]` generates the synthetic set of
@@ -334,4 +351,8 @@ request.
 with the enrichment prompt, scores it against `tests/canary/expected.json` (character error per image, word error per
 note, real-time factor, the 20-minute recording's segment bounds, the JSON shape) and exits non-zero outside the
 bounds. `--egress` runs `egress_probe.py` as an engine child would (run it inside the service's sandbox profile): TCP
-and UDP to a loopback port other than the service's and to a public address must all fail.
+and UDP to a loopback port other than the service's and to a public address must all fail. `--documents` (with
+`--key-file`) sends only the committed document fixtures (`tests/canary/documents/`, `make_documents.py`) through
+`document-structure` and checks the `documents` bounds of `expected.json`: 0 outbound attempts, under 120 s and
+2,560 MB peak RSS per fixture, table rows, headings, Russian words and page order; it prints the figures, not the
+Markdown.
