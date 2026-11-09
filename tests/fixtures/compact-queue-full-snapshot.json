@@ -31,6 +31,7 @@
 "awaiting_reply_total":25,
 "bot_filter_coverage":"observed_sender_flags_only",
 "catalog_coverage":"archived_chats_only",
+"catalog_refresh":[{"account":"queue-tg","interval_s":900,"last_completed_at":null,"last_started_at":null,"limited":null,"state":"never"},{"account":"queue-wa","interval_s":null,"last_completed_at":null,"last_started_at":null,"limited":null,"state":"not_applicable"}],
 "conversation_view_version":1,
 "coverage":"partial_or_unknown",
 "group_attention_coverage":"observed_mentions_and_replies_only",

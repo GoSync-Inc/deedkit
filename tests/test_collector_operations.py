@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+from types import SimpleNamespace as NS
 
 from hypothesis import given, strategies as st
 import pytest
@@ -146,6 +147,38 @@ def test_cancelled_group_catalog_write_still_settles_the_confirmed_receipt_first
     assert job['_cancel_after_settle'] is True  # the command worker settles the receipt, then stops
     assert answer['outcome'] == 'confirmed' and answer['data']['archive'] == 'not_collected'
     assert answer['data']['archive_reason'] == 'catalog_failed' and 'chat_id' not in answer['data']
+
+
+def creation_notice(mid, chat=GROUP):
+    """The live service message Telegram sends when a basic group is created in the app (no DeedKit operation)."""
+    from telethon import types
+    return types.MessageService(id=mid, peer_id=types.PeerChat(-int(chat)), from_id=types.PeerUser(42),
+                                date=datetime(2026, 11, 9, 1, 10, tzinfo=timezone.utc), out=False,
+                                action=types.MessageActionChatCreate(title='Synthetic team', users=[42]))
+
+
+# spec: ANYM-845
+@pytest.mark.parametrize('policy,listed', [({}, True), ({'exclude': [GROUP]}, False), ({'discover': False}, False)],
+                         ids=['discovery_on', 'excluded', 'discovery_off_not_included'])
+def test_a_group_whose_only_message_is_its_live_creation_notice_is_listed_and_previewable(worker, policy, listed):
+    w, s, key = worker
+    if policy:
+        set_policy(w, policy)
+    w.policy = w.state.policy()
+    chat_id = stable_id('chat', w.account, GROUP)
+    assert chat_id not in [c['id'] for c in s.list_chats(key, accounts=[w.account])['items']]
+    # No dialog discovery pass runs: only the live capture and its archive write.
+    asyncio.run(w.capture(NS(message=creation_notice(7))))
+    w.spool.drain(w.state.apply)
+    assert (chat_id in [c['id'] for c in s.list_chats(key, accounts=[w.account])['items']]) is listed
+    if listed:
+        stored = s.get_messages(key, chat_id)['items']
+        assert [m.get('message_kind') for m in stored] == ['system'], stored
+        w.archive.set_sending(w.account, True)
+        w.state.phase('connection', 'connected', 'provider_ready')
+        sender = s.issue_key('notice-sender', [w.account], permissions=['read', 'send'])
+        preview = s.preview_message(sender, w.account, chat_id, 'Synthetic hello')
+        assert preview['chat_id'] == chat_id and preview.get('preview_digest')
 
 
 def test_history_gap_does_not_mark_connection_or_live_capture_failed(wa):
