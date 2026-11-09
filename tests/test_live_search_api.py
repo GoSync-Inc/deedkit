@@ -174,14 +174,27 @@ def test_send_claim_proceeds_while_a_live_receipt_is_held(live):
     worker = CommandWorker(state, None); job = worker.claim()
     holder = s.pool.getconn()
     holder.execute('SELECT 1 FROM messenger_commands WHERE id=%s FOR UPDATE', (job['id'],))
+    def receipt_waits():
+        # The lock graph, not wall time: the receipt's backend waits on the holder's row lock
+        # (one pool transaction per poll, so each read sees a fresh pg_stat_activity).
+        with s.pool.connection() as c:
+            return c.execute("SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND %s=ANY(pg_blocking_pids(pid))",
+                             (holder.info.backend_pid,)).fetchone() is not None
     found = {'outcome': 'confirmed', 'data': {'hits': []}}
-    receipt = threading.Thread(target=worker.finish_live, args=(job, 'succeeded', found, None, 5))
-    receipt.start(); time.sleep(0.3)  # the receipt now waits inside its transaction
+    # A budget no loaded host reaches: a send claim blocked behind the receipt would wait for all of it.
+    receipt = threading.Thread(target=worker.finish_live, args=(job, 'succeeded', found, None, 60))
+    receipt.start()
     try:
-        started = time.monotonic(); OutgoingWorker(state, None).claim(); took = time.monotonic() - started
+        deadline = time.monotonic() + 30
+        while not receipt_waits():
+            assert time.monotonic() < deadline, 'the receipt never waited on the held command row'
+            time.sleep(0.02)
+        # The receipt now waits inside its transaction and cannot end before the holder rolls back.
+        OutgoingWorker(state, None).claim()
+        # The claim returned while the receipt still waits, so it needed no lock the receipt holds.
+        assert receipt.is_alive() and receipt_waits()
     finally:holder.rollback()
     receipt.join(); s.pool.putconn(holder)
-    assert took < 1  # the receipt holds no lock a send claim needs
     assert s.get_messenger_operation(key, operation)['status'] == 'succeeded'
 
 
