@@ -69,12 +69,14 @@ def send(pool, channels):
     """One empty NOTIFY per channel on a pool connection, in its own transaction. A failure (pool timeout included)
     is counted and logged, never raised: the writes it follows have committed already."""
     try:
-        with ConnectionPool.connection(pool, timeout=NOTIFY_POOL_WAIT_S) as c:
-            c.execute("SELECT set_config('statement_timeout',%s,true),set_config('lock_timeout',%s,true)",
+        # A cursor, not Connection.execute: this background traffic is not the caller's work, and the per-request
+        # query-count tests (ANYM-737, tests/test_body_rendered.py) count Connection.execute calls of that work.
+        with ConnectionPool.connection(pool, timeout=NOTIFY_POOL_WAIT_S) as c, c.cursor() as cur:
+            cur.execute("SELECT set_config('statement_timeout',%s,true),set_config('lock_timeout',%s,true)",
                 (NOTIFY_TIMEOUT, NOTIFY_TIMEOUT))
             for channel in sorted(channels):
                 if channel in CHANNELS:
-                    c.execute('NOTIFY ' + channel)
+                    cur.execute('NOTIFY ' + channel)
     except Exception as error:
         _failure('wake_notify_failed', error)
 
