@@ -893,181 +893,235 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
         with store.pool.connection() as c:
             # ConnectionPool exits commit. Locks cover exactly one bounded
             # subscription batch, not the whole pass or any provider operation.
-            p = _worker_identity(c, candidate)
-            row = c.execute("SELECT * FROM subscriptions WHERE id=%s AND state='active' FOR UPDATE SKIP LOCKED",
-                (candidate['id'],)).fetchone()
-            if row is None:
-                continue
-            stats['checked'] += 1
-            if p is None:
-                c.execute("""UPDATE subscriptions SET state='access_changed',version=version+1,
+            _match_batch(c, candidate, batch_size, maximum, modules, stats)
+    return stats
+
+
+def _match_batch(c, candidate, batch_size, maximum, modules, stats):
+    """One subscription's batch in the pass's stage order: admit, read events, scope, scan, record, modules.
+    A stage that stops the batch returns before the next one; the caller's connection exit commits."""
+    admitted = _admit_batch(c, candidate, stats)
+    if admitted is None:
+        return
+    row, p, sources = admitted
+    head, events = _batch_events(c, row, batch_size)
+    count = c.execute('SELECT count(*) AS n FROM subscription_matches WHERE subscription=%s',
+        (row['id'],)).fetchone()['n']
+    lookup = {(source['account'], source['chat']): source['sender_ids'] for source in sources}
+    excluded = set(zip(*excluded_chats(row)))
+    scope = _batch_visibility(c, row, p, events, stats)
+    if scope is None:
+        return
+    visible, own = scope
+    scan = _scan_batch(c, row, p, events, head, count, maximum, (lookup, visible, excluded, own), stats)
+    _record_batch(c, row, p, events, batch_size, head, scan, stats)
+    if modules:
+        _match_modules(c, row, batch_size, maximum, stats)
+
+
+def _admit_batch(c, candidate, stats):
+    """The locked active definition, its worker identity and fixed sources, or None when the batch stops here."""
+    p = _worker_identity(c, candidate)
+    row = c.execute("SELECT * FROM subscriptions WHERE id=%s AND state='active' FOR UPDATE SKIP LOCKED",
+        (candidate['id'],)).fetchone()
+    if row is None:
+        return None
+    stats['checked'] += 1
+    if p is None:
+        c.execute("""UPDATE subscriptions SET state='access_changed',version=version+1,
                     updated_at=clock_timestamp() WHERE id=%s""", (row['id'],))
-                stats['access_changed'] += 1
-                continue
-            row = _state(c, row, p)
-            if row['state'] != 'active':
-                stats[row['state']] += 1
-                continue
-            sources = [] if dynamic(row) else c.execute('''SELECT account,chat,sender_ids FROM subscription_sources
+        stats['access_changed'] += 1
+        return None
+    row = _state(c, row, p)
+    if row['state'] != 'active':
+        stats[row['state']] += 1
+        return None
+    sources = [] if dynamic(row) else c.execute('''SELECT account,chat,sender_ids FROM subscription_sources
                 WHERE subscription=%s''', (row['id'],)).fetchall()
-            # Version equality is the fence, with a full source-scope check as a
-            # defensive boundary if records are restored or repaired externally.
-            if any(source['account'] not in p['accounts'] or
-                    p['chat_ids'] is not None and source['chat'] not in p['chat_ids'] for source in sources):
-                c.execute("""UPDATE subscriptions SET state='access_changed',version=version+1,
+    # Version equality is the fence, with a full source-scope check as a
+    # defensive boundary if records are restored or repaired externally.
+    if any(source['account'] not in p['accounts'] or
+            p['chat_ids'] is not None and source['chat'] not in p['chat_ids'] for source in sources):
+        c.execute("""UPDATE subscriptions SET state='access_changed',version=version+1,
                     updated_at=clock_timestamp() WHERE id=%s""", (row['id'],))
-                stats['access_changed'] += 1
-                continue
-            head = c.execute('SELECT value FROM feed_counter WHERE id=1').fetchone()['value']
-            # ANYM-824: the account's platform labels the pass's counts (accounts(id,platform), schema 60 grant).
-            events = c.execute('''SELECT e.id,e.account,e.kind,e.origin,e.created_at,e.snapshot->>'sent_at' AS sent_at,
+        stats['access_changed'] += 1
+        return None
+    return row, p, sources
+
+
+def _batch_events(c, row, batch_size):
+    """The committed feed head and the next batch of events after the definition's frontier, origins as seen."""
+    head = c.execute('SELECT value FROM feed_counter WHERE id=1').fetchone()['value']
+    # ANYM-824: the account's platform labels the pass's counts (accounts(id,platform), schema 60 grant).
+    events = c.execute('''SELECT e.id,e.account,e.kind,e.origin,e.created_at,e.snapshot->>'sent_at' AS sent_at,
                 coalesce(a.platform,'unknown') AS platform,
                 jsonb_strip_nulls(jsonb_build_object('chat',e.snapshot->'chat',
                     'sender',e.snapshot->'sender','direction',e.snapshot->'direction',
                     'metadata',e.snapshot->'metadata','reply_evidence',e.snapshot->'reply_evidence',
                     'principal',e.snapshot->'principal','key_id',e.snapshot->'key_id')) AS snapshot
                 FROM events e LEFT JOIN accounts a ON a.id=e.account WHERE e.id>%s AND e.id<=%s ORDER BY e.id LIMIT %s''',
-                (row['matched_through'], head, batch_size)).fetchall()
-            for event in events:
-                event['origin'] = seen_origin(row['selector']['origins'], event['origin'], event['kind'],
-                    event['sent_at'], event['created_at'])
-            count = c.execute('SELECT count(*) AS n FROM subscription_matches WHERE subscription=%s',
-                (row['id'],)).fetchone()['n']
-            lookup = {(source['account'], source['chat']): source['sender_ids'] for source in sources}
-            selector = row['selector']
-            excluded = set(zip(*excluded_chats(row)))
-            # ANYM-522: one locked scope snapshot per batch; the shared principal lock holds it until commit.
-            visible, own = None, set()
-            if dynamic(row):
-                try:
-                    with c.transaction():
-                        visible = _batch_scope(c, row, p, events)
-                        if visible and 'reply_to_own_send' in selector.get('wake_rules', ()):
-                            own = _own_send_replies(c, row, events, visible)
-                except Exception as error:
-                    # Only this definition waits: it goes to the back of the queue, the pass goes on.
-                    from .telemetry import capture
-                    capture(error, 'subscription_scope_failed')
-                    print(json.dumps({'error': 'subscription_scope_failed', 'class': type(error).__name__}), flush=True)
-                    c.execute('UPDATE subscriptions SET last_matched_at=clock_timestamp() WHERE id=%s', (row['id'],))
-                    stats['scope_failed'] += 1
-                    continue
-            position = row['matched_through']
-            newly_matched = False
-            missing = 0
-            activity = Counter()
-            reason = None
-            gap = row['gap'] if row['gap'] and row['gap'].get('intentional') else None
-            for event in events:
-                if event['id'] != position + 1:
-                    reason = 'journal_gap'
-                    gap = {'reason': reason, 'after': position, 'through': event['id'] - 1,
-                        'recoverable': False, 'requires_operator': True}
-                    break
-                snapshot = event['snapshot']
-                source = (event['account'], snapshot.get('chat'))
-                selected = source in lookup if visible is None else source in visible
-                failure = event['kind'] in FAILURE_KINDS
-                # ANYM-824: the first rule that leaves a selected message event out, in this loop's order.
-                metric = None
-                if failure:
-                    # Direction and senders describe messages; these kinds have their own audience.
-                    matches = (event['kind'] in selector['kinds'] and origin_selected(event['origin'], selector['origins']) and
-                        _failure_audience(event, selected, row, p))
-                else:
-                    matches = selected
-                    if matches and event['kind'] not in selector['kinds'] and (
-                            IMPLIED_KINDS.get(event['kind']) not in selector['kinds']):
-                        matches, metric = False, 'left_out_kind'
-                    if matches and quiet_group_change(snapshot):
-                        matches, metric = False, 'left_out_kind'
-                    if matches and not origin_selected(event['origin'], selector['origins']):
-                        matches, metric = False, 'left_out_origin'
-                    if matches and visible is not None:
-                        left = ('excluded_chat' if source in excluded else
-                            _dynamic_match(selector['sources'], visible[source], snapshot))
-                        if left is not None:
-                            left_out(row, event, left)
-                            matches, metric = False, 'left_out_' + left
-                    if matches and selector['direction']:
-                        if 'direction' not in snapshot:
-                            missing += 1
-                            matches = False
-                        else:
-                            matches = snapshot['direction'] == selector['direction']
-                        metric = None if matches else 'left_out_direction'
-                    if matches and lookup.get(source) is not None:
-                        if 'sender' not in snapshot:
-                            missing += 1
-                            matches = False
-                        else:
-                            matches = snapshot['sender'] in lookup[source]
-                        metric = None if matches else 'left_out_sender'
-                if matches and selector.get('wake_rules'):
-                    from .subscription_consumption import wake_reason
-                    evidence = {**snapshot, 'account': event['account'], 'kind': event['kind'],
-                        'historical': event['origin'] in ('backfill', 'reconcile'), 'reply_to_own_send': event['id'] in own}
-                    matches = bool(set(selector['wake_rules']) & set(wake_reason(evidence, selector)))
-                    if not matches and not failure:
-                        metric = 'left_out_wake_rule'
-                if matches:
-                    if count >= maximum:
-                        reason = 'match_budget'
-                        gap = {'reason': reason, 'after': position, 'through': head,
-                            'recoverable': True, 'requires_operator': True}
-                        # The event stays unscanned: the next pass after the budget frees reads it again. A failure
-                        # event counts only as matched_failure, so a stop at one is not counted here.
-                        if not failure:
-                            activity[(event['platform'], 'match_budget_blocked')] += 1
-                        break
-                    metric = 'matched_failure' if failure else 'matched'
-                    if visible is None:
-                        inserted = c.execute('''INSERT INTO subscription_matches(subscription,event)
-                            VALUES(%s,%s) ON CONFLICT DO NOTHING RETURNING event''', (row['id'], event['id'])).fetchone()
-                    else:
-                        inserted = c.execute('''INSERT INTO subscription_matches(subscription,event,account,chat,
-                            own_send_reply) VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING event''',
-                            (row['id'], event['id'], event['account'], snapshot.get('chat'), event['id'] in own)).fetchone()
-                    if inserted:
-                        count += 1
-                        stats['matched'] += 1
-                        newly_matched = True
-                position = event['id']
-                stats['scanned'] += 1
-                # Every selected message event has a metric here, so scanned = matched + left_out_*; failure events
-                # count only as matched_failure, and an event of an unselected chat counts nowhere.
-                if metric is not None:
-                    activity[(event['platform'], metric)] += 1
-                if selected and not failure:
-                    activity[(event['platform'], 'scanned')] += 1
-            # If the retained range ends below a known committed frontier, the
-            # tail was removed. Never convert that absence into a complete page.
-            if reason is None and len(events) < batch_size and position < head:
-                reason = 'journal_gap'
+        (row['matched_through'], head, batch_size)).fetchall()
+    for event in events:
+        event['origin'] = seen_origin(row['selector']['origins'], event['origin'], event['kind'],
+            event['sent_at'], event['created_at'])
+    return head, events
+
+
+def _batch_visibility(c, row, p, events, stats):
+    """(visible, own): a dynamic definition's scope snapshot and own-send replies; (None, set()) for fixed sources;
+    None when the scope read failed and only this definition waits."""
+    # ANYM-522: one locked scope snapshot per batch; the shared principal lock holds it until commit.
+    visible, own = None, set()
+    if dynamic(row):
+        try:
+            with c.transaction():
+                visible = _batch_scope(c, row, p, events)
+                if visible and 'reply_to_own_send' in row['selector'].get('wake_rules', ()):
+                    own = _own_send_replies(c, row, events, visible)
+        except Exception as error:
+            # Only this definition waits: it goes to the back of the queue, the pass goes on.
+            from .telemetry import capture
+            capture(error, 'subscription_scope_failed')
+            print(json.dumps({'error': 'subscription_scope_failed', 'class': type(error).__name__}), flush=True)
+            c.execute('UPDATE subscriptions SET last_matched_at=clock_timestamp() WHERE id=%s', (row['id'],))
+            stats['scope_failed'] += 1
+            return None
+    return visible, own
+
+
+def _event_verdict(event, row, p, scope):
+    """(matches, metric, missing, selected, failure) for one event. ANYM-824: metric is the first rule that leaves a
+    selected message event out, in this order; missing is 1 when the direction or sender evidence is absent."""
+    lookup, visible, excluded, own = scope
+    selector = row['selector']
+    snapshot = event['snapshot']
+    source = (event['account'], snapshot.get('chat'))
+    selected = source in lookup if visible is None else source in visible
+    failure = event['kind'] in FAILURE_KINDS
+    metric, missing = None, 0
+    if failure:
+        # Direction and senders describe messages; these kinds have their own audience.
+        matches = (event['kind'] in selector['kinds'] and origin_selected(event['origin'], selector['origins']) and
+            _failure_audience(event, selected, row, p))
+    else:
+        matches = selected
+        if matches and event['kind'] not in selector['kinds'] and (
+                IMPLIED_KINDS.get(event['kind']) not in selector['kinds']):
+            matches, metric = False, 'left_out_kind'
+        if matches and quiet_group_change(snapshot):
+            matches, metric = False, 'left_out_kind'
+        if matches and not origin_selected(event['origin'], selector['origins']):
+            matches, metric = False, 'left_out_origin'
+        if matches and visible is not None:
+            left = ('excluded_chat' if source in excluded else
+                _dynamic_match(selector['sources'], visible[source], snapshot))
+            if left is not None:
+                left_out(row, event, left)
+                matches, metric = False, 'left_out_' + left
+        if matches and selector['direction']:
+            if 'direction' not in snapshot:
+                missing += 1
+                matches = False
+            else:
+                matches = snapshot['direction'] == selector['direction']
+            metric = None if matches else 'left_out_direction'
+        if matches and lookup.get(source) is not None:
+            if 'sender' not in snapshot:
+                missing += 1
+                matches = False
+            else:
+                matches = snapshot['sender'] in lookup[source]
+            metric = None if matches else 'left_out_sender'
+    if matches and selector.get('wake_rules'):
+        from .subscription_consumption import wake_reason
+        evidence = {**snapshot, 'account': event['account'], 'kind': event['kind'],
+            'historical': event['origin'] in ('backfill', 'reconcile'), 'reply_to_own_send': event['id'] in own}
+        matches = bool(set(selector['wake_rules']) & set(wake_reason(evidence, selector)))
+        if not matches and not failure:
+            metric = 'left_out_wake_rule'
+    return matches, metric, missing, selected, failure
+
+
+def _scan_batch(c, row, p, events, head, count, maximum, scope, stats):
+    """Walk the batch in event order, inserting matches, until a journal gap or the match budget stops it.
+    Returns (position, reason, gap, missing, activity, newly_matched)."""
+    visible, own = scope[1], scope[3]
+    position = row['matched_through']
+    newly_matched = False
+    missing = 0
+    activity = Counter()
+    reason = None
+    gap = row['gap'] if row['gap'] and row['gap'].get('intentional') else None
+    for event in events:
+        if event['id'] != position + 1:
+            reason = 'journal_gap'
+            gap = {'reason': reason, 'after': position, 'through': event['id'] - 1,
+                'recoverable': False, 'requires_operator': True}
+            break
+        snapshot = event['snapshot']
+        matches, metric, absent, selected, failure = _event_verdict(event, row, p, scope)
+        missing += absent
+        if matches:
+            if count >= maximum:
+                reason = 'match_budget'
                 gap = {'reason': reason, 'after': position, 'through': head,
-                    'recoverable': False, 'requires_operator': True}
-            if reason:
-                stats['blocked'] += 1
-            stats['missing_evidence'] += missing
-            c.execute('''UPDATE subscriptions SET matched_through=%s,blocked_reason=%s,gap=%s,
+                    'recoverable': True, 'requires_operator': True}
+                # The event stays unscanned: the next pass after the budget frees reads it again. A failure
+                # event counts only as matched_failure, so a stop at one is not counted here.
+                if not failure:
+                    activity[(event['platform'], 'match_budget_blocked')] += 1
+                break
+            metric = 'matched_failure' if failure else 'matched'
+            if visible is None:
+                inserted = c.execute('''INSERT INTO subscription_matches(subscription,event)
+                            VALUES(%s,%s) ON CONFLICT DO NOTHING RETURNING event''', (row['id'], event['id'])).fetchone()
+            else:
+                inserted = c.execute('''INSERT INTO subscription_matches(subscription,event,account,chat,
+                            own_send_reply) VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING event''',
+                    (row['id'], event['id'], event['account'], snapshot.get('chat'), event['id'] in own)).fetchone()
+            if inserted:
+                count += 1
+                stats['matched'] += 1
+                newly_matched = True
+        position = event['id']
+        stats['scanned'] += 1
+        # Every selected message event has a metric here, so scanned = matched + left_out_*; failure events
+        # count only as matched_failure, and an event of an unselected chat counts nowhere.
+        if metric is not None:
+            activity[(event['platform'], metric)] += 1
+        if selected and not failure:
+            activity[(event['platform'], 'scanned')] += 1
+    return position, reason, gap, missing, activity, newly_matched
+
+
+def _record_batch(c, row, p, events, batch_size, head, scan, stats):
+    """Store the batch's frontier, gap and counts, record its activity, then the delivery hint for new matches."""
+    position, reason, gap, missing, activity, newly_matched = scan
+    # If the retained range ends below a known committed frontier, the
+    # tail was removed. Never convert that absence into a complete page.
+    if reason is None and len(events) < batch_size and position < head:
+        reason = 'journal_gap'
+        gap = {'reason': reason, 'after': position, 'through': head,
+            'recoverable': False, 'requires_operator': True}
+    if reason:
+        stats['blocked'] += 1
+    stats['missing_evidence'] += missing
+    c.execute('''UPDATE subscriptions SET matched_through=%s,blocked_reason=%s,gap=%s,
                 missing_evidence=missing_evidence+%s,last_matched_at=clock_timestamp()
                 WHERE id=%s''', (position, reason, Jsonb(gap) if gap else None, missing, row['id']))
-            if activity and not _record_pass_activity(c, row, p, activity, logged=stats['activity_failed'] > 0):
-                stats['activity_failed'] += 1
-            if newly_matched:
-                from .delivery_policy import after_match
-                try:
-                    # The hint step cannot undo or block the matches and frontier above:
-                    # a failure rolls back only the savepoint and a later tick reopens the range.
-                    with c.transaction():
-                        after_match(c, row, position, p)
-                except Exception as error:
-                    from .telemetry import capture
-                    capture(error, 'subscription_hint_failed')
-                    print(json.dumps({'error': 'subscription_hint_failed'}), flush=True)
-            if modules:
-                _match_modules(c, row, batch_size, maximum, stats)
-    return stats
+    if activity and not _record_pass_activity(c, row, p, activity, logged=stats['activity_failed'] > 0):
+        stats['activity_failed'] += 1
+    if newly_matched:
+        from .delivery_policy import after_match
+        try:
+            # The hint step cannot undo or block the matches and frontier above:
+            # a failure rolls back only the savepoint and a later tick reopens the range.
+            with c.transaction():
+                after_match(c, row, position, p)
+        except Exception as error:
+            from .telemetry import capture
+            capture(error, 'subscription_hint_failed')
+            print(json.dumps({'error': 'subscription_hint_failed'}), flush=True)
 
 
 def _match_modules(c, row, batch_size, maximum, stats):
