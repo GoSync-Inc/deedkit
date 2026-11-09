@@ -152,7 +152,7 @@ def test_sync_status_counts_waiting_audio_as_on_request(cov):
     music = stored(ar, s, 'audio/mpeg')
     with s.pool.connection() as c:
         mid, chat = c.execute('''UPDATE chats SET chat_type='group' FROM attachments a JOIN messages m ON m.id=a.message
-            WHERE a.id=%s AND chats.id=m.chat RETURNING m.id, chats.id''', (music,)).fetchone().values()
+            WHERE a.id=%s AND chats.id=m.chat RETURNING m.id AS mid, chats.id AS chat''', (music,)).fetchone().values()
         c.execute('''INSERT INTO message_metadata(message,revision,metadata)
             SELECT id,revision,'{"media_kind":"audio"}'::jsonb FROM messages WHERE id=%s''', (mid,))
     token = s.issue_key('audio-watcher', [ACCOUNT], permissions=['read', 'subscription-write'],

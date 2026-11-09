@@ -99,10 +99,23 @@ RECOGNITION_REASON='(SELECT orr.reason FROM ('+ON_REQUEST_CHATS+') orr WHERE orr
 IMAGE_DESCRIPTION_DAYS=7
 IMAGE_STICKER=("EXISTS(SELECT FROM message_metadata smd WHERE smd.message=m.id"
     " AND smd.metadata->>'media_kind'='sticker')")
+# ANYM-890 (owner 11-09, «отсеять из очереди совсем не нужное»; groups and channels: «их лучше не надо»): in a group or
+# channel chat (ANYM-805's chat kind, subscribed chats included) an audio file whose message names a media kind other
+# than voice (music, a recording sent as audio or as a file) is transcribed when an agent asks. Voice notes, personal
+# chats, chats of unknown kind and audio whose message names no media kind keep automatic transcription. Video, round
+# notes included (media_kind video in both adapters), is not audio and is not read by this rule.
+AUDIO_GROUP_CHAT=("EXISTS(SELECT FROM chats gc LEFT JOIN collector_chats gcc ON gcc.account=gc.account"
+    " AND gcc.provider_chat=gc.provider_chat WHERE gc.id=m.chat AND (gc.chat_type IN ('group','channel')"
+    " OR NOT coalesce(gc.chat_type IN ('private','group','channel'),false) AND gcc.peer_kind IN ('chat','channel')))")
+AUDIO_NOT_VOICE=("EXISTS(SELECT FROM message_metadata vmd WHERE vmd.message=m.id"
+    " AND vmd.metadata->>'media_kind'<>'voice')")
+def audio_mime(mime):
+    return "(left("+mime+",6)='audio/' OR "+mime+"='application/ogg')"
 def description_shape(mime):
-    """An image (by the SQL text `mime`) of message m that is old or a sticker."""
-    return ("left("+mime+",6)='image/' AND (m.sent_at<statement_timestamp()-interval '"
-        +str(IMAGE_DESCRIPTION_DAYS)+" days' OR "+IMAGE_STICKER+")")
+    """An image (by the SQL text `mime`) of message m that is old or a sticker, or non-voice audio in a group (ANYM-890)."""
+    return ("(left("+mime+",6)='image/' AND (m.sent_at<statement_timestamp()-interval '"
+        +str(IMAGE_DESCRIPTION_DAYS)+" days' OR "+IMAGE_STICKER+") OR "+audio_mime(mime)+" AND "+AUDIO_NOT_VOICE
+        +" AND "+AUDIO_GROUP_CHAT+")")
 
 
 DESCRIPTION_SHAPE=description_shape('a.mime')
@@ -113,14 +126,16 @@ DESCRIPTION_SKIPPED=("("+DESCRIPTION_SHAPE+" AND EXISTS(SELECT FROM media_jobs d
 # The same rule over an already joined media job `job` (sync status and the health check join it by id).
 def description_skipped_row(job):
     return "("+job+".id IS NOT NULL AND "+job+".request_key_digest IS NULL AND "+DESCRIPTION_SHAPE+")"
-DESCRIPTION_REASON=("CASE WHEN "+IMAGE_STICKER+" THEN 'sticker' ELSE 'image_outside_description_window' END")
+DESCRIPTION_REASON=("CASE WHEN left(a.mime,6)<>'image/' THEN 'audio_not_a_voice_note' WHEN "+IMAGE_STICKER
+    +" THEN 'sticker' ELSE 'image_outside_description_window' END")
 # The rule as it applies to one enrichment row e: only work that has not started (unconfigured or queued) waits; a
 # lease, a result or a failure keeps its state and its retries (claim, sync status and health apply the same states).
-# For statuses, also only where a worker could describe it: queued, or unconfigured with an enabled image profile (with
-# none, the status stays not_configured).
-DESCRIPTION_WAITS=("(left(a.mime,6)='image/' AND (e.state='queued' OR coalesce(e.state,'unconfigured')='unconfigured'"
-    " AND EXISTS(SELECT FROM processing_profiles dpp WHERE dpp.account=m.account AND dpp.enabled AND dpp.kind='image'))"
-    " AND "+DESCRIPTION_SKIPPED+")")
+# For statuses, also only where a worker could describe it: queued, or unconfigured with an enabled image (audio)
+# profile (with none, the status stays not_configured).
+DESCRIPTION_WAITS=("((left(a.mime,6)='image/' OR "+audio_mime('a.mime')+") AND (e.state='queued'"
+    " OR coalesce(e.state,'unconfigured')='unconfigured' AND EXISTS(SELECT FROM processing_profiles dpp"
+    " WHERE dpp.account=m.account AND dpp.enabled AND dpp.kind=CASE WHEN left(a.mime,6)='image/' THEN 'image'"
+    " ELSE 'audio' END)) AND "+DESCRIPTION_SKIPPED+")")
 ENRICHMENT_REASON="CASE WHEN "+DESCRIPTION_WAITS+" THEN "+DESCRIPTION_REASON+" END AS description_reason"
 # Columns the policy reads (the worker role files grant exactly these).
 POLICY_COLUMNS=(('chats','id'),('chats','account'),('chats','provider_chat'),('chats','chat_type'),

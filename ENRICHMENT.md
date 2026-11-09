@@ -506,3 +506,17 @@ retention applies. `get_sync_status` counts these images under `available_on_req
 raises no alarm for them. The window is a module setting, not a worker config key, because the API, the health
 check and the worker must read the same window. A group's or channel's images are described only when a
 subscription names that chat; a dynamic (all-chats) subscription lists no chat, so it does not count (ANYM-805).
+
+### Voice notes only in groups and channels (ANYM-890)
+
+Owner 2026-11-09: «отсеять из очереди совсем не нужное»; on groups and channels: «их лучше не надо». In a group or
+channel chat (ANYM-805's chat kind, subscribed chats included) an audio file (`audio/*` or `application/ogg`) whose
+message metadata names a `media_kind` other than `voice` (music and recordings sent as `audio`, or audio sent as a
+`document`) waits for an agent's request exactly like ANYM-887's images: the same request evidence, statuses
+(`available_on_request`, `recognition_reason: audio_not_a_voice_note`, `recognition_next_action:
+request_file_download`), sync-status bucket and health exclusion; a requested file counts as fresh. Voice notes
+(Telegram voice, WhatsApp `ptt`) are transcribed by themselves in every chat. Personal chats, chats of unknown kind
+and audio whose message names no media kind (legacy or imported rows) are unchanged. Video, round video notes
+included (both adapters record them as `video`), is not read by this rule. ANYM-805's reason wins in an unsubscribed
+group. Only work that has not started waits: a queued non-voice group audio row reads `available_on_request` after
+the release without anyone asking, and becomes `queued` again once an agent asks.

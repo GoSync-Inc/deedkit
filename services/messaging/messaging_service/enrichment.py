@@ -334,12 +334,13 @@ class EnrichmentWorker:
             old_kind=sum(n for (_,k),n in old_used.items() if k==kind)
             backlog=[account for account in eligible if old_account(account)<backlog_allowance(account_cap(account),share)
                 ] if old_open and old_kind<backlog_allowance(profile_cap,share) else []
-            condition={'audio':"(a.mime LIKE 'audio/%%' OR a.mime='application/ogg')",'image':"a.mime LIKE 'image/%%' AND NOT (e.state IN ('unconfigured','queued') AND "+skipped+")",
+            condition={'audio':"(a.mime LIKE 'audio/%%' OR a.mime='application/ogg') AND NOT (e.state IN ('unconfigured','queued') AND "+skipped+")",'image':"a.mime LIKE 'image/%%' AND NOT (e.state IN ('unconfigured','queued') AND "+skipped+")",
                 'document':"a.mime NOT LIKE 'audio/%%' AND a.mime<>'application/ogg' AND a.mime NOT LIKE 'image/%%' AND f.state='ready' AND f.source_revision=m.revision AND f.source_digest=a.digest AND length(f.text_content)>0"}[kind]
             # A note downloaded on request today is as fresh as one sent today (ANYM-455).
             fresh="m.sent_at>=clock_timestamp()-interval '1 day'"+(" OR r.updated_at>=clock_timestamp()-interval '1 day'" if kind=='audio' else '')
-            # An image an agent asked for is as fresh as a new one (owner 11-09: old ones wait for that request).
-            if kind=='image' and skipped!='false':
+            # An image or audio file an agent asked for is as fresh as a new one (owner 11-09: skipped ones wait for that
+            # request; ANYM-887, ANYM-890).
+            if kind in ('image','audio') and skipped!='false':
                 fresh+=' OR EXISTS(SELECT FROM media_jobs fj WHERE fj.id=a.id AND fj.request_key_digest IS NOT NULL)'
             residency=' LEFT JOIN attachment_residency r ON r.digest=a.digest' if kind=='audio' else ''
             yield kind,profile,ph,'''SELECT e.*,a.message,a.mime,a.bytes,m.account,m.sent_at,coalesce(f.text_content,'') AS source_text,
