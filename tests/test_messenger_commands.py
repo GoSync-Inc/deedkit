@@ -410,8 +410,9 @@ def test_delete_member_messages_preview_hides_an_unreadable_channel_and_needs_it
                        permissions=MODERATOR)
     chat=s.preview_messenger_operation(scoped,**moderation_args('-1003',ids['comment']))['moderation']['chat']
     assert chat['chat_type']=='discussion group of a channel this key cannot read'
-    assert 'Synthetic news' not in str(s.preview_messenger_operation(scoped,**moderation_args('-1003',ids['comment'])))
-    full=s.issue_key('command-agent',['command-fixture'],permissions=MODERATOR)
+    # The channel's title, not the group's own ('Synthetic news chat'), appears nowhere in the preview.
+    assert "Synthetic news'" not in str(s.preview_messenger_operation(scoped,**moderation_args('-1003',ids['comment'])))
+    full=s.issue_key('command-agent',['command-fixture'],chats=None,permissions=MODERATOR)  # the policy is per principal
     assert s.preview_messenger_operation(full,**moderation_args('-1001',ids['spam']))['moderation']['chat'][
         'chat_type']=='supergroup'
 

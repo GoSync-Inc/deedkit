@@ -226,15 +226,17 @@ def test_the_archive_write_after_a_member_deletion_frees_the_archive_lock_at_its
     answer={'outcome':'confirmed','data':{'results':[{'message_id':mid,'state':'deleted'}]}}
     with s.pool.connection() as holder:
         holder.execute('SELECT pg_advisory_lock(hashtextextended(%s,0))',('archive:command-fixture',))
-        try:
-            assert asyncio.run(member_messages.record_deletions(state,job,answer))==0
+        async def write_then_look():
+            # Look while the loop still runs, as in the command loop: asyncio.run's exit would wait for the thread.
+            assert await member_messages.record_deletions(state,job,answer)==0
             ends=time.monotonic()+1.5
             while True:
                 waiting=holder.execute("SELECT count(*) AS n FROM pg_locks WHERE locktype='advisory' AND NOT granted"
                                        ).fetchone()['n']
-                if not waiting or time.monotonic()>ends:break
+                if not waiting or time.monotonic()>ends:return waiting
                 time.sleep(0.1)
-            assert waiting==0
+        try:
+            assert asyncio.run(write_then_look())==0
         finally:
             holder.execute('SELECT pg_advisory_unlock(hashtextextended(%s,0))',('archive:command-fixture',))
     with s.pool.connection() as c:
