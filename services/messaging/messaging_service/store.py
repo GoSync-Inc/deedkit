@@ -744,10 +744,14 @@ class Store:
         with self.authorized(token,'get_file_segments') as (c,p):
             return get_file_segments(self,c,p,attachment_id,offset=offset,limit=limit)
 
-    def get_sync_status(self,token,chat_id='',from_time='',to_time='',refresh=True):
+    def get_sync_status(self,token,chat_id='',from_time='',to_time='',refresh=True,include_latency=False,latency_window_h=24):
         from .sync_status import get_sync_status
+        from . import stage_latency
         with self.authorized(token,'get_sync_status') as (c,p):
-            if type(refresh) is not bool:raise APIError('invalid_filter')
+            if type(refresh) is not bool or type(include_latency) is not bool:raise APIError('invalid_filter')
+            # ANYM-865: the latency block is an account summary; a chat's status has none.
+            if not stage_latency.valid_window(latency_window_h) or include_latency and chat_id:
+                raise APIError('invalid_argument')
             if chat_id:
                 from .chat_evidence import chat_statuses
                 lower,upper=date_bound(from_time),date_bound(to_time)
@@ -757,7 +761,7 @@ class Store:
                 if not data:raise APIError('not_found',404)
                 targets(p,[chat_id]);return serial(data[chat_id])
             if from_time or to_time:raise APIError('chat_required')
-            cache_key=(p['key_id'],p['scope_version'])
+            cache_key=(p['key_id'],p['scope_version'],latency_window_h if include_latency else None)
             now=time.monotonic()
             with self._status_cache_lock:
                 cached=self._status_cache.get(cache_key)
@@ -767,6 +771,9 @@ class Store:
                     result['cache']={'hit':True,'age_seconds':round(now-cached[0],3),'max_age_seconds':10}
                     return result
             result=serial(get_sync_status(c,p))
+            if include_latency:
+                # Bounded, read-only and degraded per stage group; it never fails the summary (ANYM-865).
+                result.update(serial(stage_latency.read(c,p,latency_window_h,owner=(p['id'],p['key_id']))))
             result['observed_at']=datetime.now(timezone.utc).isoformat()
             with self._status_cache_lock:
                 self._status_cache[cache_key]=(time.monotonic(),json.dumps(result))
