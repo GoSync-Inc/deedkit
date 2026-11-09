@@ -227,10 +227,10 @@ On Telegram accounts an agent can write to a person by `@username` when the arch
 has no chat with them (ANYM-643), with `username` instead of `chat_id`:
 
 1. `preview_message(account, username, text)`: `username` is `@name`, `name` or
-   `https://t.me/name` of a person, not a bot, channel or group. Exactly one of
+   `https://t.me/name` of a person or a bot, not a channel or group. Exactly one of
    `chat_id`, `phone` and `username` is given, else `invalid_arguments`. The preview
    runs one `open_chat_by_username` lookup at Telegram (`create=false`, up to 20
-   seconds) and returns the usual draft plus `username`, `user_id`, `name`,
+   seconds) and returns the usual draft plus `username`, `user_id`, `name`, `is_bot`,
    `chat_existed` (with `chat_id` only then), `preview_contacts_provider: true` and
    `preview_digest_expires_at`. The digest binds the account, the username, that
    one lookup, the resolved user ID and the rendered draft, for 10 minutes. A lookup

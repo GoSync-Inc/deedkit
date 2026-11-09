@@ -455,7 +455,7 @@ def register_send_tools(mcp, call, async_call, read):
 
         Pass exactly one recipient: chat_id (archive ID), phone (native WhatsApp: E.164
         with or without +, or a @c.us/@s.whatsapp.net JID) or username (Telegram: @name of a
-        person, not a bot, channel or group). A chat_id preview contacts no
+        person or a bot, not a channel or group). A chat_id preview contacts no
         provider and requires read permission for the account/chat and any reply target,
         with no sending-policy or connected-collector requirement. A phone preview
         contacts the provider: it does one open_chat_by_phone lookup (send key, full
@@ -463,7 +463,7 @@ def register_send_tools(mcp, call, async_call, read):
         on_whatsapp, verified_name, chat_existed, chats_on_other_accounts and a digest
         bound to the number and its WhatsApp identity, valid 10 minutes. A username preview
         likewise does one open_chat_by_username lookup at Telegram (own hourly quota) and returns
-        username, user_id, name, chat_existed and a digest bound to the resolved user ID, valid
+        username, user_id, name, is_bot, chat_existed and a digest bound to the resolved user ID, valid
         10 minutes. Returns visible/wire text,
         structured entities, warnings, link destinations, UTF-16 lengths, renderer
         version and a preview_digest bound to this principal, scope and exact payload.

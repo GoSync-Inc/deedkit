@@ -18,7 +18,7 @@ CATALOG_VERSION = 1
 PHONE_LIMITATION = ('Native WhatsApp (whatsmeow) accounts only. One number per call: create=false checks it and '
     'writes nothing; create=true after the owner confirms returns the chat_id for send_message. At most 10 provider '
     'lookups per account per rolling hour; requires discover_chats. Sends still need exact owner confirmation.')
-USERNAME_LIMITATION = ('Telegram only. One @username per call, a person only (no bot, channel or group): '
+USERNAME_LIMITATION = ('Telegram only. One @username per call, a person or a bot (no channel or group): '
     'create=false resolves it at Telegram and writes nothing; create=true after the owner confirms returns the '
     'chat_id. At most 20 provider lookups per account per rolling hour; requires discover_chats. Sends still need '
     'exact owner confirmation.')
@@ -416,8 +416,8 @@ def parameter_format(platform, kind):
         'phone': 'international number of 5-20 digits, the first 1-9, with an optional leading +, no spaces or punctuation',
         'phone_number': 'international number with its country code, such as +49 151 1234-5678 or 0049 (151) 12345678; '
             'spaces, dashes, dots and parentheses are ignored; 7-15 digits, no national trunk 0',
-        'telegram_username': ('Telegram username of a person: @NAME, NAME or https://t.me/NAME (NAME 4-32 letters, '
-            'digits or _, starting with a letter); not a bot, channel or group'),
+        'telegram_username': ('Telegram username of a person or a bot: @NAME, NAME or https://t.me/NAME (NAME 4-32 letters, '
+            'digits or _, starting with a letter); not a channel or group'),
         'file_mode': 'one of ' + ', '.join(_modes(platform)),
         'message_format': 'one of plain, markdown, html, as send_message; markdown and html on Telegram only',
         'chat_link': ('https://t.me/+CODE, https://t.me/joinchat/CODE (CODE 8-64 letters, digits, _ or -), '

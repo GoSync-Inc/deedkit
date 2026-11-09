@@ -128,7 +128,7 @@ def preview_result(store, c, p, account, username, operation_id, text, reply_to,
     expires = c.execute("SELECT %s::timestamptz+%s*interval '1 second' AS at",
                         (row['finished_at'], DIGEST_VALID_SECONDS)).fetchone()['at']
     return serial({**draft, 'username': '@'+username, 'user_id': user_id, 'name': data.get('name'),
-                   'chat_existed': existed, 'preview_contacts_provider': True, 'lookup_operation_id': operation_id,
+                   'is_bot': data.get('is_bot') is True, 'chat_existed': existed, 'preview_contacts_provider': True, 'lookup_operation_id': operation_id,
                    'preview_digest_expires_at': expires})
 
 
@@ -144,7 +144,8 @@ def _sent(store, c, p, row, step):
     from .outgoing import result
     data = (status(store, c, p, step['id'])['result'] or {}).get('data') or {}
     return {**result(row, c, p), 'chat_id': row['chat'], 'chat_existed': data.get('existing') is True,
-            'user_id': step['payload'].get('expected_user_id'), 'name': step['payload'].get('preview_name')}
+            'user_id': step['payload'].get('expected_user_id'), 'name': step['payload'].get('preview_name'),
+            'is_bot': data.get('is_bot') is True}
 
 
 def send_begin(store, c, p, account, username, text, request_id, reply_to, format, preview_digest,

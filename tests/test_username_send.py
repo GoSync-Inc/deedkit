@@ -39,9 +39,9 @@ def telegram(seeded):
     archive.release(ACCOUNT, 'send-test', state.lease[1])
 
 
-def answer(user=USER, name='Synthetic Person'):
+def answer(user=USER, name='Synthetic Person', **extra):
     return {'outcome': 'confirmed', 'data': {'found': True, 'user_id': user, 'username': USERNAME, 'name': name,
-                                             'provider_lookup': True}}
+                                             'provider_lookup': True, **extra}}
 
 
 def dispatch(state, jobs, result):
@@ -111,6 +111,7 @@ def test_preview_resolves_once_binds_the_user_and_writes_no_chat(telegram):
     result = preview(s, key, state, jobs)
     assert result['username'] == '@' + USERNAME and result['user_id'] == USER and result['name'] == 'Synthetic Person'
     assert result['chat_existed'] is False and result['chat_id'] is None and result['preview_contacts_provider'] is True
+    assert result['is_bot'] is False
     assert len(jobs) == 1 and jobs[0]['parameters'] == {'username': USERNAME, 'create': False}
     assert count(s, 'chats', f"id='{CHAT}'") == 0
     # A repeat within the validity reuses the lookup: no second provider request.
@@ -138,6 +139,22 @@ def test_send_rechecks_the_user_opens_the_chat_and_queues_once(telegram):
     assert replay['send_id'] == sent['send_id'] and len(jobs) == 2 and count(s, 'outgoing_messages') == 1
     with pytest.raises(APIError, match='idempotency_conflict'):
         send(s, key, state, jobs, digest, text='Another synthetic text')
+
+
+# spec: ANYM-643
+def test_a_bot_user_is_previewed_and_sent_like_a_person_and_marked_is_bot(telegram):
+    s, archive, state, key = telegram
+    jobs = []
+    bot = answer(name='Synthetic Bot', is_bot=True)
+    shown = preview(s, key, state, jobs, result=bot)
+    assert shown['is_bot'] is True and shown['user_id'] == USER and shown['name'] == 'Synthetic Bot'
+    sent = send(s, key, state, jobs, shown['preview_digest'], result=bot)
+    assert sent['chat_id'] == CHAT and sent['is_bot'] is True and count(s, 'outgoing_messages') == 1
+    with s.pool.connection() as c:
+        chat = c.execute('SELECT title,chat_type,provider_chat FROM chats WHERE id=%s', (CHAT,)).fetchone()
+        receipt = c.execute("SELECT result FROM messenger_commands WHERE payload->'parameters'->>'create'='true'").fetchone()
+    assert chat == {'title': 'Synthetic Bot', 'chat_type': 'private', 'provider_chat': USER}
+    assert receipt['result']['data']['is_bot'] is True
 
 
 # spec: ANYM-643
@@ -223,10 +240,13 @@ def test_the_collector_resolves_one_person_and_refuses_bots_channels_and_unknown
     client = Client(resolved(types.User(id=int(USER), access_hash=1, first_name='Synthetic', last_name='Person')))
     out = asyncio.run(execute(client, job()))
     assert out == {'outcome': 'confirmed', 'data': {'found': True, 'user_id': USER, 'username': USERNAME,
-                                                    'name': 'Synthetic Person', 'provider_lookup': True}}
+                                                    'name': 'Synthetic Person', 'is_bot': False, 'provider_lookup': True}}
     assert len(client.calls) == 1 and isinstance(client.calls[0], functions.contacts.ResolveUsernameRequest)
-    cases = [(Client(resolved(types.User(id=5, access_hash=1, bot=True))), 'recipient_not_user'),
-             (Client(types.contacts.ResolvedPeer(peer=types.PeerChannel(9), chats=[], users=[])), 'recipient_not_user'),
+    # Owner 11-09: a bot user is accepted like a person and marked is_bot; channels and groups stay refused.
+    bot = asyncio.run(execute(Client(resolved(types.User(id=5, access_hash=1, bot=True, first_name='Synthetic Bot'))),
+                              job()))
+    assert bot['outcome'] == 'confirmed' and bot['data']['is_bot'] is True and bot['data']['user_id'] == '5'
+    cases = [(Client(types.contacts.ResolvedPeer(peer=types.PeerChannel(9), chats=[], users=[])), 'recipient_not_user'),
              (Client(resolved(types.User(id=5, access_hash=1, deleted=True))), 'username_not_found'),
              (Client(error=errors.UsernameNotOccupiedError(None)), 'username_not_found')]
     for candidate, code in cases:
