@@ -14,7 +14,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from ..errors import ServiceError
-from ..models import phase_dir, phase_key
+from ..models import ModelError, phase_dir, phase_key, verify_phase
 from ..schemas import DOCUMENT_MAX_CHARS, DOCUMENT_MAX_PAGES, DOCUMENT_REFUSALS, DocumentResult
 from . import BadOutput, Rejected
 from .pinned import PinnedEngine
@@ -79,7 +79,8 @@ class DoclingEngine(PinnedEngine):
         threads = str(int(self.options.get("threads", 2)))
         return {"OMP_NUM_THREADS": threads, "MKL_NUM_THREADS": threads}
 
-    _failed_stamp = None  # the files' stat when the last full check before a load failed (Astra r1, ANYM-850)
+    _failed_stamp = None  # the files' stat when the last full check found them wrong (Astra r1, ANYM-850)
+    _verified_stamp = None  # the files' stat when the last full check passed (Sol r2)
 
     def unavailable(self) -> str | None:
         packages = self.packages("docling")
@@ -113,14 +114,37 @@ class DoclingEngine(PinnedEngine):
             return "model_file_mismatch"  # the full check failed on exactly these files; a new pull changes the stamp
         return problem
 
+    def note_check(self, stamp, error):
+        """Remember the outcome of a full check of `stamp`. Only a finding about the files counts: a cancelled check
+        (the client left while it hashed, Sol r2) says nothing about them and changes nothing."""
+        if error is None:
+            self._verified_stamp, self._failed_stamp = stamp, None
+        elif error.code != "cancelled":
+            self._failed_stamp, self._verified_stamp = stamp, None
+
+    def available(self) -> bool:
+        """/v1/models (in a thread): advertised only after a full sha256 check of the files as they are now passed."""
+        if self.unavailable() is not None:
+            return False
+        _, stamp = self.model_stamp()
+        if stamp != self._verified_stamp:
+            try:
+                verify_phase(self.context.models, self.context.model_dir, self.alias, "docling")
+            except ModelError as error:
+                self.note_check(stamp, error)
+                return False
+            self.note_check(stamp, None)
+        return True
+
     def prepare(self, phase_name, cancel=None):
         _, stamp = self.model_stamp()
         try:
             launch = super().prepare(phase_name, cancel)
-        except ServiceError:
-            self._failed_stamp = stamp
+        except ServiceError as error:
+            if isinstance(error.__cause__, ModelError):
+                self.note_check(stamp, error.__cause__)
             raise
-        self._failed_stamp = None
+        self.note_check(stamp, None)
         return launch
 
     def venv_problem(self, packages) -> str | None:

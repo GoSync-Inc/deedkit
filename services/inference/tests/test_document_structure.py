@@ -4,6 +4,7 @@ its own venv and models, and the runtime's pure parts (format sniffing, page spa
 import io
 import json
 import sys
+import threading
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -259,16 +260,32 @@ def test_the_alias_is_unavailable_while_its_models_are_missing_or_failed_their_f
     assert engine.unavailable() == "model_file_mismatch"
     first.write_bytes(data)
     flip_in_place(first)
-    assert engine.unavailable() is None  # same size: only the full check sees it
-    with pytest.raises(ServiceError):
-        engine.prepare("docling")
+    assert engine.unavailable() is None  # same size: a stat cannot see it, the request's own load check would
+    assert engine.available() is False  # /v1/models runs the full check first (Sol r2): never advertised
     assert engine.unavailable() == "model_file_mismatch"
     first.unlink()
     first.write_bytes(data)  # a new pull: new file, new stamp
-    assert engine.unavailable() is None
+    assert engine.unavailable() is None and engine.available() is True
+    flip_in_place(first)
+    with pytest.raises(ServiceError):  # the load's full check finds it too
+        engine.prepare("docling")
+    assert engine.unavailable() == "model_file_mismatch" and engine.available() is False
+    first.unlink()
+    first.write_bytes(data)
     launch = engine.prepare("docling")
     assert engine.unavailable() is None and launch.argv[0] == python
+    # A check cancelled while it hashed (the client left) says nothing about the files: the alias stays available.
+    gone = threading.Event()
+    gone.set()
+    with pytest.raises(ServiceError):
+        engine.prepare("docling", cancel=gone)
+    assert engine.unavailable() is None and engine.available() is True
+    fresh = engine_with(python, models, str(store))
+    with pytest.raises(ServiceError):
+        fresh.prepare("docling", cancel=gone)
+    assert fresh.unavailable() is None and fresh.available() is True
     assert engine_with(python, models, str(tmp_path / "nowhere")).unavailable() == "model_missing"
+
 
 def zip_bytes(names, encrypted=False):
     buffer = io.BytesIO()

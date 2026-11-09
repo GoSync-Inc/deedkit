@@ -365,14 +365,14 @@ def create_app(config, probe=None, wall=time.time, yield_settings=None, sampler=
     async def models(request, service, ctx):
         auth = service.authenticate(request)
         ctx.principal = auth.id
-        data = [
-            {"id": name, "object": "model", "scopes": spec.scopes, "engine": spec.engine,
-             "revision": service.engines[name].revision(),
-             # ANYM-850: false while the engine cannot serve (a venv, a package or a tool missing or off its pin).
-             "available": service.engines[name].unavailable() is None}
-            for name, spec in sorted(config.aliases.items())
-            if auth.scopes & set(spec.scopes)
-        ]
+        data = []
+        for name, spec in sorted(config.aliases.items()):
+            if auth.scopes & set(spec.scopes):
+                engine = service.engines[name]
+                # ANYM-850: false while the engine cannot serve (a venv, a package or a tool missing or off its pin;
+                # for Docling also model files that have not passed a full check). In a thread: that check hashes.
+                data.append({"id": name, "object": "model", "scopes": spec.scopes, "engine": spec.engine,
+                             "revision": engine.revision(), "available": await asyncio.to_thread(engine.available)})
         return JSONResponse({
             "object": "list",
             "data": data,

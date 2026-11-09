@@ -100,6 +100,10 @@ class Engine:
         """A reason (machine code) when this engine cannot serve now: packages missing, tools missing."""
         return None
 
+    def available(self) -> bool:
+        """What /v1/models advertises; runs in a thread, so an engine may check more than `unavailable` does."""
+        return self.unavailable() is None
+
     def argv(self, ctx):
         raise NotImplementedError
 
