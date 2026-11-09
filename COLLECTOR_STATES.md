@@ -8,7 +8,8 @@ account queues, processing profile summaries or lease observations.
 `enrichment_health` (top level, ANYM-785) is the API's last check of the mini's queue:
 `checked_at` and, per permitted account, `codes` (`enrichment_stalled`,
 `enrichment_starved`, `enrichment_no_worker`) and `counts` per kind (`queued`,
-`sent_6h_to_48h`). It is read from memory and runs no query. It is `null` before this
+`sent_6h_to_48h`, and `reused_24h` when ready copies of a duplicate file were written in the last 24 hours,
+ANYM-912). It is read from memory and runs no query. It is `null` before this
 generation's first check and for a chat-restricted reader. An old `checked_at` means the
 check is failing (log line `enrichment_health_unavailable`).
 `detail=compact` names only accounts with codes or counts and omits the key when none has any.

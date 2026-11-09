@@ -517,7 +517,9 @@ a normal lease and publishes the same readiness event. It counts no model attemp
 start time and takes no local resource lease. The copy's metadata adds `reused: true` and `reused_from` (the first
 source attachment id; a copy of a copy names the original). Agents see only `enrichment_coverage.reused` in
 `get_file_text`; `reused_from` is operator evidence for SQL and never leaves the database through an agent read or an
-event. No match means a normal model call. Reuse never crosses an account or a profile, and happens only for work the
+event. `enrichment_health` counts the mini's ready copies of the last 24 hours per kind (`reused_24h`, a count only).
+A reuse lease of a row whose attempts belong to an older profile starts at 0 attempts, so an expired reuse lease is
+claimed again and never ends as `retry_exhausted` without a model attempt. No match means a normal model call. Reuse never crosses an account or a profile, and happens only for work the
 worker claims: a copy that waits for a request (ANYM-805, ANYM-887, ANYM-890) stays on request and gets the copy at
 once after the request. The daily cap check still runs first, so at the cap a duplicate waits like other work. Text
 extraction and OCR are unchanged; nothing is deleted, and a source that is superseded later leaves its copies as they

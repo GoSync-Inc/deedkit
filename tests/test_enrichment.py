@@ -827,6 +827,69 @@ def test_reuse_stays_within_the_account(seeded,tmp_path):
     assert w.once() and calls==['enrich-image','enrich-copy']
 
 
+# spec: ANYM-912
+def test_an_expired_reuse_lease_never_exhausts_a_new_profile(seeded,tmp_path):
+    """Astra r1 M1: attempts of an older profile are not spent by a reuse lease, so its expiry is no retry_exhausted."""
+    s,_,_=seeded;w,calls=described_twice(s,tmp_path)
+    with s.pool.connection() as c:
+        c.execute("""UPDATE attachment_enrichment SET state='failed',attempts=3,error_code='model_timeout',
+            profile_hash='an-older-profile',next_due=clock_timestamp() WHERE attachment='enrich-copy'""")
+    row,_=w.claim();assert row['attachment']=='enrich-copy' and '_reuse' in row and row['attempts']==0
+    with s.pool.connection() as c:
+        assert c.execute("SELECT attempts FROM attachment_enrichment WHERE attachment='enrich-copy'").fetchone()['attempts']==0
+        c.execute("UPDATE attachment_enrichment SET lease_until=clock_timestamp()-interval '1 second' WHERE attachment='enrich-copy'")
+    assert w.once() and calls==['enrich-image']  # the expired lease is claimed again and copied, with no model call
+    with s.pool.connection() as c:
+        assert c.execute("SELECT state FROM attachment_enrichment WHERE attachment='enrich-copy'").fetchone()['state']=='ready'
+
+
+# spec: ANYM-912
+def test_a_withheld_copy_waits_for_a_request_and_then_reuses_the_result(seeded,tmp_path):
+    s,key,_=seeded;w,calls=described_twice(s,tmp_path);published_image_profile(s)
+    with s.pool.connection() as c:
+        c.execute("""INSERT INTO media_jobs(id,account,message,descriptor,state)
+            VALUES('enrich-copy','telegram-demo','demo-tg-1','{}'::jsonb,'ready')""")
+        c.execute("UPDATE messages SET sent_at=clock_timestamp()-interval '8 days' WHERE id='demo-tg-1'")
+    assert w.claim() is None  # an old image waits for a request (ANYM-887), duplicate or not
+    assert s.get_attachment(key,'enrich-copy')['enrichment_status']=='available_on_request'
+    s.request_file_download(key,'enrich-copy')
+    assert w.once() and calls==['enrich-image']
+    assert s.get_attachment(key,'enrich-copy')['enrichment_status']=='ready'
+
+
+# spec: ANYM-912
+def test_a_copy_stays_when_its_source_is_superseded_and_its_event_names_no_source(seeded,tmp_path):
+    s,_,_=seeded;w,_=described_twice(s,tmp_path);w.once()
+    with s.pool.connection() as c:
+        c.execute("UPDATE messages SET revision=revision+1 WHERE id='demo-tg-2'")
+        copy=c.execute("SELECT state,text_content FROM attachment_enrichment WHERE attachment='enrich-copy'").fetchone()
+        event=c.execute('''SELECT snapshot FROM events WHERE kind='file.description.ready'
+            AND snapshot->'processing'->>'attachment_id'='enrich-copy' ''').fetchone()['snapshot']
+    assert copy['state']=='ready' and copy['text_content']=='ИТОГО 120'
+    assert 'enrich-image' not in json.dumps(event) and 'reused' not in json.dumps(event)
+
+
+# spec: ANYM-912
+def test_a_duplicate_voice_note_reuses_its_transcript_and_segments(seeded,tmp_path):
+    s,_,_=seeded;sha=add_audio(s);w=worker(s,tmp_path);calls=[]
+    model=w.processor
+    def processor(files,row,profile):
+        calls.append(row['attachment']);return model(files,row,profile)
+    w.processor=processor
+    with s.pool.connection() as c:c.execute('TRUNCATE enrichment_budget')
+    assert w.once() and calls==['enrich-audio']
+    with s.pool.connection() as c:
+        c.execute("UPDATE messages SET sent_at=clock_timestamp() WHERE id='demo-tg-1'")
+        c.execute("INSERT INTO attachments(id,message,digest,filename,mime,bytes) VALUES('enrich-audio-copy','demo-tg-1',%s,'voice.wav','audio/wav',15)",(sha,))
+    assert w.once() and calls==['enrich-audio']
+    with s.pool.connection() as c:
+        rows={r['attachment']:r for r in c.execute('''SELECT attachment,state,text_content,truncated,metadata FROM attachment_enrichment
+            WHERE attachment IN ('enrich-audio','enrich-audio-copy')''')}
+    source,copy=rows['enrich-audio'],rows['enrich-audio-copy']
+    assert copy['state']=='ready' and copy['text_content']==source['text_content'] and copy['truncated']==source['truncated']
+    assert copy['metadata']['segments']==source['metadata']['segments']==[{'start':0,'end':1,'text':'Расшифровка договора'}]
+
+
 def test_enrichment_budget_fencing_and_deletion(seeded,tmp_path):
     s,_,_=seeded;add_audio(s);w=worker(s,tmp_path,1)
     with s.pool.connection() as c:c.execute('TRUNCATE enrichment_budget')

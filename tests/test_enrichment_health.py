@@ -107,6 +107,20 @@ def test_skipped_old_images_raise_no_stall(s,state):
     assert codes(s) == {'enrichment_stalled'}
 
 
+# spec: ANYM-912
+def test_health_counts_reused_copies_without_naming_their_source(s):
+    profile(s);job(s, 'ready');copy = job(s, 'ready')
+    job(s, 'ready', kind='image', mime='image/png')
+    with s.pool.connection() as c:
+        c.execute('''UPDATE attachment_enrichment SET metadata=metadata||jsonb_build_object('reused',true,'reused_from','health-1')
+            WHERE attachment=%s''', (copy,))
+    result = health.evaluate(s)
+    assert result['codes'] == set()  # evidence, never an alarm
+    assert result['accounts'][TG]['counts']['audio']['reused_24h'] == 1
+    assert 'reused_24h' not in result['accounts'][TG]['counts'].get('image', {})
+    assert 'health-1' not in str(result)
+
+
 # spec: ANYM-785
 def test_another_scopes_fresh_ready_does_not_hide_a_stall(s):
     profile(s);profile(s, WA)

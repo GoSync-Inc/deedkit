@@ -402,11 +402,14 @@ class EnrichmentWorker:
                 if reuse:
                     # ANYM-912: a ready result of the same file and profile in this account is copied, not recomputed.
                     # The lease fences the copy like a model result; no attempt, budget, start time or resource is taken.
+                    # Attempts of an older profile are not this profile's (as a model claim's reset to 1), so an expired
+                    # reuse lease never reads as exhausted (_expire_leases: attempts>=3) without a model attempt (Astra r1).
                     c.execute('''UPDATE attachment_enrichment SET state='leased',kind=%s,profile_hash=%s,provider=%s,model=%s,
+                        attempts=CASE WHEN profile_hash IS DISTINCT FROM %s THEN 0 ELSE attempts END,
                         lease_token=%s,lease_until=clock_timestamp()+make_interval(secs=>%s),updated_at=clock_timestamp()
-                        WHERE attachment=%s''',(kind,ph,profile['provider'],profile['model'],token,ttl,row['attachment']))
+                        WHERE attachment=%s''',(kind,ph,profile['provider'],profile['model'],ph,token,ttl,row['attachment']))
                     return {**row,'kind':kind,'provider':profile['provider'],'model':profile['model'],
-                        'lease_token':token,'profile_hash':ph,'_resource_lease':None,'_lease_end':lease_end,'_reuse':reuse},profile
+                        'attempts':0 if row['profile_hash']!=ph else row['attempts'],'lease_token':token,'profile_hash':ph,'_resource_lease':None,'_lease_end':lease_end,'_reuse':reuse},profile
                 resource_lease=None
                 if resource_admission.local_heavy(profile):
                     resource_lease=resource_admission.acquire(c,self.lock_directory,'enrichment',row['attachment'],token,ttl)
