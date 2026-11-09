@@ -24,6 +24,14 @@ template, db = test_migrate_expand.template, test_migrate_expand.db
 
 MIGRATION = next(SOURCE.glob('migrations/[0-9][0-9][0-9]_telegram_group_receipts.sql'))
 VERSION = int(MIGRATION.name[:3])
+# Migration numbers may skip one another lane holds; PREVIOUS is the newest file before this one.
+FILES = sorted(int(p.name[:3]) for p in SOURCE.glob('migrations/[0-9][0-9][0-9]_*.sql'))
+PREVIOUS = max(v for v in FILES if v < VERSION)
+
+
+def batch(base):
+    """How many files a release from `base` applies."""
+    return sum(base < v <= VERSION for v in FILES)
 # The production schema the card names (N-1 is 70 or 71): a release from it applies 071 (outgoing_messages.menu_choice
 # with its CHECK and a gateway grant), 072 (an attachments index) and this file in one migrate-expand batch.
 DEPLOYED = 70
@@ -91,7 +99,7 @@ def version(dsn, base=None):
     with psycopg.connect(dsn, row_factory=dict_row) as c:
         return (int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']),
                 c.execute('SELECT count(*) AS n FROM archive_migrations WHERE version>%s',
-                          (VERSION - 1 if base is None else base,)).fetchone()['n'])
+                          (PREVIOUS if base is None else base,)).fetchone()['n'])
 
 
 def menu_choice(dsn):
@@ -144,12 +152,12 @@ def test_the_migration_is_an_unattended_non_critical_check_swap_that_backup_and_
 
 # spec: ANYM-868
 def test_the_widened_check_takes_group_aggregates_only_and_rewrites_no_row(at_schema):
-    dsn = at_schema(VERSION - 1).pool.conninfo
+    dsn = at_schema(PREVIOUS).pool.conninfo
     seed(dsn, 1000)
     assert constraints(dsn) == {'message_receipts_check': True}
     with psycopg.connect(dsn) as c:
         before = c.execute('SELECT md5(string_agg(m::text,\'\' ORDER BY id)) FROM message_receipts m').fetchone()[0]
-    assert store_module.migrate_expand(dsn, release_plan(VERSION - 1)) == {'schema_version': VERSION}
+    assert store_module.migrate_expand(dsn, release_plan(PREVIOUS)) == {'schema_version': VERSION}
     assert constraints(dsn) == {'message_receipts_source_check': False} and version(dsn) == (VERSION, 1)
     with psycopg.connect(dsn) as c:
         assert c.execute('SELECT md5(string_agg(m::text,\'\' ORDER BY id)) FROM message_receipts m').fetchone()[0] == before
@@ -167,7 +175,7 @@ def test_a_rerun_over_a_rewound_ledger_is_idempotent(db):
     store, dsn = db
     with psycopg.connect(dsn) as c:
         c.execute('DELETE FROM archive_migrations WHERE version=%s', (VERSION,))
-        c.execute("UPDATE probe_metadata SET value=%s WHERE name='schema_version'", (str(VERSION - 1),))
+        c.execute("UPDATE probe_metadata SET value=%s WHERE name='schema_version'", (str(PREVIOUS),))
     store.migrate()
     assert constraints(dsn) == {'message_receipts_source_check': False} and version(dsn) == (VERSION, 1)
     store.migrate()
@@ -192,7 +200,7 @@ def old_runtime(dsn, stop, log, kind, worker):
 
 
 # spec: ANYM-868
-@pytest.mark.parametrize('base', [DEPLOYED, VERSION - 1], ids=['from-deployed-70', 'from-previous'])
+@pytest.mark.parametrize('base', [DEPLOYED, PREVIOUS], ids=['from-deployed-70', 'from-previous'])
 @pytest.mark.parametrize(('hold_s', 'delay_s', 'code'), [
     (1.0, 1.0, None),                    # the reader lets go inside lock_timeout; the batch commits
     (3.0, 0.0, 'lock_timeout'),          # the reader outlasts lock_timeout; the batch aborts
@@ -246,7 +254,7 @@ def test_the_swap_on_100k_receipts_commits_or_aborts_inside_the_runner_bounds(at
     assert blocked and all(end <= ended + 0.5 for _, end in blocked)
     assert {kind for kind, _, begin, _, _ in log if begin > ended} == {'reader', 'writer', 'outgoing', 'outgoing-writer'}
     assert before['constraints'] == {'message_receipts_check': True} and before['version'] == (base, 0)
-    applied = {'version': (VERSION, VERSION - base), 'constraints': {'message_receipts_source_check': False},
+    applied = {'version': (VERSION, batch(base)), 'constraints': {'message_receipts_source_check': False},
                'menu_choice': 1, 'menu_grant': True if base < 71 else before['menu_grant'],
                'attachment_index': runtime_index}
     if code is None:
