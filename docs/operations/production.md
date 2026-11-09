@@ -1693,8 +1693,10 @@ name=personal-os-probe-db-1 --format '{{.Label "com.docker.compose.project.confi
    network (`docker network inspect -f '{{range .Containers}}{{.Name}} {{end}}'`) and `SHOW` of every setting above.
    `docker compose F config --hash db` must print the recorded hash: that is the undo command's configuration, proven
    before anything changes. Write the overlay `/opt/personal-os-probe/compose.db-settings.yaml` (0600) with only
-   `services.db.command` and `services.db.shm_size` as in `deploy/compose.yaml`; `docker compose F -f
-   compose.db-settings.yaml config --format json` shows db with exactly those two keys changed.
+   `services.db.command` and `services.db.shm_size` as in `deploy/compose.yaml`. Compare without printing either
+   resolved document (Compose resolves env files into it, the database password included): a host-side `python3 -I`
+   script renders both (`F`, and `F` plus the overlay) in memory and prints only the sorted names of the db keys whose
+   values differ, which must be `command shm_size`; plus the overlay's `--hash db`.
 2. Pause autodeploy (`/etc/deedkit/autodeploy.pause` with the reason, after the unit is not active). Then take the
    backup runner lock in a root shell that keeps it to the end, undo included: `flock --nonblock
    /opt/personal-os-probe/backups/.runner.lock bash`. Inside it, before step 3, check under the lock (as `production.py`
