@@ -432,8 +432,11 @@ def grow(s):
         c.execute("SET LOCAL statement_timeout='600s'")
         # register_resident_original() looks attachments up by digest and bytes, which no index covers: each of
         # the BULK inserts would scan the table (quadratic, over 600 s on a loaded runner). A transaction-local
-        # index turns the setup linear; it is dropped before commit, so the measured plans never see it.
+        # index turns the setup linear; it is dropped before commit, so the measured plans never see it. The
+        # triggers' cached plans are made from whatever statistics earlier tests left (a one-row attachments
+        # table picks a scan), so the setup also pins index access; the measured transaction keeps the defaults.
         c.execute('CREATE INDEX grow_attachment_digest ON attachments(digest,bytes)')
+        c.execute("SET LOCAL enable_seqscan=off")
         for provider_chat in ('100', '200'):
             c.execute('''INSERT INTO chats(id,account,title,provider_chat) VALUES(%s,%s,'Fixture room',%s)
                 ON CONFLICT DO NOTHING''', (stable_id('chat', ACCOUNT, provider_chat), ACCOUNT, provider_chat))
