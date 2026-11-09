@@ -853,6 +853,16 @@ Phases, each a pause or a wait before any production write:
    unfinished (`unresolved`); the base release's `store.py` opens its pool with
    `prepare_threshold: None` (#352; else "deploy #352 first"); the live ledger is exactly the base's (`schema_version` and every
    `archive_migrations` checksum; else a pause).
+   Migrated by hand (2026-11-09: the 075 copy refused, 075 was migrated by hand, and the next run would copy and
+   pause again): a messaging-only range that changes no role file, whose live ledger is exactly the target's
+   (the base's checksums and the range's own), copies, rehearses and migrates nothing. Its producer check (phase
+   2) still runs, then plan A and plan B; no `migration.json` is written. A run that finds an earlier run's
+   `refused` or `not-applied` `migration.json` of that release (a refusal before any write, or a migrate-expand
+   whose ledger and catalog were found unchanged) reads the ledger once more and goes on the same way. Any other
+   ledger, a role file change (the ledger does not show grants), a range that also touches calendar, and any
+   release whose `migration.json` ended `uncertain` or `diverged` (or cannot be read) with no plan A attempt keep
+   the pause: settle that release first (apply it by hand, or move its receipt aside with a note). So after "Migration releases" item 4 step 3's `migrate` of such a range, removing the pause lets the
+   next `deploy` apply and promote it. `--dry-run` reads no database and still names the migration.
 2. Preparation: plan A `prepare` as always, then the producer check: the image `runner.json` pins has an
    `org.opencontainers.image.revision` whose `backup.py` `SCHEMAS` holds the target. When it does not, the
    pin follows (ANYM-589 B1, under the runner lock the deploy holds): the candidate's `backup` image,
@@ -1105,7 +1115,7 @@ images until acceptance.
 
 ### Session claim guards (ANYM-914)
 
-A release that runs the session services (the collectors and pairing commands, schema 76) gets four refusals from
+A release that runs the session services (the collectors and pairing commands, schema 77) gets four refusals from
 `production.py`; each surfaces as the existing `plan_a_refused` halt with its code in the reason:
 
 - `session_locks_unmounted`: the release carries `session_claim.py` and a session service (a `-session` bind) in the
@@ -1130,7 +1140,7 @@ A release that runs the session services (the collectors and pairing commands, s
 An unreadable container listing or claims record refuses too, so it halts deploys until the agent clears the cause.
 
 First claim release (hand route). The first release carrying `session_claim.py` cannot run unattended: its range
-changes the tool pair and adds migration 076 (`migration_by_hand`), and the host's Compose files need the lock mount.
+changes the tool pair and adds migration 077 (`migration_by_hand`), and the host's Compose files need the lock mount.
 The agent who releases it, in this order:
 
 1. Read-only transition inventory on the production host and the Mac mini, receipt in the release record: every
@@ -1142,12 +1152,12 @@ The agent who releases it, in this order:
    `deploy/compose.collectors.yaml` and `deploy/compose.whatsapp.yaml`), and `stop_grace_period: 25s` on `telegram`.
    The directory itself is created by `prepare`.
 3. Install the tool pair of the release SHA ("Deploy tool updates"), then release the migration by the hand route of
-   "Migration releases and the backup gate", item 4. The backup receiver reads schema 76 only after its own update; that
+   "Migration releases and the backup gate", item 4. The backup receiver reads schema 77 only after its own update; that
    is a backup follow-up, never a release hold.
 4. After `applied`: `session_owner` on the full sync status shows generation 1 or more for every session service.
 
 Undo: before step 3, restore the copied Compose files. After it, a rollback to a pre-claim tree needs
-`--pre-claim-rollback "<reason>"` (above); migration 076 stays (expand only).
+`--pre-claim-rollback "<reason>"` (above); migration 077 stays (expand only).
 
 ### Waiting for a running backup (ANYM-744)
 

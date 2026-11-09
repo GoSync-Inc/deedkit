@@ -537,7 +537,7 @@ def test_upgrade_and_rollback_keep_feed_order_and_cursors(schema36_store, monkey
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '76'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '77'
         assert c.execute('SELECT * FROM archive_migrations WHERE version<=36 ORDER BY version').fetchall() == migrations
     assert feed_state(store) == before
     try:
@@ -950,9 +950,11 @@ def test_activity_grants_add_only_the_new_table_to_each_role(seeded, template, b
         # A later schema's block (71, ANYM-837: the gateway's INSERT of outgoing_messages.menu_choice) is not this one's.
         later = {('outgoing_messages', 'menu_choice', 'INSERT')} if base == 'messaging_gateway' else set()
         # Schema 73 (ANYM-848) adds the gateway's wake target tables; they are that block's, not this one's.
-        # Schema 76 (ANYM-914) adds the gateway's read of session_claims; also a later block's.
+        # Schema 76 (ANYM-907) adds the gateway's read of the negotiation tables; that block's too.
+        # Schema 77 (ANYM-914) adds the gateway's read of session_claims; also a later block's.
         assert {grant for grant in after if grant[0] not in ('subscription_activity', 'wake_targets',
-            'wake_target_subscriptions', 'session_claims')} - later == before
+            'wake_target_subscriptions', 'negotiations', 'negotiation_sources', 'negotiation_times',
+            'session_claims')} - later == before
         assert {grant[2] for grant in after if grant[0] == 'subscription_activity' and grant[1] == ''} == added
         token = store.issue_key('activity-acl', ['telegram-demo'], permissions=['read', 'subscription-write'],
             key_permissions=['read', 'subscription-write'])

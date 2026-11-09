@@ -27,13 +27,13 @@ VERSION = int(MIGRATION.name[:3])
 # Migration numbers may skip one another lane holds; PREVIOUS is the newest file before this one.
 FILES = sorted(int(p.name[:3]) for p in SOURCE.glob('migrations/[0-9][0-9][0-9]_*.sql'))
 PREVIOUS = max(v for v in FILES if v < VERSION)
-# A release always ends at the runtime schema: later files (076, ANYM-914) ride the same batch after this one.
-HEAD = RUNTIME_SCHEMA
+# A release goes to the newest file (migrate_expand's target), which a later migration may have moved past this one.
+LATEST = max(FILES)
 
 
 def batch(base):
     """How many files a release from `base` applies."""
-    return sum(base < v <= HEAD for v in FILES)
+    return sum(base < v <= LATEST for v in FILES)
 # The production schema the card names (N-1 is 70 or 71): a release from it applies 071 (outgoing_messages.menu_choice
 # with its CHECK and a gateway grant), 072 (an attachments index) and this file in one migrate-expand batch.
 DEPLOYED = 70
@@ -49,7 +49,7 @@ def at_schema(database, tmp_path):
     """`at_schema(version)`: a Store on a disposable database built with the migrations up to `version` only."""
     def build(version):
         store = stack.enter_context(old_schema_store(database, tmp_path, version))
-        # A release to the runtime schema also appends 076's collector and gateway grants (ANYM-914).
+        # A release to the runtime schema also appends 077's collector and gateway grants (ANYM-914).
         gateway_role(store.pool.conninfo); collector_role(store.pool.conninfo)
         return store
     with ExitStack() as stack:
@@ -74,7 +74,7 @@ def appended_roles(base):
 
 
 def release_plan(base):
-    return plan_for(SOURCE, base, HEAD, appended_roles(base))
+    return plan_for(SOURCE, base, LATEST, appended_roles(base))
 
 
 def gateway_role(dsn):
@@ -85,7 +85,7 @@ def gateway_role(dsn):
 
 
 def collector_role(dsn):
-    # As collector_role.sql's own first statement: the role 076's appended grant names exists before the release.
+    # As collector_role.sql's own first statement: the role 077's appended grant names exists before the release.
     with psycopg.connect(dsn) as c:
         c.execute("DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='messaging_collector') THEN "
                   "CREATE ROLE messaging_collector NOLOGIN; END IF; END $$")
@@ -171,8 +171,8 @@ def test_the_widened_check_takes_group_aggregates_only_and_rewrites_no_row(at_sc
     assert constraints(dsn) == {'message_receipts_check': True}
     with psycopg.connect(dsn) as c:
         before = c.execute('SELECT md5(string_agg(m::text,\'\' ORDER BY id)) FROM message_receipts m').fetchone()[0]
-    assert store_module.migrate_expand(dsn, release_plan(PREVIOUS)) == {'schema_version': HEAD}
-    assert constraints(dsn) == {'message_receipts_source_check': False} and version(dsn) == (HEAD, batch(PREVIOUS))
+    assert store_module.migrate_expand(dsn, release_plan(PREVIOUS)) == {'schema_version': LATEST}
+    assert constraints(dsn) == {'message_receipts_source_check': False} and version(dsn) == (LATEST, batch(PREVIOUS))
     with psycopg.connect(dsn) as c:
         assert c.execute('SELECT md5(string_agg(m::text,\'\' ORDER BY id)) FROM message_receipts m').fetchone()[0] == before
         assert c.execute(OLD_INSERT, receipt('synthetic', '-1000000000100', 23, 'provider_aggregate')).fetchone()
@@ -188,10 +188,10 @@ def test_the_widened_check_takes_group_aggregates_only_and_rewrites_no_row(at_sc
 def test_a_rerun_over_a_rewound_ledger_is_idempotent(db):
     store, dsn = db
     with psycopg.connect(dsn) as c:
-        c.execute('DELETE FROM archive_migrations WHERE version>=%s', (VERSION,))  # this file and every later one
+        c.execute('DELETE FROM archive_migrations WHERE version>=%s', (VERSION,))
         c.execute("UPDATE probe_metadata SET value=%s WHERE name='schema_version'", (str(PREVIOUS),))
     store.migrate()
-    assert constraints(dsn) == {'message_receipts_source_check': False} and version(dsn) == (HEAD, batch(PREVIOUS))
+    assert constraints(dsn) == {'message_receipts_source_check': False} and version(dsn) == (LATEST, batch(PREVIOUS))
     store.migrate()
     assert constraints(dsn) == {'message_receipts_source_check': False}
 
@@ -229,7 +229,7 @@ def test_the_swap_on_100k_receipts_commits_or_aborts_inside_the_runner_bounds(at
     gateway_role(dsn); seed(dsn); outgoing_row(store)
     before = batch_state(dsn, base)
     plan = release_plan(base)
-    assert ('-- Schema 71' in appended_roles(base).get('gateway_role.sql', '')) == (base < 71)  # 071's grant rides a release from 70
+    assert ('-- Schema 71' in appended_roles(base).get('gateway_role.sql', '')) == (base < 71)  # 071's grant rides from 70
     holder = psycopg.connect(dsn)
     holder.execute('SELECT count(*) FROM message_receipts')  # an old-runtime reader holds ACCESS SHARE
     stop, log, inside, result = threading.Event(), [], {}, {}
@@ -258,7 +258,7 @@ def test_the_swap_on_100k_receipts_commits_or_aborts_inside_the_runner_bounds(at
     runner.join(30); time.sleep(0.5); stop.set()
     for s in sessions: s.join(30)
     started, ended = result['span']
-    assert result['out'] == ({'schema_version': HEAD} if code is None else code)
+    assert result['out'] == ({'schema_version': LATEST} if code is None else code)
     assert ended - started <= LOCK_S + TRANSACTION_S + 1
     # Every old-runtime statement finished without an error, and none waited past the runner's bounds: a statement
     # blocked behind the batch waits from its own start until the batch commits or aborts.
@@ -268,7 +268,7 @@ def test_the_swap_on_100k_receipts_commits_or_aborts_inside_the_runner_bounds(at
     assert blocked and all(end <= ended + 0.5 for _, end in blocked)
     assert {kind for kind, _, begin, _, _ in log if begin > ended} == {'reader', 'writer', 'outgoing', 'outgoing-writer'}
     assert before['constraints'] == {'message_receipts_check': True} and before['version'] == (base, 0)
-    applied = {'version': (HEAD, batch(base)), 'constraints': {'message_receipts_source_check': False},
+    applied = {'version': (LATEST, batch(base)), 'constraints': {'message_receipts_source_check': False},
                'menu_choice': 1, 'menu_grant': True if base < 71 else before['menu_grant'],
                'attachment_index': runtime_index}
     if code is None:
@@ -277,7 +277,7 @@ def test_the_swap_on_100k_receipts_commits_or_aborts_inside_the_runner_bounds(at
     else:
         # Nothing applied, from any file or grant of the batch; the next deploy retries the same batch.
         assert batch_state(dsn, base) == before
-        assert store_module.migrate_expand(dsn, plan) == {'schema_version': HEAD}
+        assert store_module.migrate_expand(dsn, plan) == {'schema_version': LATEST}
         assert batch_state(dsn, base) == applied
 
 

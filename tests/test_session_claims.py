@@ -1,4 +1,4 @@
-"""ANYM-914: one provider-session owner per account across hosts (session_claim.py, migration 076)."""
+"""ANYM-914: one provider-session owner per account across hosts (session_claim.py, migration 077)."""
 import asyncio
 import os
 from pathlib import Path
@@ -101,7 +101,7 @@ def test_restore_hold_and_pre_claim_restore_refuse_until_the_admin_release(seede
     with held(directory,boot) as lock: claim=sc.acquire(store.pool,lock,'collector')
     sc.release(store.pool,claim)
     with store.pool.connection() as c:
-        c.execute('UPDATE session_claims SET restore_hold=true')  # what quarantine_restore does at schema 76
+        c.execute('UPDATE session_claims SET restore_hold=true')  # what quarantine_restore does at schema 77
     with held(directory,boot) as lock:
         with pytest.raises(sc.ClaimRefused,match='session_claim_restore_hold'): sc.acquire(store.pool,lock,'collector')
     row=sc.row(store.pool,ACCOUNT)
@@ -132,7 +132,7 @@ def test_quarantine_restore_holds_every_claim(seeded,locks,monkeypatch):
             executed.append(sql)
             if 'session_claims' in sql: return self.c.execute(sql,*args)
             if 'current_database' in sql: return NS(fetchone=lambda:{'name':'x_restore_test'})
-            if 'schema_version' in sql: return NS(fetchone=lambda:{'value':'76'})
+            if 'schema_version' in sql: return NS(fetchone=lambda:{'value':'77'})
             return NS(fetchone=lambda:None,fetchall=lambda:[],rowcount=0)
     class Pool:
         def connection(self):
