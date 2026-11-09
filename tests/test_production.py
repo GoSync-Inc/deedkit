@@ -5278,6 +5278,83 @@ def test_an_interrupted_backup_runner_install_never_runs_the_new_runner_on_an_ol
     assert p.read(host.state / NEWEST / "backup-runner.json")["status"] == "installed"
 
 
+MODULE = b"# synthetic candidate profiles module\n"
+# A synthetic candidate runner that, like the W5-9 runner, loads its profiles module from its own directory by its own
+# name (`backup_runner` -> `backup_profiles`): its --check exits 4 unless that file holds the candidate's module.
+SIBLING_CHECK = (b"import pathlib, sys\nhere = pathlib.Path(sys.argv[0])\n"
+                 b"module = here.with_name(here.name.replace('backup_runner', 'backup_profiles', 1))\n"
+                 b"sys.exit(4) if not module.exists() or module.read_bytes() != %r else None\n" % MODULE)
+
+
+def with_profiles(host, monkeypatch, runner, installed=None):
+    """The candidate NEWEST ships `backup_profiles.py` (MODULE) and a runner that loads it; the host has `installed`."""
+    new = b"# synthetic candidate runner\n" + SIBLING_CHECK + RUNNER_CHECK
+    host.contents[f"{NEWEST}:{p.BACKUP_RUNNER_SOURCE}"] = new
+    host.blobs[f"{NEWEST}:{p.BACKUP_RUNNER_SOURCE}"] = p.git_blob(new)
+    host.contents[f"{NEWEST}:{p.BACKUP_PROFILES_SOURCE}"] = MODULE
+    host.blobs[f"{NEWEST}:{p.BACKUP_PROFILES_SOURCE}"] = p.git_blob(MODULE)
+    module = runner.with_name("backup_profiles.py")
+    if installed is not None:
+        module.write_bytes(installed)
+        module.chmod(0o600)
+    replace, renamed = os.replace, []
+    def recorded(source, target, **kwargs):
+        renamed.append(target) if "dst_dir_fd" in kwargs else None
+        return replace(source, target, **kwargs)
+    monkeypatch.setattr(p.os, "replace", recorded)
+    return new, module, renamed
+
+
+# spec: ANYM-488
+@pytest.mark.parametrize("installed", [None, b"# synthetic older profiles module\n"])
+def test_a_release_with_a_profiles_module_installs_it_beside_the_runner_before_any_rename_of_the_runner(
+        tmp_path, monkeypatch, installed):
+    # W5-9: the runner loads its recordings and calls profiles from `backup_profiles.py` in its own directory.
+    host, runner, configs, _ = runner_host(tmp_path, monkeypatch)
+    new, module, renamed = with_profiles(host, monkeypatch, runner, installed)
+    host.fail_apply = lambda sha: p.check_backup_runner(host.state / sha / "source", sha)  # apply's own check passes
+    assert host.deploy(auto=True)["status"] == "deployed" and ("apply", NEWEST) in host.steps
+    assert runner.read_bytes() == new and module.read_bytes() == MODULE and oct(module.stat().st_mode & 0o777) == "0o600"
+    # The staged runner's --check ran against the staged module (else it exits 4), and the module moved first.
+    assert [event for event in host.events if event[0] == "check"] == [
+        ("check", f".backup_runner.py.{NEWEST}.tmp", f".runner.json.{NEWEST}.tmp")] * 2
+    assert renamed == ["backup_profiles.py", "runner.json", "runner.json", "backup_runner.py"]
+    copy = module.with_name(f"backup_profiles.py.before-{NEWEST}")
+    assert (copy.read_bytes() == installed) if installed else not copy.exists()
+    assert not [path.name for path in runner.parent.iterdir() if path.name.endswith(".tmp")]
+    files = p.read(host.state / NEWEST / "backup-runner.json")["files"]
+    assert [item["path"] for item in files] == [str(runner), str(module), *map(str, configs)]
+    assert files[1] == {"path": str(module), "before": p.git_blob(installed) if installed else None,
+                        "after": p.git_blob(MODULE), "undo": str(copy) if installed else None}
+
+
+# spec: ANYM-488
+def test_a_profiles_module_the_new_runner_refuses_with_changes_nothing(tmp_path, monkeypatch):
+    host, runner, configs, _ = runner_host(tmp_path, monkeypatch)
+    _, module, renamed = with_profiles(host, monkeypatch, runner, b"# synthetic older profiles module\n")
+    configs[1].write_text('{"image": "%s", "directory": "/synthetic/calendar", "unfinished": true}\n' % OLD_IMAGE)
+    files = {path: path.read_bytes() for path in (runner, module, *configs)}
+    assert host.deploy(auto=True)["status"] == "halted" and renamed == []
+    assert {path: path.read_bytes() for path in files} == files
+    assert sorted(path.name for path in runner.parent.iterdir()) == ["backup_profiles.py", "backup_runner.py"]
+
+
+# spec: ANYM-488
+@pytest.mark.parametrize("case", ["absent", "other"])
+def test_apply_is_refused_while_the_profiles_module_beside_the_runner_is_not_the_releases(tmp_path, monkeypatch, case):
+    host, runner, _, _ = runner_host(tmp_path, monkeypatch)
+    _, module, _ = with_profiles(host, monkeypatch, runner)
+    assert host.deploy(auto=True)["status"] == "deployed"
+    p.check_backup_runner(host.state / NEWEST / "source", NEWEST)
+    module.unlink() if case == "absent" else module.write_bytes(b"# a hand edit\n")
+    with pytest.raises(p.Refused, match="profiles beside") as refused:
+        p.check_backup_runner(host.state / NEWEST / "source", NEWEST)
+    assert ("are blob absent" if case == "absent" else p.blob(module)[:12]) in str(refused.value)
+    # A host without the runner checks nothing, as before.
+    runner.unlink()
+    assert p.check_backup_runner(host.state / NEWEST / "source", NEWEST) is None
+
+
 def test_deploy_waits_for_the_api_quota_and_for_the_interval_between_automatic_deploys(tmp_path, monkeypatch):
     host = Deployer(tmp_path, monkeypatch)
     # No API quota is read or waited for (ANYM-406): the harness fails any GitHub API request.
