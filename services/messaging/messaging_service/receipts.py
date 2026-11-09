@@ -268,6 +268,8 @@ def publish(c,account,limit=100):
                 VALUES(%s,%s,%s,'message.status',%s,'live',%s,%s)''',
                 (sequence,account,row['id'],row['revision'],Jsonb(serial(snapshot)),
                  'receipt:'+job['receipt']+':'+row['id']))
+            from .wake import EVENTS, mark
+            mark(c,EVENTS)  # ANYM-841: the matcher wakes after the commit
             c.execute('''INSERT INTO receipt_event_publications(message,receipt,state) VALUES(%s,%s,%s)
                 ON CONFLICT(message) DO UPDATE SET receipt=excluded.receipt,state=excluded.state,
                     published_at=clock_timestamp()''',(row['id'],job['receipt'],receipt_evidence['state']))

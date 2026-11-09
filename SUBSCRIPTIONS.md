@@ -84,7 +84,13 @@ counted rather than guessed from a later edited message.
 
 One small worker scans PostgreSQL; it opens no messenger sessions, calls no model
 and mounts no originals. Its default pass handles at most 16 subscriptions and
-200 journal events each, then waits two seconds. Matching references and each
+200 journal events each; while a pass scanned or matched anything the next starts
+at once, and after an empty pass it waits two seconds or until a committed event's
+notification wakes it (ANYM-841: an empty `NOTIFY` sent after the writer's commit,
+never inside it; the two-second poll stays the fallback). Writers on their own
+connections send no wake and keep the poll: the file workers' processing events, the
+module router's module events and the matcher's own source-health events (matched in
+the same pass). Matching references and each
 checkpoint commit atomically; uniqueness and row locks support restart/retry and
 multiple workers. Fair ordering rotates sources beyond one batch.
 
@@ -158,9 +164,9 @@ stages in order, and `get_subscription_events` shows where it was at each:
 | --- | --- | --- |
 | The provider sends it | `sent_at` | The provider's own time |
 | The collector captures it and the journal commits it | `observed_at` | Spool drained every 250 ms; up to 30 s more under a burst (COLLECTORS.md) |
-| The matcher matches it | `matched_at` | Polls every 2 s |
+| The matcher matches it | `matched_at` | Woken by the commit notification; polls every 2 s as the fallback |
 | The hint policy releases the hint | `get_subscription` `delivery.held_reason`, `next_hint_at` | None without a policy; the holds below apply with or without one |
-| The dispatcher posts it | `delivered_at` (first delivered hint covering the event) | A lane polls every 2 s; the POST times out after 5 s |
+| The dispatcher posts it | `delivered_at` (first delivered hint covering the event) | An idle lane wakes on the outbox commit notification, else polls every 2 s; the POST times out after 5 s |
 
 `delivered_at` is null until a hint covering the event is delivered. It is also null for
 an event at or below `hints_deleted_through`, and for an event matched more than 30 days

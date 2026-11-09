@@ -320,6 +320,8 @@ def match(c, row, *, batch_size, maximum, stats):
                 count += 1
                 stats['module_matched'] += 1
         position = event['seq']
+        # ANYM-841: an advanced module position is matcher work, so the next pass follows at once.
+        stats['module_scanned'] = stats.get('module_scanned', 0) + 1
     if reason is None and len(events) < batch_size and position < head:
         reason = 'journal_gap'
         gap = {'reason': reason, 'stream': 'modules', 'after': position, 'through': head,
@@ -370,6 +372,8 @@ def _hint(c, row, module):
             c.execute('''INSERT INTO subscription_outbox(subscription,subscription_version,''' + target + ''',
                 through_position,kind,quiet_bypass) VALUES(%s,%s,%s,%s,'module_events',%s) ON CONFLICT DO NOTHING''',
                 (row['id'], row['version'], binding[target], last['through'], bool(last['urgent'])))
+            from .wake import OUTBOX, mark
+            mark(c, OUTBOX)  # ANYM-841: the delivery lanes wake after the commit
         c.execute('UPDATE subscription_module_streams SET hinted_through=%s WHERE subscription=%s',
             (last['through'], row['id']))
 

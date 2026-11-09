@@ -240,6 +240,9 @@ def _emit(c, row, binding, window, kind, through, bypass):
         ON CONFLICT DO NOTHING RETURNING id''',
         (row['id'], row['version'], binding[target], through, kind, window['next_window'], bypass)).fetchone()
     window['next_window'] += 1
+    if hint is not None:
+        from .wake import OUTBOX, mark
+        mark(c, OUTBOX)  # ANYM-841: the delivery lanes wake after the commit
     return hint is not None
 
 

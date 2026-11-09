@@ -841,7 +841,7 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
     bounded(max_subscriptions, 128)
     maximum = _bound_setting('SUBSCRIPTION_MAX_MATCHES', 10000, 1, 1000000)
     stats = {'checked': 0, 'scanned': 0, 'matched': 0, 'access_changed': 0,
-        'expired': 0, 'blocked': 0, 'missing_evidence': 0, 'module_matched': 0, 'module_blocked': 0, 'scope_failed': 0,
+        'expired': 0, 'blocked': 0, 'missing_evidence': 0, 'module_matched': 0, 'module_scanned': 0, 'module_blocked': 0, 'scope_failed': 0,
         'activity_failed': 0}
     with store.pool.connection() as c:
         from . import module_events
@@ -1030,10 +1030,13 @@ def _match_modules(c, row, batch_size, maximum, stats):
     """ANYM-562: the module stream after the message pass, in a savepoint of its own: a failure is
     logged and rolls back only the module step; the message matches above still commit."""
     from . import module_events
+    # ANYM-841: a rolled-back module step made no progress, so its counts never keep the matcher busy.
+    progress = {key: stats.get(key, 0) for key in ('module_matched', 'module_scanned')}
     try:
         with c.transaction():
             module_events.match(c, row, batch_size=batch_size, maximum=maximum, stats=stats)
     except Exception as error:
+        stats.update(progress)
         from .telemetry import capture
         capture(error, 'subscription_module_match_failed')
         print(json.dumps({'error': 'subscription_module_match_failed', 'class': type(error).__name__}), flush=True)
@@ -1215,6 +1218,8 @@ def journal_send_failures(c, rows):
                         'account': row['account'], 'chat': row['chat'], 'send_id': str(row['id']),
                         'status': row['status'], 'error_code': row['error_code'],
                         'principal': row['principal'], 'key_id': str(row['key_id'])}), 'send.failed:' + str(row['id'])))
+                from .wake import EVENTS, mark
+                mark(c, EVENTS)  # ANYM-841: the matcher wakes after the commit
         except Exception as error:
             _journal_failed('send.failed', error)
 

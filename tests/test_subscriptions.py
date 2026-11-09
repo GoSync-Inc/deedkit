@@ -53,6 +53,191 @@ def sent_ago(store, message, interval):
         c.execute('UPDATE messages SET sent_at=clock_timestamp()-%s::interval WHERE id=%s', (interval, message))
 
 
+# spec: ANYM-841
+def test_matcher_runs_a_backlog_without_sleeping_and_sleeps_only_after_an_empty_pass(seeded, tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from messaging_service import subscription_worker
+    store, _, _ = seeded
+    token = key(store)
+    sid = create(store, token)['subscription_id']
+    events = [emit(store) for _ in range(3)]
+    waits = []
+
+    class Stop:
+        def is_set(self):
+            return bool(waits) and waits[-1] > 0
+
+        def set(self):
+            waits.append(-1)
+
+        def wait(self, seconds):
+            waits.append(seconds)
+
+    class Kept:
+        pool = store.pool
+
+        def close(self):
+            pass
+
+    dsn = tmp_path / 'synthetic.dsn'
+    dsn.write_text('postgresql://synthetic.invalid/unused')
+    monkeypatch.setenv('DATABASE_URL_FILE', str(dsn))
+    monkeypatch.setattr(sys, 'argv', ['subscription_worker', '--batch-size', '1'])
+    monkeypatch.setattr(subscription_worker, 'Store', lambda *a, **k: Kept())
+    monkeypatch.setattr(subscription_worker, 'threading', SimpleNamespace(Event=Stop))
+    monkeypatch.setattr(subscription_worker, 'signal', SimpleNamespace(SIGINT=2, SIGTERM=15, signal=lambda *a: None))
+    # No listener: the fake stop's waits are the matcher's only sleeps.
+    monkeypatch.setattr(subscription_worker.wakes, 'listen', lambda *a: None)
+    subscription_worker.main()
+    # Three one-event batches back to back, then one empty pass that sleeps the interval.
+    assert waits[-1] == 2 and waits[:-1] and set(waits[:-1]) == {0} and len(waits) >= 4
+    assert store.get_subscription(token, sid)['matched_through'] == events[-1]
+
+
+def wake_listener(store, channel, **kwargs):
+    import threading
+    import time
+    from messaging_service import wake
+    stop = threading.Event()
+    listener = wake.Listener.for_store(store, channel, stop, **kwargs)
+    due = time.monotonic() + 10
+    while not listener.listening and time.monotonic() < due:
+        time.sleep(0.02)
+    assert listener.listening
+    # The (re)connect ring is not a commit wake.
+    listener.wait(0.2, listener.token())
+    return listener, stop
+
+
+# spec: ANYM-841
+def test_a_committed_event_wakes_the_matcher_before_the_interval_and_a_rolled_back_one_does_not(seeded):
+    import time
+    from messaging_service import wake
+    store, _, _ = seeded
+    listener, stop = wake_listener(store, wake.EVENTS)
+    try:
+        token = listener.token()
+        with pytest.raises(RuntimeError):
+            with store.pool.connection() as c:
+                store.append_event(c, 'telegram-demo', 'demo-tg-1', origin='live')
+                raise RuntimeError('synthetic rollback')
+        assert listener.wait(1.0, token) is False
+        started = time.monotonic()
+        emit(store)
+        assert listener.wait(2.0, token) is True and time.monotonic() - started < 2.0
+    finally:
+        stop.set()
+        listener.close()
+
+
+# spec: ANYM-841
+def test_a_failing_notify_leaves_the_event_committed_and_is_logged_as_a_count(seeded, monkeypatch, capsys):
+    import json
+    import time
+    from messaging_service import wake
+    store, _, _ = seeded
+    before = wake.failures()
+    # An invalid statement_timeout makes the notifier's NOTIFY step raise inside PostgreSQL.
+    monkeypatch.setattr(wake, 'NOTIFY_TIMEOUT', 'not-a-duration')
+    capsys.readouterr()
+    event = emit(store)
+    with store.pool.connection() as c:
+        assert c.execute('SELECT count(*) AS n FROM events WHERE id=%s', (event,)).fetchone()['n'] == 1
+    due = time.monotonic() + 5
+    while wake.failures() == before and time.monotonic() < due:
+        time.sleep(0.02)
+    assert wake.failures() == before + 1
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert lines == [{'error': 'wake_notify_failed', 'class': 'InvalidParameterValue', 'count': before + 1}]
+
+
+# spec: ANYM-841
+def test_a_stalled_notify_or_a_broken_log_never_holds_or_fails_the_writer(seeded, monkeypatch):
+    import sys
+    import threading
+    import time
+    from messaging_service import wake
+    store, _, _ = seeded
+    listener, stop = wake_listener(store, wake.EVENTS)
+    real_send, entered, release = wake.send, threading.Event(), threading.Event()
+    before, saved = wake.failures(), sys.stdout
+
+    def stalled(pool, channels):
+        entered.set()
+        release.wait(30)
+        return real_send(pool, channels)
+
+    class Broken:
+        def write(self, _):
+            raise BrokenPipeError
+
+        def flush(self):
+            raise BrokenPipeError
+
+    try:
+        monkeypatch.setattr(wake, 'send', stalled)
+        started = time.monotonic()
+        emit(store)
+        assert entered.wait(5)
+        emit(store)  # coalesced behind the stalled send, never waiting for it
+        assert time.monotonic() - started < 2
+        # The stalled send then fails inside PostgreSQL and its log line hits a broken stdout.
+        monkeypatch.setattr(wake, 'NOTIFY_TIMEOUT', 'not-a-duration')
+        monkeypatch.setattr(sys, 'stdout', Broken())
+        release.set()
+        due = time.monotonic() + 5
+        while wake.failures() == before and time.monotonic() < due:
+            time.sleep(0.02)
+        assert wake.failures() > before
+        monkeypatch.setattr(sys, 'stdout', saved)
+        monkeypatch.setattr(wake, 'NOTIFY_TIMEOUT', '500ms')
+        monkeypatch.setattr(wake, 'send', real_send)
+        # The notifier thread survived both: the next commit still wakes the listener.
+        token = listener.token()
+        emit(store)
+        assert listener.wait(5, token) is True
+    finally:
+        release.set()
+        stop.set()
+        listener.close()
+
+
+# spec: ANYM-841
+def test_notifies_follow_exactly_the_committed_marked_transactions(seeded):
+    from hypothesis import given, settings, strategies as st, HealthCheck
+    import psycopg
+    from messaging_service import wake
+    store, _, _ = seeded
+    steps = st.lists(st.tuples(st.sets(st.sampled_from(wake.CHANNELS)), st.booleans()), max_size=6)
+
+    @settings(max_examples=15, deadline=None, derandomize=True,
+              suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @given(steps)
+    def check(transactions):
+        with psycopg.connect(store.pool.conninfo, autocommit=True) as listener:
+            for channel in wake.CHANNELS:
+                listener.execute('LISTEN ' + channel)
+            for channels, commit in transactions:
+                try:
+                    with store.pool.connection() as c:
+                        c.execute('SELECT 1')
+                        for channel in channels:
+                            wake.mark(c, channel)
+                        if not commit:
+                            raise RuntimeError('synthetic rollback')
+                except RuntimeError:
+                    pass
+            got = list(listener.notifies(timeout=0.3))
+            # The notifier coalesces: every channel a committed transaction marked gets an empty notification, a
+            # channel only rolled-back transactions marked gets none.
+            assert {n.channel for n in got} == {
+                channel for channels, commit in transactions if commit for channel in channels}
+            assert all(n.payload == '' for n in got)
+
+    check()
+
+
 # spec: ANYM-733
 @pytest.mark.parametrize('origin,kind,sent_at,expected', [
     ('reconcile', 'message.created', '2026-11-03T06:01:00+00:00', 'live_recovered'),
