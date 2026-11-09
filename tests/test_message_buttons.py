@@ -419,9 +419,10 @@ def test_button_texts_say_what_is_offered_and_how_absence_reads():
     import ast,pathlib,re
     root=pathlib.Path(__file__).parents[1]
     flat=lambda text:' '.join(text.split())
-    tree=ast.parse((root/'services/messaging/messaging_service/app.py').read_text())
+    package=root/'services/messaging/messaging_service'
+    trees=[ast.parse(path.read_text()) for path in (package/'app.py',*sorted((package/'app_tools').glob('*.py')))]
     tools=('search','get_messages','get_context')
-    docs=[flat(ast.get_docstring(n)) for n in ast.walk(tree) if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name in tools]
+    docs=[flat(ast.get_docstring(n)) for tree in trees for n in ast.walk(tree) if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name in tools]
     assert len(docs)==3
     catalog=json.loads((root/'services/gateway/src/agent_gateway/catalog.json').read_text())
     entry=flat(next(t for t in catalog if t['name']=='messages_get_context')['description'])

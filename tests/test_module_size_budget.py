@@ -105,6 +105,20 @@ def test_every_large_source_file_matches_its_size_budget():
 
 
 # spec: ANYM-949
+def test_the_archive_tools_live_in_their_app_tools_module_not_in_app_py():
+    package = ROOT / "services/messaging/messaging_service"
+    def tools(path):
+        return {node.name for node in ast.walk(ast.parse(path.read_text()))
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+                and any(ast.unparse(d).startswith("mcp.tool(") for d in node.decorator_list)}
+    archive = {"search_people", "search", "search_files", "get_file_text", "get_messages", "get_context",
+               "get_file_segments", "get_sync_status", "resolve_reference", "resolve_target", "get_file_occurrences",
+               "get_reviews", "record_review", "get_attachment", "request_file_download"}
+    assert tools(package / "app_tools/archive.py") == archive
+    assert not tools(package / "app.py") & archive
+
+
+# spec: ANYM-949
 def test_ratchet_flags_growth_a_new_large_file_and_a_stale_entry_but_not_a_shrink(tmp_path):
     def write(name, text):
         Path(tmp_path, name).parent.mkdir(parents=True, exist_ok=True)
