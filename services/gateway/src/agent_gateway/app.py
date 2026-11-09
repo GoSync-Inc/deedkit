@@ -6,6 +6,8 @@ import asyncio
 import json
 import logging
 import re
+import sys
+import time
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI
@@ -37,6 +39,40 @@ SEND_BODY_LIMIT = 524288
 # The only tools whose call may carry more than NORMAL_BODY_LIMIT, each with its own cap, after authentication.
 LARGE_BODY_LIMITS = {UPLOAD_CHUNK_TOOL: UPLOAD_BODY_LIMIT, "messages_send": SEND_BODY_LIMIT}
 SPACE = re.compile(r"[ \t\n\r]*")
+# ANYM-843: one content-free line per tool call (docs/operations/production.md, Tool call durations).
+CALLS = logging.getLogger("agent_gateway.calls")
+SAFE_OUTCOME = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+class CallLines(logging.StreamHandler):
+    """The duration lines' own stream to the container output."""
+
+
+def call_log_handler():
+    """Container output for the duration lines; uvicorn configures only its own loggers. Added once."""
+    if not any(isinstance(handler, CallLines) for handler in CALLS.handlers):
+        handler = CallLines(sys.stderr)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        CALLS.addHandler(handler)
+    CALLS.setLevel(logging.INFO)
+    CALLS.propagate = False
+
+
+def outcome_code(code):
+    """A Denied code is the gateway's own vocabulary; anything else is logged as `error`."""
+    return code if isinstance(code, str) and SAFE_OUTCOME.fullmatch(code) else "error"
+
+
+def log_call(name, outcome, started):
+    """The line names a catalogued tool or `unknown`, never caller text. A failure here never fails the call."""
+    try:
+        CALLS.info(json.dumps({
+            "tool": name if isinstance(name, str) and name in CATALOG else "unknown",
+            "outcome": outcome,
+            "duration_ms": int((time.monotonic() - started) * 1000),
+        }, separators=(",", ":")))
+    except Exception:  # noqa: BLE001 - logging must never change a tool call's response
+        pass
 
 
 def expiry_notice(credential):
@@ -180,6 +216,7 @@ def create_app(policy_path, public_url, *, transports=None):
     dispatch = Dispatch(policy, clients, tickets)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    call_log_handler()
 
     async def list_tools(context, params):
         if params and params.cursor:
@@ -193,20 +230,25 @@ def create_app(policy_path, public_url, *, transports=None):
 
     async def call_tool(context, params):
         token = admitted.set(None)
+        started, outcome = time.monotonic(), "error"
         try:
             result = await dispatch.call(current_key.get(), params.name, params.arguments or {}, current_route.get())
             content = [TextContent(type="text", text=text_block(result))]
             credential = admitted.get()
             notice = expiry_notice(credential)
             if not notice:
-                return CallToolResult(content=content, structuredContent=result)
-            # structuredContent stays exactly the declared outputSchema shape.
-            return CallToolResult(
-                content=[*content, TextContent(type="text", text=notice)],
-                structuredContent=result,
-                _meta={"deedkit.credential": credential},
-            )
+                response = CallToolResult(content=content, structuredContent=result)
+            else:
+                # structuredContent stays exactly the declared outputSchema shape.
+                response = CallToolResult(
+                    content=[*content, TextContent(type="text", text=notice)],
+                    structuredContent=result,
+                    _meta={"deedkit.credential": credential},
+                )
+            outcome = "ok"
+            return response
         except Denied as error:
+            outcome = outcome_code(error.code)
             result = getattr(error, "detail", {"error": error.code})
             return CallToolResult(
                 content=[TextContent(type="text", text=text_block(result))],
@@ -215,6 +257,7 @@ def create_app(policy_path, public_url, *, transports=None):
             )
         finally:
             admitted.reset(token)
+            log_call(params.name, outcome, started)
 
     server = Server(
         "DeedKit",
@@ -268,18 +311,24 @@ def create_app(policy_path, public_url, *, transports=None):
         def headers():
             return expiry_headers(admitted.get() or current_credential.get())
 
+        started, outcome = time.monotonic(), "error"
         try:
             value = await request.json()
             result = await dispatch.call(current_key.get(), name, value)
-            return JSONResponse(result, headers=headers())
+            response = JSONResponse(result, headers=headers())
+            outcome = "ok"
+            return response
         except Denied as error:
+            outcome = outcome_code(error.code)
             # A key revoked or expired during the request gets the plain 401.
             return JSONResponse(getattr(error, "detail", {"error": error.code}), status_code=error.status,
                                 headers=headers() if error.status != 401 else None)
         except ValueError:
+            outcome = "invalid_arguments"
             return JSONResponse({"error": "invalid_arguments"}, status_code=422, headers=headers())
         finally:
             admitted.reset(token)
+            log_call(name, outcome, started)
 
     @app.get("/v1/files/{ticket}")
     async def download(ticket: str, request: Request):

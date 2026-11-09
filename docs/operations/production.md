@@ -3345,6 +3345,22 @@ Optional configuration keys, with the defaults above: `tool`, `journal`, `tokens
 `validators`, `docker` (the Docker command prefix) and `probe_control` (`key revoke --token-file`;
 no default).
 
+### Tool call durations (ANYM-843)
+
+Every MCP or REST tool call that reaches the gateway's tool handler writes one line to the gateway container's
+stderr: `{"tool":"<catalog name or unknown>","outcome":"ok|<gateway error code>|error","duration_ms":<int>}`.
+Nothing else is on the line: no arguments, chat or message IDs, principal or key names, or results. `error` is a
+call that raised (the exception text is not logged); a name outside the catalog is `unknown`. Requests the boundary
+refuses before the handler (no key, wrong origin, body too large) write no line. Read-only, per tool for the last
+day, calls and nearest-rank p50/p90 in milliseconds (the container: `docker ps --format '{{.Names}}' | grep gateway`):
+
+```sh
+docker logs --since 24h <gateway container> 2>&1 | python3 -c 'import sys,json;R=[json.loads(x) for x in sys.stdin if x.startswith("{\"tool\":")];D={};[D.setdefault(r["tool"],[]).append(r["duration_ms"]) for r in R if set(r)=={"tool","outcome","duration_ms"}];[print(t,"calls=%d"%len(v),"p50_ms=%d"%sorted(v)[(len(v)-1)//2],"p90_ms=%d"%sorted(v)[(9*len(v)-1)//10]) for t,v in sorted(D.items())]'
+```
+
+Docker's log rotation for the container bounds how far back `--since` reaches.
+services/gateway/tests/test_call_duration_log.py runs this program on captured lines.
+
 ## Record the production release
 
 After a successful `apply`, the release owner records the release in Tiden from
