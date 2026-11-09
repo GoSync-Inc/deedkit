@@ -52,7 +52,7 @@ KEEPER_BOT = 'github-actions[bot]'
 # A no-review pull request (owner review cut 11-09; small fix, AGENTS.md section 3) says so in its description. It
 # approves the head only when the diff is clean under the change-path signal grep (docs/operations/review-protocol.md):
 # the line is author-written, so the grep, not the line, keeps a risk-path change from merging without its review.
-REVIEW_NONE_LINE = re.compile(r'^\s*Review record:\s*none\b(?:\s*\([^)\n]*\))?\s*$', re.I | re.M)
+REVIEW_NONE_LINE = re.compile(r'^[ \t]*Review record:[ \t]*none\b(?:[ \t]*\([^)\n]*\))?[ \t]*\r?$', re.I | re.M)
 SIGNAL_PATH = re.compile(r'^\.github/workflows/|main-ruleset\.json|\.sql$|migrations/|gitleaks|compose|^deploy/modules/'
                          r'|\.claude/settings\.json|^AGENTS\.md$|^docs/operations/feedback-autoloop\.md$', re.I)
 SIGNAL_LINE = re.compile(r'^[-+].*(secret|permissions|: *write|write-all|\b(GRANT|REVOKE|DROP|TRUNCATE|DELETE FROM|RENAME)\b'
@@ -126,22 +126,21 @@ def approved_shas(facts, authorizing=True):
     return shas
 
 
-def signal_hits(files, changed_files):
-    """The change-path signal grep over the pull request's files (REST `pulls/<n>/files`). A file whose patch the API
-    omits (too large, binary) or a listing shorter than `changed_files` is a hit: an unread diff is never clean."""
-    hits = []
-    for f in files:
-        name = f.get('filename') or ''
-        names = [name, f.get('previous_filename') or '']
-        if any(n and SIGNAL_PATH.search(n) for n in names):
-            hits.append(f'{name}: change-path')
-        elif f.get('patch') is None and f.get('changes'):
-            hits.append(f'{name}: diff not readable')
-        elif (m := SIGNAL_LINE.search(f.get('patch') or '')):
-            hits.append(f'{name}: `{m.group(1).strip()}`')
-    if changed_files > len(files):
-        hits.append(f'{changed_files - len(files)} files not listed')
-    return tuple(hits)
+DIFF_NAMES = re.compile(r'^diff --git a/(.*) b/(.*)$', re.M)
+BINARY = re.compile(r'^(Binary files .* differ|GIT binary patch)$', re.M)
+
+
+def signal_hits(diff):
+    """The change-path signal grep of review-protocol.md over the head's complete Git diff (`git diff --no-renames
+    --name-only` names and `^[-+]` lines, `---`/`+++` headers included). No diff, an empty one or a binary file is a
+    hit: an unread diff is never clean."""
+    if not diff or not diff.strip():
+        return ('diff not readable',)
+    hits = [f'{name}: change-path' for pair in DIFF_NAMES.findall(diff) for name in dict.fromkeys(pair)
+            if SIGNAL_PATH.search(name)]
+    hits += [f'{line[:120]}: binary, not readable' for line in BINARY.findall(diff)]
+    hits += [f'`{m.group(0)[:120]}`' for m in SIGNAL_LINE.finditer(diff)]
+    return tuple(dict.fromkeys(hits))
 
 
 def review_none_approved(facts):
@@ -323,6 +322,12 @@ class GitHub:
             return [item for page in data for item in page]
         return data
 
+    def diff(self, base, head):
+        """The complete unified diff merge-base(base, head)...head: immutable revisions, so it is exactly what an
+        enqueue of `head` would merge. GitHub refuses a diff it cannot return whole; the caller treats that as a hit."""
+        command = ['gh', 'api', '-H', 'Accept: application/vnd.github.diff', self.repo(f'compare/{base}...{head}')]
+        return subprocess.run(command, check=True, capture_output=True, text=True, timeout=CALL_TIMEOUT).stdout
+
     def graphql(self, query, **variables) -> Any:  # Any: GitHub's JSON, read by key where used
         arguments = ['-f', f'query={query}']
         for key, value in variables.items():
@@ -393,7 +398,7 @@ def collect(gh, pr, required, main_at=''):
         head_at=min((s['created_at'] for s in suites), default=github_time(now())), removals=removals,
         labeled_at=max(labeled, default=''), required=tuple(name for name, _ in required), checks=checks, added_migrations=added,
         main_migrations=on_main, review_none=review_none,
-        signals=signal_hits(files, detail.get('changed_files') or 0) if review_none else ())
+        signals=head_signals(gh, pr['base']['sha'], head) if review_none else ())
     facts.writers = frozenset(login for login in {c['user'] for c in facts.comments}
                               | {r['user'] for r in facts.reviews if r['state'] == 'APPROVED'}
                               if login and gh.can_write(login))
@@ -401,6 +406,13 @@ def collect(gh, pr, required, main_at=''):
     if failures and failures[-1]['group']:
         facts.failing_jobs = failing_jobs(gh, failures[-1]['group'])
     return facts, graph['id']
+
+
+def head_signals(gh, base, head):
+    try:
+        return signal_hits(gh.diff(base, head))
+    except subprocess.SubprocessError as error:
+        return (f'diff not readable: {type(error).__name__}',)
 
 
 def failing_jobs(gh, group_sha):

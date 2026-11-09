@@ -51,8 +51,9 @@ It acts only on an open, non-draft, same-repository pull request into `main` tha
    never edited. An approval line in the description does not count: its author can edit it after a push.
    A no-review pull request (owner review cut 11-09, or a small fix under AGENTS.md section 3) instead carries
    the description line `Review record: none (...)`. It needs no approval when the head's diff is clean under the
-   change-path signal grep (review-protocol.md: both lines, over the files API patches; a file without a
-   readable patch counts as a hit). A hit holds the pull request with one comment: a risk path needs its review
+   change-path signal grep (review-protocol.md: both lines, over the complete diff `merge-base...<head SHA>` from
+   the compare API, `---`/`+++` headers included, so the scanned revision is the one enqueued; an unreadable or
+   empty diff, or a binary file, counts as a hit). A hit holds the pull request with one comment: a risk path needs its review
    and an approval on the head. The grep is the guard here, because the line is author-written. When the approval names an older
    SHA, the keeper does not enqueue and comments once. The trust boundary is write access, which can already arm
    `gh pr merge --auto` directly, so the keeper adds no authority.
