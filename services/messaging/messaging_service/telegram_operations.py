@@ -1841,7 +1841,8 @@ async def chat_history(client, job, parameters, governor, rpc, referenced_peers,
 
 
 async def open_by_username(client, job, parameters, rpc, collection_policy, allowed_provider_id):
-    """ANYM-643: one contacts.ResolveUsername, a person only (never a bot, channel or group). The resolve is a read
+    """ANYM-643: one contacts.ResolveUsername, a person or a bot user (never a channel or group; owner 11-09: a bot
+    answers with `is_bot: true`). The resolve is a read
     in its own governor scope, so its flood wait pauses no send; the chat row is the worker's, after it rechecks
     authority (commands.finish_open_username). Telethon keeps the user's access hash in its session."""
     from .commands import CommandRejected
@@ -1877,13 +1878,11 @@ async def open_by_username(client, job, parameters, rpc, collection_policy, allo
         return {'outcome': 'unknown', 'error': 'provider_result_unverified'}
     if user.deleted:
         reject('username_not_found')
-    if user.bot:
-        reject('recipient_not_user')
     if not allowed_provider_id(user.id):
         reject('chat_not_collected')
     name = safe_text(' '.join(n for n in (user.first_name, user.last_name) if isinstance(n, str) and n.strip()), 255)
     return {'outcome': 'confirmed', 'found': True, 'user_id': str(user.id), 'username': username,
-            'name': name if name and name.strip() else None, 'provider_lookup': True}
+            'name': name if name and name.strip() else None, 'is_bot': bool(user.bot), 'provider_lookup': True}
 
 
 async def execute(client, job, *, verified_self=None, governor=None):

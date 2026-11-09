@@ -774,7 +774,8 @@ class CommandWorker:
                     # A username send's chat step opens only the previewed person, under the sending opt-in.
                     if user!=row['payload']['expected_user_id']:raise APIError('identity_changed')
                     if not policy['enabled'] or not policy['send_enabled']:raise APIError('sending_disabled')
-                public={'found':True,'user_id':user,'username':username,'name':name,'provider_lookup':True}
+                public={'found':True,'user_id':user,'username':username,'name':name,'is_bot':data.get('is_bot') is True,
+                        'provider_lookup':True}
                 chat_id=stable_id('chat',st.account,user)
                 existing=c.execute('SELECT 1 FROM chats WHERE id=%s',(chat_id,)).fetchone() is not None
                 if not existing and row['payload']['parameters'].get('create') is True:

@@ -416,7 +416,7 @@ gets `unsupported_operation` with `hint: telegram_accounts_only`) and needs what
    `name` and `https://t.me/name` are accepted (4-32 letters, digits or `_`, starting
    with a letter) and bound lower-case; anything else gets `invalid_username`. The
    collector makes one `contacts.ResolveUsername` request; the result is `found`,
-   `user_id`, `username`, `name`, `provider_lookup` and `chat_id` with `existing: true`
+   `user_id`, `username`, `name`, `is_bot`, `provider_lookup` and `chat_id` with `existing: true`
    only when the person's private chat is already archived. Nothing is written.
 2. Show the owner the account, `@username`, name and exact text; obtain confirmation.
 3. Create: the same call with `"create": true` resolves again and returns `chat_id`
@@ -424,7 +424,9 @@ gets `unsupported_operation` with `hint: telegram_accounts_only`) and needs what
    the collection policy are rechecked against the resolved user ID.
 4. Send with `send_message(account, chat_id, text, request_id)` as usual.
 
-Only people: a channel, group or bot gets `recipient_not_user`; a name nobody holds,
+People and bots (owner 11-09): a bot user is accepted like a person and the result
+adds `is_bot: true` (a person gets `is_bot: false`), so the owner sees it is a bot
+before confirming; a channel or group gets `recipient_not_user`; a name nobody holds,
 an invalid one or a deleted account gets `username_not_found`; a resolved user ID in
 `exclude_chats` gets `chat_not_collected`. These refusals have spent a lookup but
 write no chat. Each account allows at most 20 resolves per rolling hour, counted like
