@@ -85,6 +85,10 @@ type attachment struct {
 	attachedAt    time.Time
 	closed        chan struct{}
 	once          sync.Once
+	// dead is set (under holder.mu) the moment the attachment ends; inflight counts the calls admitted before that.
+	// A successor attaches only after every admitted call of its predecessor returned (finding 2).
+	dead     bool
+	inflight sync.WaitGroup
 }
 
 type frameConn struct {
@@ -131,6 +135,12 @@ type holder struct {
 	// Handlers hold provUse for reading while they use the provider; start and close hold it for writing, so a store
 	// is never closed beneath a live capture, send or operation.
 	provUse sync.RWMutex
+	// gate serializes policy updates with capture writes (CaptureStore.Fence): a write holds it for reading
+	// across its policy check and the write itself, an update holds it for writing.
+	gate sync.RWMutex
+	// starting cancels a provider start under way; provCancel ends the published provider's context.
+	starting   context.CancelFunc
+	provCancel context.CancelFunc
 
 	jmu      sync.Mutex
 	inflight map[string]chan struct{}
@@ -171,7 +181,7 @@ func newHolder(ctx context.Context, cfg Config, socketDir string, db *sql.DB) *h
 		return leaseCheck(ctx, db, cfg.Account, owner, epoch)
 	}
 	h.newProvider = func(h *holder) providerConn {
-		return &Provider{Config: h.cfg, policySource: h.policyNow}
+		return &Provider{Config: h.cfg, policySource: h.policyNow, captureFence: h.fence, serveMode: true}
 	}
 	return h
 }
@@ -200,8 +210,26 @@ type policyFrame struct {
 	ExpiresAt float64 `json:"expires_at"`
 }
 
-// applyPolicy keeps the newest version; `expires_at` is bounded to 45 s ahead whatever the collector sent.
-func (h *holder) applyPolicy(raw json.RawMessage) error {
+// fence is CaptureStore.Fence in serve mode: a write proceeds only under a fresh policy that allows its chat, and a
+// policy update waits for it (finding 1). An excluded chat's event is discarded before any write.
+func (h *holder) fence(chat string) (func(), error) {
+	h.gate.RLock()
+	p, e := h.policyNow()
+	if e == nil && chat != "" && !p.Allows(chat) {
+		e = errFenceExcluded
+	}
+	if e != nil {
+		h.gate.RUnlock()
+		return nil, e
+	}
+	return h.gate.RUnlock, nil
+}
+
+func (h *holder) applyPolicy(raw json.RawMessage) error { return h.applyPolicyFor(nil, raw) }
+
+// applyPolicyFor keeps the newest version; `expires_at` is bounded to 45 s ahead whatever the collector sent. With
+// an attachment, the policy is applied only while that attachment is the current one, in the same critical section.
+func (h *holder) applyPolicyFor(att *attachment, raw json.RawMessage) error {
 	var f policyFrame
 	if decodeStrict(raw, &f) != nil || f.Version < 1 || f.ExpiresAt <= 0 || f.IncludeChats == nil || f.ExcludeChats == nil || f.OperationsEnabled == nil {
 		return errors.New("invalid_policy")
@@ -211,8 +239,13 @@ func (h *holder) applyPolicy(raw json.RawMessage) error {
 	if limit := now.Add(policyHorizon); expires.After(limit) {
 		expires = limit
 	}
+	h.gate.Lock()
+	defer h.gate.Unlock()
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if att != nil && (h.att != att || att.dead) {
+		return errors.New("collector_lease_invalid")
+	}
 	if h.pol != nil && f.Version < h.pol.version {
 		return nil // never back to an older version after a newer one arrived
 	}
@@ -224,40 +257,66 @@ func (h *holder) methods() []string {
 	return append(append([]string{}, controlMethods...), sendMethods...)
 }
 
+// verifyLease asks the database and turns its answer into a deadline counted from when the question was asked, so
+// a slow answer never extends a lease, and an answer that arrives after that deadline is "not live" (finding 3).
+// It updates the attachment's last verified deadline; an error is "unknown".
+func (h *holder) verifyLease(att *attachment, lease leaseRef) (bool, time.Time, error) {
+	asked := h.now()
+	state, e := h.checkLease(h.ctx, lease.Owner, lease.Epoch)
+	if e != nil {
+		return false, time.Time{}, e
+	}
+	deadline := asked.Add(state.remaining)
+	valid := state.valid && h.now().Before(deadline)
+	if valid && att != nil {
+		h.mu.Lock()
+		att.verifiedUntil = deadline
+		h.mu.Unlock()
+	}
+	return valid, deadline, nil
+}
+
+// admit registers a call on the attachment while it is the current one; a call that waited (for the database or a
+// lock) is admitted only after that wait, so a detached predecessor never reaches the provider (finding 2).
+func (h *holder) admit(att *attachment) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.att != att || att.dead || !h.now().Before(att.verifiedUntil) {
+		return false
+	}
+	att.inflight.Add(1)
+	return true
+}
+
 func (h *holder) dispatch(att *attachment, lane string, r request, emit func(any) error) (any, error) {
-	if !h.attached(att) {
-		return nil, errors.New("collector_lease_invalid")
-	}
-	if r.Method == "start" {
-		return h.start()
-	}
 	if lane == "send" {
 		// Before every send-lane method: a positive "not this lease" refuses and detaches; an unanswered check
 		// keeps the last verified lease until it ends.
-		state, e := h.checkLease(h.ctx, att.lease.Owner, att.lease.Epoch)
-		if e == nil && !state.valid {
+		if valid, _, e := h.verifyLease(att, att.lease); e == nil && !valid {
 			return nil, errLeaseRefused // answer detaches after the reply
 		}
-		h.mu.Lock()
-		if e == nil {
-			att.verifiedUntil = h.now().Add(state.remaining)
-		}
-		live := h.now().Before(att.verifiedUntil)
-		h.mu.Unlock()
-		if !live {
-			return nil, errLeaseRefused
-		}
+	}
+	if !h.admit(att) {
+		return nil, errLeaseRefused
+	}
+	defer att.inflight.Done()
+	if r.Method == "start" {
+		return h.start()
 	}
 	h.provUse.RLock()
 	defer h.provUse.RUnlock()
 	h.mu.Lock()
-	p, terminal := h.prov, h.terminal
+	p, terminal, dead := h.prov, h.terminal, att.dead
 	h.mu.Unlock()
+	if dead {
+		return nil, errLeaseRefused
+	}
 	if p == nil {
 		if terminal != "" {
 			return nil, errors.New(terminal)
 		}
-		return nil, errors.New("provider_not_ready")
+		// No connection: the collector's reconnect path calls `start` (serve mode never reconnects by itself).
+		return nil, errors.New("provider_disconnected")
 	}
 	if r.Method == "messenger_operation" {
 		return h.journaledOperation(p, r)
@@ -274,12 +333,10 @@ func (h *holder) start() (any, error) {
 	p, terminal := h.prov, h.terminal
 	h.mu.Unlock()
 	if p != nil {
-		if p.isReady() {
+		if p.isReady() && p.failureCode() == "" {
 			return map[string]any{"ready": true, "generation": h.generation()}, nil
 		}
-		if p.failureCode() == "" {
-			return nil, errors.New("provider_not_ready") // whatsmeow's own reconnect is under way
-		}
+		// Serve mode has no automatic reconnect: a connection that is not ready has ended.
 		h.closeLocked(p, "provider")
 		h.mu.Lock()
 		terminal = h.terminal
@@ -293,19 +350,41 @@ func (h *holder) start() (any, error) {
 	}
 	_ = os.Remove(filepath.Join(h.cfg.EventsDirectory, ".transport-failure"))
 	p = h.newProvider(h)
-	if _, e := p.start(h.ctx); e != nil {
-		if code := safeError(e); sessionTerminal[code] {
-			h.setTerminal(code)
+	// The start is tracked (finding 4): a policy expiry or a shutdown cancels it, and shutdown waits for it on provUse.
+	ctx, cancel := context.WithCancel(h.ctx)
+	h.mu.Lock()
+	h.starting = cancel
+	h.mu.Unlock()
+	_, e := p.start(ctx)
+	h.mu.Lock()
+	h.starting = nil
+	h.mu.Unlock()
+	if e == nil {
+		if _, pe := h.policyNow(); pe != nil || ctx.Err() != nil {
+			// The policy expired or the holder is stopping while it connected: disconnect, publish nothing.
+			p.disconnectNow()
+			p.Close()
+			e = pe
+			if e == nil {
+				e = errors.New("provider_disconnected")
+			}
 		}
+	} else if code := safeError(e); sessionTerminal[code] {
+		h.setTerminal(code)
+	}
+	if e != nil {
+		cancel()
 		return nil, e
 	}
 	generation, e := h.nextGeneration()
 	if e != nil {
+		p.disconnectNow()
 		p.Close()
+		cancel()
 		return nil, e
 	}
 	h.mu.Lock()
-	h.prov, h.provGen, h.provSince = p, generation, h.now()
+	h.prov, h.provGen, h.provSince, h.provCancel = p, generation, h.now(), cancel
 	h.mu.Unlock()
 	holderLog("holder.provider_connected", map[string]any{"account": h.cfg.Account, "generation": generation})
 	return map[string]any{"ready": true, "generation": generation}, nil
@@ -321,15 +400,23 @@ func (h *holder) generation() int64 {
 // in-flight handlers return.
 func (h *holder) closeProvider(reason string) {
 	h.mu.Lock()
-	p := h.prov
+	p, starting := h.prov, h.starting
 	h.mu.Unlock()
-	if p == nil {
-		return
+	if starting != nil {
+		starting()
 	}
-	p.disconnectNow()
+	if p != nil {
+		p.disconnectNow()
+	}
+	// Always taken, also with no published provider: a start under way holds it until its own teardown ended.
 	h.provUse.Lock()
 	defer h.provUse.Unlock()
-	h.closeLocked(p, reason)
+	h.mu.Lock()
+	p = h.prov
+	h.mu.Unlock()
+	if p != nil {
+		h.closeLocked(p, reason)
+	}
 }
 
 func (h *holder) closeLocked(p providerConn, reason string) {
@@ -339,8 +426,12 @@ func (h *holder) closeLocked(p providerConn, reason string) {
 		return
 	}
 	h.prov = nil
-	generation, since := h.provGen, h.provSince
+	generation, since, cancel := h.provGen, h.provSince, h.provCancel
+	h.provCancel = nil
 	h.mu.Unlock()
+	if cancel != nil {
+		defer cancel()
+	}
 	code := p.failureCode()
 	p.disconnectNow()
 	p.Close()
@@ -372,19 +463,23 @@ func (h *holder) watch(ctx context.Context) {
 
 func (h *holder) watchOnce() {
 	h.mu.Lock()
-	p, att := h.prov, h.att
+	p, att, starting := h.prov, h.att, h.starting
 	expired := h.pol == nil || !h.now().Before(h.pol.expires)
 	leaseOver := att != nil && !h.now().Before(att.verifiedUntil)
 	h.mu.Unlock()
 	if leaseOver {
 		h.detach(att, "collector_lease_invalid")
 	}
+	if expired && starting != nil {
+		starting() // no connection may complete under an expired policy
+	}
 	if p == nil {
 		return
 	}
 	if expired {
 		h.closeProvider("policy_expired")
-	} else if p.failureCode() != "" {
+	} else if p.failureCode() != "" || !p.isReady() {
+		// A failure or a plain disconnect ends the connection; only an attached `start` makes the next one.
 		h.closeProvider("provider")
 	}
 }

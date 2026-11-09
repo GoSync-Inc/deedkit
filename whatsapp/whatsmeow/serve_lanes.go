@@ -104,6 +104,8 @@ func (h *holder) accept(conn *net.UnixConn, lane string) {
 		refuse("collector_lease_invalid")
 		return
 	}
+	// Attaching may wait for a predecessor's admitted calls to return; the token was already checked.
+	_ = conn.SetDeadline(time.Time{})
 	att, code := h.attach(lane, fc, hello.Lease)
 	if code != "" {
 		refuse(code)
@@ -140,7 +142,7 @@ func (h *holder) attach(lane string, fc *frameConn, lease leaseRef) (*attachment
 		att.send = fc
 		return att, ""
 	}
-	state, e := h.checkLease(h.ctx, lease.Owner, lease.Epoch)
+	valid, deadline, e := h.verifyLease(nil, lease)
 	h.mu.Lock()
 	current := h.att
 	h.mu.Unlock()
@@ -150,17 +152,19 @@ func (h *holder) attach(lane string, fc *frameConn, lease leaseRef) (*attachment
 		}
 		return nil, "collector_lease_unverified"
 	}
-	if !state.valid {
+	if !valid {
 		return nil, "collector_lease_invalid"
 	}
 	if current != nil {
 		if current.lease == lease {
 			return nil, "holder_busy" // a second live attachment of one lease
 		}
-		// The database names the new lease the account's live one: the old one is positively invalid.
+		// The database names the new lease the account's live one: the old one is positively invalid. Its admitted
+		// calls finish before the successor is attached, so two collectors never act at once.
 		h.detach(current, "collector_lease_invalid")
+		current.inflight.Wait()
 	}
-	att := &attachment{lease: lease, control: fc, verifiedUntil: h.now().Add(state.remaining), attachedAt: h.now(), closed: make(chan struct{})}
+	att := &attachment{lease: lease, control: fc, verifiedUntil: deadline, attachedAt: h.now(), closed: make(chan struct{})}
 	h.mu.Lock()
 	if h.att != nil {
 		h.mu.Unlock()
@@ -178,6 +182,7 @@ func (h *holder) attach(lane string, fc *frameConn, lease leaseRef) (*attachment
 func (h *holder) detach(att *attachment, reason string) {
 	att.once.Do(func() {
 		h.mu.Lock()
+		att.dead = true
 		if h.att == att {
 			h.att = nil
 		}
@@ -213,23 +218,19 @@ func (h *holder) keepalive(att *attachment, k keepaliveFrame) {
 		h.detach(att, "collector_lease_invalid")
 		return
 	}
-	state, e := h.checkLease(h.ctx, att.lease.Owner, att.lease.Epoch)
-	if e == nil && !state.valid {
+	if valid, _, e := h.verifyLease(att, att.lease); e == nil && !valid {
 		h.detach(att, "collector_lease_invalid")
 		return
 	}
 	h.mu.Lock()
-	if e == nil {
-		att.verifiedUntil = h.now().Add(state.remaining)
-	}
 	live := h.now().Before(att.verifiedUntil)
 	h.mu.Unlock()
 	if !live {
 		h.detach(att, "collector_lease_invalid")
 		return
 	}
-	if len(k.Keepalive.Policy) > 0 && h.attached(att) {
-		_ = h.applyPolicy(k.Keepalive.Policy)
+	if len(k.Keepalive.Policy) > 0 {
+		_ = h.applyPolicyFor(att, k.Keepalive.Policy)
 	}
 }
 

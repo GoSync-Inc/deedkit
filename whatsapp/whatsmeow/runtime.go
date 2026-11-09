@@ -40,6 +40,10 @@ type Provider struct {
 	groupRefresh groupRefresher
 	// ANYM-937: serve mode's policy (serve.go); nil in child mode, which reads the .policy file.
 	policySource func() (Policy, error)
+	// ANYM-937 serve mode: the capture fence (CaptureStore.Fence) and no whatsmeow auto-reconnect, so every
+	// connection is one an attached collector's `start` made. Both unset in child mode.
+	captureFence func(chat string) (func(), error)
+	serveMode    bool
 }
 
 // Connection failures the Python collector retries or blocks on
@@ -241,7 +245,7 @@ func (p *Provider) start(ctx context.Context) (result any, err error) {
 	p.Capture.Owner = dev.ID.ToNonAD()
 	p.Capture.OwnerLID = dev.GetLID()
 	p.Capture.Alias = localAlias(dev.LIDs)
-	p.Client.EnableAutoReconnect = true
+	p.Client.EnableAutoReconnect = !p.serveMode
 	child, cancel := context.WithCancel(ctx)
 	p.cancel = cancel
 	connected := make(chan struct{}, 1)
@@ -330,6 +334,7 @@ func (p *Provider) prepareCapture() error {
 	if err != nil {
 		return err
 	}
+	p.Capture.Fence = p.captureFence
 	sweepNativeTemp(p.Config)
 	return p.replayPending()
 }

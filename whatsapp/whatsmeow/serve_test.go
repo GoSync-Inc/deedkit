@@ -37,14 +37,30 @@ type fakeWorld struct {
 	opEntered   chan struct{}
 	onOperation func()
 	last        *fakeProvider
+	// startGate, when set, holds start until it is closed (or, with startOnCtx, until the context ends).
+	startGate     chan struct{}
+	startOnCtx    bool
+	startReturned bool
 }
 
 func (f *fakeProvider) start(ctx context.Context) (any, error) {
 	f.world.mu.Lock()
 	f.world.starts++
-	err := f.world.startErr
+	err, gate, onCtx := f.world.startErr, f.world.startGate, f.world.startOnCtx
 	f.world.last = f
 	f.world.mu.Unlock()
+	defer f.world.set(func(w *fakeWorld) { w.startReturned = true })
+	if gate != nil {
+		if onCtx {
+			select {
+			case <-gate:
+			case <-ctx.Done():
+				return nil, errors.New("provider_initialization_failed")
+			}
+		} else {
+			<-gate
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -124,6 +140,7 @@ type fakeLeases struct {
 	remaining time.Duration
 	down      bool
 	checks    int
+	after     func(owner string)
 }
 
 func (l *fakeLeases) set(owner string, epoch int64) {
@@ -153,20 +170,33 @@ func (x *harness) state() (att *attachment, prov providerConn, terminal string) 
 }
 func sha256Sum(b []byte) [32]byte { return sha256.Sum256(b) }
 func (l *fakeLeases) check(ctx context.Context, owner string, epoch int64) (leaseState, error) {
+	state, err, hook := l.answer(owner, epoch)
+	if hook != nil {
+		hook(owner) // runs after the database answered: a slow or delayed reply
+	}
+	return state, err
+}
+func (l *fakeLeases) answer(owner string, epoch int64) (leaseState, error, func(string)) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.checks++
 	if l.down {
-		return leaseState{}, errors.New("database unreachable")
+		return leaseState{}, errors.New("database unreachable"), l.after
 	}
 	if owner != l.owner || epoch != l.epoch {
-		return leaseState{}, nil
+		return leaseState{}, nil, l.after
 	}
-	return leaseState{valid: true, remaining: l.remaining}, nil
+	return leaseState{valid: true, remaining: l.remaining}, nil, l.after
+}
+func (l *fakeLeases) setAfter(hook func(string)) {
+	l.mu.Lock()
+	l.after = hook
+	l.mu.Unlock()
 }
 
 type harness struct {
 	h      *holder
+	cancel context.CancelFunc
 	world  *fakeWorld
 	clock  *fakeClock
 	leases *fakeLeases
@@ -184,6 +214,7 @@ func newHarness(t *testing.T) *harness {
 	ctx, cancel := context.WithCancel(context.Background())
 	x := &harness{world: &fakeWorld{}, clock: &fakeClock{at: time.Unix(1_800_000_000, 0)},
 		leases: &fakeLeases{owner: "c1", epoch: 1, remaining: 60 * time.Second}}
+	x.cancel = cancel
 	x.h = newHolder(ctx, c, sockets, nil)
 	x.h.now = x.clock.now
 	x.h.checkLease = x.leases.check
@@ -619,8 +650,11 @@ func TestExpiredPolicyCapturesNothingOnTheEventPath(t *testing.T) {
 	_ = types.EmptyJID
 }
 
+// operationExpiry is ten minutes after the harness clock's start (a messenger command's default lifetime).
+const operationExpiry = 1_800_000_600
+
 func operationParams(row int, operation string) map[string]any {
-	return map[string]any{"command_row_id": fmt.Sprintf("op_%032x", row), "operation": operation, "parameters": map[string]any{}}
+	return map[string]any{"command_row_id": fmt.Sprintf("op_%032x", row), "operation": operation, "parameters": map[string]any{}, "expires_at": operationExpiry}
 }
 
 // spec: ANYM-937
@@ -664,13 +698,13 @@ func TestOperationJournalSendsEachCommandAtMostOnce(t *testing.T) {
 	if r := send.call(t, "messenger_operation", operationParams(4, "block_contact")); r["error"] != "operation_invalid_parameters" && r["error"] != "operation_outcome_unknown" {
 		t.Fatal(r)
 	}
-	b, _ := json.Marshal(map[string]any{"operation": "block_contact", "parameters": map[string]any{}})
+	b, _ := json.Marshal(map[string]any{"expires_at": operationExpiry, "operation": "block_contact", "parameters": map[string]any{}})
 	digest := fmt.Sprintf("%x", sha256Sum(b))
 	_ = x.h.writeOutcome(operationOutcome{CommandRowID: fmt.Sprintf("op_%032x", 5), PayloadDigest: digest, Pending: true})
 	if r := send.call(t, "messenger_operation", operationParams(5, "block_contact")); r["error"] != "operation_outcome_unknown" || x.world.count(&x.world.operations) != 3 {
 		t.Fatal("holder crash mid-call: retried", r)
 	}
-	if r := send.call(t, "messenger_operation", map[string]any{"operation": "block_contact", "parameters": map[string]any{}}); r["error"] != "operation_invalid_parameters" || x.world.count(&x.world.operations) != 3 {
+	if r := send.call(t, "messenger_operation", map[string]any{"operation": "block_contact", "parameters": map[string]any{}, "expires_at": operationExpiry}); r["error"] != "operation_invalid_parameters" || x.world.count(&x.world.operations) != 3 {
 		t.Fatal("an operation without its command row", r)
 	}
 }

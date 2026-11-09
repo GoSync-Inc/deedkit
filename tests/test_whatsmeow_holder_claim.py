@@ -247,3 +247,35 @@ def test_a_refused_or_failed_acquire_keeps_the_holder_up_without_a_claim(holder_
         assert holder.process.poll() is None
     finally:
         assert holder.stop() == 0
+
+
+# spec: ANYM-937
+def test_the_go_holder_waits_on_a_restored_pre_claim_backup_migrated_to_the_claim_schema(database, native_fixture_binary,  # noqa: F811
+                                                                                         tmp_path):
+    """A real pg_dump/pg_restore of a schema-77 (pre-claim) database, quarantined and migrated: the Go holder, under
+    its own login on the restored database, refuses with session_claim_restore_hold and writes no claim."""
+    from messaging_service import backup
+    from test_session_holder_role import drop, group, login
+    from test_subscription_retention import restore_database, snapshot_restored
+    group(database)
+    with restore_database(database, tmp_path / 'source', through=77) as source:
+        source.seed()
+        with source.pool.connection() as c:  # the account's status row, as every collected account has
+            c.execute('INSERT INTO source_status(account) VALUES(%s) ON CONFLICT DO NOTHING', (ACCOUNT,))
+        with snapshot_restored(source, tmp_path) as restored:
+            backup.quarantine_restore(restored)
+            restored.migrate()
+            group(restored)
+            password = 'synthetic-' + uuid4().hex
+            role = login(restored, ACCOUNT, password=password)
+            try:
+                holder = Holder(native_fixture_binary, tmp_path / 'restored-holder', holder_dsn(restored, role, password))
+                try:
+                    holder.wait_for('session_claim.waiting', code='session_claim_restore_hold')
+                    assert holder.process.poll() is None
+                    with restored.pool.connection() as c:
+                        assert c.execute('SELECT count(*) AS n FROM session_claims').fetchone()['n'] == 0
+                finally:
+                    assert holder.stop() == 0
+            finally:
+                drop(restored, role)
