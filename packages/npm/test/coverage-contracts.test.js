@@ -89,7 +89,8 @@ test('typed action definitions retain required identities and optional reviewed 
       'kinds?: SubscriptionEventKind[] | null','direction?: \'\' | \'incoming\' | \'outgoing\'',
       'origins?: SubscriptionOrigin[] | null','label?: string','expires_at?: string | null'],
     SubscriptionLifecycleAction:['subscription_id: string','version: number',
-      "action: 'pause' | 'resume' | 'close'","resume_policy?: 'catch_up' | 'skip'"],
+      "action: 'pause' | 'resume' | 'close' | 'set_exclusions'","resume_policy?: 'catch_up' | 'skip'",
+      'exclude_chats?: {account: string; chat: string}[]','exclusions_revision?: number'],
   };
   for(const [name,required] of Object.entries(fields)){
     const body=new RegExp(`interface ${name}(?: extends \\w+)? \\{([\\s\\S]*?)\\n\\}`).exec(declared)?.[1];

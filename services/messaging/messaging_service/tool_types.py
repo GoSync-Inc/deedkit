@@ -91,6 +91,19 @@ EndpointHeaders = Annotated[dict[StrictStr,StrictStr], Field(max_length=4)]
 EndpointLabel = Annotated[StrictStr, Field(max_length=128,pattern=r'^[^\x00-\x1f\x7f]*$')]
 # ANYM-520: one page of an endpoint's attempt log.
 AttemptLimit = Annotated[StrictInt, Field(ge=1,le=50)]
+class ExcludedChat(TypedDict):
+    # ANYM-830: one chat the key can see; the server checks the 40-pair and 6,000-byte limits (invalid_filter).
+    __pydantic_config__ = ConfigDict(extra='forbid')
+    account: Annotated[StrictStr, Field(min_length=1,max_length=64)]
+    chat: Annotated[StrictStr, Field(min_length=1,max_length=256)]
+# ANYM-830: the exclusion list's own conflict counter (0 before a definition's first list).
+# No schema default (as ANYM-826's page options), so a gateway never inserts them and an old backend sees none.
+ExclusionsRevision = Annotated[StrictInt | None, Field(ge=0,le=9007199254740991,
+    json_schema_extra=lambda schema: schema.pop('default',None),
+    description='set_exclusions only: the current sources.exclusions_revision (0 before the first list).')]
+ExcludedChats = Annotated[list[ExcludedChat] | None, Field(max_length=40,
+    json_schema_extra=lambda schema: schema.pop('default',None),
+    description='set_exclusions only: the whole new list of {account, chat} pairs; an empty list clears it.')]
 class SubscriptionSources(TypedDict, total=False):
     # ANYM-522: every chat the key can see now, optionally per account; channels and bots only when asked for.
     __pydantic_config__ = ConfigDict(extra='forbid')
@@ -101,6 +114,8 @@ class SubscriptionSources(TypedDict, total=False):
     # ANYM-825: 1-4 distinct of private, group, channel, unknown, before any match; behind the operator's
     # source_filters switch. The values are checked by the server (invalid_filter), not by this schema.
     chat_types: list[StrictStr]
+    # ANYM-830: chats left out before any match; behind the operator's source_exclusions switch.
+    exclude_chats: list[ExcludedChat]
 class SubscriptionEndpoint(TypedDict, total=False):
     __pydantic_config__ = ConfigDict(extra='forbid')
     endpoint_id: Required[EndpointReference]

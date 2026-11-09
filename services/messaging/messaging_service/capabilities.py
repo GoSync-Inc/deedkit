@@ -182,12 +182,16 @@ def capabilities(self, token, detail='full', sections=None):
                 # ANYM-825: dynamic sources may keep only some chat types; WhatsApp chats are untyped (unknown).
                 'source_chat_types':{'field':'sources.chat_types','values':['private','group','channel','unknown'],
                     'untyped':'unknown','disabled_error':'source_filters_disabled'},
+                # ANYM-830: chats a dynamic definition leaves out, replaced in place (update_subscription).
+                'source_exclusions':{'field':'sources.exclude_chats','max_pairs':40,'max_bytes':6000,
+                    'update_action':'set_exclusions','revision_field':'sources.exclusions_revision',
+                    'keeps_version':True,'disabled_error':'source_exclusions_disabled'},
                 # ANYM-824: get_subscription.activity, the matcher's per-day counts (numbers only, SUBSCRIPTIONS.md).
                 'activity':{'field':'activity','operation':'get_subscription','days':7,'day_basis':'utc',
                     'labels':['platform','metric'],'scope':'current_scope_version_only','retention_days':35,
                     'metrics':['scanned','matched','left_out_kind','left_out_origin','left_out_chat_type',
                         'left_out_channel','left_out_bot','left_out_direction','left_out_sender','left_out_wake_rule',
-                        'match_budget_blocked','matched_failure','reads_compact'],
+                        'match_budget_blocked','matched_failure','reads_compact','left_out_excluded_chat'],
                     'counts_model_runs':False,'cost_estimate':False},
                 'event_selection':'structural_exact_revision','origin_default':'live',
                 'mutation_permission':'subscription-write','read_permission_required':True,

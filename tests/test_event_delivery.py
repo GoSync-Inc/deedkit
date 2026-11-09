@@ -1247,6 +1247,103 @@ def test_endpoint_hint_of_a_dynamic_definition_lists_only_references_visible_now
     assert hidden not in [ref['event_id'] for ref in payload['references']]
 
 
+SECOND_CHAT = {'account': 'telegram-demo', 'chat': 'telegram-demo-chat-2'}
+
+
+def outbox(store, sid):
+    with store.pool.connection() as c:
+        return [(row['id'], row['state'], row['subscription_version']) for row in c.execute(
+            'SELECT id,state,subscription_version FROM subscription_outbox WHERE subscription=%s ORDER BY id',
+            (sid,)).fetchall()]
+
+
+# spec: ANYM-830
+def test_an_exclusion_keeps_a_queued_hint_posts_only_allowed_references_and_cancels_an_all_excluded_one(
+        seeded, tmp_path, monkeypatch):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    store.set_source_exclusions(True)
+    try:
+        token, endpoint, _, _ = endpoint_setup(store, tmp_path, monkeypatch, events=0)
+        second_chat(store)
+        sid = store.create_subscription(token, sources={'all_visible_chats': True},
+            delivery={'endpoint_id': endpoint['endpoint_id']})['subscription_id']
+        kept, excluded = emit(store), emit_in(store, 'demo-tg-x')
+        match_subscriptions(store)
+        queued = outbox(store, sid)
+        version = store.get_subscription(token, sid)['version']
+        assert [state for _, state, _ in queued] == ['pending']
+        # After staging, before the POST: the same hint stays queued under the same version.
+        view = store.update_subscription(token, sid, version, action='set_exclusions', exclude_chats=[SECOND_CHAT],
+            exclusions_revision=0)
+        assert view['version'] == version and outbox(store, sid) == queued
+        assert view['delivery']['hint_counts'] == {'pending': 1}
+        sent = []
+        resolver = lambda *a, **k: ['93.184.216.34']  # noqa: E731
+        # endpoint_setup's own explicit subscription posts its hint to the same endpoint: keep this definition's.
+        post = lambda url, body, headers, **k: (json.loads(body)['subscription_id'] == sid and sent.append(body)) or 204  # noqa: E731
+        dispatch_hints(store, transport=post, resolver=resolver)
+        assert len(sent) == 1 and [state for _, state, _ in outbox(store, sid)] == ['delivered']
+        payload = json.loads(sent[0])
+        assert [ref['event_id'] for ref in payload['references']] == [kept] and payload['references_omitted'] == 0
+        assert excluded not in [ref['event_id'] for ref in payload['references']]
+        # A hint whose references are all in a chat listed after it was staged is cancelled by the fence.
+        store.update_subscription(token, sid, version, action='set_exclusions', exclude_chats=[], exclusions_revision=1)
+        only = emit_in(store, 'demo-tg-x')
+        match_subscriptions(store)
+        assert [state for _, state, _ in outbox(store, sid)] == ['delivered', 'pending']
+        store.update_subscription(token, sid, version, action='set_exclusions', exclude_chats=[SECOND_CHAT],
+            exclusions_revision=2)
+        assert store.get_subscription(token, sid)['delivery']['hint_counts'] == {'delivered': 1}
+        dispatch_hints(store, transport=post, resolver=resolver)
+        assert len(sent) == 1 and [state for _, state, _ in outbox(store, sid)] == ['delivered', 'cancelled']
+        assert only not in [item['event_id'] for item in store.get_subscription_events(token, sid)['items']]
+    finally:
+        store.set_delivery_features(False)
+        store.set_source_exclusions(False)
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-830
+def test_a_held_hint_window_survives_an_exclusion_and_its_hint_posts_only_allowed_references(seeded, tmp_path):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    store.set_source_exclusions(True)
+    try:
+        token = identity(store)
+        second_chat(store)
+        sid = store.create_subscription(token, sources={'all_visible_chats': True})['subscription_id']
+        rid, _ = receiver(store, token, tmp_path)
+        call(store, token, 'configure_subscription_delivery', sid, 1, rid, {'batch_count': 2})
+        version = store.get_subscription(token, sid)['version']
+        excluded = emit_in(store, 'demo-tg-x')
+        match_subscriptions(store)
+        assert pending_hints(store, sid) == 0
+        view = store.update_subscription(token, sid, version, action='set_exclusions', exclude_chats=[SECOND_CHAT],
+            exclusions_revision=0)
+        # Held windows are keyed to the version: it stays, so the held range is neither discarded nor restarted.
+        assert view['version'] == version and view['delivery']['held_reason'] == 'batch'
+        with store.pool.connection() as c:
+            assert c.execute('SELECT subscription_version FROM subscription_hint_windows WHERE subscription=%s',
+                (sid,)).fetchone()['subscription_version'] == version
+        kept = emit(store)
+        match_subscriptions(store)
+        assert pending_hints(store, sid) == 1
+        posts = []
+        def transport(endpoint, body, headers, **kwargs):
+            posts.append(body)
+            return 204
+        assert dispatch_hints(store, transport=transport, resolver=lambda *a, **k: ['93.184.216.34'])['delivered'] == 1
+        assert json.loads(posts[0])['through'] == kept
+        assert [item['event_id'] for item in store.get_subscription_events(token, sid)['items']] == [kept]
+        assert excluded < kept
+    finally:
+        store.set_dynamic_subscriptions(False)
+        store.set_source_exclusions(False)
+
+
 # spec: ANYM-535
 def test_failure_kind_hints_carry_only_reference_fields(seeded, tmp_path, monkeypatch):
     from messaging_service.archive import Archive
@@ -2061,7 +2158,7 @@ def test_dispatcher_heartbeat_reports_version_and_stops_when_a_lane_stalls(seede
     legacy, [component] = rows()
     assert len(legacy) == 1
     # ANYM-825: the package version plus the build's gate features (heartbeats.identity).
-    assert (component['version'], component['schema_version']) == (__version__ + '+source-filters', RUNTIME_SCHEMA)
+    assert (component['version'], component['schema_version']) == (__version__ + '+source-filters.source-exclusions', RUNTIME_SCHEMA)
 
 
 # spec: ANYM-534

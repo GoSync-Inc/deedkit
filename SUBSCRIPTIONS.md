@@ -21,7 +21,7 @@ Python/npm client methods:
 | `create_subscription` | `chat_ids` or `sources`; optional `sender_ids`, `kinds`, `direction`, `origins`, `label`, `expires_at` | Freeze an authorized source set, or follow every chat the key can see ([dynamic sources](#dynamic-sources-all-visible-chats-schema-58)), from the committed journal head |
 | `list_subscriptions` | Optional `limit` (1–100) | List this exact credential's definitions; `has_more` is explicit |
 | `get_subscription` | `subscription_id` | Inspect lifecycle, match frontier, gap evidence and [per-day matcher activity](#matcher-activity-per-day-schema-70) |
-| `update_subscription` | `subscription_id`, current `version`, `action`; optional `resume_policy` | Pause, resume or close with optimistic concurrency |
+| `update_subscription` | `subscription_id`, current `version`, `action`; optional `resume_policy`; for `set_exclusions` also `exclude_chats` and `exclusions_revision` | Pause, resume or close with optimistic concurrency, or replace a dynamic definition's [excluded chats](#excluded-chats-anym-830) |
 | `get_subscription_events` | `subscription_id`; optional `after`, `limit` (1–100) | Read immutable event references; return `next_after`, without ACK |
 
 Creation and lifecycle changes require **both `read` and `subscription-write`**
@@ -33,7 +33,8 @@ its original key as well as its principal; a different key cannot adopt it.
 explicit sources. Optional senders are verified against selected chats and remain
 account-scoped. An equal sender string observed in two accounts is ambiguous;
 create separate subscriptions instead of treating it as one person. Sources are
-immutable in this release: close and recreate to change filters. A label is
+immutable in this release: close and recreate to change filters (the one exception is a dynamic
+definition's [excluded chats](#excluded-chats-anym-830)). A label is
 routing context, never authority to select a host task.
 
 Defaults are `kinds=['message.created']`, `direction='incoming'`,
@@ -1558,13 +1559,50 @@ until it is closed.
 `chat_types` returns `source_filters_disabled` (409) until the operator runs
 `python -m messaging_service set-source-filters --enable`, which refuses (and changes nothing)
 unless the API, matcher and dispatcher heartbeats report this version on the current schema and
-the build feature `source-filters` (heartbeat version `<version>+source-filters`; the package
+the build feature `source-filters` (heartbeat version `<version>+source-filters.source-exclusions`; the package
 version alone does not change per merge, so an older build of the same version reports none and
 is refused with `component_feature_missing`): an older matcher would store matches of every type
 for such a definition, and readers do not filter stored matches by type. The other operator
 switches compare only the part before the `+`. Rollback, before any older code is deployed: `--disable` moves every
 definition that carries `chat_types` to `access_changed` (masked in get, list and passive reads,
 refused on resume), cancels its queued hints (`source_filters_disabled`) under the fence and
+prints the definition and hint IDs; agents recreate them after a new `--enable`.
+
+### Excluded chats (ANYM-830)
+
+`sources.exclude_chats` lists chats a dynamic definition leaves out: up to 40 `{account, chat}`
+pairs, at most 6,000 bytes serialized (inside the 14,000-byte selector bound); more is
+`invalid_filter`. Every pair must name a chat the key can see now, else `not_found`. Explicit
+`chat_ids` subscriptions have no exclusion list (`set_exclusions` on one is `invalid_filter`). A
+listed chat never matches a message event, costs no match budget and no hint, and is counted in
+the [activity](#matcher-activity-per-day-schema-70) as `left_out_excluded_chat`. Failure events
+(`send.failed`, `source.health`) keep their own audience rule at the match, but every read, count
+and hint hides a stored reference whose chat is listed: the subscriber does not see its own send
+failures in excluded chats (the send status read, `get_send_status`, still shows them).
+`source.health` names no chat and is never hidden by the list.
+
+`update_subscription(action='set_exclusions', version, exclude_chats=[...], exclusions_revision=N)`
+replaces the whole list of an active or paused dynamic definition (an empty list clears it).
+`exclusions_revision` is `sources.exclusions_revision` from `get_subscription` (0 before the first
+list); a stale `version` or revision is `subscription_conflict` (409). The call keeps `version`,
+so queued, leased and held hints stay valid, bumps only `exclusions_revision` and `updated_at`,
+and an unchanged list changes nothing. It applies before the next wake: the matcher's next pass
+leaves the chats out, and every read, count, hint fence and webhook body hides references to
+them that were stored before (a hint whose references are all excluded is cancelled at
+dispatch; a hint with an allowed one posts only the allowed one). `get_subscription` shows a
+stored pair only while the key can still see its chat.
+
+Removing a chat from the list shows its stored references again, unless the consumer's
+`acked_through` already moved past them while they were hidden: those positions were acknowledged
+and are never fetched again. An exclusion is a preference, not authorization: the key's scope
+applies first, and a chat that left the scope stays hidden whatever the list says.
+
+`exclude_chats` and `set_exclusions` return `source_exclusions_disabled` (409) until the operator
+runs `python -m messaging_service set-source-exclusions --enable`, which refuses unless the API,
+matcher and dispatcher heartbeats report the build feature `source-exclusions`: an older matcher
+matches listed chats and older readers show their references. Rollback, before any older code is
+deployed: `--disable` moves every definition that carries an exclusion list (or its revision) to
+`access_changed`, cancels its queued hints (`source_exclusions_disabled`) under the fence and
 prints the definition and hint IDs; agents recreate them after a new `--enable`.
 
 **Authorization at every disclosure point.** The matcher reads one scope snapshot per event batch
@@ -1630,14 +1668,14 @@ of the last 7 UTC days, oldest first, per platform (the account's provider name,
 | --- | --- |
 | `scanned` | Message-bearing events in the chats the definition selects: its chat list (explicit), or the chats the key can see at that pass (dynamic). Events of other chats or accounts are counted nowhere, so the numbers say nothing about other chats' traffic |
 | `matched` | Scanned events the definition kept a reference to |
-| `left_out_<reason>` | Scanned events the FIRST rejecting rule left out, in the matcher's order: `kind`, `origin`, `chat_type` (`sources.chat_types`), `channel`, `bot`, `direction` (also when the event carries no direction), `sender` (also without a sender), `wake_rule` |
+| `left_out_<reason>` | Scanned events the FIRST rejecting rule left out, in the matcher's order: `kind`, `origin`, `excluded_chat` (`sources.exclude_chats`), `chat_type` (`sources.chat_types`), `channel`, `bot`, `direction` (also when the event carries no direction), `sender` (also without a sender), `wake_rule` |
 | `match_budget_blocked` | Passes that stopped at `SUBSCRIPTION_MAX_MATCHES`; the event that hit the budget is not scanned yet |
 | `matched_failure` | `send.failed` and `source.health` events that matched by their own audience rule; never in `scanned` |
 | `reads_compact` | Platform `all`: pages read with `detail='compact'` (`get_subscription_events`, `fetch_subscription_events`, and each page `wait_for_subscription_events` returns, not each poll); not part of `scanned`. A failed count never fails the read |
 
 So `scanned = matched + Σ left_out_*` per day and platform. A zero metric and a day without
 counts are omitted; `list_subscriptions` carries no `activity`. Later reasons use the same names
-(`left_out_excluded_chat`, ANYM-830).
+(`left_out_<reason>`).
 
 What the numbers mean: `matched` counts references kept, not model runs. The server counts the
 hints it stages and delivers (`delivery.hint_counts`, unchanged) but cannot see whether the
