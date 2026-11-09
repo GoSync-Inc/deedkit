@@ -19,8 +19,6 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-import math
-
 from .enrichment_providers import ModelBackpressure, ModelError, infer, private_text, profile_hash, validate_profile
 from . import resource_admission
 from . import processing_events
