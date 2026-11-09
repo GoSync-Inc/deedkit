@@ -97,9 +97,10 @@ def test_messaging_docstrings_name_the_pointer_fields_their_catalog_descriptions
     assert named == {
         'get_messages': ['history_hint', 'next_call'], 'get_sync_status': ['history_hint', 'next_call'],
         'resolve_reference': ['next_call'], 'send_message': ['next_call']}
-    source = (root / 'services/messaging/messaging_service/app.py').read_text()
+    package = root / 'services/messaging/messaging_service'
+    sources = [package / 'app.py', *sorted((package / 'app_tools').glob('*.py'))]
     docstrings = {
-        node.name: ast.get_docstring(node) or '' for node in ast.walk(ast.parse(source))
+        node.name: ast.get_docstring(node) or '' for path in sources for node in ast.walk(ast.parse(path.read_text()))
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
         and any(ast.unparse(d).startswith('mcp.tool(') for d in node.decorator_list)}
     missing = {name: [f for f in fields if f not in docstrings.get(name, '')] for name, fields in named.items()}
