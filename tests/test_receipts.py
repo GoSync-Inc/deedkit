@@ -294,7 +294,7 @@ def typed_chat(store,provider_chat,chat_type):
 
 
 # spec: ANYM-868
-def test_a_group_boundary_publishes_an_aggregate_read_and_a_channel_or_untyped_chat_is_skipped(receipt_state,tmp_path):
+def test_a_group_boundary_publishes_an_aggregate_read_and_a_channel_is_skipped(receipt_state,tmp_path):
     store,archive,state=receipt_state
     read=outgoing(archive,17,chat='-100');unread=outgoing(archive,18,chat='-100');typed_chat(store,'-100','group')
     channel=outgoing(archive,17,chat='-1000000000200');typed_chat(store,'-1000000000200','channel')
@@ -302,15 +302,14 @@ def test_a_group_boundary_publishes_an_aggregate_read_and_a_channel_or_untyped_c
     peer=outgoing(archive,17)
     group=lambda chat:capture(chat=chat,audience='provider_aggregate')
     assert state.apply(group('-1000000000200'))=={'outcome':'receipt_skipped','reason':'receipt_broadcast_channel'}
-    assert state.apply(group('-300'))=={'outcome':'receipt_skipped','reason':'receipt_chat_type_unknown'}
-    assert state.apply(group('-400'))=={'outcome':'receipt_skipped','reason':'receipt_chat_type_unknown'}
-    # The skips are outcomes, not failures: a drain with them in the middle commits every capture after them.
+    # A skip is an outcome, not a failure: a drain with it in the middle commits every capture after it.
     spool=CaptureSpool(tmp_path/'receipts')
     for value in (group('-1000000000200'),group('-300'),group('-100'),capture()):spool.put(value)
     assert spool.drain(state.apply)==4 and not list(spool.path.glob('*.json'))
     state.publish_receipts()
     with store.pool.connection() as c:
-        assert {r['provider_chat'] for r in c.execute("SELECT provider_chat FROM message_receipts")}=={'-100','100'}
+        # The untyped chat's boundary is kept, waiting for its chat type (the next test); the channel's is not.
+        assert {r['provider_chat'] for r in c.execute("SELECT provider_chat FROM message_receipts")}=={'-100','-300','100'}
     published={e['message']:e['snapshot']['delivery_receipt'] for e in statuses(store)}
     assert set(published)=={read,peer}
     assert published[read]['state']=='read' and published[read]['audience']=='provider_aggregate'
@@ -323,6 +322,32 @@ def test_a_group_boundary_publishes_an_aggregate_read_and_a_channel_or_untyped_c
         proof=for_reference(c,'receipt-test','-100','17','telegram')
         assert (proof['state'],proof['audience'])==('read','provider_aggregate')
         assert for_reference(c,'receipt-test','-100','18','telegram')['state']=='unknown'
+        assert for_reference(c,'receipt-test','-300','17','telegram')['state']=='unknown'
+
+
+# spec: ANYM-868
+def test_a_group_boundary_before_its_chat_type_publishes_once_the_chat_is_known_and_never_for_a_channel(receipt_state):
+    """Astra r1 F1: a boundary that arrives before discovery or classification is not lost. It waits without taking a
+    publication slot, and counts once the chat is stored as a group, with no further provider update; one whose chat
+    turns out to be a broadcast channel completes with nothing published."""
+    store,archive,state=receipt_state
+    group=lambda chat:capture(chat=chat,audience='provider_aggregate')
+    assert state.apply(group('-100'))['outcome']=='receipt_recorded'  # no chat row yet
+    assert state.apply(group('-1000000000200'))['outcome']=='receipt_recorded'
+    read=outgoing(archive,17,chat='-100');channel=outgoing(archive,17,chat='-1000000000200')
+    state.publish_receipts()
+    assert statuses(store)==[] and {m:p['state'] for m,p in evidence(store,[{'id':read},{'id':channel}]).items()}=={
+        read:'unknown',channel:'unknown'}
+    with store.pool.connection() as c:
+        assert c.execute('SELECT count(*) AS n FROM receipt_event_jobs WHERE NOT complete').fetchone()['n']==2
+    typed_chat(store,'-100','group');typed_chat(store,'-1000000000200','channel')
+    state.publish_receipts()
+    published={e['message']:e['snapshot']['delivery_receipt'] for e in statuses(store)}
+    assert set(published)=={read} and (published[read]['state'],published[read]['audience'])==('read','provider_aggregate')
+    assert evidence(store,[{'id':channel}])[channel]['state']=='unknown'
+    with store.pool.connection() as c:
+        assert c.execute('SELECT count(*) AS n FROM receipt_event_jobs WHERE NOT complete').fetchone()['n']==0
+    state.publish_receipts();assert len(statuses(store))==1
 
 
 def test_self_chat_receipts_are_normalized_whatever_the_device_ack(seeded):

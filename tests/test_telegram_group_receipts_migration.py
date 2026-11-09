@@ -1,7 +1,9 @@
 """ANYM-868 migration: the Telegram branch of the message_receipts CHECK also allows an aggregate group boundary.
 A NOT VALID swap in one ALTER TABLE, run through the real `migrate-expand` batch on disposable databases with
 synthetic receipts only."""
+from contextlib import ExitStack
 import hashlib
+import re
 import threading
 import time
 
@@ -14,6 +16,7 @@ from messaging_service import store as store_module
 from messaging_service.receipts import REFERENCE_TG_SQL, ROW_PROOFS_SQL
 from messaging_service.store import ExpandError, RUNTIME_SCHEMA
 import test_migrate_expand
+from test_extend_key import old_schema_store
 from test_migrate_expand import SOURCE, plan_for
 
 # A disposable database per test from a module template at the runtime schema (test_migrate_expand's fixtures).
@@ -21,10 +24,9 @@ template, db = test_migrate_expand.template, test_migrate_expand.db
 
 MIGRATION = next(SOURCE.glob('migrations/[0-9][0-9][0-9]_telegram_group_receipts.sql'))
 VERSION = int(MIGRATION.name[:3])
-# 023's row CHECK as a schema-(VERSION-1) database has it.
-OLD_CHECK = ("CHECK((platform='telegram' AND provider_id IS NULL AND max_id IS NOT NULL AND max_id>0 "
-             "AND state='read' AND basis='telegram_outbox_boundary' AND audience='private_peer') "
-             "OR (platform='whatsapp' AND provider_id IS NOT NULL AND max_id IS NULL AND basis='whatsapp_message_ack'))")
+# The production schema the card names (N-1 is 70 or 71): a release from it applies 071 (outgoing_messages.menu_choice
+# with its CHECK and a gateway grant), 072 (an attachments index) and this file in one migrate-expand batch.
+DEPLOYED = 70
 RECEIPTS = 100_000
 LOCK_S, TRANSACTION_S = 2, 4  # store.py expand_connection: lock_timeout 2 s, statement and transaction 4 s
 # The schema-(VERSION-1) runtime's receipt write (receipts.record) and boundary read, unchanged by this card.
@@ -32,13 +34,32 @@ OLD_INSERT = ('INSERT INTO message_receipts(id,account,platform,provider_chat,pr
               'observed_at,provider_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL) ON CONFLICT(id) DO NOTHING RETURNING id')
 
 
-def rewind(dsn):
-    """The database as schema VERSION-1 left it: 023's CHECK, the ledger one version back."""
+@pytest.fixture
+def at_schema(database, tmp_path):
+    """`at_schema(version)`: the DSN of a disposable database built with the migrations up to `version` only."""
+    with ExitStack() as stack:
+        yield lambda version: stack.enter_context(old_schema_store(database, tmp_path, version)).pool.conninfo
+
+
+def appended_roles(base):
+    """Each role file's blocks for schemas after `base` (`-- Schema N` headers): what a release from `base` appends."""
+    found = {}
+    for path in sorted(SOURCE.glob('*_role.sql')):
+        text = path.read_text()
+        later = [m.start() for m in re.finditer(r'^-- Schema (\d+)', text, re.M) if int(m.group(1)) > base]
+        if later: found[path.name] = text[later[0]:]
+    return found
+
+
+def release_plan(base):
+    return plan_for(SOURCE, base, VERSION, appended_roles(base))
+
+
+def gateway_role(dsn):
+    # As gateway_role.sql's own first statement: the role an appended grant names exists before the release.
     with psycopg.connect(dsn) as c:
-        c.execute('ALTER TABLE message_receipts DROP CONSTRAINT message_receipts_source_check, '
-                  'ADD CONSTRAINT message_receipts_check ' + OLD_CHECK)
-        c.execute('DELETE FROM archive_migrations WHERE version=%s', (VERSION,))
-        c.execute("UPDATE probe_metadata SET value=%s WHERE name='schema_version'", (str(VERSION - 1),))
+        c.execute("DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='messaging_gateway') THEN "
+                  "CREATE ROLE messaging_gateway NOLOGIN; END IF; END $$")
 
 
 def seed(dsn, rows=RECEIPTS):
@@ -58,10 +79,18 @@ def constraints(dsn):
             "AND contype='c' AND conname IN ('message_receipts_check','message_receipts_source_check')")}
 
 
-def version(dsn):
+def version(dsn, base=None):
+    """(schema_version, ledger rows above `base`, default VERSION-1)."""
     with psycopg.connect(dsn, row_factory=dict_row) as c:
         return (int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']),
-                c.execute('SELECT count(*) AS n FROM archive_migrations WHERE version=%s', (VERSION,)).fetchone()['n'])
+                c.execute('SELECT count(*) AS n FROM archive_migrations WHERE version>%s',
+                          (VERSION - 1 if base is None else base,)).fetchone()['n'])
+
+
+def menu_choice(dsn):
+    with psycopg.connect(dsn) as c:
+        return c.execute("SELECT count(*) FROM information_schema.columns WHERE table_name='outgoing_messages' "
+                         "AND column_name='menu_choice'").fetchone()[0]
 
 
 def receipt(account, chat, max_id, audience):
@@ -80,12 +109,13 @@ def test_the_migration_is_an_unattended_non_critical_check_swap_that_backup_and_
 
 
 # spec: ANYM-868
-def test_the_widened_check_takes_group_aggregates_only_and_rewrites_no_row(db):
-    _, dsn = db
-    rewind(dsn); seed(dsn, 1000)
+def test_the_widened_check_takes_group_aggregates_only_and_rewrites_no_row(at_schema):
+    dsn = at_schema(VERSION - 1)
+    seed(dsn, 1000)
+    assert constraints(dsn) == {'message_receipts_check': True}
     with psycopg.connect(dsn) as c:
         before = c.execute('SELECT md5(string_agg(m::text,\'\' ORDER BY id)) FROM message_receipts m').fetchone()[0]
-    assert store_module.migrate_expand(dsn, plan_for(SOURCE, VERSION - 1, VERSION)) == {'schema_version': VERSION}
+    assert store_module.migrate_expand(dsn, release_plan(VERSION - 1)) == {'schema_version': VERSION}
     assert constraints(dsn) == {'message_receipts_source_check': False} and version(dsn) == (VERSION, 1)
     with psycopg.connect(dsn) as c:
         assert c.execute('SELECT md5(string_agg(m::text,\'\' ORDER BY id)) FROM message_receipts m').fetchone()[0] == before
@@ -111,13 +141,14 @@ def test_a_rerun_over_a_rewound_ledger_is_idempotent(db):
 
 
 def old_runtime(dsn, stop, log, kind, worker):
-    """A schema-(VERSION-1) reader or writer looping until `stop`: each statement's (start, end, error)."""
+    """A previous runtime's reader or writer looping until `stop`: each statement's (kind, worker, start, end, error)."""
     with psycopg.connect(dsn, autocommit=True, options='-c statement_timeout=15000') as c:
         n = 0
         while not stop.is_set():
             n += 1; started = time.monotonic(); error = None
             try:
                 if kind == 'reader': c.execute(REFERENCE_TG_SQL, ('synthetic', str(n % 500 + 1), n)).fetchall()
+                elif kind == 'outgoing': c.execute("SELECT count(*) FROM outgoing_messages WHERE account='synthetic'")
                 else: c.execute(OLD_INSERT, receipt('synthetic', str(n % 500 + 1), RECEIPTS + n, 'private_peer'))
             except psycopg.Error as exc: error = type(exc).__name__
             log.append((kind, worker, started, time.monotonic(), error))
@@ -125,21 +156,27 @@ def old_runtime(dsn, stop, log, kind, worker):
 
 
 # spec: ANYM-868
+@pytest.mark.parametrize('base', [DEPLOYED, VERSION - 1], ids=['from-deployed-70', 'from-previous'])
 @pytest.mark.parametrize(('hold_s', 'delay_s', 'code'), [
     (1.0, 1.0, None),                    # the reader lets go inside lock_timeout; the batch commits
     (3.0, 0.0, 'lock_timeout'),          # the reader outlasts lock_timeout; the batch aborts
     (0.5, 5.0, 'transaction_timeout'),   # a later statement of the batch outlasts the transaction budget
 ], ids=['commits', 'lock_wait_aborts', 'slow_batch_aborts'])
-def test_the_swap_on_100k_receipts_commits_or_aborts_inside_the_runner_bounds(db, hold_s, delay_s, code):
-    _, dsn = db
-    rewind(dsn); seed(dsn)
-    plan = plan_for(SOURCE, VERSION - 1, VERSION)
+def test_the_swap_on_100k_receipts_commits_or_aborts_inside_the_runner_bounds(at_schema, base, hold_s, delay_s, code):
+    """Criterion 1's lock test through the real migrate-expand batch from a database built at `base` with that
+    schema's own SQL: from 70 the batch also holds 071's outgoing_messages lock and its gateway grant while the swap
+    waits for message_receipts."""
+    dsn = at_schema(base)
+    gateway_role(dsn); seed(dsn)
+    plan = release_plan(base)
+    assert ('gateway_role.sql' in appended_roles(base)) == (base < 71)  # 071's grant rides a release from 70
     holder = psycopg.connect(dsn)
     holder.execute('SELECT count(*) FROM message_receipts')  # an old-runtime reader holds ACCESS SHARE
     stop, log, inside, result = threading.Event(), [], {}, {}
 
     def later_statement(c):
-        # Runs in the batch's transaction after the swap: the swap scanned no row and holds ACCESS EXCLUSIVE.
+        # Runs in the batch's transaction after every file and role grant: the swap scanned no row of
+        # message_receipts and holds ACCESS EXCLUSIVE on it.
         inside['seq_scan'] = c.execute("SELECT coalesce(seq_scan,0) AS n FROM pg_stat_xact_user_tables "
                                        "WHERE relname='message_receipts'").fetchone()['n']
         inside['mode'] = c.execute("SELECT mode FROM pg_locks WHERE pid=pg_backend_pid() AND granted "
@@ -153,7 +190,7 @@ def test_the_swap_on_100k_receipts_commits_or_aborts_inside_the_runner_bounds(db
         result['span'] = (started, time.monotonic())
 
     sessions = [threading.Thread(target=old_runtime, args=(dsn, stop, log, kind, i))
-                for i, kind in enumerate(['reader', 'reader', 'writer', 'writer'])]
+                for i, kind in enumerate(['reader', 'reader', 'writer', 'writer', 'outgoing'])]
     for s in sessions: s.start()
     time.sleep(0.3)
     runner = threading.Thread(target=migrate); runner.start()
@@ -169,15 +206,19 @@ def test_the_swap_on_100k_receipts_commits_or_aborts_inside_the_runner_bounds(db
     assert max(end - begin for _, _, begin, end, _ in log) <= LOCK_S + TRANSACTION_S
     blocked = [(begin, end) for _, _, begin, end, _ in log if started <= begin <= ended and end - begin > 0.3]
     assert blocked and all(end <= ended + 0.5 for _, end in blocked)
-    assert {kind for kind, _, begin, _, _ in log if begin > ended} == {'reader', 'writer'}
+    assert {kind for kind, _, begin, _, _ in log if begin > ended} == {'reader', 'writer', 'outgoing'}
     if code is None:
         assert inside['seq_scan'] == 0 and {'mode': 'AccessExclusiveLock'} in inside['mode']
-        assert constraints(dsn) == {'message_receipts_source_check': False} and version(dsn) == (VERSION, 1)
+        assert constraints(dsn) == {'message_receipts_source_check': False}
+        assert version(dsn, base) == (VERSION, VERSION - base) and menu_choice(dsn) == 1
     else:
-        # Nothing applied: the old CHECK in place, the version not recorded; the next deploy retries the same batch.
-        assert constraints(dsn) == {'message_receipts_check': True} and version(dsn) == (VERSION - 1, 0)
+        # Nothing applied, from any file of the batch: the old CHECK in place, no later column, the version not
+        # recorded. The next deploy retries the same batch.
+        assert constraints(dsn) == {'message_receipts_check': True}
+        assert version(dsn, base) == (base, 0) and menu_choice(dsn) == (1 if base >= 71 else 0)
         assert store_module.migrate_expand(dsn, plan) == {'schema_version': VERSION}
-        assert constraints(dsn) == {'message_receipts_source_check': False} and version(dsn) == (VERSION, 1)
+        assert constraints(dsn) == {'message_receipts_source_check': False}
+        assert version(dsn, base) == (VERSION, VERSION - base) and menu_choice(dsn) == 1
 
 
 # spec: ANYM-868
