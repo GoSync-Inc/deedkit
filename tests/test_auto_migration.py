@@ -305,6 +305,22 @@ def test_a_copy_refusal_then_a_hand_migration_lets_the_next_run_release_without_
 
 
 # spec: ANYM-449
+@pytest.mark.parametrize("status", ["uncertain", "diverged"])
+def test_an_unsettled_uncertain_or_diverged_migration_keeps_a_target_ledger_paused(tmp_path, monkeypatch, status):
+    # Astra r1 F1: an older candidate's migration reached the ledger's target but not its rehearsal's catalog.
+    host = MigrationHost(tmp_path, monkeypatch, {"051_synthetic_note.sql": NOTE})
+    migrated_by_hand(host)
+    (host.state / NEWER).mkdir(parents=True, exist_ok=True)
+    receipt = host.state / NEWER / "migration.json"
+    receipt.write_text(json.dumps({"status": status}))  # an unreadable one refuses earlier (unsettled_migrations)
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and host.paused() == outcome["reason"] and host.steps == []
+    assert outcome["reason"] == (f"the migration of {NEWER} ended uncertain or diverged; inspect its migration.json "
+                                 "before any release (production.md)")
+    assert not {"copy", "migrate", "status"} & set(host.events)
+
+
+# spec: ANYM-449
 def test_a_hand_migrated_ledger_still_pauses_when_the_range_changes_a_role_file(tmp_path, monkeypatch):
     host = MigrationHost(tmp_path, monkeypatch, {"051_synthetic_marks.sql": TABLE}, roles={"gateway_role.sql": GRANT})
     migrated_by_hand(host)
@@ -1380,6 +1396,17 @@ def test_a_range_touching_both_databases_rehearses_both_then_applies_calendar_th
     assert receipt["status"] == "migrated" and receipt["database"] == "messaging" and receipt["copy"] == "copy586-messaging"
     assert receipt["phases"]["calendar"]["status"] == receipt["phases"]["messaging"]["status"] == "migrated"
     assert (host.state / NEWEST / "migrate-plan.json").exists() and (host.state / NEWEST / "calendar-migrate-plan.json").exists()
+
+
+# spec: ANYM-449
+def test_a_range_touching_both_databases_never_skips_a_messaging_ledger_at_its_target(tmp_path, monkeypatch):
+    # Astra r1 F2: recovery of a two-database receipt reads both plans, so neither is skipped.
+    host = CalendarHost(tmp_path, monkeypatch, {"schema_v6.sql": CALENDAR_TABLE}, files={"051_synthetic_note.sql": NOTE})
+    migrated_by_hand(host)
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and host.steps == [] and host.migration() is None
+    assert outcome["reason"] == "the live messaging ledger is not the base's schema 50; migrate by hand (production.md)"
+    assert not {"copy", "calendar copy", "migrate", "calendar migrate"} & set(calendar_events(host))
 
 
 # spec: ANYM-586

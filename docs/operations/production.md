@@ -854,12 +854,14 @@ Phases, each a pause or a wait before any production write:
    `prepare_threshold: None` (#352; else "deploy #352 first"); the live ledger is exactly the base's (`schema_version` and every
    `archive_migrations` checksum; else a pause).
    Migrated by hand (2026-11-09: the 075 copy refused, 075 was migrated by hand, and the next run would copy and
-   pause again): a messaging range that changes no role file, whose live ledger is exactly the target's (the
-   base's checksums and the range's own), copies, rehearses and migrates nothing. Its producer check (phase 2)
-   still runs, then plan A and plan B; no `migration.json` is written. A run that finds an earlier run's
-   `refused` or `not-applied` `migration.json` (nothing reached production) reads the ledger once more and goes
-   on the same way; any other ledger, a role file change (the ledger does not show grants) and calendar keep the
-   pause. So after "Migration releases" item 4 step 3's `migrate` of such a range, removing the pause lets the
+   pause again): a messaging-only range that changes no role file, whose live ledger is exactly the target's
+   (the base's checksums and the range's own), copies, rehearses and migrates nothing. Its producer check (phase
+   2) still runs, then plan A and plan B; no `migration.json` is written. A run that finds an earlier run's
+   `refused` or `not-applied` `migration.json` of that release (a refusal before any write, or a migrate-expand
+   whose ledger and catalog were found unchanged) reads the ledger once more and goes on the same way. Any other
+   ledger, a role file change (the ledger does not show grants), a range that also touches calendar, and any
+   release whose `migration.json` ended `uncertain` or `diverged` (or cannot be read) with no plan A attempt keep
+   the pause: settle that release first (apply it by hand, or move its receipt aside with a note). So after "Migration releases" item 4 step 3's `migrate` of such a range, removing the pause lets the
    next `deploy` apply and promote it. `--dry-run` reads no database and still names the migration.
 2. Preparation: plan A `prepare` as always, then the producer check: the image `runner.json` pins has an
    `org.opencontainers.image.revision` whose `backup.py` `SCHEMAS` holds the target. When it does not, the

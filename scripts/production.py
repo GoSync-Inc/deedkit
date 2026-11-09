@@ -5195,8 +5195,9 @@ def migration_gate(settings, http, plan, mirror, base, serving, *, admission=Fal
     """M2's read-only gates, at admission and again as the final gate: no active or unknown call, nothing
     unfinished, the base release's Store without server-side prepared statements (#352) and the live ledger exactly
     the base's. The backup receiver's schema (`receiver_schema_max`) holds no release (owner 11-04): a receiver that
-    does not read the target yet is a backup follow-up. At admission a messaging ledger exactly at the target marks
-    the plan `by_hand` (`at_target`): the base already runs on that schema and `migrate` skips the database."""
+    does not read the target yet is a backup follow-up. At admission of a messaging-only range a ledger exactly at the
+    target marks the plan `by_hand` (`at_target`): the base already runs on that schema and `migrate` skips the
+    database, unless a release's migration ended uncertain or diverged and nobody settled it (Astra r1 F1)."""
     wait_for_calls(settings, time.monotonic() + CALL_POLL)
     if reason := unresolved(Path(settings["state_directory"]), Path(http["state_directory"]), lambda: mirror, serving):
         raise MigrationRefused(reason)
@@ -5204,6 +5205,9 @@ def migration_gate(settings, http, plan, mirror, base, serving, *, admission=Fal
         return calendar_gate(settings, plan, mirror, base)
     version, applied = live_ledger(copy_source(settings, AUTO_DATABASE)[0])
     if admission and at_target(plan, version, applied):
+        if held := unsettled_outcomes(Path(settings["state_directory"])):
+            raise MigrationRefused(f"the migration of {held[0]} ended uncertain or diverged; inspect its migration.json "
+                                   "before any release (production.md)")
         plan["by_hand"] = True
         return
     try:
@@ -5401,6 +5405,20 @@ def resumed_migration(settings, plans, candidate, release):
             raise MigrationRefused(f"calendar migrated to {plan['target']}; roles: interrupted")
     progress.record("migrated")
     return True
+
+
+def unsettled_outcomes(state):
+    """Releases whose unattended migration ended `uncertain` or `diverged` and whose plan A never ran: the ledger may be
+    at the target while the catalog is not what its rehearsal proved. An unreadable receipt counts."""
+    found = []
+    for path in sorted(Path(state).glob("*/migration.json")):
+        try:
+            status = read(path).get("status")
+        except Exception:
+            status = None
+        if status not in ("migrated", "planned", "refused", "not-applied") and not (path.parent / "attempted.json").exists():
+            found.append(path.parent.name)
+    return found
 
 
 def unsettled_migrations(state):
@@ -6188,7 +6206,8 @@ def deploy_plan_a(settings, http, plans, mirror, base, serving, candidate, relea
         # M2 admission (read-only) before preparation; a run that finds migration.json resumes from it (M4).
         if plans and not (migrated := resumed_migration(settings, plans, candidate, release)):
             for plan in plans:
-                migration_gate(settings, http, plan, mirror, base, serving["sha"], admission=True)
+                # A range that also touches calendar never skips messaging (Astra r1 F2: its recovery reads both).
+                migration_gate(settings, http, plan, mirror, base, serving["sha"], admission=len(plans) == 1)
         if not (release / "prepared.json").exists():
             if release.exists():
                 return finish(**halt(f"an earlier preparation of {candidate} did not finish; inspect {release}",
