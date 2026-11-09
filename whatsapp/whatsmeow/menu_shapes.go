@@ -40,6 +40,10 @@ var (
 	menuShapeDeadline  = 2 * time.Minute
 )
 
+// menuShapeBeforeRow, when set (tests only), runs before each journal statement
+// with the number of rows scanned so far.
+var menuShapeBeforeRow func(scanned int)
+
 // Only these protocol words are printed; anything else is "other", so no
 // message-controlled spelling or number reaches the report.
 var (
@@ -121,6 +125,9 @@ func menuReplyShapes(page menuShapePager, lookup mediaKeyLookup, upto int64) *me
 		if report.RowsScanned >= menuShapeRowBudget || time.Now().After(stop) {
 			report.Incomplete, report.IncompleteCause = true, "scan_budget"
 			break
+		}
+		if menuShapeBeforeRow != nil {
+			menuShapeBeforeRow(report.RowsScanned)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), menuShapeTimeout)
 		r, seq, ok, e := page(ctx, after, upto)

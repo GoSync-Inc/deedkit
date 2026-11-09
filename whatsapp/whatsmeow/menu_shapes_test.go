@@ -249,21 +249,16 @@ func TestMenuReplyShapesEndsAtASlowLaterRowWhileCaptureKeepsWriting(t *testing.T
 	t.Cleanup(func() { s.Close() })
 	s.Owner = types.NewJID("123456", types.DefaultUserServer)
 	s.MaxEntries = 1 << 30
-	// A fast first row, then a long run of rows without raw evidence that a later
-	// statement must step over before it finds the next row.
-	if err := s.Put(menuShapeEvent("REPLY1", 1700000011, true, &waE2E.Message{ListResponseMessage: &waE2E.ListResponseMessage{ContextInfo: quoting("NONE")}}), "live"); err != nil {
+	// A fast first row (plain text, so no menu lookup follows it), then a long run
+	// of rows without raw evidence that the second statement must step over
+	// before it finds the owner's menu reply.
+	if err := s.Put(fixtureMessage("FIRST", 1700000011), "live"); err != nil {
 		t.Fatal(err)
 	}
-	tx, err := s.db.Begin()
-	if err != nil {
+	if _, err := s.db.Exec("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?) INSERT INTO capture(digest,chat,message_id,source_ts,raw,envelope,published,created_at) SELECT 'slow'||i,'111111@c.us','m'||i,i,x'',x'7b7d',1,0 FROM n", menuShapeSlowRows); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 100000; i++ {
-		if _, err := tx.Exec("INSERT INTO capture(digest,chat,message_id,source_ts,raw,envelope,published,created_at) VALUES(?,?,?,?,x'',x'7b7d',1,0)", "slow"+strconv.Itoa(i), "111111@c.us", "m"+strconv.Itoa(i), i); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
+	if err := s.Put(menuShapeEvent("REPLY2", 1700000012, true, &waE2E.Message{ListResponseMessage: &waE2E.ListResponseMessage{ContextInfo: quoting("NONE")}}), "live"); err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(filepath.Dir(config.SessionDirectory), "config.json")
@@ -271,28 +266,63 @@ func TestMenuReplyShapesEndsAtASlowLaterRowWhileCaptureKeepsWriting(t *testing.T
 		t.Fatal(err)
 	}
 	defer func(d time.Duration) { menuShapeTimeout = d }(menuShapeTimeout)
-	menuShapeTimeout = 3 * time.Millisecond
-	done := make(chan error, 1)
-	var out bytes.Buffer
-	started := time.Now()
-	go func() { done <- serveMenuReplyShapes(path, &out) }()
-	// The owning adapter writes while the scan steps over the slow rows.
-	for i := 0; i < 20; i++ {
-		if err := s.Put(fixtureMessage("LIVE"+strconv.Itoa(i), 1700002000+int64(i)), "live"); err != nil {
-			t.Fatalf("a capture write failed beside the scan: %v", err)
+	menuShapeTimeout = 300 * time.Millisecond
+	// The owning adapter writes 50 ms after the scan's first statement. The fast
+	// first row ends that statement at once; the second steps over the slow rows
+	// and must end by journal_read_timeout (300 ms), so the write lands while the
+	// read holds its lock.
+	type write struct {
+		began time.Time
+		took  time.Duration
+		err   error
+	}
+	written := make(chan write, 1)
+	var second time.Time
+	defer func() { menuShapeBeforeRow = nil }()
+	menuShapeBeforeRow = func(scanned int) {
+		switch scanned {
+		case 0:
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				began := time.Now()
+				err := s.Put(fixtureMessage("LIVE", 1700002000), "live")
+				written <- write{began, time.Since(began), err}
+			}()
+		case 1:
+			second = time.Now()
 		}
 	}
-	if err := <-done; err != nil {
+	var out bytes.Buffer
+	started := time.Now()
+	if err := serveMenuReplyShapes(path, &out); err != nil {
 		t.Fatal(err)
 	}
-	if time.Since(started) > 5*time.Second {
-		t.Fatalf("scan held on for %v", time.Since(started))
+	scan := time.Since(started)
+	var w write
+	select {
+	case w = <-written:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the capture write beside the scan never finished")
+	}
+	t.Logf("scan %v, capture write %v", scan, w.took)
+	if w.err != nil {
+		t.Fatalf("a capture write failed beside the scan: %v", w.err)
+	}
+	// The write waited at most for the interrupted statement, not for the slow rows.
+	if w.took > 1500*time.Millisecond || scan > 3*time.Second {
+		t.Fatalf("the read held the journal: write %v, scan %v", w.took, scan)
+	}
+	if second.IsZero() || !second.Before(w.began) || !w.began.Before(second.Add(menuShapeTimeout)) {
+		t.Fatalf("the write did not start inside the slow statement: second statement %v, write %v", second, w.began)
 	}
 	var report menuShapeReport
 	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
 		t.Fatal(err)
 	}
-	if !report.Incomplete || report.IncompleteCause != "journal_read_timeout" || report.OwnerReplies != 1 {
+	if !report.Incomplete || report.IncompleteCause != "journal_read_timeout" || report.RowsScanned != 1 || report.OwnerReplies != 0 {
 		t.Fatalf("the slow later row did not end the scan: %s", out.String())
 	}
 }
+
+// Enough rows that stepping over them takes well past the statement timeout.
+const menuShapeSlowRows = 600000
