@@ -28,6 +28,14 @@ def check(silent, platform):
         raise unsupported()
 
 
+def operation_parameters(operation, parameters):
+    """send_file parameters with an explicit silent false removed: the usual send, with the same request hash,
+    stored request and preview digest as one that omits it, on every platform."""
+    if operation == 'send_file' and isinstance(parameters, dict) and parameters.get('silent', True) is False:
+        return {k: v for k, v in parameters.items() if k != 'silent'}
+    return parameters
+
+
 def chat_id_only(arguments, phone, username):
     """silent rides only a chat_id send; a phone opens a WhatsApp chat, which has no silent send.
     An explicit false is dropped: the phone and username routes keep their arguments of before."""

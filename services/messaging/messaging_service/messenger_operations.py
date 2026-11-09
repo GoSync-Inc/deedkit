@@ -562,8 +562,9 @@ def validate_operation(platform, operation, parameters, *, provider=None):
     if not _supported(platform, operation, spec, provider): raise ValueError('unsupported_operation')
     if parameters is None: parameters = {}
     if not isinstance(parameters, dict): raise ParameterError(field_error('parameters', 'type', 'object'))
-    fields = _fields(platform, operation, spec)
-    if operation == 'send_file' and 'silent' not in fields and parameters.get('silent', False) is not False:
+    from .silent_send import operation_parameters
+    fields, parameters = _fields(platform, operation, spec), operation_parameters(operation, parameters)
+    if operation == 'send_file' and 'silent' not in fields and 'silent' in parameters:
         # ANYM-927: WhatsApp has no send without a notification sound; named, never an unknown field.
         raise ParameterError(field_error('silent', 'enum', 'false: WhatsApp has no silent send', [False]),
                              code='silent_unsupported')
@@ -604,8 +605,6 @@ def validate_operation(platform, operation, parameters, *, provider=None):
         for name, default in EDIT_DEFAULTS.items():
             if output.get(name, default) == default and type(output.get(name, default)) is type(default):
                 output.pop(name, None)
-    if operation == 'send_file' and output.get('silent') is False:
-        output.pop('silent')  # ANYM-927: an explicit false is the loud send of before, same parameters and digest.
     if operation == 'update_profile' and not output:
         raise ParameterError(field_error('parameters', 'required', 'at least one of ' + ', '.join(fields)))
     if operation == 'send_file' and (('attachment_id' in output)+('upload_id' in output)!=1):

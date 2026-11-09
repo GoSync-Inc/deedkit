@@ -429,7 +429,8 @@ is queued. A phone recipient opens a WhatsApp chat, so it is refused `silent_uns
 send it again to its archive `chat_id` once the chat exists. `messages_send` does not take `silent`.
 
 `execute_messenger_operation` `send_file` on Telegram takes `silent` in `parameters` too. Its preview digest
-binds it, an explicit `false` is stored as the usual send, and on WhatsApp it is `silent_unsupported`.
+binds it. An explicit `false` is the usual send (the same request hash, stored request and digest as an omitted
+one, so a retry may use either), and on WhatsApp `silent: true` is `silent_unsupported` (preview and execute).
 
 A messaging service from before this change refuses a call with `silent` (`unknown_field`); a call without it
 works as before. A silent row is refused before the provider by an older collector (`send_target_invalid`),
