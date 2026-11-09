@@ -61,6 +61,22 @@ def test_registered_file_requires_digest_and_has_no_path_or_url():
             validate_operation('telegram', 'send_file', {**value, extra: '/private/file'})
 
 
+# spec: ANYM-927
+def test_send_file_takes_silent_on_telegram_and_whatsapp_refuses_it_by_name():
+    base = {'attachment_id': 'att_' + 'a' * 32, 'sha256': 'b' * 64}
+    assert validate_operation('telegram', 'send_file', {**base, 'silent': True})['silent'] is True
+    # An explicit false is the loud send of before, with the same stored parameters and digest.
+    assert validate_operation('telegram', 'send_file', {**base, 'silent': False}) == validate_operation(
+        'telegram', 'send_file', base)
+    with pytest.raises(ValueError, match='invalid_operation_parameters'):
+        validate_operation('telegram', 'send_file', {**base, 'silent': 'true'})
+    with pytest.raises(ValueError, match='silent_unsupported') as refused:
+        validate_operation('whatsapp', 'send_file', {**base, 'silent': True})
+    assert [e['field'] for e in refused.value.field_errors] == ['silent']
+    rows = {r['operation']: r for r in operation_manifest('telegram')}
+    assert rows['send_file']['parameters_schema']['silent']['type'] == 'boolean'
+
+
 def test_provider_unsupported_functions_fail_before_any_dispatch():
     rows = {r['operation']: r for r in operation_manifest('whatsapp')}
     assert rows['delete_message']['supported'] is False

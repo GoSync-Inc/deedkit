@@ -115,6 +115,18 @@
             "title": "Reply To",
             "type": "string"
           },
+          "silent": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Telegram chat_id sends: true delivers without a notification sound (the recipient sees the message, their phone stays quiet), for example late in the evening. It is part of the preview: preview_message with silent true shows silent: true and its preview_digest binds it, so send with the same silent. WhatsApp has no silent send: silent_unsupported, nothing queued. Phone and username recipients: silent_unsupported or invalid_parameters; preview the archived chat_id instead. Omitted or false is the usual send with sound.",
+            "title": "Silent"
+          },
           "text": {
             "title": "Text",
             "type": "string"
@@ -250,6 +262,18 @@
           "request_id": {
             "title": "Request Id",
             "type": "string"
+          },
+          "silent": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Telegram chat_id sends: true delivers without a notification sound (the recipient sees the message, their phone stays quiet), for example late in the evening. It is part of the preview: preview_message with silent true shows silent: true and its preview_digest binds it, so send with the same silent. WhatsApp has no silent send: silent_unsupported, nothing queued. Phone and username recipients: silent_unsupported or invalid_parameters; preview the archived chat_id instead. Omitted or false is the usual send with sound.",
+            "title": "Silent"
           },
           "text": {
             "title": "Text",

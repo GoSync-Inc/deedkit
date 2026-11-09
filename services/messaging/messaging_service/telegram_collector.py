@@ -468,6 +468,7 @@ class TelethonProvider:
         options={'parse_mode':None,'link_preview':payload['link_preview'],
             'reply_to':int(job['reply_provider_id']) if job.get('reply_provider_id') else None,
             'clear_draft':False}
+        if payload.get('silent') is True:options['silent']=True  # ANYM-927: a previewed silent row, no sound.
         if job.get('render_artifact') is not None:
             constructors={'bold':types.MessageEntityBold,'italic':types.MessageEntityItalic,
                 'strikethrough':types.MessageEntityStrike,'underline':types.MessageEntityUnderline,

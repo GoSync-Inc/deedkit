@@ -307,7 +307,8 @@ feedback and tool arguments; see SUBSCRIPTIONS.md.
 ## Registered files and forward evidence
 
 The first upload path is `send_file`, with `attachment_id`, the exact `sha256`,
-`mode` and optional plain caption. It accepts only an already registered, accessible,
+`mode`, optional plain caption and, on Telegram only, optional `silent` (true: no notification sound,
+ANYM-927; SENDING.md). It accepts only an already registered, accessible,
 available original of **at most 32 MiB**. The collector verifies the SHA-256 and
 size before upload. An arbitrary filesystem path, URL, caller-declared trusted
 directory or raw media payload is never accepted. No thumbnail substitutes for an

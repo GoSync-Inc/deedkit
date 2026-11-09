@@ -299,6 +299,8 @@ def _fields(platform, name, spec):
              'last_name': _field('string', default='', maximum=64)})
     if platform == 'telegram' and name == 'list_contacts':
         return {**spec['fields'], 'query': _field('string', maximum=64, nonempty=True)}
+    if platform == 'telegram' and name == 'send_file':
+        return {**spec['fields'], 'silent': _field('boolean')}  # ANYM-927: true sends without a notification sound.
     if name == 'update_profile':
         names = ('name', 'status') if platform == 'whatsapp' else ('first_name', 'last_name', 'bio')
         return {n: _field('string', maximum=64 if n in ('name', 'first_name', 'last_name') else 139,
@@ -560,7 +562,12 @@ def validate_operation(platform, operation, parameters, *, provider=None):
     if not _supported(platform, operation, spec, provider): raise ValueError('unsupported_operation')
     if parameters is None: parameters = {}
     if not isinstance(parameters, dict): raise ParameterError(field_error('parameters', 'type', 'object'))
-    fields = _fields(platform, operation, spec)
+    from .silent_send import operation_parameters
+    fields, parameters = _fields(platform, operation, spec), operation_parameters(operation, parameters)
+    if operation == 'send_file' and 'silent' not in fields and 'silent' in parameters:
+        # ANYM-927: WhatsApp has no send without a notification sound; named, never an unknown field.
+        raise ParameterError(field_error('silent', 'enum', 'false: WhatsApp has no silent send', [False]),
+                             code='silent_unsupported')
     output, errors = {}, []
     try:
         for name, descriptor in fields.items():

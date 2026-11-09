@@ -84,6 +84,66 @@ def test_operator_account_gate_and_reply_target(sender):
     assert result['status'] == 'queued'
 
 
+def preview_of(s, key, **changes):
+    return s.preview_message(key, account='send-fixture', chat_id=stable_id('chat', 'send-fixture', '100'),
+        text='Exact synthetic text', **changes)
+
+
+def queued_count(s):
+    with s.pool.connection() as c:
+        return c.execute('SELECT count(*) AS n FROM outgoing_messages').fetchone()['n']
+
+
+# spec: ANYM-927
+def test_a_silent_preview_says_so_and_its_digest_binds_silent_both_ways(sender):
+    s, _, key, _, _ = sender
+    silent, loud = preview_of(s, key, silent=True), preview_of(s, key)
+    assert silent['silent'] is True and silent['render_policy']['silent'] is True
+    assert 'silent' not in loud and 'silent' not in loud['render_policy']
+    assert preview_of(s, key, silent=False) == loud
+    assert silent['preview_digest'] != loud['preview_digest']
+    with pytest.raises(APIError, match='preview_required'):
+        submit(s, key, silent=True)
+    with pytest.raises(APIError, match='preview_mismatch'):
+        submit(s, key, silent=True, preview_digest=loud['preview_digest'])
+    with pytest.raises(APIError, match='preview_mismatch'):
+        submit(s, key, preview_digest=silent['preview_digest'])
+    assert queued_count(s) == 0
+    for bad in ('true', 1, None):
+        with pytest.raises(APIError, match='invalid_parameters'):
+            submit(s, key, silent=bad, preview_digest=silent['preview_digest'])
+    receipt = submit(s, key, silent=True, preview_digest=silent['preview_digest'])
+    assert receipt['status'] == 'queued'
+    # An exact retry returns the same send; the same request_id sent loud is a conflict.
+    assert submit(s, key, silent=True, preview_digest=silent['preview_digest'])['send_id'] == receipt['send_id']
+    with pytest.raises(APIError, match='idempotency_conflict'):
+        submit(s, key, preview_digest=silent['preview_digest'])
+    with s.pool.connection() as c:
+        row = c.execute('SELECT render_policy FROM outgoing_messages').fetchone()
+    assert row['render_policy'] == {'link_preview': False, 'allow_lossy': False, 'silent': True}
+
+
+# spec: ANYM-927
+def test_silent_on_whatsapp_is_the_field_error_silent_unsupported_and_queues_nothing(sender):
+    s, archive, _, _, _ = sender
+    archive.register('wa-silent', 'whatsapp', 'Synthetic WhatsApp', discover=True)
+    archive.ingest(event(account='wa-silent', platform='whatsapp', chat='fixture@c.us', provider_id='1',
+        body='Existing synthetic message'))
+    archive.set_sending('wa-silent', True)
+    key = s.issue_key('wa-silent-agent', ['wa-silent'], permissions=['read', 'send'])
+    chat = stable_id('chat', 'wa-silent', 'fixture@c.us')
+    calls = [lambda: s.preview_message(key, account='wa-silent', chat_id=chat, text='Synthetic', silent=True),
+             lambda: s.send_message(key, account='wa-silent', chat_id=chat, text='Synthetic',
+                 request_id='wa-silent-request-1', silent=True, preview_digest='a' * 64)]
+    for call in calls:
+        with pytest.raises(APIError, match='silent_unsupported') as refused:
+            call()
+        assert refused.value.field_errors == [{'field': 'silent', 'reason': 'enum',
+            'expected': 'false: WhatsApp has no silent send', 'allowed': [False]}]
+    assert queued_count(s) == 0
+    assert s.preview_message(key, account='wa-silent', chat_id=chat, text='Synthetic', silent=False)['account'] == 'wa-silent'
+
+
 def test_worker_sends_once_and_rechecks_revocation(sender):
     from messaging_service.outgoing import OutgoingWorker
     s, _, key, _, state = sender
@@ -287,6 +347,56 @@ def test_mcp_and_rest_send_contract(sender):
         assert tool['annotations']['readOnlyHint'] is False
         assert tool['annotations']['openWorldHint'] is True
         assert 'confirm' in tool['description'].lower()
+
+
+# spec: ANYM-927
+def test_mcp_send_message_and_preview_take_silent_with_no_schema_default(sender):
+    s, _, key, _, _ = sender
+    headers = {'Authorization': 'Bearer ' + key}
+    with TestClient(create_app(s, ['testserver'])) as client:
+        tools = client.post('/mcp', headers={**headers,'Accept':'application/json, text/event-stream'},
+            json={'jsonrpc':'2.0','id':2,'method':'tools/list','params':{}}).json()['result']['tools']
+        args = {'account':'send-fixture','chat_id':stable_id('chat','send-fixture','100'),'text':'Synthetic silent'}
+        preview = client.post('/v1/preview_message', headers=headers, json={**args,'silent':True}).json()
+        sent = client.post('/v1/send_message', headers=headers, json={**args,'silent':True,
+            'request_id':'synthetic-silent-http','preview_digest':preview['preview_digest']})
+    for name in ('preview_message', 'send_message'):
+        schema = next(t for t in tools if t['name'] == name)['inputSchema']['properties']['silent']
+        assert 'default' not in schema and 'notification sound' in schema['description']
+    assert preview['silent'] is True and sent.status_code == 200 and sent.json()['status'] == 'queued'
+
+
+# spec: ANYM-927
+def test_a_silent_telegram_send_reaches_telethon_as_silent():
+    from types import SimpleNamespace
+    from messaging_service.telegram_collector import TelethonProvider
+    calls = []
+    class Client:
+        async def send_message(self, chat, text, **options):
+            calls.append(options)
+            return SimpleNamespace(id=42, chat_id=100)
+    provider = TelethonProvider.__new__(TelethonProvider)
+    provider.client = Client()
+    text = 'Synthetic quiet'
+    def job(policy):
+        artifact = {'format':'plain','source_text':text,'rendered_text':text,'provider_text':text,'entities':[],
+            'provider_payload':{'text':text,'entities':[],'link_preview':False},'warnings':[],'links':[],
+            'utf16_units':len(text),'renderer_version':'anymsg-renderer-1'}
+        return {'provider_chat':'100','body':text,'source_text':text,'source_format':'plain','render_artifact':artifact,
+            'render_policy':policy,'preview_digest':'f'*64,'expires_at':datetime.now(timezone.utc).timestamp()+300}
+    asyncio.run(provider.send_text(job({'link_preview':False,'allow_lossy':False,'silent':True})))
+    asyncio.run(provider.send_text(job({'link_preview':False,'allow_lossy':False})))
+    assert calls[0]['silent'] is True and 'silent' not in calls[1]
+    assert {k: v for k, v in calls[0].items() if k != 'silent'} == calls[1]
+    # A stored policy may carry silent only as true; anything else is refused before the provider.
+    from messaging_service.outgoing import SendRejected, dispatch_payload
+    for policy in ({'link_preview':False,'allow_lossy':False,'silent':False},
+                   {'link_preview':False,'allow_lossy':False,'silent':'yes'}):
+        with pytest.raises(SendRejected):
+            asyncio.run(provider.send_text(job(policy)))
+    assert len(calls) == 2
+    with pytest.raises(SendRejected):
+        dispatch_payload(job({'link_preview':False,'allow_lossy':False,'silent':True}), 'whatsapp')
 
 
 def test_telegram_send_plain_text_through_existing_client():

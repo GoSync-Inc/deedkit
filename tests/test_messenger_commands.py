@@ -638,6 +638,63 @@ def test_send_file_mode_mismatch_names_field(operator):
         'audio and voice audio/*; document for any file'}]
 
 
+def registered_original(s,name):
+    content=b'Synthetic silent original '+name.encode();sha=hashlib.sha256(content).hexdigest()
+    s.files.mkdir(parents=True,exist_ok=True);(s.files/sha).write_bytes(content)
+    aid=stable_id('att','command-fixture','100','1',name)
+    with s.pool.connection() as c:
+        c.execute('INSERT INTO attachments(id,message,digest,filename,mime,bytes) VALUES(%s,%s,%s,%s,%s,%s)',
+            (aid,stable_id('msg','command-fixture','100','1'),sha,'synthetic.txt','text/plain',len(content)))
+    return aid,sha
+
+
+# spec: ANYM-927
+def test_a_silent_telegram_send_file_is_bound_and_an_explicit_false_is_the_usual_send(operator):
+    s,_,key,_=operator
+    aid,sha=registered_original(s,'synthetic-silent')
+    args={'account':'command-fixture','operation':'send_file','chat_id':stable_id('chat','command-fixture','200')}
+    plain={'attachment_id':aid,'sha256':sha}
+    loud=s.preview_messenger_operation(key,**args,parameters=plain)
+    silent=s.preview_messenger_operation(key,**args,parameters={**plain,'silent':True})
+    assert silent['preview_digest']!=loud['preview_digest']
+    assert s.preview_messenger_operation(key,**args,parameters={**plain,'silent':False})['preview_digest']==loud['preview_digest']
+    with pytest.raises(APIError,match='preview_mismatch'):
+        s.execute_messenger_operation(key,**args,parameters=plain,request_id='silent-file-send-0001',
+            preview_digest=silent['preview_digest'])
+    # An explicit false and an omitted silent are one request: a retry with either returns the first operation.
+    first=s.execute_messenger_operation(key,**args,parameters={**plain,'silent':False},request_id='silent-file-send-0002',
+        preview_digest=loud['preview_digest'])
+    again=s.execute_messenger_operation(key,**args,parameters=plain,request_id='silent-file-send-0002',
+        preview_digest=loud['preview_digest'])
+    quiet=s.execute_messenger_operation(key,**args,parameters={**plain,'silent':True},request_id='silent-file-send-0003',
+        preview_digest=silent['preview_digest'])
+    assert again['operation_id']==first['operation_id']
+    with s.pool.connection() as c:
+        rows={r['id']:r['payload'] for r in c.execute('SELECT id,payload FROM messenger_commands').fetchall()}
+    assert 'silent' not in rows[first['operation_id']]['parameters']
+    assert 'silent' not in rows[first['operation_id']]['request_input']['parameters']
+    assert rows[quiet['operation_id']]['parameters']['silent'] is True
+
+
+# spec: ANYM-927
+def test_a_whatsapp_send_file_with_silent_is_refused_silent_unsupported_by_name(seeded):
+    s,_,_=seeded
+    archive=Archive(s)
+    archive.register('wa-files','whatsapp','Synthetic WhatsApp files',discover=True)
+    archive.ingest(event(account='wa-files',platform='whatsapp',chat='fixture@c.us',provider_id='1',body='Synthetic'))
+    s.set_messenger_operations('wa-files',['send_file'])
+    key=s.issue_key('wa-files-agent',['wa-files'],permissions=['read','download','send'])
+    args={'account':'wa-files','operation':'send_file','chat_id':stable_id('chat','wa-files','fixture@c.us'),
+          'parameters':{'attachment_id':'att_'+'a'*32,'sha256':'b'*64,'silent':True}}
+    for call in (lambda:s.preview_messenger_operation(key,**args),
+                 lambda:s.execute_messenger_operation(key,**args,request_id='wa-silent-file-0001',preview_digest='c'*64)):
+        with pytest.raises(APIError,match='^silent_unsupported$') as failure:
+            call()
+        assert [e['field'] for e in failure.value.field_errors]==['silent']
+    with s.pool.connection() as c:
+        assert c.execute('SELECT count(*) AS n FROM messenger_commands').fetchone()['n']==0
+
+
 GROUP_ADMIN_TELEGRAM = ['set_group_messages_admins_only', 'set_group_info_admins_only', 'set_slow_mode',
                         'list_join_requests', 'approve_join_requests', 'reject_join_requests']
 

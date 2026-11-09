@@ -513,6 +513,8 @@ def enqueue(store,c,p,account,operation,chat_id='',message_id='',expected_revisi
         raise APIError('invalid_request_id')
     if not isinstance(preview_digest,str) or (preview_digest and not re.fullmatch(r'[a-f0-9]{64}',preview_digest)):
         raise refused(APIError('preview_mismatch',409))
+    from .silent_send import operation_parameters  # ANYM-927: an explicit silent false is the omitted one.
+    parameters=operation_parameters(operation,parameters)
     request_input,request_hash=_input(account,operation,chat_id,message_id,expected_revision,parameters,preview_digest)
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('commands:'+str(p['key_id']),))
     existing=c.execute('SELECT * FROM messenger_commands WHERE principal=%s AND key_id=%s AND request_id=%s',
