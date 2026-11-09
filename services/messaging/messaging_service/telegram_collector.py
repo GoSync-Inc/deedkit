@@ -542,6 +542,13 @@ class TelethonProvider:
             kind=dialog_kind(dialog)
             chat_type='private' if dialog.is_user else ('group' if dialog.is_group else 'channel')
             raw=getattr(dialog,'dialog',None)
+            # The dialog's top message id, with when this page saw it, lets history reconcile skip an unchanged
+            # chat's head page (dialog_tops: chat -> (top id, observed wall time, observed monotonic time)).
+            top=getattr(raw,'top_message',None)
+            tops=self.__dict__.setdefault('dialog_tops',{})
+            if type(top) is int and top>0:
+                tops[str(dialog.id)]=(top,datetime.now(timezone.utc),time.monotonic())
+            else:tops.pop(str(dialog.id),None)
             observation={'observed_at':page_observed_at,
                 'unread_count':getattr(raw,'unread_count',None),
                 'read_inbox_max_id':getattr(raw,'read_inbox_max_id',None),
@@ -666,6 +673,8 @@ def media_deadline(size):
 # BURST_FETCH other queued live jobs of its chat; a later job uses its copy once, if at most FETCHED_SECONDS old.
 MEDIA_REQUEST_BYTES=512*1024
 BURST_FETCH=20; FETCHED_SECONDS=600; FETCHED_MAX=200
+# History reconcile reads no head page of a chat whose dialog top, seen at most this long ago, is at most its cursor.
+TOP_FRESH_SECONDS=1800
 # Deterministic failures of a pure parser on malformed provider input. Resource,
 # I/O and unexpected errors are not among them and still fail capture closed.
 PARSE_ERRORS=(ValueError,TypeError,KeyError,AttributeError,IndexError,RecursionError)
@@ -710,6 +719,7 @@ def chat_error_evidence(error):
 class TelegramCollector:
     state_class=CollectorState
     head_pages=HEAD_PAGES_PER_PASS
+    _tops_trusted=True  # this pass may skip head pages by the catalog's tops (not after a failed discovery)
     _pass_head_capped=None
     _tombstones_due=-math.inf
     coverage_code='telegram_history_partial'
@@ -975,18 +985,25 @@ class TelegramCollector:
                 initialized=True,window_complete=len(kept)<len(recent),head_complete=True)
             return
         high_water=state['high_water']
-        for _ in range(self.head_pages):
-            new=await self.chat_page(chat,limit=self.batch_size,min_id=high_water,reverse=True)
-            await self.commit_page(self.in_window(new),chat,title,kind,'reconcile')
-            if new:
-                high_water=max(high_water,*(m.id for m in new))
-                await asyncio.to_thread(self.state.checkpoint,chat,high_water=high_water)
-            if len(new)<self.batch_size:break
+        # A chat whose catalog, seen at most TOP_FRESH_SECONDS ago in a pass whose discovery did not fail, shows no
+        # message above the cursor needs no head page (a head left at the page cap has a top above it); the catalog's
+        # time is its head evidence. A message after that catalog is read once the next one shows it.
+        top=(getattr(self.provider,'dialog_tops',None) or {}).get(chat) if self._tops_trusted else None
+        unchanged=top is not None and top[0]<=high_water and 0<=time.monotonic()-top[2]<=TOP_FRESH_SECONDS
+        if not unchanged:
+            for _ in range(self.head_pages):
+                new=await self.chat_page(chat,limit=self.batch_size,min_id=high_water,reverse=True)
+                await self.commit_page(self.in_window(new),chat,title,kind,'reconcile')
+                if new:
+                    high_water=max(high_water,*(m.id for m in new))
+                    await asyncio.to_thread(self.state.checkpoint,chat,high_water=high_water)
+                if len(new)<self.batch_size:break
         # Recent overlap catches edits after the library's update state advanced
         # ahead of durable capture. It cannot prove absence of older edits/deletes.
         recent=await self.chat_page(chat,limit=self.batch_size)
         await self.commit_page(self.in_window(recent),chat,title,kind,'reconcile')
-        if len(new)<self.batch_size:
+        if unchanged:await asyncio.to_thread(self.state.checkpoint,chat,head_verified_at=top[1])
+        elif len(new)<self.batch_size:
             await asyncio.to_thread(self.state.checkpoint,chat,head_complete=True)
         else:self._head_capped.add(chat)
         if not state['history_exhausted'] and not state['window_complete'] and state['history_before']:
@@ -1003,7 +1020,7 @@ class TelegramCollector:
     async def sync_once(self):
         from telethon.errors import ChannelPrivateError,ChatAdminRequiredError,PeerIdInvalidError,FloodWaitError
         self.policy=await asyncio.to_thread(self.state.policy)
-        discovery_failed=None;self._head_capped=set()
+        discovery_failed=None;self._head_capped=set();self._tops_trusted=True
         if self._dialog_cache is None or time.monotonic()>=self._next_discovery:
             await asyncio.to_thread(self.state.status,'receiving','telegram_discovery')
             await asyncio.to_thread(self.state.discovery_started)
@@ -1020,7 +1037,7 @@ class TelegramCollector:
             except DiscoveryFailed as failure:
                 # The pass degrades; batches already yielded stay saved, discovery is not marked finished and
                 # the next loop tries again. History goes on over the previous catalog, if any (ANYM-749).
-                discovery_failed=failure.code
+                discovery_failed=failure.code;self._tops_trusted=False  # an old catalog proves no head
                 print(json.dumps({'event':'telegram_discovery_error','code':failure.code}),flush=True)
                 await asyncio.to_thread(self.state.status,'degraded',failure.code)
                 if self._dialog_cache is None:return
