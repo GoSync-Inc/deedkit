@@ -49,6 +49,18 @@ volume) (owner 11-03, see Data egress).
   and polls are stored and deleted under the message-text rules (retention above, deletion below; owner
   11-02 «5 да» to the question «Превью ссылок и опросы. Храним по правилам текста?»). Invoices,
   contact cards and other message parts this file does not name: proposal.
+- Scheduling negotiations (ANYM-907): each chat's negotiation records states, times, zones, offsets
+  and references (message, chat and account IDs) derived from its messages by fixed rules, with no
+  copied text and no model. Visibility is that of messages (`read`, ANYM-909). Deletion: a message
+  purge hides every negotiation it fed from reads when the purge commits; the negotiation worker
+  (ANYM-908) deletes its sources, times and mark, or blanks them to ids, before its next `apply`
+  or publish touches that negotiation, otherwise within one lap of its cleanup while it runs (up to
+  2,000 source rows a second), and before any other work when it starts; what stays
+  is a content-free `removed` tombstone and transition rows with ids, kinds and timestamps. A
+  negotiation event fetched in that window still shows its ids, state and whose turn it was.
+  Backups and cold copies follow today's rule, with the gap the Deletion line records unchanged
+  and no stronger promise. Egress: no model, and nothing beyond agent reads (ANYM-909) and
+  reference-only hints (ANYM-911).
 - Statement statistics (ANYM-842, docs/operations/production.md "Database settings"): `pg_stat_statements` keeps
   SQL text normalized as PostgreSQL does it (constants usually replaced by `$n`, but not always: a text can keep its
   constants, for example after its entry was deallocated and re-entered; comments and identifiers stay), with call
