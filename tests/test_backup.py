@@ -169,6 +169,42 @@ def test_schema77_backup_carries_the_structured_versions_and_a_schema76_receiver
                 assert {name:manifest[name] for name in before}==before
 
 
+# spec: ANYM-908
+def test_a_snapshot_keeps_the_negotiation_heartbeat_and_its_policy_and_the_role_file_restores_the_grants(database,tmp_path):
+    from pathlib import Path
+    from messaging_service import heartbeats
+    from messaging_service.backup import SCHEMAS,database_manifest
+    from messaging_service.store import RUNTIME_SCHEMA
+    from messaging_service.backup_restore_worker import restore_roles_sql
+    from messaging_service.negotiation_worker import COLUMNS
+    from test_subscription_retention import restore_database,snapshot_restored
+    role_sql=(Path(__file__).resolve().parents[1]/'services/messaging/messaging_service/negotiation_role.sql').read_text()
+    assert RUNTIME_SCHEMA in SCHEMAS
+    with restore_database(database,tmp_path/'source') as source:
+        with source.pool.connection() as c:
+            c.execute(role_sql)
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']==str(RUNTIME_SCHEMA)
+            c.execute("SET LOCAL ROLE messaging_negotiations")
+            assert heartbeats.beat(c,'negotiations') is True
+        with source.pool.connection() as c:
+            before=database_manifest(c)['component_heartbeats']
+        assert before['rows']>=1
+        with snapshot_restored(source,tmp_path) as restored:
+            # As the restore worker: the roles first; a restore runs without ACLs, so the operator installs the role
+            # files again (BACKUP.md), this one included. Row-level security and its policy come with the dump.
+            with restored.pool.connection() as c:c.execute(restore_roles_sql())
+            restored.migrate()
+            with restored.pool.connection() as c:
+                assert database_manifest(c)['component_heartbeats']==before
+                assert c.execute("""SELECT qual FROM pg_policies WHERE tablename='component_heartbeats'
+                    AND policyname='messaging_negotiations_beat'""").fetchone()['qual']=="(component = 'negotiations'::text)"
+                ok=lambda table,column: c.execute("SELECT has_column_privilege('messaging_negotiations',%s,%s,'SELECT') AS ok",
+                    (table,column)).fetchone()['ok']
+                assert not ok('messages','body')
+                c.execute(role_sql)
+                assert all(ok(table,column) for table,columns in COLUMNS.items() for column in columns)
+
+
 # spec: ANYM-824
 def test_schema70_snapshot_restores_the_activity_counts(database,tmp_path):
     from messaging_service.backup import database_manifest

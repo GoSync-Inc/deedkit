@@ -32,3 +32,37 @@ services:
     logging:
       driver: json-file
       options: {max-size: 5m, max-file: "2"}
+  # ANYM-908: the negotiation worker, the only writer of negotiations. Install negotiation_role.sql as owner and
+  # give it a LOGIN inheriting messaging_negotiations only (private/negotiations.dsn); it never shares a DSN.
+  negotiations:
+    image: anymsg-subscriptions:${MESSAGING_VERSION:-0.9.19}
+    build:
+      context: ..
+      target: runtime
+    command: [python, -m, messaging_service.negotiation_worker]
+    init: true
+    restart: unless-stopped
+    depends_on:
+      db: {condition: service_healthy}
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+      ANYMSG_OWNER_TIMEZONE: ${ANYMSG_OWNER_TIMEZONE:-}
+    volumes:
+      - type: bind
+        source: ./private/negotiations.dsn
+        target: /run/secrets/database_url
+        read_only: true
+        bind: {create_host_path: false}
+    networks: [backend]
+    read_only: true
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:size=16m,noexec,nosuid"]
+    mem_limit: 192m
+    cpu_shares: 512
+    pids_limit: 32
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options: {max-size: 5m, max-file: "2"}

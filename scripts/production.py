@@ -5287,6 +5287,30 @@ def inference_worker_line(path=None):
         return f"{prefix}receipt unreadable ({'not JSON' if isinstance(exc, ValueError) else type(exc).__name__})"
 
 
+def negotiation_worker_line(settings, timeout=15):
+    """The `status` line for the negotiation worker (ANYM-908): its heartbeat row and owner-zone label, which its
+    own `--status` reads inside the container; None while no project selects it. Read-only, never an error."""
+    project = next((item for item in settings.get("projects") or [] if "negotiations" in (item.get("services") or {})), None)
+    if project is None:
+        return None
+    prefix = "negotiation worker: "
+    try:
+        data = json.loads(run(compose(project) + ["exec", "-T", "negotiations", "python", "-m",
+                                                   "messaging_service.negotiation_worker", "--status"], timeout=timeout))
+        zone, beat = data.get("owner_zone"), data.get("heartbeat")
+        if not isinstance(zone, str) or not re.fullmatch(r"[A-Za-z0-9_+/-]{1,64}", zone):
+            return prefix + "unreadable (bad owner_zone)"
+        if beat is None:
+            return f"{prefix}no heartbeat, owner zone {zone}"
+        version, at = beat.get("version"), beat.get("beat_at")
+        if not (isinstance(version, str) and re.fullmatch(r"[0-9A-Za-z.+-]{1,64}", version)
+                and isinstance(at, str) and re.fullmatch(r"[0-9T:.+-]{19,40}", at)):
+            return prefix + "unreadable (bad heartbeat)"
+        return f"{prefix}heartbeat {version} at {at}, owner zone {zone}"
+    except Exception as exc:
+        return f"{prefix}unreadable ({type(exc).__name__})"
+
+
 def leaf_identity(found):
     """What a change to runner.json changes: its inode, content times, size, owner and mode."""
     return (found.st_dev, found.st_ino, found.st_size, found.st_mtime_ns, found.st_ctime_ns, found.st_mode,
@@ -8347,6 +8371,8 @@ def print_result(args, result, parser):
             for line in backup_health_lines():
                 print(line, file=sys.stderr)
             print(inference_worker_line(), file=sys.stderr)
+            if (line := negotiation_worker_line(config(args.config))) is not None:
+                print(line, file=sys.stderr)
 
 
 def main(argv=None):
