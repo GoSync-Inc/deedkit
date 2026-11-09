@@ -1819,9 +1819,9 @@ def test_deploy_syncs_the_docling_venv_before_the_release_is_ready():
     assert ';' not in chain and '||' not in chain
 
 
-# spec: ANYM-850
 # reads: services/inference/pyproject.toml
 # reads: services/inference/docling/pyproject.toml
+# spec: ANYM-850
 def test_the_deploy_sync_keeps_wheels_only_although_uv_reads_no_project_configuration(tmp_path):
     """Astra r1 (ANYM-850): `UV_NO_CONFIG=1` also drops the project's `[tool.uv] no-build-package`, so a sync that
     relied on it could build an sdist. Both syncs pass the list explicitly with `--config-file`, written from the
