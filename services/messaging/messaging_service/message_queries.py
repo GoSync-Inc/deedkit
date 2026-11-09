@@ -311,6 +311,7 @@ def kind_filter(clauses, args, message_kinds=None, call_outcome=''):
     if message_kinds is not None and (not isinstance(message_kinds,list) or not message_kinds
             or not all(isinstance(k,str) and k in KINDS for k in message_kinds)):
         raise APIError('invalid_filter')
+    call_outcome='' if call_outcome is None else call_outcome  # the tool's and REST's unset value
     if not isinstance(call_outcome,str) or call_outcome not in ('',*CALL_OUTCOMES):raise APIError('invalid_filter')
     if call_outcome and message_kinds is not None and 'call' not in message_kinds:raise APIError('invalid_filter')
     if message_kinds is None and not call_outcome:return None
@@ -393,7 +394,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
         **({'collapse_forwards':False} if flat else {}),
         **({'include_media_text':False} if body_only else {}),
         **({'person':person} if members is not None else {}),
-        **({'message_kinds':kinds,'call_outcome':call_outcome} if kinds is not None else {}),
+        **({'message_kinds':kinds,'call_outcome':call_outcome or ''} if kinds is not None else {}),
         **({'view':view,'include_system':include_system,'conversation_version':1} if conversation else {})})
     extra_join=' LEFT JOIN message_metadata cmd ON cmd.message=m.id AND cmd.revision=m.revision' if conversation else ''
     if conversation and not include_system:clauses.append(visible_sql('m','cmd'))
