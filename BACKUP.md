@@ -799,6 +799,10 @@ and undo: `docs/operations/production.md`, "Backup alerts".
   - `backup_unverified.<profile>` when the last verified backup's capture is older than the limit. Recordings and
     calls read `captured_at` from the proof. Messaging and calendar read the `backup_id` time, which is the job's
     creation time and which a resumed job keeps. That is conservative: the age can only read too large.
+- **Autodeploy halts** (production host only): `deploy_halted.<code>` while `/etc/deedkit/autodeploy.pause` names
+  a halt code `deploy` wrote (`deploy_halted.other` for a code this copy does not know), component `deploy`. A
+  hand-written pause raises nothing; removing the pause ends the episode. Only the code leaves the host
+  (TELEMETRY.md, Autodeploy halts).
 - **Limits**, measured from capture, are policy rather than every timeout's worst case: messaging 30 h, calendar 32 h,
   recordings 30 h, calls 36 h. A slow verification inside its budgets can raise one `backup_unverified` event;
   resolve it.

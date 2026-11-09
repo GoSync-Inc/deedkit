@@ -298,6 +298,82 @@ def test_episodes_raise_once_repeat_after_a_day_and_start_again_after_clearing(t
     assert sent == ['backup_failed.messaging'] * 3
 
 
+def pause(tmp_path, monkeypatch, content):
+    """The autodeploy pause at a synthetic path; None removes it."""
+    target = tmp_path / 'autodeploy.pause'
+    monkeypatch.setattr(h, 'PAUSE_FILE', str(target))
+    if content is None:
+        target.unlink(missing_ok=True)
+    else:
+        target.write_text(content)
+
+
+def codes_sent(sent):
+    def send(url, data, timeout):
+        event = json.loads(data.split(b'\n')[2])
+        sent.append((event['tags']['component'], event['tags']['error_code'], event['fingerprint']))
+        return True
+    return send
+
+
+# spec: ANYM-807
+def test_a_deploy_halt_raises_its_code_once_a_day_until_the_pause_is_removed(tmp_path, monkeypatch):
+    # ci-deploy-speed 11-09: a halt waited until a person happened to look; the hourly checker now raises it.
+    cfg = config(tmp_path, profiles=['messaging'])
+    good_status(tmp_path, 'messaging')
+    pause(tmp_path, monkeypatch, json.dumps({'reason': 'synthetic-private-reason', 'code': 'migration_refused',
+                                             'actor': 'agent', 'at': iso(NOW)}))
+    sent, run = [], systemctl()
+    h.check(cfg, now=NOW, run=run, send=codes_sent(sent))
+    h.check(cfg, now=NOW + timedelta(hours=23), run=run, send=codes_sent(sent))
+    expected = ('deploy', 'deploy_halted.migration_refused', ['backup-health', 'deploy', 'deploy_halted.migration_refused'])
+    assert sent == [expected]
+    h.check(cfg, now=NOW + timedelta(hours=24), run=run, send=codes_sent(sent))
+    assert sent == [expected] * 2
+    pause(tmp_path, monkeypatch, None)
+    h.check(cfg, now=NOW + timedelta(hours=25), run=run, send=codes_sent(sent))
+    pause(tmp_path, monkeypatch, json.dumps({'code': 'a_code_this_copy_does_not_know'}))
+    h.check(cfg, now=NOW + timedelta(hours=26), run=run, send=codes_sent(sent))
+    assert [code for _, code, _ in sent] == ['deploy_halted.migration_refused'] * 2 + ['deploy_halted.other']
+    assert 'synthetic-private-reason' not in (tmp_path / 'state' / 'state.json').read_text()
+
+
+# spec: ANYM-807
+@pytest.mark.parametrize('content', ['', 'paused by hand for the 075 release\n', '{"reason": "by hand"}', '{"code": 7}',
+                                     '[1]', '{"code": "migration_refused"'])
+def test_a_hand_written_or_unreadable_pause_raises_nothing(tmp_path, monkeypatch, content):
+    cfg = config(tmp_path, profiles=['messaging'])
+    good_status(tmp_path, 'messaging')
+    pause(tmp_path, monkeypatch, content)
+    sent = []
+    assert h.check(cfg, now=NOW, run=systemctl(), send=codes_sent(sent))[1] == [] and sent == []
+
+
+# spec: ANYM-807
+def test_the_backup_server_never_reads_the_autodeploy_pause(tmp_path, monkeypatch):
+    cfg = config(tmp_path, side='verifier', profiles=['messaging'])
+    verified(tmp_path, 'messaging', NOW - timedelta(hours=3))
+    pause(tmp_path, monkeypatch, json.dumps({'code': 'migration_refused'}))
+    sent = []
+    h.check(cfg, now=NOW, run=systemctl(), send=codes_sent(sent))
+    assert sent == []
+
+
+# spec: ANYM-807
+def test_the_halt_codes_are_the_deployers_and_each_event_survives_before_send(monkeypatch):
+    from scripts import production
+    assert set(h.HALT_CODES) == set(production.HALTS) | {'other'}
+    assert h.DEPLOY_CODES <= telemetry.CODES and 'deploy' in telemetry.COMPONENTS and not h.DEPLOY_CODES & h.CODES
+    monkeypatch.setenv('DEEDKIT_SOURCE_SHA', SHA)
+    for code in sorted(h.DEPLOY_CODES):
+        event = h.build_event(code, {'release_sha': SHA, 'environment': 'local-synthetic'}, 1793860000.0)
+        assert telemetry.before_send(json.loads(json.dumps(event))) == event
+        assert event['tags'] == {'component': 'deploy', 'error_code': code}
+        assert event['fingerprint'] == ['backup-health', 'deploy', code]
+    # A halt code under another component gets no backup-health issue of its own.
+    assert 'fingerprint' not in telemetry.safe_event(None, 'backup', 'deploy_halted.migration_refused')
+
+
 # spec: ANYM-807
 @pytest.mark.parametrize('value', ['1e309', '-1e309', '1' + '0' * 400, 'true', '"x"'])
 def test_a_corrupt_stored_time_never_silences_an_alert(tmp_path, value):

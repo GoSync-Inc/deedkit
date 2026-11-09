@@ -1356,7 +1356,10 @@ stack's resolved Compose file; no copy). On backup-1 the same DSN is copied to `
 secret-read hook refuses that copy (11-08), so the owner runs it. Read back:
 `systemctl start deedkit-backup-health.service` exits 0, `production.py status` prints the five `backup` lines,
 `--print` on backup-1 prints four. The copy does not follow later releases: reinstall it when `backup_health.py`
-changes. Undo per host: `systemctl disable --now deedkit-backup-health.timer`; remove the two unit files,
+changes (ci-deploy-speed 11-09: the production copy also raises `deploy_halted.<code>` for an autodeploy halt, so an
+agent sees a pause within the hour; reinstall on the production host only, then read back with one
+`systemctl start deedkit-backup-health.service` and its `due` line; undo: the previous copy, kept beside it as
+`backup_health.py.before-<sha>`). Undo per host: `systemctl disable --now deedkit-backup-health.timer`; remove the two unit files,
 `/opt/deedkit/backup-health`, `/etc/deedkit-backup-health` (on backup-1 the DSN copy with it) and
 `/var/lib/deedkit-backup-health`; `daemon-reload`. No backup is touched, so nothing else is undone.
 

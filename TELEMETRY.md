@@ -86,6 +86,15 @@ is `deedkit@<sha>` of the checker's install copy, not the running product's. The
 carries no path other than the public source frame, no unit name, backup ID, size,
 runner error code, host name or count.
 
+Autodeploy halts (ci-deploy-speed 11-09): on the production host the same checker raises
+`deploy_halted.<code>` while `/etc/deedkit/autodeploy.pause` names a code `deploy` wrote:
+the deployer's halt codes (`scripts/production.py` `HALTS`, for example
+`deploy_halted.migration_refused`), or `deploy_halted.other` for a code the installed copy
+does not know. Component `deploy`, fingerprint `["backup-health", "deploy", <code>]`, the
+same episodes (once, then every 24 hours until the pause is removed). A hand-written pause
+(no JSON `code`) raises nothing. The event carries the code only, never the pause's reason,
+SHA or time; `production.py status` on the host shows those.
+
 Collector stop codes: `capture_overload`, `collection_disabled`,
 `collector_already_owned`, `collector_disabled`, `collector_lease_lost`,
 `disk_reserve`, `durable_capture_failed`, `live_account_required`,
