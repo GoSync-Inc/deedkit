@@ -1061,6 +1061,25 @@ def test_a_ready_merge_refuses_a_text_change_that_also_changes_the_spec_structur
     assert not server.writes()
 
 
+# spec: ANYM-598
+def test_a_ready_merge_takes_a_text_change_of_a_parent_whose_branch_copy_counts_other_children(server, monkeypatch):
+    # A branch copy of an epic lists another child count than main (derived), and main keeps its own after the merge.
+    main = [spec(12), spec(60, kind="Epic", children=6, status="Backlog", content=f"Criteria.\n{READY_LINE}\n")]
+    copy = spec(60, kind="Epic", status="Backlog", content=f"Changed criteria.\n{REFRESHED}\n", branch=True)
+    ready_server(server, main=main, branch=[copy],
+                 preview={"modifications": [{"mainVersion": {"seqNum": 60, "childrenCount": 6},
+                                             "branchVersion": {"seqNum": 60, "childrenCount": 0}}],
+                          "stats": {"modifications": 1, "conflicts": 0}})
+
+    def derived(state):
+        for row in state["main"]:
+            row["childrenCount"] = 6 if row["seqNum"] == 60 else row["childrenCount"]
+    merged_then(server, monkeypatch, derived)
+    code, out = ready_run(server)
+    assert code == 0 and "Ready merge of proposal/ready done (ANYM-60)." in out, out
+    assert REFRESHED in server.main(60)["content"] and server.main(60)["childrenCount"] == 6
+
+
 # spec: ANYM-405
 def test_a_ready_merge_refuses_a_branch_that_changes_between_its_check_and_the_merge(server, monkeypatch):
     ready_server(server)
