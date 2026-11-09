@@ -32,6 +32,9 @@ CREATE TABLE IF NOT EXISTS challenges(target_id TEXT NOT NULL, thread TEXT NOT N
   confirmed INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(target_id,thread));
 CREATE INDEX IF NOT EXISTS challenges_thread ON challenges(thread,created_at);
 CREATE TABLE IF NOT EXISTS key_polls(key INTEGER PRIMARY KEY, rules INTEGER NOT NULL, last_error TEXT, polled_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS key_budgets(key_ref TEXT NOT NULL, thread TEXT NOT NULL, budget INTEGER NOT NULL,
+  PRIMARY KEY(key_ref,thread));
+CREATE TABLE IF NOT EXISTS subscription_owners(subscription_id TEXT PRIMARY KEY, key_ref TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS target_outcomes(target_id TEXT PRIMARY KEY, key INTEGER NOT NULL,
   outcome TEXT NOT NULL CHECK(outcome IN (${TARGET_OUTCOMES.map(s=>`'${s}'`).join(',')})), updated_at INTEGER NOT NULL);`;
 
@@ -84,7 +87,9 @@ export function loadWatchConfig(config,{env=process.env}={}){
       const allowed=key.allowed_threads;
       if(allowed!==undefined&&(!Array.isArray(allowed)||allowed.length<1||allowed.length>MAX_ALLOWED||!allowed.every(validThread)))
         fail(`${at}.allowed_threads`,`must be a list of 1..${MAX_ALLOWED} threads (UUIDs or names matching ^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$)`);
-      return {index,keyFile:keyFile(`${at}.key_file`,key.key_file),tool,allowedThreads:allowed===undefined?null:[...allowed]};
+      // `ref` names the key across restarts and reorders: a digest of its file path, never of the key itself.
+      return {index,keyFile:keyFile(`${at}.key_file`,key.key_file),tool,allowedThreads:allowed===undefined?null:[...allowed],
+        ref:createHash('sha256').update(path.resolve(key.key_file)).digest('hex').slice(0,32)};
     });
     return {mode:'registry',...common,registryTool:tool===TOOLS[1]?'list_wake_targets':'messages_list_wake_targets',keys,watches:[]};
   }
@@ -152,7 +157,8 @@ export class Watcher{
       clientFor??=key=>deedkitClient({url:this.config.deedkitUrl,keyFile:key.keyFile,tool:key.tool});
       this.clients=this.config.keys.map(key=>clientFor(key));
       // Last successful read per key: its targets' subscriptions (whose held wakes it decides) and its budgets.
-      this.owner=new Map();this.keyBudgets=new Map();
+      // Kept in SQLite (key_budgets, subscription_owners), so a restart with a key skipped keeps both.
+      this.refs=new Map(this.config.keys.map(key=>[key.ref,key.index]));
     }else this.client=client??deedkitClient({url:this.config.deedkitUrl,keyFile:this.config.keyFile,tool:this.config.tool});
     this.codex=codex??codexQueue({codexPath:this.config.codexPath});
     // One watch process per database: an exclusive SQLite lock on a sibling file, held for the process lifetime and
@@ -393,10 +399,18 @@ export class Watcher{
   // (`rule_removed`, never called), unless the key it belongs to was skipped this poll (then it is kept, not called).
   reconcileRules(rules){
     const now=this.now();
+    // A queued wake on a thread the rule left stops folding, so the next event wakes the rule's current thread.
+    for(const row of this.all(`SELECT id,subscription_id,thread FROM wakes WHERE state IN ('queued','queued_not_resumed')
+      AND released=0`)){
+      const rule=rules.get(row.subscription_id);
+      if(rule&&rule.thread!==row.thread)this.run(`UPDATE wakes SET released=1,updated_at=? WHERE id=?`,now,row.id);
+    }
     for(const row of this.all(`SELECT id,subscription_id,thread FROM wakes WHERE state='budget_held'`)){
       if(rules.get(row.subscription_id)?.thread===row.thread)continue;
-      const owner=this.owner.get(row.subscription_id);
-      if(owner===undefined?this.skipped.size>0:this.skipped.has(owner))continue;
+      const ref=this.get('SELECT key_ref FROM subscription_owners WHERE subscription_id=?',row.subscription_id)?.key_ref;
+      const owner=ref===undefined?undefined:this.refs.get(ref);
+      // Unknown owner: decided only when no key was skipped. A key no longer configured can never wake it again.
+      if(ref===undefined?this.skipped.size>0:owner!==undefined&&this.skipped.has(owner))continue;
       this.run(`UPDATE wakes SET state='dropped_config',outcome='rule_removed',updated_at=? WHERE id=?`,now,row.id);
     }
   }
@@ -421,16 +435,20 @@ export class Watcher{
         this.log({event:'key_skipped',key:key.index,error:read.error});
         continue;
       }
-      for(const target of read.targets)for(const sub of target.subscriptions)this.owner.set(sub,key.index);
-      const budgets=new Map();
-      for(const target of read.targets)if(target.outcome==='active')
-        budgets.set(target.thread,Math.min(budgets.get(target.thread)??Infinity,target.budget));
-      this.keyBudgets.set(key.index,budgets);
+      this.tx(()=>{
+        for(const target of read.targets)for(const sub of target.subscriptions)
+          this.run(`INSERT INTO subscription_owners VALUES(?,?) ON CONFLICT(subscription_id) DO UPDATE SET key_ref=excluded.key_ref`,sub,key.ref);
+        const budgets=new Map();
+        for(const target of read.targets)if(target.outcome==='active')
+          budgets.set(target.thread,Math.min(budgets.get(target.thread)??Infinity,target.budget));
+        this.run('DELETE FROM key_budgets WHERE key_ref=?',key.ref);
+        for(const [thread,budget] of budgets)this.run('INSERT INTO key_budgets VALUES(?,?,?)',key.ref,thread,budget);
+      });
     }
-    // The lowest budget among a thread's rules of every key wins (a skipped key keeps its last read).
+    // The lowest budget among a thread's rules of every configured key wins (a skipped key keeps its last read).
     this.budgets=new Map();
-    for(const budgets of this.keyBudgets.values())for(const [thread,budget] of budgets)
-      this.budgets.set(thread,Math.min(this.budgets.get(thread)??Infinity,budget));
+    for(const row of this.all('SELECT key_ref,thread,budget FROM key_budgets'))
+      if(this.refs.has(row.key_ref))this.budgets.set(row.thread,Math.min(this.budgets.get(row.thread)??Infinity,row.budget));
     // Rules: each enabled, confirmed codex_thread target and each of its subscriptions; a subscription is used once.
     const rules=new Map(),challenges=[];
     for(const [index,read] of reads.entries()){

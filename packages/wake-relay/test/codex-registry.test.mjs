@@ -218,6 +218,30 @@ test('a paused, disabled, deleted or unbound target turns its held wakes into dr
 });
 
 // spec: ANYM-849
+test('after a restart, a deleted or unbound target drops its held wakes even while another key is skipped',async()=>{
+  for(const change of ['deleted','unbound']){
+    const ctx=setup({keys:[{},{}]});const dk=await ctx.server();
+    ctx.key(0).targets=[target(T1,THREAD,[SUB],{hourly_budget:1})];
+    ctx.key(1).targets=[target(T2,THREAD2,[SUB2])];
+    let watcher=ctx.start();
+    await watcher.pollOnce();ctx.answer(0,T1);ctx.answer(1,T2);
+    ctx.time.advance(3600_001);await watcher.pollOnce();
+    dk.push(1);await watcher.pollOnce();
+    dk.state.acked=dk.state.matched;await watcher.pollOnce();
+    dk.push(1);await watcher.pollOnce();
+    assert.equal(held(watcher).at(-1).state,'budget_held',change);
+    await watcher.close();
+    if(change==='deleted')ctx.key(0).targets=[];else ctx.key(0).targets[0].subscription_ids=[];
+    ctx.key(1).status=500;
+    watcher=ctx.start();
+    ctx.time.advance(3600_001);await watcher.pollOnce();
+    assert.deepEqual(held(watcher).at(-1),{subscription_id:SUB,state:'dropped_config',outcome:'rule_removed'},change);
+    assert.equal(ctx.wakes().length,1,change);
+    await watcher.close();
+  }
+});
+
+// spec: ANYM-849
 test('a thread change drops held wakes and challenges the new thread before any wake',async()=>{
   const ctx=setup();const dk=await ctx.server();
   ctx.key().targets=[target(T1,THREAD,[SUB],{hourly_budget:1})];
@@ -236,6 +260,20 @@ test('a thread change drops held wakes and challenges the new thread before any 
   assert.ok(ctx.wakes().every(argv=>argv[2]===THREAD),'no wake on the new thread before it confirms');
   ctx.answer(0,T1);ctx.time.advance(3600_001);await watcher.pollOnce();   // the new thread's challenge slot has expired
   assert.equal(ctx.wakes().at(-1)[2],THREAD2,'the event held back while unconfirmed wakes the new thread');
+});
+
+// spec: ANYM-849
+test('a thread change while the old thread has an unacknowledged queued wake: the next event wakes the new thread',async()=>{
+  const ctx=setup();const dk=await ctx.server();
+  ctx.key().targets=[target(T1,THREAD,[SUB])];
+  const watcher=ctx.start();
+  await confirmed(ctx,watcher,[[0,T1]]);
+  dk.push(1);await watcher.pollOnce();
+  assert.deepEqual(held(watcher).at(-1),{subscription_id:SUB,state:'queued',outcome:'exit_0'});
+  ctx.key().targets[0].thread=THREAD2;ctx.key().targets[0].confirmation=null;
+  await watcher.pollOnce();ctx.answer(0,T1);await watcher.pollOnce();
+  dk.push(1);await watcher.pollOnce();
+  assert.deepEqual(ctx.wakes().map(argv=>argv[2]),[THREAD,THREAD2],'the old queued wake no longer folds the new event');
 });
 
 // spec: ANYM-849
@@ -302,6 +340,25 @@ test('two keys sharing a thread: the hourly budget counts every key and every ch
   dk.push(1,{},SUB);dk.push(1,{},SUB2);await watcher.pollOnce();
   assert.equal(ctx.wakes().length,1,'one slot left for both keys');
   assert.equal(held(watcher).filter(row=>row.state==='budget_held').length,1);
+});
+
+// spec: ANYM-849
+test('after a restart with the low-budget key skipped, the shared thread keeps that key\'s lower budget',async()=>{
+  const ctx=setup({keys:[{},{}]});const dk=await ctx.server();
+  ctx.key(0).targets=[target(T1,THREAD,[SUB],{hourly_budget:1})];
+  ctx.key(1).targets=[target(T2,THREAD,[SUB2],{hourly_budget:30})];
+  let watcher=ctx.start();
+  await watcher.pollOnce();ctx.time.advance(3600_001);await watcher.pollOnce();   // one challenge per hour (budget 1)
+  ctx.answer(0,T1);ctx.answer(1,T2);
+  ctx.time.advance(3600_001);await watcher.pollOnce();
+  dk.push(1,{},SUB2);await watcher.pollOnce();                                    // takes THREAD's one slot
+  assert.equal(ctx.wakes().length,1);
+  await watcher.close();
+  ctx.key(0).status=500;
+  watcher=ctx.start();
+  dk.sub(SUB2).acked=dk.sub(SUB2).matched;dk.push(1,{},SUB2);await watcher.pollOnce();
+  assert.equal(ctx.wakes().length,1,'still one call in the hour');
+  assert.equal(held(watcher).at(-1).state,'budget_held');
 });
 
 // spec: ANYM-849
