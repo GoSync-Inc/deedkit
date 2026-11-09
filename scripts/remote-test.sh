@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Run a DeedKit test or build suite on the Mac mini (owner D41/D42) instead of the laptop.
+# Run a DeedKit test or build suite on a test host: the laptop itself (`local`, owner 11-09), another machine set up
+# as the Mac mini is, or the mini (owner D41/D42); the host list (read_hosts) picks one.
 #
 #   scripts/remote-test.sh [--full] <worktree> <suite> [args...]   run <suite> there, stream its output, exit with its status
-#   scripts/remote-test.sh --cleanup <worker>             remove the worker's copies and databases on the mini
-#   scripts/remote-test.sh --load                         print the mini's load.log
+#   scripts/remote-test.sh --cleanup <worker>             remove the worker's copies and databases on every host
+#   scripts/remote-test.sh --load                         print every host's load.log
 #   scripts/remote-test.sh --list <worktree>              print the files a run sends
 #
 # Suites: root calendar gateway calls go build frontend node. GitHub CI runs the full suites (owner D46), so by
@@ -20,11 +21,19 @@
 #
 # The mini runs at most MAX_RUNS DeedKit suites at once and gives way to Between: while a Between container
 # runs, the host load or free memory is past its cap, or the slots are taken, a run waits in the mini queue
-# up to WAIT_SECONDS. Nothing runs on the laptop (owner 10-29): a run that cannot start exits 90 (mini busy
-# or disk short), 91 (mini unreachable) or 92 (service user not set up), saying "CI covers": the pull
+# up to WAIT_SECONDS. A run that no host starts exits 90 (host busy or disk short), 91 (host unreachable) or
+# 92 (service user or docker not set up), saying "CI covers": the pull
 # request's GitHub-hosted CI runs every suite. Each mini run appends
 # `worker suite start wall_s cpu_s pg_cpu_s exit` to ~_deedkitci/deedkit-ci/load.log (cpu_s: all of the
 # run's processes, PostgreSQL included).
+#
+# The local lane (owner 11-09: tests move to the laptop, the mini keeps the always-on processing): the host `local`
+# (DEEDKIT_REMOTE_HOST=local, or `local` as the first line of the host file) runs the same runner on this machine as
+# its own user, with no ssh or sudo, under DEEDKIT_LOCAL_ROOT (default ~/.cache/deedkit-ci: shared/ holds the stage
+# and caps.conf, ci/ the runs and load.log). Lease, slots, queue, cleanup and exit codes stay the same; 92 means
+# docker (OrbStack) is not running. Each database is a disposable container of CI's PostgreSQL 18 image on
+# 127.0.0.1, its name in ANYMSG_TEST_POSTGRES_CONTAINER, so the tests that need that container run here too.
+# Its default is MAX_RUNS=2 and MAX_LOAD=16 (18 cores); its caps.conf overrides them.
 #
 # Caps: /Users/Shared/deedkit-ci/caps.conf on the mini (KEY=value lines, defaults below), so they change
 # without a pull request. Worker name: DEEDKIT_REMOTE_WORKER, else the worktree's last two path components; `-` reads
@@ -65,7 +74,7 @@
 set -euo pipefail
 
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-HOST="${DEEDKIT_REMOTE_HOST:-}"   # else need_host reads HOST_FILE: the repository names no host or account
+HOST="${DEEDKIT_REMOTE_HOST:-}"   # else read_hosts: the repository names no host or account
 HOST_FILE="${HOME:-}/.config/deedkit/mini-host"
 SERVICE_USER="${DEEDKIT_REMOTE_USER:-_deedkitci}"
 SHIM="${DEEDKIT_REMOTE_SHIM:-/usr/local/libexec/deedkit-remote-test}"
@@ -77,6 +86,11 @@ UNREACHABLE=91
 NOT_SET_UP=92
 QUEUED=93   # between the laptop and the mini only: a run that did not start yet and asks for another try
 QUIET_QUEUE=0
+LOCAL=0   # the laptop side: 1 for the host `local`
+LOCAL_ROOT="${DEEDKIT_LOCAL_ROOT:-${HOME:-}/.cache/deedkit-ci}"
+LOCAL_LANE="${DEEDKIT_LOCAL_LANE:-0}"   # the runner side: 1 when it runs on the laptop (databases in docker)
+# CI's PostgreSQL service image (.github/workflows/checks.yml), so a local database is the one CI tests against.
+PG_IMAGE="${DEEDKIT_PG_IMAGE:-postgres:18-bookworm@sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c}"
 
 # Defaults of the caps; caps.conf overrides them (owner D42: Between has priority, one DeedKit run).
 MAX_RUNS=1          # DeedKit runs at once on the mini
@@ -205,11 +219,14 @@ START_ISO=""
 runner_env() {
   local dir
   ROOT_DIR="${DEEDKIT_CI_ROOT:-$HOME/deedkit-ci}"
+  # Read once; the suite (this script's own tests among them) never inherits the lane's settings.
+  unset DEEDKIT_LOCAL_LANE DEEDKIT_REMOTE_SHARED DEEDKIT_CI_ROOT DEEDKIT_LOCAL_ROOT DEEDKIT_TEST_HOSTS DEEDKIT_REMOTE_HOST
   # The shim's PATH lacks Homebrew; node@24 is keg-only there (the repo's Node 24).
   for dir in ${DEEDKIT_RUNNER_PATH_DIRS-/usr/local/bin /opt/homebrew/sbin /opt/homebrew/bin /opt/homebrew/opt/node@24/bin}; do
     if [ -d "$dir" ]; then PATH="$dir:$PATH"; fi
   done
   export PATH
+  if [ "$LOCAL_LANE" = 1 ]; then MAX_RUNS=2 MAX_LOAD=16; fi
   read_caps "$SHARED/caps.conf"
 }
 
@@ -330,6 +347,9 @@ admit() {
   mkdir -p "$ROOT_DIR"
   free="$(free_gb "$ROOT_DIR")"
   if [ "$free" -lt "$MIN_FREE_GB" ]; then say "mini disk guard: ${free} G free, need ${MIN_FREE_GB} G; CI covers"; return "$BUSY"; fi
+  if [ "$LOCAL_LANE" = 1 ] && ! docker info >/dev/null 2>&1; then
+    say "docker is not running here (start OrbStack: orb start), CI covers"; return "$NOT_SET_UP"
+  fi
   [ "$mode" = run ] || return 0
   take_slot run || taken=$?
   if [ "$taken" = "$BUSY" ]; then
@@ -371,11 +391,16 @@ ours() {
 }
 
 # signal_recorded <run dir> stop|kill: stop sends TERM to each group and QUIT (immediate shutdown) to
-# PostgreSQL; kill sends KILL to every group. Only to what is still this run's.
+# PostgreSQL; kill sends KILL to every group. Only to what is still this run's. A local-lane database container
+# (its name holds the run directory's, so it is this run's alone) gets QUIT, then KILL; `--rm` removes it.
 signal_recorded() {
   local dir="$1" how="$2" kind id stamp
   [ -f "$dir/owned" ] || return 0
   while read -r kind id stamp; do
+    if [ "$kind" = container ]; then
+      if [ "$how" = stop ]; then docker kill --signal=QUIT "$id" >/dev/null 2>&1 || true; else docker kill "$id" >/dev/null 2>&1 || true; fi
+      continue
+    fi
     [ -n "$stamp" ] && ours "$id" "$stamp" || continue
     case "$how:$kind" in
       stop:group) kill -TERM -- "-$id" 2>/dev/null || true ;;
@@ -385,10 +410,19 @@ signal_recorded() {
   done < "$dir/owned"
 }
 
+# A container is gone once docker lists it no more, running or not (`--rm` removes it as it exits). A lookup that fails
+# (docker unreachable) counts as alive, so the record stays for the next run or --cleanup.
+container_alive() {
+  local out
+  out="$(docker ps -aq --filter "name=^$1\$" 2>/dev/null)" || return 0
+  [ -n "$out" ]
+}
+
 recorded_alive() {
   local dir="$1" kind id stamp
   [ -f "$dir/owned" ] || return 1
   while read -r kind id stamp; do
+    if [ "$kind" = container ]; then container_alive "$id" && return 0; continue; fi
     [ -n "$stamp" ] && ours "$id" "$stamp" && return 0
   done < "$dir/owned"
   return 1
@@ -476,12 +510,15 @@ run() {
 in_dir() { cd "$1" && shift && exec "$@"; }
 
 PG_DSN=""
+PG_CONTAINER=""
 PG_BIN="${DEEDKIT_PG_BIN:-/opt/homebrew/opt/postgresql@18/bin}"
 
 # PostgreSQL 18 from Homebrew as a child of this run, its cluster in the run directory, listening on
 # 127.0.0.1 only. A child, so its CPU (and its backends') counts in `times` once it is reaped.
 pg_start() {
   local name="$1" data password port i pid
+  if [ "$LOCAL_LANE" = 1 ]; then pg_start_container "$name"; return; fi
+  PG_CONTAINER=""
   data="$RUN_DIR/$name"
   password="$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
   mkdir -p "$data"
@@ -505,6 +542,32 @@ pg_start() {
     sleep 1
   done
   PGPASSWORD="$password" "$PG_BIN/createdb" -h 127.0.0.1 -p "$port" -U probe_owner messaging_probe_test
+  PG_DSN="postgresql://probe_owner:$password@127.0.0.1:$port/messaging_probe_test"
+}
+
+# The local lane's database: CI's image in docker, on a free 127.0.0.1 port, named after this run's directory so no
+# other run's stop reaches it. Recorded before it starts, so the watchdog, the next run and --cleanup stop it even
+# when the runner dies the moment after; the password reaches docker through its environment, not its arguments.
+pg_start_container() {
+  local name="$1" data password port i
+  data="$RUN_DIR/$name"
+  mkdir -p "$data"
+  password="$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
+  PG_CONTAINER="deedkit_pg_${WORKER}_$(basename "$RUN_DIR" | tr -c 'a-z0-9\n' '_')_$name"
+  printf 'container %s run\n' "$PG_CONTAINER" >> "$RUN_DIR/owned"
+  export POSTGRES_PASSWORD="$password"
+  run docker run --rm -d --name "$PG_CONTAINER" -p 127.0.0.1::5432 \
+    -e POSTGRES_USER=probe_owner -e POSTGRES_PASSWORD -e POSTGRES_DB=messaging_probe_test -e TZ=UTC "$PG_IMAGE" \
+    -c timezone=UTC -c log_timezone=UTC -c fsync=off -c synchronous_commit=off -c full_page_writes=off >/dev/null
+  unset POSTGRES_PASSWORD
+  # The image's first start runs its init on a Unix socket only; TCP answers once the real server is up.
+  for i in $(seq 1 60); do
+    if docker exec "$PG_CONTAINER" pg_isready -q -h 127.0.0.1 -U probe_owner -d messaging_probe_test 2>/dev/null; then break; fi
+    if [ "$i" = 60 ]; then say "postgres $name did not become ready"; docker logs "$PG_CONTAINER" >&2 2>&1 || true; return 1; fi
+    sleep 1
+  done
+  port="$(docker port "$PG_CONTAINER" 5432/tcp | sed -n 's/^127\.0\.0\.1:\([0-9][0-9]*\)$/\1/p' | head -1)"
+  [ -n "$port" ] || { say "postgres $name has no 127.0.0.1 port"; return 1; }
   PG_DSN="postgresql://probe_owner:$password@127.0.0.1:$port/messaging_probe_test"
 }
 
@@ -586,6 +649,8 @@ finish() {
   fi
   if [ -n "$DATABASES" ]; then
     pg="$(awk -v a="$(cpu_of "$RUN_DIR/.times")" -v b="$(cpu_of "$RUN_DIR/.times-before")" 'BEGIN { printf "%.1f", a - b }')"
+  elif [ "$LOCAL_LANE" = 1 ]; then
+    pg=-   # a container's CPU is docker's, not this run's
   fi
   if [ "$SUITE" = root ]; then report_skips || true; fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$WORKER" "$SUITE" "$START_ISO" "$((SECONDS - START_EPOCH))" \
@@ -597,7 +662,11 @@ finish() {
   exit "$status"
 }
 
-write_dsn() { (umask 077 && printf '%s' "$PG_DSN" > "$1"); }
+# The DSN file, and beside it the local lane's container name (empty on the mini).
+write_dsn() { (umask 077 && printf '%s' "$PG_DSN" > "$1"); printf '%s' "$PG_CONTAINER" > "${1%.dsn}.container"; }
+
+# The env argument naming a run's database container for the tests that use it, as CI's, or none on the mini.
+container_env() { local name; name="$(cat "$1" 2>/dev/null || true)"; [ -z "$name" ] || printf 'ANYMSG_TEST_POSTGRES_CONTAINER=%s' "$name"; }
 
 sync_env() { cd "$1" && exec uv sync --frozen --group dev -q; }
 
@@ -617,7 +686,7 @@ suite_root() {
     pg_start pg1
     write_dsn "$RUN_DIR/test-1.dsn"
     [ $# -gt 0 ] || set -- --tb=short "${ignores[@]}" tests
-    run env PROBE_TEST_DSN_FILE="$RUN_DIR/test-1.dsn" uv run pytest "$@" --junitxml="$RUN_DIR/junit-1.xml" -o junit_family=xunit1
+    run env PROBE_TEST_DSN_FILE="$RUN_DIR/test-1.dsn" $(container_env "$RUN_DIR/test-1.container") uv run pytest "$@" --junitxml="$RUN_DIR/junit-1.xml" -o junit_family=xunit1
     return
   fi
   # The full suite: PARALLEL file-level shards (scripts/python_shards.py, as CI), each with its own database.
@@ -627,7 +696,8 @@ suite_root() {
   done
   for shard in $(seq 1 "$PARALLEL"); do
     (own_self group
-      env DEEDKIT_TEST_SHARD="$shard/$PARALLEL" PROBE_TEST_DSN_FILE="$RUN_DIR/test-$shard.dsn" uv run python \
+      env DEEDKIT_TEST_SHARD="$shard/$PARALLEL" PROBE_TEST_DSN_FILE="$RUN_DIR/test-$shard.dsn" \
+        $(container_env "$RUN_DIR/test-$shard.container") uv run python \
       scripts/python_shards.py pytest --tb=short "${ignores[@]}" tests --junitxml="$RUN_DIR/junit-$shard.xml" -o junit_family=xunit1 2>&1 | prefix "[$shard/$PARALLEL] ") &
     pid=$!
     pids="$pids $pid"
@@ -766,20 +836,67 @@ runner_here() {
 
 quoted() { local arg out=""; for arg in "$@"; do out="$out $(printf '%q' "$arg")"; done; printf '%s' "$out"; }
 
-# The mini's ssh destination (user@address or an ssh alias): DEEDKIT_REMOTE_HOST, else the first line of
-# HOST_FILE, kept on the laptop only. Without one, or with one ssh would read as an option, nothing runs: CI covers.
-need_host() {
-  [ -n "$HOST" ] || HOST="$(head -1 "$HOST_FILE" 2>/dev/null || true)"
-  case "$HOST" in
-    "") say "no mini address (DEEDKIT_REMOTE_HOST or $HOST_FILE), CI covers"; exit "$UNREACHABLE" ;;
-    -*|*[[:space:]]*) die "bad mini address in DEEDKIT_REMOTE_HOST or $HOST_FILE" ;;
-  esac
+# The test hosts in order, kept on the laptop only: DEEDKIT_REMOTE_HOST (one host), else DEEDKIT_TEST_HOSTS (several,
+# space-separated), else the lines of HOSTS_FILE (blank lines and `#` comments skipped), else the first line of
+# HOST_FILE. A host is an ssh destination (user@address or an ssh alias) set up as the mini is, or `local`. A run takes
+# the first host that admits it and falls back to the next only when one is unreachable (91) or not set up (92), never
+# once its suite started; a busy host (90) keeps the run in its queue. Without a host, or with one ssh would read as
+# an option, nothing runs: CI covers.
+HOSTS_FILE="${HOME:-}/.config/deedkit/test-hosts"
+SHARED_MINI="$SHARED"
+HOSTS=()
+read_hosts() {
+  local line host
+  if [ -n "$HOST" ]; then
+    HOSTS=("$HOST")
+  elif [ -n "${DEEDKIT_TEST_HOSTS:-}" ]; then
+    read -ra HOSTS <<< "$DEEDKIT_TEST_HOSTS"
+  elif [ -f "$HOSTS_FILE" ]; then
+    while read -r line || [ -n "$line" ]; do
+      case "$line" in ""|"#"*) ;; *) HOSTS+=("$line") ;; esac
+    done < "$HOSTS_FILE"
+  else
+    line="$(head -1 "$HOST_FILE" 2>/dev/null || true)"
+    if [ -n "$line" ]; then HOSTS=("$line"); fi
+  fi
+  if [ "${#HOSTS[@]}" = 0 ]; then
+    say "no mini address (DEEDKIT_REMOTE_HOST, DEEDKIT_TEST_HOSTS, $HOSTS_FILE or $HOST_FILE), CI covers"; exit "$UNREACHABLE"
+  fi
+  for host in "${HOSTS[@]}"; do
+    case "$host" in -*|*[[:space:]]*) die "bad mini address in DEEDKIT_REMOTE_HOST, DEEDKIT_TEST_HOSTS, $HOSTS_FILE or $HOST_FILE" ;; esac
+  done
 }
 
-# As the admin account on the mini, and as the service user through its shim (the only sudo it may run).
-as_owner() { ssh "${SSH_OPTS[@]}" "$HOST" "bash -s --$(quoted "$@")" < "$SELF"; }
+# Make one host of the list the current one.
+use_host() {
+  HOST="$1" LOCAL=0 SHARED="$SHARED_MINI" DEADLINE=""
+  if [ "$HOST" = local ]; then
+    LOCAL=1
+    [ -n "${HOME:-}" ] || die "the local lane needs HOME"
+    SHARED="$LOCAL_ROOT/shared"
+    mkdir -p "$SHARED/stage" "$LOCAL_ROOT/ci"
+  fi
+}
+
+# As the admin account on the mini, and as the service user through its shim (the only sudo it may run). The local
+# lane runs both here as this user, the script on stdin as there, with its own shared and CI directories.
+as_owner() {
+  if [ "$LOCAL" = 1 ]; then
+    (cd "$HOME" && DEEDKIT_LOCAL_LANE=1 DEEDKIT_REMOTE_SHARED="$SHARED" DEEDKIT_CI_ROOT="$LOCAL_ROOT/ci" bash -s -- "$@" < "$SELF")
+    return
+  fi
+  ssh "${SSH_OPTS[@]}" "$HOST" "bash -s --$(quoted "$@")" < "$SELF"
+}
 # From /: the admin account's home, the ssh session's directory, is closed to the service user.
-as_service() { ssh "${SSH_OPTS[@]}" "$HOST" "cd / && sudo -n -u $SERVICE_USER $SHIM$(quoted "$@")" < "$SELF"; }
+as_service() {
+  if [ "$LOCAL" = 1 ]; then
+    (cd / && DEEDKIT_LOCAL_LANE=1 DEEDKIT_REMOTE_SHARED="$SHARED" DEEDKIT_CI_ROOT="$LOCAL_ROOT/ci" bash -s -- "$@" < "$SELF")
+    return
+  fi
+  ssh "${SSH_OPTS[@]}" "$HOST" "cd / && sudo -n -u $SERVICE_USER $SHIM$(quoted "$@")" < "$SELF"
+}
+# A shell command on the mini as the admin account, or here for the local lane.
+on_host() { if [ "$LOCAL" = 1 ]; then bash -c "$1"; else ssh "${SSH_OPTS[@]}" "$HOST" "$1"; fi; }
 
 # Files changed against the merge base with main (committed or not) plus new untracked ones, one per line.
 touched_files() {
@@ -838,7 +955,11 @@ copy_to_mini() {
   local stage="$1" worker="$2" end=$((SECONDS + COPY_SECONDS)) status=0
   trap 'if [ -n "$COPY_JOB" ]; then kill -KILL -- "-$COPY_JOB" 2>/dev/null || true; fi; exit 130' INT TERM HUP
   set -m
-  rsync "${RSYNC_COPY[@]}" --timeout="$COPY_IO_SECONDS" -e "ssh ${SSH_OPTS[*]}" "$stage/src/" "$HOST:$SHARED/stage/$worker/" </dev/null 2>"$stage/copy.err" &
+  if [ "$LOCAL" = 1 ]; then
+    rsync "${RSYNC_COPY[@]}" --timeout="$COPY_IO_SECONDS" "$stage/src/" "$SHARED/stage/$worker/" </dev/null 2>"$stage/copy.err" &
+  else
+    rsync "${RSYNC_COPY[@]}" --timeout="$COPY_IO_SECONDS" -e "ssh ${SSH_OPTS[*]}" "$stage/src/" "$HOST:$SHARED/stage/$worker/" </dev/null 2>"$stage/copy.err" &
+  fi
   COPY_JOB=$!
   set +m
   while kill -0 "$COPY_JOB" 2>/dev/null; do
@@ -855,8 +976,45 @@ copy_to_mini() {
   return "$status"
 }
 
+# One host's admission, before the suite starts: the queue, the probe, the stage and the copy. Returns 0 (admitted,
+# copied) or the run's exit code: 90 busy, 91 unreachable, 92 not set up; the caller tries the next host on 91 and 92.
+STAGED=""
+start_on_host() {
+  local tree="$1" worker="$2" status=0
+  wait_turn || return $?
+  as_service --here probe "$worker" || status=$?
+  case "$status" in
+    0) ;;
+    "$BUSY") return "$BUSY" ;;
+    255) say "mini unreachable, CI covers"; return "$UNREACHABLE" ;;
+    *)
+      if [ "$LOCAL" = 1 ]; then say "the local lane is not set up (exit $status), CI covers"; return "$NOT_SET_UP"; fi
+      say "the mini's service user $SERVICE_USER is not set up (exit $status), CI covers"; return "$NOT_SET_UP" ;;
+  esac
+  # The local stage (kept until the next run of this worker) mirrors exactly the files that may leave.
+  # The caller tests this function's status, so errexit is off in here: every staging step is checked, and the stage
+  # counts as made only once all of them succeeded.
+  if [ -z "$STAGED" ]; then
+    local stage="${DEEDKIT_REMOTE_STAGE:-${TMPDIR:-/tmp}/deedkit-remote-test/$worker}"
+    # The mini stage is read by _deedkitci, not its owner, the admin account: readable to all (rsync -a keeps modes).
+    if ! { rm -rf "$stage/src" && mkdir -p "$stage/src" && list_files "$tree" > "$stage/files" &&
+           tar -C "$tree" --null -T "$stage/files" -cf - | tar -C "$stage/src" -xpf - && chmod -R go+rX "$stage/src"; }; then
+      die "staging the worktree in $stage failed; nothing was sent"
+    fi
+    STAGED="$stage"
+  fi
+  status=0
+  on_host "mkdir -p $(printf '%q' "$SHARED/stage/$worker")" || status=1
+  if [ "$status" = 0 ]; then copy_to_mini "$STAGED" "$worker" || status=$?; fi
+  case "$status" in
+    0) ;;
+    30) say "copying to the mini timed out, CI covers"; return "$UNREACHABLE" ;;
+    *) say "copying to the mini failed before the suite started, CI covers"; return "$UNREACHABLE" ;;
+  esac
+}
+
 laptop_run() {
-  local tree suite="$2" worker stage status mode=modules
+  local tree suite="$2" worker status mode=modules
   tree="$(cd "$1" && pwd)" || die "no worktree $1"
   shift 2
   git -C "$tree" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$tree is not a git worktree"
@@ -873,33 +1031,22 @@ laptop_run() {
       exit 0
     fi
   fi
-  need_host
+  read_hosts
   [[ "$COPY_IO_SECONDS $COPY_SECONDS" =~ ^[1-9][0-9]*\ [1-9][0-9]*$ ]] || die "DEEDKIT_REMOTE_COPY_IO_SECONDS and DEEDKIT_REMOTE_COPY_SECONDS must be positive integers"
-  wait_turn || exit $?
-  status=0
-  as_service --here probe "$worker" || status=$?
-  case "$status" in
-    0) ;;
-    "$BUSY") exit "$BUSY" ;;
-    255) say "mini unreachable, CI covers"; exit "$UNREACHABLE" ;;
-    *) say "the mini's service user $SERVICE_USER is not set up (exit $status), CI covers"; exit "$NOT_SET_UP" ;;
-  esac
-  # The local stage (kept until the next run of this worker) mirrors exactly the files that may leave.
-  stage="${DEEDKIT_REMOTE_STAGE:-${TMPDIR:-/tmp}/deedkit-remote-test/$worker}"
-  rm -rf "$stage/src"
-  mkdir -p "$stage/src"
-  list_files "$tree" > "$stage/files"
-  tar -C "$tree" --null -T "$stage/files" -cf - | tar -C "$stage/src" -xpf -
-  # The mini stage is read by _deedkitci, not its owner, the admin account: readable to all (rsync -a keeps modes).
-  chmod -R go+rX "$stage/src"
-  status=0
-  ssh "${SSH_OPTS[@]}" "$HOST" "mkdir -p $(printf '%q' "$SHARED/stage/$worker")" || status=1
-  if [ "$status" = 0 ]; then copy_to_mini "$stage" "$worker" || status=$?; fi
-  case "$status" in
-    0) ;;
-    30) say "copying to the mini timed out, CI covers"; exit "$UNREACHABLE" ;;
-    *) say "copying to the mini failed before the suite started, CI covers"; exit "$UNREACHABLE" ;;
-  esac
+  local host index=0
+  for host in "${HOSTS[@]}"; do
+    index=$((index + 1))
+    use_host "$host"
+    status=0
+    start_on_host "$tree" "$worker" || status=$?
+    case "$status" in
+      0) break ;;
+      "$UNREACHABLE"|"$NOT_SET_UP") if [ "$index" -lt "${#HOSTS[@]}" ]; then say "trying the next test host"; fi ;;
+      *) exit "$status" ;;
+    esac
+  done
+  [ "$status" = 0 ] || exit "$status"
+  if [ "${#HOSTS[@]}" -gt 1 ]; then say "test host $index of ${#HOSTS[@]}"; fi
   local runner_args=() path again=""
   if [ "${#RUFF[@]}" -gt 0 ]; then for path in "${RUFF[@]}"; do runner_args+=(--ruff "$path"); done; fi
   runner_args+=(--)
@@ -934,15 +1081,32 @@ case "${1:-}" in
   --list)
     [ $# = 2 ] || die "usage: $0 --list <worktree>"
     list_files "$2" | tr '\0' '\n' ;;
-  --load) need_host; as_service --here load ;;
+  --load)
+    # Every host's load.log; with several hosts each starts with a `# <host>` line, and one that is down is skipped.
+    read_hosts
+    for host in "${HOSTS[@]}"; do
+      use_host "$host"
+      if [ "${#HOSTS[@]}" -gt 1 ]; then printf '# %s\n' "$host"; as_service --here load || say "$host unreachable, skipped"
+      else as_service --here load; fi
+    done ;;
   --cleanup)
+    # On every host, since a worker's runs may have landed on any of them; a host that is down is skipped.
     [ $# = 2 ] || die "usage: $0 --cleanup <worker>"
     worker="$(canonical_worker "$2")"
     valid_worker "$worker" || die "bad worker name"
-    need_host
+    read_hosts
     status=0
-    as_service --here cleanup "$worker" || status=$?
-    ssh "${SSH_OPTS[@]}" "$HOST" "rm -rf $(printf '%q' "$SHARED/stage/$worker")"
+    for host in "${HOSTS[@]}"; do
+      use_host "$host"
+      one=0
+      as_service --here cleanup "$worker" || one=$?
+      if [ "$one" = 255 ] && [ "${#HOSTS[@]}" -gt 1 ]; then say "$host unreachable, skipped"; continue; fi
+      [ "$one" = 0 ] || status="$one"
+      if ! on_host "rm -rf $(printf '%q' "$SHARED/stage/$worker")"; then
+        say "$host: removing the stage of $worker failed; run --cleanup again later"
+        [ "$status" != 0 ] || status=1
+      fi
+    done
     exit "$status" ;;
   --full|*)
     if [ "${1:-}" = --full ]; then FULL=1; shift; fi

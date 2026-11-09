@@ -215,3 +215,19 @@ rm -f $R $L; echo undo-ok'
   defaults in the script).
 - `~_deedkitci/deedkit-ci`: the workers' run copies, `load.log` (`scripts/remote-test.sh --load`) and the
   slot locks.
+
+## Test hosts and the laptop's local lane (owner 11-09)
+
+The laptop is a test host too: the host `local` runs the same runner on the laptop as its own user (no ssh, no
+sudo, no service user), under `~/.cache/deedkit-ci` (`DEEDKIT_LOCAL_ROOT`): `shared/stage/<worker>`, `shared/caps.conf`,
+`ci/<worker>` and `ci/load.log`. Its databases are disposable containers of CI's pinned `postgres:18-bookworm` image
+under OrbStack (`orb start`), one per shard, on a free `127.0.0.1` port, named
+`deedkit_pg_<worker>_<run>_pg<n>`; their names reach the tests as `ANYMSG_TEST_POSTGRES_CONTAINER`, so the
+container tests that skip on the mini run there. Lease, slots, cleanup and exit codes are the mini's; exit 92
+means docker is not running. Defaults: `MAX_RUNS=2`, `PARALLEL=2`, `MAX_LOAD=16`; `shared/caps.conf` overrides them.
+
+The host list lives on the laptop only: `DEEDKIT_REMOTE_HOST` (one host), else `DEEDKIT_TEST_HOSTS`
+(space-separated), else the lines of `~/.config/deedkit/test-hosts` (`#` comments and blank lines skipped), else
+the first line of `~/.config/deedkit/mini-host`, which the setup blocks above keep reading. A run takes the first
+host that admits it. It moves to the next host only when one is unreachable (91) or not set up (92). A busy host (90) keeps the
+run in its own queue. `--cleanup` and `--load` go to every listed host and skip one that is down.
