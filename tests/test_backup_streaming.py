@@ -316,18 +316,32 @@ def test_the_capture_and_fence_helper_deadlines_fire_within_one_poll_of_expiry(t
 
 # spec: ANYM-635
 def test_the_stream_result_is_seen_within_a_tenth_of_a_second_while_the_worker_is_inspected_once_a_second(tmp_path):
-    holding,timing,seen=[False],[],[]
+    holding,timing,seen,polls=[False],[],[],[]
     async def send(path,metadata,transfer,timeout,start,completed,stopped=None):
         start(True);holding[0]=True
         async def worker():
-            await asyncio.sleep(.25)
+            while len(polls)<2:await asyncio.sleep(.01)  # the result lands during the runner's second wait
             write_json(path.parent/'result.json',{'v':2,'id':metadata['id'],'snapshot_sha256':metadata['snapshot_sha256'],
                                                   'status':'encrypted','bytes':64,'sha256':'c'*64})
             holding[0]=False
-        task=asyncio.create_task(worker());loop=asyncio.get_running_loop();began,before=loop.time(),len(seen)
-        result=await asyncio.wait_for(completed(),.6)  # 1-s sleeps between result.json checks miss this bound
-        timing.append((loop.time()-began,len(seen)-before));await task
+        task=asyncio.create_task(worker());before=len(seen)
+        result=await asyncio.wait_for(completed(),30)
+        timing.append(len(seen)-before);await task
         return {**result,'status':'stored','duplicate':False}
+    # The runner's waits are counted, not timed, so a loaded runner cannot fail the bound: each wait between
+    # result.json checks asks for at most a tenth of a second, and the check right after the write sees it. Its
+    # loop clock is the sum of those waits, so "once a second" is the runner's own schedule, not the host's.
+    clock=[0.0]
+    class Loop:
+        def __init__(self,loop):self.loop=loop
+        def __getattr__(self,name):return getattr(self.loop,name)
+        def time(self):return clock[0]
+    class Polled:
+        def __getattr__(self,name):return getattr(asyncio,name)
+        def get_running_loop(self):return Loop(asyncio.get_running_loop())
+        async def sleep(self,delay):
+            polls.append((delay,any(path.name=='result.json' for path in tmp_path.rglob('result.json'))))
+            clock[0]+=delay;await asyncio.sleep(delay)
     runner,docker=streaming_runner(tmp_path,send);inspect=docker.inspect
     def counted(cid):
         if not cid.startswith('pos-backup-'):return inspect(cid)
@@ -337,9 +351,12 @@ def test_the_stream_result_is_seen_within_a_tenth_of_a_second_while_the_worker_i
         try:return FakeDocker.inspect(docker,cid)  # running, no result yet
         finally:docker.hold_worker=False
     docker.inspect=counted
-    runner.run()
+    backup_runner.asyncio=Polled()
+    try:runner.run()
+    finally:backup_runner.asyncio=asyncio
     assert read_json(tmp_path/'status.json')['state']=='ok'
-    assert timing[0][0]<.5 and timing[0][1]==1
+    assert len(polls)>=2 and all(delay<=.1 for delay,_ in polls) and not any(written for _,written in polls)
+    assert timing==[1]
 
 
 def test_stream_runner_lost_receipt_uses_duplicate_without_reencryption(tmp_path):
