@@ -53,14 +53,15 @@ def build(s, chats, pairs):
     return [r[0] for r in rows]
 
 
-def walk(s, c, p, *, limit, view, accounts, page_first, pages=6):
+def walk(s, c, p, *, limit, view, accounts, page_first, pages=6, **filters):
     """Every page of the catalog walk (rows and cursors), page-first or forced onto today's per-chat plan (the oracle)."""
     real = chat_queries._page_first
     if not page_first:chat_queries._page_first = lambda *a, **k: None
     try:
         out, after = [], ''
         for _ in range(pages):
-            result = chat_queries.list_chats(s, c, p, after, limit, order='activity', view=view, accounts=accounts, include_coverage=False)
+            result = chat_queries.list_chats(s, c, p, after, limit, order='activity', view=view, accounts=accounts,
+                include_coverage=False, **filters)
             out.append(result)
             after = result['next_cursor']
             if not after:break
@@ -119,3 +120,58 @@ def test_page_first_second_page_after_a_new_message_matches_the_per_chat_plan(se
     # The second page came from the page-first plan, not from its fallback.
     assert found and found[0] is not None
     assert got['items'] and got == oracle
+
+
+def spied():
+    """Wrap _page_first; the list holds what each call returned."""
+    found, real = [], chat_queries._page_first
+    def spy(*args, **kw):
+        found.append(real(*args, **kw));return found[-1]
+    return found, spy, real
+
+
+# spec: ANYM-878
+def test_page_first_role_filter_keeps_the_unknown_role_count(seeded):
+    s, a, _ = seeded
+    build(s, [('tg-channel', [(m % 7, 'text', False)]) for m in range(30)], [])
+    with s.pool.connection() as c:
+        c.execute("UPDATE chats SET my_role='admin',can_post=true,role_observed_at=now() WHERE id LIKE 'h-%' AND id<>'h-29'")
+        c.execute("UPDATE messages SET sent_at=sent_at-interval '30 days' WHERE chat='h-29'")
+    found, spy, real = spied()
+    chat_queries._page_first = spy
+    try:
+        with s.authorized(a, 'list_chats') as (c, p):
+            got, oracle = (walk(s, c, p, limit=25, view='conversation', accounts=None, page_first=True, pages=1, my_roles=['admin']),
+                walk(s, c, p, limit=25, view='conversation', accounts=None, page_first=False, pages=1, my_roles=['admin']))
+    finally:
+        chat_queries._page_first = real
+    # The page came from the page-first plan, and the count of unknown-role channels still reads the whole catalog.
+    assert found and found[0] is not None
+    assert got == oracle and got[0]['unknown_role_rows'] == 1
+
+
+# spec: ANYM-878
+def test_page_first_reruns_on_the_per_chat_plan_when_a_chat_gets_newer_inside_the_call(seeded):
+    s, a, _ = seeded
+    build(s, [('tg-private', [(m, 'text', False)]) for m in range(7)]*2, [])
+    found, real = [], chat_queries._page_first
+    def racing(*args, **kw):
+        # Another writer commits after the candidates were read: a chat outside them becomes the newest.
+        result = real(*args, **kw);found.append(result)
+        if result and len(found) == 1:
+            outside = next(i for i in ('h-'+str(n) for n in range(14)) if i not in result['found'])
+            with s.pool.connection() as w:
+                w.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
+                    VALUES('h-m-race','telegram-demo',%s,'998','peer','synthetic racing text',now(),'incoming')''', (outside,))
+        return result
+    chat_queries._page_first = racing
+    try:
+        with s.authorized(a, 'list_chats') as (c, p):
+            got = chat_queries.list_chats(s, c, p, '', 3, order='activity', view='conversation', include_coverage=False)
+            chat_queries._page_first = lambda *a, **k: None
+            oracle = chat_queries.list_chats(s, c, p, '', 3, order='activity', view='conversation', include_coverage=False)
+    finally:
+        chat_queries._page_first = real
+    # The proof failed in the page statement's snapshot, so the call answered from the per-chat plan: the racing chat leads.
+    assert found and found[0] is not None
+    assert got == oracle and got['items'][0]['last_message_id'] == 'h-m-race'

@@ -265,7 +265,10 @@ def _page_first(c,p,clauses,args,*,accounts,limit,last_sql,last_filter,pos,lower
     outside the candidates has no qualifying message at or after the floor, so its head is older than every candidate's;
     a candidate list that still yields limit+1 rows after the cursor and the bounds is therefore exactly the page.
     Anything the window cannot prove (an exhausted archive, chats without messages, a deep cursor) returns None and the
-    caller runs today's per-chat plan. Returns (page chat ids, aliases, listed) otherwise.
+    caller runs today's per-chat plan. Otherwise returns the candidates, the hidden pair chats to leave out, the page's
+    aliases and listed pairs, and a proof the page statement checks in its own snapshot (READ COMMITTED gives each
+    statement a new one): a chat that became newer than the page between these reads fails it, and the caller reruns
+    the call on the per-chat plan.
     """
     at=cid=None
     if pos is not None:
@@ -285,7 +288,14 @@ def _page_first(c,p,clauses,args,*,accounts,limit,last_sql,last_filter,pos,lower
         ' (SELECT count(*) AS n,min(sent_at) AS oldest FROM examined) e LEFT JOIN LATERAL (SELECT m.chat,m.sent_at,m.id FROM examined m'+
         kept+') q ON true ORDER BY q.sent_at DESC,q.id DESC')
     window_args=[*msg_args,*bound_args]
-    tie_sql='SELECT DISTINCT m.chat FROM messages m'+kept+' AND '+scoped+' AND m.sent_at=%s'
+    # The rest of a floor tie: at most PAGE_WINDOW_CAP rows at that one timestamp, else the tie is unresolved.
+    tie_sql=('WITH tied AS MATERIALIZED (SELECT m.id,m.chat,m.account,m.sent_at,m.revision,m.body,m.deleted FROM messages m'
+        ' WHERE '+scoped+' AND m.sent_at=%s ORDER BY m.id DESC LIMIT %s) SELECT e.n,q.chat FROM (SELECT count(*) AS n FROM tied) e'
+        ' LEFT JOIN LATERAL (SELECT DISTINCT m.chat FROM tied m'+kept+') q ON true')
+    # Proof inside the page statement's own snapshot: no kept message of a chat outside the candidates at or after the
+    # page's oldest head (scope and bounds as the window's).
+    proof_sql=('NOT EXISTS(SELECT 1 FROM messages m'+kept+' AND '+scoped+
+        " AND NOT m.chat=ANY(%s) AND m.sent_at>=(SELECT min(coalesce(page_head,'-infinity')) FROM chat_page))")
     exact=[*clauses,'c.id=ANY(%s)','NOT c.id=ANY(%s)']
     exact_tail,exact_args=[],[]
     if pos is not None:
@@ -312,14 +322,19 @@ def _page_first(c,p,clauses,args,*,accounts,limit,last_sql,last_filter,pos,lower
         floor=list(first.values())[need-1]
         found=[chat for chat,t in first.items() if t>=floor]
         if examined['oldest']==floor:
-            # The window may end inside the floor's tie; the rest of the tie is one index range.
-            found+=[r['chat'] for r in c.execute(tie_sql,[*args,*msg_args,*bound_args,floor]) if r['chat'] not in first]
+            # The window may end inside the floor's tie; the rest of the tie is one bounded index range.
+            tied=c.execute(tie_sql,[*msg_args,*bound_args,floor,PAGE_WINDOW_CAP+1,*args]).fetchall()
+            if tied[0]['n']>PAGE_WINDOW_CAP:return None
+            found+=[r['chat'] for r in tied if r['chat'] is not None and r['chat'] not in first]
+        if len(found)>PAGE_CANDIDATE_CAP*(limit+1):return None
         aliases,listed=_alias_pairs(accounts,c,p,chats=[*found,*(exclude_chats or [])])
         # The listed chat of a pair hides the other one; an excluded hidden chat excludes its listed chat too.
         hidden={v['chat']['id']:shown for shown,v in listed.items()}
         excluded=[*hidden,*(hidden[i] for i in (exclude_chats or []) if i in hidden)]
         page=c.execute(exact_sql,[*args,found,excluded,*exact_args,limit+1]).fetchall()
-        if len(page)>limit:return [r['id'] for r in page],aliases,listed
+        if len(page)>limit:
+            return {'found':found,'excluded':excluded,'aliases':aliases,'listed':listed,'proof':proof_sql,
+                'proof_args':[*args,*msg_args,*bound_args,[*found,*excluded]]}
         need=max(2*need,len(found)+limit+1-len(page))
     return None
 
@@ -430,12 +445,21 @@ def _decorate_peers(c,items,listed,p,private,selected_chat,selves,titles):
             row.update(title=alias['title'],title_basis='alias_chat')
 
 
-def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=None,
+class _PerChatPlan(Exception):
+    """ANYM-878: the page-first proof failed in the page statement's snapshot; the call reruns on the per-chat plan."""
+
+
+def list_chats(*args,**kw):
+    try:return _list_chats(*args,**kw)
+    except _PerChatPlan:return _list_chats(*args,**kw,plan='per_chat')
+
+
+def _list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=None,
         order='id',exclude_channels=False,awaiting_reply=False,from_time='',to_time='',
         include_coverage=True,awaiting_reply_days=14,exclude_chats=None,exclude_senders=None,
         only_questions=False,only_unread=False,selected_chat=None,include_dismissed=False,
         view='archive',exclude_likely_broadcasts=False,include_muted=False,promotional='exclude',
-        my_roles=None,can_post=None,awaiting_their_reply=False,min_wait_hours=None,courtesies='include'):
+        my_roles=None,can_post=None,awaiting_their_reply=False,min_wait_hours=None,courtesies='include',plan='page_first'):
     from .store import APIError,bounded,date_bound,serial
     from . import owner_waits
     bounded(limit);valid_text(after,4096);valid_text(query,200)
@@ -482,7 +506,7 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     # ANYM-878: a catalog page in activity order is found from the newest messages (_page_first), and the WhatsApp
     # pairs are read for its candidates only. A principal with no more chats than the first window keeps the per-chat
     # plan: it reads no more heads than the window would.
-    page_first=(order=='activity' and not (awaiting_reply or only_questions or only_unread or awaiting_their_reply or query
+    page_first=(plan=='page_first' and order=='activity' and not (awaiting_reply or only_questions or only_unread or awaiting_their_reply or query
         or selected_chat) and exclude_senders is None and (p['chat_ids'] is None or len(p['chat_ids'])>PAGE_WINDOW*(limit+1)))
     aliases,listed=({},{}) if page_first else _alias_pairs(accounts,c,p)
     hidden={v['chat']['id']:shown for shown,v in listed.items()}
@@ -544,11 +568,12 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         CASE WHEN a.platform='telegram' THEN {number('m')} ELSE 0::bigint END AS numeric_id FROM messages m
         LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision
         WHERE m.account=c.account AND m.chat=c.id AND {last_filter}'''
+    found=None
     if page_first:
         found=_page_first(c,p,clauses,args,accounts=accounts,limit=limit,last_sql=last_sql,last_filter=last_filter,
             pos=pos,lower=lower,upper=upper,exclude_chats=exclude_chats)
         if found:
-            page_ids,aliases,listed=found;clauses.append('c.id=ANY(%s)');args.append(page_ids)
+            aliases,listed=found['aliases'],found['listed']
         else:
             # Today's per-chat plan, with the catalog's WhatsApp pairs.
             aliases,listed=_alias_pairs(accounts,c,p)
@@ -851,8 +876,15 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         if order=='activity':
             page_from+=' JOIN accounts a ON a.id=c.account LEFT JOIN LATERAL ('+latest_sql(last_sql,both_directions=True)+') last ON true'
         prefix='WITH chat_page AS MATERIALIZED (SELECT c.*'+page_from+' WHERE '+where+' ORDER BY '+sort+' LIMIT %s) '
+        query_args=[*args,limit+1,*base_args,limit+1]
+        if found:
+            # ANYM-878: the page is chosen over the candidates and proven in this one statement's snapshot.
+            prefix=('WITH chat_page AS MATERIALIZED (SELECT c.*,last.sent_at AS page_head'+page_from+' WHERE '+where+
+                ' AND c.id=ANY(%s) AND NOT c.id=ANY(%s) ORDER BY '+sort+' LIMIT %s), page_proof AS MATERIALIZED (SELECT count(*)>%s AND '+
+                found['proof']+' AS proven FROM chat_page) ')
+            query_args=[*args,found['found'],found['excluded'],limit+1,limit,*found['proof_args'],*base_args,limit+1]
         base=base.replace(' FROM chats c JOIN accounts a',' FROM chat_page c JOIN accounts a',1)
-        query_args=[*args,limit+1,*base_args,limit+1];where='true'
+        where='true'
     if waits:
         # The page is chosen over the run lookups alone; the row's head, read and hint evidence is read for it only.
         # One statement picks the page and counts the totals; the row query then reads only the picked chats.
@@ -905,8 +937,12 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
           'ambiguous_message_order' ELSE 'heuristic_not_obligation' END AS awaiting_reply_confidence'''+(
         ''',c.wait_since AS _wait_since,c.wait_last_id AS _wait_last_id,c.wait_last_at AS _wait_last_at,
         c.wait_peer_at AS _wait_peer_at,c.wait_peer_numeric AS _wait_peer_numeric,c.wait_muted AS _wait_muted''' if waits else '')+(
-        ',count(*) OVER() AS _total,count(*) FILTER(WHERE '+unread+' IS NULL) OVER() AS _unknown' if inline_totals else '')+base+where+
+        ',count(*) OVER() AS _total,count(*) FILTER(WHERE '+unread+' IS NULL) OVER() AS _unknown' if inline_totals else '')+(
+        ',(SELECT proven FROM page_proof) AS _page_proof' if found else '')+base+where+
         ' ORDER BY '+sort+' LIMIT %s',query_args).fetchall()
+    if found:
+        if not (rows and rows[0]['_page_proof']):raise _PerChatPlan()
+        for row in rows:row.pop('_page_proof')
     if inline_totals:
         totals={'n':rows[0]['_total'] if rows else 0,'unknown':rows[0]['_unknown'] if rows else 0};total=totals['n']
         for row in rows:row.pop('_total');row.pop('_unknown')

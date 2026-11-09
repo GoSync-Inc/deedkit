@@ -216,6 +216,50 @@ def test_default_activity_page_reads_heads_for_the_page_not_the_catalog(seeded):
     assert empty['items']==[] and 0<examined<=PAGE_WINDOW_CAP,examined
 
 
+def page_first_heads(plans):
+    """Head reads the page-first plan added: per statement the most-run messages scan, summed over its statements."""
+    return sum(max((node.get('Actual Loops',1) for node in nodes(plan) if node.get('Relation Name')=='messages'),default=0)
+        for chain,plan in plans if chain and chain[-1]=='_page_first')
+
+
+# spec: ANYM-878
+def test_deep_activity_cursor_returns_the_per_chat_answer_within_its_extra_head_allowance(seeded):
+    from messaging_service import chat_queries
+    s,a,b=seeded
+    seed_catalog(s)
+    limit=25
+    with s.authorized(a,'list_chats') as (c,p):
+        after=''
+        for _ in range(6):  # 600 of 1,000 chats: past half of the catalog
+            after=chat_queries.list_chats(s,c,p,after,100,order='activity',view='conversation',include_coverage=False)['next_cursor']
+        measured=Plans(c)
+        got=chat_queries.list_chats(s,measured,p,after,limit,order='activity',view='conversation',include_coverage=False)
+        real=chat_queries._page_first;chat_queries._page_first=lambda *x,**k:None
+        try:oracle=chat_queries.list_chats(s,c,p,after,limit,order='activity',view='conversation',include_coverage=False)
+        finally:chat_queries._page_first=real
+    assert got==oracle and len(got['items'])==limit
+    # The narrowed criterion 2: at most today's plan plus 7x(limit+1) head reads for the page-first tries.
+    assert page_first_heads(measured.plans)<=7*(limit+1),page_first_heads(measured.plans)
+
+
+# spec: ANYM-878
+def test_a_large_timestamp_tie_falls_back_before_any_head_read(seeded):
+    s,a,b=seeded
+    with s.pool.connection() as c:
+        c.execute("""INSERT INTO chats(id,account,provider_chat,title,chat_type)
+            SELECT 'tie-'||n,'telegram-demo','tie-'||n,'Synthetic '||n,'private' FROM generate_series(0,299) n""")
+        # 300 chats whose only message has one shared timestamp: the floor tie is larger than the candidate cap.
+        c.execute("""INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
+            SELECT 'tie-m-'||n,'telegram-demo','tie-'||n,n::text,'peer','synthetic text',date_trunc('minute',now()),'incoming'
+            FROM generate_series(0,299) n""")
+        c.execute('ANALYZE messages')
+    result,plans=listed(s,a)
+    assert len(result['items'])==25 and [r['id'] for r in result['items']][:2]==['tie-99','tie-98']
+    # The window and the bounded tie read ran; no candidate head was read before the per-chat fallback.
+    own=[plan for chain,plan in plans if chain and chain[-1]=='_page_first']
+    assert own and all(node.get('Actual Loops',1)<=1 for plan in own for node in nodes(plan) if node.get('Relation Name')=='messages'),[scans(plan) for plan in own]
+
+
 # spec: ANYM-878
 def test_default_activity_page_reads_whatsapp_identity_rows_for_the_page_only(seeded):
     s,a,b=seeded
