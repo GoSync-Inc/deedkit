@@ -322,14 +322,14 @@ def test_the_gateway_catalog_accepts_the_latency_arguments():
     assert schema['latency_window_h'] == {'default': 24, 'title': 'Latency Window H', 'type': 'integer'}
 
 
-def migration_073():
-    return ROOT / 'services/messaging/messaging_service/migrations/073_events_created_at.sql'
+def migration_074():
+    return ROOT / 'services/messaging/messaging_service/migrations/074_events_created_at.sql'
 
 
 # spec: ANYM-865
-def test_migration_073_is_a_manual_non_critical_file_that_migrate_expand_still_runs_unattended():
+def test_migration_074_is_a_manual_non_critical_file_that_migrate_expand_still_runs_unattended():
     from messaging_service import migration_rollout as rollout
-    text = migration_073().read_text()
+    text = migration_074().read_text()
     assert rollout.rollout_class(text) == 'manual'
     assert rollout.unattended_class(text) == 'expand'
     assert rollout.risk_class(text) == ('non-critical', None, None)
@@ -337,10 +337,10 @@ def test_migration_073_is_a_manual_non_critical_file_that_migrate_expand_still_r
 
 # spec: ANYM-865
 @pytest.mark.parametrize('shape', ['invalid', 'partial', 'other_keys', 'descending', 'unique', 'hash'])
-def test_migration_073_refuses_an_unusable_index_of_its_name_and_builds_it_once_dropped(database, tmp_path, shape):
+def test_migration_074_refuses_an_unusable_index_of_its_name_and_builds_it_once_dropped(database, tmp_path, shape):
     import psycopg
     from test_extend_key import old_schema_store
-    with old_schema_store(database, tmp_path, 72) as store:
+    with old_schema_store(database, tmp_path, 73) as store:
         with store.pool.connection() as c:
             c.execute(('CREATE UNIQUE INDEX' if shape == 'unique' else 'CREATE INDEX') + ' events_created_at ON events ' + {
                 'invalid': '(created_at)', 'partial': "(created_at) WHERE kind='message.created'",
@@ -351,11 +351,11 @@ def test_migration_073_refuses_an_unusable_index_of_its_name_and_builds_it_once_
         with pytest.raises(psycopg.errors.RaiseException, match='not a valid btree index on events\\(created_at\\)'):
             store.migrate()
         with store.pool.connection() as c:
-            assert c.execute('SELECT max(version) AS v FROM archive_migrations').fetchone()['v'] == 72
+            assert c.execute('SELECT max(version) AS v FROM archive_migrations').fetchone()['v'] == 73
             c.execute('DROP INDEX events_created_at')
         store.migrate()
         store.migrate()
         with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '73'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '74'
             assert c.execute("SELECT pg_get_indexdef('public.events_created_at'::regclass) AS d").fetchone()['d'] == (
                 'CREATE INDEX events_created_at ON public.events USING btree (created_at)')
