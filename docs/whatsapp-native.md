@@ -53,6 +53,15 @@ the holder. Without the key the collector runs child mode unchanged; that is the
   both use), reads `files` and `file_uploads` read-only at the collector's paths (send_file), and has
   `stop_grace_period: 25s`. Its collector keeps its DSN, config, permit, spool and files mounts and adds the socket
   directory; it loses the session and `session-locks` binds. The other account is untouched.
+- Where the holder writes (its root is read-only): `/sessions` (`auth.sqlite`, `capture.sqlite` and their rollback
+  journals, `.holder-generation`, `.holder-terminal`, history downloads in `.native-tmp`); `/spool/events` (captured
+  events, `send-receipts/`, `operation-outcomes/`, `.history-status`, `.repair-status`, `.transport-failure`);
+  `/spool/pages` (media downloads in `.native-tmp`); `/run/deedkit/holder` (`token`, `control.sock`,
+  `send.sock`). Avatars and thumbnails are capture rows, not files. SQLite's own temporaries
+  (sorts, temporary tables) use the overlay's tmpfs `/tmp`, as the collector's child mode did. `/data` is mounted
+  read-only (registered files and uploads for send_file). Guards: `TestNoAdapterWriteUsesTheProcessTempDirectory`,
+  `TestNativeMediaTemporaryStaysOutsideSpoolQuota`, `TestStartupSweepsOnlyStaleNativeTemporaries` and the overlay test
+  in tests/test_whatsapp_holder_image.py.
 - Source status: `collector_health.operations.holder` holds `{state: attached|refused|disconnected, generation,
   protocol, holder_source_sha, code, reason, planned_end, observed_at}`. A refusal (`holder_unavailable`,
   `holder_busy`, `collector_lease_unverified`, a protocol mismatch) is written once and retried in-process: every 60 s

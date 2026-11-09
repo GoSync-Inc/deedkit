@@ -91,6 +91,8 @@ def test_the_rendered_holder_overlay_passes_the_session_locks_check_and_the_coll
         assert {'/sessions', p.SESSION_LOCKS, '/run/deedkit/holder', '/run/secrets/holder_dsn'} <= targets
         assert p.grace_seconds(holder['stop_grace_period']) >= p.SESSION_GRACE_S
         assert holder['user'] == '10001:10001' and holder['read_only'] is True and holder['cap_drop'] == ['ALL']
+        # A read-only root: SQLite's temporary files go to a private tmpfs /tmp, as in the collector (child mode).
+        assert holder['tmpfs'] == ['/tmp:size=256m,noexec,nosuid'] == collector['tmpfs']
         mounted = p.binds(collector)
         assert not any(os.path.basename(source).endswith('-session') for source, _ in mounted)
         assert all(target != p.SESSION_LOCKS for _, target in mounted)
