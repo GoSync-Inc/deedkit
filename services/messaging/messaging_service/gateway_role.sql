@@ -141,3 +141,5 @@ GRANT SELECT ON attachment_structure,structure_profiles TO messaging_gateway;
 GRANT SELECT ON session_claims TO messaging_gateway;
 -- Schema 83 (ANYM-921): message reads show a poll's counts and who chose which option; read only.
 GRANT SELECT ON poll_results,poll_voters TO messaging_gateway;
+-- Schema 84 (ANYM-920): message reads show a Telegram poll's total, the owner's choice and voter names; read only.
+GRANT SELECT ON telegram_polls TO messaging_gateway;

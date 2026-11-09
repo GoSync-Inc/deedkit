@@ -1825,6 +1825,9 @@ one `poll.updated` event on the poll message in the same transaction. A vote tha
 choice again, a replay, an older vote) commits none. The item is the poll message; read its `poll` block with
 `get_context`. Matching follows the `message.created` rules, but only a subscription whose `kinds` names
 `poll.updated` receives it: default subscriptions are never woken by votes. `get_updates` does not return it.
+A Telegram poll (ANYM-920) commits the same event when Telegram's pushed or captured counts change an option's
+count or the poll's total; an older or unchanged observation, a voter-list read and the poll's first capture
+commit none.
 
 ## A download that failed for good (ANYM-867)
 

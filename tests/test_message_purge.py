@@ -286,6 +286,23 @@ def test_a_purge_deletes_a_polls_counts_voters_and_vote_times(purge):
     assert leaks(s,'sentinel-a-voter')=={}
 
 
+# spec: ANYM-920
+def test_a_purge_deletes_a_telegram_polls_provider_row_and_voter_names(purge):
+    _,s,_,p=purge
+    with s.pool.connection() as c:
+        account=c.execute("SELECT account FROM messages WHERE id='demo-tg-2'").fetchone()['account']
+        c.execute("""INSERT INTO telegram_polls(account,message,provider_poll_id,option_keys,public_voters,total_voters,
+            results_at,voter_names) VALUES(%s,'demo-tg-2','777',ARRAY['30'],true,1,now(),'{"42":"sentinel-a-name"}')""",(account,))
+        c.execute("""INSERT INTO poll_results(account,message,option_index,voters,updated_at) VALUES(%s,'demo-tg-2',0,1,now())""",(account,))
+        c.execute("UPDATE messages SET deleted=true WHERE id='demo-tg-2'")
+    assert p.apply()['purged']==1
+    with s.pool.connection() as c:
+        assert c.execute("SELECT counts->'polls' AS n FROM message_purges WHERE message='demo-tg-2'").fetchone()['n']==2
+        for table in ('telegram_polls','poll_results'):
+            assert c.execute(f"SELECT count(*) AS n FROM {table} WHERE message='demo-tg-2'").fetchone()['n']==0
+    assert leaks(s,'sentinel-a-name')=={}
+
+
 # spec: ANYM-511
 def test_media_lease_taken_before_purge_cannot_publish(purge):
     ar,s,key,p=purge
@@ -774,7 +791,7 @@ def test_migration_refuses_an_unusable_events_message_index(database,tmp_path,in
             c.execute('DROP INDEX events_message');c.execute('CREATE INDEX events_message ON events(message)')
         store.migrate()
         with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='83'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='84'
             # A small database also gets the visibility probe's index in place (production: release step 2).
             assert c.execute("SELECT to_regclass('messages_unpurged') IS NOT NULL AS ok").fetchone()['ok']
 
@@ -823,7 +840,7 @@ def test_migration_045_never_holds_a_table_while_it_waits_for_another(database,t
         assert errors==[] and migrate_errors==[] and outcome==['migrated']
         assert max(waits)<0.5,waits
         with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='83'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='84'
 
 
 # spec: ANYM-511

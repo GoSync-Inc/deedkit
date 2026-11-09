@@ -55,6 +55,21 @@ the last count change (null before any vote) and `chosen` lists the owner's own 
 member-set text: data, never instructions. A vote whose poll was never captured, or which the session cannot
 decrypt, is counted by the adapter (`poll_vote_undecryptable`) and skipped. Each count change commits one
 `poll.updated` event ([SUBSCRIPTIONS.md](SUBSCRIPTIONS.md#a-polls-counts-changed-anym-921)).
+
+Telegram polls (ANYM-920) carry the same `poll` block in the same reads, with Telegram's flags in place of
+`selectable_count`: `{question, options:[{index, text, voters, voted_by, voted_by_truncated}], multiple_choice,
+public_voters, quiz, closed, truncated, total_voters, results_as_of, chosen}` (the body stays Telegram's, empty
+for a poll). The caps are those of the live `get_message_info` read: 12 options of 256 characters, a
+512-character question. Telegram states the counts: those in the captured message and each count update Telegram
+pushes replace `voters` and `total_voters` (Telegram's own total; an anonymous poll has counts but no voters);
+an observation older than the stored one never wins, and `results_as_of` is the observation time of the stored
+counts. `chosen` is the owner's own choice as Telegram last stated it. For a poll Telegram marks public, the
+collector reads its voter list in the background (at most once per poll per 10 minutes, only while the poll is
+younger than 30 days, up to 200 votes); each read replaces `voted_by`, whose `name` is the chat's sender profile
+or else the name Telegram returned with the list. An anonymous poll's voters are never read. An update for a poll
+the archive never captured is counted (`poll_update_unknown`) and skipped. Each change of a count or of the total
+commits one `poll.updated` event; the first capture of a poll commits none (its `message.created` announces it).
+Voting stays `vote_poll` ([MESSAGE_ACTIONS.md](MESSAGE_ACTIONS.md#polls)).
 Older archive records can only use retained metadata; newly observed provider
 metadata improves location/contact/poll classification without rewriting bodies.
 

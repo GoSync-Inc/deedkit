@@ -34,3 +34,5 @@ GRANT SELECT,UPDATE(state) ON attachment_residency TO messaging_purge;
 GRANT INSERT(actor,operation,outcome,resource_ids) ON audit_log TO messaging_purge;
 -- Schema 83 (ANYM-921): a purged poll's results, voters and vote times are deleted.
 GRANT SELECT,DELETE ON poll_results,poll_voters,poll_votes TO messaging_purge;
+-- Schema 84 (ANYM-920): a purged Telegram poll's provider row is deleted.
+GRANT SELECT,DELETE ON telegram_polls TO messaging_purge;

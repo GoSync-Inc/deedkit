@@ -205,9 +205,9 @@ class Purger:
                 ON t.provider_chat=l.provider_chat AND t.provider_id=l.provider_id
             WHERE l.account=%s AND r.digest=l.digest''',(chats,provider_ids,account))
         counts['metadata']=n('DELETE FROM message_metadata WHERE message=ANY(%s)',(ids,))
-        # A purged poll's counts, voters and vote times (ANYM-921).
+        # A purged poll's counts, voters and vote times (ANYM-921) and its Telegram provider row (ANYM-920).
         counts['polls']=sum(n(sql.SQL('DELETE FROM {} WHERE message=ANY(%s)').format(sql.Identifier(t)),(ids,))
-            for t in ('poll_results','poll_voters','poll_votes'))
+            for t in ('poll_results','poll_voters','poll_votes','telegram_polls'))
         # Review results lose their reference text (an exception to ANYM-20's append-only rows).
         counts['reviews']=n("UPDATE reviews SET result_ref='[deleted]' WHERE message=ANY(%s) AND result_ref<>'[deleted]'",(ids,))
         # A send is this message by its verified wire reference (native WhatsApp may archive a LID chat

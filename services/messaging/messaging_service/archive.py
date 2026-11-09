@@ -396,14 +396,20 @@ class Archive:
         if not row: raise RuntimeError('collector_lease_lost')
 
     def ingest(self,raw,*,lease=None,identity_observations=(),replay=False):
-        e=validate(raw)
+        # ANYM-920: a Telegram poll's counts ride beside the message, outside its receipt, revision and metadata.
+        from .polls import apply_capture_results,split_capture_results
+        e,poll_results=split_capture_results(validate(raw))
         # ANYM-839: an envelope with no media whose stored message has no attachment rows never touches an original,
         # so it skips the global residency lock. Otherwise (media, or attachment rows to flip) it rolls back and
         # runs lifecycle lock first; the residency trigger fires on finish_media's insert, never here.
+        result=None
         if not e['media']:
-            try:return self._ingest(e,lease,identity_observations,replay,lifecycle=False)
+            try:result=self._ingest(e,lease,identity_observations,replay,lifecycle=False)
             except _LifecycleFirst:pass
-        return self._ingest(e,lease,identity_observations,replay,lifecycle=True)
+        if result is None:result=self._ingest(e,lease,identity_observations,replay,lifecycle=True)
+        if poll_results is not None and result.get('message'):
+            apply_capture_results(self.store,e,result['message'],poll_results,lease)
+        return result
 
     def _ingest(self,e,lease,identity_observations,replay,*,lifecycle):
         captured=e; receipt=hashlib.sha256(canonical(e)).hexdigest()

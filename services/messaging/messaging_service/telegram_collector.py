@@ -31,6 +31,7 @@ from .spool import DurableSpool,InvalidCapture,KeepItem,PoisonItem
 from .collector_common import DbBackoff,commit_items,validate_common,validate_ranges
 from .store import Store
 from . import session_claim
+from .telegram_polls import PollCollector,PollProvider
 from .telegram_governor import BACKGROUND,LIVE_BUDGETS,LIVE_MEDIA,LIVE_STATE,ProviderRateLimited,RequestGovernor
 from .operational import CONNECTION_ERRORS,MEDIA_ERRORS,collector_stop
 from .storage_admission import MEDIA_RESERVE_BYTES
@@ -219,7 +220,7 @@ def peer_kind(message):
     raise ValueError('unsupported_telegram_peer')
 
 
-class TelethonProvider:
+class TelethonProvider(PollProvider):
     supports_receipts=True
     supports_owner_reads=True
     supports_group_receipts=True
@@ -722,7 +723,7 @@ def chat_error_evidence(error):
     return evidence
 
 
-class TelegramCollector:
+class TelegramCollector(PollCollector):
     state_class=CollectorState
     head_pages=HEAD_PAGES_PER_PASS
     _tops_trusted=True  # this pass may skip head pages by the catalog's tops (not after a failed discovery)
@@ -1417,6 +1418,8 @@ class TelegramCollector:
             elif getattr(self.provider,'supports_receipts',False) is True:
                 self.provider.subscribe(self.capture,self.deleted,self.receipt)
             else:self.provider.subscribe(self.capture,self.deleted)
+            polls=hasattr(self.provider,'subscribe_polls') and hasattr(self.provider,'poll_votes')  # ANYM-920
+            if polls:self.provider.subscribe_polls(self.poll_update)
             # Renew ownership and honor shutdown during a slow network connect.
             tasks=[asyncio.create_task(self.heartbeat()),asyncio.create_task(self.stopping.wait())]
             if self.session_claim is not None:
@@ -1431,7 +1434,7 @@ class TelegramCollector:
             tasks.remove(connecting)
             tasks.extend(asyncio.create_task(coro) for coro in
                 [self.drain_loop(),self.reconcile_loop(),self.media_loop(),self.outgoing_loop(),
-                 self.provider.wait_disconnected(),self.failed.wait()])
+                 self.provider.wait_disconnected(),self.failed.wait(),*([self.poll_voters_loop()] if polls else [])])
             done,_=await asyncio.wait(tasks,return_when=asyncio.FIRST_COMPLETED)
             for task in done: task.result()
             if self.failed.is_set():
