@@ -140,6 +140,31 @@ def test_ticket_revocation_is_checked_without_a_gateway_bearer_header(tmp_path):
     assert len(requests) == 1
 
 
+# spec: ANYM-206
+@pytest.mark.parametrize("method", ["POST", "PUT"])
+def test_keyless_ticket_path_refuses_a_body_before_reading_it(tmp_path, method):
+    app, _, _, requests = setup(tmp_path)
+    sent, reads = [], []
+
+    async def receive():
+        reads.append(method)
+        await asyncio.Event().wait()
+
+    async def send(message):
+        sent.append(message)
+
+    path = "/v1/files/" + "a" * 43
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": method,
+             "scheme": "http", "path": path, "raw_path": path.encode(), "root_path": "", "query_string": b"",
+             "client": ("203.0.113.9", 1234), "server": ("testserver", 80),
+             "headers": [(b"host", b"testserver"), (b"content-length", b"1024")]}
+    # A slow body from anyone on the internet must not hold the request for the 10 s body deadline.
+    asyncio.run(asyncio.wait_for(app(scope, receive, send), 2))
+    assert reads == [] and requests == []
+    assert sent[0]["status"] == 405
+    assert json.loads(sent[1]["body"]) == {"error": "method_not_allowed"}
+
+
 def test_expired_ticket_and_range_do_not_contact_backend(tmp_path):
     app, _, _, requests = setup(tmp_path)
     with TestClient(app) as client:

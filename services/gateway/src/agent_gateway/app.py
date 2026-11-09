@@ -365,6 +365,9 @@ def create_app(policy_path, public_url, *, transports=None):
                     raise Denied("invalid_origin", 403)
                 if request.url.path == "/healthz" and request.method == "GET":
                     return await app(scope, receive, protected_send)
+                if request.url.path.startswith("/v1/files/") and request.method not in ("GET", "HEAD"):
+                    # A ticket path takes no key, so it never reads a body: a slow one held a slot for anyone.
+                    raise Denied("method_not_allowed", 405)
                 key = ""
                 if not request.url.path.startswith("/v1/files/"):
                     auth = request.headers.get("authorization", "")

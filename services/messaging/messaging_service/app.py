@@ -190,6 +190,11 @@ SECURITY_HEADERS = {'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer
 
 
 PEER_PER_MINUTE = 600
+# A key that authenticated this long ago or less is never refused on its peer's budget (audit 11-09: every
+# caller behind the release router shares one peer address, so rejected traffic from anyone locked out all of
+# them). It is still authenticated on every request; a 401 drops it at once.
+KNOWN_KEY_SECONDS = 600
+KNOWN_KEY_LIMIT = 4096
 # Per authenticated principal. The gateway runs a capabilities pre-check before
 # every call and a 32 MiB upload is 128 chunks; separate budgets keep neither
 # from halving or exhausting the general one.
@@ -271,6 +276,7 @@ class Boundary:
         url = urlsplit(store.public_url)
         self.origins = {f'{url.scheme}://{url.netloc}'}
         self.buckets = OrderedDict()
+        self.known = OrderedDict()
         self.models=models or {}
 
     def allow(self, key, maximum, cost=1):
@@ -280,6 +286,15 @@ class Boundary:
         self.buckets[key] = (count+cost,start)
         if len(self.buckets)>4096: self.buckets.popitem(last=False)
         return count<maximum
+
+    def recently_authenticated(self, value):
+        until = self.known.get(digest(value)) if value else None
+        return until is not None and time.monotonic() < until
+
+    def remember(self, value):
+        self.known.pop(digest(value), None)
+        self.known[digest(value)] = time.monotonic()+KNOWN_KEY_SECONDS
+        while len(self.known)>KNOWN_KEY_LIMIT: self.known.popitem(last=False)
 
     def charge(self, principal, name):
         if not self.allow(name+':'+principal,PRINCIPAL_PER_MINUTE[name]):
@@ -321,14 +336,22 @@ class Boundary:
             # requests are charged to their principal instead, because every
             # agent behind one gateway shares its peer address.
             download=request.url.path.startswith('/v1/download/')
-            if not self.allow('peer:'+peer,PEER_PER_MINUTE,cost=1 if download else 0):
+            if download and request.method not in ('GET','HEAD'):
+                # A grant path takes no key, so it never reads a body: a slow one held a slot for anyone.
+                raise APIError('method_not_allowed',405)
+            credential='' if download else request.headers.get('authorization','')
+            if (not self.recently_authenticated(credential)
+                    and not self.allow('peer:'+peer,PEER_PER_MINUTE,cost=1 if download else 0)):
                 raise APIError('rate_limited',429)
             principal=None
             if not download:
                 try:principal=await run_in_threadpool(self.store.authenticate,bearer(request.headers))
                 except APIError as error:
-                    if error.status==401:self.allow('peer:'+peer,PEER_PER_MINUTE)
+                    if error.status==401:
+                        self.known.pop(digest(credential),None)
+                        self.allow('peer:'+peer,PEER_PER_MINUTE)
                     raise
+                self.remember(credential)
                 if request.method!='POST':self.charge(principal,'principal')
             if request.method=='GET' and request.url.path.rstrip('/')=='/mcp':
                 # Optional SSE requires a connection that can deliver server
