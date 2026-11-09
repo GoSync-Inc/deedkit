@@ -162,7 +162,7 @@ def attachment_fields(row, *, original_present=None):
             recognition_next_action='request_file_download')
     if (registered and row.get('description_reason') and enrichment=='available_on_request'
             and 'recognition_reason' not in item):
-        # Owner 11-09: an old image or a sticker is described when an agent asks (media_policy.DESCRIPTION_SKIPPED).
+        # Owner 11-09: an old image, a sticker or non-voice group audio waits for an agent's request (media_policy.DESCRIPTION_SKIPPED).
         # The same two fields as ANYM-805, whose reason wins; this one sets no retention (row recognition_reason).
         item.update(recognition_reason=row['description_reason'],recognition_next_action='request_file_download')
     if registered and row.get('recognition_reason'):

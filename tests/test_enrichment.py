@@ -667,6 +667,95 @@ def test_an_old_image_in_an_unsubscribed_group_keeps_the_group_reason(seeded,tmp
     assert item['enrichment_status']=='available_on_request' and item['recognition_reason']=='group_chat_on_request'
 
 
+def chat_audio(s,chat_type,media_kind,*,subscribed=True):
+    """A new stored audio file with its media job (no request yet) whose message names media_kind, in a chat of the given
+    kind; a group or channel is named by an active subscription unless told otherwise, so ANYM-805 does not withhold it."""
+    add_audio(s)
+    with s.pool.connection() as c:
+        c.execute('''INSERT INTO media_jobs(id,account,message,descriptor,state)
+            VALUES('enrich-audio','telegram-demo','demo-tg-2','{}'::jsonb,'ready')''')
+        chat=c.execute('''UPDATE chats SET chat_type=%s FROM messages m WHERE m.id='demo-tg-2' AND chats.id=m.chat
+            RETURNING chats.id''',(chat_type,)).fetchone()['id']
+        c.execute("UPDATE messages SET sent_at=clock_timestamp() WHERE id='demo-tg-2'")
+        if media_kind:
+            c.execute('''INSERT INTO message_metadata(message,revision,metadata)
+                SELECT id,revision,jsonb_build_object('media_kind',%s::text) FROM messages WHERE id='demo-tg-2'
+                ON CONFLICT DO NOTHING''',(media_kind,))
+            c.execute("UPDATE message_metadata SET metadata=metadata||jsonb_build_object('media_kind',%s::text) WHERE message='demo-tg-2'",
+                (media_kind,))
+        c.execute('TRUNCATE enrichment_budget')
+    if subscribed and chat_type in ('group','channel'):
+        token=s.issue_key('audio-watcher',['telegram-demo'],permissions=['read','subscription-write'],
+            key_permissions=['read','subscription-write'])
+        s.create_subscription(token,[chat])
+
+
+def published_audio_profile(s):
+    with s.pool.connection() as c:
+        c.execute('''INSERT INTO processing_profiles(account,kind,provider,model,enabled,expires_at)
+            VALUES('telegram-demo','audio','openai','synthetic',true,clock_timestamp()+interval '1 hour')
+            ON CONFLICT(account,kind) DO UPDATE SET enabled=true''')
+
+
+def audio_untouched(s):
+    with s.pool.connection() as c:
+        row=c.execute("SELECT state,attempts,updated_at FROM attachment_enrichment WHERE attachment='enrich-audio'").fetchone()
+        spent=c.execute('''SELECT (SELECT coalesce(sum(attempts),0) FROM enrichment_budget)+
+            (SELECT coalesce(sum(attempts),0) FROM processing_budget) AS n''').fetchone()['n']
+    return row,spent
+
+
+def asked_and_transcribed(s,key,w):
+    item=s.get_attachment(key,'enrich-audio')
+    assert item['enrichment_status']=='available_on_request'
+    assert item['recognition_reason']=='audio_not_a_voice_note' and item['recognition_next_action']=='request_file_download'
+    result=s.request_file_download(key,'enrich-audio')
+    assert result['request_status']=='ready' and result['recognition_request']=='requested'
+    assert result['enrichment_status']=='queued' and 'recognition_reason' not in result
+    row,_=w.claim();assert row['attachment']=='enrich-audio' and row['fresh']
+
+
+# spec: ANYM-890
+@pytest.mark.parametrize('chat_type',['group','channel'])
+def test_music_in_a_group_is_transcribed_only_after_an_agent_asks(seeded,tmp_path,chat_type):
+    s,key,_=seeded;chat_audio(s,chat_type,'audio');published_audio_profile(s);w=worker(s,tmp_path)
+    before=audio_untouched(s)
+    assert w.claim() is None
+    assert audio_untouched(s)==before and before[1]==0  # skipped, never changed: no lease, attempt, budget or failure
+    asked_and_transcribed(s,key,w)
+
+
+# spec: ANYM-890
+def test_audio_sent_as_a_file_in_a_group_waits_for_a_request(seeded,tmp_path):
+    s,key,_=seeded;chat_audio(s,'group','document');published_audio_profile(s);w=worker(s,tmp_path)
+    assert w.claim() is None
+    asked_and_transcribed(s,key,w)
+
+
+# spec: ANYM-890
+@pytest.mark.parametrize('chat_type',['group','channel','private'])
+def test_a_voice_note_in_a_group_is_transcribed_by_itself(seeded,tmp_path,chat_type):
+    s,key,_=seeded;chat_audio(s,chat_type,'voice');w=worker(s,tmp_path)
+    row,_=w.claim();assert row['attachment']=='enrich-audio'
+    assert 'recognition_reason' not in s.get_attachment(key,'enrich-audio')
+
+
+# spec: ANYM-890
+@pytest.mark.parametrize('chat_type,media_kind',[('private','audio'),(None,'audio'),('group',None)])
+def test_music_in_a_personal_chat_is_transcribed_by_itself(seeded,tmp_path,chat_type,media_kind):
+    """A personal chat, a chat of unknown kind, and audio whose message names no media kind keep automatic work."""
+    s,key,_=seeded;chat_audio(s,chat_type,media_kind);w=worker(s,tmp_path)
+    row,_=w.claim();assert row['attachment']=='enrich-audio'
+    assert 'recognition_reason' not in s.get_attachment(key,'enrich-audio')
+
+
+# spec: ANYM-890
+def test_music_in_an_unsubscribed_group_keeps_the_group_reason(seeded,tmp_path):
+    s,key,_=seeded;chat_audio(s,'group','audio',subscribed=False);published_audio_profile(s)
+    item=s.get_attachment(key,'enrich-audio')
+    assert item['enrichment_status']=='available_on_request' and item['recognition_reason']=='group_chat_on_request'
+
+
 def test_enrichment_budget_fencing_and_deletion(seeded,tmp_path):
     s,_,_=seeded;add_audio(s);w=worker(s,tmp_path,1)
     with s.pool.connection() as c:c.execute('TRUNCATE enrichment_budget')
