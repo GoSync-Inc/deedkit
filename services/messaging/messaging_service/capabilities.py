@@ -187,7 +187,7 @@ def capabilities(self, token, detail='full', sections=None):
                     'labels':['platform','metric'],'scope':'current_scope_version_only','retention_days':35,
                     'metrics':['scanned','matched','left_out_kind','left_out_origin','left_out_chat_type',
                         'left_out_channel','left_out_bot','left_out_direction','left_out_sender','left_out_wake_rule',
-                        'match_budget_blocked','matched_failure'],
+                        'match_budget_blocked','matched_failure','reads_compact'],
                     'counts_model_runs':False,'cost_estimate':False},
                 'event_selection':'structural_exact_revision','origin_default':'live',
                 'mutation_permission':'subscription-write','read_permission_required':True,

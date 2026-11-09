@@ -753,7 +753,8 @@
     "left_out_sender",
     "left_out_wake_rule",
     "match_budget_blocked",
-    "matched_failure"
+    "matched_failure",
+    "reads_compact"
    ],
    "operation": "get_subscription",
    "retention_days": 35,

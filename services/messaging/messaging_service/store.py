@@ -1153,18 +1153,47 @@ class Store:
 
     def get_subscription_events(self, token, subscription_id, *, after=0, limit=50, module_after=None, detail=None,
                                 include=None):
-        from .subscription_consumption import page_detail, project_page
+        from .subscription_consumption import COMPACT_READS, page_detail, project_page
         from .subscriptions import get_subscription_events
         view = page_detail(detail, include)
         with self.authorized(token, 'get_subscription_events') as (c, p):
-            return project_page(get_subscription_events(self, c, p, subscription_id, after=after, limit=limit,
-                module_after=module_after), *view)
+            page = get_subscription_events(self, c, p, subscription_id, after=after, limit=limit,
+                module_after=module_after)
+            scope = p['scope_version']
+        if view[0] == 'compact':
+            # ANYM-826: counted after the read committed, off the request path (never delays or fails it).
+            COMPACT_READS.submit(self, token, page['subscription']['subscription_id'], scope)
+        return project_page(page, *view)
 
     def fetch_subscription_events(self, token, subscription_id, *, limit=50, detail=None, include=None):
-        from .subscription_consumption import fetch_subscription_events, page_detail, project_page
+        from .subscription_consumption import COMPACT_READS, READ_SCOPE, fetch_subscription_events, page_detail, project_page
         view = page_detail(detail, include)
         with self.authorized(token, 'fetch_subscription_events') as (c, p):
-            return project_page(fetch_subscription_events(self, c, p, subscription_id, limit=limit), *view)
+            page = fetch_subscription_events(self, c, p, subscription_id, limit=limit)
+            scope = p['scope_version']
+        # The scope this read used, for wait_for_subscription_events' poll in this thread (its count, ANYM-826).
+        READ_SCOPE.version = scope
+        if view[0] == 'compact':
+            # ANYM-826: counted after the read and its receipt committed, off the request path.
+            COMPACT_READS.submit(self, token, page['subscription']['subscription_id'], scope)
+        return project_page(page, *view)
+
+    def count_compact_read(self, token, subscription_id, scope_version):
+        """ANYM-826: the counter worker's job for one compact page the key read under `scope_version`
+        (subscription_consumption COMPACT_READS): its own short transaction, the key's own subscription only, and
+        only while the key's scope is the one the read used (a count never moves to a later scope, ANYM-824).
+        A failure is logged and dropped."""
+        from .subscriptions import _subscription_id, record_compact_read
+        def resolve(c):
+            # Before the identity's principal lock: a held lock, row or slow statement drops this count fast.
+            c.execute("SET LOCAL lock_timeout='100ms'")
+            c.execute("SET LOCAL statement_timeout='500ms'")
+            return self.identity(c, token)
+        # No operation: the read it counts was authorized and audited already; this adds no second audit row.
+        with self.access(None, resolve) as (c, p):
+            if p['scope_version'] == scope_version and 'read' in p['permissions'] and c.execute('SELECT 1 FROM subscriptions WHERE id=%s AND principal=%s AND key_id=%s',
+                    (_subscription_id(subscription_id), p['id'], p['key_id'])).fetchone():
+                record_compact_read(c, p, subscription_id)
 
     def ack_subscription_events(self, token, subscription_id, receipt, version):
         from .subscription_consumption import ack_subscription_events

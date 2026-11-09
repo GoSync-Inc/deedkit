@@ -2,6 +2,7 @@
 from __future__ import annotations
 import asyncio
 import hashlib
+import json
 import secrets
 import time
 import threading
@@ -26,12 +27,15 @@ class _Admission:
         self.reading = False
 
     def read(self, store, token, subscription_id, limit):
+        """(page, the scope version it was read under)."""
         with self.lock:
             if self.closed:
                 return None
             self.reading = True
         try:
-            return store.fetch_subscription_events(token, subscription_id, limit=limit)
+            READ_SCOPE.version = None
+            page = store.fetch_subscription_events(token, subscription_id, limit=limit)
+            return page, READ_SCOPE.version
         finally:
             with self.lock:
                 self.reading = False
@@ -267,36 +271,102 @@ async def wait_for_subscription_events(store, token, subscription_id, *, timeout
         raise APIError('invalid_parameters')
     view = page_detail(detail, include)
     # Polls read full pages (the loop reads the subscription state); only the returned page is projected.
-    return project_page(await _wait(store, token, subscription_id, timeout, limit), *view)
+    page, scope = await _wait(store, token, subscription_id, timeout, limit)
+    if view[0] == 'compact' and scope is not None:
+        # ANYM-826: one count per returned page, not per poll; submitting never blocks or awaits.
+        COMPACT_READS.submit(store, token, page['subscription']['subscription_id'], scope)
+    return project_page(page, *view)
+
+
+class _CompactReads:
+    """ANYM-826: `reads_compact` counts, written after the read returned by one worker thread in its own short
+    transaction (Store.count_compact_read), so a held counter row, a timeout or a terminated session never delays
+    or fails a read, a receipt or an ACK. At most SLOTS counts are queued or running; a count beyond them is
+    skipped (`skipped`), never waited for. The counter uses at most one pooled connection at a time."""
+    SLOTS = 4
+
+    def __init__(self):
+        self.slots = threading.BoundedSemaphore(self.SLOTS)
+        self.lock = threading.Lock()
+        self.executor = None
+        self.pending = set()
+        self.skipped = 0
+
+    def submit(self, store, token, subscription_id, scope_version):
+        if not self.slots.acquire(blocking=False):
+            with self.lock:
+                self.skipped += 1
+            return False
+        try:
+            with self.lock:
+                if self.executor is None:
+                    from concurrent.futures import ThreadPoolExecutor
+                    self.executor = ThreadPoolExecutor(1, thread_name_prefix='reads-compact')
+                future = self.executor.submit(_count_compact_read, store, token, subscription_id, scope_version)
+                self.pending.add(future)
+        except Exception:
+            # An interpreter shutting down refuses new work: the count is dropped.
+            self.slots.release()
+            return False
+        future.add_done_callback(self._finished)
+        return True
+
+    def _finished(self, future):
+        with self.lock:
+            self.pending.discard(future)
+        self.slots.release()
+
+    def drain(self, timeout=10):
+        """Tests: wait for the counts already submitted."""
+        from concurrent.futures import wait
+        with self.lock:
+            pending = list(self.pending)
+        wait(pending, timeout)
+
+
+def _count_compact_read(store, token, subscription_id, scope_version):
+    try:
+        store.count_compact_read(token, subscription_id, scope_version)
+    except Exception as error:
+        # Includes a revoked key or a lost connection: only this count is lost.
+        print(json.dumps({'error': 'subscription_activity_failed',
+            'code': getattr(error, 'code', None) or type(error).__name__}), flush=True)
+
+
+COMPACT_READS = _CompactReads()
+# ANYM-826: Store.fetch_subscription_events leaves the scope version of its read here for the wait poll that
+# called it in the same thread; another store leaves none, and its page is not counted.
+READ_SCOPE = threading.local()
 
 
 async def _wait(store, token, subscription_id, timeout, limit):
+    """(page, the scope version the returned page was read under)."""
     from .store import APIError
     admission = _Admission()
     deadline = time.monotonic() + (timeout or _IMMEDIATE_READ_TIMEOUT_S)
-    latest = None
+    latest = scope = None
     try:
         while True:
             remaining = deadline - time.monotonic()
             if timeout and remaining <= 0:
                 if latest is None:
                     raise APIError('subscription_wait_timeout', 503)
-                return {**latest, 'wait_status': 'timeout'}
+                return {**latest, 'wait_status': 'timeout'}, scope
             poll = asyncio.create_task(asyncio.to_thread(admission.read, store, token, subscription_id, limit))
             poll.add_done_callback(_consume_result)
             try:
-                latest = await asyncio.wait_for(asyncio.shield(poll), remaining)
+                latest, scope = await asyncio.wait_for(asyncio.shield(poll), remaining)
             except TimeoutError:
                 if latest is None:
                     raise APIError('subscription_wait_timeout', 503) from None
-                return {**latest, 'wait_status': 'timeout'}
+                return {**latest, 'wait_status': 'timeout'}, scope
             if latest['items'] or (latest.get('module') or {}).get('items'):
-                return {**latest, 'wait_status': 'events_available'}
+                return {**latest, 'wait_status': 'events_available'}, scope
             if latest.get('subscription', {}).get('state') != 'active':
-                return {**latest, 'wait_status': 'subscription_inactive'}
+                return {**latest, 'wait_status': 'subscription_inactive'}, scope
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not timeout:
-                return {**latest, 'wait_status': 'timeout'}
+                return {**latest, 'wait_status': 'timeout'}, scope
             await asyncio.sleep(min(0.25, remaining))
     finally:
         admission.close()

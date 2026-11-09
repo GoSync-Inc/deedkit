@@ -1633,10 +1633,11 @@ of the last 7 UTC days, oldest first, per platform (the account's provider name,
 | `left_out_<reason>` | Scanned events the FIRST rejecting rule left out, in the matcher's order: `kind`, `origin`, `chat_type` (`sources.chat_types`), `channel`, `bot`, `direction` (also when the event carries no direction), `sender` (also without a sender), `wake_rule` |
 | `match_budget_blocked` | Passes that stopped at `SUBSCRIPTION_MAX_MATCHES`; the event that hit the budget is not scanned yet |
 | `matched_failure` | `send.failed` and `source.health` events that matched by their own audience rule; never in `scanned` |
+| `reads_compact` | Platform `all`: pages read with `detail='compact'` (`get_subscription_events`, `fetch_subscription_events`, and each page `wait_for_subscription_events` returns, not each poll); not part of `scanned`. A failed count never fails the read |
 
 So `scanned = matched + Σ left_out_*` per day and platform. A zero metric and a day without
 counts are omitted; `list_subscriptions` carries no `activity`. Later reasons use the same names
-(`left_out_excluded_chat`, ANYM-830; `reads_compact` with platform `all`, ANYM-826).
+(`left_out_excluded_chat`, ANYM-830).
 
 What the numbers mean: `matched` counts references kept, not model runs. The server counts the
 hints it stages and delivers (`delivery.hint_counts`, unchanged) but cannot see whether the
