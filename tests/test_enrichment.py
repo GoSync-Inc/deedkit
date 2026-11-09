@@ -11,7 +11,7 @@ import pytest
 
 from messaging_service.enrichment import EnrichmentWorker, verified_copy
 from messaging_service.enrichment_providers import (ModelBackpressure, ModelError, PROMPT, PROMPT_RU, infer,
-    normalize_result, validate_profile)
+    normalize_result, profile_hash, validate_profile)
 from messaging_service.envelope import fingerprint,validate
 from test_archive import archive as archive,event
 
@@ -504,6 +504,8 @@ def chat_image(s,chat_type):
         c.execute('''INSERT INTO media_jobs(id,account,message,descriptor,state)
             VALUES('enrich-image','telegram-demo','demo-tg-2','{}'::jsonb,'ready')''')
         c.execute("UPDATE chats SET chat_type=%s FROM messages m WHERE m.id='demo-tg-2' AND chats.id=m.chat",(chat_type,))
+        # A new photo: an old one waits for a request in any chat (ANYM-887).
+        c.execute("UPDATE messages SET sent_at=clock_timestamp() WHERE id='demo-tg-2'")
         c.execute('TRUNCATE enrichment_budget')
 
 
@@ -558,6 +560,111 @@ def test_an_original_without_a_media_job_is_never_withheld(seeded,tmp_path):
         c.execute("UPDATE chats SET chat_type='group' FROM messages m WHERE m.id='demo-tg-2' AND chats.id=m.chat")
         c.execute('TRUNCATE enrichment_budget')
     row,_=w.claim();assert row['attachment']=='enrich-image'
+
+
+def untouched(s):
+    with s.pool.connection() as c:
+        row=c.execute("SELECT state,attempts,updated_at FROM attachment_enrichment WHERE attachment='enrich-image'").fetchone()
+        spent=c.execute('''SELECT (SELECT coalesce(sum(attempts),0) FROM enrichment_budget)+
+            (SELECT coalesce(sum(attempts),0) FROM processing_budget) AS n''').fetchone()['n']
+    return row,spent
+
+
+def published_image_profile(s):
+    with s.pool.connection() as c:
+        c.execute('''INSERT INTO processing_profiles(account,kind,provider,model,enabled,expires_at)
+            VALUES('telegram-demo','image','openai','synthetic',true,clock_timestamp()+interval '1 hour')
+            ON CONFLICT(account,kind) DO UPDATE SET enabled=true''')
+
+
+def asked_and_described(s,key,w,reason):
+    """The status reads as waiting for a request; the request queues it and the worker then claims it as fresh."""
+    item=s.get_attachment(key,'enrich-image')
+    assert item['enrichment_status']=='available_on_request'
+    assert item['recognition_reason']==reason and item['recognition_next_action']=='request_file_download'
+    assert item['extraction_status']!='available_on_request'  # description only: text extraction keeps its state
+    assert 'original_retention_hours' not in item  # no ANYM-806 retention in a personal chat
+    result=s.request_file_download(key,'enrich-image')
+    assert result['request_status']=='ready' and result['recognition_request']=='requested'
+    assert result['enrichment_status']=='queued' and 'recognition_reason' not in result
+    row,_=w.claim();assert row['attachment']=='enrich-image' and row['fresh']
+
+
+# spec: ANYM-887
+def test_an_old_image_is_described_only_after_an_agent_asks(seeded,tmp_path):
+    s,key,_=seeded;chat_image(s,'private');w=image_worker(s,tmp_path);published_image_profile(s)
+    with s.pool.connection() as c:c.execute("UPDATE messages SET sent_at=clock_timestamp()-interval '8 days' WHERE id='demo-tg-2'")
+    before=untouched(s)
+    assert w.claim() is None and not w.due()
+    assert untouched(s)==before and before[1]==0  # skipped, never changed: no lease, attempt, budget or failure
+    asked_and_described(s,key,w,'image_outside_description_window')
+
+
+# spec: ANYM-887
+def test_a_sticker_is_described_only_after_an_agent_asks(seeded,tmp_path):
+    s,key,_=seeded;chat_image(s,'private');w=image_worker(s,tmp_path);published_image_profile(s)
+    with s.pool.connection() as c:
+        c.execute('''INSERT INTO message_metadata(message,revision,metadata)
+            SELECT id,revision,'{"media_kind":"sticker"}'::jsonb FROM messages WHERE id='demo-tg-2'
+            ON CONFLICT DO NOTHING''')
+        c.execute('''UPDATE message_metadata SET metadata=metadata||'{"media_kind":"sticker"}'::jsonb
+            WHERE message=%s''',('demo-tg-2',))
+    assert w.claim() is None
+    asked_and_described(s,key,w,'sticker')
+
+
+# spec: ANYM-887
+def test_a_new_photo_is_described_by_itself(seeded,tmp_path):
+    s,key,_=seeded;chat_image(s,'private');w=image_worker(s,tmp_path)
+    with s.pool.connection() as c:c.execute("UPDATE messages SET sent_at=clock_timestamp()-interval '6 days' WHERE id='demo-tg-2'")
+    row,_=w.claim();assert row['attachment']=='enrich-image'
+
+
+# spec: ANYM-887
+def test_an_image_without_a_media_job_is_never_skipped(seeded,tmp_path):
+    s,_,_=seeded;add_image(s);w=image_worker(s,tmp_path)  # the fixture message is weeks old
+    with s.pool.connection() as c:c.execute('TRUNCATE enrichment_budget')
+    row,_=w.claim();assert row['attachment']=='enrich-image'
+
+
+# spec: ANYM-887
+def test_a_retryable_failure_of_an_old_image_keeps_its_retries(seeded,tmp_path):
+    """Astra r1 M2: only work that has not started waits; a failure keeps its state, status and retries everywhere."""
+    s,key,_=seeded;chat_image(s,'private');w=image_worker(s,tmp_path);published_image_profile(s)
+    with s.pool.connection() as c:
+        c.execute("UPDATE messages SET sent_at=clock_timestamp()-interval '8 days' WHERE id='demo-tg-2'")
+        c.execute("""UPDATE attachment_enrichment SET state='failed',attempts=1,error_code='model_timeout',
+            profile_hash=%s,next_due=clock_timestamp() WHERE attachment='enrich-image'""",
+            (profile_hash(w.config['profiles']['image']),))
+    item=s.get_attachment(key,'enrich-image')
+    assert item['enrichment_status']=='failed' and 'recognition_reason' not in item
+    row,_=w.claim();assert row['attachment']=='enrich-image'
+
+
+# spec: ANYM-887
+def test_message_reads_and_file_text_show_a_skipped_image_as_on_request(seeded,tmp_path):
+    """Astra r1 M3: the two other status readers agree with get_attachment, before and after the request."""
+    s,key,_=seeded;chat_image(s,'private');published_image_profile(s)
+    with s.pool.connection() as c:c.execute("UPDATE messages SET sent_at=clock_timestamp()-interval '8 days' WHERE id='demo-tg-2'")
+    def read():
+        item=next(a for a in s.get_context(key,'demo-tg-2')['message']['attachments'] if a['attachment_id']=='enrich-image')
+        return item,s.get_file_text(key,'enrich-image')
+    item,text=read()
+    assert item['enrichment_status']=='available_on_request' and item['recognition_reason']=='image_outside_description_window'
+    assert item['recognition_next_action']=='request_file_download' and item['extraction_status']!='available_on_request'
+    assert text['enrichment_status']=='available_on_request'
+    s.request_file_download(key,'enrich-image')
+    item,text=read()
+    assert item['enrichment_status']=='queued' and 'recognition_reason' not in item
+    assert text['enrichment_status']=='queued'
+
+
+# spec: ANYM-887
+def test_an_old_image_in_an_unsubscribed_group_keeps_the_group_reason(seeded,tmp_path):
+    s,key,_=seeded;chat_image(s,'group');published_image_profile(s)
+    with s.pool.connection() as c:c.execute("UPDATE messages SET sent_at=clock_timestamp()-interval '30 days' WHERE id='demo-tg-2'")
+    item=s.get_attachment(key,'enrich-image')
+    assert item['enrichment_status']=='available_on_request' and item['recognition_reason']=='group_chat_on_request'
 
 
 def test_enrichment_budget_fencing_and_deletion(seeded,tmp_path):

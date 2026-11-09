@@ -28,6 +28,7 @@ from . import resource_admission
 from . import processing_events
 from .field_errors import field_error
 from .search_query import compile_query, cursor_binding, encode_cursor, decode_cursor
+from .media_policy import DESCRIPTION_WAITS
 
 
 CURRENT = '''a.active AND NOT m.deleted AND f.source_digest=a.digest
@@ -174,7 +175,7 @@ MEDIA_CLASS = ("(CASE " + MEDIA_LABEL + " WHEN 'voice' THEN 'voice' WHEN 'audio'
     " WHEN 'sticker' THEN 'image' WHEN 'video' THEN 'video' WHEN 'animation' THEN 'video' ELSE"
     " (CASE WHEN a.mime IN ('audio/ogg','audio/opus','application/ogg') THEN 'voice' WHEN a.mime LIKE 'audio/%%' THEN 'audio'"
     " WHEN a.mime LIKE 'image/%%' THEN 'image' WHEN a.mime LIKE 'video/%%' THEN 'video' ELSE 'document' END) END)")
-ENRICH_COLUMNS = """CASE WHEN coalesce(e.state,'unconfigured')='unconfigured' AND EXISTS(
+ENRICH_COLUMNS = """CASE WHEN """+DESCRIPTION_WAITS+""" THEN 'available_on_request' WHEN coalesce(e.state,'unconfigured')='unconfigured' AND EXISTS(
     SELECT FROM processing_profiles pp WHERE pp.account=m.account AND pp.enabled
     AND pp.kind=CASE WHEN a.mime LIKE 'audio/%%' OR a.mime='application/ogg' THEN 'audio'
         WHEN a.mime LIKE 'image/%%' THEN 'image' ELSE 'document' END)

@@ -15,7 +15,7 @@ Task snapshots and short briefs: task-flow.md; current owner/safety restrictions
   started. No secrets, sessions, dumps or private reports in Git, images, logs or packages.
 - Never change existing test paths, names or parameters (Tiden IDs) or CI check IDs.
 - Deploys only through the project's promotion tool from a green `main` SHA; other production
-  changes: section 2 gates. Merged source is not live verification.
+  changes: section 2 gates.
 - Own worktree; never bare `git stash`; `git commit -s`.
 
 ## 2. What the owner keeps
@@ -46,11 +46,13 @@ Agents decide everything else by consequence (reviews.md, Routing), with undo:
 
 Incident recovery comes first: a confirmed outage or broken critical user path permits the
 smallest reversible recovery of the existing service/session, compatible rollback or verified
-green-main service-only hotfix. Check live activity and preserve state,
-session identity and artifact verification. It adds no new auth, send/replay, access or destructive
-change. No fresh backup for stateless recovery; defer intake and independent review until
-restored. Record before/after and undo; finish deferred reviews and process corrections before
+green-main service-only hotfix. Preserve state, session identity and artifact verification. It
+adds no new auth, send/replay, access or destructive change. Defer intake and independent review
+until restored. Record before/after and undo; finish deferred reviews and process corrections before
 other work. Project live-action restrictions apply.
+
+Urgent production setting fix (owner 11-08): hand-edit it first with undo, PR after (not secrets,
+access, internet exposure); recheck after each release until shipped.
 
 Never accept open blocking/major findings: narrow, follow up or revert. Ready owner-asked
 features ship enabled after merge/deploy, flags and grants included, listed live actions excluded.
@@ -75,7 +77,7 @@ Source done: green `main` evidence (orchestration.md); production done adds depl
 
 ## 4. Product context and Tiden
 
-- Product code/specs/tests: `tiden intent skip`, `product-context`, then code.
+- Product code/specs/tests: `tiden intent skip`, the `product-context` skill, then code.
 - The ready card is the spec; failing tests come first. Each new test has
   `# spec: <PREFIX>-n` (Python) or `// spec: <PREFIX>-n` (JS, TS, Go) directly above it and its
   decorators, naming a story-level spec, or sits in the project's unlinked-tests list. Defects, infra and refactors
@@ -84,12 +86,11 @@ Source done: green `main` evidence (orchestration.md); production done adds depl
   `Tiden branch: proposal/<name>` or `review/<name>`, the only place to edit criteria. The first
   ID is primary; new files are anchored to it.
 - Wait for sync B covering your squash, read back; rerun or dispatch a failed B, `Tiden
-  drift` or `Tiden health`. Hand Tiden writes: a maintenance window (the project's Tiden CI
-  document).
+  drift` or `Tiden health`. Hand Tiden writes: a maintenance window.
 
 ## 5. Reviews
 
-- Astra: `bin/review-codex.sh astra`. Fable: product manager, never on code.
+- Astra: `bin/review-codex.sh astra`. Fable: product cards; code only if the task brief names it.
 - Packet, rounds, routing, verdict line: reviews.md. Every Astra task starts with:
   1. Failure isolation: can an exception, timeout or bad input in the new code break or silence an
      existing path (`<critical paths>`)? Name the line.

@@ -245,9 +245,14 @@ def recognition_request(c,p,row):
     takes no request quota (provider_demand counts open windows only) and moves no download.
     """
     if row.get('request_key_digest') is not None:return False
-    from .media_policy import ON_REQUEST_CHAT
+    from .media_policy import DESCRIPTION_SKIPPED, JOB_DESCRIPTION_SHAPE, ON_REQUEST_CHAT
+    # Also an image whose description waits for a request in any chat (owner 11-09: old images and stickers), and
+    # one still downloading, by its job's descriptor (no attachment row yet).
     return c.execute('''UPDATE media_jobs j SET request_key_digest=%s FROM messages m
-        WHERE j.id=%s AND m.id=j.message AND j.request_key_digest IS NULL AND '''+ON_REQUEST_CHAT+''' RETURNING j.id''',
+        WHERE j.id=%s AND m.id=j.message AND j.request_key_digest IS NULL
+        AND ('''+ON_REQUEST_CHAT+''' OR EXISTS(SELECT FROM attachments a WHERE a.id=j.id AND '''+DESCRIPTION_SKIPPED+''')
+            OR NOT EXISTS(SELECT FROM attachments a WHERE a.id=j.id) AND '''+JOB_DESCRIPTION_SHAPE+''')
+        RETURNING j.id''',
         (p['key_digest'],row['id'])).fetchone() is not None
 
 

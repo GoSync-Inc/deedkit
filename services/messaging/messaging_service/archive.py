@@ -29,6 +29,10 @@ BACKFILL_CANDIDATES = 16
 MEDIA_TIER = '''CASE WHEN j.descriptor->>'mime'=ANY(%(voice_mimes)s)
         AND (j.descriptor->>'bytes')::bigint BETWEEN 0 AND %(voice_max)s THEN 0
     WHEN (j.descriptor->>'bytes')::bigint BETWEEN 0 AND %(small_max)s THEN 1 ELSE 2 END'''
+# ANYM-877: among live originals, files of at most LIVE_SMALL_BYTES go first, and those sent in the last
+# LIVE_BURST_SECONDS are claimed oldest first, so a burst arrives in the order it was sent.
+LIVE_SMALL_BYTES = 2*1024**2
+LIVE_BURST_SECONDS = 900
 # A media claim picks its candidate lock-free and leases it after a recheck under the locks (ANYM-839); a call
 # gives up after this many lost rechecks in a row and reports MEDIA_CONTENDED.
 MEDIA_CLAIM_PICKS = 3
@@ -752,10 +756,20 @@ class Archive:
                 AND NOT j.id=ANY(%(lost)s::text[])
                 ORDER BY priority.requested DESC,CASE WHEN NOT priority.requested THEN j.id=ANY(%(backfill_ids)s::text[]) END,
                     priority.live_media DESC,
+                    -- ANYM-877: a live job: a private chat first, then a file of at most LIVE_SMALL_BYTES, then the
+                    -- last LIVE_BURST_SECONDS oldest first (a burst arrives in sent order), then the older newest first.
+                    CASE WHEN priority.live_media AND NOT priority.requested THEN ch.chat_type<>'private' END,
+                    CASE WHEN priority.live_media AND NOT priority.requested THEN
+                        (j.descriptor->>'bytes')::bigint>%(live_small)s END,
+                    CASE WHEN priority.live_media AND NOT priority.requested THEN
+                        m.sent_at<%(now)s-%(live_burst)s*interval '1 second' END,
+                    CASE WHEN priority.live_media AND NOT priority.requested
+                        AND m.sent_at>=%(now)s-%(live_burst)s*interval '1 second' THEN m.sent_at END,
                     CASE WHEN priority.live_media THEN m.sent_at END DESC,
                     CASE WHEN NOT priority.requested THEN priority.tier END,
                     CASE WHEN NOT priority.requested THEN m.sent_at END DESC,j.next_due,j.id
-                LIMIT 1'''),{**params,'now':now,'lost':lost}).fetchone()
+                LIMIT 1'''),{**params,'now':now,'lost':lost,'live_small':LIVE_SMALL_BYTES,
+                    'live_burst':LIVE_BURST_SECONDS}).fetchone()
         return row['id'] if row else None
 
     @staticmethod
@@ -860,6 +874,25 @@ class Archive:
                 (job['message'],)).fetchone()
             if not row: raise RuntimeError('media_lease_lost')
             return row['snapshot']
+
+    def media_burst(self,job,*,window_seconds,limit=20):
+        """ANYM-877: provider ids of up to `limit` other due, queued jobs' messages in this job's chat, sent inside
+        the live window, in the live claim order, so one message fetch serves a burst. Read-only, no lock."""
+        with self.store.pool.connection() as c:
+            rows=c.execute('''SELECT m.provider_id FROM messages jm
+                JOIN messages m ON m.account=jm.account AND m.chat=jm.chat AND m.id<>jm.id
+                    AND m.sent_at>=clock_timestamp()-%(window)s*interval '1 second' AND NOT m.deleted
+                JOIN media_jobs j ON j.message=m.id AND j.account=m.account
+                WHERE jm.id=%(message)s AND j.state='queued' AND j.next_due<=clock_timestamp()
+                    AND j.attempts<%(max_attempts)s
+                ORDER BY (j.descriptor->>'bytes')::bigint>%(live_small)s NULLS LAST,
+                    m.sent_at<clock_timestamp()-%(live_burst)s*interval '1 second',
+                    CASE WHEN m.sent_at>=clock_timestamp()-%(live_burst)s*interval '1 second' THEN m.sent_at END,
+                    m.sent_at DESC,m.id LIMIT %(rows)s''',{'message':job['message'],'window':window_seconds,
+                    'max_attempts':MEDIA_MAX_ATTEMPTS,'live_small':LIVE_SMALL_BYTES,'live_burst':LIVE_BURST_SECONDS,
+                    'rows':2*limit}).fetchall()
+        ids=[int(r['provider_id']) for r in rows if re.fullmatch(r'[0-9]{1,19}',r['provider_id'])]
+        return list(dict.fromkeys(ids))[:limit]
 
     def finish_media(self,job,blob,writer,*,collector_lease=None):
         # Keep the verified inode identity across the serving/lifecycle lock.

@@ -21,8 +21,16 @@ affect every pull request make parallel edits collide.
   again. The first flake on `main` or in the merge queue (a failing test outside the pull request's
   changes) is fixed at once by whoever sees it, as its own tests-only AUTO pull request, never a
   card candidate (owner 10-30); `bin/wait-merge.sh` prints the failing test ids and
-  re-enqueues the dropped pull request once. Update a branch only for a real conflict, never just to stay current. A conflict in
-  another task's files goes to the orchestrator.
+  re-enqueues the dropped pull request once. Fix the cause, not the timeout (owner 11-09: fix flaky
+  tests at the cause; only the timeout rule below moves one): reproduce it under load first (many
+  copies at CI's parallelism); replace a wall-clock wait or sleep with the event the test waits for
+  (a barrier, a readiness signal) or an injected clock, and let the test own its clock and its data
+  (fixtures, database statistics it depends on); keep the assertion and the test's path, name and
+  parameters (process.md section 1). A cause in product code (a race) stops the fix and goes to the
+  orchestrator; a flake that does not reproduce after a fair hunt is recorded as residual (test id,
+  runs tried, load used) in the fix pull request or STATE.md, not given a guessed fix. One pull
+  request per cause. Update a branch only for a real conflict, never just to stay current. A
+  conflict in another task's files goes to the orchestrator.
 - Draft first (owner 10-27, paid CI minutes): workers open pull requests as drafts, run the
   project's local checks before every push and mark the pull request ready (`gh pr ready <n>`)
   once local checks pass and either reviews pass or the push that carries the fixes of every open
@@ -67,6 +75,10 @@ affect every pull request make parallel edits collide.
   safe GET->PUT path). Choose checks by affected modules and consumers. Shared contracts, migrations, security and
   verification/build inputs get wider checks; unknown dependency coverage runs the full suite.
   Text-only changes use lightweight checks through main, with no product build/publication.
+  A path filter that skips a required check (docs-only, mobile-only), new or existing, gets a guard
+  that no test of that check reads a skipped path (a test-time file-read guard or a declared reads
+  list); without it, such skips turned `main` red in two projects. It is not a merge gate: until
+  the guard exists, a red `main` from such a skip is fixed like a first flake (Merging).
   Reuse unchanged verification and image artifacts only with validated input/dependency identities
   and provenance; record what this exact commit checked or reused. Never relabel an older full
   suite as newly run. The required gate verifies that decision, not a blanket full-suite rerun.
@@ -85,7 +97,9 @@ affect every pull request make parallel edits collide.
     (release record, tags) read the push range (`github.event.before`..`after`), not the head
     commit only (tiden.md, One Tiden branch per pull request).
   - Timeouts that caused reruns (job, step, per test, database start) go to about 1.5x the p99 of
-    loaded runs: a slow but healthy run passes, a real hang still fails.
+    loaded runs: a slow but healthy run passes, a real hang still fails. A per-test timeout moves
+    only when loaded runs show the healthy path is that slow; a flaky test is fixed at its cause
+    (Merging).
   - Test speed is standing work: a periodic pass (the project names the cadence in AGENTS.md)
     over the slowest tests, flaky reruns and parallelism.
   - Each change is measured before and about 3 days after: full runs per merged pull request,
@@ -104,6 +118,19 @@ affect every pull request make parallel edits collide.
   push runs" exit 0 means the push holding the squash had no runs within 300 s: before DONE,
   check with the `gh run list` above that `main` has push runs at all; if it has, wait for them.
   Its exit 6 "no push holding" the squash: find the push with the same list.
+- Coalesced main runs (a project with a scarce test runner; one measured main queue wait went 2 s ->
+  23 min with 5 main runs queued, and no queue after): main push runs of the test workflow share
+  one concurrency group with `cancel-in-progress: false`, so a running run finishes and a newer
+  push replaces the pending one; the next run tests every squash since the last. A replaced
+  squash has no run of its own: the oldest later run of the same workflow whose head holds it,
+  not cancelled, covers it, and `bin/wait-merge.sh --main` waits for that run (exit 6 when none
+  covers it within 300 s: one full rerun of the cancelled run). Give a hand rerun
+  (`github.run_attempt` above 1) a group of its own SHA, so it never replaces a newer pending
+  run. A covering run's push range (`github.event.before..after`) does not hold the replaced
+  squash: jobs that act per squash (release record, tags, Tiden sync) and any change filter of
+  the covered workflow read the range from the last main head they processed (the last
+  successful run's head or a tag) to the run's head; a test job gated on the event range alone
+  would skip the replaced squash's changes and still read green.
 - A red `main` push run: never `gh run rerun --failed` (a partial rerun can never pass a release
   record job that needs the whole run). Use one full `gh run rerun <id>`. If it is still red
   outside your code, report DONE with the run link; a later green main SHA carries your code.

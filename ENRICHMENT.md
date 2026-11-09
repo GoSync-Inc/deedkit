@@ -487,3 +487,22 @@ observed within 7 days, enabled or not, so a stopped worker's files stay due (`c
 behind`, `enrichment_no_worker`) rather than reading as recognition switched off. A row failed or
 unsupported under an older profile reads as failed or unsupported until the worker with a changed
 profile takes it again.
+
+### New images only (ANYM-887)
+
+Owner 2026-11-09: «картинки только новые ... только новые обрабатывали в реал тайме» and «отсеять из очереди совсем не
+нужное». An image is described by itself only while it is new. An image whose message was sent more than
+`IMAGE_DESCRIPTION_DAYS` (7, media_policy.py) days ago, or a sticker (message metadata `media_kind: sticker`), waits
+for an agent's request whenever its media job carries none. The request is recorded like ANYM-805's: any accepted
+`request_file_download` sets the job's `request_key_digest`. For these images this now also happens in personal chats,
+even when the original is already on disk. A requested image counts as fresh for the claim order and the backlog share.
+
+The rule is description only. Text extraction and OCR keep their behaviour, and audio and documents are unchanged.
+Nothing is changed, failed or deleted: a waiting row keeps its state and becomes claimable once an agent asks. An
+attachment without a media job keeps the old behaviour. `get_attachment` and message reads show `enrichment_status:
+available_on_request` with `recognition_reason` (`image_outside_description_window` or `sticker`) and
+`recognition_next_action: request_file_download`; ANYM-805's reason wins in an unsubscribed group. No ANYM-806
+retention applies. `get_sync_status` counts these images under `available_on_request`, and `enrichment_health`
+raises no alarm for them. The window is a module setting, not a worker config key, because the API, the health
+check and the worker must read the same window. A group's or channel's images are described only when a
+subscription names that chat; a dynamic (all-chats) subscription lists no chat, so it does not count (ANYM-805).

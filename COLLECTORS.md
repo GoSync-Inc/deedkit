@@ -38,7 +38,14 @@ fsync, the DB queue and the agent's own request time are added to it. After a st
 catch-up events are possible; `origin=live` does not prove there was no such delay.
 A message the live stream lost is stored later by the periodic reconcile pass (every
 `scan_interval_seconds`, 60 s by default, but paced by the request governor, so
-a long pass can be much later). The journal records it as `reconcile`; if it was sent
+a long pass can be much later). The governor admits one request per second per account and
+gives the next slot to the most urgent tier (ANYM-877): agents' live reads and commands,
+then live and requested originals, then history reconcile, discovery and backfill. A waiting
+lower tier still gets at least one of every five admissions, so under continuous live work
+a reconcile pass can take up to about five times longer. A FloodWait or account cooldown
+stops every tier; each one is also kept as `{started_at, seconds, phase}` in
+`collector_health.operations.cooldowns.recent` (the last 20), which the full `get_sync_status`
+shows under `operations.cooldowns`. The journal records it as `reconcile`; if it was sent
 at most 6 hours before, live subscriptions read it as `live_recovered` and match it
 (SUBSCRIPTIONS.md, ANYM-733).
 Stateless MCP does not wake an idle agent: the client must call read/updates.
@@ -59,6 +66,52 @@ IDs can be matched to an outgoing message only within the same account/chat. Thi
 heuristic for the attention queue, not the provider's unread state or a fact of an obligation.
 
 API documentation used: [Telethon catch-up and streaming download](https://docs.telethon.dev/en/stable/modules/client.html), [MessageDeleted limitations](https://docs.telethon.dev/en/stable/modules/events.html#telethon.events.messagedeleted.MessageDeleted). Real Telegram downloads were verified; long-term observation and reconnect scenarios need separate acceptance. In 0.7.2 expired or refresh-needing file references are handled by the queue with bounded attempts and a fresh metadata load, without stopping collection of other chats.
+
+### Stage latency (ANYM-865)
+
+`get_sync_status(include_latency=true, latency_window_h=24)` adds three lists to the account
+summary. The window is 1, 24, 72 or 168 hours; any other value is `invalid_argument`.
+
+- `latency`: one row per account, stage, origin, chat type, message kind and hint policy, with
+  `n`, `p50_s`, `p90_s` and `window_h`. The stages:
+  - `arrival`: commit of a live `message.created` minus the provider's `sent_at`. Negative values
+    are clipped to 0. `message_kind` is `message` or the service kind.
+  - `download`: `attachment.ready` minus the message's `message.created`.
+  - `text`, `transcript`, `description`: the `file.*.ready` event minus that file's `attachment.ready`.
+  - `failed`: a count of `file.processing.failed` events, with no percentiles.
+  - `match`: `matched_at` minus the event's commit.
+  - `hint`: the first delivered hint covering the match minus `matched_at`. Its `policy` is
+    `immediate`, or `held_by_policy` for a debounce, batch or quiet-hours subscription.
+
+  A stage with nothing in the window has no row.
+- `latency_pending`: what waits for each stage now, as `pending: {n, oldest_s}`.
+  - `download`, `text`, `transcript` and `description` add `on_request_n`, the work that waits for
+    `request_file_download` by policy.
+  - `hint` adds `held_n`, the matches your own debounce, batch or quiet hours hold. These are never
+    counted as pending.
+
+  A stalled worker shows a growing `oldest_s` while the window's p50 still looks normal.
+- `latency_unavailable`: stages whose statement ran out of time (2 s up to 24 h, 5 s for 72 and
+  168 h) or failed. The rest of the status is unaffected.
+
+Rows hold counts and seconds only: no chat IDs, titles, senders or bodies. A key sees only the
+accounts and chats it may read, and only its own subscriptions in the `match` and `hint` rows.
+
+How exact the numbers are:
+- Provider `sent_at` has 1 s resolution and comes from the provider's own clock, so arrival values
+  under 1 s are indicative.
+- The window filters each stage by its own commit time: `events.created_at`, served by the
+  `events_created_at` index from migration 073. `match` and `hint` filter by `matched_at`, so a
+  late match of an old event still counts.
+- One budget covers the whole block: 2 s up to 24 h, 5 s for 72 and 168 h. A group that starts with
+  the budget spent is named in `latency_unavailable`.
+- A match whose first covering hint the retention worker already deleted has no hint sample. It is
+  not pending either.
+- A queued download with an unknown claim (no published policy or history bound) is `unknown_n`. It
+  is not counted as pending.
+
+Operators get the same rows, for every account and subscription, as one table:
+`python -m messaging_service sync-latency [--window-h 24]` (operator DSN in `DATABASE_URL_FILE`).
 
 ### Queue quarantine and resilience
 

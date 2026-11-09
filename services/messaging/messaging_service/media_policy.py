@@ -90,6 +90,38 @@ ON_REQUEST_REASONS=('group_chat_on_request','channel_on_request')
 RECOGNITION_WITHHELD=('('+ON_REQUEST_CHAT+' AND EXISTS(SELECT FROM media_jobs rj WHERE rj.id=a.id'
     ' AND rj.request_key_digest IS NULL))')
 RECOGNITION_REASON='(SELECT orr.reason FROM ('+ON_REQUEST_CHATS+') orr WHERE orr.chat=m.chat)'
+# Owner 2026-11-09 («картинки только новые ... только новые обрабатывали в реал тайме»; «отсеять из очереди совсем не
+# нужное»): an image (alias a, message m) is described by itself only while it is new. One sent more than
+# IMAGE_DESCRIPTION_DAYS ago, or a sticker, waits for an agent's request, recorded as for ANYM-805 in the job's request
+# key digest. Description only: text extraction and OCR do not read this rule. Nothing is changed, failed or deleted.
+# An attachment without a media job keeps the old behaviour (no request could be recorded for it). No '%' in the text,
+# so it is valid in parameterized and plain statements alike.
+IMAGE_DESCRIPTION_DAYS=7
+IMAGE_STICKER=("EXISTS(SELECT FROM message_metadata smd WHERE smd.message=m.id"
+    " AND smd.metadata->>'media_kind'='sticker')")
+def description_shape(mime):
+    """An image (by the SQL text `mime`) of message m that is old or a sticker."""
+    return ("left("+mime+",6)='image/' AND (m.sent_at<statement_timestamp()-interval '"
+        +str(IMAGE_DESCRIPTION_DAYS)+" days' OR "+IMAGE_STICKER+")")
+
+
+DESCRIPTION_SHAPE=description_shape('a.mime')
+# A media job j still downloading has no attachment row yet: its descriptor names the mime (Astra r1 M1).
+JOB_DESCRIPTION_SHAPE=description_shape("coalesce(j.descriptor->>'mime','')")
+DESCRIPTION_SKIPPED=("("+DESCRIPTION_SHAPE+" AND EXISTS(SELECT FROM media_jobs dj WHERE dj.id=a.id"
+    " AND dj.request_key_digest IS NULL))")
+# The same rule over an already joined media job `job` (sync status and the health check join it by id).
+def description_skipped_row(job):
+    return "("+job+".id IS NOT NULL AND "+job+".request_key_digest IS NULL AND "+DESCRIPTION_SHAPE+")"
+DESCRIPTION_REASON=("CASE WHEN "+IMAGE_STICKER+" THEN 'sticker' ELSE 'image_outside_description_window' END")
+# The rule as it applies to one enrichment row e: only work that has not started (unconfigured or queued) waits; a
+# lease, a result or a failure keeps its state and its retries (claim, sync status and health apply the same states).
+# For statuses, also only where a worker could describe it: queued, or unconfigured with an enabled image profile (with
+# none, the status stays not_configured).
+DESCRIPTION_WAITS=("(left(a.mime,6)='image/' AND (e.state='queued' OR coalesce(e.state,'unconfigured')='unconfigured'"
+    " AND EXISTS(SELECT FROM processing_profiles dpp WHERE dpp.account=m.account AND dpp.enabled AND dpp.kind='image'))"
+    " AND "+DESCRIPTION_SKIPPED+")")
+ENRICHMENT_REASON="CASE WHEN "+DESCRIPTION_WAITS+" THEN "+DESCRIPTION_REASON+" END AS description_reason"
 # Columns the policy reads (the worker role files grant exactly these).
 POLICY_COLUMNS=(('chats','id'),('chats','account'),('chats','provider_chat'),('chats','chat_type'),
     ('collector_chats','account'),('collector_chats','provider_chat'),('collector_chats','peer_kind'),
@@ -111,6 +143,11 @@ def recognition_withheld(c):
         FROM unnest(%s::text[],%s::text[]) v(t,col)''',
         ([t for t,_ in POLICY_COLUMNS],[col for _,col in POLICY_COLUMNS])).fetchone()['readable']
     return RECOGNITION_WITHHELD if readable else 'false'
+
+
+def description_skipped(withheld):
+    """DESCRIPTION_SKIPPED for a worker whose recognition_withheld(c) reads the policy, else 'false' (as before)."""
+    return 'false' if withheld=='false' else DESCRIPTION_SKIPPED
 
 
 # Requires aliases j (media_jobs), m (messages) and ch (chats); adds mp, ecc, ecp, eor and

@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from .file_index import file_response_fields
 from .file_lifecycle import CHAT_POLICY_HOURS
 from .media_retry import MEDIA_MAX_ATTEMPTS
-from .media_policy import RECOGNITION_REASON, RECOGNITION_WITHHELD
+from .media_policy import DESCRIPTION_WAITS, ENRICHMENT_REASON, RECOGNITION_REASON, RECOGNITION_WITHHELD
 from .status_details import describe
 
 
@@ -38,7 +38,8 @@ def processing_phases(c, row):
         coalesce(f.truncated,false) AS truncated,
         (f.extraction_metadata-'page_spans'-'sheet_spans'-'cell_spans') AS extraction_metadata,
         '''+RECOGNITION_WITHHELD+''' AS recognition_withheld,'''+RECOGNITION_REASON+''' AS recognition_reason,
-        CASE WHEN coalesce(e.state,'unconfigured')='unconfigured' AND EXISTS(
+        '''+ENRICHMENT_REASON+''',
+        CASE WHEN '''+DESCRIPTION_WAITS+''' THEN 'available_on_request' WHEN coalesce(e.state,'unconfigured')='unconfigured' AND EXISTS(
             SELECT FROM processing_profiles pp WHERE pp.account=m.account AND pp.enabled
             AND pp.kind=CASE WHEN a.mime LIKE 'audio/%%' OR a.mime='application/ogg' THEN 'audio'
                 WHEN a.mime LIKE 'image/%%' THEN 'image' ELSE 'document' END)
@@ -157,6 +158,11 @@ def attachment_fields(row, *, original_present=None):
     if (withheld or evicted_wait) and 'available_on_request' in (extraction,enrichment):
         item.update(recognition_reason=row.get('recognition_reason') or 'group_chat_on_request',
             recognition_next_action='request_file_download')
+    if (registered and row.get('description_reason') and enrichment=='available_on_request'
+            and 'recognition_reason' not in item):
+        # Owner 11-09: an old image or a sticker is described when an agent asks (media_policy.DESCRIPTION_SKIPPED).
+        # The same two fields as ANYM-805, whose reason wins; this one sets no retention (row recognition_reason).
+        item.update(recognition_reason=row['description_reason'],recognition_next_action='request_file_download')
     if registered and row.get('recognition_reason'):
         item['original_retention_hours']=CHAT_POLICY_HOURS  # ANYM-806: kept 24 hours after its last read.
     source={}
