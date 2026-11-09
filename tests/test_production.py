@@ -1776,10 +1776,23 @@ def test_every_build_target_stage_chain_is_covered_by_the_input_digest():
                                          "RUN --mount=source=.,target=/src true", "RUN <<EOF\ntrue\nEOF",
                                          "COPY <<EOF /x\nCOPY a b\nEOF", 'COPY "src file.py" /app/',
                                          "COPY src --chmod=644 /app/", "RUN <<1\nFROM scratch\n1",
-                                         "ADD git@example.invalid:x.git /x"])
+                                         "ADD git@example.invalid:x.git /x", "RUN\t<<1 cat\nFROM scratch\n1",
+                                         'RUN --mount=type=bind,from="one",target=/m true', "RUN\ttrue",
+                                         "COPY a /b", "RUN true\r", "MAINTAINER synthetic", "COPY --from='one' /a /b"])
 def test_a_dockerfile_instruction_the_digest_cannot_place_refuses_the_keep(instruction):
     with pytest.raises(p.Unreadable):
         p.dockerfile_stages("FROM python:3.13-slim AS one\n" + instruction + "\n")
+
+
+# spec: ANYM-895
+@pytest.mark.parametrize("directive", ["# syntax=docker/dockerfile:1", "# escape=`", "#check=skip=all"])
+def test_a_dockerfile_parser_directive_refuses_the_keep_and_a_quoted_run_argument_does_not(directive):
+    with pytest.raises(p.Unreadable):
+        p.dockerfile_stages(directive + "\nFROM python:3.13-slim AS one\nCOPY a /a\n")
+    # Quotes in the command a RUN runs are the command's own, not Docker's options.
+    stages = p.dockerfile_stages("# a comment, not a directive\nFROM python:3.13-slim AS one\n"
+                                 'RUN pip install --index-url="https://example.invalid/simple" x\nCOPY a /a\n')
+    assert stages[0]["copies"] == ["a"]
 
 
 # spec: ANYM-895

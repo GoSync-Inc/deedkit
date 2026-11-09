@@ -31,6 +31,7 @@ import fnmatch
 import hashlib
 import io
 import ipaddress
+import itertools
 import json
 from pathlib import Path, PurePosixPath
 import posixpath
@@ -1045,15 +1046,36 @@ def copy_sources(arguments):
     return flags, words[:-1]
 
 
+DOCKERFILE_INSTRUCTIONS = ("FROM", "ARG", "ENV", "LABEL", "WORKDIR", "USER", "RUN", "COPY", "ADD", "CMD", "ENTRYPOINT",
+                           "EXPOSE", "HEALTHCHECK", "STOPSIGNAL", "VOLUME", "SHELL", "ONBUILD")
+
+
 def dockerfile_stages(text):
     """Each stage of a Dockerfile in order: its name, the stage it starts FROM (None for an image), the stages its
-    COPY --from names and the context paths it copies. ADD of a URL or an archive and anything not understood refuse."""
+    COPY --from names and the context paths it copies. ADD of a URL or an archive and anything not understood refuse.
+
+    The reading is deliberately narrow (fail-safe, the service is then always recreated): only printable ASCII, single
+    spaces as BuildKit reads any whitespace, no parser directive (`# syntax=`, `# escape=` change the parser), no heredoc
+    or here-string anywhere, no quote in an option, and only the instructions listed below."""
+    if re.search(r"[^\x20-\x7e\n]", text):
+        raise Unreadable("a Dockerfile with a tab, a carriage return or a character outside printable ASCII")
+    if "<<" in text:
+        raise Unreadable("a Dockerfile with a heredoc or a here-string")
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if not re.match(r"\s*#\s*[A-Za-z]+\s*=", line):
+            break
+        raise Unreadable("a Dockerfile with a parser directive")
     stages = []
     for line in dockerfile_lines(text):
         instruction, _, arguments = line.partition(" ")
         instruction = instruction.upper()
-        if instruction in ("RUN", "COPY", "ADD") and "<<" in arguments:  # a heredoc (or a here-string): not read
-            raise Unreadable(f"a {instruction} heredoc")
+        if instruction not in DOCKERFILE_INSTRUCTIONS:
+            raise Unreadable(f"an instruction the digest does not read: {instruction}")
+        options = itertools.takewhile(lambda word: word.startswith("--"), arguments.split())  # the instruction's own
+        if any(char in word for word in options for char in "\"'"):
+            raise Unreadable(f"a {instruction} option with a quote")
         if instruction == "FROM":
             words = [word for word in arguments.split() if not word.startswith("--")]
             if not words or len(words) not in (1, 3) or len(words) == 3 and words[1].upper() != "AS":
