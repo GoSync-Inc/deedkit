@@ -38,6 +38,11 @@ write-only for the API role and never returned, logged or audited. This is privi
 separation, not encryption: database owners and anyone who can decrypt a backup can
 read them. Details: [SUBSCRIPTIONS.md](SUBSCRIPTIONS.md#self-service-webhook-endpoints-schema-49).
 
+The messaging database records statement statistics (`pg_stat_statements`, ANYM-842): normalized SQL text, with
+constants replaced but comments and identifiers kept (normalization is not redaction), plus counts and times,
+stays on the database host. A role reads only its own statements unless it has `pg_read_all_stats` (no DeedKit
+role has it, prod 11-09) or is the bootstrap superuser; perf reports carry query ids, calls and times only (docs/DATA-POLICY.md).
+
 A vendor endpoint (ANYM-582, Grok Bot routine webhooks; its host named in that policy, or under
 self-registration a Grok routine URL recognised by its shape, ANYM-585) receives the
 same content-free bodies plus the agent's own routine key as `Authorization: Bearer`, stored and

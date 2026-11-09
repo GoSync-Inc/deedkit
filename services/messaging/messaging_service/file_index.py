@@ -945,6 +945,8 @@ class FileIndexer:
 
 
 def main():
+    from .store import name_sessions
+    name_sessions('indexer')  # ANYM-842: this service's sessions carry its name
     from .telemetry import configure, capture
     configure('indexer')
     parser = argparse.ArgumentParser(description='Index already archived immutable files locally')

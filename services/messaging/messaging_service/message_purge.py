@@ -397,6 +397,8 @@ def deletions(c,accounts):
 
 
 def main(argv=None):
+    from .store import name_sessions
+    name_sessions('message-purge')  # ANYM-842: this service's sessions carry its name
     from .store import Store
     parser=argparse.ArgumentParser(prog='python -m messaging_service.message_purge')
     parser.add_argument('--dsn-file',required=True)

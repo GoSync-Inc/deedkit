@@ -369,6 +369,8 @@ def run(config):
 
 
 def main():
+    from .store import name_sessions
+    name_sessions('backup')  # ANYM-842: this service's sessions carry its name
     parser=argparse.ArgumentParser();parser.add_argument('--config',type=Path,required=True)
     args=parser.parse_args();os.umask(0o077)
     from .backup_calendar import CalendarCaptureRefused

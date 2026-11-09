@@ -6,7 +6,7 @@ from pathlib import Path
 import stat
 import sys
 
-from .store import Store, caller_token, operation_name, revocable_token
+from .store import Store, caller_token, name_sessions, operation_name, revocable_token
 from .policy import PERMISSIONS, UNSET, key_id, principal_id
 from .messenger_operations import OPERATIONS
 
@@ -125,6 +125,8 @@ def main():
     args=parser.parse_args()
     if args.command=='migrate-expand': return migrate_expand(args,parser)
     if args.command == 'serve':
+        # ANYM-842: the API's sessions carry its name; the HTTP plan's generation API runs with DEEDKIT_RELEASE_ID.
+        name_sessions('http-api' if os.environ.get('DEEDKIT_RELEASE_ID') else 'api')
         configure('gateway')
     dsn=Path(os.environ['DATABASE_URL_FILE']).read_text().strip()
     public_url=os.environ.get('PROBE_PUBLIC_URL','http://127.0.0.1:18940')

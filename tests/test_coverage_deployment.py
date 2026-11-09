@@ -126,6 +126,19 @@ def test_calendar_service_guide_names_the_login_log_and_limits_what_it_proves():
     assert 'run `ALTER SYSTEM RESET log_connections`, remove `command` from the compose file, recreate' in guide
 
 
+# spec: ANYM-842
+def test_database_records_statement_statistics_with_the_budgeted_memory_set():
+    db = document('deploy/compose.yaml')['services']['db']
+    command = db['command']
+    assert command[0] == 'postgres' and command[1::2] == ['-c'] * (len(command) // 2)
+    settings = dict(item.split('=', 1) for item in command[2::2])
+    assert settings == {'shared_preload_libraries': 'pg_stat_statements', 'pg_stat_statements.max': '5000',
+                        'track_io_timing': 'on', 'shared_buffers': '128MB', 'work_mem': '4MB',
+                        'effective_cache_size': '1536MB', 'random_page_cost': '1.1'}
+    # The limit is unchanged; jit keeps its default; shared memory for parallel steps is bounded.
+    assert db['mem_limit'] == '${PROBE_DB_MEMORY:-2g}' and db['shm_size'] == '256m'
+
+
 def test_database_and_optional_workers_have_isolated_networks_and_role_mounts():
     base = document('deploy/compose.yaml')
     db = base['services']['db']

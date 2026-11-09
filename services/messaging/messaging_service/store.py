@@ -63,6 +63,19 @@ class ExpandError(Exception):
         super().__init__(code)
 
 
+SESSION_NAME=re.compile(r'[a-z][a-z0-9-]{0,62}')
+
+
+def name_sessions(service):
+    """ANYM-842: every later database session of this process (pool, direct connects, pg_dump children) names its
+    service in pg_stat_activity: libpq reads PGAPPNAME at each connect. A name the environment already gives (the
+    promotion tool's per-step names) wins, and a DSN's own application_name still overrides both."""
+    name=re.sub(r'[^a-z0-9-]+','-',str(service).lower()).strip('-')[:63].rstrip('-')
+    if not SESSION_NAME.fullmatch(name):raise ValueError('invalid_session_name')
+    os.environ.setdefault('PGAPPNAME',name)
+    return os.environ['PGAPPNAME']
+
+
 # The database a connection reached: cluster system identifier, database name and OID (ANYM-449).
 EXPAND_IDENTITY=("SELECT ARRAY[(SELECT system_identifier::text FROM pg_control_system()),current_database()::text,"
     "(SELECT oid::text FROM pg_database WHERE datname=current_database())] AS identity")
