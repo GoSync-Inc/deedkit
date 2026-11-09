@@ -27,6 +27,7 @@ import copy
 from contextlib import ExitStack, contextmanager, suppress
 from datetime import datetime, timezone
 import fcntl
+import fnmatch
 import hashlib
 import io
 import ipaddress
@@ -978,6 +979,268 @@ def build_recipe(target, sha):
     if target == "http-router":
         arguments["VERSION_REF"] = sha
     return arguments, digest({"dockerfile": dockerfile, "stage": stage, "arguments": arguments})
+
+
+# ANYM-895: a release recreates a service only when its inputs changed. Builds are not reproducible and every image
+# carries its revision, so the comparison is over what the repository and host control, never over image IDs: the
+# Dockerfile and .dockerignore content, the build arguments without the revision, the git objects (with their modes) of
+# every path the target's stage chain copies, and the rendered service with the host files it reads. A part that cannot
+# be read makes the digest None, and a service without a digest is always recreated. INPUT_VERSION changes with the rule,
+# so every service is recreated once after it changes.
+INPUT_VERSION = "i1:"
+INPUT_LABEL = "io.deedkit.production.inputs"
+REVISION_LABEL = "org.opencontainers.image.revision"
+REVISION_ARGUMENTS = ("DEEDKIT_SOURCE_SHA", "VERSION_REF")
+INPUT_PARTS = ("dockerfile", "recipe", "code", "compose", "host")
+
+
+class Unreadable(Exception):
+    """An input the digest cannot read or parse: the service is recreated."""
+
+
+def dockerfile_lines(text):
+    """The instructions of a Dockerfile: comments and parser directives dropped, continuation lines joined."""
+    lines, current = [], ""
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not current and (not stripped or stripped.startswith("#")):
+            continue
+        if current and stripped.startswith("#"):
+            continue
+        if stripped.endswith("\\"):
+            current += stripped[:-1] + " "
+            continue
+        lines.append((current + stripped).strip())
+        current = ""
+    if current.strip():
+        lines.append(current.strip())
+    return lines
+
+
+def copy_sources(arguments):
+    """The flags and source paths of a COPY or ADD instruction (its last argument is the destination)."""
+    if arguments.startswith("["):
+        try:
+            words = json.loads(arguments)
+        except ValueError as exc:
+            raise Unreadable("a COPY in JSON form does not parse") from exc
+        flags = []
+    else:
+        words = arguments.split()
+        flags = [word for word in words if word.startswith("--")]
+        words = [word for word in words if not word.startswith("--")]
+    if len(words) < 2 or not all(isinstance(word, str) for word in words):
+        raise Unreadable("a COPY without a source and a destination")
+    return flags, words[:-1]
+
+
+def dockerfile_stages(text):
+    """Each stage of a Dockerfile in order: its name, the stage it starts FROM (None for an image), the stages its
+    COPY --from names and the context paths it copies. ADD of a URL or an archive and anything not understood refuse."""
+    stages = []
+    for line in dockerfile_lines(text):
+        instruction, _, arguments = line.partition(" ")
+        instruction = instruction.upper()
+        if instruction == "FROM":
+            words = [word for word in arguments.split() if not word.startswith("--")]
+            if not words:
+                raise Unreadable("a FROM without an image")
+            name = words[2] if len(words) == 3 and words[1].upper() == "AS" else str(len(stages))
+            known = {stage["name"] for stage in stages}
+            stages.append({"name": name, "base": words[0] if words[0] in known else None, "from": [], "copies": []})
+        elif instruction in ("COPY", "ADD"):
+            if not stages:
+                raise Unreadable(f"{instruction} before FROM")
+            flags, sources = copy_sources(arguments)
+            origin = [flag.partition("=")[2] for flag in flags if flag.startswith("--from=")]
+            if origin:
+                stages[-1]["from"].append(origin[0])
+            elif instruction == "ADD" and any(re.match(r"[a-z]+://", source) or re.search(r"\.(tar|gz|tgz|bz2|xz|zst)$", source)
+                                              for source in sources):
+                raise Unreadable("ADD of a URL or an archive")
+            else:
+                stages[-1]["copies"].extend(sources)
+        elif instruction == "ONBUILD":
+            raise Unreadable("ONBUILD")
+    if not stages:
+        raise Unreadable("a Dockerfile without a stage")
+    return stages
+
+
+def stage_chain(stages, target):
+    """The stages a target's image is built from: its stage, the stage it starts from and every COPY --from stage,
+    transitively. `target` "" is the last stage. A COPY --from naming an image (not a stage) adds no context path; the
+    image reference is part of the Dockerfile content, which the digest hashes whole."""
+    named = {stage["name"]: stage for stage in stages}
+    start = stages[-1] if not target else named.get(target)
+    if start is None:
+        raise Unreadable(f"stage {target!r} is not in the Dockerfile")
+    chain, pending = [], [start]
+    while pending:
+        stage = pending.pop()
+        if any(stage is seen for seen in chain):
+            continue
+        chain.append(stage)
+        if stage["base"]:
+            pending.append(named[stage["base"]])
+        pending.extend(named[origin] for origin in stage["from"] if origin in named)
+    return chain
+
+
+def context_paths(context, sources):
+    """The repository paths (POSIX, relative to the checkout) that `sources` of a build context select."""
+    result = set()
+    for source in sources:
+        if source.startswith("/") or ".." in Path(source).parts or "$" in source:
+            raise Unreadable(f"a COPY source the digest cannot place: {source}")
+        joined = os.path.normpath(os.path.join(context, source)).replace(os.sep, "/")
+        result.add("" if joined == "." else joined)
+    return sorted(result)
+
+
+def tree_entries(source):
+    """Every file of the checked-out commit as `mode id path` (git ls-tree), so a mode change is a change too."""
+    listing = run(["git", "-C", str(source), "ls-tree", "-r", "--full-tree", "HEAD"])
+    entries = {}
+    for line in listing.splitlines():
+        meta, _, path = line.partition("\t")
+        mode, _, rest = meta.partition(" ")
+        kind, _, object_id = rest.partition(" ")
+        if path and kind in ("blob", "commit"):
+            entries[path] = mode + " " + object_id
+    if not entries:
+        raise Unreadable("the release checkout lists no files")
+    return entries
+
+
+def selected_entries(entries, paths):
+    """The tree entries under each copied path (a glob is matched as Docker matches it); a path that selects nothing is
+    named, so a COPY of a file the commit lacks still changes the digest when the file appears."""
+    chosen = {}
+    for path in paths:
+        found = {name: value for name, value in entries.items()
+                 if not path or name == path or name.startswith(path + "/")
+                 or (any(char in path for char in "*?[") and fnmatch.fnmatchcase(name, path))}
+        chosen.update(found or {path: "missing"})
+    return chosen
+
+
+def build_inputs(source, target, entries):
+    """The repository part of a target's input digest: the Dockerfile and .dockerignore content, the recipe without
+    the revision arguments and the git objects of every path its stage chain copies."""
+    context, dockerfile, stage, _ = BUILDS[target]
+    try:
+        text = (Path(source) / dockerfile).read_text()
+    except OSError as exc:
+        raise Unreadable(f"{dockerfile} is not in the release checkout") from exc
+    ignore = Path(source) / context / ".dockerignore"
+    try:
+        ignored = hashlib.sha256(ignore.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        ignored = None
+    except OSError as exc:
+        raise Unreadable(f"{ignore} cannot be read") from exc
+    copied = [path for item in stage_chain(dockerfile_stages(text), stage) for path in item["copies"]]
+    arguments, _ = build_recipe(target, "0" * 40)
+    arguments = {key: value for key, value in arguments.items() if key not in REVISION_ARGUMENTS}
+    return {"dockerfile": digest({"dockerfile": hashlib.sha256(text.encode()).hexdigest(), "ignore": ignored}),
+            "recipe": digest({"path": dockerfile, "stage": stage, "arguments": arguments}),
+            "code": digest(selected_entries(entries, context_paths(context, copied)))}
+
+
+def file_sha256(path):
+    """The sha256 of a regular host file the service reads; a directory (data, sessions, spools) counts by path only."""
+    try:
+        found = os.stat(path)
+    except FileNotFoundError:
+        return "missing"
+    except OSError as exc:
+        raise Unreadable(f"{path} cannot be read") from exc
+    if stat.S_ISDIR(found.st_mode):
+        return "directory"
+    if not stat.S_ISREG(found.st_mode):
+        raise Unreadable(f"{path} is neither a file nor a directory")
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError as exc:
+        raise Unreadable(f"{path} cannot be read") from exc
+
+
+def host_inputs(document, service):
+    """The host files one rendered service reads: its env files, bind-mounted files, and the files of the top-level
+    secrets and configs it uses. Digests only; never a value."""
+    unit = document["services"][service]
+    files = {}
+    for path in reference_paths(unit.get("env_file")):
+        files["env:" + path] = file_sha256(path.replace("$$", "$"))
+    for volume in unit.get("volumes") or []:
+        if isinstance(volume, dict) and volume.get("type") == "bind" and isinstance(volume.get("source"), str):
+            files["mount:" + volume["source"]] = file_sha256(volume["source"])
+    for kind in ("secrets", "configs"):
+        for entry in unit.get(kind) or []:
+            name = entry.get("source") if isinstance(entry, dict) else entry
+            top = (document.get(kind) or {}).get(name) or {}
+            if isinstance(top.get("file"), str):
+                files[kind + ":" + name] = file_sha256(top["file"])
+            elif top:
+                files[kind + ":" + name] = digest(top)
+    return files
+
+
+def service_definition(unit):
+    """The rendered service without what a release sets (image, build, the revision and input labels)."""
+    value = json.loads(json.dumps(unit))
+    for key in ("image", "build"):
+        value.pop(key, None)
+    labels = value.get("labels")
+    if isinstance(labels, dict):
+        value["labels"] = {key: label for key, label in labels.items() if key not in (REVISION_LABEL, INPUT_LABEL)}
+        if not value["labels"]:
+            value.pop("labels")
+    return value
+
+
+def service_inputs(document, service, built):
+    """`{digest, parts}` of one service: its target's build parts and its rendered definition and host files. `built` is
+    the target's `build_inputs` or None when they could not be read; then the digest is None (always recreated)."""
+    try:
+        host = digest(host_inputs(document, service))
+    except Unreadable:
+        host = None
+    parts = {**(built or {}), "compose": digest(service_definition(document["services"][service])), "host": host}
+    complete = built is not None and host is not None
+    return {"digest": INPUT_VERSION + digest(parts) if complete else None,
+            "parts": {name: parts.get(name) for name in INPUT_PARTS}}
+
+
+def recorded_inputs(state, project_name, current=None):
+    """`{service: {container, settings, digest, parts, revision}}` the current applied release recorded for a project's
+    services; empty without such a release."""
+    if current is None:
+        current = read(state / "current.json") if (state / "current.json").exists() else {}
+    if current.get("status") != "applied":
+        return {}
+    for item in (current.get("rollback") or {}).get("projects") or []:
+        if item.get("name") == project_name:
+            inputs = item.get("inputs") or {}
+            return {service: {**inputs[service], **identity, "revision": (item.get("kept") or {}).get(service, current["sha"])}
+                    for service, identity in (item.get("running") or {}).items() if service in inputs}
+    return {}
+
+
+def keep_decision(service, wanted, identity, label, recorded):
+    """Why `service` is recreated (the changed parts, or `unlabeled`), or None when its running container may stay:
+    the candidate's digest is known, the container carries it as its label, and the current release recorded that very
+    container with the same settings and digest (a label edited by hand matches no record)."""
+    if wanted["digest"] is None:
+        return ["unreadable"]
+    if not recorded or label is None:
+        return ["unlabeled"]
+    if (label != wanted["digest"] or recorded.get("digest") != label or recorded.get("container") != identity["container"]
+            or recorded.get("settings") != identity["settings"] or recorded.get("image") != identity["image"]):
+        changed = [name for name in INPUT_PARTS if (recorded.get("parts") or {}).get(name) != wanted["parts"].get(name)]
+        return changed or ["unlabeled"]
+    return None
 
 
 def names_revision(image, sha, dockerfile, recipe=None):
