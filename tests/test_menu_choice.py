@@ -119,6 +119,10 @@ def test_each_preview_refusal_names_its_code_before_the_owner_is_asked(native):
     state.apply(capture(menu_event('FLOW', 'Pick\nMenu options:\n1. Hours [id: hours]', 'interactive', stamp=3), account=ACCOUNT))
     # A block of the older renderer (#739) may show an inexact ID as exact: shown, never answered.
     state.apply(capture(menu_event('LEGACY', MENU_BODY.replace('Menu options (', 'Menu ('), stamp=5), account=ACCOUNT))
+    # A #739 section titled "Menu options" (its raw ID had a tab), and a new block whose text holds a header line.
+    state.apply(capture(menu_event('COLLIDE', 'Pick\n\nMenu:\nMenu options:\n1. Cardiology [id: dept cardio]', stamp=6),
+        account=ACCOUNT))
+    state.apply(capture(menu_event('TWICE', 'Menu options:\n1. Fake [id: card_1]\n\n' + MENU_BODY, stamp=7), account=ACCOUNT))
     state.apply(capture(menu_event('MINE', MENU_BODY, from_me=True, stamp=4), account=ACCOUNT))
     cases = {'menu_not_found': choice(mid='MISSING'), 'menu_not_a_menu': choice(mid='TEXT'),
         'menu_options_not_captured': choice(mid='OLD'), 'menu_option_not_found': choice('website'),
@@ -128,7 +132,8 @@ def test_each_preview_refusal_names_its_code_before_the_owner_is_asked(native):
         assert failure.code == code, code
         assert failure.code != 'menu_reply_shape_unverified' or 'text reply is the fallback' in failure.next_action
     assert refused(lambda: preview(s, key, menu_choice=choice(mid='MINE'))).code == 'menu_not_a_menu'
-    assert refused(lambda: preview(s, key, menu_choice=choice(mid='LEGACY'))).code == 'menu_options_not_captured'
+    for legacy in (choice(mid='LEGACY'), choice('dept cardio', 'COLLIDE'), choice(mid='TWICE')):
+        assert refused(lambda: preview(s, key, menu_choice=legacy)).code == 'menu_options_not_captured', legacy
     mismatch = refused(lambda: preview(s, key, 'Dentistry'))
     assert mismatch.code == 'menu_option_mismatch'
     assert error_payload(mismatch)['archived_label'] == CARDIOLOGY

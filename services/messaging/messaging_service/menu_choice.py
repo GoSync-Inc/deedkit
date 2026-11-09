@@ -71,12 +71,13 @@ def validate(value):
     return value['message_id'],value['option_id']
 
 
-def last_header(body):
-    """The last menu header line of an archived body, or None."""
-    found=None
-    for line in (body or '').split('\n'):
-        if HEADER.fullmatch(line):found=line
-    return found
+def exact_block(body):
+    """True when the body has one menu header line and it is this renderer's.
+
+    An older (#739) block with options always starts with its own "Menu" header, and its sender text (a section
+    title, the menu text) may hold any other header line; two header-shaped lines are never evidence."""
+    headers=[line for line in (body or '').split('\n') if HEADER.fullmatch(line)]
+    return len(headers)==1 and EXACT_HEADER.fullmatch(headers[0]) is not None
 
 
 def options(body):
@@ -138,7 +139,7 @@ def resolve(c,account,chat_id,chat,value,text):
         raise refusal('menu_not_a_menu')
     listed=options(menu['body'])
     # An older renderer's block may show an inexact ID as exact: only this renderer's block is evidence.
-    if listed is None or not EXACT_HEADER.fullmatch(last_header(menu['body'])):raise refusal('menu_options_not_captured')
+    if listed is None or not exact_block(menu['body']):raise refusal('menu_options_not_captured')
     chosen=[o for o in listed if o[2]==option_id]
     if not chosen:raise refusal('menu_option_not_found')
     if len(chosen)>1:raise refusal('menu_option_ambiguous')
