@@ -31,11 +31,24 @@ LEASE_GRACE_SECONDS=60
 STRUCTURE_LOCK=74509141  # serializes structure claims and deferrals; the enrichment claim keeps 74509139
 
 PPTX_MIME=DOCUMENT_MIMES['pptx']
-# The kind of a stored file (aliases a, f), as file_extract reads it: a PDF by its bytes (the poppler extractor), a
-# DOCX by its extraction profile, a PPTX (which has no extracted text: unsupported_format) by MIME or name.
+DOCX_MIME=DOCUMENT_MIMES['docx']
+# The kind of a stored file (aliases a, f), as file_extract reads it: a PDF by its bytes (the poppler extractor) or
+# its type and name, a DOCX by its type or name (file_extract.extraction_profile; the indexer stores the profile as
+# `docx:chars=<limit>`), a PPTX (which has no extracted text: unsupported_format) by type or name.
 KIND_SQL=("(CASE WHEN left(coalesce(f.extractor,''),8)='poppler-' OR a.mime='application/pdf'"
-    " OR right(lower(a.filename),4)='.pdf' THEN 'pdf' WHEN f.extraction_profile='docx' THEN 'docx'"
+    " OR right(lower(a.filename),4)='.pdf' THEN 'pdf'"
+    " WHEN split_part(coalesce(f.extraction_profile,''),':',1)='docx' OR a.mime='"+DOCX_MIME+"'"
+    " OR right(lower(a.filename),5)='.docx' THEN 'docx'"
     " WHEN a.mime='"+PPTX_MIME+"' OR right(lower(a.filename),5)='.pptx' THEN 'pptx' END)")
+
+
+def document_kind(row):
+    """KIND_SQL for a read's row (mime, filename, extractor): a cheap check before any structure query."""
+    mime,name,extractor=row.get('mime') or '',(row.get('filename') or '').lower(),row.get('extractor') or ''
+    if extractor.startswith('poppler-') or mime=='application/pdf' or name.endswith('.pdf'):return 'pdf'
+    if mime==DOCX_MIME or name.endswith('.docx'):return 'docx'
+    if mime==PPTX_MIME or name.endswith('.pptx'):return 'pptx'
+    return None
 
 
 def _number(key):
@@ -54,8 +67,10 @@ SCANNED=("("+KIND_SQL+"='pdf' AND coalesce("+_number('pages_processed')+",0)>0"
 def ineligible_sql(withheld,processable):
     """Why a file of these kinds is not sent (aliases a, m, f), or NULL. `withheld` is media_policy's expression (or
     'false'), `processable` file_lifecycle.PROCESSABLE_ORIGINAL; neither contains a '%'."""
+    # A PDF's page count must be known before its original leaves: file_extract omits `pages_total` when the PDF has
+    # more than 100 pages or more text than it reads, so a PDF without it counts as over the limit.
     return ("(CASE WHEN a.bytes>"+str(DOCUMENT_MAX_BYTES)+" THEN 'size_limit'"
-        " WHEN "+KIND_SQL+"='pdf' AND coalesce("+_number('pages_total')+",0)>"+str(DOCUMENT_MAX_PAGES)+" THEN 'page_limit'"
+        " WHEN "+KIND_SQL+"='pdf' AND f.state='ready' AND coalesce("+_number('pages_total')+","+str(DOCUMENT_MAX_PAGES+1)+")>"+str(DOCUMENT_MAX_PAGES)+" THEN 'page_limit'"
         " WHEN "+SCANNED+" THEN 'scanned_pdf'"
         " WHEN "+withheld+" THEN 'withheld'"
         " WHEN NOT "+processable+" THEN 'original_evicted'"
@@ -112,6 +127,10 @@ class StructureWork:
         self.accounts=list(worker.config['accounts'])
         self.paused_until=0.0  # monotonic: a backpressure or error pause lives in the lane's memory (and in next_due)
         self.swept_at=None
+        # The publication is refreshed before every main-lane pass; a pass is at most one job of the lane's kinds and
+        # one structure job. A worker that died without unpublishing stops counting as configured after this.
+        self.fresh_seconds=max([self.config['timeout_seconds'],
+            *(profile['timeout_seconds'] for profile in worker.config['profiles'].values())])+600
 
     # --- publication -------------------------------------------------------------------------------------------
     def publish(self,c,*,enabled=True):
@@ -121,8 +140,11 @@ class StructureWork:
                 clock_timestamp()+make_interval(secs=>%s))
             ON CONFLICT(account) DO UPDATE SET provider=excluded.provider,model=excluded.model,enabled=excluded.enabled,
                 paused_until=excluded.paused_until,observed_at=excluded.observed_at,expires_at=excluded.expires_at''',
-            [(account,self.config['provider'],self.config['model'],enabled,pause,pause,self.config['timeout_seconds']+120)
+            [(account,self.config['provider'],self.config['model'],enabled,pause,pause,self.fresh_seconds)
              for account in self.accounts])
+        # An account taken out of `accounts` is no longer served (one worker carries the structure key).
+        c.execute('''UPDATE structure_profiles SET enabled=false,observed_at=clock_timestamp()
+            WHERE enabled AND account<>ALL(%s)''',(self.accounts,))
 
     def publication(self,c,write):
         """A publication write inside the kinds' publication transaction, in its own savepoint: a database error here
@@ -325,8 +347,9 @@ def read_state(c,attachment_id):
     row=c.execute('SELECT '+KIND_SQL+' AS kind,'+TEXT_READY+' AS text_ready,f.state AS text_state,'
         +ineligible_sql(recognition_withheld(c),PROCESSABLE_ORIGINAL)+''' AS ineligible,
         s.state,s.error_code,s.attempts,s.next_due>clock_timestamp() AS waiting,s.source_digest=a.digest AS current,
-        sp.enabled AS account_enabled,sp.paused_until>clock_timestamp() AS paused,
-        EXISTS(SELECT FROM structure_profiles x WHERE x.enabled) AS configured
+        coalesce(sp.enabled AND sp.expires_at>clock_timestamp(),false) AS account_enabled,
+        sp.paused_until>clock_timestamp() AS paused,
+        EXISTS(SELECT FROM structure_profiles x WHERE x.enabled AND x.expires_at>clock_timestamp()) AS configured
         FROM attachment_text f JOIN attachments a ON a.id=f.attachment JOIN messages m ON m.id=a.message
         LEFT JOIN attachment_structure s ON s.attachment=a.id
         LEFT JOIN structure_profiles sp ON sp.account=m.account
@@ -370,7 +393,7 @@ def structured_response(response,state,found,offset):
     response['content']='structured'
     if found is None:
         state=state or {'state':'not_applicable','next_action':EXTRACTED_ACTION}
-        response.update(text='',content_chars=0,next_offset=None,source_spans=[],source_spans_truncated=False,
+        response.update(text='',content_chars=0,next_offset=None,source_spans=[],source_spans_truncated=False,truncated=False,
             empty_reason='structure_pending' if state['state']=='ready' else state['state'],
             next_action=state['next_action'] if state['state']!='ready' else PENDING_ACTION)
         for key in ('reason','failure_reason','retryable'):
@@ -385,7 +408,8 @@ def structured_response(response,state,found,offset):
     end=offset+len(text)
     metadata=found['metadata'] or {};coverage=metadata.get('coverage') or {}
     spans=[{'kind':'page',**span} for span in metadata.get('page_spans') or [] if span['end']>offset and span['start']<end]
-    response.update(text=text,content_chars=found['content_chars'],next_offset=end if end<found['content_chars'] else None,
+    # `truncated` is the selected content's, as for extracted and enriched reads, never today's text's.
+    response.update(text=text,truncated=found['truncated'],content_chars=found['content_chars'],next_offset=end if end<found['content_chars'] else None,
         source_spans=spans[:200],source_spans_truncated=len(spans)>200)
     response['content_coverage']={'retained_chars':found['content_chars'],'truncated':found['truncated'],
         'complete':not found['truncated'],'pages':coverage.get('pages'),'pages_with_text':coverage.get('pages_with_text'),

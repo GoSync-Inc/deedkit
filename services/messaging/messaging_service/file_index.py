@@ -659,13 +659,17 @@ def get_file_text(store, c, p, attachment_id, offset=0, limit=4000, *, content=N
             state = document_structure.read_state(c, row['attachment_id'])
             found = document_structure.read_text(c, row['attachment_id'], offset, limit) if state and state['state'] == 'ready' else None
             response = document_structure.structured_response(response, state, found, offset)
-        else:
-            # In a savepoint: a database without schema 76 (or any error here) leaves the read exactly as before.
+        elif document_structure.document_kind(row):
+            # Only a PDF, DOCX or PPTX pays for this lookup. In a savepoint: a database without schema 76 (or any
+            # error here) leaves the read exactly as before.
             try:
                 with c.transaction():
                     state = document_structure.read_state(c, row['attachment_id'])
             except psycopg.Error:
                 state = None
+        else:
+            state = None
+        if not structured:
             if state is not None:
                 response['structured_text'] = {'state': state['state'], 'next_action': state['next_action']}
     return serial({**response, **store.dataset(c, p)})

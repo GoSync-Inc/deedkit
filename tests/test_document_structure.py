@@ -38,13 +38,13 @@ def add_document(s, ident, kind='pdf', *, message='demo-tg-2', data=None, metada
         c.execute('INSERT INTO attachments(id,message,digest,filename,mime,bytes) VALUES(%s,%s,%s,%s,%s,%s)',
                   (ident, message, digest, filename, mime, size or len(data)))
         meta = metadata if metadata is not None else (
-            {'pages_total': 2, 'pages_processed': 2, 'ocr_pages': 0} if kind == 'pdf' else {})
+            {'pages_total': 2, 'pages_processed': 2, 'ocr_pages': 0, 'pdf_page_limit': 100} if kind == 'pdf' else {})
         ready = kind != 'pptx'
         assert c.execute('''UPDATE attachment_text SET state=%s,extractor=%s,extraction_profile=%s,extraction_metadata=%s,
             text_content=%s,error_code=%s,indexed_at=clock_timestamp() WHERE attachment=%s''',
             ('ready' if ready else 'unsupported',
              {'pdf': 'poppler-pdftotext-v2', 'docx': 'stdlib-docx-v1', 'text': 'stdlib-text-v1'}.get(kind),
-             {'docx': 'docx', 'text': 'text'}.get(kind, 'magic'), Jsonb(meta),
+             {'docx': 'docx', 'text': 'text'}.get(kind, 'magic') + ':chars=100000', Jsonb(meta),  # the indexer's form
              'Item B-2040 12.50' if ready else '', None if ready else 'unsupported_format', ident)).rowcount == 1
     return digest
 
@@ -201,7 +201,8 @@ def test_only_eligible_files_get_a_row(clean, tmp_path):
     for ident, kind in (('el-pdf', 'pdf'), ('el-docx', 'docx'), ('el-pptx', 'pptx'), ('el-text', 'text')):
         add_document(s, ident, kind)
     add_document(s, 'el-big', size=33 * 1024 ** 2)
-    add_document(s, 'el-pages', metadata={'pages_total': 101, 'pages_processed': 100, 'ocr_pages': 0})
+    # file_extract omits pages_total for a PDF of more than 100 pages (it reads 100 and marks the text truncated).
+    add_document(s, 'el-pages', metadata={'pages_processed': 100, 'ocr_pages': 0, 'pdf_page_limit': 100})
     add_document(s, 'el-scan', metadata={'pages_total': 2, 'pages_processed': 2, 'ocr_pages': 2})
     add_document(s, 'el-mixed', metadata={'pages_total': 2, 'pages_processed': 2, 'ocr_pages': 1})
     add_document(s, 'el-other', message='demo-wa-1')
@@ -426,6 +427,60 @@ def test_a_lost_lease_or_a_purge_during_the_job_writes_nothing(clean, tmp_path):
 
 
 # spec: ANYM-851
+def test_a_stop_during_a_structure_job_gives_it_back_without_its_attempt(clean, tmp_path):
+    s, _, _ = clean
+    add_document(s, 'stop-pdf')
+
+    def stopping(files, row, profile):
+        raise enrichment.WorkerStopping
+    w = EnrichmentWorker(s.pool.conninfo, s.files, write_config(tmp_path), processor=stopping)
+    assert w.structure.step() is True and w.requeueing is True
+    row = row_of(s, 'stop-pdf')
+    # The attempt is given back; the day's count stays spent, as the kinds' stop path keeps its budget.
+    assert (row['state'], row['attempts'], row['day_attempts'], row['error_code'], row['lease_token']) == (
+        'queued', 0, 1, 'worker_stopping', None)
+
+
+# spec: ANYM-851
+def test_a_stale_or_narrowed_publication_stops_counting_as_configured(clean, tmp_path):
+    s, _, _ = clean
+    add_document(s, 'fresh-pdf'); add_document(s, 'fresh-wa', message='demo-wa-1')
+    wide = make(s, write_config(tmp_path, accounts=['telegram-demo', 'whatsapp-demo-1']))
+    with s.pool.connection() as c:
+        assert ds.read_state(c, 'fresh-wa')['state'] == 'structure_pending'
+    # The worker restarts with one account fewer: that account is no longer served.
+    make(s, write_config(tmp_path))
+    with s.pool.connection() as c:
+        assert ds.read_state(c, 'fresh-wa') == {'state': 'not_eligible', 'reason': 'account_not_configured',
+                                                'next_action': ds.EXTRACTED_ACTION}
+        assert ds.read_state(c, 'fresh-pdf')['state'] == 'structure_pending'
+        # A worker that died without unpublishing (and came back without the key) stops counting once stale.
+        c.execute("UPDATE structure_profiles SET expires_at=clock_timestamp()-interval '1 second'")
+        assert ds.read_state(c, 'fresh-pdf')['state'] == 'processing_not_configured'
+    assert wide.structure.fresh_seconds == 150 + 600
+
+
+# spec: ANYM-851
+def test_a_docx_and_a_pptx_the_real_indexer_stored_are_found(clean, tmp_path):
+    from test_file_index import add_file, drain, office, worker_for
+    s, _, _ = clean
+    body = '<w:document xmlns:w="urn:w"><w:p><w:r><w:t>Позиция B-2040</w:t></w:r></w:p></w:document>'
+    add_file(s, 'real-docx', 'demo-tg-2', office({'word/document.xml': body}), 'price.docx', 'application/octet-stream')
+    add_file(s, 'real-pptx', 'demo-tg-2', office({'ppt/presentation.xml': '<p:presentation xmlns:p="urn:p"/>'}),
+             'deck.pptx', ds.PPTX_MIME)
+    drain(worker_for(s))
+    with s.pool.connection() as c:
+        stored = {r['attachment']: r for r in c.execute(
+            "SELECT attachment,state,extraction_profile FROM attachment_text WHERE attachment IN ('real-docx','real-pptx')")}
+    assert stored['real-docx']['state'] == 'ready' and stored['real-docx']['extraction_profile'].startswith('docx:')
+    assert stored['real-pptx']['state'] == 'unsupported'
+    w = make(s, write_config(tmp_path))
+    w.structure.sweep()
+    assert row_of(s, 'real-docx')['state'] == row_of(s, 'real-pptx')['state'] == 'queued'
+    assert {w.structure.claim()['document_kind'], w.structure.claim()['document_kind']} == {'docx', 'pptx'}
+
+
+# spec: ANYM-851
 def test_a_hung_mini_ends_at_the_timeout_plus_ten_seconds(clean, tmp_path, monkeypatch):
     s, _, _ = clean
     add_document(s, 'hung-pdf')
@@ -475,6 +530,8 @@ def test_a_structure_database_error_pauses_structure_work_only(clean, tmp_path, 
     assert w.structure.step() is False
     logged = capsys.readouterr().err
     assert '"structure_paused"' in logged and 'err-pdf' not in logged and 'denial' not in logged
+    from messaging_service.telemetry import safe_event
+    assert safe_event(psycopg.errors.InsufficientPrivilege('x'), 'enricher', 'structure_failed') is not None
     lane = EnrichmentWorker(s.pool.conninfo, s.files, cfg, processor=Mini().processor(), kinds={'audio'})
     assert lane.structure is None and lane.once() is True and enrichment_state(s, 'lane-audio') == 'ready'
     monkeypatch.undo()

@@ -532,7 +532,9 @@ def lean_file_text(result):
         output['content_coverage']={k:v for k,v in result['content_coverage'].items()
             if k in ('retained_chars','truncated','complete','pages','pages_with_text','tables','headings')}
     if isinstance(result.get('provenance'),dict):
-        output['provenance']={k:v for k,v in result['provenance'].items() if k in PROVENANCE_KEYS and v is not None}
+        # ANYM-851: a structured read keeps the engine's model revisions and its conversion time too.
+        keys=PROVENANCE_KEYS+(('models','indexed_at') if result.get('content')=='structured' else ())
+        output['provenance']={k:v for k,v in result['provenance'].items() if k in keys and v is not None}
     spans=[s for s in result.get('source_spans') or [] if s.get('kind') in ('page','sheet')]
     if spans:output['source_spans']=spans
     if result.get('source_spans_truncated'):output['source_spans_truncated']=True
