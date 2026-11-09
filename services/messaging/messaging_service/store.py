@@ -130,8 +130,11 @@ def migrate_expand(dsn, plan, *, root=None, before_commit=None, application_name
     connection, or nothing (ANYM-596). Never schema.sql, lock_replay_tables or the ACL repair of migrate().
     A plan `identity` (EXPAND_IDENTITY of the database deploy copied) must be what this connection reached before
     anything else runs (ANYM-449). Raises ExpandError with a fixed code; `before_commit(c)` is a test hook.
-    A `timing` dict gets `transaction_ms` after the commit: monotonic milliseconds, rounded up, from before the
-    connection opens to the commit's return, so it covers every lock the transaction held until its release."""
+    A `timing` dict gets `transaction_ms` after the commit: monotonic milliseconds, rounded up, from before the first
+    pending statement to the commit's return, so it covers every lock a migration statement or role grant takes, its
+    wait included, until the commit releases it. The connection, session setup, identity, advisory lock and ledger and
+    catalog reads before it are left out: they hold only ACCESS SHARE on probe_metadata, archive_migrations and the
+    catalogs, which no application read or write waits for (fix-rehearsal-timer-11-09)."""
     from . import migration_rollout as rollout
     root=Path(root) if root else Path(__file__).parent
     files={int(p.name[:3]):p for p in root.joinpath('migrations').glob('[0-9][0-9][0-9]_*.sql')}
@@ -156,7 +159,6 @@ def migrate_expand(dsn, plan, *, root=None, before_commit=None, application_name
     pending=[(v,files[v].read_bytes()) for v in sorted(files) if base<v<=target]
 
     def run():
-        started=time.monotonic()
         c=expand_connection(dsn,application_name)
         try:
             if identity is not None and c.execute(EXPAND_IDENTITY).fetchone()['identity']!=identity:
@@ -185,6 +187,7 @@ def migrate_expand(dsn, plan, *, root=None, before_commit=None, application_name
                 created=following
             for old,new in appended.values():
                 if rollout.role_class(old,new,created,tables=inventory)!='additive': raise ExpandError('role_not_additive')
+            started=time.monotonic()
             for version,data in pending:
                 c.execute(data.decode())
                 c.execute('INSERT INTO archive_migrations(version,sha256) VALUES(%s,%s)',(version,hashlib.sha256(data).hexdigest()))

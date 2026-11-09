@@ -174,6 +174,25 @@ def test_the_transaction_time_runs_to_the_commit_s_return_while_its_locks_are_he
     assert ledger(dsn) == (NEXT, 1, 1)
 
 
+# spec: ANYM-449
+def test_the_transaction_time_starts_at_the_first_pending_statement_not_at_the_connection(db, tmp_path, monkeypatch):
+    # fix-rehearsal-timer-11-09: the connection, session setup and ledger reads hold no lock an application waits
+    # for, yet counted in 068's 764 ms (236 ms margin). A 1.2 s connection must not count; 0.3 s inside the batch must.
+    _, dsn = db
+    root = package(tmp_path)
+    opened = store_module.expand_connection
+    def slow_connection(*args):
+        c = opened(*args)
+        time.sleep(1.2)
+        return c
+    monkeypatch.setattr(store_module, 'expand_connection', slow_connection)
+    timing = {}
+    found = store_module.migrate_expand(dsn, plan_for(root, RUNTIME_SCHEMA, NEXT), root=root, timing=timing,
+                                        before_commit=lambda c: c.execute('SELECT pg_sleep(0.3)'))
+    assert found == {'schema_version': NEXT} and ledger(dsn) == (NEXT, 1, 1)
+    assert 300 <= timing['transaction_ms'] < 1200
+
+
 # spec: ANYM-596
 def test_the_entry_point_opens_one_connection_under_the_budgets_and_no_pool(db, tmp_path, monkeypatch):
     # Astra r1 F5: no application pool beside the bounded connection.
