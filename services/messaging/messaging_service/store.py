@@ -925,7 +925,7 @@ class Store:
             # Authorization remains READ COMMITTED. Re-read source evidence
             # after pinning the view, then reject changes around all scans.
             anchor=self.message(c,p,message_id)
-            enrich(c,[anchor],p,with_body=bool(body_format))
+            enrich(c,[anchor],p,with_body=bool(body_format),media=True)
         return anchor,snapshot
 
     @staticmethod
@@ -974,7 +974,7 @@ class Store:
             for row in [*rows,anchor]:cap_display_text(row,cap)
         else:
             rows.sort(key=lambda r:(r['sent_at'],r['id']))
-            enrich(c,rows,p,with_body=bool(body_format));enrich(c,[anchor],p,with_body=bool(body_format))
+            enrich(c,rows,p,with_body=bool(body_format));enrich(c,[anchor],p,with_body=bool(body_format),media=True)
             shape_messages(rows,compact=compact,body_chars=cap)
             shape_messages([anchor],compact=compact,body_chars=cap)
         if body_format:
