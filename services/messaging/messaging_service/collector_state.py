@@ -510,8 +510,9 @@ class CollectorState:
                 value['history']=history;self._save_operations(c,value)
 
     def checkpoint(self,chat,*,high_water=None,history_before=None,exhausted=False,initialized=False,
-                   window_complete=False,head_complete=False):
-        # Caller advances only after all captures in a provider page committed.
+                   window_complete=False,head_complete=False,head_verified_at=None):
+        # Caller advances only after all captures in a provider page committed. head_verified_at: the time a
+        # provider dialog catalog showed no message above the cursor (a skipped head page, never later than now).
         with self.archive.store.pool.connection() as c:
             self.archive.fence(c,self.account,self.lease)
             c.execute('''UPDATE collector_chats SET high_water=greatest(high_water,coalesce(%s,0)),
@@ -519,11 +520,13 @@ class CollectorState:
                     ELSE least(coalesce(history_before,%s),%s) END,
                 history_exhausted=history_exhausted OR %s,initialized=initialized OR %s,
                 window_complete=window_complete OR %s,
-                last_head_scan_at=CASE WHEN %s THEN clock_timestamp() ELSE last_head_scan_at END,
+                last_head_scan_at=CASE WHEN %s THEN clock_timestamp()
+                    WHEN %s::timestamptz IS NOT NULL THEN greatest(last_head_scan_at,least(%s::timestamptz,clock_timestamp()))
+                    ELSE last_head_scan_at END,
                 last_error_code=NULL,
                 last_scan_at=clock_timestamp() WHERE account=%s AND provider_chat=%s''',
                 (high_water,history_before,history_before,history_before,exhausted,initialized,
-                 window_complete,head_complete,self.account,chat))
+                 window_complete,head_complete,head_verified_at,head_verified_at,self.account,chat))
 
     def head_capped(self,count):
         """How many chats ended the last whole reconcile pass at the head page cap."""
