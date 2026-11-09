@@ -123,8 +123,9 @@ CHANGES = ('none', 'at_floor', 'after_floor', 'deleted_after', 'purged_after', '
 changes = itertools.count()
 
 
-def changing(page_first, change, pick):
-    """`page_first` that, once per call chain, writes `change` in the call's own transaction after its reads."""
+def changing(page_first, change, pick, n, now):
+    """`page_first` that, once per call chain, writes `change` (message h-x-<n>) in the call's own transaction after its
+    reads."""
     done = []
     def wrapped(c, p, clauses, args, **kw):
         result = page_first(c, p, clauses, args, **kw)
@@ -140,8 +141,7 @@ def changing(page_first, change, pick):
             (result['found']+result['excluded'],)).fetchall()]
         if not outside:return result
         chat = outside[pick % len(outside)]
-        n = next(changes)
-        at = {'at_floor': floor, 'arrives_now': datetime.now(timezone.utc)}.get(change, floor+timedelta(seconds=30))
+        at = {'at_floor': floor, 'arrives_now': now}.get(change, floor+timedelta(seconds=30))
         c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction,deleted,purged)
             SELECT %s,account,id,%s,'peer',%s,%s,'incoming',%s,%s FROM chats WHERE id=%s''',
             ('h-x-'+str(n), 'x-'+str(n), '' if change == 'purged_after' else 'synthetic late text', at,
@@ -168,27 +168,34 @@ def proven_pages(s, c, p, plan, *, limit, view):
     return pages, measured.seen
 
 
+# Chats that all have messages, so most archives take the page-first plan and reach the proof.
+BUSY = st.tuples(st.sampled_from(('tg-private', 'tg-group', 'wa-group')), st.lists(MESSAGE, min_size=1, max_size=4))
+
+
 # spec: ANYM-950
-@settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow])
-@given(st.lists(CHAT, max_size=12), st.lists(PAIR, max_size=3), st.integers(1, 3), st.sampled_from(('conversation', 'archive')),
-       st.booleans(), st.sampled_from(CHANGES), st.integers(0, 50), st.data())
-def test_bounded_page_proof_answers_and_decides_as_todays_proof(seeded, chats, pairs, limit, view, restricted, change, pick,
-        data):
+@settings(max_examples=25, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow])
+@given(st.lists(BUSY, min_size=5, max_size=12), st.lists(PAIR, max_size=3), st.integers(1, 3),
+       st.sampled_from(('conversation', 'archive')), st.booleans(), st.integers(0, 50), st.data())
+def test_bounded_page_proof_answers_and_decides_as_todays_proof(seeded, chats, pairs, limit, view, restricted, pick, data):
     from page_proof_legacy import with_legacy_proof
     s, a, _ = seeded
     ids = build(s, chats, pairs)
     token = a
-    if restricted and ids:
+    if restricted:
         allowed = data.draw(st.lists(st.sampled_from(ids), min_size=1, unique=True))
         token = s.issue_key('bounded-proof-'+str(next(keys)), ['telegram-demo', 'whatsapp-demo-1'], chats=allowed)
-    real = chat_queries._page_first
+    real, now = chat_queries._page_first, datetime.now(timezone.utc)
     with s.authorized(token, 'list_chats') as (c, p):
-        got, verdicts = proven_pages(s, c, p, changing(real, change, pick), limit=limit, view=view)
-        old, old_verdicts = proven_pages(s, c, p, with_legacy_proof(changing(real, change, pick)), limit=limit, view=view)
-    # The same pages, and in every page statement the same verdict as today's proof (a failed one reran per chat).
-    assert got == old and verdicts == old_verdicts
-    if restricted and ids:
-        assert {r['id'] for page in got for r in page['items']} <= set(allowed)
+        # Every write on the same archive, each rolled back: both proofs see the same rows in each page statement.
+        for change in CHANGES:
+            n = next(changes)
+            got, verdicts = proven_pages(s, c, p, changing(real, change, pick, n, now), limit=limit, view=view)
+            old, old_verdicts = proven_pages(s, c, p, with_legacy_proof(changing(real, change, pick, n, now)), limit=limit,
+                view=view)
+            # The same pages, and in every page statement the same verdict as today's proof (a failed one reran per chat).
+            assert got == old and verdicts == old_verdicts, change
+            if restricted:
+                assert {r['id'] for page in got for r in page['items']} <= set(allowed)
 
 
 # spec: ANYM-878
