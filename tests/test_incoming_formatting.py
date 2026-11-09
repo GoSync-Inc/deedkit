@@ -232,6 +232,19 @@ def test_sender_completion_does_not_hide_formatting_conflicts(archive):
     assert s.get_context(key,mid)['message']['evidence']['active_conflicts']==1
 
 
+# spec: ANYM-157
+def test_sender_completion_without_captured_formatting_keeps_the_known_formatting(archive):
+    # A capture with no native entities completes the sender: its new revision inherits the retained known
+    # formatting instead of erasing it (Archive._ingest_classify, inherited_format).
+    ar,s,key,_=archive
+    mid=ar.ingest(event(sender='',direction='outgoing',metadata={'chat_type':'private'},formatting=proof()))['message']
+    candidate=event(sender='42',direction='outgoing',
+        metadata={'chat_type':'private','sender_identity_basis':'authenticated_self'})
+    assert ar.ingest(candidate)['outcome']=='edited'
+    row=s.get_context(key,mid)['message']
+    assert row['sender']=='42' and row['revision']==2 and row['formatting']==public_proof()
+
+
 def test_current_reads_align_exact_revision_and_acl(archive):
     ar,s,key,other=archive
     mid=ar.ingest(event(formatting=proof()))['message']

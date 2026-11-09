@@ -58,6 +58,18 @@ class _LifecycleFirst(Exception):
     """An attachment-free ingest found attachment rows: its transaction rolls back and ingest restarts lifecycle-first."""
 
 
+class _Observation:
+    """One envelope on its way through Archive._ingest's stages (W5-11): what an earlier stage leaves for a later one.
+    A stage sets only its own slots, so a read of one a stage has not set fails loudly."""
+    __slots__=('e','captured','receipt','aid','cid','mid','previous','old','retained','retained_snapshot','sender_alias',
+        'content','updated','outcome','sender_completed','sender_device_only','unreadable','jitter_version',
+        'body_completed','web_preview_refresh','old_format','link_completed','attachment_completed',
+        'inherited_format','revision')
+    def __init__(self,e):
+        self.e=self.captured=e; self.receipt=hashlib.sha256(canonical(e)).hexdigest()
+        self.aid=e['account']; self.cid=stable_id('chat',self.aid,e['chat']); self.mid=stable_id('msg',self.aid,e['chat'],e['provider_id'])
+
+
 # A WhatsApp user identity with and without its device number (`<user>:<device>@lid`) is one
 # sender, as whatsmeow's JID.ToNonAD() reads it. Used for comparison only; senders stay raw.
 WHATSAPP_USER=re.compile(r'([0-9]+)(?::[0-9]+)?@(lid|c\.us)')
@@ -412,147 +424,202 @@ class Archive:
         return result
 
     def _ingest(self,e,lease,identity_observations,replay,*,lifecycle):
-        captured=e; receipt=hashlib.sha256(canonical(e)).hexdigest()
-        aid=e['account']; cid=stable_id('chat',aid,e['chat']); mid=stable_id('msg',aid,e['chat'],e['provider_id'])
+        # W5-11: one transaction on one connection; its stages run in this order, each on the observation `o`.
+        o=_Observation(e)
         with self.store.pool.connection() as c:
-            if lifecycle:
-                from .file_lifecycle import lifecycle_lock
-                lifecycle_lock(c)
-            # One bounded transaction per account; no provider/network/file work while holding it.
-            c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('archive:'+aid,))
-            # Attachment rows are added only under this account lock (finish_media), so none appears before commit.
-            # A new message has none (the row comes first): its primary key lookup skips the attachments scan.
-            if not lifecycle and c.execute('''SELECT 1 FROM messages m WHERE m.id=%s
+            if (early:=self._ingest_admit(c,o,lease,lifecycle)) is not None:return early
+            if (early:=self._ingest_dedupe(c,o,identity_observations,replay)) is not None:return early
+            self._ingest_chat(c,o,replay)
+            self._ingest_classify(c,o,replay)
+            if o.outcome in ('created','edited','deleted'):
+                self._ingest_revision(c,o)
+                self._ingest_attachments(c,o)
+            elif o.outcome=='unchanged' and not o.jitter_version:
+                c.execute('UPDATE messages SET provider_updated_at=greatest(provider_updated_at,%s) WHERE id=%s',(o.updated,o.mid))
+            self._ingest_sender_profile(c,o)
+            self._ingest_metadata(c,o)
+            self._ingest_group_title(c,o)
+            self._ingest_events(c,o)
+            self._ingest_conflicts(c,o)
+            self._ingest_status(c,o)
+            return {'outcome':o.outcome,'message':o.mid}
+
+    def _ingest_admit(self,c,o,lease,lifecycle):
+        """Locks, collector fence and collection policy: the `excluded` result, else None."""
+        e,aid,mid=o.e,o.aid,o.mid
+        if lifecycle:
+            from .file_lifecycle import lifecycle_lock
+            lifecycle_lock(c)
+        # One bounded transaction per account; no provider/network/file work while holding it.
+        c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('archive:'+aid,))
+        # Attachment rows are added only under this account lock (finish_media), so none appears before commit.
+        # A new message has none (the row comes first): its primary key lookup skips the attachments scan.
+        if not lifecycle and c.execute('''SELECT 1 FROM messages m WHERE m.id=%s
                     AND EXISTS(SELECT FROM attachments a WHERE a.message=m.id)''',(mid,)).fetchone():
-                raise _LifecycleFirst
-            self.fence(c,aid,lease)
-            policy=c.execute('''SELECT p.*,a.platform FROM account_policies p JOIN accounts a ON a.id=p.account
+            raise _LifecycleFirst
+        self.fence(c,aid,lease)
+        policy=c.execute('''SELECT p.*,a.platform FROM account_policies p JOIN accounts a ON a.id=p.account
                 WHERE account=%s''',(aid,)).fetchone()
-            if not policy or not policy['enabled'] or policy['platform']!=e['platform']:
-                raise ValueError('collection_disabled')
-            if e['chat'] in policy['exclude_chats'] or (not policy['discover_chats'] and e['chat'] not in policy['include_chats']):
-                return {'outcome':'excluded'}
-            # Delete events can arrive before history imports. A chat-less
-            # Telegram deletion applies only to its non-channel ID namespace.
-            tombstone=c.execute('''SELECT max(t.observed_at) AS at FROM provider_tombstones t
+        if not policy or not policy['enabled'] or policy['platform']!=e['platform']:
+            raise ValueError('collection_disabled')
+        if e['chat'] in policy['exclude_chats'] or (not policy['discover_chats'] and e['chat'] not in policy['include_chats']):
+            return {'outcome':'excluded'}
+        return None
+
+    @staticmethod
+    def _ingest_dedupe(c,o,identity_observations,replay):
+        """Tombstone, identity fence and receipt lookup: the `duplicate` result, else None."""
+        e,aid,mid=o.e,o.aid,o.mid
+        # Delete events can arrive before history imports. A chat-less
+        # Telegram deletion applies only to its non-channel ID namespace.
+        tombstone=c.execute('''SELECT max(t.observed_at) AS at FROM provider_tombstones t
                 WHERE t.account=%s AND t.provider_id=%s AND (t.provider_chat=%s OR
                 (t.provider_chat='' AND EXISTS(SELECT 1 FROM collector_chats cc
                     WHERE cc.account=t.account AND cc.provider_chat=%s AND cc.peer_kind IN ('user','chat'))))''',
-                (aid,e['provider_id'],e['chat'],e['chat'])).fetchone()['at']
-            if tombstone and not e['deleted']:
-                e={**e,'deleted':True,'body':'','media':[],
-                   'updated_at':max(tombstone,datetime.fromisoformat(e['updated_at'])).isoformat()}
-                if 'formatting' in e:e['formatting']=unknown_formatting()
-                if {'contact','buttons','location'}&set(e.get('metadata',{})):
-                    e['metadata']={k:v for k,v in e['metadata'].items() if k not in ('contact','buttons','location')}
-            if (identity_observations and not e['deleted']
-                    and c.execute('SELECT 1 FROM messages WHERE id=%s AND NOT deleted',(mid,)).fetchone()):
-                # A capture's identity evidence that contradicts a recorded pair is kept as a fence
-                # before anything else, also for a duplicate receipt (ANYM-559). As for `record`, a
-                # deleted or tombstoned message supplies no new evidence.
-                from .whatsapp_identity import fence as fence_identity
-                fence_identity(c,aid,mid,identity_observations)
-            previous=c.execute('SELECT outcome FROM ingest_receipts WHERE digest=%s',(receipt,)).fetchone()
-            if previous and not replay: return {'outcome':'duplicate','message':mid}
-            chat_type=e.get('metadata',{}).get('chat_type')
-            if chat_type=='unknown':chat_type=None
-            # A WhatsApp observation that could not be read (kind `unknown`, no text, no attachment)
-            # may create its chat but never rewrites the chat's title or type.
-            unreadable_shape=whatsapp_unreadable_shape(e)
-            title=e['chat_title']
-            if e['platform']=='whatsapp' and 'group_change' not in e.get('metadata',{}) and group_title_kept(c,aid,cid,e['chat'],title,e['sent_at']):
-                title=e['chat']
-            # So does a stored receipt's replay: the chat row may have moved on since (ANYM-796).
-            if unreadable_shape or replay:c.execute('''INSERT INTO chats(id,account,title,provider_chat,chat_type)
+            (aid,e['provider_id'],e['chat'],e['chat'])).fetchone()['at']
+        if tombstone and not e['deleted']:
+            e={**e,'deleted':True,'body':'','media':[],
+               'updated_at':max(tombstone,datetime.fromisoformat(e['updated_at'])).isoformat()}
+            if 'formatting' in e:e['formatting']=unknown_formatting()
+            if {'contact','buttons','location'}&set(e.get('metadata',{})):
+                e['metadata']={k:v for k,v in e['metadata'].items() if k not in ('contact','buttons','location')}
+            o.e=e
+        if (identity_observations and not e['deleted']
+                and c.execute('SELECT 1 FROM messages WHERE id=%s AND NOT deleted',(mid,)).fetchone()):
+            # A capture's identity evidence that contradicts a recorded pair is kept as a fence
+            # before anything else, also for a duplicate receipt (ANYM-559). As for `record`, a
+            # deleted or tombstoned message supplies no new evidence.
+            from .whatsapp_identity import fence as fence_identity
+            fence_identity(c,aid,mid,identity_observations)
+        o.previous=c.execute('SELECT outcome FROM ingest_receipts WHERE digest=%s',(o.receipt,)).fetchone()
+        if o.previous and not replay: return {'outcome':'duplicate','message':mid}
+        return None
+
+    @staticmethod
+    def _ingest_chat(c,o,replay):
+        e,aid,cid=o.e,o.aid,o.cid
+        chat_type=e.get('metadata',{}).get('chat_type')
+        if chat_type=='unknown':chat_type=None
+        # A WhatsApp observation that could not be read (kind `unknown`, no text, no attachment)
+        # may create its chat but never rewrites the chat's title or type.
+        unreadable_shape=whatsapp_unreadable_shape(e)
+        title=e['chat_title']
+        if e['platform']=='whatsapp' and 'group_change' not in e.get('metadata',{}) and group_title_kept(c,aid,cid,e['chat'],title,e['sent_at']):
+            title=e['chat']
+        # So does a stored receipt's replay: the chat row may have moved on since (ANYM-796).
+        if unreadable_shape or replay:c.execute('''INSERT INTO chats(id,account,title,provider_chat,chat_type)
                 VALUES(%s,%s,%s,%s,%s) ON CONFLICT(id) DO NOTHING''',(cid,aid,title,e['chat'],chat_type))
-            else:c.execute('''INSERT INTO chats(id,account,title,provider_chat,chat_type) VALUES(%s,%s,%s,%s,%s)
+        else:c.execute('''INSERT INTO chats(id,account,title,provider_chat,chat_type) VALUES(%s,%s,%s,%s,%s)
                 ON CONFLICT(id) DO UPDATE SET
                 title=CASE WHEN excluded.title<>%s AND excluded.title<>'' THEN excluded.title ELSE chats.title END,
                 provider_chat=excluded.provider_chat,chat_type=coalesce(excluded.chat_type,chats.chat_type)
                 WHERE (excluded.title<>%s AND excluded.title<>'' AND chats.title<>excluded.title)
                     OR chats.provider_chat IS DISTINCT FROM excluded.provider_chat
                     OR (excluded.chat_type IS NOT NULL AND chats.chat_type IS DISTINCT FROM excluded.chat_type)''',
-                      (cid,aid,title,e['chat'],chat_type,e['chat'],e['chat']))
-            old=c.execute('SELECT * FROM messages WHERE id=%s FOR UPDATE',(mid,)).fetchone()
-            # One WhatsApp sender in its phone-number and LID forms (a fenced pair this account recorded)
-            # or an unknown (empty) candidate sender is the retained sender for every comparison below:
-            # the receipt keeps the raw value, a revision the retained one. At the retained provider
-            # version it lifts only the sender difference (ANYM-559). One rule per field: with another
-            # sent time as well (even ANYM-558's jitter) the observation stays a conflict.
-            sender_alias=bool(old and e['platform']=='whatsapp' and old['sender'] and e['sender']!=old['sender']
-                and not old['deleted'] and old['sent_at']==datetime.fromisoformat(e['sent_at']))
-            if sender_alias and e['sender']:
-                from .whatsapp_identity import same_sender
-                sender_alias=same_sender(c,aid,old['sender'],e['sender'])
-            if sender_alias:e={**e,'sender':old['sender']}
-            content=fingerprint(e); updated=datetime.fromisoformat(e['updated_at'])
-            retained=None;retained_snapshot=None
-            if old:
-                retained=c.execute('SELECT snapshot FROM message_revisions WHERE message=%s AND revision=%s',
-                    (mid,old['revision'])).fetchone()
-                retained_snapshot=retained['snapshot'] if retained else None
-            (outcome,sender_completed,sender_device_only,unreadable,sent_at_jitter,jitter_version,body_completed,
-             web_preview_refresh,known_candidate,known_retained,old_format,link_completed,attachment_completed)=ingest_outcome(old,e,retained_snapshot,sender_alias,
-                effective_buttons(c,mid,old,retained_snapshot))
-            if replay and outcome!='edited':raise ValueError('replay_not_accepted')
-            if link_completed and outcome=='edited':
-                # The same provider version: the new revision keeps the retained keyboard, as a same-version
-                # observation does (ANYM-658). Metadata is outside the content hash.
-                kept=effective_buttons(c,mid,old,retained_snapshot)
-                metadata={k:v for k,v in (e.get('metadata') or {}).items() if k!='buttons'}
-                if kept is not None:metadata['buttons']=kept
-                e={k:v for k,v in e.items() if k!='metadata'}
-                if metadata:e['metadata']=metadata
-            # An incomplete observation of the same retained provider body must
-            # not erase known formatting, including authenticated sender repair.
-            inherited_format=bool(old and known_retained and not known_candidate and not e['deleted']
-                and (old['content_hash']==content or sender_completed or sent_at_jitter))
-            if inherited_format:e={**e,'formatting':old_format}
-            if outcome in ('created','edited','deleted'):
-                revision=old['revision']+1 if old else 1
-                c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,revision,
+                  (cid,aid,title,e['chat'],chat_type,e['chat'],e['chat']))
+
+    @staticmethod
+    def _ingest_classify(c,o,replay):
+        """The stored message under its row lock and the observation's outcome against its retained revision."""
+        e,aid,mid=o.e,o.aid,o.mid
+        old=o.old=c.execute('SELECT * FROM messages WHERE id=%s FOR UPDATE',(mid,)).fetchone()
+        # One WhatsApp sender in its phone-number and LID forms (a fenced pair this account recorded)
+        # or an unknown (empty) candidate sender is the retained sender for every comparison below:
+        # the receipt keeps the raw value, a revision the retained one. At the retained provider
+        # version it lifts only the sender difference (ANYM-559). One rule per field: with another
+        # sent time as well (even ANYM-558's jitter) the observation stays a conflict.
+        sender_alias=bool(old and e['platform']=='whatsapp' and old['sender'] and e['sender']!=old['sender']
+            and not old['deleted'] and old['sent_at']==datetime.fromisoformat(e['sent_at']))
+        if sender_alias and e['sender']:
+            from .whatsapp_identity import same_sender
+            sender_alias=same_sender(c,aid,old['sender'],e['sender'])
+        if sender_alias:e={**e,'sender':old['sender']}
+        o.sender_alias=sender_alias
+        content=o.content=fingerprint(e); o.updated=datetime.fromisoformat(e['updated_at'])
+        retained=None;retained_snapshot=None
+        if old:
+            retained=c.execute('SELECT snapshot FROM message_revisions WHERE message=%s AND revision=%s',
+                (mid,old['revision'])).fetchone()
+            retained_snapshot=retained['snapshot'] if retained else None
+        o.retained=retained;o.retained_snapshot=retained_snapshot
+        (o.outcome,o.sender_completed,o.sender_device_only,o.unreadable,sent_at_jitter,o.jitter_version,o.body_completed,
+         o.web_preview_refresh,known_candidate,known_retained,o.old_format,o.link_completed,o.attachment_completed)=ingest_outcome(old,e,retained_snapshot,sender_alias,
+            effective_buttons(c,mid,old,retained_snapshot))
+        if replay and o.outcome!='edited':raise ValueError('replay_not_accepted')
+        if o.link_completed and o.outcome=='edited':
+            # The same provider version: the new revision keeps the retained keyboard, as a same-version
+            # observation does (ANYM-658). Metadata is outside the content hash.
+            kept=effective_buttons(c,mid,old,retained_snapshot)
+            metadata={k:v for k,v in (e.get('metadata') or {}).items() if k!='buttons'}
+            if kept is not None:metadata['buttons']=kept
+            e={k:v for k,v in e.items() if k!='metadata'}
+            if metadata:e['metadata']=metadata
+        # An incomplete observation of the same retained provider body must
+        # not erase known formatting, including authenticated sender repair.
+        o.inherited_format=bool(old and known_retained and not known_candidate and not e['deleted']
+            and (old['content_hash']==content or o.sender_completed or sent_at_jitter))
+        if o.inherited_format:e={**e,'formatting':o.old_format}
+        o.e=e
+
+    @staticmethod
+    def _ingest_revision(c,o):
+        """A created, edited or deleted outcome: the message row and its new immutable revision."""
+        e,aid,cid,mid,old=o.e,o.aid,o.cid,o.mid,o.old
+        revision=o.revision=old['revision']+1 if old else 1
+        c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,revision,
                     deleted,direction,provider_updated_at,content_hash) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT(id) DO UPDATE SET sender=excluded.sender,body=excluded.body,revision=excluded.revision,
                     deleted=excluded.deleted,provider_updated_at=excluded.provider_updated_at,content_hash=excluded.content_hash''',
-                    (mid,aid,cid,e['provider_id'],e['sender'],e['body'],e['sent_at'],revision,e['deleted'],
-                     e['direction'],updated,content))
-                snapshot={**e,'message':mid,'provider_chat':e['chat'],'chat':cid,'revision':revision}
-                c.execute('INSERT INTO message_revisions(message,revision,snapshot) VALUES(%s,%s,%s)',
-                          (mid,revision,Jsonb(snapshot)))
-                media_ids=[]
-                for descriptor in e['media']:
-                    jid=stable_id('file',mid,hashlib.sha256(canonical(descriptor)).hexdigest())
-                    media_ids.append(jid)
-                    c.execute('''INSERT INTO media_jobs(id,account,message,descriptor) VALUES(%s,%s,%s,%s)
+            (mid,aid,cid,e['provider_id'],e['sender'],e['body'],e['sent_at'],revision,e['deleted'],
+             e['direction'],o.updated,o.content))
+        snapshot={**e,'message':mid,'provider_chat':e['chat'],'chat':cid,'revision':revision}
+        c.execute('INSERT INTO message_revisions(message,revision,snapshot) VALUES(%s,%s,%s)',
+                  (mid,revision,Jsonb(snapshot)))
+
+    @staticmethod
+    def _ingest_attachments(c,o):
+        """The new revision's media jobs; jobs and attachments it no longer names go inactive."""
+        e,aid,mid=o.e,o.aid,o.mid
+        media_ids=[]
+        for descriptor in e['media']:
+            jid=stable_id('file',mid,hashlib.sha256(canonical(descriptor)).hexdigest())
+            media_ids.append(jid)
+            c.execute('''INSERT INTO media_jobs(id,account,message,descriptor) VALUES(%s,%s,%s,%s)
                         ON CONFLICT(id) DO UPDATE SET state=CASE WHEN media_jobs.state='superseded'
                         THEN 'queued' ELSE media_jobs.state END''',(jid,aid,mid,Jsonb(descriptor)))
-                c.execute("UPDATE media_jobs SET state='superseded',lease_until=NULL WHERE message=%s AND NOT(id=ANY(%s))",
-                          (mid,media_ids))
-                # A formatting-only revision retains the same originals. Avoid
-                # no-op active updates which otherwise enqueue extraction again.
-                c.execute('''UPDATE attachments SET active=(id=ANY(%s)) WHERE message=%s
+        c.execute("UPDATE media_jobs SET state='superseded',lease_until=NULL WHERE message=%s AND NOT(id=ANY(%s))",
+                  (mid,media_ids))
+        # A formatting-only revision retains the same originals. Avoid
+        # no-op active updates which otherwise enqueue extraction again.
+        c.execute('''UPDATE attachments SET active=(id=ANY(%s)) WHERE message=%s
                     AND active IS DISTINCT FROM (id=ANY(%s))''',(media_ids,mid,media_ids))
-            elif outcome=='unchanged' and not jitter_version:
-                c.execute('UPDATE messages SET provider_updated_at=greatest(provider_updated_at,%s) WHERE id=%s',(updated,mid))
-            if (outcome in ('created','edited','unchanged') and not e['deleted'] and e['sender'] and not sender_device_only
-                    and not unreadable and not sender_alias):
-                # Identity hints come only from this message's provider payload,
-                # never a cross-chat contact book. Unknown metadata stays unknown.
-                profile=e.get('sender_profile',{})
-                if profile.get('display_name') or profile.get('username'):
-                    c.execute('''INSERT INTO sender_profiles(id,account,chat,sender,display_name,username,
+
+    @staticmethod
+    def _ingest_sender_profile(c,o):
+        e,aid,cid,mid=o.e,o.aid,o.cid,o.mid
+        if (o.outcome in ('created','edited','unchanged') and not e['deleted'] and e['sender'] and not o.sender_device_only
+                and not o.unreadable and not o.sender_alias):
+            # Identity hints come only from this message's provider payload,
+            # never a cross-chat contact book. Unknown metadata stays unknown.
+            profile=e.get('sender_profile',{})
+            if profile.get('display_name') or profile.get('username'):
+                c.execute('''INSERT INTO sender_profiles(id,account,chat,sender,display_name,username,
                         source_message,source_sent_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
                         ON CONFLICT(account,chat,sender) DO UPDATE SET
                         display_name=excluded.display_name,username=excluded.username,
                         source_message=excluded.source_message,source_sent_at=excluded.source_sent_at,
                         observed_at=clock_timestamp()
                         WHERE excluded.source_sent_at>=sender_profiles.source_sent_at''',
-                        (stable_id('person',aid,cid,e['sender']),aid,cid,e['sender'],
-                         profile.get('display_name',''),profile.get('username',''),mid,e['sent_at']))
-            if (outcome in ('created','edited','unchanged') and not e['deleted'] and e.get('metadata') and not unreadable
-                    and not web_preview_refresh):
-                # Observations do not rewrite immutable revisions or create content conflicts.
-                c.execute('''INSERT INTO message_metadata(message,revision,metadata) SELECT id,revision,%s
+                    (stable_id('person',aid,cid,e['sender']),aid,cid,e['sender'],
+                     profile.get('display_name',''),profile.get('username',''),mid,e['sent_at']))
+
+    @staticmethod
+    def _ingest_metadata(c,o):
+        e,mid=o.e,o.mid
+        if (o.outcome in ('created','edited','unchanged') and not e['deleted'] and e.get('metadata') and not o.unreadable
+                and not o.web_preview_refresh):
+            # Observations do not rewrite immutable revisions or create content conflicts.
+            c.execute('''INSERT INTO message_metadata(message,revision,metadata) SELECT id,revision,%s
                     FROM messages WHERE id=%s AND (provider_updated_at IS NULL OR provider_updated_at<=%s)
                     ON CONFLICT(message) DO UPDATE SET
                     revision=excluded.revision,
@@ -574,75 +641,91 @@ class Archive:
                                 ELSE '{}'::jsonb END
                         ELSE excluded.metadata END,
                     observed_at=clock_timestamp()''',
-                    (Jsonb(e['metadata']),mid,updated))
-            group=(e.get('metadata') or {}).get('group_change')
-            if outcome=='created' and group and group['change'] in ('rename','joined_group') and group['value']:
-                # ANYM-869: the chat title follows the newest rename or join. An older one (a synced
-                # history stub) never overwrites it; a group the owner joined gets its name at once.
-                c.execute('''UPDATE chats SET title=%s,chat_type=coalesce(chat_type,'group') WHERE id=%s
+                (Jsonb(e['metadata']),mid,o.updated))
+
+    @staticmethod
+    def _ingest_group_title(c,o):
+        e,aid,cid,mid=o.e,o.aid,o.cid,o.mid
+        group=(e.get('metadata') or {}).get('group_change')
+        if o.outcome=='created' and group and group['change'] in ('rename','joined_group') and group['value']:
+            # ANYM-869: the chat title follows the newest rename or join. An older one (a synced
+            # history stub) never overwrites it; a group the owner joined gets its name at once.
+            c.execute('''UPDATE chats SET title=%s,chat_type=coalesce(chat_type,'group') WHERE id=%s
                     AND NOT EXISTS(SELECT 1 FROM messages m JOIN message_metadata md ON md.message=m.id
                         WHERE m.account=%s AND m.chat=%s AND m.sent_at>%s AND m.id<>%s
                         AND md.metadata->'group_change'->>'change' IN ('rename','joined_group'))''',
-                    (group['value'][:512],cid,aid,cid,e['sent_at'],mid))
-            # Publish only after this observation's validated native metadata is
-            # present. The event trigger snapshots this exact revision once.
-            if outcome in ('created','edited','deleted'):
-                from .reply_evidence import capture as capture_reply
-                reply = capture_reply(c,e,cid) if outcome=='created' else None
-                self.store.append_event(c,aid,mid,'message.'+outcome,e['origin'],receipt,
-                    snapshot_metadata={'reply_evidence':reply} if reply else None)
-            if not previous:c.execute('INSERT INTO ingest_receipts(digest,account,envelope,outcome) VALUES(%s,%s,%s,%s)',
-                (receipt,aid,Jsonb(captured),outcome))
-            if outcome=='conflict':
-                # The class compares the receipt with the contradicted revision, as the backfill does (ANYM-557).
-                from .conflict_classes import REASON_VERSION,classify,stored
-                if stored(c):
-                    c.execute('''INSERT INTO message_conflicts(receipt_digest,message,observed_revision,
+                (group['value'][:512],cid,aid,cid,e['sent_at'],mid))
+
+    def _ingest_events(self,c,o):
+        """The revision's event, then the receipt (a stored receipt's replay keeps its row)."""
+        e,aid,cid,mid,outcome=o.e,o.aid,o.cid,o.mid,o.outcome
+        # Publish only after this observation's validated native metadata is
+        # present. The event trigger snapshots this exact revision once.
+        if outcome in ('created','edited','deleted'):
+            from .reply_evidence import capture as capture_reply
+            reply = capture_reply(c,e,cid) if outcome=='created' else None
+            self.store.append_event(c,aid,mid,'message.'+outcome,e['origin'],o.receipt,
+                snapshot_metadata={'reply_evidence':reply} if reply else None)
+        if not o.previous:c.execute('INSERT INTO ingest_receipts(digest,account,envelope,outcome) VALUES(%s,%s,%s,%s)',
+            (o.receipt,aid,Jsonb(o.captured),outcome))
+
+    @staticmethod
+    def _ingest_conflicts(c,o):
+        """A conflict outcome records the contradiction; later evidence resolves earlier open ones."""
+        e,aid,mid,old,outcome,updated,receipt=o.e,o.aid,o.mid,o.old,o.outcome,o.updated,o.receipt
+        if outcome=='conflict':
+            # The class compares the receipt with the contradicted revision, as the backfill does (ANYM-557).
+            from .conflict_classes import REASON_VERSION,classify,stored
+            if stored(c):
+                c.execute('''INSERT INTO message_conflicts(receipt_digest,message,observed_revision,
                         candidate_updated_at,observed_at,reason,reason_version) VALUES(%s,%s,%s,%s,clock_timestamp(),%s,%s)''',
-                        (receipt,mid,old['revision'],updated,
-                         classify(retained['snapshot'] if retained else None,captured,old['provider_updated_at']),
-                         REASON_VERSION))
-                else:c.execute('''INSERT INTO message_conflicts(receipt_digest,message,observed_revision,
+                    (receipt,mid,old['revision'],updated,
+                     classify(o.retained['snapshot'] if o.retained else None,o.captured,old['provider_updated_at']),
+                     REASON_VERSION))
+            else:c.execute('''INSERT INTO message_conflicts(receipt_digest,message,observed_revision,
                     candidate_updated_at,observed_at) VALUES(%s,%s,%s,%s,clock_timestamp())''',
-                    (receipt,mid,old['revision'],updated))
-            elif (outcome in ('edited','deleted','unchanged') and not sender_device_only and not unreadable and not jitter_version
-                    and not body_completed and not attachment_completed and not web_preview_refresh and not (sender_alias and outcome=='unchanged')):
-                # A repeated copy of the retained revision does not resolve an
-                # equal/newer conflicting observation. Only later evidence does.
-                # From schema 57 each resolve names how it was resolved (ANYM-621); N-1 rows keep NULL, unknown.
-                from .conflict_reevaluation import resolution_set
-                c.execute('''UPDATE message_conflicts mc SET resolved_at=clock_timestamp(),'''+resolution_set(c,'newer_observation')+'''
+                (receipt,mid,old['revision'],updated))
+        elif (outcome in ('edited','deleted','unchanged') and not o.sender_device_only and not o.unreadable and not o.jitter_version
+                and not o.body_completed and not o.attachment_completed and not o.web_preview_refresh and not (o.sender_alias and outcome=='unchanged')):
+            # A repeated copy of the retained revision does not resolve an
+            # equal/newer conflicting observation. Only later evidence does.
+            # From schema 57 each resolve names how it was resolved (ANYM-621); N-1 rows keep NULL, unknown.
+            from .conflict_reevaluation import resolution_set
+            c.execute('''UPDATE message_conflicts mc SET resolved_at=clock_timestamp(),'''+resolution_set(c,'newer_observation')+'''
                     resolved_revision=(SELECT revision FROM messages WHERE id=%s)
                     FROM ingest_receipts r WHERE r.digest=mc.receipt_digest
                     AND mc.message=%s AND mc.resolved_at IS NULL AND mc.candidate_updated_at<%s
                     AND (NOT %s OR coalesce(r.envelope->'formatting'->>'state','unknown')='unknown'
                         OR r.envelope->'formatting'=%s::jsonb)''',
-                    (mid,mid,updated,inherited_format,Jsonb(old_format)))
-                if sender_completed:
-                    # Only competing copies of this exact content are resolved.
-                    # Unrelated equal-version contradictions stay visible.
-                    candidates=c.execute('''SELECT mc.receipt_digest,mc.candidate_updated_at,r.envelope FROM message_conflicts mc
+                (mid,mid,updated,o.inherited_format,Jsonb(o.old_format)))
+            if o.sender_completed:
+                # Only competing copies of this exact content are resolved.
+                # Unrelated equal-version contradictions stay visible.
+                candidates=c.execute('''SELECT mc.receipt_digest,mc.candidate_updated_at,r.envelope FROM message_conflicts mc
                         JOIN ingest_receipts r ON r.digest=mc.receipt_digest
                         WHERE mc.message=%s AND mc.resolved_at IS NULL
                         ORDER BY mc.observed_at,mc.receipt_digest LIMIT 100''',(mid,)).fetchall()
-                    equivalent=[r['receipt_digest'] for r in candidates
-                        if r['candidate_updated_at']<=updated
-                        and fingerprint(validate(r['envelope'])) in (content,old['content_hash'])
-                        and (not known_formatting(r['envelope'].get('formatting'))
-                            or not known_formatting(e.get('formatting'))
-                            or r['envelope']['formatting']==e['formatting'])]
-                    if equivalent:c.execute('''UPDATE message_conflicts SET resolved_at=clock_timestamp(),'''+resolution_set(c,'sender_completed')+'''
+                equivalent=[r['receipt_digest'] for r in candidates
+                    if r['candidate_updated_at']<=updated
+                    and fingerprint(validate(r['envelope'])) in (o.content,old['content_hash'])
+                    and (not known_formatting(r['envelope'].get('formatting'))
+                        or not known_formatting(e.get('formatting'))
+                        or r['envelope']['formatting']==e['formatting'])]
+                # sender_completed makes the outcome `edited` (ingest_outcome), so _ingest_revision set the revision.
+                if equivalent:c.execute('''UPDATE message_conflicts SET resolved_at=clock_timestamp(),'''+resolution_set(c,'sender_completed')+'''
                         resolved_revision=%s WHERE message=%s AND receipt_digest=ANY(%s) AND resolved_at IS NULL''',
-                        (revision,mid,equivalent))
-            if link_completed and outcome=='edited':
-                # A stored receipt of this observation that the settle job passed earlier is closable now: its next
-                # start scans the account's open rows of the class again, in its own bounded batches (ANYM-796).
-                from .conflict_reevaluation import rescan
-                rescan(c,aid,'telegram_link_settled')
-            c.execute("""UPDATE source_status SET last_ingest_at=clock_timestamp(),status='receiving',
+                    (o.revision,mid,equivalent))
+        if o.link_completed and outcome=='edited':
+            # A stored receipt of this observation that the settle job passed earlier is closable now: its next
+            # start scans the account's open rows of the class again, in its own bounded batches (ANYM-796).
+            from .conflict_reevaluation import rescan
+            rescan(c,aid,'telegram_link_settled')
+
+    @staticmethod
+    def _ingest_status(c,o):
+        c.execute("""UPDATE source_status SET last_ingest_at=clock_timestamp(),status='receiving',
                 detail_code=CASE WHEN detail_code='version_conflict' THEN detail_code ELSE %s END WHERE account=%s""",
-                      ('version_conflict' if outcome=='conflict' else 'coverage_not_reconciled',aid))
-            return {'outcome':outcome,'message':mid}
+                  ('version_conflict' if o.outcome=='conflict' else 'coverage_not_reconciled',o.aid))
 
     def claim_media(self,owner,*,account=None,ttl=120,collector_lease=None,since=None,writer=None,
                     live_writer=None,live_window_seconds=86400,media_prefetch_days=None,backfill=False):
