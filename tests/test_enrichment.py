@@ -11,7 +11,7 @@ import pytest
 
 from messaging_service.enrichment import EnrichmentWorker, verified_copy
 from messaging_service.enrichment_providers import (ModelBackpressure, ModelError, PROMPT, PROMPT_RU, infer,
-    normalize_result, validate_profile)
+    normalize_result, profile_hash, validate_profile)
 from messaging_service.envelope import fingerprint,validate
 from test_archive import archive as archive,event
 
@@ -625,6 +625,38 @@ def test_an_image_without_a_media_job_is_never_skipped(seeded,tmp_path):
     s,_,_=seeded;add_image(s);w=image_worker(s,tmp_path)  # the fixture message is weeks old
     with s.pool.connection() as c:c.execute('TRUNCATE enrichment_budget')
     row,_=w.claim();assert row['attachment']=='enrich-image'
+
+
+# spec: ANYM-887
+def test_a_retryable_failure_of_an_old_image_keeps_its_retries(seeded,tmp_path):
+    """Astra r1 M2: only work that has not started waits; a failure keeps its state, status and retries everywhere."""
+    s,key,_=seeded;chat_image(s,'private');w=image_worker(s,tmp_path);published_image_profile(s)
+    with s.pool.connection() as c:
+        c.execute("UPDATE messages SET sent_at=clock_timestamp()-interval '8 days' WHERE id='demo-tg-2'")
+        c.execute("""UPDATE attachment_enrichment SET state='failed',attempts=1,error_code='model_timeout',
+            profile_hash=%s,next_due=clock_timestamp() WHERE attachment='enrich-image'""",
+            (profile_hash(w.config['profiles']['image']),))
+    item=s.get_attachment(key,'enrich-image')
+    assert item['enrichment_status']=='failed' and 'recognition_reason' not in item
+    row,_=w.claim();assert row['attachment']=='enrich-image'
+
+
+# spec: ANYM-887
+def test_message_reads_and_file_text_show_a_skipped_image_as_on_request(seeded,tmp_path):
+    """Astra r1 M3: the two other status readers agree with get_attachment, before and after the request."""
+    s,key,_=seeded;chat_image(s,'private');published_image_profile(s)
+    with s.pool.connection() as c:c.execute("UPDATE messages SET sent_at=clock_timestamp()-interval '8 days' WHERE id='demo-tg-2'")
+    def read():
+        item=next(a for a in s.get_context(key,'demo-tg-2')['message']['attachments'] if a['attachment_id']=='enrich-image')
+        return item,s.get_file_text(key,'enrich-image')
+    item,text=read()
+    assert item['enrichment_status']=='available_on_request' and item['recognition_reason']=='image_outside_description_window'
+    assert item['recognition_next_action']=='request_file_download' and item['extraction_status']!='available_on_request'
+    assert text['enrichment_status']=='available_on_request'
+    s.request_file_download(key,'enrich-image')
+    item,text=read()
+    assert item['enrichment_status']=='queued' and 'recognition_reason' not in item
+    assert text['enrichment_status']=='queued'
 
 
 # spec: ANYM-887

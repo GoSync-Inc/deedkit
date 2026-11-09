@@ -87,7 +87,7 @@ def recognition_bucket():
         WHEN ''' + WITHHELD_ROW + ''' THEN 'withheld'
         WHEN ''' + EVICTED_ROW + ''' THEN 'evicted'
         WHEN NOT ''' + CONFIGURED_ROW + ''' THEN 'recognition_off'
-        WHEN ''' + SKIPPED_ROW + ''' THEN 'skipped'
+        WHEN e.state IN ('unconfigured','queued') AND ''' + SKIPPED_ROW + ''' THEN 'skipped'
         WHEN ''' + KIND + "='document' AND NOT coalesce(" + DOCUMENT_TEXT + ''',false) THEN 'no_text'
         WHEN e.state='failed' THEN 'failed_retry'
         ELSE 'due' END''')

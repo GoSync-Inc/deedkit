@@ -99,8 +99,15 @@ RECOGNITION_REASON='(SELECT orr.reason FROM ('+ON_REQUEST_CHATS+') orr WHERE orr
 IMAGE_DESCRIPTION_DAYS=7
 IMAGE_STICKER=("EXISTS(SELECT FROM message_metadata smd WHERE smd.message=m.id"
     " AND smd.metadata->>'media_kind'='sticker')")
-DESCRIPTION_SHAPE=("left(a.mime,6)='image/' AND (m.sent_at<statement_timestamp()-interval '"
-    +str(IMAGE_DESCRIPTION_DAYS)+" days' OR "+IMAGE_STICKER+")")
+def description_shape(mime):
+    """An image (by the SQL text `mime`) of message m that is old or a sticker."""
+    return ("left("+mime+",6)='image/' AND (m.sent_at<statement_timestamp()-interval '"
+        +str(IMAGE_DESCRIPTION_DAYS)+" days' OR "+IMAGE_STICKER+")")
+
+
+DESCRIPTION_SHAPE=description_shape('a.mime')
+# A media job j still downloading has no attachment row yet: its descriptor names the mime (Astra r1 M1).
+JOB_DESCRIPTION_SHAPE=description_shape("coalesce(j.descriptor->>'mime','')")
 DESCRIPTION_SKIPPED=("("+DESCRIPTION_SHAPE+" AND EXISTS(SELECT FROM media_jobs dj WHERE dj.id=a.id"
     " AND dj.request_key_digest IS NULL))")
 # The same rule over an already joined media job `job` (sync status and the health check join it by id).
@@ -108,7 +115,7 @@ def description_skipped_row(job):
     return "("+job+".id IS NOT NULL AND "+job+".request_key_digest IS NULL AND "+DESCRIPTION_SHAPE+")"
 DESCRIPTION_REASON=("CASE WHEN "+IMAGE_STICKER+" THEN 'sticker' ELSE 'image_outside_description_window' END")
 # The rule as it applies to one enrichment row e: only work that has not started (unconfigured or queued) waits; a
-# lease, a result or a failure keeps its state.
+# lease, a result or a failure keeps its state and its retries (claim, sync status and health apply the same states).
 # For statuses, also only where a worker could describe it: queued, or unconfigured with an enabled image profile (with
 # none, the status stays not_configured).
 DESCRIPTION_WAITS=("(left(a.mime,6)='image/' AND (e.state='queued' OR coalesce(e.state,'unconfigured')='unconfigured'"
