@@ -107,11 +107,11 @@ def documented_grep(root):
     return any(mk.SIGNAL_PATH.search(n) for n in names.splitlines()) or bool(mk.SIGNAL_LINE.search(lines))
 
 
+# spec: ANYM-625
 @pytest.mark.parametrize('change', [
     {'scripts/a.py': 'x = 2\n'}, {'scripts/secrets.py': 'x = 1\n'}, {'docs/x.md': 'drop the old plan\n'},
     {'svc/m/migrations/075_a.sql': 'SELECT 1;\n'}, {'deploy/compose.yml': 'a: 1\n'}, {'scripts/a.py': 'ok\n',
      'docs/y.md': 'permissions: read\n'}])
-# spec: ANYM-625
 def test_signal_grep_agrees_with_the_documented_commands(tmp_path, change):
     root = tmp_path / 'repo'
     env = {'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@example.invalid', 'GIT_COMMITTER_NAME': 't',
