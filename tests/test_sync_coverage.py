@@ -144,6 +144,29 @@ def test_a_skipped_image_is_not_due_work_in_sync_status(cov):
     assert block['due']['to_recognize']['image'] == 1 and block['available_on_request']['stored_not_recognized'] == 0
 
 
+# spec: ANYM-890
+def test_sync_status_counts_waiting_audio_as_on_request(cov):
+    ar, s, _ = cov
+    profiles(s)
+    publish(ar)
+    music = stored(ar, s, 'audio/mpeg')
+    with s.pool.connection() as c:
+        mid, chat = c.execute('''UPDATE chats SET chat_type='group' FROM attachments a JOIN messages m ON m.id=a.message
+            WHERE a.id=%s AND chats.id=m.chat RETURNING m.id, chats.id''', (music,)).fetchone().values()
+        c.execute('''INSERT INTO message_metadata(message,revision,metadata)
+            SELECT id,revision,'{"media_kind":"audio"}'::jsonb FROM messages WHERE id=%s''', (mid,))
+    token = s.issue_key('audio-watcher', [ACCOUNT], permissions=['read', 'subscription-write'],
+                        key_permissions=['read', 'subscription-write'])
+    s.create_subscription(token, [chat])  # a subscribed group: ANYM-805 does not withhold it
+    block = status(s)[0]['coverage']
+    assert block['due']['to_recognize']['total'] == 0 and block['state'] == 'done'
+    assert block['available_on_request']['stored_not_recognized'] == 1
+    with s.pool.connection() as c:  # an agent asked: due work again
+        c.execute("UPDATE media_jobs SET request_key_digest='synthetic-key' WHERE id=%s", (music,))
+    block = status(s)[0]['coverage']
+    assert block['due']['to_recognize']['audio'] == 1 and block['available_on_request']['stored_not_recognized'] == 0
+
+
 # spec: ANYM-812
 def test_each_file_lands_in_one_coverage_bucket_and_the_verdict_follows_the_due_work(cov):
     ar, s, _ = cov
