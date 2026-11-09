@@ -1766,7 +1766,12 @@ autodeploy was already halted for the 072 hand release and is not this step's pa
 in `/root/prodmem-20261109` on the host: hashes `e26841ea…` (before) and `f7a4c4a1…` (after). The comparison named only
 `cmd`, `mem_limit` and `shm_size`, the networks equal the record, and no client container restarted. Client errors
 appear only between 06:56:21 and 06:56:27Z; collector leases, heartbeats, ingest, `subscription_outbox` and the
-listeners resumed.
+listeners resumed. One hour later (07:57Z): no OOM kill (`memory.events` all 0, no `docker events` oom, no kernel
+line), cgroup peak 3.5 GB (shared 1.14 GB, anonymous 196 MB, the rest page cache), host 3.96 GB available. The hit
+ratio over the hour was 99.73% (257.3M hits, 0.71M reads). From 04:35 to 06:56Z it was 94.5% (823.9M hits, 48.0M reads),
+so block reads per minute fell about 29×. Temp use was 2 files and 3 MB in the hour, against 6 files and 85 MB in the
+2 h 21 min before. All 25 `subscription_outbox` rows created after the restart were finished, and 213 messages
+were ingested.
 
 Undo, under the runner lock: `flock --nonblock /opt/personal-os-probe/backups/.runner.lock
 /root/prodmem-20261109/dbmem.sh undo` puts the previous overlay back (`compose.db-settings.before.yaml`, the
