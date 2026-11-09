@@ -422,9 +422,9 @@ def test_rejected_traffic_from_a_shared_peer_never_locks_out_a_recently_authenti
         await send({'type': 'http.response.start', 'status': 200, 'headers': []})
         await send({'type': 'http.response.body', 'body': b'{}'})
     boundary = Boundary(handler, Store(), ['testserver'])
-    async def request(token):
+    async def request(token, scheme=b'Bearer '):
         sent = []
-        scope = {**_scope(), 'headers': [(b'host', b'testserver'), (b'authorization', b'Bearer ' + token.encode())]}
+        scope = {**_scope(), 'headers': [(b'host', b'testserver'), (b'authorization', scheme + token.encode())]}
         async def receive(): return {'type': 'http.request', 'body': b'{}', 'more_body': False}
         async def send(message): sent.append(message)
         await boundary(scope, receive, send)
@@ -440,10 +440,13 @@ def test_rejected_traffic_from_a_shared_peer_never_locks_out_a_recently_authenti
         # The key that authenticated a moment ago keeps working, and is still authenticated each time.
         assert await request('agent-0') == 200
         assert authenticated == ['agent-0']
-        # A revoked key loses the exemption at once.
+        # Any spelling of the scheme the boundary accepts is the same key.
+        assert await request('agent-0', b'bearer ') == 200
+        # A revoked key loses the exemption at once, whichever spelling was refused.
         revoked.add('agent-0')
-        assert await request('agent-0') == 401
+        assert await request('agent-0', b'BEARER ') == 401
         assert await request('agent-0') == 429
+        assert await request('agent-0', b'bearer ') == 429
     asyncio.run(run())
 
 

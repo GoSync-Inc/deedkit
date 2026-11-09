@@ -339,7 +339,9 @@ class Boundary:
             if download and request.method not in ('GET','HEAD'):
                 # A grant path takes no key, so it never reads a body: a slow one held a slot for anyone.
                 raise APIError('method_not_allowed',405)
-            credential='' if download else request.headers.get('authorization','')
+            # The cache holds the bearer token itself, so every spelling bearer() accepts is one key.
+            try:credential='' if download else bearer(request.headers)
+            except APIError:credential=''
             if (not self.recently_authenticated(credential)
                     and not self.allow('peer:'+peer,PEER_PER_MINUTE,cost=1 if download else 0)):
                 raise APIError('rate_limited',429)
