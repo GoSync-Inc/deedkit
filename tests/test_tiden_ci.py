@@ -553,8 +553,9 @@ def test_ci_reports_required_checks_for_merge_queue_runs_without_cancelling_them
     assert set(ci["jobs"]["gate"]["needs"]) == {"added_list", "reuse", "pr_reuse", "checks", "native", "images"}
     assert ci["jobs"]["checks"]["uses"] == "./.github/workflows/checks.yml"
     assert "if" not in ci["jobs"]["images"]
-    # native is skipped only with checks / verify on the queue's pull request reuse.
-    assert ci["jobs"]["native"]["if"] == "${{ !cancelled() && needs.pr_reuse.outputs.decision != 'reuse' }}"
+    # native is skipped only with checks / verify: on the queue's pull request reuse or a main push's queue reuse.
+    assert ci["jobs"]["native"]["if"] == ("${{ !cancelled() && needs.pr_reuse.outputs.decision != 'reuse' "
+                                          "&& needs.reuse.outputs.decision != 'reuse' }}")
     assert ci["jobs"]["reuse"]["if"] == "github.event_name == 'push' && github.ref == 'refs/heads/main'"
     assert ci["jobs"]["checks"]["if"] == ("${{ !cancelled() && (needs.reuse.outputs.decision != 'reuse' "
                                           "|| needs.reuse.result == 'success') }}")
