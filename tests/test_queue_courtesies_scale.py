@@ -9,6 +9,16 @@ GAP = 300
 BUSY = 100
 
 
+def own_statistics(c):
+    """Every table the measured statements read gets its statistics now, the emptied ones included.
+
+    The seeded fixture truncates the tables an earlier test filled; autovacuum may analyze them at any moment
+    later, and an estimate that changes between the plain and the exclude measurement compares two plans made
+    from different statistics (an extra of -63798 in CI). Analyzed here, a later autovacuum pass finds the same
+    contents and changes nothing."""
+    c.execute('ANALYZE')
+
+
 class Statements(ChatMeasured):
     """Plans the page statements (ChatMeasured) and the exclude count statement."""
     def __init__(self, c): super().__init__(c); self.sql = []; self.counts = []
@@ -52,7 +62,7 @@ def courtesy_catalogue(s):
                 now()-interval '1 day'+k*interval '1 second',CASE WHEN k IN (1,%s) THEN 'incoming' ELSE 'outgoing' END
             FROM generate_series(1,%s) n CROSS JOIN generate_series(1,%s) k''',
             (CHATS, GAP + 3, GAPS, GAP + 3, GAP + 2, GAP + 2, GAP + 2, BUSY, GAP + 2))
-        c.execute('ANALYZE messages'); c.execute('ANALYZE chats')
+        own_statistics(c)
 
 
 def measure(s, key, **kwargs):
@@ -112,7 +122,7 @@ def tied_catalogue(s):
                 CASE WHEN k=2 THEN 'outgoing' ELSE 'incoming' END
             FROM generate_series(1,%s) n CROSS JOIN generate_series(1,%s) k CROSS JOIN unnest(ARRAY['wa','tg']) side''',
             (TIES, GAP + 2))
-        c.execute('ANALYZE messages'); c.execute('ANALYZE chats')
+        own_statistics(c)
 
 
 # spec: ANYM-810
