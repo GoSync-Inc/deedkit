@@ -31,7 +31,7 @@ FORBIDDEN = psycopg.errors.InsufficientPrivilege
 # spec: ANYM-848
 def test_gateway_role_runs_the_wake_target_tools_and_other_roles_never_read_them(seeded):
     from copy import copy
-    from messaging_service.wake_targets import schema_ready
+    from messaging_service.wake_targets import schema_ready, subscription_wake_target
     store, _, _ = seeded
     permissions = ['read', 'subscription-write', 'delivery-write']
     token = store.issue_key('wake-role-agent', ['telegram-demo'], permissions=permissions, key_permissions=permissions)
@@ -53,9 +53,19 @@ def test_gateway_role_runs_the_wake_target_tools_and_other_roles_never_read_them
         refused(store, api_role, "UPDATE wake_targets SET principal='x'")
         refused(store, api_role, "UPDATE wake_targets SET key_id=key_id")
         assert api.delete_wake_target(token, tid, 3)['deleted'] is True
-        # A role without the grant reads nothing, and a subscription view under it still answers (null target).
-        with as_role(store, worker_role) as c:
-            assert schema_ready(c) is False
+        # A role without the grant reads nothing, and the subscription view's lookup under it answers null, also for
+        # the dispatcher role.
+        live = api.register_wake_target(token, 'wake-role-2', 'codex_thread', 'Role chat', [sid])['wake_target_id']
+        with as_role(store, api_role) as c:
+            assert subscription_wake_target(c, sid) == live
+        dispatcher_role = install(store, 'delivery_role.sql', 'messaging_event_delivery')
+        try:
+            for role in (worker_role, dispatcher_role):
+                with as_role(store, role) as c:
+                    assert schema_ready(c) is False and subscription_wake_target(c, sid) is None
+                refused(store, role, 'SELECT * FROM wake_targets')
+        finally:
+            remove(store, dispatcher_role)
         refused(store, worker_role, 'SELECT * FROM wake_targets')
         refused(store, worker_role, 'SELECT * FROM wake_target_subscriptions')
     finally:

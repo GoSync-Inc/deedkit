@@ -128,7 +128,7 @@ def _budget(value, errors):
 def _bindings(c, target_ids):
     """Each target's bindings to subscriptions that are still active (closed, expired or paused ones drop out)."""
     rows = c.execute('''SELECT b.wake_target,b.subscription FROM wake_target_subscriptions b
-        JOIN subscriptions s ON s.id=b.subscription AND s.state='active'
+        JOIN subscriptions s ON s.id=b.subscription AND s.state='active' AND (s.expires_at IS NULL OR s.expires_at>clock_timestamp())
         WHERE b.wake_target=ANY(%s::uuid[]) ORDER BY b.subscription''', ([str(i) for i in target_ids],)).fetchall()
     bound = {}
     for row in rows:
@@ -171,16 +171,19 @@ def _bind(c, p, target_id, ids, rebind):
     """Bind the key's own active subscriptions; the caller holds the key lock. A subscription belongs to one key,
     so a binding found here is always one of this key's targets."""
     owned = {str(row['id']) for row in c.execute('''SELECT id FROM subscriptions WHERE id=ANY(%s::uuid[])
-        AND principal=%s AND key_id=%s AND state='active' ''', (ids, p['id'], p['key_id'])).fetchall()}
+        AND principal=%s AND key_id=%s AND state='active' AND (expires_at IS NULL OR expires_at>clock_timestamp())''',
+        (ids, p['id'], p['key_id'])).fetchall()}
     if len(owned) != len(ids):
-        # The same answer for another key's subscription, bound or not, and for an unknown or closed one.
-        raise _error('not_found', 404)
+        # The same answer for another key's subscription, bound or not, and for an unknown, closed or expired one; the
+        # field error names the list, never which entry.
+        raise _field_refusal('not_found', 404, 'format', "this key's own active subscription UUIDs")
     held = c.execute('''SELECT b.subscription,t.id,t.version FROM wake_target_subscriptions b
         JOIN wake_targets t ON t.id=b.wake_target WHERE b.subscription=ANY(%s::uuid[]) AND b.wake_target<>%s
         AND t.principal=%s AND t.key_id=%s ORDER BY b.subscription''', (ids, target_id, p['id'], p['key_id'])).fetchall()
     if held and not rebind:
         first = held[0]
-        raise _error('subscription_already_bound', 409, wake_target={'wake_target_id': str(first['id']),
+        raise _field_refusal('subscription_already_bound', 409, 'unique', 'subscriptions no other target of yours holds',
+            wake_target={'wake_target_id': str(first['id']),
             'version': first['version'], 'subscription_id': str(first['subscription'])},
             next_step='repeat with rebind true to move it here, or update the other target first')
     for holder in {str(row['id']) for row in held}:
@@ -189,6 +192,13 @@ def _bind(c, p, target_id, ids, rebind):
         (ids, target_id))
     c.execute('''INSERT INTO wake_target_subscriptions(wake_target,subscription)
         SELECT %s,unnest(%s::uuid[])''', (target_id, ids))
+
+
+def _field_refusal(code, status, reason, expected, **extra):
+    from .field_errors import field_error
+    failure = _error(code, status, **extra)
+    failure.field_errors = [field_error('subscription_ids', reason, expected)]
+    return failure
 
 
 def _limit_error(c, p):

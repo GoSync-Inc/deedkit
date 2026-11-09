@@ -93,8 +93,10 @@ def test_every_tool_needs_read_delivery_write_and_the_exact_key(gate):
             assert refusal(lambda: call(other)).code == 'not_found'
         # Another key's subscription is not_found whether or not it is bound.
         unbound = subscription(store, token)
-        assert refusal(lambda: register(store, other, [sid])).code == 'not_found'
-        assert refusal(lambda: register(store, other, [unbound])).code == 'not_found'
+        bound_refusal = refusal(lambda: register(store, other, [sid]))
+        unbound_refusal = refusal(lambda: register(store, other, [unbound]))
+        assert bound_refusal.code == unbound_refusal.code == 'not_found'
+        assert bound_refusal.field_errors == unbound_refusal.field_errors and not hasattr(bound_refusal, 'wake_target')
     assert store.list_wake_targets(token)['items'][0]['state'] == 'enabled'
 
 
@@ -186,6 +188,7 @@ def test_a_bound_subscription_names_its_holder_and_rebind_moves_it(gate):
     holder = register(store, token, [sid], label='old chat')
     failure = refusal(lambda: register(store, token, [sid], thread=OTHER_THREAD))
     assert failure.code == 'subscription_already_bound' and failure.status == 409
+    assert failure.field_errors[0]['field'] == 'subscription_ids' and failure.field_errors[0]['reason'] == 'unique'
     assert failure.wake_target == {'wake_target_id': holder['wake_target_id'], 'version': 1, 'subscription_id': sid}
     moved = register(store, token, [sid], thread=OTHER_THREAD, rebind=True)
     assert moved['subscription_ids'] == [sid]
@@ -297,34 +300,75 @@ def test_a_bound_target_changes_neither_hints_nor_push_delivery(gate):
 
 
 # spec: ANYM-848
-def test_before_schema_72_tools_answer_delivery_disabled_and_views_stay_null(gate, monkeypatch):
+def test_a_schema_71_database_answers_the_tools_delivery_disabled_and_every_read_as_before(database, tmp_path):
+    """A genuine schema-71 database (the real schema_ready guard, no stub): the new code refuses the five tools with a
+    boundary audit and answers get, events, fetch and wait with a null wake target; a snapshot of it captures, verifies
+    and quarantines without the new tables; migrating it then adds them."""
     from starlette.testclient import TestClient
-    from messaging_service import wake_targets
     from messaging_service.app import create_app
+    from messaging_service.backup import create_snapshot, database_manifest, quarantine_restore, verify_snapshot
+    from messaging_service.subscriptions import match_subscriptions
+    from messaging_service.wake_targets import schema_ready
+    from test_subscription_retention import emit, restore_database
+    with restore_database(database, tmp_path / 'old', through=71) as old:
+        with old.pool.connection() as c:
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '71'
+            assert schema_ready(c) is False
+        old.set_delivery_features(True)
+        token = identity(old)
+        sid = subscription(old, token)
+        emit(old)
+        match_subscriptions(old)
+        tid = str(uuid4())
+        for call in (lambda: register(old, token, [sid]), lambda: old.list_wake_targets(token),
+                     lambda: old.update_wake_target(token, tid, 1, 'pause'), lambda: old.delete_wake_target(token, tid, 1),
+                     lambda: old.confirm_wake_target(token, tid, CODE)):
+            failure = refusal(call)
+            assert failure.code == 'delivery_disabled' and failure.audited
+        assert old.get_subscription(token, sid)['delivery']['wake_target_id'] is None
+        assert len(old.get_subscription_events(token, sid)['items']) == 1
+        assert old.fetch_subscription_events(token, sid)['subscription']['delivery']['wake_target_id'] is None
+        auth = {'Authorization': 'Bearer ' + token, 'Accept': 'application/json, text/event-stream'}
+        with TestClient(create_app(old, ['testserver'])) as client:
+            waited = client.post('/mcp', headers=auth, json={'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                'params': {'name': 'wait_for_subscription_events', 'arguments': {'subscription_id': sid, 'timeout': 0}}}
+                ).json()['result']
+            rest = client.post('/v1/list_wake_targets', headers=auth, json={})
+        assert not waited.get('isError') and waited['structuredContent']['subscription']['delivery']['wake_target_id'] is None
+        assert rest.status_code == 409 and rest.json()['error'] == 'delivery_disabled'
+        with old.pool.connection() as c:
+            rows = c.execute("""SELECT operation,outcome,error_code FROM audit_log WHERE operation='http_boundary'
+                ORDER BY occurred_at""").fetchall()
+        assert rows == [{'operation': 'http_boundary', 'outcome': 'denied', 'error_code': 'delivery_disabled'}] * 6
+        # A schema-71 backup: captured, verified and quarantined by this runtime without the new tables.
+        old.set_delivery_features(False)
+        snapshot = tmp_path / 'snapshot71'
+        create_snapshot(old, snapshot, [sys.executable, '-c', 'print("unit-dump-stub")'])
+        assert verify_snapshot(old, snapshot)['status'] == 'verified'
+        manifest = json.loads((snapshot / 'manifest.json').read_text())
+        assert manifest['schema_version'] == 71 and 'wake_targets' not in manifest['tables']
+        quarantine_restore(old)
+        # Migrating the old database adds the tables; a second migrate changes nothing.
+        old.migrate()
+        old.migrate()
+        with old.pool.connection() as c:
+            assert schema_ready(c) is True and 'wake_targets' in database_manifest(c)
+
+
+# spec: ANYM-848
+def test_an_expired_subscription_is_neither_bound_nor_listed(gate):
     store = gate
     token = identity(store)
-    sid = subscription(store, token)
-    monkeypatch.setattr(wake_targets, 'schema_ready', lambda c: False)
-    tid = str(uuid4())
-    for call in (lambda: register(store, token, [sid]), lambda: store.list_wake_targets(token),
-                 lambda: store.update_wake_target(token, tid, 1, 'pause'), lambda: store.delete_wake_target(token, tid, 1),
-                 lambda: store.confirm_wake_target(token, tid, CODE)):
-        failure = refusal(call)
-        assert failure.code == 'delivery_disabled' and failure.audited
-    # Existing subscription reads answer as before, with no wake target.
-    assert store.get_subscription(token, sid)['delivery']['wake_target_id'] is None
-    assert store.get_subscription_events(token, sid)['items'] == []
-    auth = {'Authorization': 'Bearer ' + token, 'Accept': 'application/json, text/event-stream'}
-    with TestClient(create_app(store, ['testserver'])) as client:
-        rest = client.post('/v1/list_wake_targets', headers=auth, json={})
-        listed = client.post('/mcp', headers=auth, json={'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list',
-            'params': {}}).json()['result']['tools']
-    assert rest.status_code == 409 and rest.json()['error'] == 'delivery_disabled'
-    assert {'list_delivery_endpoints', 'get_subscription', 'list_wake_targets'} <= {tool['name'] for tool in listed}
+    sid, kept = subscription(store, token), subscription(store, token)
+    register(store, token, [sid, kept])
     with gate.pool.connection() as c:
-        rows = c.execute("""SELECT operation,outcome,error_code FROM audit_log
-            WHERE operation LIKE '%%wake_target%%' OR operation='http_boundary' ORDER BY occurred_at""").fetchall()
-    assert rows == [{'operation': 'http_boundary', 'outcome': 'denied', 'error_code': 'delivery_disabled'}] * 6
+        # The deadline passed; no read has turned the stored state to expired yet.
+        c.execute("UPDATE subscriptions SET expires_at=clock_timestamp()-interval '1 minute' WHERE id=%s", (sid,))
+        assert c.execute('SELECT state FROM subscriptions WHERE id=%s', (sid,)).fetchone()['state'] == 'active'
+    assert store.list_wake_targets(token)['items'][0]['subscription_ids'] == [kept]
+    failure = refusal(lambda: register(store, token, [sid], thread=OTHER_THREAD))
+    assert failure.code == 'not_found' and failure.field_errors == [{'field': 'subscription_ids', 'reason': 'format',
+        'expected': "this key's own active subscription UUIDs"}]
 
 
 # spec: ANYM-848
