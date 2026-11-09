@@ -200,7 +200,7 @@ class Clients:
                     ) as response,
                 ):
                     if module == agents.MODULE:
-                        return await agents_answer(response)
+                        return await agents_answer(response, operation, arguments)
                     failed = response.status_code >= 500 or response.status_code in (301, 302, 303, 307, 308)
                     body = bytearray()
                     maximum = 65536 if failed else 8 * 1024 * 1024
@@ -255,7 +255,7 @@ class Clients:
 NOT_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
 
-async def agents_answer(response):
+async def agents_answer(response, operation, arguments):
     """One agent-runner answer: a JSON object on 2xx; a refusal the adapter knows as its fixed error; anything else
     backend_unavailable with `sent`, so a start or stop is reported as an unknown outcome and never resent."""
     body = bytearray()
@@ -270,7 +270,7 @@ async def agents_answer(response):
         value = json.loads(body)
     except (ValueError, UnicodeDecodeError, RecursionError):
         value = None
-    if 200 <= response.status_code < 300 and isinstance(value, dict):
+    if 200 <= response.status_code < 300 and isinstance(value, dict) and agents.answers(operation, value, arguments):
         return value
     known = agents.refusal(response.status_code, value) if response.status_code >= 400 else None
     if known is not None:

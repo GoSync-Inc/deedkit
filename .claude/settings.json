@@ -1,6 +1,10 @@
 {
   "permissions": {
     "allow": [
+      "mcp__claude_ai_Deedkit__agents_capabilities",
+      "mcp__claude_ai_Deedkit__agents_get_task",
+      "mcp__claude_ai_Deedkit__agents_list_tasks",
+      "mcp__claude_ai_Deedkit__agents_read_task_log",
       "mcp__claude_ai_Deedkit__calendar_agenda",
       "mcp__claude_ai_Deedkit__calendar_assignments",
       "mcp__claude_ai_Deedkit__calendar_calendars",
@@ -81,6 +85,8 @@
       "mcp__claude_ai_Gmail__*"
     ],
     "ask": [
+      "mcp__claude_ai_Deedkit__agents_start_task",
+      "mcp__claude_ai_Deedkit__agents_stop_task",
       "mcp__claude_ai_Deedkit__calendar_apply",
       "mcp__claude_ai_Deedkit__calendar_assignment",
       "mcp__claude_ai_Deedkit__calendar_plan",

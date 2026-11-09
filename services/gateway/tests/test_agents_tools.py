@@ -195,9 +195,9 @@ def test_a_principal_with_everything_lists_the_six_tools(tmp_path):
     assert runner.requests == []
 
 
+# spec: ANYM-820
 @pytest.mark.parametrize("variant", ["profile_without_the_tool", "grant_without_the_scope", "no_credential",
                                      "undeployed_module"])
-# spec: ANYM-820
 def test_an_agents_tool_is_hidden_and_refused_without_each_condition(tmp_path, variant):
     options = {"profile_without_the_tool": {"tools": READS}, "grant_without_the_scope": {"scopes": ["agents:read"]},
                "no_credential": {"credential": False}, "undeployed_module": {"deployed": False}}[variant]
@@ -358,8 +358,8 @@ REFUSALS = {
 }
 
 
-@pytest.mark.parametrize("code", sorted(REFUSALS))
 # spec: ANYM-820
+@pytest.mark.parametrize("code", sorted(REFUSALS))
 def test_each_runner_refusal_is_a_fixed_code_with_a_next_action_and_no_runner_text(tmp_path, code):
     status, extra, relayed = REFUSALS[code]
     runner = FakeRunner()
@@ -374,8 +374,8 @@ def test_each_runner_refusal_is_a_fixed_code_with_a_next_action_and_no_runner_te
     assert CANARY not in json.dumps(result)
 
 
-@pytest.mark.parametrize("reason", ["login_required", "host_busy"])
 # spec: ANYM-820
+@pytest.mark.parametrize("reason", ["login_required", "host_busy"])
 def test_a_task_that_failed_for_a_login_or_a_busy_host_names_its_next_action(tmp_path, reason):
     app, runner = setup(tmp_path)
     with TestClient(app) as client:
@@ -388,8 +388,8 @@ def test_a_task_that_failed_for_a_login_or_a_busy_host_names_its_next_action(tmp
                                      "host_busy": "tell_owner_host_busy_start_again_later"}[reason]
 
 
-@pytest.mark.parametrize("status", [500, 502, 418])
 # spec: ANYM-820
+@pytest.mark.parametrize("status", [500, 502, 418])
 def test_an_unknown_runner_answer_is_backend_unavailable_for_a_read_and_unknown_for_a_start(tmp_path, status):
     runner = FakeRunner()
     runner.fail = lambda request: httpx.Response(status, json={"error": "boom", "trace": CANARY})
@@ -401,6 +401,49 @@ def test_an_unknown_runner_answer_is_backend_unavailable_for_a_read_and_unknown_
     assert read["error"] == "backend_unavailable"
     assert start["outcome"] == "unknown" and start["next_action"] == "agents_list_tasks with this request_id"
     assert CANARY not in json.dumps(read) + json.dumps(start)
+
+
+def answer_of_every_call(runner, tmp_path, status, body):
+    """One start, one stop and one read against a runner that answers each with `status` and `body`."""
+    runner.fail = lambda request: httpx.Response(status, json=body)
+    app, _ = setup(tmp_path, runner)
+    values, task = start_args(), str(uuid.uuid4())
+    with TestClient(app) as client:
+        start = call(client, "agents_start_task", values)
+        stop = call(client, "agents_stop_task", {"task_id": task})
+        read = call(client, "agents_get_task", {"task_id": task})
+    return values, task, start, stop, read
+
+
+# spec: ANYM-820
+@pytest.mark.parametrize("body", [{}, {"id": "not-a-uuid", "state": "queued"},
+                                  {"id": str(uuid.uuid4()), "state": "unheard_of"},
+                                  {"id": str(uuid.uuid4()), "state": "queued", "request_id": str(uuid.uuid4()),
+                                   "engine": "codex"}],
+                         ids=["empty", "bad_id", "bad_state", "another_task"])
+def test_a_success_status_without_this_calls_task_is_an_unknown_start_or_stop_and_an_unavailable_read(tmp_path, body):
+    runner = FakeRunner()
+    values, task, start, stop, read = answer_of_every_call(runner, tmp_path, 201, body)
+    assert [r[1] for r in runner.requests if r[0] == "POST"] == ["/v1/tasks", f"/v1/tasks/{task}/stop"]
+    assert start["isError"] and start["structuredContent"]["outcome"] == "unknown"
+    assert start["structuredContent"]["next_action"] == "agents_list_tasks with this request_id"
+    assert start["structuredContent"]["request_id"] == values["request_id"]
+    assert stop["isError"] and stop["structuredContent"]["outcome"] == "unknown"
+    assert stop["structuredContent"]["next_action"] == "agents_get_task"
+    assert read["isError"] and read["structuredContent"]["error"] == "backend_unavailable"
+
+
+# spec: ANYM-820
+@pytest.mark.parametrize("status", [409, 500])
+@pytest.mark.parametrize("code", [{}, [], 7, None], ids=["object", "list", "number", "null"])
+def test_a_runner_error_code_that_is_no_string_is_an_unknown_start_or_stop_and_an_unavailable_read(tmp_path, status,
+                                                                                                    code):
+    runner = FakeRunner()
+    _, _, start, stop, read = answer_of_every_call(runner, tmp_path, status, {"error": code, "trace": CANARY})
+    assert start["isError"] and start["structuredContent"]["outcome"] == "unknown"
+    assert stop["isError"] and stop["structuredContent"]["outcome"] == "unknown"
+    assert read["isError"] and read["structuredContent"]["error"] == "backend_unavailable"
+    assert CANARY not in json.dumps([start, stop, read])
 
 
 # spec: ANYM-820

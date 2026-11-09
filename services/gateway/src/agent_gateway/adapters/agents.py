@@ -72,6 +72,9 @@ def request(operation, args):
 def refusal(status, value):
     """The fixed error of a runner answer that refused the call, or None for an answer this module does not know."""
     code = value.get("error") if isinstance(value, dict) else None
+    if not isinstance(code, str):
+        # An object or list here is no refusal this module knows: the caller's fallback (sent, unknown) applies.
+        return None
     if status == 404 and code == "not_found":
         return not_found()
     if status == 422 and code == "continue_task_invalid":
@@ -190,6 +193,23 @@ def valid_uuid(value):
         return isinstance(value, str) and str(uuid.UUID(value)) == value.lower()
     except ValueError:
         return False
+
+
+def answers(operation, value, args):
+    """Whether a 2xx body is this call's answer: a task names a valid id and state, and the start's request_id and
+    engine, or the stopped or read task's id; a log page has entries; capabilities have engines. Anything else is an
+    answer of unknown shape (for a start or stop: an unknown outcome, never a success without a task)."""
+    if operation == "read_task_log":
+        return isinstance(value.get("entries"), list)
+    if operation == "capabilities":
+        return isinstance(value.get("engines"), dict)
+    if not valid_uuid(value.get("id")) or value.get("state") not in STATES:
+        return False
+    if operation in ("start_task", "list_tasks"):
+        if value.get("request_id") != task_id(args["request_id"]):
+            return False
+        return operation != "start_task" or value.get("engine") == args["engine"]
+    return value["id"] == task_id(args["task_id"])
 
 
 def started(view):

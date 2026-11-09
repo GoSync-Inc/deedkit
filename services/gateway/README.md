@@ -133,7 +133,7 @@ An agent that needs only some modules can load fewer tools. Selection only narro
 no tool, scope or action.
 
 - **Connection path.** `POST /mcp/modules/<m>[,<m>...]` with `m` from `messaging`, `calendar`, `calls`,
-  `recordings` is the same MCP endpoint as `/mcp`. Its `tools/list` and `tools/call` cover `platform_capabilities`,
+  `recordings`, `agents` is the same MCP endpoint as `/mcp`. Its `tools/list` and `tools/call` cover `platform_capabilities`,
   `platform_select_modules` (when the profile lists it) and the named modules' tools, intersected with
   everything that limits the key on `/mcp`. Order does not matter (`calendar,messaging` and
   `messaging,calendar` are one path, reported as the sorted form). An unknown or repeated name, an empty list
