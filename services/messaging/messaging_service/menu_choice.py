@@ -22,7 +22,7 @@ RISK=("live answer by the owner's account; the bot decides what it means; it may
 FRESH_MENU='ask the bot for a fresh menu (a text send; needs the owner\'s confirmation), then preview again'
 NEXT_ACTION={
     'menu_choice_unsupported':'WhatsApp only, on the native adapter; Telegram bot buttons: press_button',
-    'menu_options_not_captured':'this menu was archived before menu options were captured; '+FRESH_MENU,
+    'menu_options_not_captured':'this menu was archived before its exact options were captured; '+FRESH_MENU,
     'menu_option_not_found':'only options shown with [id: ...] can be answered (not [id (inexact): ...] or [id (native '
         'flow): ...]); links, numbers and codes go to the owner',
     'menu_option_ambiguous':'several options show this ID; a text reply is the fallback',
@@ -42,11 +42,15 @@ FAILED_NEXT={
     'menu_reply_shape_unverified':'this menu kind cannot be answered yet; '+TEXT_FALLBACK,
     'menu_choice_unsupported':'WhatsApp only, on the native adapter; '+TEXT_FALLBACK,
 }
-HEADER=re.compile(r'Menu(?: \(.*\))?:')
+HEADER=re.compile(r'Menu(?: options)?(?: \(.*\))?:')
+# The header of the renderer whose [id: X] lines are exact and whose block holds no sender bracket (menu.go,
+# withMenu, menuShow); an older "Menu" block is shown but cannot be answered.
+EXACT_HEADER=re.compile(r'Menu options(?: \(.*\))?:')
 NUMBERED=re.compile(r'(\d+)\. (.*)')
-# The last [id: ...] before the optional link and call markers (menu.go, optionLine). Only this plain marker names a
-# choosable option: an ID shown inexactly or a native-flow unit in a buttons menu carries [id (<note>): ...].
-WITH_ID=re.compile(r'(.*) \[id: (.*?)\]((?: \[link: [^\]]*\])?(?: \[call: [^\]]*\])?)')
+# A label, the plain [id: ...] marker and the optional link and call markers (menu.go, optionLine). Sender text in an
+# exact block holds no bracket, so only this marker names a choosable option: an ID shown inexactly or a native-flow
+# unit in a buttons menu carries [id (<note>): ...].
+WITH_ID=re.compile(r'([^\[\]]*) \[id: ([^\[\]]*)\]((?: \[link: [^\[\]]*\])?(?: \[call: [^\[\]]*\])?)')
 MARKERS=re.compile(r'(?: \[link: [^\]]*\])?(?: \[call: [^\]]*\])?$')
 
 
@@ -65,6 +69,14 @@ def validate(value):
         from .field_errors import refusal as field_refusal
         raise field_refusal('invalid_parameters',[('menu_choice','format','{message_id, option_id}')])
     return value['message_id'],value['option_id']
+
+
+def last_header(body):
+    """The last menu header line of an archived body, or None."""
+    found=None
+    for line in (body or '').split('\n'):
+        if HEADER.fullmatch(line):found=line
+    return found
 
 
 def options(body):
@@ -125,7 +137,8 @@ def resolve(c,account,chat_id,chat,value,text):
     if menu['direction']!='incoming' or menu['provider_message_type'] not in MENU_TYPES:
         raise refusal('menu_not_a_menu')
     listed=options(menu['body'])
-    if listed is None:raise refusal('menu_options_not_captured')
+    # An older renderer's block may show an inexact ID as exact: only this renderer's block is evidence.
+    if listed is None or not EXACT_HEADER.fullmatch(last_header(menu['body'])):raise refusal('menu_options_not_captured')
     chosen=[o for o in listed if o[2]==option_id]
     if not chosen:raise refusal('menu_option_not_found')
     if len(chosen)>1:raise refusal('menu_option_ambiguous')

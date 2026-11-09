@@ -35,6 +35,8 @@ func main() {
 	flag.StringVar(&path, "config", "", "private collector config")
 	flag.BoolVar(&pair, "pair", false, "explicit device linking; private QR PNG only")
 	flag.StringVar(&fixture, "normalize-fixture", "", "offline synthetic fixture; no provider/session access")
+	var menuFixture string
+	flag.StringVar(&menuFixture, "menu-answer-fixture", "", "offline synthetic menu choice through sendText with fake dependencies; no provider/session access")
 	var mediaKeys bool
 	flag.BoolVar(&mediaKeys, "media-keys", false, "read-only capture journal lookup for the operator media inventory; no provider/session access")
 	var menuShapes bool
@@ -44,6 +46,8 @@ func main() {
 	var err error
 	if fixture != "" {
 		err = normalizeFixture(fixture)
+	} else if menuFixture != "" {
+		err = menuAnswerFixture(menuFixture, os.Stdout)
 	} else if mediaKeys {
 		err = serveMediaKeys(path, os.Stdin, os.Stdout)
 	} else if menuShapes {

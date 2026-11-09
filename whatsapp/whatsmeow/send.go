@@ -20,6 +20,7 @@ import (
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -192,6 +193,81 @@ func sendText(ctx context.Context, req textRequest, d sendDependencies) (any, er
 		return nil, err
 	}
 	return sendAndCaptureReceipt(ctx, d, to, message)
+}
+
+// menuAnswerFixture runs one send_text with menu_choice through sendText
+// against a synthetic list menu and fake dependencies (ANYM-837): no client,
+// device store, session or network; the provider send only records the wire
+// message. It prints {"sends", "error", "reply"} for the Python contract test.
+func menuAnswerFixture(path string, out io.Writer) error {
+	var v struct {
+		Synthetic bool             `json:"synthetic"`
+		Owner     string           `json:"owner"`
+		Chat      string           `json:"chat"`
+		MenuID    string           `json:"menu_id"`
+		Rows      []menuFixtureRow `json:"rows"`
+		Params    json.RawMessage  `json:"params"`
+	}
+	data, err := readPrivate(path, 1<<20)
+	if err != nil {
+		return err
+	}
+	if json.Unmarshal(data, &v) != nil || !v.Synthetic {
+		return errors.New("invalid_fixture")
+	}
+	chat, err := ParseChatID(v.Chat)
+	if err != nil {
+		return err
+	}
+	owner, err := ParseChatID(v.Owner)
+	if err != nil {
+		return err
+	}
+	list := &waE2E.ListMessage{Description: proto.String("synthetic"), Sections: []*waE2E.ListMessage_Section{{}}}
+	for _, r := range v.Rows {
+		list.Sections[0].Rows = append(list.Sections[0].Rows, &waE2E.ListMessage_Row{RowID: proto.String(r.ID), Title: proto.String(r.Title), Description: proto.String(r.Description)})
+	}
+	menu := &events.Message{Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: chat, Sender: chat}, ID: v.MenuID, Timestamp: time.Unix(1700000000, 0)},
+		Message: &waE2E.Message{ListMessage: list}}
+	var req textRequest
+	if decodeStrict(v.Params, &req) != nil {
+		return errors.New("send_target_invalid")
+	}
+	var wires []*waE2E.Message
+	d := sendDependencies{owner: owner,
+		policy: func() (Policy, error) { return Policy{Enabled: true, SendEnabled: true, DiscoverChats: true}, nil },
+		get: func(c, id string) (*events.Message, error) {
+			if c == LegacyChatID(chat) && id == LegacyMessageID(menu) {
+				return menu, nil
+			}
+			return nil, errors.New("missing")
+		},
+		put:     func(*events.Message, string) error { return nil },
+		newID:   func() string { return "FIXTURESTANZA" },
+		journal: func(string, string, map[string]any) error { return nil },
+		send: func(_ context.Context, to types.JID, wire *waE2E.Message, extra whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+			wires = append(wires, wire)
+			return whatsmeow.SendResponse{ID: extra.ID, Timestamp: time.Unix(1700000001, 0), Chat: to, Sender: owner}, nil
+		}}
+	result := map[string]any{"error": nil, "reply": nil}
+	if _, err := sendText(context.Background(), req, d); err != nil {
+		result["error"] = safeError(err)
+	}
+	result["sends"] = len(wires)
+	if len(wires) == 1 {
+		raw, err := protojson.Marshal(wires[0])
+		if err != nil {
+			return err
+		}
+		result["reply"] = json.RawMessage(raw)
+	}
+	return json.NewEncoder(out).Encode(result)
+}
+
+type menuFixtureRow struct {
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
 }
 
 // A server acknowledgement is evidence of acceptance, not delivery or reading.

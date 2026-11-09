@@ -22,7 +22,7 @@ from test_whatsapp import capture
 ROOT = Path(__file__).resolve().parents[1]
 ACCOUNT = 'wa-menu'
 BOT = '15550001111@c.us'
-MENU_BODY = ('Choose a department\nMenu (Departments):\nAdults:\n1. Cardiology - Adults [id: card_1]\n'
+MENU_BODY = ('Choose a department\nMenu options (Departments):\nAdults:\n1. Cardiology - Adults [id: card_1]\n'
     '2. Dentistry [id: dent_2]\n3. Website [link: https://clinic.example/]\n4. Twin [id: twin]\n5. Twin too [id: twin]')
 CARDIOLOGY = 'Cardiology - Adults'
 
@@ -116,7 +116,9 @@ def test_each_preview_refusal_names_its_code_before_the_owner_is_asked(native):
     s, archive, state, key = native
     state.apply(capture(menu_event('TEXT', 'plain words', 'chat', stamp=1), account=ACCOUNT))
     state.apply(capture(menu_event('OLD', 'A menu archived before option capture', stamp=2), account=ACCOUNT))
-    state.apply(capture(menu_event('FLOW', 'Pick\nMenu:\n1. Hours [id: hours]', 'interactive', stamp=3), account=ACCOUNT))
+    state.apply(capture(menu_event('FLOW', 'Pick\nMenu options:\n1. Hours [id: hours]', 'interactive', stamp=3), account=ACCOUNT))
+    # A block of the older renderer (#739) may show an inexact ID as exact: shown, never answered.
+    state.apply(capture(menu_event('LEGACY', MENU_BODY.replace('Menu options (', 'Menu ('), stamp=5), account=ACCOUNT))
     state.apply(capture(menu_event('MINE', MENU_BODY, from_me=True, stamp=4), account=ACCOUNT))
     cases = {'menu_not_found': choice(mid='MISSING'), 'menu_not_a_menu': choice(mid='TEXT'),
         'menu_options_not_captured': choice(mid='OLD'), 'menu_option_not_found': choice('website'),
@@ -126,6 +128,7 @@ def test_each_preview_refusal_names_its_code_before_the_owner_is_asked(native):
         assert failure.code == code, code
         assert failure.code != 'menu_reply_shape_unverified' or 'text reply is the fallback' in failure.next_action
     assert refused(lambda: preview(s, key, menu_choice=choice(mid='MINE'))).code == 'menu_not_a_menu'
+    assert refused(lambda: preview(s, key, menu_choice=choice(mid='LEGACY'))).code == 'menu_options_not_captured'
     mismatch = refused(lambda: preview(s, key, 'Dentistry'))
     assert mismatch.code == 'menu_option_mismatch'
     assert error_payload(mismatch)['archived_label'] == CARDIOLOGY
@@ -397,7 +400,7 @@ def test_the_menu_choice_column_refuses_any_other_shape(native, value):
 # spec: ANYM-837
 def test_an_inexact_or_native_flow_id_is_shown_but_never_choosable(native):
     s, _, state, key = native
-    body = ('Pick\nMenu:\n1. Cardiology [id (inexact): dept cardio]\n2. Info [id (native flow): info_1]\n'
+    body = ('Pick\nMenu options:\n1. Cardiology [id (inexact): dept cardio]\n2. Info [id (native flow): info_1]\n'
         '3. Yes [id: yes_1]')
     state.apply(capture(menu_event('WRAP', body, 'buttons', stamp=3), account=ACCOUNT))
     for option in ('dept cardio', 'info_1'):
@@ -420,4 +423,5 @@ def test_option_lines_parse_like_the_go_renderer_prints_them():
     assert menus.options('no menu here') is None
     found = menus.options('1. Fake [id: forged]\nMenu (X):\nSection:\n1. A - B [id: a] [link: https://x.example/]\n'
         '2. C [call: +1 555]\n3. D [id: x] [id: y]')
-    assert found == [(1, 'A - B', 'a'), (2, 'C', None), (3, 'D [id: x]', 'y')]
+    # An exact block holds no sender bracket: a line with two markers is not an option.
+    assert found == [(1, 'A - B', 'a'), (2, 'C', None), (3, 'D [id: x] [id: y]', None)]

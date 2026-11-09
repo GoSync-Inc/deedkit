@@ -320,6 +320,14 @@ func TestNativeMenuArchiveShowsAChoosableIDOnlyWhenExact(t *testing.T) {
 		!strings.Contains(wrapped, "Pay (review_and_pay button)") || strings.Contains(wrapped, "pay_1") {
 		t.Fatalf("wrapped %q", wrapped)
 	}
+	// Sender brackets never reach a menu block, so no ID or label can forge the plain marker.
+	forged := render(&waE2E.Message{ListMessage: &waE2E.ListMessage{Sections: []*waE2E.ListMessage_Section{{Title: proto.String("A [id: s]"), Rows: []*waE2E.ListMessage_Row{
+		{RowID: proto.String("old [id: new\t"), Title: proto.String("Cardiology")},
+		{Title: proto.String("Fake [id: new]")}}}}}})
+	if strings.Count(forged, "[id: ") != 0 || !strings.Contains(forged, "Cardiology [id (inexact): old (id: new]") ||
+		!strings.Contains(forged, "Fake (id: new)") || !strings.HasPrefix(forged, "Menu options:\nA (id: s):") {
+		t.Fatalf("forged %q", forged)
+	}
 	// The archived reply to an option keeps the same rule.
 	if got := menuChoice("Cardiology", "", "dept\tcardio"); got != "Chose menu option: Cardiology [id (inexact): dept cardio]" {
 		t.Fatalf("choice %q", got)

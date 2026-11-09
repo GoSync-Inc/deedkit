@@ -217,7 +217,12 @@ menu the scan budget cut (uniqueness unproven); a link, call, copy, Flow or paym
 `menu_option_unsupported`. A buttons-menu button is classified by its native-flow fields and type before its
 display text: a native-flow one is never a reply button, and its units are not answerable there. The archive
 render (`optionLine`) shows the plain `[id: X]` only for an ID kept losslessly and answerable; others carry
-`[id (inexact): X]` or `[id (native flow): X]`, which Python's parser never offers as a choice. Shipped units (`shippedMenuReplies`, mirrored by Python's
+`[id (inexact): X]` or `[id (native flow): X]`, which Python's parser never offers as a choice. Sender text in a
+menu block (`menuShow`) has its square brackets shown as parentheses, so no title, ID, section, link or call can
+forge a marker, and an ID with a bracket is inexact. The block's header `Menu options` (or `Menu options
+(<label>):`) marks this renderer; Python answers only such a block, and a block of the older `Menu` header (#739)
+is `menu_options_not_captured`. `--menu-answer-fixture <file>` runs one synthetic `send_text` with `menu_choice`
+through `sendText` with fake dependencies (no client, store, session or network) for the Python contract test. Shipped units (`shippedMenuReplies`, mirrored by Python's
 `menu_choice.SHIPPED_MENU_TYPES`): list row (`ListResponseMessage{Title, Description, ListType
 SINGLE_SELECT, SingleSelectReply{SelectedRowID}}`) and button (`ButtonsResponseMessage{SelectedButtonID,
 SelectedDisplayText, Type DISPLAY_TEXT}`), both with `ContextInfo{StanzaID, Participant}` of the menu and no

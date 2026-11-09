@@ -414,7 +414,9 @@ child steps are not covered. Against a messaging service from before this change
 
 Many WhatsApp bots act only on the structured reply a phone sends when the user taps a menu option; a
 text reply sends them back to their menu. A menu is archived with numbered options and their IDs
-(`1. Cardiology - Adults [id: card_1]`). `preview_message` and `send_message` take
+under a `Menu options:` header (`1. Cardiology - Adults [id: card_1]`); square brackets in the bot's own text
+are shown as parentheses. A menu archived before this release (header `Menu:`) cannot be answered
+(`menu_options_not_captured`: ask the bot for a fresh menu). `preview_message` and `send_message` take
 `menu_choice = {message_id, option_id}`: the archived menu in the same `chat_id` and one ID exactly as
 shown after `[id: `. DeedKit never picks an option.
 

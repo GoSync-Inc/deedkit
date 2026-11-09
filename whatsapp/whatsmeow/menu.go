@@ -129,13 +129,27 @@ func menuClean(s string, limit int) string {
 	return strings.Join(strings.Fields(b.String()), " ")
 }
 
+// menuBrackets keeps the archive's markers unforgeable: no sender text shown in
+// a menu block holds a square bracket, so " [id: " and its kin are ours alone.
+var menuBrackets = strings.NewReplacer("[", "(", "]", ")")
+
+// menuShow is the form a menu block shows of sender text (ANYM-837).
+func menuShow(s string, limit int) string {
+	return menuBrackets.Replace(menuClean(s, limit))
+}
+
+// menuLabel is an option's shown label, the one a choice confirms.
+func menuLabel(o menuOption) string {
+	return joinNonEmpty(" - ", menuShow(o.title, maxMenuText), menuShow(o.description, maxMenuText))
+}
+
 // menuLink keeps a web link's scheme, host and path only.
 func menuLink(raw string) string {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		return ""
 	}
-	return menuClean((&url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path}).String(), maxMenuText)
+	return menuShow((&url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path}).String(), maxMenuText)
 }
 
 func joinNonEmpty(sep string, parts ...string) string {
@@ -149,11 +163,11 @@ func joinNonEmpty(sep string, parts ...string) string {
 }
 
 func optionLine(i int, o menuOption) string {
-	line := joinNonEmpty(" - ", menuClean(o.title, maxMenuText), menuClean(o.description, maxMenuText))
+	line := menuLabel(o)
 	if line == "" {
 		line = "(no label)"
 	}
-	if id := menuClean(o.id, maxMenuID); id != "" {
+	if id := menuShow(o.id, maxMenuID); id != "" {
 		// Only an ID shown exactly as the bot sent it gets the plain marker the
 		// archive side accepts (menu_choice.WITH_ID); any other form is shown
 		// for reading but cannot be chosen (ANYM-837).
@@ -170,7 +184,7 @@ func optionLine(i int, o menuOption) string {
 	if o.link != "" {
 		line += " [link: " + o.link + "]"
 	}
-	if c := menuClean(o.call, maxMenuText); c != "" {
+	if c := menuShow(o.call, maxMenuText); c != "" {
 		line += " [call: " + c + "]"
 	}
 	return fmt.Sprintf("\n%d. %s", i, line)
@@ -199,8 +213,10 @@ func withMenu(text, label string, c *menuCollector) string {
 		used += n
 		return true
 	}
-	header := "Menu"
-	if label = menuClean(label, maxMenuText); label != "" {
+	// "Menu options" marks this renderer: its [id: X] lines are exact and its
+	// block holds no sender bracket. An older "Menu" block cannot be answered.
+	header := "Menu options"
+	if label = menuShow(label, maxMenuText); label != "" {
 		header += " (" + label + ")"
 	}
 	shown, i := 0, 0
@@ -212,7 +228,7 @@ func withMenu(text, label string, c *menuCollector) string {
 		if len(s.options) == 0 {
 			continue
 		}
-		if t := menuClean(s.title, maxMenuText); t != "" && !write("\n"+t+":") {
+		if t := menuShow(s.title, maxMenuText); t != "" && !write("\n"+t+":") {
 			full = false
 			break
 		}
@@ -484,7 +500,7 @@ type menuChoiceRequest struct {
 
 // menuAnswer builds the structured reply to one option of the newest captured
 // menu, or refuses with a code; nothing is sent here. The option is bound by its
-// RAW ID, which must already be in the form the archive shows (menuClean would
+// RAW ID, which must already be in the form the archive shows (menuShow would
 // not change it), so a bot cannot swap the ID behind an unchanged shown one; the
 // label is compared by its shown form and the reply carries the raw text.
 func menuAnswer(menu *events.Message, req menuChoiceRequest) (*waE2E.Message, error) {
@@ -501,7 +517,7 @@ func menuAnswer(menu *events.Message, req menuChoiceRequest) (*waE2E.Message, er
 		for _, o := range s.options {
 			if o.id == req.OptionID {
 				match = append(match, o)
-			} else if o.id != "" && menuClean(o.id, maxMenuID) == req.OptionID {
+			} else if o.id != "" && menuShow(o.id, maxMenuID) == req.OptionID {
 				shownOnly = true
 			}
 		}
@@ -510,7 +526,7 @@ func menuAnswer(menu *events.Message, req menuChoiceRequest) (*waE2E.Message, er
 	// menu the scan budget cut cannot prove it (ANYM-837).
 	extra := false
 	for _, id := range c.overflowIDs {
-		if id == req.OptionID || menuClean(id, maxMenuID) == req.OptionID {
+		if id == req.OptionID || menuShow(id, maxMenuID) == req.OptionID {
 			extra = true
 		}
 	}
@@ -523,11 +539,10 @@ func menuAnswer(menu *events.Message, req menuChoiceRequest) (*waE2E.Message, er
 		return nil, errors.New("menu_changed")
 	}
 	o := match[0]
-	if o.id == "" || menuClean(o.id, maxMenuID) != o.id {
+	if o.id == "" || menuShow(o.id, maxMenuID) != o.id {
 		return nil, errors.New("menu_option_id_unrepresentable")
 	}
-	label := joinNonEmpty(" - ", menuClean(o.title, maxMenuText), menuClean(o.description, maxMenuText))
-	if label == "" || label != req.Label {
+	if label := menuLabel(o); label == "" || label != req.Label {
 		return nil, errors.New("menu_changed")
 	}
 	if o.reply == "" || o.idNote != "" {
