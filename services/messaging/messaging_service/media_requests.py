@@ -247,9 +247,10 @@ def recognition_request(c,p,row):
     if row.get('request_key_digest') is not None:return False
     from .media_policy import DESCRIPTION_SKIPPED, ON_REQUEST_CHAT
     # Also an image whose description waits for a request in any chat (owner 11-09: old images and stickers).
-    return c.execute('''UPDATE media_jobs j SET request_key_digest=%s FROM messages m,attachments a
-        WHERE j.id=%s AND m.id=j.message AND a.id=j.id AND j.request_key_digest IS NULL
-        AND ('''+ON_REQUEST_CHAT+''' OR '''+DESCRIPTION_SKIPPED+''') RETURNING j.id''',
+    return c.execute('''UPDATE media_jobs j SET request_key_digest=%s FROM messages m
+        WHERE j.id=%s AND m.id=j.message AND j.request_key_digest IS NULL
+        AND ('''+ON_REQUEST_CHAT+''' OR EXISTS(SELECT FROM attachments a WHERE a.id=j.id AND '''+DESCRIPTION_SKIPPED+'''))
+        RETURNING j.id''',
         (p['key_digest'],row['id'])).fetchone() is not None
 
 
@@ -258,7 +259,6 @@ def recognition_requested(result):
     for key in ('extraction_status','enrichment_status'):
         if result.get(key)=='available_on_request':result[key]='queued'
     result.pop('recognition_reason',None);result.pop('recognition_next_action',None)
-    result.pop('enrichment_reason',None);result.pop('enrichment_next_action',None)
 
 
 def wake_backoff(c,row,result,attachment_id):

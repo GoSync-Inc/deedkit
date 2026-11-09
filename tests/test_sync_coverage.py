@@ -126,6 +126,24 @@ def mixed(ar, s):
     return rows
 
 
+# spec: ANYM-887
+def test_a_skipped_image_is_not_due_work_in_sync_status(cov):
+    ar, s, _ = cov
+    profiles(s)
+    publish(ar)
+    old = stored(ar, s, 'image/jpeg')
+    with s.pool.connection() as c:
+        c.execute("UPDATE messages m SET sent_at=clock_timestamp()-interval '30 days' FROM attachments a "
+                  "WHERE a.id=%s AND m.id=a.message", (old,))
+    block = status(s)[0]['coverage']
+    assert block['due']['to_recognize']['total'] == 0 and block['state'] == 'done'
+    assert block['available_on_request']['stored_not_recognized'] == 1
+    with s.pool.connection() as c:  # an agent asked: due work again
+        c.execute("UPDATE media_jobs SET request_key_digest='synthetic-key' WHERE id=%s", (old,))
+    block = status(s)[0]['coverage']
+    assert block['due']['to_recognize']['image'] == 1 and block['available_on_request']['stored_not_recognized'] == 0
+
+
 # spec: ANYM-812
 def test_each_file_lands_in_one_coverage_bucket_and_the_verdict_follows_the_due_work(cov):
     ar, s, _ = cov
@@ -487,7 +505,9 @@ def test_the_coverage_counts_add_no_scan_and_no_per_row_sequential_subquery(cov)
             result = get_sync_status(c, {'accounts': [ACCOUNT], 'chat_ids': None})
         row = next(r for r in result['sources'] if r['account'] == ACCOUNT)
     assert row['coverage']['done']['stored'] == BULK
-    assert row['coverage']['available_on_request']['stored_not_recognized'] == BULK // 2
+    # The group's files wait for a request (ANYM-805); so do the other chat's images older than 7 days (ANYM-887).
+    old_images = sum(1 for n in range(1, BULK + 1) if n % 2 == 0 and n % 3 == 0 and n % 400 >= 7)
+    assert row['coverage']['available_on_request']['stored_not_recognized'] == BULK // 2 + old_images
     full = 0
     for query, plan in plans:
         def visit(node, inside=False):

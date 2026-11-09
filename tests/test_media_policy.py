@@ -251,6 +251,17 @@ def test_personal_and_subscribed_group_media_keep_the_prefetch_window(archive):
     assert ar.claim_media('worker',media_prefetch_days=7)['message']==group
 
 
+# spec: ANYM-887
+def test_only_a_subscription_naming_the_chat_releases_its_images(archive):
+    """Owner 11-09: a group's images are described only when a subscription names that chat; a dynamic one does not."""
+    ar,s,_,_=archive;mid=original(ar,age=3600)
+    set_kind(s,mid,'group');chat=chat_of(s,mid)
+    subscribe(s,chat,dynamic=True)
+    assert chat in on_request(s)
+    subscribe(s,chat)
+    assert chat not in on_request(s)
+
+
 # spec: ANYM-805
 def test_a_request_during_a_running_download_records_the_recognition_request(archive):
     ar,s,key,_=archive;mid=original(ar,age=3600)

@@ -8,6 +8,7 @@ The workers' claims keep their own order, caps and leases (tests/test_sync_cover
 from datetime import datetime, timedelta, timezone
 
 from .file_lifecycle import PROCESSABLE_ORIGINAL
+from .media_policy import description_skipped_row
 
 # WhatsApp publishes no media retention; integrators report about 30 days (an estimate, not a provider guarantee).
 WHATSAPP_MEDIA_RETENTION_DAYS = 30
@@ -40,16 +41,12 @@ def exclusion_sets(withheld):
 
     `withheld` is media_policy.recognition_withheld(c): the on-request rule, or 'false' for a login that cannot
     read its columns (then no chat is on request, as for the claims)."""
-    from .media_policy import DESCRIPTION_SKIPPED, ON_REQUEST_CHATS
+    from .media_policy import ON_REQUEST_CHATS
     chats = ('SELECT DISTINCT orc.chat FROM (' + ON_REQUEST_CHATS + ') orc' if withheld != 'false'
              else 'SELECT NULL::text AS chat WHERE false')
-    # Owner 11-09: images whose description waits for a request (old ones and stickers), by attachment id.
-    skipped = ('SELECT a.id FROM attachments a JOIN messages m ON m.id=a.message WHERE ' + DESCRIPTION_SKIPPED
-               if withheld != 'false' else 'SELECT NULL::text AS id WHERE false')
     return ('on_request_chats AS MATERIALIZED (' + chats.replace('%', '%%') + '),'
             '\n    evicted_originals AS MATERIALIZED (SELECT a.digest,a.bytes FROM attachment_residency a WHERE '
-            + EVICTED.replace('%', '%%') + '),'
-            '\n    description_skipped AS MATERIALIZED (' + skipped.replace('%', '%%') + ')')
+            + EVICTED.replace('%', '%%') + ')')
 
 
 def policy_sets(withheld):
@@ -63,13 +60,14 @@ def policy_sets(withheld):
 # digest, profile key), so no row is counted twice.
 EXCLUSION_JOINS = ('\n        LEFT JOIN on_request_chats orq ON orq.chat=m.chat'
                    '\n        LEFT JOIN media_jobs wj ON wj.id=a.id'
-                   '\n        LEFT JOIN evicted_originals eo ON eo.digest=a.digest AND eo.bytes=a.bytes'
-                   '\n        LEFT JOIN description_skipped dsk ON dsk.id=a.id')
+                   '\n        LEFT JOIN evicted_originals eo ON eo.digest=a.digest AND eo.bytes=a.bytes')
 POLICY_JOINS = (EXCLUSION_JOINS
                 + '\n        LEFT JOIN configured_kinds ck ON ck.account=m.account AND ck.kind=' + KIND)
 WITHHELD_ROW = '(orq.chat IS NOT NULL AND wj.id IS NOT NULL AND wj.request_key_digest IS NULL)'
 EVICTED_ROW, CONFIGURED_ROW = 'eo.digest IS NOT NULL', 'ck.kind IS NOT NULL'
-SKIPPED_ROW = 'dsk.id IS NOT NULL'
+# Owner 11-09: an image whose description waits for a request (media_policy.DESCRIPTION_SKIPPED), read on the job
+# joined above: no extra pass over attachments; a sticker probes message_metadata by its key.
+SKIPPED_ROW = description_skipped_row('wj')
 
 
 # enrichment.FINAL_LIMIT_CODES: a failure the same profile never retries (a test keeps the two equal, so the API

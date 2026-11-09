@@ -158,9 +158,11 @@ def attachment_fields(row, *, original_present=None):
     if (withheld or evicted_wait) and 'available_on_request' in (extraction,enrichment):
         item.update(recognition_reason=row.get('recognition_reason') or 'group_chat_on_request',
             recognition_next_action='request_file_download')
-    if registered and not withheld and row.get('enrichment_reason') and enrichment=='available_on_request':
+    if (registered and row.get('description_reason') and enrichment=='available_on_request'
+            and 'recognition_reason' not in item):
         # Owner 11-09: an old image or a sticker is described when an agent asks (media_policy.DESCRIPTION_SKIPPED).
-        item.update(enrichment_reason=row['enrichment_reason'],enrichment_next_action='request_file_download')
+        # The same two fields as ANYM-805, whose reason wins; this one sets no retention (row recognition_reason).
+        item.update(recognition_reason=row['description_reason'],recognition_next_action='request_file_download')
     if registered and row.get('recognition_reason'):
         item['original_retention_hours']=CHAT_POLICY_HOURS  # ANYM-806: kept 24 hours after its last read.
     source={}

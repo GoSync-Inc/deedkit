@@ -93,6 +93,20 @@ def test_withheld_group_rows_raise_no_stall_until_an_agent_asks(s):
     assert codes(s) == {'enrichment_stalled'}
 
 
+# spec: ANYM-887
+@pytest.mark.parametrize('state',['queued','unconfigured'])
+def test_skipped_old_images_raise_no_stall(s,state):
+    profile(s, kind='image');old=job(s, state, kind='image', mime='image/png', sent='30 days', age='7 hours')
+    job(s, 'ready', kind='image', mime='image/png', age='7 hours')
+    with s.pool.connection() as c:
+        c.execute('''INSERT INTO media_jobs(id,account,message,descriptor,state)
+            SELECT id,%s,message,'{}'::jsonb,'ready' FROM attachments WHERE id=%s''', (TG, old))
+    assert codes(s) == set()
+    with s.pool.connection() as c:  # asked for: due work again, so a stopped worker shows
+        c.execute("UPDATE media_jobs SET request_key_digest='synthetic-key' WHERE id=%s", (old,))
+    assert codes(s) == {'enrichment_stalled'}
+
+
 # spec: ANYM-785
 def test_another_scopes_fresh_ready_does_not_hide_a_stall(s):
     profile(s);profile(s, WA)
