@@ -2,11 +2,15 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/proto"
 
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 )
@@ -36,6 +40,13 @@ const (
 
 type menuOption struct {
 	title, description, id, link, call string
+	// reply names the structured reply that answers this option (ANYM-837);
+	// empty for a link, call, copy, Flow, payment or unreadable button.
+	reply string
+	// A hydrated template quick reply's explicit Index and its position among
+	// all buttons of the template.
+	index    uint32
+	position int
 }
 
 type menuSection struct {
@@ -217,13 +228,17 @@ func withMenu(text, label string, c *menuCollector) string {
 }
 
 func listMenu(text string, v *waE2E.ListMessage) string {
+	return withMenu(text, v.GetButtonText(), listOptions(v))
+}
+
+func listOptions(v *waE2E.ListMessage) *menuCollector {
 	c := &menuCollector{}
 	for _, s := range v.GetSections() {
 		if !c.section(s.GetTitle()) {
 			break
 		}
 		for _, r := range s.GetRows() {
-			if !c.add(menuOption{title: r.GetTitle(), description: r.GetDescription(), id: r.GetRowID()}) {
+			if !c.add(menuOption{title: r.GetTitle(), description: r.GetDescription(), id: r.GetRowID(), reply: "list_row"}) {
 				break
 			}
 		}
@@ -231,10 +246,14 @@ func listMenu(text string, v *waE2E.ListMessage) string {
 			break
 		}
 	}
-	return withMenu(text, v.GetButtonText(), c)
+	return c
 }
 
 func buttonsMenu(text string, v *waE2E.ButtonsMessage) string {
+	return withMenu(text, "", buttonsOptions(v))
+}
+
+func buttonsOptions(v *waE2E.ButtonsMessage) *menuCollector {
 	c := &menuCollector{}
 	for _, btn := range v.GetButtons() {
 		if c.cut {
@@ -244,9 +263,9 @@ func buttonsMenu(text string, v *waE2E.ButtonsMessage) string {
 			nativeFlowButton(c, info.GetName(), info.GetParamsJSON())
 			continue
 		}
-		c.add(menuOption{title: btn.GetButtonText().GetDisplayText(), id: btn.GetButtonID()})
+		c.add(menuOption{title: btn.GetButtonText().GetDisplayText(), id: btn.GetButtonID(), reply: "button"})
 	}
-	return withMenu(text, "", c)
+	return c
 }
 
 type nativeFlowParams struct {
@@ -291,7 +310,7 @@ func nativeFlowButton(c *menuCollector, name, raw string) {
 			st := menuClean(s.Title, maxMenuText)
 			for _, r := range s.Rows {
 				title := joinNonEmpty(" ", menuClean(r.Header, maxMenuText), menuClean(r.Title, maxMenuText))
-				if !c.add(menuOption{title: joinNonEmpty(": ", st, title), description: r.Description, id: r.ID}) {
+				if !c.add(menuOption{title: joinNonEmpty(": ", st, title), description: r.Description, id: r.ID, reply: "native_flow_single_select"}) {
 					return
 				}
 			}
@@ -307,13 +326,17 @@ func nativeFlowButton(c *menuCollector, name, raw string) {
 		// The copied code is not read: it may be a credential.
 		c.add(menuOption{title: joinNonEmpty(" ", menuClean(p.DisplayText, maxMenuText), "(copy button)")})
 	case "quick_reply":
-		c.add(menuOption{title: p.DisplayText, id: p.ID})
+		c.add(menuOption{title: p.DisplayText, id: p.ID, reply: "native_flow_quick_reply"})
 	default:
 		c.add(menuOption{title: joinNonEmpty(" ", menuClean(p.DisplayText, maxMenuText), "("+menuClean(name, 64)+" button)")})
 	}
 }
 
 func interactiveMenu(text string, v *waE2E.InteractiveMessage) string {
+	return withMenu(text, "", interactiveOptions(v))
+}
+
+func interactiveOptions(v *waE2E.InteractiveMessage) *menuCollector {
 	c := &menuCollector{}
 	for _, btn := range v.GetNativeFlowMessage().GetButtons() {
 		if c.cut {
@@ -321,23 +344,28 @@ func interactiveMenu(text string, v *waE2E.InteractiveMessage) string {
 		}
 		nativeFlowButton(c, btn.GetName(), btn.GetButtonParamsJSON())
 	}
-	return withMenu(text, "", c)
+	return c
 }
 
 func templateMenu(text string, v *waE2E.TemplateMessage) string {
+	return withMenu(text, "", templateOptions(v))
+}
+
+func templateOptions(v *waE2E.TemplateMessage) *menuCollector {
 	if i := v.GetInteractiveMessageTemplate(); i != nil {
-		return interactiveMenu(text, i)
+		return interactiveOptions(i)
 	}
 	h := v.GetHydratedFourRowTemplate()
 	if h == nil {
 		h = v.GetHydratedTemplate()
 	}
 	c := &menuCollector{}
-	for _, btn := range h.GetHydratedButtons() {
+	for i, btn := range h.GetHydratedButtons() {
 		var ok bool
 		switch {
 		case btn.GetQuickReplyButton() != nil:
-			ok = c.add(menuOption{title: btn.GetQuickReplyButton().GetDisplayText(), id: btn.GetQuickReplyButton().GetID()})
+			ok = c.add(menuOption{title: btn.GetQuickReplyButton().GetDisplayText(), id: btn.GetQuickReplyButton().GetID(),
+				reply: "template_quick_reply", index: btn.GetIndex(), position: i})
 		case btn.GetUrlButton() != nil:
 			ok = c.add(menuOption{title: btn.GetUrlButton().GetDisplayText(), link: menuLink(btn.GetUrlButton().GetURL())})
 		case btn.GetCallButton() != nil:
@@ -349,7 +377,25 @@ func templateMenu(text string, v *waE2E.TemplateMessage) string {
 			break
 		}
 	}
-	return withMenu(text, "", c)
+	return c
+}
+
+// menuOptions returns the archived menu type (provider_message_type) and the
+// options of a menu message, enumerated by the same code that renders them, so
+// the options an agent reads and the ones it can answer are the same.
+func menuOptions(m *waE2E.Message) (string, *menuCollector) {
+	// The order of NormalizeMessage's cases (capture.go).
+	switch {
+	case m.GetTemplateMessage() != nil:
+		return "template", templateOptions(m.GetTemplateMessage())
+	case m.GetInteractiveMessage() != nil:
+		return "interactive", interactiveOptions(m.GetInteractiveMessage())
+	case m.GetButtonsMessage() != nil:
+		return "buttons", buttonsOptions(m.GetButtonsMessage())
+	case m.GetListMessage() != nil:
+		return "list", listOptions(m.GetListMessage())
+	}
+	return "", nil
 }
 
 // menuChoice is the archived text of a reply that chose a menu option.
@@ -387,4 +433,81 @@ func menuReply(m *waE2E.Message) (kind, body string, ok bool) {
 		return "interactive_response", menuChoice(v.GetBody().GetText(), "", id), true
 	}
 	return "", "", false
+}
+
+// ANYM-837: the reply units (archived menu type / reply kind) this adapter
+// answers, each built from a wire reference (docs/whatsapp-native.md, Menu
+// choices). Python mirrors the menu types in outgoing.MENU_CHOICE_TYPES.
+var shippedMenuReplies = map[string]bool{"list/list_row": true, "buttons/button": true}
+
+// menuChoiceRequest is send_text's menu_choice: the option the owner confirmed,
+// as archived (option ID and label as shown, the menu's provider_message_type).
+type menuChoiceRequest struct {
+	OptionID string `json:"option_id"`
+	Label    string `json:"label"`
+	MenuType string `json:"menu_type"`
+}
+
+// menuAnswer builds the structured reply to one option of the newest captured
+// menu, or refuses with a code; nothing is sent here. The option is bound by its
+// RAW ID, which must already be in the form the archive shows (menuClean would
+// not change it), so a bot cannot swap the ID behind an unchanged shown one; the
+// label is compared by its shown form and the reply carries the raw text.
+func menuAnswer(menu *events.Message, req menuChoiceRequest) (*waE2E.Message, error) {
+	if menu.Info.IsFromMe || menu.Message == nil {
+		return nil, errors.New("menu_unavailable")
+	}
+	kind, c := menuOptions(menu.Message)
+	if c == nil || kind != req.MenuType {
+		return nil, errors.New("menu_changed")
+	}
+	var match []menuOption
+	shownOnly := false
+	for _, s := range c.sections {
+		for _, o := range s.options {
+			if o.id == req.OptionID {
+				match = append(match, o)
+			} else if o.id != "" && menuClean(o.id, maxMenuID) == req.OptionID {
+				shownOnly = true
+			}
+		}
+	}
+	switch {
+	case len(match) > 1, len(match) == 1 && shownOnly:
+		return nil, errors.New("menu_option_ambiguous")
+	case len(match) == 0 && shownOnly:
+		return nil, errors.New("menu_option_id_unrepresentable")
+	case len(match) == 0:
+		return nil, errors.New("menu_changed")
+	}
+	o := match[0]
+	if o.id == "" || menuClean(o.id, maxMenuID) != o.id {
+		return nil, errors.New("menu_option_id_unrepresentable")
+	}
+	label := joinNonEmpty(" - ", menuClean(o.title, maxMenuText), menuClean(o.description, maxMenuText))
+	if label == "" || label != req.Label {
+		return nil, errors.New("menu_changed")
+	}
+	if o.reply == "" {
+		return nil, errors.New("menu_option_unsupported")
+	}
+	if !shippedMenuReplies[kind+"/"+o.reply] {
+		return nil, errors.New("menu_reply_shape_unverified")
+	}
+	// The menu is referenced by its ID; its content is not quoted back.
+	quote := &waE2E.ContextInfo{StanzaID: proto.String(menu.Info.ID), Participant: proto.String(menu.Info.Sender.ToNonAD().String())}
+	switch o.reply {
+	case "list_row":
+		reply := &waE2E.ListResponseMessage{Title: proto.String(o.title), ListType: waE2E.ListResponseMessage_SINGLE_SELECT.Enum(),
+			SingleSelectReply: &waE2E.ListResponseMessage_SingleSelectReply{SelectedRowID: proto.String(o.id)}, ContextInfo: quote}
+		if o.description != "" {
+			reply.Description = proto.String(o.description)
+		}
+		return &waE2E.Message{ListResponseMessage: reply}, nil
+	case "button":
+		return &waE2E.Message{ButtonsResponseMessage: &waE2E.ButtonsResponseMessage{SelectedButtonID: proto.String(o.id),
+			Response: &waE2E.ButtonsResponseMessage_SelectedDisplayText{SelectedDisplayText: o.title},
+			Type:     waE2E.ButtonsResponseMessage_DISPLAY_TEXT.Enum(), ContextInfo: quote}}, nil
+	}
+	return nil, errors.New("menu_reply_shape_unverified")
 }

@@ -58,6 +58,8 @@ type textRequest struct {
 	ExpiresAt       float64 `json:"expires_at"`
 	ReplyProviderID string  `json:"reply_provider_id,omitempty"`
 	LinkPreview     *bool   `json:"link_preview,omitempty"`
+	// ANYM-837: answer the menu ReplyProviderID names with a structured reply.
+	MenuChoice *menuChoiceRequest `json:"menu_choice,omitempty"`
 }
 
 func decodeStrict(raw json.RawMessage, value any) error {
@@ -166,7 +168,20 @@ func sendText(ctx context.Context, req textRequest, d sendDependencies) (any, er
 	}
 	to, _ := ParseChatID(req.Chat)
 	message := &waE2E.Message{Conversation: proto.String(req.Text)}
-	if req.ReplyProviderID != "" {
+	if req.MenuChoice != nil {
+		// The reply re-reads the newest captured menu; every refusal comes before
+		// the send, so nothing leaves the process (ANYM-837).
+		if req.ReplyProviderID == "" || req.Text != req.MenuChoice.Label {
+			return nil, errors.New("send_target_invalid")
+		}
+		menu, err := exactCaptured(d, req.Chat, req.ReplyProviderID)
+		if err != nil {
+			return nil, errors.New("menu_unavailable")
+		}
+		if message, err = menuAnswer(menu, *req.MenuChoice); err != nil {
+			return nil, err
+		}
+	} else if req.ReplyProviderID != "" {
 		quoted, err := exactCaptured(d, req.Chat, req.ReplyProviderID)
 		if err != nil {
 			return nil, errors.New("send_target_invalid")

@@ -133,6 +133,150 @@ func TestNativeTextChecksRevocationAfterResolvingReply(t *testing.T) {
 	requireError(t, err, "sending_disabled")
 }
 
+// menuFixture is a bot's menu message in operationsChat with the given content.
+func menuFixture(id string, m *waE2E.Message) *events.Message {
+	e := operationMessage(operationsChat, id, false, 1600000000)
+	e.Message, e.RawMessage = m, m
+	return e
+}
+
+func listMenuMessage(rowID, title, description string) *waE2E.Message {
+	return &waE2E.Message{ListMessage: &waE2E.ListMessage{Description: proto.String("Choose a department"), ButtonText: proto.String("Departments"),
+		Sections: []*waE2E.ListMessage_Section{{Title: proto.String("Clinics"), Rows: []*waE2E.ListMessage_Row{
+			{RowID: proto.String("dept_neuro"), Title: proto.String("Neurology")},
+			{RowID: proto.String(rowID), Title: proto.String(title), Description: proto.String(description)}}}}}}
+}
+
+func menuChoiceFixture(menu *events.Message, optionID, label, menuType string) textRequest {
+	r := textFixture()
+	r.Text, r.ReplyProviderID = label, LegacyMessageID(menu)
+	r.MenuChoice = &menuChoiceRequest{OptionID: optionID, Label: label, MenuType: menuType}
+	return r
+}
+
+// spec: ANYM-837
+func TestNativeMenuChoiceSendsTheStructuredReplyWithTheRawOptionOnce(t *testing.T) {
+	list := menuFixture("MENU1", listMenuMessage("dept_cardio", "Cardiology", "Heart and vessels"))
+	buttons := menuFixture("MENU2", &waE2E.Message{ButtonsMessage: &waE2E.ButtonsMessage{ContentText: proto.String("Confirm?"),
+		Buttons: []*waE2E.ButtonsMessage_Button{{ButtonID: proto.String("yes_1"), ButtonText: &waE2E.ButtonsMessage_Button_ButtonText{DisplayText: proto.String("Yes")}, Type: waE2E.ButtonsMessage_Button_RESPONSE.Enum()}}}})
+	for name, c := range map[string]struct {
+		menu  *events.Message
+		r     textRequest
+		check func(*waE2E.Message) bool
+	}{
+		"list": {list, menuChoiceFixture(list, "dept_cardio", "Cardiology - Heart and vessels", "list"), func(m *waE2E.Message) bool {
+			v := m.GetListResponseMessage()
+			return v.GetSingleSelectReply().GetSelectedRowID() == "dept_cardio" && v.GetTitle() == "Cardiology" && v.GetDescription() == "Heart and vessels" &&
+				v.GetListType() == waE2E.ListResponseMessage_SINGLE_SELECT && v.GetContextInfo().GetStanzaID() == "MENU1" && v.GetContextInfo().GetQuotedMessage() == nil
+		}},
+		"buttons": {buttons, menuChoiceFixture(buttons, "yes_1", "Yes", "buttons"), func(m *waE2E.Message) bool {
+			v := m.GetButtonsResponseMessage()
+			return v.GetSelectedButtonID() == "yes_1" && v.GetSelectedDisplayText() == "Yes" && v.GetType() == waE2E.ButtonsResponseMessage_DISPLAY_TEXT &&
+				v.GetContextInfo().GetStanzaID() == "MENU2" && v.GetContextInfo().GetQuotedMessage() == nil
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			d := sendFake(t)
+			d.get = func(chat, id string) (*events.Message, error) { return c.menu, nil }
+			sends := 0
+			d.send = func(_ context.Context, to types.JID, wire *waE2E.Message, extra whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+				sends++
+				if !c.check(wire) || wire.GetConversation() != "" || wire.GetExtendedTextMessage() != nil {
+					t.Fatalf("wrong reply %v", wire)
+				}
+				return whatsmeow.SendResponse{ID: extra.ID, Timestamp: time.Unix(1700000000, 0), Chat: to, Sender: d.owner}, nil
+			}
+			var captured *events.Message
+			d.put = func(m *events.Message, _ string) error { captured = m; return nil }
+			if _, err := sendText(context.Background(), c.r, d); err != nil || sends != 1 {
+				t.Fatalf("err=%v sends=%d", err, sends)
+			}
+			// The captured reply is archived as the chosen option, quoting the menu.
+			if kind, body, ok := menuReply(captured.Message); !ok || !strings.HasPrefix(body, "Chose menu option: ") || kind == "" {
+				t.Fatalf("capture %q %q", kind, body)
+			}
+		})
+	}
+}
+
+// spec: ANYM-837
+func TestNativeMenuChoiceRefusesBeforeAnySend(t *testing.T) {
+	interactive := &waE2E.Message{InteractiveMessage: &waE2E.InteractiveMessage{InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
+		NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{Buttons: []*waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton{
+			{Name: proto.String("quick_reply"), ButtonParamsJSON: proto.String(`{"display_text":"Info","id":"info_1"}`)},
+			{Name: proto.String("cta_url"), ButtonParamsJSON: proto.String(`{"display_text":"Pay","url":"https://pay.example/x"}`)},
+			{Name: proto.String("review_and_pay"), ButtonParamsJSON: proto.String(`{"display_text":"Pay now","id":"pay_1"}`)}}}}}}
+	ownMenu := menuFixture("MENU9", listMenuMessage("dept_cardio", "Cardiology", ""))
+	ownMenu.Info.IsFromMe = true
+	cases := map[string]struct {
+		menu *events.Message
+		r    func(*events.Message) textRequest
+		code string
+	}{
+		// The bot edited the row behind an unchanged shown ID: a truncated suffix or a tab for a space.
+		"raw id suffix past the shown limit": {menuFixture("M", listMenuMessage(strings.Repeat("a", 256)+"PAY", "Cardiology", "")), func(m *events.Message) textRequest {
+			return menuChoiceFixture(m, strings.Repeat("a", 256), "Cardiology", "list")
+		}, "menu_option_id_unrepresentable"},
+		"tab in raw id": {menuFixture("M", listMenuMessage("dept\tcardio", "Cardiology", "")), func(m *events.Message) textRequest {
+			return menuChoiceFixture(m, "dept cardio", "Cardiology", "list")
+		}, "menu_option_id_unrepresentable"},
+		"option gone":   {menuFixture("M", listMenuMessage("dept_other", "Cardiology", "")), func(m *events.Message) textRequest { return menuChoiceFixture(m, "dept_cardio", "Cardiology", "list") }, "menu_changed"},
+		"label changed": {menuFixture("M", listMenuMessage("dept_cardio", "Pay 500", "")), func(m *events.Message) textRequest { return menuChoiceFixture(m, "dept_cardio", "Cardiology", "list") }, "menu_changed"},
+		"type changed": {menuFixture("M", listMenuMessage("dept_cardio", "Cardiology", "")), func(m *events.Message) textRequest {
+			return menuChoiceFixture(m, "dept_cardio", "Cardiology", "buttons")
+		}, "menu_changed"},
+		"duplicate id": {menuFixture("M", listMenuMessage("dept_neuro", "Neurology", "")), func(m *events.Message) textRequest {
+			return menuChoiceFixture(m, "dept_neuro", "Neurology", "list")
+		}, "menu_option_ambiguous"},
+		"owner menu": {ownMenu, func(m *events.Message) textRequest { return menuChoiceFixture(m, "dept_cardio", "Cardiology", "list") }, "menu_unavailable"},
+		"no capture": {nil, func(*events.Message) textRequest {
+			return menuChoiceFixture(menuFixture("GONE", listMenuMessage("x", "y", "")), "x", "y", "list")
+		}, "menu_unavailable"},
+		"payment flow": {menuFixture("M", interactive), func(m *events.Message) textRequest {
+			return menuChoiceFixture(m, "pay_1", "Pay now (review_and_pay button)", "interactive")
+		}, "menu_changed"},
+		"unverified shape": {menuFixture("M", interactive), func(m *events.Message) textRequest {
+			return menuChoiceFixture(m, "info_1", "Info", "interactive")
+		}, "menu_reply_shape_unverified"},
+		"text is not the label": {menuFixture("M", listMenuMessage("dept_cardio", "Cardiology", "")), func(m *events.Message) textRequest {
+			r := menuChoiceFixture(m, "dept_cardio", "Cardiology", "list")
+			r.Text = "Pay"
+			return r
+		}, "send_target_invalid"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			d := sendFake(t)
+			if c.menu != nil {
+				d.get = func(string, string) (*events.Message, error) { return c.menu, nil }
+			}
+			d.send = func(context.Context, types.JID, *waE2E.Message, whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+				t.Fatal("a refused menu choice reached the provider")
+				return whatsmeow.SendResponse{}, nil
+			}
+			_, err := sendText(context.Background(), c.r(c.menu), d)
+			requireError(t, err, c.code)
+		})
+	}
+}
+
+// spec: ANYM-837
+func TestNativeMenuChoiceUncertainSendIsNeverRetried(t *testing.T) {
+	menu := menuFixture("MENU1", listMenuMessage("dept_cardio", "Cardiology", ""))
+	d := sendFake(t)
+	d.get = func(string, string) (*events.Message, error) { return menu, nil }
+	calls := 0
+	d.send = func(context.Context, types.JID, *waE2E.Message, whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+		calls++
+		return whatsmeow.SendResponse{}, errors.New("socket closed")
+	}
+	_, err := sendText(context.Background(), menuChoiceFixture(menu, "dept_cardio", "Cardiology", "list"), d)
+	requireError(t, err, "provider_operation_uncertain")
+	if calls != 1 {
+		t.Fatalf("send attempted %d times", calls)
+	}
+}
+
 func TestNativeSendNeverRetriesAmbiguousOutcome(t *testing.T) {
 	for _, mode := range []string{"timeout", "wrong_id", "wrong_chat", "missing_timestamp", "capture_failure"} {
 		t.Run(mode, func(t *testing.T) {
