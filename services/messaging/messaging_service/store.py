@@ -786,10 +786,12 @@ class Store:
                     result=json.loads(cached[1])
                     result['cache']={'hit':True,'age_seconds':round(now-cached[0],3),'max_age_seconds':10}
                     return result
-            result=serial(get_sync_status(c,p))
+            claims={} if include_latency and p['chat_ids'] is None else None
+            result=serial(get_sync_status(c,p,claims))
             if include_latency:
-                # Bounded, read-only and degraded per stage group; it never fails the summary (ANYM-865).
-                result.update(serial(stage_latency.read(c,p,latency_window_h,owner=(p['id'],p['key_id']))))
+                # Bounded, read-only and degraded per stage group; it never fails the summary (ANYM-865). The summary's
+                # job pass gives the download wait of an unscoped key (ANYM-917).
+                result.update(serial(stage_latency.read(c,p,latency_window_h,owner=(p['id'],p['key_id']),claims=claims)))
             result['observed_at']=datetime.now(timezone.utc).isoformat()
             with self._status_cache_lock:
                 self._status_cache[cache_key]=(time.monotonic(),json.dumps(result))

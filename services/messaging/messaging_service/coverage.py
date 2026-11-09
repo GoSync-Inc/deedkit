@@ -36,15 +36,20 @@ EVICTED = 'NOT ' + PROCESSABLE_ORIGINAL
 #   request; the job is joined by its id, which is the attachment's id;
 # - evicted: file_lifecycle.PROCESSABLE_ORIGINAL verbatim, applied to attachment_residency (alias a: digest, bytes).
 # tests/test_sync_coverage.py holds these flags to the claims, which apply the predicates themselves.
+def on_request_set(readable):
+    """The `on_request_chats` CTE (column chat), escaped for parameterized statements; empty when not `readable`."""
+    from .media_policy import ON_REQUEST_CHATS
+    chats = ('SELECT DISTINCT orc.chat FROM (' + ON_REQUEST_CHATS + ') orc' if readable
+             else 'SELECT NULL::text AS chat WHERE false')
+    return 'on_request_chats AS MATERIALIZED (' + chats.replace('%', '%%') + ')'
+
+
 def exclusion_sets(withheld):
     """The `on_request_chats` and `evicted_originals` CTEs, escaped for parameterized statements.
 
     `withheld` is media_policy.recognition_withheld(c): the on-request rule, or 'false' for a login that cannot
     read its columns (then no chat is on request, as for the claims)."""
-    from .media_policy import ON_REQUEST_CHATS
-    chats = ('SELECT DISTINCT orc.chat FROM (' + ON_REQUEST_CHATS + ') orc' if withheld != 'false'
-             else 'SELECT NULL::text AS chat WHERE false')
-    return ('on_request_chats AS MATERIALIZED (' + chats.replace('%', '%%') + '),'
+    return (on_request_set(withheld != 'false') + ','
             '\n    evicted_originals AS MATERIALIZED (SELECT a.digest,a.bytes FROM attachment_residency a WHERE '
             + EVICTED.replace('%', '%%') + ')')
 
