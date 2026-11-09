@@ -19,8 +19,9 @@ from . import wake as wakes
 
 HEALTH_INTERVAL_S = 30
 RETIRE_INTERVAL_S = 60
-# ANYM-841: a pass that scanned or matched anything is followed at once by the next; only an empty pass sleeps.
-BUSY_KEYS = ('scanned', 'matched', 'module_matched')
+# ANYM-841: a pass that scanned, matched or advanced anything (messages or modules) is followed at once by the
+# next; only an empty pass sleeps.
+BUSY_KEYS = ('scanned', 'matched', 'module_scanned', 'module_matched')
 
 
 def busy(result):

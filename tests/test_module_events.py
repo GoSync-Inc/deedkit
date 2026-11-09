@@ -886,6 +886,24 @@ def test_an_event_that_expires_after_matching_is_never_announced(modules, tmp_pa
     assert store.get_subscription_events(token, sid)['module']['items'][0]['expired'] is True
 
 
+# spec: ANYM-841
+def test_filtered_module_batches_keep_the_matcher_busy_until_the_matching_event(modules):
+    from messaging_service.subscription_worker import busy
+    store = modules[0]
+    token = subscriber(store)
+    sid = mixed(store, token, types=('call.owner_request',))
+    for seq in (1, 2):
+        publish(store, call_event(seq, f'call-{seq}'))  # call.finished: not selected
+    wanted = publish(store, call_event(3, 'call-3', kind='call.owner_request'))
+    passes = []
+    while not passes or busy(passes[-1]):
+        passes.append(match_subscriptions(store, batch_size=1))
+        assert len(passes) < 10
+    # Two filtered module batches advance the cursor without a match and still count as work.
+    assert [(p['module_scanned'], p['module_matched']) for p in passes] == [(1, 0), (1, 0), (1, 1), (0, 0)]
+    assert store.get_subscription(token, sid)['module_stream']['matched_through'] == wanted
+
+
 # spec: ANYM-562
 def test_a_failing_hint_step_keeps_the_module_matches(modules, monkeypatch):
     store = modules[0]

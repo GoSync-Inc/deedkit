@@ -86,7 +86,10 @@ and mounts no originals. Its default pass handles at most 16 subscriptions and
 200 journal events each; while a pass scanned or matched anything the next starts
 at once, and after an empty pass it waits two seconds or until a committed event's
 notification wakes it (ANYM-841: an empty `NOTIFY` sent after the writer's commit,
-never inside it; the two-second poll stays the fallback). Matching references and each
+never inside it; the two-second poll stays the fallback). Writers on their own
+connections send no wake and keep the poll: the file workers' processing events, the
+module router's module events and the matcher's own source-health events (matched in
+the same pass). Matching references and each
 checkpoint commit atomically; uniqueness and row locks support restart/retry and
 multiple workers. Fair ordering rotates sources beyond one batch.
 

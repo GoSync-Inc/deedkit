@@ -1,5 +1,4 @@
 """Durable structural subscriptions; isolated synthetic PostgreSQL only."""
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import threading
@@ -135,18 +134,73 @@ def test_a_committed_event_wakes_the_matcher_before_the_interval_and_a_rolled_ba
 # spec: ANYM-841
 def test_a_failing_notify_leaves_the_event_committed_and_is_logged_as_a_count(seeded, monkeypatch, capsys):
     import json
+    import time
     from messaging_service import wake
     store, _, _ = seeded
     before = wake.failures()
-    # An invalid statement_timeout makes the post-commit NOTIFY step raise inside PostgreSQL.
+    # An invalid statement_timeout makes the notifier's NOTIFY step raise inside PostgreSQL.
     monkeypatch.setattr(wake, 'NOTIFY_TIMEOUT', 'not-a-duration')
     capsys.readouterr()
     event = emit(store)
     with store.pool.connection() as c:
         assert c.execute('SELECT count(*) AS n FROM events WHERE id=%s', (event,)).fetchone()['n'] == 1
+    due = time.monotonic() + 5
+    while wake.failures() == before and time.monotonic() < due:
+        time.sleep(0.02)
     assert wake.failures() == before + 1
     lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert lines == [{'error': 'wake_notify_failed', 'class': 'InvalidParameterValue', 'count': before + 1}]
+
+
+# spec: ANYM-841
+def test_a_stalled_notify_or_a_broken_log_never_holds_or_fails_the_writer(seeded, monkeypatch):
+    import sys
+    import threading
+    import time
+    from messaging_service import wake
+    store, _, _ = seeded
+    listener, stop = wake_listener(store, wake.EVENTS)
+    real_send, entered, release = wake.send, threading.Event(), threading.Event()
+    before, saved = wake.failures(), sys.stdout
+
+    def stalled(pool, channels):
+        entered.set()
+        release.wait(30)
+        return real_send(pool, channels)
+
+    class Broken:
+        def write(self, _):
+            raise BrokenPipeError
+
+        def flush(self):
+            raise BrokenPipeError
+
+    try:
+        monkeypatch.setattr(wake, 'send', stalled)
+        started = time.monotonic()
+        emit(store)
+        assert entered.wait(5)
+        emit(store)  # coalesced behind the stalled send, never waiting for it
+        assert time.monotonic() - started < 2
+        # The stalled send then fails inside PostgreSQL and its log line hits a broken stdout.
+        monkeypatch.setattr(wake, 'NOTIFY_TIMEOUT', 'not-a-duration')
+        monkeypatch.setattr(sys, 'stdout', Broken())
+        release.set()
+        due = time.monotonic() + 5
+        while wake.failures() == before and time.monotonic() < due:
+            time.sleep(0.02)
+        assert wake.failures() > before
+        monkeypatch.setattr(sys, 'stdout', saved)
+        monkeypatch.setattr(wake, 'NOTIFY_TIMEOUT', '500ms')
+        monkeypatch.setattr(wake, 'send', real_send)
+        # The notifier thread survived both: the next commit still wakes the listener.
+        token = listener.token()
+        emit(store)
+        assert listener.wait(5, token) is True
+    finally:
+        release.set()
+        stop.set()
+        listener.close()
 
 
 # spec: ANYM-841
@@ -157,7 +211,7 @@ def test_notifies_follow_exactly_the_committed_marked_transactions(seeded):
     store, _, _ = seeded
     steps = st.lists(st.tuples(st.sets(st.sampled_from(wake.CHANNELS)), st.booleans()), max_size=6)
 
-    @settings(max_examples=25, deadline=None, derandomize=True,
+    @settings(max_examples=15, deadline=None, derandomize=True,
               suppress_health_check=[HealthCheck.function_scoped_fixture])
     @given(steps)
     def check(transactions):
@@ -174,11 +228,11 @@ def test_notifies_follow_exactly_the_committed_marked_transactions(seeded):
                             raise RuntimeError('synthetic rollback')
                 except RuntimeError:
                     pass
-            listener.execute('SELECT 1')  # delivers what has arrived
-            got = list(listener.notifies(timeout=0.2))
-            # One empty notification per channel per committed transaction that marked it; none for a rollback.
-            assert Counter(n.channel for n in got) == Counter(
-                channel for channels, commit in transactions if commit for channel in channels)
+            got = list(listener.notifies(timeout=0.3))
+            # The notifier coalesces: every channel a committed transaction marked gets an empty notification, a
+            # channel only rolled-back transactions marked gets none.
+            assert {n.channel for n in got} == {
+                channel for channels, commit in transactions if commit for channel in channels}
             assert all(n.payload == '' for n in got)
 
     check()

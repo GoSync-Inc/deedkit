@@ -320,6 +320,8 @@ def match(c, row, *, batch_size, maximum, stats):
                 count += 1
                 stats['module_matched'] += 1
         position = event['seq']
+        # ANYM-841: an advanced module position is matcher work, so the next pass follows at once.
+        stats['module_scanned'] = stats.get('module_scanned', 0) + 1
     if reason is None and len(events) < batch_size and position < head:
         reason = 'journal_gap'
         gap = {'reason': reason, 'stream': 'modules', 'after': position, 'through': head,

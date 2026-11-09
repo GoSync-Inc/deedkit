@@ -1,10 +1,11 @@
 """Best-effort commit wake-ups for the matcher and the delivery lanes (ANYM-841).
 
-A writer marks its connection; the Store pool sends an empty `NOTIFY` after that transaction commits, in a
-transaction of its own, so a full notification queue can never fail the write. A worker listens on a dedicated
-connection and wakes on it; its `--interval` poll stays the fallback, so a lost notification, a failed NOTIFY or a
-dropped listener costs at most one poll. Payloads stay empty: channel names and payloads are visible to every
-database role. LISTEN and NOTIFY need no grant.
+A writer marks its connection; after that transaction commits, the Store pool hands the marked channels to one
+background notifier thread and returns at once: the writer never waits for a NOTIFY, and a full notification queue
+can never fail its write. The notifier coalesces the requests and sends empty NOTIFYs on a pool connection in a
+transaction of its own. A worker listens on a dedicated connection and wakes on it; its `--interval` poll stays the
+fallback, so a lost or dropped notification, a failed NOTIFY or a dropped listener costs at most one poll. Payloads
+stay empty: channel names and payloads are visible to every database role. LISTEN and NOTIFY need no grant.
 """
 from __future__ import annotations
 
@@ -18,8 +19,9 @@ EVENTS = 'anymsg_events'
 OUTBOX = 'anymsg_outbox'
 CHANNELS = (EVENTS, OUTBOX)
 _ATTRIBUTE = '_anymsg_wake'
-# The NOTIFY step after a commit: bounded, so a stalled notification queue never holds a writer.
+# The notifier's NOTIFY step: bounded on the server, and it waits at most this long for a pool connection.
 NOTIFY_TIMEOUT = '500ms'
+NOTIFY_POOL_WAIT_S = 1.0
 
 _failed = 0
 _failed_lock = threading.Lock()
@@ -47,42 +49,109 @@ def failures():
     return _failed
 
 
-def notify(c, channels):
-    """One empty NOTIFY per channel, on the committed connection in its own transaction. A failure is counted and
-    logged (class only), never raised: the write it follows has committed already."""
-    global _failed
+def _log(line):
+    """Local stdout, fixed keys, class and count only; a broken stdout never raises into a caller or a thread."""
     try:
-        with c.transaction():
+        print(json.dumps(line), flush=True)
+    except Exception:
+        pass
+
+
+def _failure(code, error, **fields):
+    global _failed
+    with _failed_lock:
+        _failed += 1
+        count = _failed
+    _log({'error': code, **fields, 'class': type(error).__name__, 'count': count})
+
+
+def send(pool, channels):
+    """One empty NOTIFY per channel on a pool connection, in its own transaction. A failure (pool timeout included)
+    is counted and logged, never raised: the writes it follows have committed already."""
+    try:
+        with ConnectionPool.connection(pool, timeout=NOTIFY_POOL_WAIT_S) as c:
             c.execute("SELECT set_config('statement_timeout',%s,true),set_config('lock_timeout',%s,true)",
                 (NOTIFY_TIMEOUT, NOTIFY_TIMEOUT))
             for channel in sorted(channels):
                 if channel in CHANNELS:
                     c.execute('NOTIFY ' + channel)
     except Exception as error:
-        with _failed_lock:
-            _failed += 1
-            count = _failed
-        print(json.dumps({'error': 'wake_notify_failed', 'class': type(error).__name__, 'count': count}), flush=True)
+        _failure('wake_notify_failed', error)
+
+
+class Notifier:
+    """One daemon thread per pool, started at the first request. `request` only adds to a pending set under a
+    lock, so a writer never waits on notification I/O; a request during a send goes out in the next one."""
+
+    def __init__(self, pool):
+        self.pool = pool
+        self._cond = threading.Condition(threading.Lock())
+        self._pending = set()
+        self._closed = False
+        self._thread = None
+
+    def request(self, channels):
+        with self._cond:
+            if self._closed:
+                return
+            self._pending |= channels
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._run, daemon=True, name='anymsg-wake-notify')
+                self._thread.start()
+            self._cond.notify()
+
+    def close(self, timeout=2.0):
+        with self._cond:
+            self._closed = True
+            self._cond.notify()
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout)
+
+    def _run(self):
+        while True:
+            with self._cond:
+                self._cond.wait_for(lambda: self._pending or self._closed)
+                if self._closed:
+                    return
+                channels, self._pending = self._pending, set()
+            try:
+                send(self.pool, channels)
+            except BaseException:  # noqa: BLE001  (send never raises; the thread outlives anything)
+                pass
 
 
 class WakingPool(ConnectionPool):
-    """ConnectionPool whose `connection()` sends the marked NOTIFYs after its commit, before the connection goes
-    back to the pool. A rolled-back or failed transaction sends nothing; a savepoint rolled back inside a committed
-    transaction may send one spare wake, which costs one empty pass."""
+    """ConnectionPool whose `connection()` hands the marked channels to its Notifier after the commit. A rolled-back
+    or failed transaction sends nothing; a savepoint rolled back inside a committed transaction may send one spare
+    wake, which costs one empty pass. The checkout itself is psycopg_pool's, statistics included."""
 
     @contextmanager
     def connection(self, timeout=None):
-        conn = self.getconn(timeout=timeout)
-        try:
-            with conn:
+        channels = None
+        with super().connection(timeout) as conn:
+            try:
                 yield conn
-            channels = _take(conn)
-            # A closed connection committed nothing (transaction_timeout and a lost session end it).
-            if channels and not conn.closed:
-                notify(conn, channels)
-        finally:
-            _take(conn)
-            self.putconn(conn)
+            finally:
+                channels = _take(conn)
+        # Reached only after the commit; a closed connection committed nothing (transaction_timeout, a lost session).
+        if channels and not conn.closed:
+            try:
+                self._wake_notifier().request(channels)
+            except Exception as error:
+                _failure('wake_notify_failed', error)
+
+    def _wake_notifier(self):
+        notifier = self.__dict__.get('_anymsg_notifier')
+        if notifier is None:
+            notifier = self.__dict__.setdefault('_anymsg_notifier', Notifier(self))
+        return notifier
+
+    def close(self, timeout=5.0):
+        notifier = self.__dict__.get('_anymsg_notifier')
+        if notifier is not None:
+            notifier.close()
+        super().close(timeout)
 
 
 class Listener:
@@ -148,8 +217,8 @@ class Listener:
             except Exception as error:
                 self.failures += 1
                 # Class and count only: a connection error can name the DSN's host or role.
-                print(json.dumps({'error': 'wake_listen_failed', 'channel': self.channel,
-                    'class': type(error).__name__, 'count': self.failures}), flush=True)
+                _log({'error': 'wake_listen_failed', 'channel': self.channel,
+                    'class': type(error).__name__, 'count': self.failures})
             finally:
                 self.listening = False
                 if conn is not None:
@@ -165,8 +234,7 @@ def listen(store, channel, stop):
     try:
         return Listener.for_store(store, channel, stop)
     except Exception as error:
-        print(json.dumps({'error': 'wake_listen_failed', 'channel': channel, 'class': type(error).__name__}),
-            flush=True)
+        _log({'error': 'wake_listen_failed', 'channel': channel, 'class': type(error).__name__})
         return None
 
 

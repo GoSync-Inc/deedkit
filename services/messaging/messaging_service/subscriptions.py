@@ -722,7 +722,7 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
     bounded(max_subscriptions, 128)
     maximum = _bound_setting('SUBSCRIPTION_MAX_MATCHES', 10000, 1, 1000000)
     stats = {'checked': 0, 'scanned': 0, 'matched': 0, 'access_changed': 0,
-        'expired': 0, 'blocked': 0, 'missing_evidence': 0, 'module_matched': 0, 'module_blocked': 0, 'scope_failed': 0,
+        'expired': 0, 'blocked': 0, 'missing_evidence': 0, 'module_matched': 0, 'module_scanned': 0, 'module_blocked': 0, 'scope_failed': 0,
         'activity_failed': 0}
     with store.pool.connection() as c:
         from . import module_events
