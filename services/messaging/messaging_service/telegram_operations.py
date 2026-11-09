@@ -503,6 +503,54 @@ READ_HANDLERS = {
 }
 
 
+async def write_add_contact(op):
+    parameters, invoke, accepted = op.parameters, op.invoke, op.accepted
+    if 'phone' not in parameters or 'first_name' not in parameters:
+        reject('invalid_parameters')
+    contact = types.InputPhoneContact(secrets.randbits(63), parameters['phone'],
+        parameters['first_name'], parameters.get('last_name', ''))
+    response = await invoke(functions.contacts.ImportContactsRequest([contact]), mutation=True)
+    imported = [p for p in getattr(response, 'imported', []) if getattr(p, 'client_id', None) == contact.client_id]
+    if len(imported) == 1 and type(imported[0].user_id) is int:
+        return {'outcome': 'confirmed', 'user_id': str(imported[0].user_id), 'basis': 'provider_imported_contact'}
+    return accepted(response)
+
+
+async def write_contact_change(op):
+    operation, parameters, verified_self, input_peer, invoke, accepted = (
+        op.operation, op.parameters, op.verified_self, op.input_peer, op.invoke, op.accepted)
+    user_id = number_id(parameters.get('user_id'))
+    if isinstance(verified_self, types.User) and user_id == verified_self.id:
+        reject('invalid_parameters')
+    target = await input_peer(user_id)
+    if not isinstance(target, types.InputPeerUser):
+        reject('invalid_parameters')
+    if operation == 'delete_contact':
+        request = functions.contacts.DeleteContactsRequest([utils.get_input_user(target)])
+    else:
+        fn = functions.contacts.BlockRequest if operation == 'block_contact' else functions.contacts.UnblockRequest
+        request = fn(target, my_stories_from=False)
+    return accepted(await invoke(request, mutation=True))
+
+
+async def write_update_profile(op):
+    parameters, invoke, verified_self, accepted = op.parameters, op.invoke, op.verified_self, op.accepted
+    if not parameters:
+        reject('invalid_parameters')
+    response = await invoke(functions.account.UpdateProfileRequest(
+        first_name=parameters.get('first_name'), last_name=parameters.get('last_name'),
+        about=parameters.get('bio')), mutation=True)
+    if isinstance(verified_self, types.User) and isinstance(response, types.User) and response.id == verified_self.id:
+        return {'outcome': 'confirmed', 'profile': profile(response), 'basis': 'provider_profile'}
+    return accepted(response)
+
+
+ACCOUNT_HANDLERS = {
+    'add_contact': write_add_contact, 'delete_contact': write_contact_change, 'block_contact': write_contact_change,
+    'unblock_contact': write_contact_change, 'update_profile': write_update_profile,
+}
+
+
 async def write_file(op):
     parameters, job, info, stream, invoke, peer, accepted_updates, chat = (
         op.parameters, op.job, op.info, op.stream, op.invoke, op.peer, op.accepted_updates, op.chat)
@@ -826,13 +874,21 @@ async def write_mute(op):
         types.InputNotifyPeer(peer), settings), mutation=True))
 
 
+async def write_press_button(op):
+    # ANYM-676: one press of one callback button, bound to the preview; the callback data never leaves
+    # button_press_executor except inside the one Telegram request. _execute admits it before the peer lookup.
+    from .button_press_executor import press
+    return await press(op.client, op.job, op.governor, op.rpc, op.invoke, op.peer, op.chat, op.message_id,
+                       op.clear_started, op.check_policy)
+
+
 MESSAGE_HANDLERS = {
     'send_file': write_file, 'forward_message': write_forward, 'send_poll': write_media_message,
     'send_contact': write_media_message, 'send_location': write_media_message, 'edit_message': write_edit_delete,
     'delete_message': write_edit_delete, 'send_reaction': write_reaction, 'vote_poll': write_vote,
     'pin_message': write_pin, 'unpin_message': write_pin, 'mark_read': write_mark_read,
     'mark_unread': write_mark_unread, 'archive_chat': write_archive, 'unarchive_chat': write_archive,
-    'mute_chat': write_mute, 'unmute_chat': write_mute,
+    'mute_chat': write_mute, 'unmute_chat': write_mute, 'press_button': write_press_button,
 }
 
 
@@ -1118,7 +1174,7 @@ GROUP_HANDLERS = {
     'approve_join_requests': write_join_requests, 'reject_join_requests': write_join_requests,
 }
 
-HANDLERS = {**READ_HANDLERS, **MESSAGE_HANDLERS, **GROUP_HANDLERS}
+HANDLERS = {**READ_HANDLERS, **ACCOUNT_HANDLERS, **MESSAGE_HANDLERS, **GROUP_HANDLERS}
 
 
 def check_slow_mode(parameters, job, prepared):
@@ -1257,6 +1313,36 @@ def check_parameters(operation, parameters, job, prepared):
         check(parameters, job, prepared)
 
 
+ACCOUNT_ONLY = frozenset({'list_contacts', 'list_blocked', 'get_contact', 'get_profile',
+                          'add_contact', 'delete_contact', 'block_contact', 'unblock_contact',
+                          'update_profile', 'create_group', 'check_chat_link', 'join_chat'})
+MESSAGE_OPERATIONS = frozenset({'get_reactions', 'get_message_info', 'edit_message', 'delete_message',
+                                'send_reaction', 'vote_poll', 'pin_message', 'unpin_message', 'mark_read',
+                                'press_button'})
+
+
+def read_targets(operation, job, parameters, ids, referenced_peers):
+    """(chat, message_id, source_chat, source_message), None where absent; adds each peer to `referenced_peers`."""
+    chat = None if operation in ACCOUNT_ONLY else number_id(job.get('provider_chat'), marked=True)
+    message_id = number_id(job.get('provider_message_id')) if operation in MESSAGE_OPERATIONS else None
+    if message_id is not None and message_id > 2**31 - 1:
+        reject('invalid_parameters')
+    source_chat = source_message = None
+    if operation == 'forward_message':
+        source_chat = number_id(job.get('source_provider_chat'), marked=True)
+        source_message = number_id(job.get('source_provider_message'))
+        if source_message > 2**31 - 1:
+            reject('invalid_parameters')
+        referenced_peers.add(str(source_chat))
+    if chat is not None:
+        referenced_peers.add(str(chat))
+    if 'user_id' in parameters and operation != 'get_contact':
+        referenced_peers.add(str(number_id(parameters['user_id'])))
+    if operation == 'create_group':
+        referenced_peers.update(str(user) for user in ids)
+    return chat, message_id, source_chat, source_message
+
+
 async def _execute(client, job, *, verified_self=None, governor=None):
     """Execute exactly one prepared, bounded operation without automatic retries.
 
@@ -1296,7 +1382,6 @@ async def _execute(client, job, *, verified_self=None, governor=None):
         # The shared rate gate and lookups may delay the first mutation.
         report('waiting')
     prepared = {}  # check_parameters fills it; `finally` closes its stream
-    source_chat = source_message = None
     referenced_peers = set()
 
     def collection_policy():
@@ -1405,7 +1490,8 @@ async def _execute(client, job, *, verified_self=None, governor=None):
 
     def join_refused():
         nonlocal started_mutation
-        started_mutation = False  # A definite refusal: the provider joined nothing.
+        # A definite refusal: the provider joined nothing (join_chat) or the bot received nothing (press_button).
+        started_mutation = False
 
     try:
         check_parameters(operation, parameters, job, prepared)
@@ -1421,28 +1507,7 @@ async def _execute(client, job, *, verified_self=None, governor=None):
         if operation == INSPECT_BUTTONS:
             return await inspect_message_buttons(client, job, governor, rpc, referenced_peers, check_policy)
 
-        account_only = {'list_contacts', 'list_blocked', 'get_contact', 'get_profile',
-                        'add_contact', 'delete_contact', 'block_contact', 'unblock_contact',
-                        'update_profile', 'create_group', 'check_chat_link', 'join_chat'}
-        chat = None if operation in account_only else number_id(job.get('provider_chat'), marked=True)
-        message_operations = {'get_reactions', 'get_message_info', 'edit_message', 'delete_message',
-                              'send_reaction', 'vote_poll', 'pin_message', 'unpin_message', 'mark_read',
-                              'press_button'}
-        message_id = number_id(job.get('provider_message_id')) if operation in message_operations else None
-        if message_id is not None and message_id > 2**31 - 1:
-            reject('invalid_parameters')
-        if operation == 'forward_message':
-            source_chat = number_id(job.get('source_provider_chat'), marked=True)
-            source_message = number_id(job.get('source_provider_message'))
-            if source_message > 2**31 - 1:
-                reject('invalid_parameters')
-            referenced_peers.add(str(source_chat))
-        if chat is not None:
-            referenced_peers.add(str(chat))
-        if 'user_id' in parameters and operation != 'get_contact':
-            referenced_peers.add(str(number_id(parameters['user_id'])))
-        if operation == 'create_group':
-            referenced_peers.update(str(user) for user in ids)
+        chat, message_id, source_chat, source_message = read_targets(operation, job, parameters, ids, referenced_peers)
         check_policy()
         if operation == 'press_button':
             # ANYM-676: over the pacing budget nothing reaches the provider, not even the peer lookup.
@@ -1456,56 +1521,12 @@ async def _execute(client, job, *, verified_self=None, governor=None):
         if handler is not None:
             return await handler(OperationContext(
                 accepted=accepted, accepted_updates=accepted_updates, allowed_provider_id=allowed_provider_id,
-                basic_chat=basic_chat, channel=channel, chat=chat, client=client, clock=clock,
-                collection_policy=collection_policy, entered=entered, exact_message=exact_message, ids=ids,
-                info=info, input_peer=input_peer, invoke=invoke, job=job, join_refused=join_refused,
-                message_id=message_id, operation=operation, parameters=parameters, peer=peer, rpc=rpc,
-                source_chat=source_chat, source_message=source_message, stream=stream, user_input=user_input,
-                verified_self=verified_self))
-
-        if operation == 'press_button':
-            # ANYM-676: one press of one callback button, bound to the preview; the callback data never leaves
-            # button_press_executor except inside the one Telegram request.
-            from .button_press_executor import press
-
-            def clear_started():
-                nonlocal started_mutation
-                started_mutation = False  # A definite refusal: the bot received nothing.
-            return await press(client, job, governor, rpc, invoke, peer, chat, message_id, clear_started,
-                               check_policy)
-
-        if operation == 'add_contact':
-            if 'phone' not in parameters or 'first_name' not in parameters:
-                reject('invalid_parameters')
-            contact = types.InputPhoneContact(secrets.randbits(63), parameters['phone'],
-                parameters['first_name'], parameters.get('last_name', ''))
-            response = await invoke(functions.contacts.ImportContactsRequest([contact]), mutation=True)
-            imported = [p for p in getattr(response, 'imported', []) if getattr(p, 'client_id', None) == contact.client_id]
-            if len(imported) == 1 and type(imported[0].user_id) is int:
-                return {'outcome': 'confirmed', 'user_id': str(imported[0].user_id), 'basis': 'provider_imported_contact'}
-            return accepted(response)
-        if operation in ('delete_contact', 'block_contact', 'unblock_contact'):
-            user_id = number_id(parameters.get('user_id'))
-            if isinstance(verified_self, types.User) and user_id == verified_self.id:
-                reject('invalid_parameters')
-            target = await input_peer(user_id)
-            if not isinstance(target, types.InputPeerUser):
-                reject('invalid_parameters')
-            if operation == 'delete_contact':
-                request = functions.contacts.DeleteContactsRequest([utils.get_input_user(target)])
-            else:
-                fn = functions.contacts.BlockRequest if operation == 'block_contact' else functions.contacts.UnblockRequest
-                request = fn(target, my_stories_from=False)
-            return accepted(await invoke(request, mutation=True))
-        if operation == 'update_profile':
-            if not parameters:
-                reject('invalid_parameters')
-            response = await invoke(functions.account.UpdateProfileRequest(
-                first_name=parameters.get('first_name'), last_name=parameters.get('last_name'),
-                about=parameters.get('bio')), mutation=True)
-            if isinstance(verified_self, types.User) and isinstance(response, types.User) and response.id == verified_self.id:
-                return {'outcome': 'confirmed', 'profile': profile(response), 'basis': 'provider_profile'}
-            return accepted(response)
+                basic_chat=basic_chat, channel=channel, chat=chat, check_policy=check_policy,
+                clear_started=join_refused, client=client, clock=clock, collection_policy=collection_policy,
+                entered=entered, exact_message=exact_message, governor=governor, ids=ids, info=info,
+                input_peer=input_peer, invoke=invoke, job=job, join_refused=join_refused, message_id=message_id,
+                operation=operation, parameters=parameters, peer=peer, rpc=rpc, source_chat=source_chat,
+                source_message=source_message, stream=stream, user_input=user_input, verified_self=verified_self))
         reject('unsupported_operation')
     except asyncio.CancelledError:
         raise
