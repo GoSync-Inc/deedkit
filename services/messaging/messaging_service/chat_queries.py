@@ -294,16 +294,20 @@ def _page_first(c,p,clauses,args,*,accounts,limit,last_sql,last_filter,pos,lower
         ' WHERE '+scoped+' AND m.sent_at=%s ORDER BY m.id DESC LIMIT %s) SELECT e.n,q.chat FROM (SELECT count(*) AS n FROM tied) e'
         ' LEFT JOIN LATERAL (SELECT DISTINCT m.chat FROM tied m'+kept+') q ON true')
     # Proof inside the page statement's own snapshot: no kept message of a chat outside the candidates at or after the
-    # page's oldest head (scope and bounds as the window's).
-    proof_sql=('NOT EXISTS(SELECT 1 FROM messages m'+kept+' AND '+scoped+
-        " AND NOT m.chat=ANY(%s) AND m.sent_at>=(SELECT min(coalesce(page_head,'-infinity')) FROM chat_page))")
+    # page's oldest head (scope and bounds as the window's). ANYM-950: that floor is a run-time value the planner cannot
+    # estimate, so the probe also takes the exact read's oldest head as a literal lower bound (a message_live_date range).
+    # It is used only while the statement's own floor is not below it (a head deleted between the reads lowers the
+    # floor); then both bounds mean the floor alone. Otherwise today's unbounded probe decides: the verdict never moves.
+    floor_sql="(SELECT min(coalesce(page_head,'-infinity')) FROM chat_page)"
+    probe_sql='NOT EXISTS(SELECT 1 FROM messages m'+kept+' AND '+scoped+' AND NOT m.chat=ANY(%s) AND m.sent_at>='+floor_sql
+    proof_sql='CASE WHEN '+floor_sql+'>=%s::timestamptz THEN '+probe_sql+' AND m.sent_at>=%s::timestamptz) ELSE '+probe_sql+') END'
     exact=[*clauses,'c.id=ANY(%s)','NOT c.id=ANY(%s)']
     exact_tail,exact_args=[],[]
     if pos is not None:
         exact_tail.append("(coalesce(last.sent_at,'-infinity'),c.id)<(coalesce(%s::timestamptz,'-infinity'),%s)");exact_args.extend([at,cid])
     for bound,op in [(lower,'>='),(upper,'<')]:
         if bound:exact_tail.append('last.sent_at'+op+'%s');exact_args.append(bound)
-    exact_sql=('SELECT c.id FROM chats c JOIN accounts a ON a.id=c.account LEFT JOIN LATERAL ('+
+    exact_sql=('SELECT c.id,last.sent_at AS head FROM chats c JOIN accounts a ON a.id=c.account LEFT JOIN LATERAL ('+
         latest_sql(last_sql,both_directions=True)+') last ON true WHERE '+' AND '.join([*exact,*exact_tail])+
         " ORDER BY coalesce(last.sent_at,'-infinity') DESC,c.id DESC LIMIT %s")
     # need: distinct window chats the floor must cover. It starts at limit+1 and at least doubles while a candidate list
@@ -336,8 +340,9 @@ def _page_first(c,p,clauses,args,*,accounts,limit,last_sql,last_filter,pos,lower
         excluded=[*hidden,*(hidden[i] for i in (exclude_chats or []) if i in hidden)]
         page=c.execute(exact_sql,[*args,found,excluded,*exact_args,limit+1]).fetchall()
         if len(page)>limit:
+            probe_args=[*args,*msg_args,*bound_args,[*found,*excluded]]
             return {'found':found,'excluded':excluded,'aliases':aliases,'listed':listed,'proof':proof_sql,
-                'proof_args':[*args,*msg_args,*bound_args,[*found,*excluded]]}
+                'proof_args':[page[-1]['head'],*probe_args,page[-1]['head'],*probe_args]}
         need=max(2*need,len(found)+limit+1-len(page))
     return None
 
