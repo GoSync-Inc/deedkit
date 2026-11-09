@@ -36,9 +36,16 @@ OLD_INSERT = ('INSERT INTO message_receipts(id,account,platform,provider_chat,pr
 
 @pytest.fixture
 def at_schema(database, tmp_path):
-    """`at_schema(version)`: the DSN of a disposable database built with the migrations up to `version` only."""
+    """`at_schema(version)`: a Store on a disposable database built with the migrations up to `version` only."""
     with ExitStack() as stack:
-        yield lambda version: stack.enter_context(old_schema_store(database, tmp_path, version)).pool.conninfo
+        yield lambda version: stack.enter_context(old_schema_store(database, tmp_path, version))
+
+
+@pytest.fixture
+def runtime_index(database):
+    """072's attachment_message index as the runtime schema has it."""
+    with database.pool.connection() as c:
+        return c.execute("SELECT pg_get_indexdef('public.attachment_message'::regclass) AS d").fetchone()['d']
 
 
 def appended_roles(base):
@@ -93,6 +100,33 @@ def menu_choice(dsn):
                          "AND column_name='menu_choice'").fetchone()[0]
 
 
+def batch_state(dsn, base):
+    """What every file of a batch from `base` changes: the ledger, 071's column and gateway grant, 072's index and
+    this file's constraint."""
+    with psycopg.connect(dsn) as c:
+        index = c.execute("SELECT pg_get_indexdef(to_regclass('public.attachment_message'))").fetchone()[0]
+        grant = c.execute("SELECT has_column_privilege('messaging_gateway','public.outgoing_messages','menu_choice',"
+                          "'INSERT') FROM information_schema.columns WHERE table_name='outgoing_messages' "
+                          "AND column_name='menu_choice'").fetchone()
+    return {'version': version(dsn, base), 'constraints': constraints(dsn), 'menu_choice': menu_choice(dsn),
+            'menu_grant': grant[0] if grant else None, 'attachment_index': index}
+
+
+def outgoing_row(store):
+    """One sent outgoing message of a synthetic principal, for the previous runtime's outgoing writer."""
+    token = store.issue_key('synthetic-agent', ['synthetic'])
+    with store.authorized(token) as (_, p):
+        owner = p
+    with store.pool.connection() as c:
+        c.execute("INSERT INTO chats(id,account,title,provider_chat) VALUES ('synthetic-chat','synthetic','Synthetic','1')")
+        c.execute('''INSERT INTO outgoing_messages(id,principal,key_id,scope_version,key_permission_version,
+            request_id,request_hash,account,chat,provider_chat,body,status,provider_message_id)
+            VALUES('send_synthetic',%s,%s,%s,%s,'synthetic-send-1',%s,'synthetic','synthetic-chat','1',
+            'Synthetic outgoing text','sent','1')''', (owner['id'], owner['key_id'], owner['scope_version'],
+            owner['key_permission_version'], 'a' * 64))
+    return 'send_synthetic'
+
+
 def receipt(account, chat, max_id, audience):
     return (hashlib.sha256(f'{account}/{chat}/{max_id}/{audience}'.encode()).hexdigest(), account, 'telegram', chat, None, max_id,
             'read', 'telegram_outbox_boundary', audience, '2026-11-09T08:00:00+00:00')
@@ -110,7 +144,7 @@ def test_the_migration_is_an_unattended_non_critical_check_swap_that_backup_and_
 
 # spec: ANYM-868
 def test_the_widened_check_takes_group_aggregates_only_and_rewrites_no_row(at_schema):
-    dsn = at_schema(VERSION - 1)
+    dsn = at_schema(VERSION - 1).pool.conninfo
     seed(dsn, 1000)
     assert constraints(dsn) == {'message_receipts_check': True}
     with psycopg.connect(dsn) as c:
@@ -149,6 +183,8 @@ def old_runtime(dsn, stop, log, kind, worker):
             try:
                 if kind == 'reader': c.execute(REFERENCE_TG_SQL, ('synthetic', str(n % 500 + 1), n)).fetchall()
                 elif kind == 'outgoing': c.execute("SELECT count(*) FROM outgoing_messages WHERE account='synthetic'")
+                elif kind == 'outgoing-writer':
+                    c.execute("UPDATE outgoing_messages SET body=%s WHERE id='send_synthetic'", (f'Synthetic text {n}',))
                 else: c.execute(OLD_INSERT, receipt('synthetic', str(n % 500 + 1), RECEIPTS + n, 'private_peer'))
             except psycopg.Error as exc: error = type(exc).__name__
             log.append((kind, worker, started, time.monotonic(), error))
@@ -162,12 +198,14 @@ def old_runtime(dsn, stop, log, kind, worker):
     (3.0, 0.0, 'lock_timeout'),          # the reader outlasts lock_timeout; the batch aborts
     (0.5, 5.0, 'transaction_timeout'),   # a later statement of the batch outlasts the transaction budget
 ], ids=['commits', 'lock_wait_aborts', 'slow_batch_aborts'])
-def test_the_swap_on_100k_receipts_commits_or_aborts_inside_the_runner_bounds(at_schema, base, hold_s, delay_s, code):
+def test_the_swap_on_100k_receipts_commits_or_aborts_inside_the_runner_bounds(at_schema, runtime_index, base, hold_s,
+                                                                              delay_s, code):
     """Criterion 1's lock test through the real migrate-expand batch from a database built at `base` with that
     schema's own SQL: from 70 the batch also holds 071's outgoing_messages lock and its gateway grant while the swap
     waits for message_receipts."""
-    dsn = at_schema(base)
-    gateway_role(dsn); seed(dsn)
+    store = at_schema(base); dsn = store.pool.conninfo
+    gateway_role(dsn); seed(dsn); outgoing_row(store)
+    before = batch_state(dsn, base)
     plan = release_plan(base)
     assert ('gateway_role.sql' in appended_roles(base)) == (base < 71)  # 071's grant rides a release from 70
     holder = psycopg.connect(dsn)
@@ -190,7 +228,7 @@ def test_the_swap_on_100k_receipts_commits_or_aborts_inside_the_runner_bounds(at
         result['span'] = (started, time.monotonic())
 
     sessions = [threading.Thread(target=old_runtime, args=(dsn, stop, log, kind, i))
-                for i, kind in enumerate(['reader', 'reader', 'writer', 'writer', 'outgoing'])]
+                for i, kind in enumerate(['reader', 'reader', 'writer', 'writer', 'outgoing', 'outgoing-writer'])]
     for s in sessions: s.start()
     time.sleep(0.3)
     runner = threading.Thread(target=migrate); runner.start()
@@ -206,19 +244,19 @@ def test_the_swap_on_100k_receipts_commits_or_aborts_inside_the_runner_bounds(at
     assert max(end - begin for _, _, begin, end, _ in log) <= LOCK_S + TRANSACTION_S
     blocked = [(begin, end) for _, _, begin, end, _ in log if started <= begin <= ended and end - begin > 0.3]
     assert blocked and all(end <= ended + 0.5 for _, end in blocked)
-    assert {kind for kind, _, begin, _, _ in log if begin > ended} == {'reader', 'writer', 'outgoing'}
+    assert {kind for kind, _, begin, _, _ in log if begin > ended} == {'reader', 'writer', 'outgoing', 'outgoing-writer'}
+    assert before['constraints'] == {'message_receipts_check': True} and before['version'] == (base, 0)
+    applied = {'version': (VERSION, VERSION - base), 'constraints': {'message_receipts_source_check': False},
+               'menu_choice': 1, 'menu_grant': True if base < 71 else before['menu_grant'],
+               'attachment_index': runtime_index}
     if code is None:
         assert inside['seq_scan'] == 0 and {'mode': 'AccessExclusiveLock'} in inside['mode']
-        assert constraints(dsn) == {'message_receipts_source_check': False}
-        assert version(dsn, base) == (VERSION, VERSION - base) and menu_choice(dsn) == 1
+        assert batch_state(dsn, base) == applied
     else:
-        # Nothing applied, from any file of the batch: the old CHECK in place, no later column, the version not
-        # recorded. The next deploy retries the same batch.
-        assert constraints(dsn) == {'message_receipts_check': True}
-        assert version(dsn, base) == (base, 0) and menu_choice(dsn) == (1 if base >= 71 else 0)
+        # Nothing applied, from any file or grant of the batch; the next deploy retries the same batch.
+        assert batch_state(dsn, base) == before
         assert store_module.migrate_expand(dsn, plan) == {'schema_version': VERSION}
-        assert constraints(dsn) == {'message_receipts_source_check': False}
-        assert version(dsn, base) == (VERSION, VERSION - base) and menu_choice(dsn) == 1
+        assert batch_state(dsn, base) == applied
 
 
 # spec: ANYM-868

@@ -42,13 +42,15 @@ chat ID. It means that at least one member of the group read the owner's
 messages up to that ID, never who read them or that every member did. Each
 update contains a maximum outgoing message ID, with no exact read or
 device-delivery time. `message.status` publishes the group read as it does a
-private one. A group boundary counts only while its chat is stored as a
-group. A boundary for a broadcast channel (`chat_type: channel`; one reader
-among its subscribers tells the owner nothing) is skipped with the reason code
+private one. A group boundary is recorded only for a chat stored as a group.
+A boundary for a broadcast channel (`chat_type: channel`; one reader among its
+subscribers tells the owner nothing) is skipped with the reason code
 `receipt_broadcast_channel`. A boundary that arrives before its chat is
-discovered or typed is kept: it counts and its `message.status` is published
-once the chat is stored as a group, and never if the chat turns out to be a
-channel. An outbox
+discovered or typed stays outside the archive, in the collector's
+`deferred-receipts` spool beside the live spool. The drain tries it again at
+most every 10 seconds: it is recorded and its `message.status` is published once
+the chat is stored as a group, dropped if the chat is a channel, and dropped
+after 7 days otherwise. An outbox
 update with an unknown peer type is skipped and counted as
 `receipt_peer_unsupported` in `live_capture.rejected_live_captures`. Inbox read
 updates and Saved Messages are excluded. `messenger_reports` below keeps its

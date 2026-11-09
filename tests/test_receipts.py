@@ -302,14 +302,15 @@ def test_a_group_boundary_publishes_an_aggregate_read_and_a_channel_is_skipped(r
     peer=outgoing(archive,17)
     group=lambda chat:capture(chat=chat,audience='provider_aggregate')
     assert state.apply(group('-1000000000200'))=={'outcome':'receipt_skipped','reason':'receipt_broadcast_channel'}
+    assert state.apply(group('-300'))=={'outcome':'receipt_deferred'}  # untyped: the collector keeps it (next test)
     # A skip is an outcome, not a failure: a drain with it in the middle commits every capture after it.
     spool=CaptureSpool(tmp_path/'receipts')
     for value in (group('-1000000000200'),group('-300'),group('-100'),capture()):spool.put(value)
     assert spool.drain(state.apply)==4 and not list(spool.path.glob('*.json'))
     state.publish_receipts()
     with store.pool.connection() as c:
-        # The untyped chat's boundary is kept, waiting for its chat type (the next test); the channel's is not.
-        assert {r['provider_chat'] for r in c.execute("SELECT provider_chat FROM message_receipts")}=={'-100','-300','100'}
+        # Only a group's and the private peer's boundaries reach the archive, so every runtime reads only those.
+        assert {r['provider_chat'] for r in c.execute("SELECT provider_chat FROM message_receipts")}=={'-100','100'}
     published={e['message']:e['snapshot']['delivery_receipt'] for e in statuses(store)}
     assert set(published)=={read,peer}
     assert published[read]['state']=='read' and published[read]['audience']=='provider_aggregate'
@@ -326,28 +327,39 @@ def test_a_group_boundary_publishes_an_aggregate_read_and_a_channel_is_skipped(r
 
 
 # spec: ANYM-868
-def test_a_group_boundary_before_its_chat_type_publishes_once_the_chat_is_known_and_never_for_a_channel(receipt_state):
-    """Astra r1 F1: a boundary that arrives before discovery or classification is not lost. It waits without taking a
-    publication slot, and counts once the chat is stored as a group, with no further provider update; one whose chat
-    turns out to be a broadcast channel completes with nothing published."""
+def test_a_group_boundary_before_its_chat_type_waits_outside_the_archive_and_publishes_once_the_chat_is_a_group(
+        receipt_state,tmp_path):
+    """Astra r1 F1, Sol r2: a boundary that arrives before discovery or classification is not lost and is never in
+    message_receipts while its chat may be a channel (a previous runtime's reads have no chat-type filter). The
+    collector's drain keeps it in its deferred spool and applies it again later, with no further provider update:
+    a group then records and publishes it, a channel drops it."""
+    import asyncio
+    from types import SimpleNamespace as NS
+    from messaging_service.telegram_collector import TelegramCollector
     store,archive,state=receipt_state
-    group=lambda chat:capture(chat=chat,audience='provider_aggregate')
-    assert state.apply(group('-100'))['outcome']=='receipt_recorded'  # no chat row yet
-    assert state.apply(group('-1000000000200'))['outcome']=='receipt_recorded'
-    read=outgoing(archive,17,chat='-100');channel=outgoing(archive,17,chat='-1000000000200')
-    state.publish_receipts()
-    assert statuses(store)==[] and {m:p['state'] for m,p in evidence(store,[{'id':read},{'id':channel}]).items()}=={
-        read:'unknown',channel:'unknown'}
+    worker=TelegramCollector(None,'receipt-test',NS(),CaptureSpool(tmp_path/'captures',reserve_bytes=0),writer=object())
+    worker.state=state
+    from datetime import datetime,timezone
+    now=datetime.now(timezone.utc).isoformat()  # inside the deferred spool's 7 days
+    group=lambda chat:capture(chat=chat,audience='provider_aggregate',observed_at=now)
+    worker.spool.put(group('-100'));worker.spool.put(group('-1000000000200'))  # no chat rows yet
+    asyncio.run(worker.drain_captures([worker.spool]))
+    assert not list(worker.spool.path.glob('*.json')) and len(list(worker.deferred_receipts.path.glob('*.json')))==2
+    read=outgoing(archive,17,chat='-100');channel=outgoing(archive,17,chat='-1000000000200')  # untyped chats
+    worker._next_deferred_retry=0;asyncio.run(worker.drain_captures([worker.spool]))
+    assert len(list(worker.deferred_receipts.path.glob('*.json')))==2 and statuses(store)==[]
     with store.pool.connection() as c:
-        assert c.execute('SELECT count(*) AS n FROM receipt_event_jobs WHERE NOT complete').fetchone()['n']==2
+        assert c.execute('SELECT count(*) AS n FROM message_receipts').fetchone()['n']==0
     typed_chat(store,'-100','group');typed_chat(store,'-1000000000200','channel')
-    state.publish_receipts()
+    asyncio.run(worker.drain_captures([worker.spool]))  # inside the retry interval: nothing yet
+    assert statuses(store)==[]
+    worker._next_deferred_retry=0;asyncio.run(worker.drain_captures([worker.spool]))
+    assert not list(worker.deferred_receipts.path.glob('*.json'))
     published={e['message']:e['snapshot']['delivery_receipt'] for e in statuses(store)}
     assert set(published)=={read} and (published[read]['state'],published[read]['audience'])==('read','provider_aggregate')
     assert evidence(store,[{'id':channel}])[channel]['state']=='unknown'
     with store.pool.connection() as c:
-        assert c.execute('SELECT count(*) AS n FROM receipt_event_jobs WHERE NOT complete').fetchone()['n']==0
-    state.publish_receipts();assert len(statuses(store))==1
+        assert {r['provider_chat'] for r in c.execute('SELECT provider_chat FROM message_receipts')}=={'-100'}
 
 
 def test_self_chat_receipts_are_normalized_whatever_the_device_ack(seeded):

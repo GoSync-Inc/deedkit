@@ -26,7 +26,6 @@ ROW_PROOFS_SQL='''SELECT m.id,r.state,r.basis,r.audience,r.observed_at,'''+SELF_
         (SELECT r.state,r.basis,r.audience,r.observed_at FROM message_receipts r
             WHERE r.account=m.account AND r.provider_chat=ch.provider_chat AND r.platform='telegram'
             AND a.platform='telegram' AND m.direction='outgoing'
-            AND (r.audience='private_peer' OR ch.chat_type='group')
             AND r.max_id>=CASE WHEN m.provider_id ~ '^[1-9][0-9]{0,18}$'
                 THEN CASE WHEN m.provider_id::numeric<9223372036854775808
                     THEN m.provider_id::bigint ELSE NULL END ELSE NULL END ORDER BY r.max_id LIMIT 1)
@@ -36,13 +35,9 @@ ROW_PROOFS_SQL='''SELECT m.id,r.state,r.basis,r.audience,r.observed_at,'''+SELF_
             AND a.platform='whatsapp' AND m.direction='outgoing' AND r.provider_id=m.provider_id
             ORDER BY r.state,r.observed_at,r.id)
     ) r ON true WHERE m.id=ANY(%s)'''
-# ANYM-868: an aggregate (group) boundary counts only while its chat is stored as a group (GROUP_CHAT_SQL).
-GROUP_CHAT_SQL='''EXISTS(SELECT 1 FROM chats gc WHERE gc.account=r.account AND gc.provider_chat=r.provider_chat
-    AND gc.chat_type='group')'''
 REFERENCE_TG_SQL='''SELECT r.state,r.basis,r.audience,r.observed_at FROM message_receipts r
     JOIN accounts a ON a.id=r.account AND a.platform=r.platform
     WHERE r.account=%s AND r.provider_chat=%s AND r.platform='telegram' AND r.max_id>=%s
-    AND (r.audience='private_peer' OR '''+GROUP_CHAT_SQL+''')
     ORDER BY r.max_id LIMIT 1'''
 
 
@@ -113,14 +108,17 @@ def unknown_evidence():
 def record(c,raw):
     """Caller holds the account's archive lock and fenced collector lease.
 
-    ANYM-868: an aggregate Telegram boundary of a chat stored as a broadcast channel is skipped (one reader among its
-    subscribers tells the owner nothing). Any other one is kept, also before chat discovery or classification: reads
-    and publication count it only while its chat is stored as a group (GROUP_CHAT_SQL, publish)."""
+    ANYM-868: an aggregate Telegram boundary is recorded only for a chat stored as a group, so every row any runtime
+    reads is a group's. One for a broadcast channel is skipped (one reader among its subscribers tells the owner
+    nothing). One whose chat has no stored type yet records nothing and returns `receipt_deferred`: the collector keeps
+    it in its own deferred spool and applies it again on later drains (TelegramCollector.drain_captures)."""
     value=validate_capture(raw)
     if value['platform']=='telegram' and value['audience']=='provider_aggregate':
         found=c.execute('SELECT chat_type FROM chats WHERE account=%s AND provider_chat=%s',
             (value['account'],value['chat'])).fetchone()
-        if found and found['chat_type']=='channel':return {'outcome':'receipt_skipped','reason':'receipt_broadcast_channel'}
+        kind=found['chat_type'] if found else None
+        if kind=='channel':return {'outcome':'receipt_skipped','reason':'receipt_broadcast_channel'}
+        if kind!='group':return {'outcome':'receipt_deferred'}
     digest=hashlib.sha256(canonical({k:v for k,v in value.items() if k!='observed_at'})).hexdigest()
     previous=c.execute('''SELECT max(max_id) AS max_id FROM message_receipts
         WHERE account=%s AND provider_chat=%s AND platform='telegram' ''',
@@ -244,23 +242,17 @@ def receipt_hint(platform,chat_type,bot,self_chat,evidence_state,sent_at,now):
 def publish(c,account,limit=100):
     """Drain at most 100 known outgoing messages, with durable restart cursors."""
     if type(limit) is not int or not 1<=limit<=100:raise ValueError('invalid_receipt_limit')
-    # ANYM-868: a Telegram aggregate job waits until its chat has a stored type: a group publishes, a channel
-    # completes the job with nothing published. A waiting job never takes a place in the page.
     jobs=c.execute('''SELECT j.*,r.platform,r.provider_chat,r.provider_id,r.max_id,r.state,
-        r.basis,r.audience,r.observed_at,gc.chat_type FROM receipt_event_jobs j JOIN message_receipts r ON r.id=j.receipt
+        r.basis,r.audience,r.observed_at FROM receipt_event_jobs j JOIN message_receipts r ON r.id=j.receipt
         JOIN account_policies p ON p.account=j.account AND p.enabled
-        LEFT JOIN chats gc ON gc.account=r.account AND gc.provider_chat=r.provider_chat
         WHERE j.account=%s AND NOT j.complete AND NOT(r.provider_chat=ANY(p.exclude_chats))
         AND (p.discover_chats OR r.provider_chat=ANY(p.include_chats))
-        AND (r.platform<>'telegram' OR r.audience<>'provider_aggregate' OR gc.chat_type IN ('group','channel'))
         ORDER BY r.recorded_at,r.id LIMIT %s FOR UPDATE OF j''',
         (account,limit)).fetchall()
     scanned=0
     for job in jobs:
         remaining=limit-scanned
         if not remaining:break
-        if job['platform']=='telegram' and job['audience']=='provider_aggregate' and job['chat_type']!='group':
-            c.execute('UPDATE receipt_event_jobs SET complete=true WHERE receipt=%s',(job['receipt'],));continue
         if job['platform']=='telegram':
             # The existing unique chat_provider_lookup preserves old/custom IDs
             # while supplying a fixed equality prefix to the numeric range index.

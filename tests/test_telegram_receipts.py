@@ -337,6 +337,30 @@ def test_an_unknown_outbox_peer_type_is_counted_by_its_reason_code_and_capture_c
 
 
 # spec: ANYM-868
+def test_a_deferred_group_boundary_is_kept_retried_and_dropped_after_its_week(tmp_path):
+    from messaging_service.telegram_receipts import telegram_group_receipt
+    worker = collector(tmp_path); outcomes = []
+    def apply(item):
+        worker.state.applied.append(item)
+        return outcomes.pop(0) if outcomes else {'outcome': 'receipt_deferred'}
+    worker.state.apply = apply
+    fresh = telegram_group_receipt('tg-fixture', types.UpdateReadChannelOutbox(100, 23),
+        verified_self=types.User(id=42, is_self=True), expected_user_id=42, observed_at=datetime.now(timezone.utc))
+    stale = group_normalize(update(types.PeerChat(100)))  # observed weeks before now
+    worker.spool.put(fresh); worker.spool.put(stale)
+    asyncio.run(worker.drain_captures([worker.spool]))
+    deferred = lambda: [p.read_text() for p in worker.deferred_receipts.path.glob('*.json')]
+    # Both applied once from the live spool, the fresh one once more from the deferred spool; the stale one dropped.
+    assert [item['chat'] for item in worker.state.applied] == ['-1000000000100', '-100', '-1000000000100']
+    assert not list(worker.spool.path.glob('*.json')) and len(deferred()) == 1 and '-1000000000100' in deferred()[0]
+    asyncio.run(worker.drain_captures([worker.spool]))  # inside the retry interval
+    assert len(worker.state.applied) == 3 and len(deferred()) == 1
+    outcomes.append({'outcome': 'receipt_recorded'}); worker._next_deferred_retry = 0
+    asyncio.run(worker.drain_captures([worker.spool]))
+    assert len(worker.state.applied) == 4 and deferred() == [] and not worker.failed.is_set()
+
+
+# spec: ANYM-868
 def test_group_receipts_honor_the_chat_policy(tmp_path):
     worker = collector(tmp_path); worker.policy['exclude_chats'] = ['-1000000000100']
     asyncio.run(worker.group_receipt(types.UpdateReadChannelOutbox(100, 23)))

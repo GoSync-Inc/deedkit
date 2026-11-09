@@ -26,7 +26,7 @@ from .archive import MEDIA_CONTENDED,Archive
 from .blobs import BlobWriter
 from .envelope import stable_id
 from .collector_state import LIVE_REJECT_CODES,CaptureSpool,CollectorState,PeerKindConflict,session_lock
-from .spool import DurableSpool,InvalidCapture,PoisonItem
+from .spool import DurableSpool,InvalidCapture,KeepItem,PoisonItem
 from .collector_common import DbBackoff,commit_items,validate_common,validate_ranges
 from .store import Store
 from .telegram_governor import LIVE_BUDGETS,LIVE_STATE,ProviderRateLimited,RequestGovernor
@@ -609,6 +609,16 @@ def media_deadline(size):
 # Deterministic failures of a pure parser on malformed provider input. Resource,
 # I/O and unexpected errors are not among them and still fail capture closed.
 PARSE_ERRORS=(ValueError,TypeError,KeyError,AttributeError,IndexError,RecursionError)
+# ANYM-868: a group read boundary whose chat has no stored type is retried at most this often, and dropped once its
+# observation is this old (a chat still untyped after a week is not one the owner is waiting on).
+DEFERRED_RECEIPT_RETRY_S=10
+DEFERRED_RECEIPT_DAYS=7
+DEFERRED_RECEIPT_BATCH=500
+
+
+def deferred_expired(item,now=None):
+    observed=datetime.fromisoformat(item['observed_at'])
+    return (now or datetime.now(timezone.utc))-observed>timedelta(days=DEFERRED_RECEIPT_DAYS)
 # Live capture backpressure (ANYM-291): at most CAPTURE_WRITES spool writes run at once;
 # further callbacks wait in arrival order. More than CAPTURE_WAITERS waiting callbacks, or one
 # wait longer than CAPTURE_WAIT_SECONDS, fails the collector closed with capture_overload.
@@ -678,6 +688,17 @@ class TelegramCollector:
             self._history_spool=DurableSpool(live.path/'history',validator=live.validator,
                 max_bytes=live.max_bytes,max_entries=live.max_entries,reserve_bytes=live.reserve_bytes)
         return self._history_spool
+
+    @property
+    def deferred_receipts(self):
+        # ANYM-868: group read boundaries whose chat has no stored type yet (receipts.record `receipt_deferred`),
+        # beside the live spool and outside the archive, so no runtime reads them before the chat is known.
+        if getattr(self,'_deferred_receipts',None) is None:
+            from .spool import DurableSpool
+            live=self.spool
+            self._deferred_receipts=DurableSpool(live.path/'deferred-receipts',validator=live.validator,
+                max_bytes=live.max_bytes,max_entries=live.max_entries,reserve_bytes=live.reserve_bytes)
+        return self._deferred_receipts
 
     @property
     def edit_spool(self):
@@ -1041,15 +1062,27 @@ class TelegramCollector:
             except PeerKindConflict as exc:raise PoisonItem('peer_kind_conflict') from exc
         def apply(item):
             nonlocal last,count
-            settle(item);last=item;count+=1
+            defer(item,settle(item));last=item;count+=1
             # ANYM-813: the first committed live message of a batch, kept until a status write succeeds
             # (capture_progress records it for the native WhatsApp provider only).
             if (getattr(self,'first_live',None) is None and isinstance(item,dict) and item.get('kind')=='message'
                     and isinstance(item.get('envelope'),dict) and item['envelope'].get('origin')=='live'):
                 self.first_live=item
+        def defer(item,result):
+            # Kept durably before the drain removes the item from its own spool (ANYM-868); an expired one is dropped.
+            if isinstance(result,dict) and result.get('outcome')=='receipt_deferred' and not deferred_expired(item):
+                self.deferred_receipts.put(item)
         gap_lock=getattr(getattr(self,'provider',None),'read_gap_lock',None) or nullcontext()
         async with gap_lock:await self.flush_read_gap()
         for spool in spools:await asyncio.to_thread(spool.drain,apply,100)
+        if isinstance(live,DurableSpool) and time.monotonic()>=getattr(self,'_next_deferred_retry',0):
+            self._next_deferred_retry=time.monotonic()+DEFERRED_RECEIPT_RETRY_S
+            def retry(item):
+                result=self.state.apply(item)
+                # Still untyped: the file stays where it is (a put of the same item would dedupe onto it).
+                if isinstance(result,dict) and result.get('outcome')=='receipt_deferred' and not deferred_expired(item):
+                    raise KeepItem()
+            await asyncio.to_thread(self.deferred_receipts.drain,retry,DEFERRED_RECEIPT_BATCH)
         # History pages were applied inline when fetched. Replaying them is
         # idempotent and is neither live progress nor live backlog.
         for spool in history_spools:await asyncio.to_thread(spool.drain,settle,100)
