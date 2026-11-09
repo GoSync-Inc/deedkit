@@ -559,7 +559,9 @@ def test_compact_page_of_fifty_forwarded_media_items_is_smaller(seeded):
 
 
 def compact_reads(store,token,sid):
+    from messaging_service.subscription_consumption import COMPACT_READS
     from tests.test_subscriptions import activity
+    COMPACT_READS.drain()
     return activity(store,token,sid).get('all',{}).get('reads_compact',0)
 
 
@@ -614,6 +616,8 @@ def test_a_failed_compact_read_count_never_fails_the_read_and_logs_its_code(seed
     try:
         pages={method:page_store_call(store,token,method,sid,detail='compact')
             for method in ('get_subscription_events','fetch_subscription_events','wait_for_subscription_events')}
+        from messaging_service.subscription_consumption import COMPACT_READS
+        COMPACT_READS.drain()
     finally:
         with store.pool.connection() as c:
             c.execute('DROP TRIGGER compact_read_failure ON subscription_activity')
@@ -625,6 +629,70 @@ def test_a_failed_compact_read_count_never_fails_the_read_and_logs_its_code(seed
         assert [item['event_id'] for item in page['items']]==[item['event_id'] for item in full['items']]
     assert pages['fetch_subscription_events']['receipt'] and pages['wait_for_subscription_events']['receipt']
     assert compact_reads(store,token,sid)==0
+
+
+# spec: ANYM-826
+def test_a_held_counter_row_never_delays_a_compact_read_its_receipt_or_an_ack(seeded,capsys):
+    import time
+    from messaging_service.subscription_consumption import COMPACT_READS
+    from messaging_service.subscriptions import match_subscriptions
+    store,_,_=seeded
+    token,sid=static_case(store)
+    match_subscriptions(store)
+    with store.authorized(token) as (_,p):
+        scope=p['scope_version']
+    capsys.readouterr()
+    with store.pool.connection() as c:
+        c.execute('''INSERT INTO subscription_activity(subscription,day,platform,scope_version,metric,n)
+            VALUES(%s,(statement_timestamp() AT TIME ZONE 'UTC')::date,'all',%s,'reads_compact',1)''',(sid,scope))
+    # Another transaction holds today's reads_compact row of the definition (that row only, not the definition)
+    # until the block ends.
+    with store.pool.connection() as blocker:
+        assert blocker.execute('''SELECT n FROM subscription_activity WHERE subscription=%s AND metric='reads_compact'
+            FOR UPDATE''',(sid,)).fetchone()['n']==1
+        started=time.monotonic()
+        page=store.fetch_subscription_events(token,sid,detail='compact')
+        passive=store.get_subscription_events(token,sid,detail='compact')
+        assert time.monotonic()-started<1 and page['items'] and passive['items']
+        ack=store.ack_subscription_events(token,sid,page['receipt'],page['ack_version'])
+        assert ack['acked_through']>=page['next_after']
+        COMPACT_READS.drain()
+    logged=[line for line in capsys.readouterr().out.splitlines() if 'subscription_activity_failed' in line]
+    # Each count gave up at its lock budget (lock_not_available); the read, its receipt and the ACK went through.
+    assert logged==['{"error": "subscription_activity_failed", "code": "55P03"}']*2
+    assert compact_reads(store,token,sid)==1
+
+
+# spec: ANYM-826
+def test_a_stalled_counter_skips_counts_beyond_its_slots_and_never_holds_a_read(seeded,monkeypatch):
+    import threading
+    import time
+    from messaging_service.subscription_consumption import COMPACT_READS
+    from messaging_service.subscriptions import match_subscriptions
+    store,_,_=seeded
+    token,sid=static_case(store)
+    match_subscriptions(store)
+    release=threading.Event()
+    started=[]
+    count=store.count_compact_read
+    def stalled(*args):
+        started.append(1)
+        release.wait(10)
+        return count(*args)
+    monkeypatch.setattr(store,'count_compact_read',stalled)
+    skipped=COMPACT_READS.skipped
+    try:
+        began=time.monotonic()
+        for _ in range(COMPACT_READS.SLOTS+3):
+            assert page_store_call(store,token,'get_subscription_events',sid,detail='compact')['items']
+        assert page_store_call(store,token,'wait_for_subscription_events',sid,detail='compact')['items']
+        # Every read returned while the counter was stalled; the counts beyond its slots were dropped.
+        assert time.monotonic()-began<5 and len(started)==1
+        assert COMPACT_READS.skipped-skipped==4
+    finally:
+        release.set()
+        COMPACT_READS.drain()
+    assert compact_reads(store,token,sid)==COMPACT_READS.SLOTS
 
 
 def tracked_keys(function,item,*args):

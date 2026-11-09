@@ -270,17 +270,67 @@ async def wait_for_subscription_events(store, token, subscription_id, *, timeout
     # Polls read full pages (the loop reads the subscription state); only the returned page is projected.
     page = await _wait(store, token, subscription_id, timeout, limit)
     if view[0] == 'compact':
-        await _count_compact_read(store, token, page['subscription']['subscription_id'])
+        # ANYM-826: one count per returned page, not per poll; submitting never blocks or awaits.
+        COMPACT_READS.submit(store, token, page['subscription']['subscription_id'])
     return project_page(page, *view)
 
 
-async def _count_compact_read(store, token, subscription_id):
-    """ANYM-826: one `reads_compact` per returned compact page, not per poll; a failed count never fails the wait."""
+class _CompactReads:
+    """ANYM-826: `reads_compact` counts, written after the read returned by one worker thread in its own short
+    transaction (Store.count_compact_read), so a held counter row, a timeout or a terminated session never delays
+    or fails a read, a receipt or an ACK. At most SLOTS counts are queued or running; a count beyond them is
+    skipped (`skipped`), never waited for. The counter uses at most one pooled connection at a time."""
+    SLOTS = 4
+
+    def __init__(self):
+        self.slots = threading.BoundedSemaphore(self.SLOTS)
+        self.lock = threading.Lock()
+        self.executor = None
+        self.pending = set()
+        self.skipped = 0
+
+    def submit(self, store, token, subscription_id):
+        if not self.slots.acquire(blocking=False):
+            with self.lock:
+                self.skipped += 1
+            return False
+        try:
+            with self.lock:
+                if self.executor is None:
+                    from concurrent.futures import ThreadPoolExecutor
+                    self.executor = ThreadPoolExecutor(1, thread_name_prefix='reads-compact')
+                future = self.executor.submit(_count_compact_read, store, token, subscription_id)
+                self.pending.add(future)
+        except Exception:
+            # An interpreter shutting down refuses new work: the count is dropped.
+            self.slots.release()
+            return False
+        future.add_done_callback(self._finished)
+        return True
+
+    def _finished(self, future):
+        with self.lock:
+            self.pending.discard(future)
+        self.slots.release()
+
+    def drain(self, timeout=10):
+        """Tests: wait for the counts already submitted."""
+        from concurrent.futures import wait
+        with self.lock:
+            pending = list(self.pending)
+        wait(pending, timeout)
+
+
+def _count_compact_read(store, token, subscription_id):
     try:
-        await asyncio.to_thread(store.count_compact_read, token, subscription_id)
+        store.count_compact_read(token, subscription_id)
     except Exception as error:
+        # Includes a revoked key or a lost connection: only this count is lost.
         print(json.dumps({'error': 'subscription_activity_failed',
             'code': getattr(error, 'code', None) or type(error).__name__}), flush=True)
+
+
+COMPACT_READS = _CompactReads()
 
 
 async def _wait(store, token, subscription_id, timeout, limit):
