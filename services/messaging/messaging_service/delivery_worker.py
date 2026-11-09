@@ -11,6 +11,7 @@ from .egress import proxy_lookup, proxy_transport
 from .event_delivery import (OPERATOR_DNS_SLOTS, _addresses, _transport, beat, dispatch_hints, disable_receiver,
     endpoint_tests, register_receiver)
 from .store import Store
+from . import wake as wakes
 
 HEARTBEAT_S = heartbeats.HEARTBEAT_S
 # A lane that has not finished a pass for this long stops the heartbeat, so capabilities report webhook down.
@@ -27,9 +28,11 @@ def pulse(store, progress, *, now=None):
     return heartbeats.record(store, 'dispatcher') and alive
 
 
-def _lane(store, stop, name, progress, interval, step):
+def _lane(store, stop, name, progress, interval, step, wake=None):
     while not stop.is_set():
         busy = False
+        # ANYM-841: taken before the pass, so an outbox commit during the pass ends the idle sleep at once.
+        token = wake.token() if wake is not None else None
         try:
             result = step()
             busy = any(result.get(key) for key in ('delivered', 'retried', 'dead_letter', 'cancelled', 'deferred'))
@@ -41,13 +44,14 @@ def _lane(store, stop, name, progress, interval, step):
         finally:
             progress[name] = time.monotonic()
         if not busy:
-            stop.wait(interval)
+            wakes.pause(stop, wake, interval, token)
 
 
-def run(store, stop, *, transport=_transport, resolver=None, interval=2, proxy=None):
+def run(store, stop, *, transport=_transport, resolver=None, interval=2, proxy=None, wake=None):
     """Operator receivers and self-service endpoints in separate lanes until stop is set (ANYM-534). With `proxy`
     (DELIVERY_EGRESS_PROXY) every lookup and connection goes through the egress proxy, the operator lane on its own
-    proxy slots (ANYM-581)."""
+    proxy slots (ANYM-581). With `wake` (a wake.Listener on the outbox channel) idle lanes also wake on a committed
+    hint; `interval` stays the fallback poll (ANYM-841)."""
     operator_transport = transport
     if proxy:
         transport, operator_transport = proxy_transport(proxy), proxy_transport(proxy, lane='operator')
@@ -72,7 +76,7 @@ def run(store, stop, *, transport=_transport, resolver=None, interval=2, proxy=N
     steps.update({f'endpoint-{n}': endpoint_step(n == 0) for n in range(ENDPOINT_LANES)})
     started = time.monotonic()
     progress = dict.fromkeys(steps, started)
-    threads = [threading.Thread(target=_lane, args=(store, stop, name, progress, interval, step), daemon=True,
+    threads = [threading.Thread(target=_lane, args=(store, stop, name, progress, interval, step, wake), daemon=True,
         name='deedkit-delivery-' + name) for name, step in steps.items()]
     for thread in threads:
         thread.start()
@@ -86,6 +90,8 @@ def run(store, stop, *, transport=_transport, resolver=None, interval=2, proxy=N
             stop.wait(HEARTBEAT_S)
     finally:
         stop.set()
+        if wake is not None:
+            wake.ring()
         for thread in threads:
             thread.join()
 
@@ -126,7 +132,12 @@ def main():
             once = {'transport': proxy_transport(proxy), 'resolver': proxy_lookup(proxy)} if proxy else {}
             print(json.dumps(dispatch_hints(store, **once)), flush=True)
             return
-        run(store, stop, proxy=proxy)
+        wake = wakes.listen(store, wakes.OUTBOX, stop)
+        try:
+            run(store, stop, proxy=proxy, wake=wake)
+        finally:
+            if wake is not None:
+                wake.close()
     finally:
         store.close()
 

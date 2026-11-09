@@ -22,7 +22,9 @@ from uuid import UUID
 import psycopg
 from psycopg.errors import LockNotAvailable, QueryCanceled, TransactionTimeout
 from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
+# ANYM-841: the pool sends the commit wake-ups writers mark (wake.mark) after each commit; the name stays for
+# production.py's prepare_threshold source check and the tests that replace it.
+from .wake import WakingPool as ConnectionPool
 from . import __version__  # noqa: F401  (still importable from here)
 from .field_errors import date_range_refusal
 from .policy import (  # noqa: F401  (key_admin reads these through this module)
@@ -1592,6 +1594,7 @@ class Store:
     def append_event(c, account, message, kind='message.created', origin='fixture', event_key=None,
                      snapshot_metadata=None, publisher=None):
         from psycopg.types.json import Jsonb
+        from . import wake
         row=Store.event_snapshot(c, account, message, snapshot_metadata)
         if publisher is not None and publisher not in ('publish_file_text_event','publish_file_enrichment_event'):
             raise ValueError('invalid_event_publisher')
@@ -1602,12 +1605,16 @@ class Store:
             # stage, derives the origin and alone writes the journal and feed counter.
             # Until the reapplied template grants it (schema 36, or 37 with the previous
             # grants) the worker keeps the direct write those grants allow.
-            return c.execute('SELECT public.'+publisher+'(%s,%s,%s,%s,%s) AS id',
+            event=c.execute('SELECT public.'+publisher+'(%s,%s,%s,%s,%s) AS id',
                 (account,message,kind,event_key,Jsonb(row))).fetchone()['id']
+            wake.mark(c, wake.EVENTS)
+            return event
         value = c.execute('UPDATE feed_counter SET value=value+1 WHERE id=1 RETURNING value').fetchone()['value']
         c.execute('''INSERT INTO events(id,account,message,kind,revision,origin,snapshot,event_key)
             VALUES(%s,%s,%s,%s,%s,%s,%s,%s)''',
             (value,account,message,kind,row['revision'],origin,Jsonb(row),event_key))
+        # ANYM-841: the matcher wakes after this transaction commits, never inside it.
+        wake.mark(c, wake.EVENTS)
         return value
 
     def seed(self):

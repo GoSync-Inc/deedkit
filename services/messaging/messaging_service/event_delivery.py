@@ -265,11 +265,15 @@ def enqueue_hint(c, row, through, *, kind='events', request_id='', capped=True):
     if target == 'endpoint' and capped and endpoint_queue_full(c, row):
         from .store import APIError
         raise APIError('rate_limited', 429)
-    return c.execute('''INSERT INTO subscription_outbox(subscription,subscription_version,''' + target + ''',
+    hint = c.execute('''INSERT INTO subscription_outbox(subscription,subscription_version,''' + target + ''',
         through_position,kind,request_id) VALUES(%s,%s,%s,%s,%s,%s)
         ON CONFLICT(subscription,subscription_version,kind,through_position,request_id)
         DO NOTHING RETURNING *''',
         (row['id'], row['version'], binding[target], through, kind, request_id)).fetchone()
+    if hint is not None:
+        from .wake import OUTBOX, mark
+        mark(c, OUTBOX)  # ANYM-841: the delivery lanes wake after the commit
+    return hint
 
 
 def _probe_view(row):

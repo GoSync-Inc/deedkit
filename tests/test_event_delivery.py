@@ -1412,6 +1412,84 @@ def test_operator_receiver_hint_is_on_time_while_four_endpoints_hang(seeded, tmp
         store.set_delivery_features(False)
 
 
+# spec: ANYM-841
+def test_a_committed_hint_wakes_an_idle_delivery_lane_before_the_interval(seeded, tmp_path):
+    import threading
+    import time
+    from messaging_service import delivery_worker, wake
+    store, _, _ = seeded
+    token = identity(store)
+    sid = subscription(store, token)
+    rid, _ = receiver(store, token, tmp_path)
+    call(store, token, 'configure_subscription_delivery', sid, 1, rid)
+    sent = {}
+    def transport(url, body, headers, *, resolved, timeout):
+        sent[url] = time.monotonic()
+        return 204
+    stop = threading.Event()
+    listener = wake.Listener.for_store(store, wake.OUTBOX, stop)
+    # A 30 s poll: only the commit wake can deliver within the bound below.
+    worker = threading.Thread(target=delivery_worker.run, args=(store, stop),
+        kwargs={'transport': transport, 'resolver': PUBLIC, 'interval': 30, 'wake': listener})
+    worker.start()
+    try:
+        due = time.monotonic() + 10
+        while not listener.listening and time.monotonic() < due:
+            time.sleep(0.02)
+        assert listener.listening
+        time.sleep(0.5)  # every lane has finished its first, empty pass and sleeps
+        emit(store)
+        match_subscriptions(store)
+        matched = time.monotonic()
+        while 'https://hooks.example.test/wake' not in sent and time.monotonic() < matched + 10:
+            time.sleep(0.02)
+        assert sent['https://hooks.example.test/wake'] - matched < 5
+    finally:
+        stop.set()
+        worker.join(30)
+        listener.close()
+    assert not worker.is_alive()
+
+
+# spec: ANYM-841
+def test_a_lost_listener_connection_falls_back_to_the_poll_and_reconnects(seeded, capsys):
+    import json
+    import threading
+    import time
+    from messaging_service import wake
+    store, _, _ = seeded
+    stop = threading.Event()
+    listener = wake.Listener.for_store(store, wake.OUTBOX, stop, slice_s=0.2, retry_s=1.0)
+    try:
+        due = time.monotonic() + 10
+        while not listener.listening and time.monotonic() < due:
+            time.sleep(0.02)
+        first = listener.pid
+        capsys.readouterr()
+        with store.pool.connection() as c:
+            assert c.execute('SELECT pg_terminate_backend(%s) AS ok', (first,)).fetchone()['ok']
+        while listener.listening and time.monotonic() < due:
+            time.sleep(0.02)
+        # While it reconnects the wait is the plain poll: it ends at its timeout, never later.
+        token = listener.token()
+        started = time.monotonic()
+        assert wake.pause(stop, listener, 0.3, token) is False
+        assert 0.25 < time.monotonic() - started < 1.0
+        while not listener.listening and time.monotonic() < due + 10:
+            time.sleep(0.02)
+        assert listener.listening and listener.pid != first and listener.failures == 1
+        listener.wait(0.2, listener.token())
+        token = listener.token()
+        with store.pool.connection() as c:
+            wake.mark(c, wake.OUTBOX)
+        assert listener.wait(2.0, token) is True
+        lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        assert lines == [{'error': 'wake_listen_failed', 'channel': wake.OUTBOX, 'class': lines[0]['class'], 'count': 1}]
+    finally:
+        stop.set()
+        listener.close()
+
+
 # spec: ANYM-534
 def test_endpoint_lane_keeps_one_attempt_per_key_in_flight_and_serves_keys_in_turn(seeded, tmp_path, monkeypatch):
     import threading

@@ -1080,6 +1080,8 @@ def journal_send_failures(c, rows):
                         'account': row['account'], 'chat': row['chat'], 'send_id': str(row['id']),
                         'status': row['status'], 'error_code': row['error_code'],
                         'principal': row['principal'], 'key_id': str(row['key_id'])}), 'send.failed:' + str(row['id'])))
+                from .wake import EVENTS, mark
+                mark(c, EVENTS)  # ANYM-841: the matcher wakes after the commit
         except Exception as error:
             _journal_failed('send.failed', error)
 

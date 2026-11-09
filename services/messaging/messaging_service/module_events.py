@@ -370,6 +370,8 @@ def _hint(c, row, module):
             c.execute('''INSERT INTO subscription_outbox(subscription,subscription_version,''' + target + ''',
                 through_position,kind,quiet_bypass) VALUES(%s,%s,%s,%s,'module_events',%s) ON CONFLICT DO NOTHING''',
                 (row['id'], row['version'], binding[target], last['through'], bool(last['urgent'])))
+            from .wake import OUTBOX, mark
+            mark(c, OUTBOX)  # ANYM-841: the delivery lanes wake after the commit
         c.execute('UPDATE subscription_module_streams SET hinted_through=%s WHERE subscription=%s',
             (last['through'], row['id']))
 

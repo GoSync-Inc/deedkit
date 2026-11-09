@@ -15,9 +15,16 @@ from .delivery_policy import flush_hints
 from .subscriptions import (acked_retention_days, journal_source_health, match_subscriptions,
     prune_subscriptions, retire_subscriptions, source_health_stale_seconds)
 from .telemetry import configure, capture
+from . import wake as wakes
 
 HEALTH_INTERVAL_S = 30
 RETIRE_INTERVAL_S = 60
+# ANYM-841: a pass that scanned or matched anything is followed at once by the next; only an empty pass sleeps.
+BUSY_KEYS = ('scanned', 'matched', 'module_matched')
+
+
+def busy(result):
+    return isinstance(result, dict) and any(result.get(key) for key in BUSY_KEYS)
 
 
 def main():
@@ -40,19 +47,33 @@ def main():
     acked_retention_days()
     source_health_stale_seconds()
     stop = threading.Event()
+    wake = None
+    def halt(*_):
+        stop.set()
+        if wake is not None:
+            wake.ring()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, lambda *_: stop.set())
+        signal.signal(sig, halt)
     dsn = Path(os.environ['DATABASE_URL_FILE']).read_text().strip()
     store = Store(dsn, Path(os.environ.get('PROBE_FILES', '/tmp/unused-files')),
                   'http://localhost')
-    last_beat = last_health = last_retire = None
+    last_beat = last_health = last_retire = last_prune = None
     more = False
     try:
+        if not args.once:
+            # ANYM-841: committed events wake the matcher early; the --interval poll stays the fallback.
+            wake = wakes.listen(store, wakes.EVENTS, stop)
         while not stop.is_set():
+            # Taken before the pass, so a commit during the pass ends the sleep after it at once.
+            token = wake.token() if wake is not None else None
+            result = None
             if not args.once:
                 # Retention first frees match budget; its failures never stop matching or hints.
                 try:
-                    prune_subscriptions(store, max_subscriptions=args.max_subscriptions)
+                    # ANYM-841: a busy loop keeps the poll's pruning cadence, at most once per --interval.
+                    if last_prune is None or time.monotonic() - last_prune >= args.interval:
+                        last_prune = time.monotonic()
+                        prune_subscriptions(store, max_subscriptions=args.max_subscriptions)
                     # ANYM-447: 30-day housekeeping runs once a minute, at once again while a batch was full.
                     if last_retire is None or more or time.monotonic() - last_retire >= RETIRE_INTERVAL_S:
                         last_retire = time.monotonic()
@@ -86,8 +107,10 @@ def main():
             except Exception as error:
                 capture(error, 'subscription_hint_failed')
                 print(json.dumps({'error': 'subscription_hint_failed'}), flush=True)
-            stop.wait(args.interval)
+            wakes.pause(stop, wake, 0 if busy(result) else args.interval, token)
     finally:
+        if wake is not None:
+            wake.close()
         store.close()
 
 
