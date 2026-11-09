@@ -629,67 +629,70 @@ class Dispatch:
             raise Denied("invalid_arguments", 422) from None
         return snapshot, agent, tool, selected, args
 
-    async def call(self, key, name, values, route=None):
-        """One admitted tool call; `route` is the MCP connection path (REST passes None and ignores selection)."""
-        snapshot, agent, tool, selected, args = self.admit_call(key, name, values, route)
-        if tool["operation"] == "select_modules":
-            return await self.select_modules(key, route, args["modules"])
-        if tool["module"] == "gateway":
-            snapshot, agent, visible, states, selection = await self.platform(key, route)
-            credential = admitted.get()
-            return {
-                "service": "deedkit",
-                "version": "0.1.0",
-                "principal": agent["id"],
-                "gateway_principal": agent["id"],
-                "discovery": states["discovery"],
-                "backend_tool_manifests": states["backend_tool_manifests"],
-                "policy_revision": snapshot["revision"],
-                "tools": visible,
-                "modules": sorted({CATALOG[n]["module"] for n in visible} - {"gateway"}),
-                "backend_states": states["states"],
-                "unavailable": states["unavailable_modules"],
-                "backend_builds": states["backend_builds"],
-                "gateway": {"build": gateway_build()},
-                "coverage": "query selected module capabilities; unavailable/stale sources remain unknown",
-                "subscriptions": "existing backend identity; passive events do not ACK",
-                # The gateway's own local write (platform_select_modules) is not a provider mutation.
-                "provider_mutations": any(
-                    CATALOG[n]["module"] != "gateway"
-                    and not CATALOG[n].get("annotations", {}).get("readOnlyHint", False) for n in visible
-                ),
-                "owner_authorization_verified": False,
-                "credential": credential,
-                "capability": Capability("gateway", "capabilities", snapshot["revision"]).to_dict(),
-                **selection,
-            }
-        module = tool["module"]
+    async def gateway_capabilities(self, key, route):
+        """The gateway module's own answer (platform_capabilities): the caller's tools, modules and backend states."""
+        snapshot, agent, visible, states, selection = await self.platform(key, route)
+        credential = admitted.get()
+        return {
+            "service": "deedkit",
+            "version": "0.1.0",
+            "principal": agent["id"],
+            "gateway_principal": agent["id"],
+            "discovery": states["discovery"],
+            "backend_tool_manifests": states["backend_tool_manifests"],
+            "policy_revision": snapshot["revision"],
+            "tools": visible,
+            "modules": sorted({CATALOG[n]["module"] for n in visible} - {"gateway"}),
+            "backend_states": states["states"],
+            "unavailable": states["unavailable_modules"],
+            "backend_builds": states["backend_builds"],
+            "gateway": {"build": gateway_build()},
+            "coverage": "query selected module capabilities; unavailable/stale sources remain unknown",
+            "subscriptions": "existing backend identity; passive events do not ACK",
+            # The gateway's own local write (platform_select_modules) is not a provider mutation.
+            "provider_mutations": any(
+                CATALOG[n]["module"] != "gateway"
+                and not CATALOG[n].get("annotations", {}).get("readOnlyHint", False) for n in visible
+            ),
+            "owner_authorization_verified": False,
+            "credential": credential,
+            "capability": Capability("gateway", "capabilities", snapshot["revision"]).to_dict(),
+            **selection,
+        }
+
+    def call_credential(self, snapshot, agent, module):
+        """The agent's key for one backend call; a backend the running clients were not built for needs a restart."""
         target = snapshot["deployment"]["backends"].get(module)
         if target != self.clients.deployment["backends"].get(module):
             raise Denied("backend_configuration_requires_restart", 503)
         binding = agent["credentials"][module]
-        credential = key_from_file(binding["key_file"], binding["key_sha256"])
-        read_only = tool.get("annotations", {}).get("readOnlyHint", False)
+        return key_from_file(binding["key_file"], binding["key_sha256"])
+
+    async def call_capabilities(self, snapshot, agent, tool, read_only):
+        """The backend's capabilities for one call; an unreachable backend says the capabilities phase failed."""
         try:
             # Discovery keeps a short bound; one call may wait for a busy pool.
-            caps = await self.backend_capabilities(snapshot, agent, module, timeout=6)
+            return await self.backend_capabilities(snapshot, agent, tool["module"], timeout=6)
         except Denied as error:
             if error.code == "backend_unavailable":
                 error.detail = unavailable(tool["operation"], getattr(error, "detail", None),
                                            phase="capabilities", read_only=read_only)
             raise
+
+    def call_admission(self, key, name, snapshot, agent, tool, args, caps):
+        """The call's allowed actions; a refusal for an operation the module build lacks gets its detailed body."""
         try:
-            allowed_actions = self.argument_admission(tool, args, snapshot, agent, caps)
+            return self.argument_admission(tool, args, snapshot, agent, caps)
         except Denied as denied:
             if getattr(denied, "operation_missing_caps", None) is not None:
                 detail = self.operation_missing(key, name, snapshot, tool, denied.operation_missing_caps)
                 if detail is not None:
                     denied.detail = detail
             raise
-        operation, args = self.backend_call(tool, args, caps)
-        # A preview has no effect, also when a risk-class tool asks for it.
-        read_only = read_only or operation == "preview_messenger_operation"
-        rules_ceiling = "assignment:read" in set(agent["grants"].get(module, [])) & set(caps["permissions"])
+
+    def module_arguments(self, tool, args, snapshot, agent, caps, rules_ceiling):
+        """The arguments this gateway sets or drops per module operation, from its own grants, never the agent's."""
+        module = tool["module"]
         if module == "messaging" and tool["operation"] in ("preview_message", "send_message"):
             # An empty recipient field is not sent, so a backend from before ANYM-532 keeps taking chat_id calls.
             args = {k: v for k, v in args.items() if k not in ("chat_id", "phone", "username") or v != ""}
@@ -717,19 +720,100 @@ class Dispatch:
             args = {k: v for k, v in args.items() if k != "projection_status"}
             if rules_ceiling and (caps.get("features") or {}).get("projection_status") is True:
                 args["projection_status"] = True
-        # ANYM-478: search's live part is the search_messages_live action, so it needs that grant too;
-        # without it the backend answers from the archive only and live says not_permitted.
-        live_denied = (module == "messaging" and tool["operation"] == "search"
+        return args
+
+    def live_search(self, tool, args, snapshot, agent, caps):
+        """ANYM-478: search's live part is the search_messages_live action, so it needs that grant too; without it the
+        backend answers from the archive only and live says not_permitted. Returns (args, denied, requested)."""
+        live_denied = (tool["module"] == "messaging" and tool["operation"] == "search"
                        and LIVE_SEARCH not in self.policy.actions(snapshot, agent, caps["permissions"]))
         live_requested = live_denied and args.get("live", "off") != "off"
         if live_requested:
             args = {**args, "live": "off"}
-        started = datetime.now(timezone.utc).timestamp()
-        # Admission is rechecked after all local work; a cached MCP session is
-        # never authority. ACK is not retried if its network outcome is unknown.
+        return args, live_denied, live_requested
+
+    def readmit(self, key, name, snapshot, agent):
+        """Admission rechecked after all local work; a cached MCP session is never authority."""
         current, principal, _ = self.admit(key, name)
         if current["revision"] != snapshot["revision"] or principal["id"] != agent["id"]:
             raise Denied("policy_changed", 409)
+        return current, principal
+
+    def backend_failure(self, error, name, values, tool, read_only, caps, agent, snapshot, current, principal,
+                        selected):
+        """A backend refusal of a non-agents call: the wait outcome of a full wait pool, else None after its body is
+        rewritten for the caller, who raises it unchanged otherwise."""
+        module = tool["module"]
+        if error.code == "backend_busy" and module == "messaging" and tool["operation"] == "wait_for_subscription_events":
+            # ANYM-518: a full wait pool is a wait outcome, not a bare 503.
+            return {"wait_status": "busy", "retry_after_s": WAIT_RETRY_AFTER_S, "wait_pool": WAIT_POOL}
+        if (error.code == "backend_unavailable" and module == "messaging" and tool["operation"] == "send_message"
+                and getattr(error, "detail", {}).get("backend_error") == "chat_guard_unavailable"):
+            # ANYM-736: the guard read failed before anything was queued: a rejection, not an unknown outcome.
+            diagnostics = error.detail
+            error.detail = {
+                **safe_error("chat_guard_unavailable"), "next_action": "retry_after_delay",
+                **{key: diagnostics[key] for key in FAILURE_FIELDS if key in diagnostics},
+            }
+        elif error.code in {"backend_unavailable", "backend_response_too_large"} and not read_only:
+            diagnostics = getattr(error, "detail", {})
+            error.detail = {
+                **safe_error("mutation_outcome_unknown", unknown_outcome=True),
+                **{key: diagnostics[key] for key in FAILURE_FIELDS if key in diagnostics},
+            }
+        elif error.code == "backend_unavailable":
+            error.detail = unavailable(tool["operation"], getattr(error, "detail", None),
+                                       phase="operation", read_only=True)
+        elif error.code == "backend_denied" and isinstance(getattr(error, "detail", None), dict):
+            if module == "messaging":
+                error.detail = self.next_call(error.detail, snapshot, agent, caps)
+            visible = [n for n in self.policy.visible(current, principal)
+                       if selected is None or CATALOG[n]["module"] in selected | {"gateway"}]
+            upload = inline_upload_next(name, values, error.detail)
+            error.detail = relayed_error(
+                error.detail, lambda value: self.runnable(value, visible, module, current, principal, caps),
+                {n for n in visible if CATALOG[n].get("annotations", {}).get("readOnlyHint", False)},
+                caller_payload(resolver_query(name, values), tool.get("inputSchema")),
+                lambda candidate: caller_payload(candidate_query(name, resolver_query(name, values), candidate),
+                                                 tool.get("inputSchema")))
+            # Runnable as soon as the caller picks its own request_id in place of the placeholder.
+            if upload is not None and self.runnable(
+                    {**upload, "arguments": {**upload["arguments"], "request_id": "inline-upload-check"}},
+                    visible, module, current, principal, caps):
+                error.detail["next"] = upload
+        return None
+
+    def agents_result(self, tool, result, current, principal):
+        """An agents-module answer in the gateway's shape; its capabilities list the agents tools this key sees."""
+        result = agents.shape(tool["operation"], result)
+        if tool["operation"] == "capabilities":
+            result["gateway_tools"] = [n for n in self.policy.visible(current, principal)
+                                       if CATALOG[n]["module"] == agents.MODULE]
+        return result
+
+    async def call(self, key, name, values, route=None):
+        """One admitted tool call; `route` is the MCP connection path (REST passes None and ignores selection).
+        The stages above run in this order; each one's refusal ends the call before anything reaches a backend."""
+        snapshot, agent, tool, selected, args = self.admit_call(key, name, values, route)
+        if tool["operation"] == "select_modules":
+            return await self.select_modules(key, route, args["modules"])
+        if tool["module"] == "gateway":
+            return await self.gateway_capabilities(key, route)
+        module = tool["module"]
+        credential = self.call_credential(snapshot, agent, module)
+        read_only = tool.get("annotations", {}).get("readOnlyHint", False)
+        caps = await self.call_capabilities(snapshot, agent, tool, read_only)
+        allowed_actions = self.call_admission(key, name, snapshot, agent, tool, args, caps)
+        operation, args = self.backend_call(tool, args, caps)
+        # A preview has no effect, also when a risk-class tool asks for it.
+        read_only = read_only or operation == "preview_messenger_operation"
+        rules_ceiling = "assignment:read" in set(agent["grants"].get(module, [])) & set(caps["permissions"])
+        args = self.module_arguments(tool, args, snapshot, agent, caps, rules_ceiling)
+        args, live_denied, live_requested = self.live_search(tool, args, snapshot, agent, caps)
+        started = datetime.now(timezone.utc).timestamp()
+        # Admission is rechecked after all local work; a cached MCP session is
+        # never authority. ACK is not retried if its network outcome is unknown.
+        current, principal = self.readmit(key, name, snapshot, agent)
         try:
             result = (
                 caps
@@ -739,50 +823,13 @@ class Dispatch:
         except Denied as error:
             if module == agents.MODULE:
                 raise self.agents_failure(error, tool, args) from None
-            if error.code == "backend_busy" and module == "messaging" and tool["operation"] == "wait_for_subscription_events":
-                # ANYM-518: a full wait pool is a wait outcome, not a bare 503.
-                return {"wait_status": "busy", "retry_after_s": WAIT_RETRY_AFTER_S, "wait_pool": WAIT_POOL}
-            if (error.code == "backend_unavailable" and module == "messaging" and tool["operation"] == "send_message"
-                    and getattr(error, "detail", {}).get("backend_error") == "chat_guard_unavailable"):
-                # ANYM-736: the guard read failed before anything was queued: a rejection, not an unknown outcome.
-                diagnostics = error.detail
-                error.detail = {
-                    **safe_error("chat_guard_unavailable"), "next_action": "retry_after_delay",
-                    **{key: diagnostics[key] for key in FAILURE_FIELDS if key in diagnostics},
-                }
-            elif error.code in {"backend_unavailable", "backend_response_too_large"} and not read_only:
-                diagnostics = getattr(error, "detail", {})
-                error.detail = {
-                    **safe_error("mutation_outcome_unknown", unknown_outcome=True),
-                    **{key: diagnostics[key] for key in FAILURE_FIELDS if key in diagnostics},
-                }
-            elif error.code == "backend_unavailable":
-                error.detail = unavailable(tool["operation"], getattr(error, "detail", None),
-                                           phase="operation", read_only=True)
-            elif error.code == "backend_denied" and isinstance(getattr(error, "detail", None), dict):
-                if module == "messaging":
-                    error.detail = self.next_call(error.detail, snapshot, agent, caps)
-                visible = [n for n in self.policy.visible(current, principal)
-                           if selected is None or CATALOG[n]["module"] in selected | {"gateway"}]
-                upload = inline_upload_next(name, values, error.detail)
-                error.detail = relayed_error(
-                    error.detail, lambda value: self.runnable(value, visible, module, current, principal, caps),
-                    {n for n in visible if CATALOG[n].get("annotations", {}).get("readOnlyHint", False)},
-                    caller_payload(resolver_query(name, values), tool.get("inputSchema")),
-                    lambda candidate: caller_payload(candidate_query(name, resolver_query(name, values), candidate),
-                                                     tool.get("inputSchema")))
-                # Runnable as soon as the caller picks its own request_id in place of the placeholder.
-                if upload is not None and self.runnable(
-                        {**upload, "arguments": {**upload["arguments"], "request_id": "inline-upload-check"}},
-                        visible, module, current, principal, caps):
-                    error.detail["next"] = upload
+            busy = self.backend_failure(error, name, values, tool, read_only, caps, agent, snapshot, current,
+                                        principal, selected)
+            if busy is not None:
+                return busy
             raise
         if module == agents.MODULE:
-            result = agents.shape(tool["operation"], result)
-            if tool["operation"] == "capabilities":
-                result["gateway_tools"] = [n for n in self.policy.visible(current, principal)
-                                           if CATALOG[n]["module"] == agents.MODULE]
-            return result
+            return self.agents_result(tool, result, current, principal)
         return shape_result(
             self, result, tool=tool, module=module, snapshot=snapshot, agent=agent, caps=caps, current=current,
             principal=principal, allowed_actions=allowed_actions, rules_ceiling=rules_ceiling,

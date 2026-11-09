@@ -123,6 +123,38 @@ def test_reload_revokes_cached_mcp_and_rest(setup):
     assert requests == []
 
 
+# spec: ANYM-205
+def test_a_policy_change_after_the_capability_read_is_policy_changed_and_never_reaches_the_backend(setup):
+    _, path, _ = setup
+    sent = []
+
+    def handler(request):
+        if request.url.path == "/v1/capabilities":
+            # Same tools and grants under a new revision: only the recheck before the operation can refuse.
+            value = json.loads(path.read_text())
+            value["revision"] = 2
+            path.write_text(json.dumps(value))
+            return httpx.Response(200, json={"permissions": ["agenda:read", "availability:read"]})
+        sent.append(request)
+        return httpx.Response(200, json={"coverage": "unknown", "calendars": []})
+
+    app = create_app(path, "http://testserver", transports={"calendar": httpx.MockTransport(handler)})
+    with TestClient(app) as client:
+        rest = client.post("/v1/calendar_calendars", json={}, headers={"Authorization": "Bearer gateway-a"})
+    assert (rest.status_code, rest.json()) == (409, {"error": "policy_changed"})
+    assert sent == []
+
+
+# spec: ANYM-205
+def test_platform_capabilities_labels_the_gateway_principal_and_never_claims_owner_authorization(setup):
+    app, _, _ = setup
+    with TestClient(app) as client:
+        body = client.post("/v1/platform_capabilities", json={}, headers={"Authorization": "Bearer gateway-a"}).json()
+    assert (body["service"], body["principal"], body["gateway_principal"]) == ("deedkit", "agent-a", "agent-a")
+    assert body["owner_authorization_verified"] is False and body["provider_mutations"] is False
+    assert body["policy_revision"] == 1 and body["modules"] == ["calendar"]
+
+
 def test_transport_failure_is_explicit_and_never_retried(setup):
     app, path, requests = setup
 
