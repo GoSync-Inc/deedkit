@@ -1247,6 +1247,20 @@ def test_promotion_accepts_a_skipped_push_verify_through_the_chain_to_the_passed
             production.verify(SHA, get=chain_push(broken))
 
 
+# spec: ANYM-322
+def test_a_chained_push_run_may_skip_native_only_when_the_reused_pull_request_run_passed_it(tmp_path):
+    skipped = ("checks / verify", "native / synthetic")
+    jobs = [{"name": name, "status": "completed", "conclusion": "skipped" if name in skipped else "success"}
+            for name in production.REQUIRED_JOBS]
+    with_native = [*({"name": name, "status": "completed", "conclusion": "success"} for name in PR_JOBS),
+                   {"name": "native / synthetic", "status": "completed", "conclusion": "success"}]
+    assert production.verify(SHA, get=chain_push(ChainGitHub(b"", jobs=with_native), jobs))["verify_run_id"] == PR_RUN_ID
+    failed = [*with_native[:-1], {"name": "native / synthetic", "status": "completed", "conclusion": "failure"}]
+    for pull_jobs in (failed, with_native[:-1]):
+        with pytest.raises(production.Refused, match="pull request job did not pass: native / synthetic"):
+            production.verify(SHA, get=chain_push(ChainGitHub(b"", jobs=pull_jobs), jobs))
+
+
 def chain_published(tmp_path, monkeypatch, tree=TREE):
     data = archive(pr_evidence(tmp_path))
     adopt_chain(tmp_path, ChainGitHub(data), data)

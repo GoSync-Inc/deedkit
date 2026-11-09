@@ -982,7 +982,8 @@ def test_container_check_builds_the_working_tree_without_touching_production_tag
     assert len(store.built()) == 2
 
 
-def queue_github(*, push_verify="skipped", queue=None, queue_jobs=None, extra_queue_runs=(), pages=None, changes=None):
+def queue_github(*, push_verify="skipped", push_native="success", queue=None, queue_jobs=None, extra_queue_runs=(), pages=None,
+                 changes=None):
     """A main push run that skipped checks / verify plus the merge queue run of the same commit."""
     push = {"id": 40, "run_attempt": 1, "head_sha": SHA, "head_branch": "main", "event": "push", "status": "completed",
             "conclusion": "success", "head_repository": {"full_name": p.REPOSITORY}, "html_url": "https://example.invalid/run/40"}
@@ -990,7 +991,8 @@ def queue_github(*, push_verify="skipped", queue=None, queue_jobs=None, extra_qu
              "event": "merge_group", "status": "completed", "conclusion": "success",
              "head_repository": {"full_name": p.REPOSITORY}, "html_url": "https://example.invalid/run/30", **(queue or {})}
     push_jobs = [{"name": name, "status": "completed",
-                  "conclusion": push_verify if name == "checks / verify" else "success"} for name in p.REQUIRED_JOBS]
+                  "conclusion": {"checks / verify": push_verify, "native / synthetic": push_native}.get(name, "success")}
+                 for name in p.REQUIRED_JOBS]
     group_jobs = queue_jobs if queue_jobs is not None else [
         {"name": name, "status": "completed", "conclusion": "success"} for name in ("checks / verify", "CI gate", "checks / load")]
     reads = {"push": 0, "merge_group": 0}
@@ -1025,6 +1027,29 @@ def test_main_push_that_reused_the_queue_verification_of_the_same_commit_is_prom
     # A push run that ran checks / verify itself keeps today's path and names itself as the source.
     plain, _, _ = github()
     assert p.verify(SHA, plain)["verify_run_id"] == 12
+
+
+QUEUE_JOBS_WITH_NATIVE = [{"name": name, "status": "completed", "conclusion": "success"}
+                          for name in ("checks / verify", "CI gate", "checks / load", "native / synthetic")]
+
+
+# spec: ANYM-321
+def test_a_push_run_that_reused_the_queue_may_skip_native_only_when_the_queue_run_passed_it():
+    get, _, group = queue_github(push_native="skipped", queue_jobs=QUEUE_JOBS_WITH_NATIVE)
+    assert p.verify(SHA, get)["verify_run_id"] == group["id"]
+    for conclusion in ("failure", "skipped", "cancelled", "missing"):
+        jobs = [job if job["name"] != "native / synthetic" else {**job, "conclusion": conclusion}
+                for job in QUEUE_JOBS_WITH_NATIVE if conclusion != "missing" or job["name"] != "native / synthetic"]
+        get, _, _ = queue_github(push_native="skipped", queue_jobs=jobs)
+        with pytest.raises(p.Refused, match="merge queue job did not pass: native / synthetic"):
+            p.verify(SHA, get)
+    # Without the queue reuse of checks / verify a skipped native job never counts, whatever the queue run shows.
+    get, _, _ = queue_github(push_verify="success", push_native="skipped", queue_jobs=QUEUE_JOBS_WITH_NATIVE)
+    with pytest.raises(p.Refused, match="required job did not pass: native / synthetic"):
+        p.verify(SHA, get)
+    # A push run that ran native itself still needs no native job in the queue run.
+    get, _, _ = queue_github()
+    assert p.verify(SHA, get)["verify_run_id"] == group["id"]
 
 
 @pytest.mark.parametrize("case", [

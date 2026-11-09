@@ -53,6 +53,9 @@ REPOSITORY = "GoSync-Inc/deedkit"
 REQUIRED_JOBS = {"checks / verify", "native / synthetic", "images / build (backup)", "CI gate", "publish"}
 # A main push run may skip only this job, and only when the merge queue verified the exact commit (ANYM-321).
 QUEUE_VERIFIED_JOB = "checks / verify"
+# With that skip the push run may also skip this job: the queue run, or the pull request run it reused, must show it
+# passed on the same tree (ci-deploy-speed 11-09; TIDEN-CI.md).
+NATIVE_JOB = "native / synthetic"
 QUEUE_BRANCH_PREFIX = "gh-readonly-queue/main/"
 # A merge queue run that skipped `checks / verify` because this job validated a full pull request run of exactly its
 # tree (ANYM-358): promotion follows that chain to the pull request run, whose jobs below must have passed.
@@ -229,8 +232,9 @@ def unchanged(run, again):
                                      for key in ("id", "run_attempt", "status", "conclusion"))
 
 
-def queue_verification(sha, get):
-    """The merge queue run whose `checks / verify` and `CI gate` verified exactly this commit."""
+def queue_verification(sha, get, native=False):
+    """The merge queue run whose `checks / verify` and `CI gate` (and with `native`, `native / synthetic`) verified
+    exactly this commit."""
     queue = latest_run(sha, "merge_group", get)
     if queue is None:
         raise Refused("the main push run skipped checks / verify and no merge queue run verified this commit")
@@ -242,7 +246,7 @@ def queue_verification(sha, get):
     jobs = attempt_jobs(queue, get)
     if job_concluded(jobs, QUEUE_VERIFIED_JOB, "skipped") and job_concluded(jobs, "CI gate"):
         raise QueueSkipped(f"merge queue job did not pass: {QUEUE_VERIFIED_JOB}", queue, jobs)
-    for required in (QUEUE_VERIFIED_JOB, "CI gate"):
+    for required in (QUEUE_VERIFIED_JOB, "CI gate", *((NATIVE_JOB,) if native else ())):
         if not job_concluded(jobs, required):
             raise Refused(f"merge queue job did not pass: {required}")
     if not unchanged(queue, latest_run(sha, "merge_group", get)):
@@ -258,13 +262,13 @@ def timestamp(value):
     return moment
 
 
-def queue_chain(sha, get, queue=None, jobs=None):
+def queue_chain(sha, get, queue=None, jobs=None, native=False):
     """The merge queue run that reused a full pull request run for this commit, and that pull request run.
 
     Returns (queue run, pull request run, pull request number, head branch). The queue run must have passed `CI gate`
     with `checks / verify` skipped after its pull request reuse job, and not by its docs-only decision; the pull
     request must have merged as exactly this commit, and the latest run of its head must have passed every
-    `PULL_REQUEST_JOBS` job. That run must be the one the reuse job's one passed `QUEUE_PR_REUSE_STEP` step names, at
+    `PULL_REQUEST_JOBS` job (with `native`, also `native / synthetic`). That run must be the one the reuse job's one passed `QUEUE_PR_REUSE_STEP` step names, at
     that or a later attempt (a rerun attempt tests the same merge commit), created before the queue run's latest attempt
     started: a deleted or replaced producer is refused, never substituted. The exact tree equality is the queue gate's
     (ANYM-358), checked again by the push run. `queue` and `jobs`, when given, are the latest queue run and its attempt's jobs as just read.
@@ -309,7 +313,7 @@ def queue_chain(sha, get, queue=None, jobs=None):
     if not decided:
         raise Refused("the latest pull request run of the merged head is not the one the merge queue decision evaluated")
     pull_jobs = attempt_jobs(run, get)
-    for name in PULL_REQUEST_JOBS:
+    for name in (*PULL_REQUEST_JOBS, *((NATIVE_JOB,) if native else ())):
         if not job_concluded(pull_jobs, name):
             raise Refused(f"pull request job did not pass: {name}")
     if not (unchanged(queue, latest_run(sha, "merge_group", get)) and unchanged(run, latest_run(head_sha, "pull_request", get))):
@@ -356,15 +360,20 @@ def verify(sha, get=api):
         return known["result"]
     jobs = attempt_jobs(latest, get)
     verified_by, queue = latest, None
+    reused = job_concluded(jobs, QUEUE_VERIFIED_JOB, "skipped")
+    # A skipped native job counts only beside that reuse, and then the run that verified must show it passed.
+    native = reused and job_concluded(jobs, NATIVE_JOB, "skipped")
     for required in sorted(REQUIRED_JOBS):
-        if required == QUEUE_VERIFIED_JOB and job_concluded(jobs, required, "skipped"):
+        if required == NATIVE_JOB and native:
+            continue
+        if required == QUEUE_VERIFIED_JOB and reused:
             # The push run reused the queue's verification, or the pull request run the queue reused; GitHub, not
             # the push run, must show it passed.
             try:
-                verified_by = queue = queue_verification(sha, get)
+                verified_by = queue = queue_verification(sha, get, native)
             except QueueSkipped as refused:
                 try:
-                    queue, verified_by, _, _ = queue_chain(sha, get, refused.queue, refused.jobs)
+                    queue, verified_by, _, _ = queue_chain(sha, get, refused.queue, refused.jobs, native)
                 except Refused as exc:
                     raise Refused(f"{refused}; {exc}") from None
         elif not job_concluded(jobs, required):
