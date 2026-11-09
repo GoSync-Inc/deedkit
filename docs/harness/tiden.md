@@ -8,7 +8,7 @@ CI details in the project's Tiden CI document. The project names its Tiden produ
 IDs; pass them when a worktree is not bound.
 
 Never create a replacement product, reimport existing tests or reset the drift watermark to make
-a dashboard green. Skills come with the CLI (skills.md); use `product-context` for lookups,
+a dashboard green. Skills come with the CLI (skills.md); use the `product-context` skill for lookups,
 `link-coverage` and `triage-issues` as their names say, and do not fork the vendor skill bodies.
 
 ## Specs and statuses
@@ -207,7 +207,7 @@ intake; an agent's idea stays a draft (Card intake step 1).
   (Fable medium); architect and skeptic (Opus high: whether to build it at all, risks, cost; for a
   new project 2–3 stacks with trade-offs); marketing and growth, and designer (Sonnet medium each).
   Each gets the idea, the owner's answers, the last synthesis and, in an existing project,
-  VISION.md and a `product-context` summary of at most 30 lines; no file dumps. Each replies in at
+  VISION.md and a `product-context` skill summary of at most 30 lines; no file dumps. Each replies in at
   most 300 words: 2–3 options with trade-offs, the main risks, at most 3 questions for the owner.
 - **B3 Synthesis.** In the chat, as Owner talk (orchestration.md): each option and disagreement
   with its role's name, the orchestrator's own view, and at most 5 questions, each with options
@@ -256,7 +256,7 @@ the planner the rest.
   (`research-<slug>`, Opus high, the depth in its brief): ambiguity high or two highs is
   critical, else standard.
 - **P1 Research.** Step 1 triage (main and open branches; a match is updated) and
-  `product-context` for every part; `How others solve it`. Critical only: three Opus lens
+  the `product-context` skill for every part; `How others solve it`. Critical only: three Opus lens
   subagents (product, staff engineer, ops and security) each give options with trade-offs, the
   biggest risk of the obvious approach and a recommendation, merged into a Board Memo:
   consensus, disagreements, risks, recommendation.
@@ -341,7 +341,7 @@ test, and never start a provider session or weaken redaction to diagnose one.
 
 ## One Tiden branch per pull request
 
-A worker runs `tiden intent skip` and reads the card and `product-context` before code; it
+A worker runs `tiden intent skip` and reads the card and the `product-context` skill's answer before code; it
 opens no `intent/` branch. Tiden changes in step with each PR: the PR's proposal or review
 branch carries the spec text it changes (a card it writes, every criterion edit or flag made while
 coding, the settle text); the PR names it as `Tiden branch:`, the reviewers read it with the diff, check A reads its specs and compares
@@ -458,6 +458,7 @@ pinned copy. A CI on another platform gets its line here first.
 TIDEN_CLI_VERSION=0.43.0
 TIDEN_CLI_SHA256_linux_amd64=3332d6d1f5a0bdb37134109efba6266db3e9435d9de7b7753b4965cfbc9a04ea
 TIDEN_CLI_SHA256_darwin_arm64=63c2569806e1382721d7de752a853f8aa3590892cd0994a85188ade2234522b5
+TIDEN_CLI_SHA256_linux_arm64=ca896b51d7a48f0d1660104211d4ac6542db743ac0f47a0ce99e67d192fb75b4
 ```
 
 - A project's CI installs Tiden with this step (after `actions/checkout`), never a version or

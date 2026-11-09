@@ -43,6 +43,10 @@ rounds and the verdict. A project's review notes add its deployed-version list, 
   not apply (the copied text was reviewed here).
 - The authoring model never adds or changes a review gate. Use one independent reviewer in a
   separate session: Sol for ordinary code, Astra for the named risk, never both for the same r1.
+  Fable may take Sol's r1 place on code (owner 11-09; `Agent(subagent_type: "general-purpose",
+  model: "fable")`), never in addition to it. The author checks the packet list (Packet) before
+  launching it, as `bin/review-codex.sh` would. It is a no-Codex review: its scoped recheck is
+  Fable again (Rounds 4; the Sol recheck rule above covers Codex r1s), under the same cap (Rounds 5).
   Product cards retain their Fable round (Card review below); it is not repeated on finished code.
 - Name the model in the pull request's `Review record:`; put `Model: <model> <effort>` (the
   author's) in every pull request description.
