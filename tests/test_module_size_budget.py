@@ -1,9 +1,10 @@
-"""Size ratchet: every source file of 900+ lines keeps its committed line count and longest function.
+"""Size ratchet: no source file of 900+ lines grows past its committed line count or longest function.
 
 config/module-size-budget.json lists each such file's `lines` and `longest_function` (lines of its longest def or
-func, the definition line through its end). The check is exact: a file that grows fails until the PR raises its
-entry, so review sees the growth in the diff; a file that shrinks fails until the PR lowers its entry, so the
-budget only ratchets down. A source file that reaches the threshold needs a new entry; a deleted file's entry goes.
+func, the definition line through its end) as a ceiling. A file that grows past it fails until the same PR raises
+its entry, so review sees the growth in the diff. A shrink or a neutral edit needs no budget edit (parallel PRs on one
+monolith then do not all edit the same entry, ANYM-625); any PR may lower an entry, and a periodic tighten PR sets
+them to the current sizes. A source file that reaches the threshold needs a new entry; a deleted file's entry goes.
 """
 import ast
 import json
@@ -74,9 +75,6 @@ def problems(root, paths, budget, threshold):
             if size[key] > want[key]:
                 found.append(f"{path} grew past its budget: {key} {size[key]} > {want[key]}. {ROUTE} "
                              f"New entry: {entry_line(path, size)}")
-            elif size[key] < want[key]:
-                found.append(f"{path} shrank: {key} {size[key]} < {want[key]}; lower its entry in {BUDGET} in this "
-                             f"PR so the budget ratchets down: {entry_line(path, size)}")
     present = {p for p in paths if Path(root, p).is_file()}
     found += [f"{path} is gone or is no source file: remove its entry from {BUDGET}"
               for path in sorted(budgeted) if path not in present or not is_source(path)]
@@ -99,19 +97,21 @@ def tracked(root):
     return [p for p in listing.split("\0") if p]
 
 
+# spec: ANYM-949
 def test_every_large_source_file_matches_its_size_budget():
     modules, threshold = load_budget((ROOT / BUDGET).read_text())
     found = problems(ROOT, tracked(ROOT), modules, threshold)
     assert not found, "\n".join(found)
 
 
-def test_ratchet_flags_growth_shrink_a_new_large_file_and_a_stale_entry(tmp_path):
+# spec: ANYM-949
+def test_ratchet_flags_growth_a_new_large_file_and_a_stale_entry_but_not_a_shrink(tmp_path):
     def write(name, text):
         Path(tmp_path, name).parent.mkdir(parents=True, exist_ok=True)
         Path(tmp_path, name).write_text(text)
     body = "def big():\n" + "    x = 1\n" * 5 + "\n\ndef small():\n    return 2\n"
     write("app.py", body)
-    write("grown.py", body + "y = 3\n")
+    write("grown.py", body.replace("x = 1", "x = 1\n    y = 2", 1))
     write("shrunk.py", body)
     write("new.go", "package x\n\nfunc init() { run() }\nfunc Long() {\n\ta()\n\tb()\n}\n")
     write("tests/test_big.py", body * 3)
@@ -122,7 +122,9 @@ def test_ratchet_flags_growth_shrink_a_new_large_file_and_a_stale_entry(tmp_path
     paths = ["app.py", "grown.py", "shrunk.py", "new.go", "tests/test_big.py"]
     found = problems(tmp_path, paths, budget, threshold=7)
     assert [line.split(":")[0] for line in found] == [
-        "grown.py grew past its budget", "new.go has 7 lines (threshold 7) and no budget entry",
-        "shrunk.py shrank", "shrunk.py shrank", "gone.py is gone or is no source file"], found
-    assert 'New entry: "grown.py": {"lines": 11, "longest_function": 6}' in found[0] and BUDGET in found[0]
+        "grown.py grew past its budget", "grown.py grew past its budget",
+        "new.go has 7 lines (threshold 7) and no budget entry", "gone.py is gone or is no source file"], found
+    assert found[0].startswith("grown.py grew past its budget: lines 11 > 10") and BUDGET in found[0]
+    assert found[1].startswith("grown.py grew past its budget: longest_function 7 > 6")
+    assert found[1].endswith('New entry: "grown.py": {"lines": 11, "longest_function": 7}')
     assert problems(tmp_path, ["app.py"], {"app.py": exact}, threshold=7) == []

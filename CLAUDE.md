@@ -19,7 +19,7 @@ process and state.
 - `tools/dev`: pinned dev tools (ruff 0.15.7, load-gate deps)
 - `config/tiden-test-identities.json`: registry of Tiden test IDs
 - Size ratchet: `config/module-size-budget.json` pins every 900+ line source file's lines and longest
-  function (`tests/test_module_size_budget.py`, exact both ways). New code goes beside a monolith: an MCP
+  function as a ceiling (`tests/test_module_size_budget.py`). New code goes beside a monolith: an MCP
   tool into `messaging_service/app_tools/<domain>.py`, a deploy subcommand into its own bundle module, a
   collector behaviour into a mixin module; deliberate growth raises the entry in the same PR
 
