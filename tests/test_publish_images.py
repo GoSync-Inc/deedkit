@@ -130,7 +130,7 @@ def attested_only_in_github(*_):
 def test_publication_targets_are_the_image_build_matrix():
     jobs = yaml.safe_load((ROOT / ".github/workflows/images.yml").read_text())["jobs"]
     assert list(pi.TARGETS) == jobs["build"]["strategy"]["matrix"]["target"]
-    assert set(pi.TARGETS) == set(production.BUILDS) - {"http-router"}
+    assert set(pi.TARGETS) == set(production.BUILDS) - {"http-router", "whatsapp-holder"}
 
 
 def test_only_a_main_push_runs_the_publish_job_and_only_it_can_write():

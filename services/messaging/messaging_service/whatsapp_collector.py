@@ -73,7 +73,8 @@ def configuration(path):
     fields={'enabled','account','expected_wid','permit_file','session_directory','events_directory',
         'pages_directory','chromium_executable','node_executable','batch_size','scan_interval_seconds',
         'max_media_bytes','disk_reserve_bytes','max_dialogs',
-        'provider','native_executable','whatsapp_gap_repair','session_lock_directory'}|MEDIA_POLICY_FIELDS
+        'provider','native_executable','whatsapp_gap_repair','session_lock_directory','holder_socket_directory',
+        'holder_dsn_file','boot_id_path'}|MEDIA_POLICY_FIELDS  # the last two: the holder's keys in one shared file
     validate_common(cfg,fields)
     if not re.fullmatch(r'[0-9]{5,20}@c.us',cfg.get('expected_wid','')): raise ValueError('invalid_whatsapp_identity')
     # Legacy configs retain their existing session; new setup templates select native.
@@ -85,7 +86,11 @@ def configuration(path):
     lock_directory=cfg.get('session_lock_directory')  # ANYM-914; default session_claim.LOCK_DIRECTORY
     if lock_directory is not None and (not isinstance(lock_directory,str) or not Path(lock_directory).is_absolute()):
         raise ValueError('invalid_private_path')
-    private=[Path(cfg[name]).resolve() for name in ['session_directory','events_directory','pages_directory']]
+    holder=cfg.get('holder_socket_directory')  # ANYM-937: attach to the session holder instead of a child
+    if holder is not None and (provider!='whatsmeow' or not isinstance(holder,str) or not Path(holder).is_absolute()):
+        raise ValueError('invalid_private_path')
+    private=[Path(cfg[name]).resolve() for name in ['session_directory','events_directory','pages_directory',
+        *(['holder_socket_directory'] if holder else [])]]
     if any(a==b or a in b.parents or b in a.parents for i,a in enumerate(private) for b in private[i+1:]):
         raise ValueError('collector_directories_overlap')
     validate_ranges(cfg,[('batch_size',50,1,100),('scan_interval_seconds',60,10,3600),
@@ -871,8 +876,24 @@ class WhatsAppCollector(TelegramCollector):
         await super().run()
 
 
+def build_collector(cfg,store,provider,cls,owner):
+    live_writer=(BlobWriter(store.files,max_bytes=cfg['media_live_max_bytes'],
+        reserve_bytes=cfg['media_live_disk_reserve_bytes'])
+        if cfg['media_live_disk_reserve_bytes'] is not None else None)
+    return cls(Archive(store),cfg['account'],provider,
+        CaptureSpool(cfg['pages_directory'],reserve_bytes=cfg['disk_reserve_bytes']),
+        events_spool=CaptureSpool(cfg['events_directory'],reserve_bytes=cfg['disk_reserve_bytes']),
+        batch_size=cfg['batch_size'],interval=cfg['scan_interval_seconds'],max_dialogs=cfg['max_dialogs'],
+        owner=owner,media_prefetch_days=cfg['media_prefetch_days'],live_writer=live_writer,
+        live_window_seconds=cfg['media_live_window_seconds'],gap_repair=cfg['whatsapp_gap_repair'],
+        writer=BlobWriter(store.files,max_bytes=cfg['max_media_bytes'],reserve_bytes=cfg['media_disk_reserve_bytes']))
+
+
 async def run_config(path):
     cfg=configuration(path)
+    if cfg.get('holder_socket_directory'):
+        from .whatsapp_holder import run_attached  # ANYM-937: no session, lock, claim or child here
+        return await run_attached(cfg,path,build_collector)
     session=Path(cfg['session_directory'])
     if not session.is_dir() or session.is_symlink() or session.stat().st_mode&0o077:
         raise RuntimeError('private_session_required')
@@ -893,19 +914,8 @@ async def run_config(path):
         store=await session_claim.open_waiting(open_store,check,cfg['account'])  # a database outage at start waits
         try:
             claim=await session_claim.acquire_waiting(store.pool,host,'collector') if native else None
-            live_writer=(BlobWriter(store.files,max_bytes=cfg['media_live_max_bytes'],
-                reserve_bytes=cfg['media_live_disk_reserve_bytes'])
-                if cfg['media_live_disk_reserve_bytes'] is not None else None)
-            worker=WhatsAppCollector(Archive(store),cfg['account'],
-                provider_for_config(cfg,path,lock_fd,host.fd if native else None),
-                CaptureSpool(cfg['pages_directory'],reserve_bytes=cfg['disk_reserve_bytes']),
-                events_spool=CaptureSpool(cfg['events_directory'],reserve_bytes=cfg['disk_reserve_bytes']),
-                batch_size=cfg['batch_size'],interval=cfg['scan_interval_seconds'],max_dialogs=cfg['max_dialogs'],
-                owner='whatsapp-'+secrets.token_hex(12),
-                media_prefetch_days=cfg['media_prefetch_days'],live_writer=live_writer,
-                live_window_seconds=cfg['media_live_window_seconds'],
-                gap_repair=cfg['whatsapp_gap_repair'],
-                writer=BlobWriter(store.files,max_bytes=cfg['max_media_bytes'],reserve_bytes=cfg['media_disk_reserve_bytes']))
+            worker=build_collector(cfg,store,provider_for_config(cfg,path,lock_fd,host.fd if native else None),
+                WhatsAppCollector,'whatsapp-'+secrets.token_hex(12))
             if claim is not None:
                 worker.session_claim=(store.pool,claim)
                 async def release_claim():

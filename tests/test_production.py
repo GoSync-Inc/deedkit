@@ -1200,7 +1200,7 @@ def test_a_truncated_push_job_listing_never_hides_a_failed_required_job():
 
 def test_published_targets_are_the_publication_matrix_and_the_verifier_is_the_recorded_build():
     from scripts import publish_images
-    assert p.PUBLISHED == publish_images.TARGETS and set(p.BUILDS) - set(p.PUBLISHED) == {"http-router"}
+    assert p.PUBLISHED == publish_images.TARGETS and set(p.BUILDS) - set(p.PUBLISHED) == {"http-router", "whatsapp-holder"}
     recorded = (ROOT / "tools/attest-verify/attest-verify.linux-amd64.sha256").read_text().split()
     assert recorded == [p.VERIFIER_SHA256, "attest-verify"]
 

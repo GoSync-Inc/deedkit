@@ -41,6 +41,10 @@ type fakeWorld struct {
 	startGate     chan struct{}
 	startOnCtx    bool
 	startReturned bool
+	// readOnCtx: a control-lane media read runs until its context ends (a long download).
+	readOnCtx     bool
+	readsEntered  int
+	readCancelled bool
 }
 
 func (f *fakeProvider) start(ctx context.Context) (any, error) {
@@ -68,6 +72,15 @@ func (f *fakeProvider) start(ctx context.Context) (any, error) {
 	return map[string]any{"ready": true}, nil
 }
 func (f *fakeProvider) handle(ctx context.Context, r request, emit func(any) error) (any, error) {
+	f.world.mu.Lock()
+	onCtx := f.world.readOnCtx && r.Method == "media"
+	f.world.mu.Unlock()
+	if onCtx {
+		f.world.set(func(w *fakeWorld) { w.readsEntered++ })
+		<-ctx.Done()
+		f.world.set(func(w *fakeWorld) { w.readCancelled = true })
+		return nil, ctx.Err()
+	}
 	if r.Method != "messenger_operation" {
 		return map[string]any{"method": r.Method}, nil
 	}
@@ -461,6 +474,36 @@ func TestHolderAttachVerifiesTheLeaseAgainstTheDatabase(t *testing.T) {
 	x.attach(t, "control", leaseRef{"c2", 2})
 	if !control.closed(t) || !send.closed(t) {
 		t.Fatal("stale connection kept after a new lease")
+	}
+}
+
+// spec: ANYM-937
+func TestASuccessorAttachesWhileThePredecessorsLongReadIsCancelled(t *testing.T) {
+	x := newHarness(t)
+	control, r := readyCollector(t, x, c1, 1)
+	if r["result"] == nil {
+		t.Fatal(r)
+	}
+	x.world.set(func(w *fakeWorld) { w.readOnCtx = true })
+	// A media download of the predecessor is in flight (its deadline can be 50 min) when the successor attaches.
+	control.write(t, map[string]any{"id": 99, "method": "media", "params": map[string]any{}})
+	eventually(t, func() bool { return x.world.count(&x.world.readsEntered) == 1 })
+	x.leases.set("c2", 2)
+	done := make(chan *lane, 1)
+	go func() { done <- x.dial(t, "control", leaseRef{"c2", 2}, [2]int{1, 1}, x.h.token) }()
+	select {
+	case l := <-done:
+		if l.reply["attached"] == nil {
+			t.Fatal(l.reply)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the successor waited for the predecessor's read")
+	}
+	x.world.mu.Lock()
+	cancelled := x.world.readCancelled
+	x.world.mu.Unlock()
+	if !cancelled {
+		t.Fatal("the predecessor's read kept running after its attachment ended")
 	}
 }
 
