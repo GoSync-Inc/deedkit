@@ -1108,7 +1108,9 @@ class TelegramCollector:
             job=await asyncio.to_thread(self.archive.claim_media,self.owner,account=self.account,
                 collector_lease=self.state.lease,since=self.history_since,writer=self.writer,
                 media_prefetch_days=self.media_prefetch_days,backfill=True,**priority)
-            self._backfill_due=time.monotonic()+(MEDIA_BACKFILL_IDLE if job is None else MEDIA_BACKFILL_INTERVAL)
+            # A contended backfill claim leased nothing: it keeps its turn for the next, immediate claim.
+            if job is not MEDIA_CONTENDED:
+                self._backfill_due=time.monotonic()+(MEDIA_BACKFILL_IDLE if job is None else MEDIA_BACKFILL_INTERVAL)
         # A contended claim is not idle: the loop claims again at once.
         if not job: return job is MEDIA_CONTENDED
         writer=self.live_writer if job.get('_live_media') else self.writer

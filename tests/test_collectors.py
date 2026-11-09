@@ -774,6 +774,23 @@ def test_idle_telegram_media_loop_waits_after_an_empty_claim_and_wakes_on_its_ow
     idle_loop_wakes_on_own_media(w,ingest)
 
 
+# spec: ANYM-839
+def test_a_contended_backfill_claim_is_retried_at_once_without_an_idle_wait(worker):
+    from messaging_service.archive import MEDIA_CONTENDED
+    w,_,_=worker
+    w.media_backfill=True
+    claims=[]
+    def claim(*args,backfill=False,**kwargs):
+        claims.append(backfill)
+        return MEDIA_CONTENDED if backfill and claims.count(True)==1 else None
+    w.archive.claim_media=claim
+    # An empty main queue, then a backfill claim that lost its rechecks: not idle.
+    assert asyncio.run(w.media_once()) is True
+    # The next claim still has the backfill's turn; only an empty backfill starts its pause.
+    assert asyncio.run(w.media_once()) is False
+    assert claims==[False,True,False,True]
+
+
 def test_delete_during_download_never_publishes_ready(worker):
     w,s,key=worker
     asyncio.run(w.capture(NS(message=message(22,media=True)))); w.spool.drain(w.state.apply)
