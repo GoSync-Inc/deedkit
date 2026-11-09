@@ -418,9 +418,10 @@ def answer_of_every_call(runner, tmp_path, status, body):
 # spec: ANYM-820
 @pytest.mark.parametrize("body", [{}, {"id": "not-a-uuid", "state": "queued"},
                                   {"id": str(uuid.uuid4()), "state": "unheard_of"},
+                                  {"id": str(uuid.uuid4()), "state": {}}, {"id": str(uuid.uuid4()), "state": []},
                                   {"id": str(uuid.uuid4()), "state": "queued", "request_id": str(uuid.uuid4()),
                                    "engine": "codex"}],
-                         ids=["empty", "bad_id", "bad_state", "another_task"])
+                         ids=["empty", "bad_id", "bad_state", "object_state", "list_state", "another_task"])
 def test_a_success_status_without_this_calls_task_is_an_unknown_start_or_stop_and_an_unavailable_read(tmp_path, body):
     runner = FakeRunner()
     values, task, start, stop, read = answer_of_every_call(runner, tmp_path, 201, body)

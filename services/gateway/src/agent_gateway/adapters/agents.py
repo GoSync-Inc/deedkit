@@ -203,7 +203,7 @@ def answers(operation, value, args):
         return isinstance(value.get("entries"), list)
     if operation == "capabilities":
         return isinstance(value.get("engines"), dict)
-    if not valid_uuid(value.get("id")) or value.get("state") not in STATES:
+    if not valid_uuid(value.get("id")) or word(value.get("state"), STATES) is None:
         return False
     if operation in ("start_task", "list_tasks"):
         if value.get("request_id") != task_id(args["request_id"]):
