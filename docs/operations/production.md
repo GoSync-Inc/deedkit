@@ -729,6 +729,27 @@ split it into its own file. Until
 ANYM-675 ships, the deployer still copies before every unattended range, because its rehearsal runs on
 the copy; that copy is automatic and holds no one.
 
+An index on a large existing table goes out before the deploy, built CONCURRENTLY (the pattern of 045
+step 0 under "Roll back the current release"). The rehearsal builds a migration's index on the copy's
+scratch server, which has 1 CPU and 1 GiB, and an unattended run refuses one that is too slow. When that
+happens, an agent builds the index as the owner on the live database: `SET lock_timeout='5s'`, then
+`CREATE INDEX CONCURRENTLY IF NOT EXISTS <name> ON <table>(<columns>)`. That build does not lock writes.
+It then checks `pg_index` against the migration's own precondition: valid, ready, the exact columns and
+the access method. An invalid build gets `DROP INDEX CONCURRENTLY` and one rebuild. Then the agent copies
+the pause to `autodeploy.pause.before-<migration>` and removes it. The migration's `CREATE INDEX IF NOT
+EXISTS` then finds the index, the next rehearsal is fast, and the tool's own copy, catalog compare and
+migrate release it. Nothing writes the ledger by hand. A migration that adds an index to a large table
+should therefore use `IF NOT EXISTS` with a `DO` precondition on `pg_index`, as 074 does. Undo before the
+deploy: `DROP INDEX CONCURRENTLY <name>`. After the deploy, the index belongs to its migration.
+
+Release record, 2026-11-09 (074 `events_created_at`, ANYM-865): the 08:34Z run refused 074 with "too slow
+for an unattended lock: the rehearsal took 2086 ms, over 1000 ms" (`events`, 437k rows). Pre-checks:
+no active call, the three backup services inactive, no `.unsettled` marker, the runner lock free. The
+CONCURRENTLY build ran 08:51:12Z to 08:51:14Z, and every condition of 074's `DO` block read true. The
+pause was copied to `/etc/deedkit/autodeploy.pause.before-074` and removed. The 08:56Z run then copied
+and rehearsed in 16 ms, migrated 73 to 74 at 09:09:12Z and deployed c68c9081 at 09:12:26Z, with no
+pause left.
+
 ### Database copies
 
 ANYM-588. A release needs a copy only for a database with no daily backup running (owner 11-04, "Migration
