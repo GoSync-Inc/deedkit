@@ -419,7 +419,9 @@ class CollectorState:
     def inventory(self,dialogs,history_since,*,discovery=False,listed_at=None):
         """Persist the catalog before any history fetch. Fence bounded batches.
 
-        listed_at: when the dialog list was read (ANYM-869 group titles); unknown means now."""
+        listed_at: when the dialog list was read (ANYM-869 group titles); default: the read time the WhatsApp
+        pass recorded in dialogs_listed_at, else now."""
+        listed_at=listed_at or getattr(self,'dialogs_listed_at',None)
         for offset in range(0,len(dialogs),100):
             with self.archive.store.pool.connection() as c:
                 self.archive.fence(c,self.account,self.lease)

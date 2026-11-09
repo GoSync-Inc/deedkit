@@ -747,10 +747,11 @@ class WhatsAppCollector(TelegramCollector):
         self.policy=await asyncio.to_thread(self.state.policy)
         await self.provider.set_policy(self.policy)
         from datetime import datetime,timezone
-        listed_at=datetime.now(timezone.utc)  # A group title in the list is no newer than this (ANYM-869).
+        # A group title in the list is no newer than its read time (ANYM-869, CollectorState.inventory).
+        self.state.dialogs_listed_at=datetime.now(timezone.utc)
         dialogs=await self.provider.dialogs(self.max_dialogs)
         # Catalog entries exist even before a chat's first message page is saved.
-        await asyncio.to_thread(lambda:self.state.inventory(dialogs,None,listed_at=listed_at))
+        await asyncio.to_thread(self.state.inventory,dialogs,None)
         dialogs=await asyncio.to_thread(self.state.scan_order,dialogs)
         seen=set();gap=False;unavailable=False
         for dialog in dialogs:
