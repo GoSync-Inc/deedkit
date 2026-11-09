@@ -301,7 +301,7 @@ def test_telegram_channel_difference_fetch_logs_chat_count_and_timing_only(capsy
         # Every finished fetch left the tracker: it stays bounded.
         assert provider.channel_fetches=={}
     # A stdout event, as the collector's other events: it reaches prod logs without any logging configuration.
-    asyncio.run(scenario())
+    asyncio.run(scenario());provider.channel_events.join()
     out=capsys.readouterr().out
     events=[json.loads(line) for line in out.splitlines() if '"telegram_channel_difference"' in line]
     chat=stable_id('chat','tg-gate',str(utils.get_peer_id(types.PeerChannel(4242))))
@@ -317,6 +317,40 @@ def test_telegram_channel_difference_fetch_logs_chat_count_and_timing_only(capsy
     assert events[0]['oldest_age_s']>0 and events[4]['oldest_age_s']>0 and events[3]['oldest_age_s'] is None
     assert events[6]['elapsed_ms'] is None and all(isinstance(event['fetch_ms'],int) for event in events)
     assert 'synthetic private text' not in out and '4242' not in out and '777' not in out
+
+
+# spec: ANYM-840
+def test_a_stalled_stdout_never_blocks_the_channel_difference_hooks(monkeypatch):
+    import sys,threading,time
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    from messaging_service.telegram_collector import TelethonProvider
+    client=TelegramClient(StringSession(),1,'synthetic',receive_updates=False)
+    provider=object.__new__(TelethonProvider);provider.client=client
+    provider.bind_state(NS(account='tg-stall',update_gap=lambda:None))
+    release=threading.Event();written=[]
+    class Stalled:
+        # Docker's blocking log delivery with a full pipe: every write waits.
+        def write(self,text):
+            release.wait(10);written.append(text);return len(text)
+        def flush(self):pass
+    monkeypatch.setattr(sys,'stdout',Stalled())
+    calls=provider.CHANNEL_EVENTS_MAX+50
+    async def scenario():
+        ticks=[];loop=asyncio.get_running_loop();loop.call_soon(ticks.append,1)
+        started=time.monotonic()
+        for _ in range(calls):provider.channel_fetch_log(4242,['timeout',loop.time(),1,None],'empty',None,loop.time())
+        elapsed=time.monotonic()-started
+        await asyncio.sleep(0)
+        return elapsed,ticks
+    elapsed,ticks=asyncio.run(scenario())
+    # The hooks returned at once and the event loop ran on; what the queue could not hold was dropped and counted.
+    assert elapsed<1 and ticks==[1]
+    assert provider.channel_events_dropped>=calls-provider.CHANNEL_EVENTS_MAX-1
+    release.set();provider.channel_events.join()
+    lines=[line for line in written if line.strip()]
+    assert len(lines)==calls-provider.channel_events_dropped
+    assert all(json.loads(line)['event']=='telegram_channel_difference' for line in lines)
 
 
 @pytest.fixture
