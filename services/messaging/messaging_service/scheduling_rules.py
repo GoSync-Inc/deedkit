@@ -60,6 +60,7 @@ RESCHEDULE_ALONE = re.compile(r"(?:(?:может|давай|можем|можн�
     r'(?:перенес\w*|перенест\w*|перенос\w*|reschedul\w*|postpone\w*)(?:\s+(?:it|this|that|это|е[её]|его))?', re.I)
 # A clause opener: «лучше в среду» or "how about Wednesday" starts a new clause after a decline.
 # A dot or comma between digits ("12.11", "15.00", "12,5") is part of a number, never a break.
+POLITE = re.compile(r'\b(?:please|pls|пожалуйста|плиз)\b', re.I)
 OR_WORD = re.compile(r'\b(?:или|либо|or)\b', re.I)
 SENTENCE_END = re.compile(r'[.!?](?!\d)|\n')
 CLAUSE_BREAK = re.compile(r'[.;!?](?!\d)|\n|,(?!\d)|\b(?:лучше|давай\w*|но|зато|а\s+вот|but|how\s+about|what\s+about|instead|maybe|let\'?s)\b', re.I)
@@ -277,6 +278,10 @@ class _Bounds:
 
     def index(self, pos):return bisect_right(self.ends, pos)
 
+    def opened_by_word(self, pos):
+        i = self.index(pos)
+        return bool(i) and self.word_opens and self.breaks[i - 1][2]
+
     def bounds(self, pos):
         i = self.index(pos)
         start = 0
@@ -394,13 +399,21 @@ def signals(text, sent_at, direction, zone):
         here = sentences.index(span[0])
         if here not in past:past[here] = bool(PAST_CLAUSE.search(work[slice(*sentences.bounds(span[0]))]))
         if past[here] and not cues['reschedule']:continue
-        # The clause of the clock itself, not of the day it borrowed ("cancel tomorrow at 10, let's do at 11").
-        clause = work[slice(*clauses.bounds(c[0] if c else span[0]))]
+        # The clause of the clock itself, not of the day it borrowed ("cancel tomorrow at 10, let's do at 11"). A clause
+        # with no move of its own after a bare comma ("отменяем созвон завтра, в 10:00") continues the one before it in the
+        # sentence; an opener word ("but", «давай») always starts a new one.
+        lo = sentences.bounds(span[0])[0]
+        at = c[0] if c else span[0]
+        cs, ce = clauses.bounds(at)
+        while cs > lo and not clauses.opened_by_word(at) and not any(rx.search(work, cs, ce) for rx in CUES.values()):
+            at = cs - 1
+            cs = clauses.bounds(at)[0]
+        clause = work[cs:ce]
         polarity = 'rejected' if CUES['decline'].search(clause) or CUES['cancel'].search(clause) else 'offered'
         final.append({'start': start.isoformat(), 'end': end.isoformat(), 'granularity': granularity,
             'zone': getattr(tz, 'key', None) or 'UTC', 'zone_source': zone_source, 'assumed': sorted(set(assumed)),
             'span': list(span), 'rule': '+'.join(rule_ids), 'polarity': polarity})
-    intent, cue = _intent(work, cues, final, medium, clauses)
+    intent, cue = _intent(work, cues, final, medium, clauses, sentences)
     result.update({'intent': intent, 'times': final, 'cue_span': list(cue) if cue else None})
     result['rules'] = rules + sorted({t['rule'] for t in final}) + ([f'intent:{intent}'] if intent != 'none' else []) + (
         ['zone:explicit'] if any(t['zone_source'] == 'explicit' for t in final) else [])
@@ -410,7 +423,7 @@ def signals(text, sent_at, direction, zone):
     return result
 
 
-def _intent(text, cues, times, medium, clauses):
+def _intent(text, cues, times, medium, clauses, sentences):
     """The winning move and its cue span. A scheduling move needs a time or a medium, except accept and decline
     replies, which stand alone ("ок", "не могу"), and a rescheduling request that is its whole clause ("перенесём?")."""
     found = {k: v for k, v in cues.items() if v}
@@ -418,7 +431,10 @@ def _intent(text, cues, times, medium, clauses):
     if 'accept' in found and found['accept'][0] <= 12 and not any(k in found for k in ('cancel', 'reschedule', 'decline')):
         return 'accept', found['accept']
     resched = found.get('reschedule')
-    alone = bool(resched) and RESCHEDULE_ALONE.fullmatch(text[slice(*clauses.bounds(resched[0]))].strip(' \t?!.…,')) is not None
+    clause = ' '.join(POLITE.sub(' ', text[slice(*clauses.bounds(resched[0]))]).split()).strip(' \t?!.…,') if resched else ''
+    # ... and nothing but politeness follows it to the end of its sentence («перенесём, пожалуйста, файлы» is a transfer).
+    rest = POLITE.sub(' ', text[resched[1]:sentences.bounds(resched[0])[1]]) if resched else ''
+    alone = bool(resched) and RESCHEDULE_ALONE.fullmatch(clause) is not None and not rest.strip(' \t?!.…,')
     for intent in ('cancel', 'reschedule', 'decline'):
         if intent in found and (times or medium != 'unknown' or intent == 'decline' or (intent == 'reschedule' and alone)):
             return intent, found[intent]

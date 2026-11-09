@@ -193,7 +193,8 @@ def test_lookalike_meeting_hosts_are_not_kept(text):
 # spec: ANYM-892
 @pytest.mark.parametrize('text,intent', [('Не получится, перенесём?', 'reschedule'), ('Can we reschedule?', 'reschedule'),
     ('Давай перенесём файлы на диск', 'none'), ('Мне нужно файлы перенести.', 'none'), ('Давай файлы перенесём?', 'none'),
-    ('Может, перенесём?', 'reschedule'), ('We need to postpone', 'reschedule')])
+    ('Может, перенесём?', 'reschedule'), ('We need to postpone', 'reschedule'), ('Can we please reschedule?', 'reschedule'),
+    ('Please reschedule.', 'reschedule'), ('Давай, пожалуйста, перенесём', 'reschedule'), ('Перенесём, пожалуйста, файлы', 'none')])
 def test_rescheduling_word_stands_alone_only_when_unambiguous(text, intent):
     assert signals(text, MONDAY, 'in', LISBON)['intent'] == intent
 
@@ -201,7 +202,8 @@ def test_rescheduling_word_stands_alone_only_when_unambiguous(text, intent):
 # spec: ANYM-892
 @pytest.mark.parametrize('text,expected', [('Отменяем встречу в пятницу', ['rejected']),
     ('Отменим созвон в пятницу, давай в понедельник', ['rejected', 'offered']), ("Let's cancel Friday, let's do Monday", ['rejected', 'offered']),
-    ("Cancel tomorrow at 10, let's do at 11", ['rejected', 'offered']), ('Отменим завтра в 10, давай в 11', ['rejected', 'offered'])])
+    ("Cancel tomorrow at 10, let's do at 11", ['rejected', 'offered']), ('Отменим завтра в 10, давай в 11', ['rejected', 'offered']),
+    ('Отменяем созвон завтра, в 10:00.', ['rejected']), ('Cancel tomorrow, at 10.', ['rejected']), ('Отменяем созвон, в 10', ['rejected'])])
 def test_cancelled_times_are_rejected(text, expected):
     got = signals(text, MONDAY, 'in', LISBON)
     assert got['intent'] == 'cancel' and [t['polarity'] for t in got['times']] == expected
