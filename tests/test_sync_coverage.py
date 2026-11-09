@@ -5,6 +5,7 @@ import json
 from uuid import uuid4
 
 import pytest
+from hypothesis import HealthCheck, given, settings, strategies as st
 
 from messaging_service import coverage
 from messaging_service.capabilities import CAPABILITY_SECTIONS
@@ -304,6 +305,100 @@ def test_a_leased_download_keeps_the_account_behind_with_its_waiting_time(cov):
     assert block['state'] == 'behind' and block['due']['to_download'] == 1 and block['since'] == created
 
 
+# ANYM-917: the three statements the job pass replaced, verbatim from 2f993334 (account key, scope on m), as the oracle.
+OLD_DOWNLOADS = '''SELECT account,state,error_code,count(*) AS count FROM (SELECT m.account AS account,
+        CASE WHEN a.id IS NOT NULL THEN 'ready' WHEN j.state='ready' THEN 'unavailable' ELSE j.state END AS state,
+        CASE WHEN a.id IS NULL AND j.state IN ('queued','leased','failed') THEN j.error_code END AS error_code
+    FROM media_jobs j JOIN messages m ON m.id=j.message AND m.account=j.account
+    LEFT JOIN attachments a ON a.id=j.id AND a.message=j.message AND a.active
+    WHERE NOT m.deleted AND m.account=%(account)s UNION ALL SELECT m.account,'ready',NULL
+    FROM attachments a JOIN messages m ON m.id=a.message WHERE a.active AND NOT m.deleted
+    AND NOT EXISTS(SELECT FROM media_jobs j WHERE j.id=a.id) AND m.account=%(account)s) occurrence
+    GROUP BY account,state,error_code'''
+OLD_ELIGIBILITY = '''SELECT m.account,el.claim AS eligibility,j.error_code,j.state,count(*) AS count,
+        count(*) FILTER (WHERE m.sent_at<clock_timestamp()-make_interval(days=>30)) AS old,
+        min(j.created_at) AS since
+    FROM media_jobs j JOIN messages m ON m.id=j.message AND m.account=j.account
+    JOIN chats ch ON ch.id=m.chat AND ch.account=m.account {join}
+    LEFT JOIN attachments a ON a.id=j.id AND a.message=j.message AND a.active
+    WHERE j.state IN ('queued','leased') AND a.id IS NULL AND NOT m.deleted AND m.account=%(account)s
+    GROUP BY 1,2,3,4'''
+# One generated job: state, its original (none, active, inactive, or active under another message), the message
+# deleted, the chat, the error code and the age in days; plus jobless originals.
+PB_JOB = st.tuples(st.sampled_from(('queued', 'leased', 'ready', 'failed', 'superseded')),
+                   st.sampled_from(('none', 'active', 'inactive', 'elsewhere')), st.booleans(),
+                   st.sampled_from(('100', '200')), st.sampled_from((None, 'media_timeout', 'provider_refused')),
+                   st.sampled_from((0, 3, 40)))
+
+
+def pb_seed(s, jobs, jobless):
+    with s.pool.connection() as c:
+        for provider_chat in ('100', '200'):
+            c.execute('''INSERT INTO chats(id,account,title,provider_chat) VALUES(%s,%s,'Fixture room',%s)
+                ON CONFLICT DO NOTHING''', (stable_id('chat', ACCOUNT, provider_chat), ACCOUNT, provider_chat))
+        c.execute("DELETE FROM attachments WHERE id LIKE 'pb-%'")
+        c.execute("DELETE FROM media_jobs WHERE id LIKE 'pb-%'")
+        c.execute("DELETE FROM messages WHERE id LIKE 'pb-%'")
+        rows = [(f'pb-m{n}', chat, deleted, days) for n, (_, _, deleted, chat, _, days) in enumerate(jobs)]
+        rows += [(f'pb-o{n}', '100', False, 0) for n in range(jobless)]
+        for mid, chat, deleted, days in rows:
+            c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,deleted)
+                VALUES(%s,%s,%s,%s,'42','',clock_timestamp()-make_interval(days=>%s),%s)''',
+                (mid, ACCOUNT, stable_id('chat', ACCOUNT, chat), mid, days, deleted))
+        for n, (state, original, _, _, code, _) in enumerate(jobs):
+            c.execute('''INSERT INTO media_jobs(id,account,message,descriptor,state,error_code,lease_owner,lease_until)
+                VALUES(%s,%s,%s,'{}',%s,%s,%s,%s)''', (f'pb-j{n}', ACCOUNT, f'pb-m{n}', state, code,
+                'pb' if state == 'leased' else None,
+                datetime.now(timezone.utc) + timedelta(minutes=5) if state == 'leased' else None))
+            if original != 'none':
+                message_id = 'pb-o0' if original == 'elsewhere' and jobless else f'pb-m{n}'
+                c.execute('''INSERT INTO attachments(id,message,digest,filename,mime,bytes,active)
+                    VALUES(%s,%s,%s,'pb.bin','image/jpeg',4,%s)''',
+                    (f'pb-j{n}', message_id, hashlib.sha256(f'pb-j{n}'.encode()).hexdigest(), original != 'inactive'))
+        for n in range(jobless):
+            c.execute('''INSERT INTO attachments(id,message,digest,filename,mime,bytes)
+                VALUES(%s,%s,%s,'pb.bin','image/jpeg',4)''',
+                (f'pb-a{n}', f'pb-o{n}', hashlib.sha256(f'pb-a{n}'.encode()).hexdigest()))
+
+
+def pb_oracle(c):
+    """What 2f993334's statements gave: download counts, error codes and states, and the queued claims."""
+    from messaging_service.media_policy import ELIGIBILITY_JOIN
+    downloads, errors, states = {}, {}, {}
+    for row in c.execute(OLD_DOWNLOADS, {'account': ACCOUNT}):
+        downloads[row['state']] = downloads.get(row['state'], 0) + row['count']
+        if row['error_code'] is not None:
+            errors[row['error_code']] = errors.get(row['error_code'], 0) + row['count']
+            states.setdefault(row['error_code'], {})[row['state']] = row['count']
+    claims = sorted((r['eligibility'], r['error_code'] or '', r['state'], r['count'], r['old'], r['since'])
+                    for r in c.execute(OLD_ELIGIBILITY.replace('{join}', ELIGIBILITY_JOIN), {'account': ACCOUNT}))
+    return downloads, errors, states, claims
+
+
+# spec: ANYM-917
+@settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow])
+@given(st.lists(PB_JOB, max_size=12), st.integers(0, 3))
+def test_the_one_job_pass_gives_the_download_counts_errors_and_claims_of_the_three_statements_it_replaced(
+        cov, jobs, jobless):
+    from messaging_service import sync_status
+    ar, s, _ = cov
+    if not getattr(s, 'pb_ready', False):
+        publish(ar)
+        pb_seed(s, [], 0)
+        group(s)
+        s.pb_ready = True
+    pb_seed(s, jobs, jobless)
+    with s.pool.connection() as c:
+        downloads, errors, states, claims = pb_oracle(c)
+        found = {}
+        new_downloads, files = sync_status._files(c, {'accounts': [ACCOUNT], 'chat_ids': None}, claims=found)
+    item = files.get(ACCOUNT) or sync_status.empty_files()
+    assert new_downloads.get(ACCOUNT, {}) == downloads
+    assert item.get('download_errors', {}) == errors and item.get('download_error_states', {}) == states
+    assert sorted((r['eligibility'], r['error_code'] or '', r['state'], r['count'], r['old'], r['since'])
+                  for r in found.get(ACCOUNT, [])) == claims
+
+
 def model_profile(tmp_path, kind):
     key = tmp_path / 'model-key'
     key.write_text('synthetic-key')
@@ -545,3 +640,39 @@ def test_the_coverage_counts_add_no_scan_and_no_per_row_sequential_subquery(cov)
             full += 1
     # _files reads attachments in its download pass and its grouped file pass; coverage adds no third.
     assert full <= 2, [query[:120] for query, _ in plans]
+
+
+# spec: ANYM-917
+def test_the_job_pass_joins_messages_only_to_the_jobs_still_without_their_original(cov):
+    from test_media_claim_performance import explained, outline
+    ar, s, _ = cov
+    profiles(s)
+    publish(ar)
+    group(s)
+    grow(s)
+    with s.pool.connection() as c:  # a third more jobs, none stored yet: about 23k unstored jobs to classify
+        c.execute("SET LOCAL statement_timeout='600s'")
+        c.execute('''INSERT INTO media_jobs(id,account,message,descriptor,state)
+            SELECT 'bulk-wait-'||n,%s,'bulk-msg-'||n,'{}',CASE WHEN n%%2=0 THEN 'queued' ELSE 'failed' END
+            FROM generate_series(1,%s,3) n''', (ACCOUNT, BULK))
+        c.execute('ANALYZE media_jobs')
+    plans = []
+    with explained(ar, plans):
+        with s.pool.connection() as c:
+            c.execute("SET LOCAL statement_timeout='120s'")
+            get_sync_status(c, {'accounts': [ACCOUNT], 'chat_ids': None})
+    passes = [plan for query, plan in plans if 'unstored AS MATERIALIZED' in query]
+    assert len(passes) == 1
+    unstored = len(range(1, BULK + 1, 3))
+
+    def reads_messages(node):
+        return node.get('Relation Name') == 'messages' or any(reads_messages(n) for n in node.get('Plans', []))
+
+    def visit(node):
+        # The stored jobs are dropped before any join with their messages: no join above the messages read carries
+        # more rows than the jobs still waiting for their original (before: every job, then the anti join).
+        if 'Relation Name' not in node and reads_messages(node):
+            assert node.get('Actual Rows', 0) * node.get('Actual Loops', 1) <= unstored, outline(passes[0])
+        for child in node.get('Plans', []):
+            visit(child)
+    visit(passes[0])

@@ -200,41 +200,68 @@ def empty_files():
             'extraction_truncated': 0, 'enrichment_truncated': 0}
 
 
-def _files(c, p, *, group_by_chat=False, tallies=None):
+def _jobs(key, where, claims, by_chat):
+    """ANYM-917: the one pass over media jobs without their active original (aliases j, m).
+
+    A job with its original is counted by the file pass instead. Each row: the job's download state (a ready job
+    without a registered original is unavailable), its error code while queued, leased or failed, how many are likely
+    expired (ANYM-815) and, when `claims` is set, the automatic-download claim of a queued or leased job whose chat
+    row exists (media_policy.ELIGIBILITY_JOIN: what _eligibility and the latency block's download wait read).
+    Parameters: _jobs_args."""
+    claim = "CASE WHEN j.state IN ('queued','leased') AND ch.id IS NOT NULL THEN el.claim END" if claims else 'NULL'
+    joins = ('LEFT JOIN chats ch ON ch.id=m.chat AND ch.account=m.account ' + ELIGIBILITY_JOIN) if claims else ''
+    if by_chat:
+        # A chat-restricted scope is driven from its chats' messages, as before ANYM-917.
+        prefix, source = '', '''media_jobs j JOIN messages m ON m.id=j.message AND m.account=j.account
+            AND j.account=ANY(%s) AND NOT EXISTS(SELECT FROM attachments a WHERE a.id=j.id AND a.message=j.message
+                AND a.active)'''
+    else:
+        # The jobs without their original first (prod 11-09: about 20k of 75k), then their messages. Joined the other
+        # way round the plan joined every job to its message and claim before dropping the stored ones (650 ms, not
+        # 355); a lookup by key per job took 470-560 ms against the hash join's one read of the scope's messages.
+        prefix = '''WITH unstored AS MATERIALIZED (SELECT j.id,j.account,j.message,j.state,j.error_code,j.created_at,
+            j.requested_until FROM media_jobs j WHERE j.account=ANY(%s)
+                AND NOT EXISTS(SELECT FROM attachments a WHERE a.id=j.id AND a.message=j.message AND a.active))
+        '''
+        source = 'unstored j JOIN messages m ON m.id=j.message AND m.account=j.account'
+    return (prefix + 'SELECT ' + key + ''' AS account,CASE WHEN j.state='ready' THEN 'unavailable' ELSE j.state END AS state,
+            CASE WHEN j.state IN ('queued','leased','failed') THEN j.error_code END AS error_code,
+            ''' + claim + ''' AS eligibility,count(*) AS count,
+            count(*) FILTER (WHERE j.state='failed' AND j.error_code IS NOT NULL AND ''' + LIKELY_EXPIRED + ''') AS expired,
+            count(*) FILTER (WHERE m.sent_at<clock_timestamp()-make_interval(days=>%s)) AS old,
+            min(j.created_at) AS since
+        FROM ''' + source + ' ' + joins + '''
+        WHERE NOT m.deleted AND ''' + where + ' GROUP BY 1,2,3,4')
+
+
+def _jobs_args(p, args):
+    """_jobs' parameters in statement order: the unscoped pass names its accounts first (in its CTE)."""
+    from .coverage import WHATSAPP_MEDIA_RETENTION_DAYS
+    accounts = list(p['accounts'])
+    return ([WHATSAPP_MEDIA_RETENTION_DAYS, accounts] if p['chat_ids'] is not None
+            else [accounts, WHATSAPP_MEDIA_RETENTION_DAYS]) + args
+
+
+def _files(c, p, *, group_by_chat=False, tallies=None, claims=None):
+    """(downloads, files) of scope p, by account or by chat. `claims` (a dict; by account only) receives each queued
+    or leased job group's download claim for _eligibility and the latency block (ANYM-917)."""
     tallies = {} if tallies is None else tallies
     where, args = scope_filter(p, alias='m')
     key = "m.chat" if group_by_chat else "m.account"
+    if group_by_chat and claims is not None:
+        raise ValueError('claims_by_account_only')
     # One row per file occurrence of a non-deleted message, in exactly one state
     # (the per-file download_status rule): a registered active original is ready
     # whatever its job says (an edit can re-queue an original that is still
     # stored), a jobless legacy original is ready and a ready job without a
     # registered original is unavailable. Superseded jobs are older revisions.
+    # ANYM-917: the ready occurrences are counted by the file pass below (its rows are the active originals of
+    # non-deleted messages, each with its job joined by id); this pass reads only the jobs without their original.
     downloads = {}
     errors={};error_states={}
-    for row in c.execute('SELECT account,state,error_code,count(*) AS count FROM (SELECT '+key+''' AS account,
-            CASE WHEN a.id IS NOT NULL THEN 'ready' WHEN j.state='ready' THEN 'unavailable' ELSE j.state END AS state,
-            CASE WHEN a.id IS NULL AND j.state IN ('queued','leased','failed') THEN j.error_code END AS error_code
-        FROM media_jobs j JOIN messages m ON m.id=j.message AND m.account=j.account
-        LEFT JOIN attachments a ON a.id=j.id AND a.message=j.message AND a.active
-        WHERE NOT m.deleted AND '''+where+' UNION ALL SELECT '+key+''','ready',NULL
-        FROM attachments a JOIN messages m ON m.id=a.message WHERE a.active AND NOT m.deleted
-        AND NOT EXISTS(SELECT FROM media_jobs j WHERE j.id=a.id) AND '''+where+''') occurrence
-        GROUP BY account,state,error_code''', args+args):
-        counts=downloads.setdefault(row['account'], {})
-        counts[row['state']]=counts.get(row['state'], 0)+row['count']
-        if row['error_code'] is not None:
-            account_errors=errors.setdefault(row['account'],{})
-            account_errors[row['error_code']]=account_errors.get(row['error_code'],0)+row['count']
-            error_states.setdefault(row['account'],{}).setdefault(row['error_code'],{})[row['state']]=row['count']
     # ANYM-815: failed WhatsApp jobs queued when their message was older than the estimated media retention;
-    # read-time wording only, the recorded codes and counts above stay as they are.
+    # read-time wording only, the recorded codes and counts stay as they are.
     expired={}
-    for row in c.execute('SELECT '+key+''' AS account,j.error_code,count(*) AS count
-        FROM media_jobs j JOIN messages m ON m.id=j.message AND m.account=j.account
-        LEFT JOIN attachments a ON a.id=j.id AND a.message=j.message AND a.active
-        WHERE j.state='failed' AND a.id IS NULL AND j.error_code IS NOT NULL AND NOT m.deleted
-        AND '''+LIKELY_EXPIRED+' AND '+where+' GROUP BY 1,2', args):
-        expired.setdefault(row['account'],{})[row['error_code']]=row['count']
     # Count current occurrences, not global digests. Stale extraction/enrichment
     # rows must never inflate ready counts or expose another chat's derived state.
     from .media_policy import recognition_withheld
@@ -254,7 +281,8 @@ def _files(c, p, *, group_by_chat=False, tallies=None):
             count(*) FILTER (WHERE f.state='ready' AND f.truncated) AS extraction_truncated,
             count(*) FILTER (WHERE e.state='ready' AND e.truncated) AS enrichment_truncated,
             count(*) FILTER (WHERE e.state='ready' AND e.updated_at>=clock_timestamp()-interval '1 day') AS ready_last_24h,
-            min(e.updated_at) AS recognition_waiting_since,min(f.updated_at) AS extraction_waiting_since
+            min(e.updated_at) AS recognition_waiting_since,min(f.updated_at) AS extraction_waiting_since,
+            count(*) FILTER (WHERE wj.id IS NULL OR wj.message=a.message AND wj.account=m.account) AS ready_occurrences
         FROM attachments a JOIN messages m ON m.id=a.message
         LEFT JOIN attachment_text f ON f.attachment=a.id AND f.source_digest=a.digest
             AND f.source_revision=m.revision AND f.source_filename=a.filename
@@ -275,6 +303,26 @@ def _files(c, p, *, group_by_chat=False, tallies=None):
         item['extraction_truncated'] += row['extraction_truncated']
         item['enrichment_truncated'] += row['enrichment_truncated']
         coverage.add_row(tallies.setdefault(row['account'], coverage.empty_tally()), row)
+        # A jobless legacy original, or one whose job of the same message and account it is (ANYM-917).
+        if row['ready_occurrences']:
+            counts = downloads.setdefault(row['account'], {})
+            counts['ready'] = counts.get('ready', 0) + row['ready_occurrences']
+    jobs = _jobs(key, where, claims is not None, p['chat_ids'] is not None)
+    for row in c.execute(jobs, _jobs_args(p, args)):
+        account = row['account']
+        counts = downloads.setdefault(account, {})
+        counts[row['state']] = counts.get(row['state'], 0) + row['count']
+        code = row['error_code']
+        if code is not None:
+            account_errors = errors.setdefault(account, {})
+            account_errors[code] = account_errors.get(code, 0) + row['count']
+            states = error_states.setdefault(account, {}).setdefault(code, {})
+            states[row['state']] = states.get(row['state'], 0) + row['count']
+        if row['expired']:
+            account_expired = expired.setdefault(account, {})
+            account_expired[code] = account_expired.get(code, 0) + row['expired']
+        if claims is not None and row['eligibility'] is not None:
+            claims.setdefault(account, []).append(row)
     # ANYM-816: operator recovery states of each permitted account, also one with no current media. Account-wide,
     # so never for a chat-restricted principal or a per-chat view; None when this database cannot read them.
     if not group_by_chat and p['chat_ids'] is None:
@@ -291,27 +339,20 @@ def _files(c, p, *, group_by_chat=False, tallies=None):
     return downloads, files
 
 
-def _eligibility(c, accounts):
+def _eligibility(c, accounts, claims):
     """Queued originals by automatic-download eligibility under the published window.
 
     None for an account without a current publication (basis unknown). A recorded
     error_code is history evidence: a job that left the window keeps its code but
-    is not reported as waiting for storage (ANYM-284)."""
+    is not reported as waiting for storage (ANYM-284). `claims` are _files' job rows
+    with a claim (ANYM-917: that pass already read every queued or leased job)."""
     result = {r['account']: {'prefetch_days': None if r['days'] is None else int(r['days']), 'queued': {}}
         for r in c.execute('SELECT a.id AS account,mp.days FROM accounts a '+published_window('a.id')
             +' WHERE a.id=ANY(%s) AND mp.published', (accounts,))}
     if not result:
         return {}
-    from .coverage import WHATSAPP_MEDIA_RETENTION_DAYS
     # ANYM-812: also how many are older than WhatsApp's media retention estimate, and since when due work waits.
-    for row in c.execute('''SELECT m.account,el.claim AS eligibility,j.error_code,j.state,count(*) AS count,
-            count(*) FILTER (WHERE m.sent_at<clock_timestamp()-make_interval(days=>%s)) AS old,
-            min(j.created_at) AS since
-        FROM media_jobs j JOIN messages m ON m.id=j.message AND m.account=j.account
-        JOIN chats ch ON ch.id=m.chat AND ch.account=m.account '''+ELIGIBILITY_JOIN+'''
-        LEFT JOIN attachments a ON a.id=j.id AND a.message=j.message AND a.active
-        WHERE j.state IN ('queued','leased') AND a.id IS NULL AND NOT m.deleted AND m.account=ANY(%s)
-        GROUP BY 1,2,3,4''', (WHATSAPP_MEDIA_RETENTION_DAYS, list(result))):
+    for row in (row for account in result for row in claims.get(account, ())):
         item = result[row['account']]
         if row['state'] == 'queued':
             codes = item['queued'].setdefault(row['eligibility'], {})
@@ -324,7 +365,9 @@ def _eligibility(c, accounts):
     return result
 
 
-def get_sync_status(c, p):
+def get_sync_status(c, p, claims=None):
+    """The account summary. `claims` (a dict) receives, by account, the queued or leased job rows with their download
+    claim for an unscoped principal (ANYM-917), so the latency block's download wait reads no second pass."""
     where, args = scope_filter(p, alias='c', chat_column='id')
     catalog = c.execute('SELECT c.account,c.id,a.platform FROM chats c JOIN accounts a ON a.id=c.account WHERE '+where, args).fetchall()
     catalogs = {}
@@ -355,12 +398,13 @@ def get_sync_status(c, p):
     if sources:
         checkpoints = _checkpoints(c, p, {row['id'] for row in catalog})
         tallies = {}
-        downloads, files = _files(c, p, tallies=tallies)
+        claims = None if scoped else ({} if claims is None else claims)
+        downloads, files = _files(c, p, tallies=tallies, claims=claims)
     conflicts = {}
     reevaluations = {}
     eligibility = {}
     if sources and not scoped:
-        eligibility = _eligibility(c, [row['account'] for row in sources])
+        eligibility = _eligibility(c, [row['account'] for row in sources], claims)
         # The archive detail code is sticky once any conflict was observed; the
         # alert follows conflicts which are still unresolved.
         conflicts = grouped(c, 'account', [row['account'] for row in sources])

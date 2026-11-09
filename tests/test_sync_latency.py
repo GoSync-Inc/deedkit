@@ -14,7 +14,7 @@ from messaging_service.envelope import stable_id
 from messaging_service.subscriptions import match_subscriptions
 from test_archive import archive as archive, event
 from test_delivery_policy import bound, identity, local_window, matched
-from test_sync_coverage import ACCOUNT, cov as cov, group, message, publish, stored
+from test_sync_coverage import ACCOUNT, cov as cov, evict, group, message, profiles, publish, stored
 
 ROOT = Path(__file__).resolve().parents[1]
 UTC = timezone.utc
@@ -162,6 +162,90 @@ def test_a_download_whose_eligibility_is_unknown_is_neither_pending_nor_on_reque
     download = next(r for r in latency(s, key)['latency_pending'] if r['stage'] == 'download')
     assert download == {'account': ACCOUNT, 'stage': 'download', 'pending': {'n': 0, 'oldest_s': None},
                         'on_request_n': 0, 'unknown_n': 1}
+
+
+def speed_store(ar, s):
+    """ANYM-917's fixed store: the latency timeline plus coverage rows (a due image, a withheld one in the group, an
+    evicted one) and three queued downloads (due, group, outside the window)."""
+    timeline(ar, s)
+    profiles(s)
+    publish(ar)
+    group(s)
+    stored(ar, s, 'image/jpeg', enrichment='queued')
+    stored(ar, s, 'image/jpeg', chat='200', enrichment='queued')
+    evict(s, stored(ar, s, 'image/png'))
+    message(ar, days=1)
+    message(ar, chat='200', days=1)
+    message(ar, days=30)
+
+
+def counted(s, monkeypatch, call):
+    import psycopg
+    seen = []
+    original = psycopg.Cursor.execute
+
+    def execute(self, query, params=None, **kw):
+        seen.append(query)
+        return original(self, query, params, **kw)
+    monkeypatch.setattr(psycopg.Cursor, 'execute', execute)
+    try:
+        return call(), len(seen)
+    finally:
+        monkeypatch.undo()
+
+
+# ANYM-917: 33 and 54 statements before; the one job pass replaced three (downloads, likely expired, eligibility),
+# and the latency block's download wait reads those rows instead of a second pass over the queued jobs.
+STATUS_STATEMENTS = {False: 31, True: 52}
+
+
+# spec: ANYM-917
+def test_one_refresh_call_runs_a_pinned_number_of_statements_with_and_without_the_latency_block(cov, monkeypatch):
+    ar, s, key = cov
+    speed_store(ar, s)
+    for block in (False, True):
+        result, n = counted(s, monkeypatch, lambda: s.get_sync_status(key, refresh=True, include_latency=block))
+        assert result['cache']['hit'] is False and ('latency' in result) is block
+        assert n == STATUS_STATEMENTS[block], (block, n)
+
+
+# spec: ANYM-917
+def test_the_status_and_its_latency_block_read_as_before_on_the_fixed_store(cov):
+    ar, s, key = cov
+    speed_store(ar, s)
+    result = latency(s, key)
+    row = next(r for r in result['sources'] if r['account'] == ACCOUNT)
+    files, block = row['files'], row['coverage']
+    assert row['messages'] == 12 and files['stored_files'] == 3
+    assert files['download'] == {'queued': 3, 'leased': 0, 'ready': 3, 'failed': 0, 'superseded': 0}
+    assert files['download_errors'] == {} and files['download_error_states'] == {}
+    assert {k: v for k, v in files['enrichment'].items() if v} == {'available_on_request': 2, 'queued': 1}
+    assert {k: v for k, v in files['extraction'].items() if v} == {'ready': 3}
+    assert block['state'] == 'behind' and block['due']['to_download'] == 1 and block['due']['to_index'] == 0
+    assert block['due']['to_recognize'] == {'audio': 0, 'image': 1, 'document': 0, 'total': 1}
+    assert block['available_on_request'] == {'total': 4, 'stored_not_recognized': 2, 'likely_expired': None,
+        'not_downloaded': {'group_chat_on_request': 1, 'outside_prefetch_window': 1},
+        'next_action': 'request_file_download'}
+    assert result['latency_unavailable'] == []
+    # The timeline's rows to the millisecond; the coverage messages' arrivals by count (their seconds follow the clock).
+    assert rows(result) == {**rows(result), ('download', None): (2, 10.0, 14.0), ('text', None): (1, 3.0, 3.0),
+                            ('transcript', None): (1, 4.0, 4.0), ('failed', None): (1, None, None)}
+    arrivals = {(r['chat_type'], r['message_kind']): r['n'] for r in result['latency'] if r['stage'] == 'arrival'}
+    assert arrivals == {('group', 'message'): 2, ('private', 'message'): 8, ('private', 'service'): 1}
+    pending = {r['stage']: r for r in result['latency_pending']}
+    assert set(pending) == {'download', 'description'}
+    download, description = pending['download'], pending['description']
+    assert (download['pending']['n'], download['on_request_n'], download['unknown_n']) == (1, 2, 0)
+    assert (description['pending']['n'], description['on_request_n']) == (1, 1)
+    # The download wait taken from the summary's job rows equals the block's own statement (a chat-scoped key's
+    # path), field by field; oldest_s by the clock between the two reads.
+    with s.authorized(key, 'get_sync_status') as (c, p):
+        own = stage_latency.read(c, p, 24, owner=(p['id'], p['key_id']))
+    mine = next(r for r in own['latency_pending'] if r['stage'] == 'download')
+    assert {k: v for k, v in mine.items() if k != 'pending'} == {k: v for k, v in download.items() if k != 'pending'}
+    assert mine['pending']['n'] == download['pending']['n']
+    assert mine['pending']['oldest_s'] == pytest.approx(download['pending']['oldest_s'], abs=5)
+    assert own['latency'] == result['latency']
 
 
 # spec: ANYM-865

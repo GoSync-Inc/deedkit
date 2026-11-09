@@ -16,6 +16,7 @@ import time
 
 import psycopg
 
+from .coverage import on_request_set
 from .media_policy import ELIGIBILITY_JOIN, recognition_withheld
 from .subscriptions import CLOSED_RETENTION_DAYS
 
@@ -46,11 +47,13 @@ HELD_POLICY = '''(jsonb_typeof(d.policy->'debounce_s')='number' AND (d.policy->>
     OR jsonb_typeof(d.policy->'quiet_hours')='object')'''
 HINT_FINAL = "('delivered','dead_letter','cancelled')"
 # Queued downloads that wait for request_file_download by policy, never by a stall (media_policy.ELIGIBILITY_JOIN).
-_ON_REQUEST = ("('group_chat_on_request','channel_on_request','outside_prefetch_window','outside_history_bounds',"
-               "'collection_excluded')")
+ON_REQUEST_CLAIMS = ('group_chat_on_request', 'channel_on_request', 'outside_prefetch_window', 'outside_history_bounds',
+                     'collection_excluded')
 # A claim the collector does not make without a confirmed policy or history bound (archive.claim_media): neither
 # due work nor a request wait.
-_UNKNOWN = "('unknown','history_bound_unknown')"
+UNKNOWN_CLAIMS = ('unknown', 'history_bound_unknown')
+_ON_REQUEST = '(' + ','.join("'" + claim + "'" for claim in ON_REQUEST_CLAIMS) + ')'
+_UNKNOWN = '(' + ','.join("'" + claim + "'" for claim in UNKNOWN_CLAIMS) + ')'
 # The original's own attachment.ready commit; a legacy original without one falls back to its row's last change.
 _READY_AT = '''(SELECT max(r.created_at) FROM events r WHERE r.message=a.message AND r.kind='attachment.ready'
     AND r.snapshot->'processing'->>'attachment_id'=a.id)'''
@@ -82,8 +85,9 @@ def _arrival():
     GROUP BY 2,4,5,6'''
 
 
-def _download():
-    return '''SELECT 'p' AS row,m.account,'download' AS stage,e.origin,''' + CHAT_TYPE + ''' AS chat_type,
+def _download(waiting=True):
+    """The download percentiles and, unless the summary's job pass already read it (ANYM-917), what waits now."""
+    measured = '''SELECT 'p' AS row,m.account,'download' AS stage,e.origin,''' + CHAT_TYPE + ''' AS chat_type,
         NULL AS message_kind,NULL AS policy,count(*) AS n,
         ''' + _percentiles('extract(epoch FROM e.created_at-created.at)::float8') + ''',
         NULL::bigint AS pending_n,NULL::float8 AS oldest_s,NULL::bigint AS on_request_n,NULL::bigint AS unknown_n
@@ -91,7 +95,8 @@ def _download():
     CROSS JOIN LATERAL (SELECT min(x.created_at) AS at FROM events x
         WHERE x.message=e.message AND x.kind='message.created') created
     WHERE e.created_at>=%(cutoff)s AND e.kind='attachment.ready' AND created.at IS NOT NULL AND {scope}
-    GROUP BY 2,4,5
+    GROUP BY 2,4,5'''
+    return measured + '''
     UNION ALL
     SELECT 'now',m.account,'download',NULL,NULL,NULL,NULL,NULL,NULL,NULL,
         count(*) FILTER (WHERE el.claim='eligible'),
@@ -102,10 +107,36 @@ def _download():
     JOIN chats ch ON ch.id=m.chat AND ch.account=m.account ''' + ELIGIBILITY_JOIN + '''
     LEFT JOIN attachments a ON a.id=j.id AND a.message=j.message AND a.active
     WHERE j.state IN ('queued','leased') AND a.id IS NULL AND NOT m.deleted AND {scope}
-    GROUP BY 2'''
+    GROUP BY 2''' if waiting else measured
+
+
+def _download_waiting(claims, now):
+    """_download's `now` rows from sync_status' job rows with a claim (same jobs, claims and counts)."""
+    rows = []
+    for account in sorted(claims):
+        n = {'eligible': 0, 'on_request': 0, 'unknown': 0}
+        oldest = None
+        for row in claims[account]:
+            claim = row['eligibility']
+            if claim == 'eligible':
+                n['eligible'] += row['count']
+                oldest = row['since'] if oldest is None else min(oldest, row['since'])
+            elif claim in ON_REQUEST_CLAIMS:
+                n['on_request'] += row['count']
+            elif claim in UNKNOWN_CLAIMS:
+                n['unknown'] += row['count']
+        rows.append({'row': 'now', 'account': account, 'stage': 'download', 'pending_n': n['eligible'],
+                     'oldest_s': None if oldest is None else (now - oldest).total_seconds(),
+                     'on_request_n': n['on_request'], 'unknown_n': n['unknown']})
+    return rows
 
 
 def _files(withheld):
+    # ANYM-917: the withheld rule reads the on-request chat set once per statement (a MATERIALIZED CTE, as
+    # coverage.exclusion_sets does), not once per row and FILTER (prod 11-09: three SubPlans, 45 ms each).
+    if withheld != 'false':
+        withheld = ('(m.chat IN (SELECT orq.chat FROM on_request_chats orq) AND EXISTS(SELECT FROM media_jobs rj'
+                    ' WHERE rj.id=a.id AND rj.request_key_digest IS NULL))')
     stage = '''CASE e.kind WHEN 'file.text.ready' THEN 'text' WHEN 'file.transcript.ready' THEN 'transcript'
         WHEN 'file.description.ready' THEN 'description' ELSE 'failed' END'''
     waiting = '''SELECT 'now',m.account,{stage},NULL,NULL,NULL,NULL,NULL,NULL,NULL,
@@ -117,7 +148,8 @@ def _files(withheld):
     WHERE q.state IN ('queued','leased') AND q.source_digest=a.digest AND q.source_revision=m.revision
         AND NOT m.deleted AND {scope}
     GROUP BY 2,3'''
-    return ('''SELECT 'p' AS row,m.account,''' + stage + ''' AS stage,e.origin,''' + CHAT_TYPE + ''' AS chat_type,
+    return ('WITH ' + on_request_set(withheld != 'false') + '''
+    SELECT 'p' AS row,m.account,''' + stage + ''' AS stage,e.origin,''' + CHAT_TYPE + ''' AS chat_type,
         NULL AS message_kind,NULL AS policy,count(*) AS n,
         ''' + _percentiles('extract(epoch FROM e.created_at-ready.at)::float8') + ''',
         NULL::bigint AS pending_n,NULL::float8 AS oldest_s,NULL::bigint AS on_request_n
@@ -199,11 +231,12 @@ def _bounded(c, timeout_s, run):
     return result
 
 
-def read(c, p, window_h=DEFAULT_WINDOW, owner=None):
+def read(c, p, window_h=DEFAULT_WINDOW, owner=None, claims=None):
     """{latency, latency_window_h, latency_pending, latency_unavailable} for scope p (accounts, chat_ids).
 
     owner=(principal, key_id) limits match and hint rows to that key's own subscriptions; None (the operator's
-    table) reads every subscription.
+    table) reads every subscription. claims: sync_status.get_sync_status' job rows of this unscoped p (ANYM-917):
+    the download group then reads only its percentiles and takes what waits now from those rows.
     """
     if not valid_window(window_h):
         raise ValueError('invalid_latency_window')
@@ -225,7 +258,7 @@ def read(c, p, window_h=DEFAULT_WINDOW, owner=None):
     scope = _scope(p)
     # Fragments such as ELIGIBILITY_JOIN hold regex braces: placeholders are replaced, never str.format'ed.
     groups = (('arrival', ('arrival',), _arrival().replace('{scope}', scope)),
-              ('download', ('download',), _download().replace('{scope}', scope)),
+              ('download', ('download',), _download(claims is None).replace('{scope}', scope)),
               ('files', ('text', 'transcript', 'description', 'failed'), _files(withheld).replace('{scope}', scope)),
               ('subscriptions', ('match', 'hint'), _subscriptions(owner).replace('{scope}', scope)))
     for name, stages, sql in groups:
@@ -241,6 +274,8 @@ def read(c, p, window_h=DEFAULT_WINDOW, owner=None):
             log.warning('stage_latency_unavailable group=%s exception_type=%s', name, type(error).__name__)
             result['latency_unavailable'].extend(stages)
             continue
+        if name == 'download' and claims is not None:
+            rows = rows + _download_waiting(claims, now)
         for row in rows:
             if row['row'] == 'p':
                 failed = row['stage'] == 'failed'
