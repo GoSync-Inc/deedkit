@@ -7,10 +7,10 @@ Merge keeper). Every GitHub call goes through `gh`, which takes `GH_TOKEN` from 
 so the token source is the caller's choice.
 
 For each open, non-draft, same-repository pull request into `main` that carries the label `ship`:
-  1. An approval must be recorded for the full head SHA by an account with write access (author association owner,
-     member or collaborator): an APPROVE review on that commit, or an unedited comment, posted after the head
-     arrived, with the line `Review: orchestrator diff read <40-hex sha>`. The description is never read for it.
-     An approval of an older SHA: no enqueue, one comment.
+  1. An approval must be recorded for the full head SHA by an account whose effective repository permission is
+     write, maintain or admin (collaborators/<login>/permission): an APPROVE review on that commit, or an unedited
+     comment, posted after the head arrived, with the line `Review: orchestrator diff read <40-hex sha>`. The
+     description is never read for it. An approval of an older SHA: no enqueue, one comment.
   2. Every required check of the live `main` rules (name and app) has its newest run on the head completed: `CI
      gate` success, the others success or skipped (`CI gate` validates their skip; never all skipped).
   3. The new migrations must take the next free numbers on `main`; otherwise one comment with the exact rename.
@@ -18,7 +18,9 @@ For each open, non-draft, same-repository pull request into `main` that carries 
      minutes after it so a worker's `wait-merge.sh` re-enqueues first; a second one on the same head gets one
      comment with the failing jobs and the keeper leaves the pull request alone. A queue conflict waits until main
      moves and is retried once; a removal by hand holds the pull request until a new head or the `ship` label is
-     added again. The counts come from the pull request's timeline, so they are shared with every other actor.
+     added again. The counts come from the pull request's timeline, so they are shared with every other actor, and
+     the keeper enforces the budget on all of them: a `ship` pull request queued or armed again after two failures
+     on its head is taken out of the queue (or disarmed) with one comment.
 Comments carry an HTML marker and are posted once per head. `--dry-run` writes nothing and prints every decision.
 """
 from __future__ import annotations
@@ -44,7 +46,7 @@ MIGRATION = re.compile(r'^(\d{3})_[A-Za-z0-9_]+\.sql$')
 APPROVAL_LINE = re.compile(r'^\s*Review:\s*orchestrator diff read\s+([0-9a-f]{7,40})\b', re.I | re.M)
 KEEPER_BOT = 'github-actions[bot]'
 RETRY_AFTER = 3  # minutes a failed-checks removal waits before the keeper re-enqueues
-TRUSTED = {'OWNER', 'MEMBER', 'COLLABORATOR'}
+WRITE = {'admin', 'maintain', 'write'}  # effective repository permissions that may approve
 MARK_PREFIX = '<!-- merge-keeper:'
 MARK = MARK_PREFIX + '{} -->'
 QUEUE_DONE = {'merged'}
@@ -64,8 +66,9 @@ class Facts:
     same_repository: bool = True
     base: str = BASE
     labels: tuple = (LABEL,)
-    reviews: list = field(default_factory=list)  # {'state','commit_id','author_association'}
-    comments: list = field(default_factory=list)  # {'body','author_association','user','created_at','updated_at'}
+    reviews: list = field(default_factory=list)  # {'state','commit_id','user'}
+    comments: list = field(default_factory=list)  # {'body','user','created_at','updated_at'}
+    writers: frozenset = frozenset()  # logins among the authors above with write, maintain or admin permission
     queued: bool = False
     auto_merge: bool = False
     mergeable: bool | None = True
@@ -83,29 +86,27 @@ class Facts:
 
 @dataclass
 class Decision:
-    action: str  # enqueue | hold | skip
+    action: str  # enqueue | dequeue | hold | skip
     reason: str
     comment_key: str = ''
     comment: str = ''
 
 
-def trusted(comment):
-    return comment.get('author_association') in TRUSTED or comment.get('user') == KEEPER_BOT
-
-
 def marked(facts, key):
     """A dedup marker counts only from a write-access account or the Actions bot, so an outsider cannot mute one."""
-    return any(MARK.format(key) in (c.get('body') or '') for c in facts.comments if trusted(c))
+    return any(MARK.format(key) in (c.get('body') or '') for c in facts.comments
+               if c.get('user') in facts.writers or c.get('user') == KEEPER_BOT)
 
 
-def approved_shas(facts):
-    """SHAs with a recorded approval by a write-access account: APPROVE reviews and unedited diff-read comments."""
+def approved_shas(facts, authorizing=True):
+    """SHAs approved by a write-access account: APPROVE reviews and diff-read comments. Authorizing comments must
+    be unedited and posted after the head arrived; `authorizing=False` keeps every one, for the stale notice."""
     shas = [r['commit_id'] for r in facts.reviews
-            if r.get('state') == 'APPROVED' and r.get('author_association') in TRUSTED and r.get('commit_id')]
+            if r.get('state') == 'APPROVED' and r.get('user') in facts.writers and r.get('commit_id')]
     for c in facts.comments:
-        if c.get('author_association') in TRUSTED and c.get('updated_at') == c.get('created_at'):
-            shas += [sha.lower() for sha in APPROVAL_LINE.findall(c.get('body') or '')
-                     if (c.get('created_at') or '') >= (facts.head_at or '')]
+        fresh = c.get('updated_at') == c.get('created_at') and (c.get('created_at') or '') >= (facts.head_at or '')
+        if c.get('user') in facts.writers and (fresh or not authorizing):
+            shas += [sha.lower() for sha in APPROVAL_LINE.findall(c.get('body') or '')]
     return shas
 
 
@@ -193,15 +194,22 @@ def decide(facts):
         return Decision('skip', 'draft')
     if not facts.same_repository:
         return Decision('skip', 'head in a fork: never enqueued by the keeper')
+    since = [r for r in facts.removals if (r.get('at') or '') >= (facts.head_at or '')]
+    failures = [r for r in since if r.get('reason') not in QUEUE_DONE | QUEUE_RETRYLESS]
+    if (facts.queued or facts.auto_merge) and len(failures) >= 2:
+        return Decision('dequeue', f'queued again after {len(failures)} failures on this head', f'budget:{facts.head}',
+                        '\n'.join([MARK.format(f'budget:{facts.head}'),
+                                    f'Merge keeper: this head (`{facts.head[:12]}`) already failed in the queue '
+                                    f'{len(failures)} times, the retry budget for every actor, so the keeper took it '
+                                    'out of the queue. Fix the cause and push, or remove the `ship` label to enqueue '
+                                    'it by hand.']))
     if facts.queued:
         return Decision('skip', 'in the merge queue')
     if facts.auto_merge:
         return Decision('skip', 'auto-merge armed: GitHub enqueues it')
-    since = [r for r in facts.removals if (r.get('at') or '') >= (facts.head_at or '')]
     manual = [r for r in since if r.get('reason') == 'manual']
     if manual and (facts.labeled_at or '') <= manual[-1]['at']:
         return Decision('hold', 'removed from the queue by hand on this head; push or add the ship label again')
-    failures = [r for r in since if r.get('reason') not in QUEUE_DONE | QUEUE_RETRYLESS]
     conflicts = [r for r in since if r.get('reason') == 'merge_conflict']
     jobs = '\n'.join(f'- {job}' for job in facts.failing_jobs) or '- (no failed job found in the group run)'
     if len(failures) >= 2:
@@ -219,8 +227,9 @@ def decide(facts):
     if conflicts and (facts.main_at or '') < conflicts[-1]['at']:
         return Decision('hold', 'queue conflict: waits for main to move past the entry ahead')
     if not head_approved(facts):
-        if approved_shas(facts):
-            old = ', '.join(sorted({s[:12] for s in approved_shas(facts)}))
+        historical = [sha for sha in approved_shas(facts, authorizing=False) if not facts.head.startswith(sha)]
+        if historical:
+            old = ', '.join(sorted({s[:12] for s in historical}))
             return Decision('hold', 'approval is for an older head', f'stale:{facts.head}', '\n'.join([
                 MARK.format(f'stale:{facts.head}'),
                 f'Merge keeper: not enqueued. The recorded approval names `{old}`, but the head is '
@@ -257,6 +266,7 @@ class GitHub:
     def __init__(self, repository=REPOSITORY, dry_run=True):
         self.repository, self.dry_run = repository, dry_run
         self.owner, self.name = repository.split('/')
+        self.permissions = {}
 
     def api(self, path, *arguments, paginate=False) -> Any:  # Any: GitHub's JSON, read by key where used
         command = ['gh', 'api', *(['--paginate', '--slurp'] if paginate else []), path, *arguments]
@@ -277,6 +287,16 @@ class GitHub:
 
     def repo(self, path):
         return f'repos/{self.repository}/{path}'
+
+    def can_write(self, login):
+        """The account's effective permission on this repository (organization roles and teams included)."""
+        cache = self.permissions
+        if login not in cache:
+            try:
+                cache[login] = self.api(self.repo(f'collaborators/{quote(login)}/permission'))['permission'] in WRITE
+            except subprocess.CalledProcessError:  # 404: not a collaborator
+                cache[login] = False
+        return cache[login]
 
 
 PR_QUERY = '''query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){
@@ -312,9 +332,9 @@ def collect(gh, pr, required, main_at=''):
         number=number, head=head, open=pr['state'] == 'open', draft=pr['draft'], same_repository=pr['head']['repo'] is not None
         and pr['head']['repo']['full_name'] == gh.repository, base=pr['base']['ref'],
         labels=tuple(label['name'] for label in pr['labels']),
-        reviews=gh.api(gh.repo(f'pulls/{number}/reviews?per_page=100'), paginate=True),
-        comments=[{'body': c.get('body') or '', 'author_association': c.get('author_association'),
-                   'user': (c.get('user') or {}).get('login'), 'created_at': c.get('created_at'),
+        reviews=[{'state': r.get('state'), 'commit_id': r.get('commit_id'), 'user': (r.get('user') or {}).get('login')}
+                 for r in gh.api(gh.repo(f'pulls/{number}/reviews?per_page=100'), paginate=True)],
+        comments=[{'body': c.get('body') or '', 'user': (c.get('user') or {}).get('login'), 'created_at': c.get('created_at'),
                    'updated_at': c.get('updated_at')}
                   for c in gh.api(gh.repo(f'issues/{number}/comments?per_page=100'), paginate=True)
                   if MARK_PREFIX in (c.get('body') or '') or APPROVAL_LINE.search(c.get('body') or '')],
@@ -323,6 +343,9 @@ def collect(gh, pr, required, main_at=''):
         head_at=min((s['created_at'] for s in suites), default=github_time(now())), removals=removals,
         labeled_at=max(labeled, default=''), required=tuple(name for name, _ in required), checks=checks, added_migrations=added,
         main_migrations=on_main)
+    facts.writers = frozenset(login for login in {c['user'] for c in facts.comments}
+                              | {r['user'] for r in facts.reviews if r['state'] == 'APPROVED'}
+                              if login and gh.can_write(login))
     failures = [r for r in removals if r['at'] >= facts.head_at and r['reason'] not in QUEUE_DONE | QUEUE_RETRYLESS]
     if failures and failures[-1]['group']:
         facts.failing_jobs = failing_jobs(gh, failures[-1]['group'])
@@ -354,6 +377,10 @@ ENQUEUE = '''mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pull
 mergeQueueEntry{position state}}}'''
 
 
+DEQUEUE = 'mutation($id:ID!){dequeuePullRequest(input:{id:$id}){clientMutationId}}'
+DISARM = 'mutation($id:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$id}){clientMutationId}}'
+
+
 def act(gh, facts, node_id, decision):
     """Post the decision's comment once, then enqueue; returns what was done."""
     done = []
@@ -361,6 +388,10 @@ def act(gh, facts, node_id, decision):
         if not gh.dry_run:
             gh.api(gh.repo(f'issues/{facts.number}/comments'), '-f', f'body={decision.comment}')
         done.append(f'comment {decision.comment_key}')
+    if decision.action == 'dequeue':
+        if not gh.dry_run:
+            gh.graphql(DEQUEUE if facts.queued else DISARM, id=node_id)
+        done.append(('dequeued' if facts.queued else 'disarmed') if not gh.dry_run else 'would dequeue')
     if decision.action == 'enqueue':
         if not gh.dry_run:
             entry = gh.graphql(ENQUEUE, id=node_id, head=facts.head)['enqueuePullRequest']['mergeQueueEntry']

@@ -43,8 +43,9 @@ The merge keeper (`scripts/merge_keeper.py`) enqueues reviewed, green pull reque
 person or the morning (lead-time study 11-09: 11 green, reviewed pull requests waited 8.6-32 h to be enqueued).
 It acts only on an open, non-draft, same-repository pull request into `main` that carries the label `ship`:
 
-1. **Approval on the full head SHA, by an account with write access** (author association owner, member or
-   collaborator). Either an APPROVE review on the head commit, or a comment
+1. **Approval on the full head SHA, by an account with write access**: its effective repository permission
+   (`collaborators/<login>/permission`) is write, maintain or admin. An organization member with read or triage
+   access does not count. Either an APPROVE review on the head commit, or a comment
    `Review: orchestrator diff read <40-hex head sha>` that was posted after the head arrived and was never
    edited. The description is not read: its author can edit it after a push. When the approval names an older
    SHA, the keeper does not enqueue and comments once. The trust boundary is write access, which can already arm
@@ -61,13 +62,15 @@ It acts only on an open, non-draft, same-repository pull request into `main` tha
    reruns the whole group, which a rerun of a dropped group's jobs cannot. The keeper waits 3 minutes first, so
    a worker's `wait-merge.sh` (30-s polls) re-enqueues a flake first. The counts come from the pull request's
    timeline, so every actor shares them. A second failure gets one comment with the failing jobs, and the keeper
-   stops for that head. A queue `merge_conflict` waits until main moves past the entry ahead and is retried
+   stops for that head. Two failures are the budget for every actor: when a `ship` pull request is queued or
+   armed again on that head (a later `wait-merge.sh` retry, a hand enqueue), the keeper takes it out of the
+   queue (or disarms it) and comments once. Remove the `ship` label to enqueue it by hand anyway. A queue `merge_conflict` waits until main moves past the entry ahead and is retried
    once; a second one gets a comment and stops. A removal by hand holds the pull request until a new head
    arrives or the `ship` label is added again. A conflict with main gets one comment.
 
 A pull request that is queued or has auto-merge armed is left to GitHub. Each comment carries an HTML marker
 `<!-- merge-keeper:<kind>:<head> -->` and is posted once per head; markers count only from a write-access account
-or `github-actions[bot]`. The enqueue passes `expectedHeadOid`, so a
+(effective permission) or `github-actions[bot]`. The enqueue passes `expectedHeadOid`, so a
 push racing the keeper is never enqueued.
 
 **Where it runs.** The keeper runs every 300 s on the Mac mini as the LaunchDaemon

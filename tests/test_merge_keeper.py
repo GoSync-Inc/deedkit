@@ -10,9 +10,11 @@ GREEN = {'checks / verify': {'status': 'completed', 'conclusion': 'success', 'st
 AT = '2026-11-09T00:10:00Z'
 
 
-def comment(body, association='OWNER', created=AT, updated=None, user='egerev'):
-    return {'body': body, 'author_association': association, 'user': user, 'created_at': created,
-            'updated_at': updated or created}
+WRITER = 'writer'
+
+
+def comment(body, created=AT, updated=None, user=WRITER):
+    return {'body': body, 'user': user, 'created_at': created, 'updated_at': updated or created}
 
 
 def approval(sha=HEAD, **changes):
@@ -21,6 +23,7 @@ def approval(sha=HEAD, **changes):
 
 def facts(**changes):
     base: dict[str, object] = dict(number=7, head=HEAD, comments=[approval()], checks=dict(GREEN),
+                                   writers=frozenset({WRITER, 'other-writer'}),
                                    head_at='2026-11-09T00:00:00Z', main_at='2026-11-09T00:00:00Z',
                                    now='2026-11-09T05:00:00Z', main_migrations=('072_a.sql', '073_b.sql'))
     base.update(changes)
@@ -34,15 +37,15 @@ def test_approved_green_pull_request_is_enqueued():
 
 # spec: ANYM-625
 def test_trusted_approve_review_on_the_head_counts_and_an_outsider_does_not():
-    review = {'state': 'APPROVED', 'commit_id': HEAD, 'author_association': 'COLLABORATOR'}
+    review = {'state': 'APPROVED', 'commit_id': HEAD, 'user': 'other-writer'}
     assert mk.decide(facts(comments=[], reviews=[review])).action == 'enqueue'
-    outsider = dict(review, author_association='NONE')
+    outsider = dict(review, user='read-only-member')
     assert mk.decide(facts(comments=[], reviews=[outsider])).reason == 'no approval recorded for the head'
 
 
 # spec: ANYM-625
 def test_forged_edited_abbreviated_or_pre_head_approval_comments_do_not_approve():
-    for forged in (approval(association='NONE'), approval(association='CONTRIBUTOR'),
+    for forged in (approval(user='read-only-member'), approval(user='outsider'),
                    approval(updated='2026-11-09T00:20:00Z'), approval(sha=HEAD[:12]),
                    approval(created='2026-11-08T23:00:00Z')):
         assert not mk.head_approved(facts(comments=[forged])), forged
@@ -59,11 +62,18 @@ def test_approval_of_an_older_head_holds_and_comments_once():
 
 
 # spec: ANYM-625
+def test_approval_of_the_previous_head_posted_before_the_push_still_gets_the_stale_comment():
+    before_push = facts(comments=[approval(OLD, created='2026-11-08T23:00:00Z')])
+    decision = mk.decide(before_push)
+    assert (decision.action, decision.comment_key) == ('hold', f'stale:{HEAD}')
+
+
+# spec: ANYM-625
 def test_an_outsider_marker_does_not_mute_the_keeper_comment():
     decision = mk.decide(facts(comments=[approval(OLD)]))
-    muted = facts(comments=[approval(OLD), comment(decision.comment, association='NONE')])
+    muted = facts(comments=[approval(OLD), comment(decision.comment, user='read-only-member')])
     assert mk.act(mk.GitHub(dry_run=True), muted, 'id', decision) == [f'comment stale:{HEAD}']
-    by_bot = facts(comments=[approval(OLD), comment(decision.comment, association='NONE', user=mk.KEEPER_BOT)])
+    by_bot = facts(comments=[approval(OLD), comment(decision.comment, user=mk.KEEPER_BOT)])
     assert mk.act(mk.GitHub(dry_run=True), by_bot, 'id', decision) == []
 
 
@@ -91,6 +101,17 @@ def test_one_queue_failure_retries_once_after_the_worker_window_and_a_second_sto
     assert (decision.action, decision.comment_key) == ('hold', f'stop:{HEAD}')
     older_head = [dict(r, at='2026-11-08T00:00:00Z') for r in two]
     assert mk.decide(facts(removals=older_head)).action == 'enqueue'
+
+
+# spec: ANYM-625
+def test_a_head_queued_or_armed_again_after_two_failures_is_taken_out_by_any_actor():
+    two = [{'at': '2026-11-09T01:30:00Z', 'reason': 'failed_checks', 'group': None},
+           {'at': '2026-11-09T02:30:00Z', 'reason': 'failed_checks', 'group': None}]
+    for state in ({'queued': True}, {'auto_merge': True}):
+        decision = mk.decide(facts(removals=two, **state))
+        assert (decision.action, decision.comment_key) == ('dequeue', f'budget:{HEAD}')
+        assert mk.act(mk.GitHub(dry_run=True), facts(removals=two, **state), 'id', decision)[-1] == 'would dequeue'
+    assert mk.decide(facts(removals=two[:1], queued=True)).action == 'skip'
 
 
 # spec: ANYM-625
@@ -170,7 +191,7 @@ removal = st.fixed_dictionaries({'at': st.sampled_from(['2026-11-08T00:00:00Z', 
                                                         '2026-11-09T04:59:00Z']),
                                  'reason': st.sampled_from(['failed_checks', 'manual', 'merge_conflict', 'merged']),
                                  'group': st.none()})
-approvals = st.sampled_from([approval(), approval(HEAD[:9]), approval(OLD), approval(association='NONE'),
+approvals = st.sampled_from([approval(), approval(HEAD[:9]), approval(OLD), approval(user='read-only-member'),
                              approval(updated='2026-11-09T00:30:00Z'), approval(created='2026-11-08T00:00:00Z')])
 
 
