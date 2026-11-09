@@ -44,6 +44,28 @@ def test_osv_scanner_fails_the_security_run_except_for_listed_advisories():
         assert "; card: " in entry["reason"], entry
 
 
+# spec: ANYM-137
+def test_a_go_allowlist_entry_names_every_go_mod_that_requires_its_module():
+    # A Go entry's reason starts with the module path; osv-scanner filters the ID in every go.mod, so the reason
+    # (and its govulncheck evidence) must cover each one, not only the module that was first scanned.
+    config = tomllib.loads((ROOT / "osv-scanner.toml").read_text())
+    go_mods = subprocess.run(["git", "ls-files", "*go.mod"], cwd=ROOT, capture_output=True, text=True,
+                             check=True).stdout.split()
+    assert go_mods
+    for entry in config.get("IgnoredVulns", ()):
+        if not entry["id"].startswith("GO-"):
+            continue
+        module = entry["reason"].split()[0]
+        assert module.count("/") >= 2, entry
+        for go_mod in go_mods:
+            # reads: services/release-router/go.mod
+            # reads: tools/attest-verify/go.mod
+            # reads: whatsapp/whatsmeow/go.mod
+            lines = (ROOT / go_mod).read_text().splitlines()
+            required = any(line.split()[:1] == [module] or line.split()[1:2] == [module] for line in lines)
+            assert not required or go_mod in entry["reason"], (entry["id"], go_mod)
+
+
 # spec: ANYM-500
 def test_security_runs_cancel_only_an_older_run_of_the_same_pull_request():
     concurrency = _workflow("security.yml")["concurrency"]
