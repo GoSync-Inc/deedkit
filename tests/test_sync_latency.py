@@ -314,6 +314,7 @@ def test_the_operator_table_prints_the_same_rows(archive, tmp_path, monkeypatch,
         assert [str(row[k]) for k in stage_latency.ROW_KEYS[:9] if row[k] is not None] in printed
 
 
+# spec: ANYM-865
 def test_the_gateway_catalog_accepts_the_latency_arguments():
     catalog = json.loads((ROOT / 'services/gateway/src/agent_gateway/catalog.json').read_text())
     schema = next(t for t in catalog if t['name'] == 'messages_get_sync_status')['inputSchema']['properties']
