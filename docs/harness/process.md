@@ -47,9 +47,9 @@ Agents decide everything else by consequence (reviews.md, Routing), with undo:
 Incident recovery comes first: a confirmed outage or broken critical user path permits the
 smallest reversible recovery of the existing service/session, compatible rollback or verified
 green-main service-only hotfix. Preserve state, session identity and artifact verification. It
-adds no new auth, send/replay, access or destructive change. Defer intake and independent review
-until restored. Record before/after and undo; finish deferred reviews and process corrections before
-other work. Project live-action restrictions apply.
+adds no new auth, send/replay, access or destructive change. Defer intake and review until
+restored. Record before/after and undo; finish deferred reviews and process corrections first.
+Project live-action restrictions apply.
 
 Urgent production setting fix (owner 11-08): hand-edit it first with undo, PR after (not secrets,
 access, internet exposure); recheck after each release until shipped.
@@ -68,8 +68,8 @@ Path: consequences and section 2 (reviews.md, Pull request lines); PR line
 
 - AUTO (tests, non-gate process text, docs, a pinned-copy refresh; reviews.md, Rounds 8):
   merge on green required checks.
-- AUTO+review (other code or gate changes): one independent review (reviews.md, Routing); VISION.md:
-  the B5 review (tiden.md).
+- AUTO+review (other code or gate changes): one independent review (reviews.md, Routing; small
+  fix: orchestrator diff read); VISION.md: the B5 review (tiden.md).
 - OWNER (a change, here or in a project's AGENTS.md, that lets agents decide part of section 2's
   five, drops or weakens a section 2 gate, or loosens section 3): plus the owner's words; a quoted request naming the change counts (checked against the diff).
 
@@ -106,6 +106,6 @@ Source done: green `main` evidence (orchestration.md); production done adds depl
 - The card or brief is the plan. Decide in scope; ask only before leaving it (another task's
   files, section 2, card criteria, an unclear fork).
 - Message on events only (question, BLOCKED, DONE), ending with a `SUPERSET_WORKER_*` block.
-- Word cap: this file 1,000 words; project AGENTS.md its own.
+- Word cap: 1,000 words here; AGENTS.md its own.
   A rule change replaces or deletes words and names its incident and enforcer; recovery precedes
   an incident regression test or hook.
