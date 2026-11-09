@@ -33,25 +33,31 @@ affect every pull request make parallel edits collide.
   conflict in another task's files goes to the orchestrator.
 - Draft first (owner 10-27, paid CI minutes): workers open pull requests as drafts, run the
   project's local checks before every push and mark the pull request ready (`gh pr ready <n>`)
-  once local checks pass and either reviews pass (a small fix: no review, below) or the push that carries the fixes of every open
-  finding is made (only the confirming recheck left): then CI runs alongside the recheck (owner
-  10-29); the recheck never waits for that run (reviews.md, Rounds 4). A recheck finding returns
-  it to draft (`gh pr ready <n> --undo`) and cancels that head's run in flight (`gh run cancel <id>`) before its fix; that costs one more CI run. Nothing skips a
+  once local checks pass and, on a review path, the push that fixes the r1 findings is made (no
+  review path: at once; there is no recheck, reviews.md, Rounds 4). Nothing skips a
   required check or the `main` push run. Whoever enqueues (the worker, or the orchestrator when
   the project's merge lock or the brief names it as merger) enqueues only a ready pull
   request, and only after the run that `ready_for_review` (or a later push) started for the
   head SHA has finished with no required job `skipped`: a draft's skipped checks read as
   passed, and a gate job's dependants get new check runs only once it ends. "First CI run green" (Sessions) means the first run after ready.
 - No parking, merge without the orchestrator (owner 10-29, every project): after a verdict the
-  worker starts the fix and the next round in the same turn and never idles with a pull request in
+  worker starts the fix in the same turn and never idles with a pull request in
   review; a wait on CI or another pull request is a background wait (Sessions), not silence. Once
-  the review has passed (no open blocking or major finding) and the ready run has finished with no
-  required job skipped (Draft first), the worker arms the merge itself (`gh pr merge <n> --squash
-  --auto`, or the project's merge step) without waiting for the orchestrator; the required checks
-  gate it. Exception: when the project's merge lock or a rule for paths its AGENTS.md marks shared,
-  or the brief, names the orchestrator as merger, or for a small fix (below), the worker reports
-  and the orchestrator arms.
-- Small fix (reviews.md, Routing; owner 11-09): the orchestrator is the merger. The worker marks
+  no review was needed (owner 11-09) or r1 left no open finding, the worker arms the merge itself
+  (`gh pr merge <n> --squash --auto`, or the project's merge step) without waiting for the
+  orchestrator; the required checks gate it. When (lead-time study 11-09: green pull requests
+  waited 8-32 h for a person to arm them): with a merge queue whose `merge_group` run runs every
+  required check, at `gh pr ready` (the conflict guard first): the queue run, not the draft's
+  skipped checks, decides; without one, once the ready run has finished with no required job
+  skipped (Draft first), or at ready with a `Keeper:` line where the project runs a merge keeper
+  (below), so a session that ends or sleeps leaves nothing waiting. Exception: when the project's merge lock or a rule for paths
+  its AGENTS.md marks shared, or the brief, names the orchestrator as merger, for a small fix or a
+  blocking fix (below), the worker reports and the orchestrator arms.
+- Small fix and blocking fix (reviews.md, Routing and Rounds 4; owner 11-09): the
+  orchestrator is the merger. A blocking fix is the push that fixes an r1 blocking finding; for it
+  the orchestrator reads the fix range (`git diff <r1 head>..<head>`) instead of the scope check
+  below: the finding is fixed and its regression test fails on the r1 head (the PR shows that run);
+  no recheck runs. The worker marks
   the pull request ready once local checks pass, runs the conflict guard, reports and pushes no
   more unless the orchestrator asks. The
   orchestrator reads the whole diff at the head SHA (`gh pr diff <n>`), checking: the scope is
@@ -60,8 +66,26 @@ affect every pull request make parallel edits collide.
   Then it adds `Diff read: <orchestrator> <head SHA>` to the description and arms once the ready
   run has finished (Draft first). A head other than the read SHA (auto-merge stays armed across
   pushes): `gh pr merge <n> --disable-auto`, read the new diff, arm again. A diff outside the scope goes
-  back for the ordinary r1. The digest gets one line listing the small fixes merged since the
-  previous one (pull request, what it fixed); no `r<n>`.
+  back for the ordinary route. The digest gets one line listing the small and blocking fixes
+  merged since the previous one (pull request, what it fixed); no `r<n>`.
+- Merge keeper (optional; lead-time study 11-09: 46% of build-to-live hours were nights with
+  green work waiting for a person): `bin/merge-keeper.sh` on an always-on host (launchd or cron
+  every 5 minutes, the owner's `gh` login, `MERGE_KEEPER_REPOS` in config.sh; empty: off) arms
+  `--auto --squash --match-head-commit <head>` on each open, ready, unarmed pull request whose
+  description has `Keeper: <head SHA>` and whose required checks all passed (none pending, failed
+  or skipped). It never arms a fork pull request, and only authors in `MERGE_KEEPER_AUTHORS`
+  (default: the keeper's `gh` login): on a public repository anyone can write the line. The merger writes that line where it would arm: the worker after its guard, the
+  orchestrator after its `Diff read:`; a later push makes it stale. A GitHub Actions keeper needs
+  a GitHub App token: an enqueue with `GITHUB_TOKEN` starts no `merge_group` run, so the queue
+  never merges it. The keeper takes only the arming step; required checks, the queue and
+  `wait-merge.sh` stay. Example launchd job: `ProgramArguments` = `<orchestrator dir>/bin/merge-keeper.sh`,
+  `StartInterval` 300, stdout to a log the orchestrator reads on wake-up.
+- Autodeploy halts wake an agent (lead-time study 11-09: 66% of merged-to-live hours were halts
+  nobody picked up, the longest 36 h): a project whose promotion tool can halt unattended deploys
+  sends each halt to its alert path and wakes the agent that clears it (the project's ops worker
+  or orchestrator: an inbox file plus a wake-up, Wake-ups), with a target time in AGENTS.md. A halt
+  is never only a log line or a status file nobody reads; the wake names the halted release and
+  the step to run (the project's production document).
 - Conflict guard before arming (study 10-29: conflicts cost queue re-entries): the worker runs
   `bin/merge-guard.sh [base]` in its worktree on its pushed head before it arms, or before it
   reports ready when the orchestrator arms (which then arms only on a clean guard). Exit 3: push
@@ -162,7 +186,7 @@ harness-defined override needs no differences.md row. While it is on, these repl
 name; everything else stays:
 
 1. Quality stays: failing tests first, real fixes, never a weakened, skipped or deleted test to
-   get green, and the review on the risk paths (item 4).
+   get green, and the review on the review paths (item 4).
 2. Merge: with green required checks and no open blocking finding the agent merges at once
    (`gh pr merge <n> --squash --match-head-commit <sha>`; `--auto` with the same flag where a merge
    queue exists). No merge lock, freeze or update-and-retest on the latest `main`, also on shared
@@ -170,10 +194,7 @@ name; everything else stays:
    and CI routing (`.github/`). Draft first, the conflict guard and the required checks stay.
 3. A red `main` push run is not a stop: whoever sees it first fixes forward or reverts the
    suspect squash, whichever is faster, as its own pull request; other merges continue.
-4. Reviews (reviews.md, Routing and Rounds): one round; a recheck only after a blocking finding;
-   the author fixes major and minor findings without a new round; no r3 or over-cap round. Astra
-   r1 only on the risk paths: user isolation and privacy, safety, auth and session,
-   migrations, CI permissions; other code gets one Sol r1.
+4. Reviews: as reviews.md, Routing (owner 11-09): one first look on the review paths only.
 5. No backup gate (process.md section 2; reviews.md, Rounds 7): deleting or rewriting data,
    restores and rollbacks need no fresh backup either, because the data is disposable test data;
    undo and read-back stay. Production-observation steps never gate
@@ -219,7 +240,7 @@ This adds no second task registry, extra report cadence or approval.
   never use bare `git stash`.
 - Tiden commands use `--format json` with a `jq` projection; files over about 20k characters are
   read by range or `grep`. Whole exports never go into a session or a reviewer packet.
-- Models for code: Opus on risk paths (reviews.md, Codex budget), which wins over the rest. Sonnet
+- Models for code: Opus on the review paths (reviews.md, Routing), which wins over the rest. Sonnet
   high, as an extended trial (owner 10-19, 10-24: more Sonnet work), on small and
   medium cards (Effort up to 3, one lane). Clear feature cards of Effort 5 (the orchestrator's
   band for the owner's "more complex tasks") alternate, in dispatch order, Sonnet high and Opus
@@ -232,8 +253,7 @@ This adds no second task registry, extra report cadence or approval.
   once on a post-merge defect of blocking severity (reviews.md). Worker and orchestrator
   subagents default to Sonnet for search, exploration, kit or script adaptation and scoped
   rechecks of their own work (re-running a check, confirming a fix landed); Opus only for a reason
-  named in the subagent's prompt. Reviews (r1 and rechecks) keep the model reviews.md names (Routing;
-  Rounds 4, 5; owner 10-19, 10-21, 10-23). The worker's DONE has one line per Sonnet subagent
+  named in the subagent's prompt. Reviews keep the model reviews.md names (Routing). The worker's DONE has one line per Sonnet subagent
   task: task, model, `ok` or `redo` (redone by Opus or by hand), the orchestrator's digest the
   same for its own, so the trial's quality is watched (owner 10-30: give Sonnet more, continue the experiment).
 - Orchestrator address: `bin/boss-of.sh <project>` prints a project's orchestrator session name from one
@@ -433,15 +453,13 @@ Workers can run on another machine that Paradev (formerly Superset) knows as a h
 - Cost (process-diet 10-18): no "ok/noted" replies to workers; each wake-up re-reads the whole
   context, so wake less: rely on worker standing approvals and answer worker questions in one
   message. Orchestrator effort medium (owner 10-19).
-- An over-cap ask (an r4) is checked against the packet class first (owner 10-30): a card keeps its
-  one recheck and a production operation plan gets none (reviews.md, Rounds 6, 7; owner 11-04), so
-  the answer is no: a card's open finding is the worker's BLOCKED, a plan's finding the author
-  cannot fix stops that step (Rounds 7); `bin/review-codex.sh` refuses those rounds.
+- There is no over-cap or recheck ask (owner 11-09): a blocking finding the author cannot
+  fix is the worker's BLOCKED (reviews.md, Rounds 5); `bin/review-codex.sh` refuses every r2.
 - Capacity (owner 10-18): run at least 7 workers in parallel (owner wants 10–15 later). A
   worker's context limit is a restart signal at a natural boundary; never stop a worker just for
   the number.
 - Process and rule changes (owner 10-18, 10-27): agents decide them without asking: checklist,
-  a review only for authority/gate changes (reviews.md, Rounds 8), merge, a "Decided by agents" digest line; the
+  no model review (reviews.md, Rounds 8), merge, a "Decided by agents" digest line; the
   owner reverses with one word. Only a change process.md section 3 makes OWNER needs the owner's
   words; a quoted owner request naming it counts. Give your own opinion and say plainly when an owner idea looks wrong or costly.
 - Partner, not yes-man (owner 10-18): hold an evidence-based opinion; when the owner pushes back,
@@ -483,7 +501,7 @@ Workers can run on another machine that Paradev (formerly Superset) knows as a h
   - Only these get a digest line under "Decided by agents": a process.md section 2 step (ruleset or required
     checks, secrets or access, destructive SQL or deleting data (not a service-run DELETE a ready card or data policy names), restore, rollback, production change, release), a process text
     change, a deleted card or weakened criterion, a GUI or ops step on a live service, a review finding closed
-    by narrowing, a follow-up card or a revert (reviews.md, Rounds 5 and the epic review). Each line: `r<n>` (never
+    by narrowing, a follow-up card or a revert (reviews.md, Rounds 5). Each line: `r<n>` (never
     reused), what, why, the gate it passed, the undo. The never-asked kinds and answered worker questions get no
     line. STATE.md DECIDED BY AGENTS keeps each `r<n>` with its undo for 14 days (the page shows it for one digest).
   - The owner reverses one by naming it in chat or with the page's reverse item; that is an owner answer (Owner
@@ -520,10 +538,8 @@ Workers can run on another machine that Paradev (formerly Superset) knows as a h
 - Estimates (owner 10-26; only when the facts' `Estimate:` line names a data dir). Every command but `link` takes `--repo
   <owner/repo>` before the subcommand (`estimate --repo <owner/repo> record`). Once: `estimate link --dir <estimate
   dir> --repo <owner/repo>` (add `--claude-project-dir <Claude transcript dir>`, a `~/.claude/projects/...` path, only
-  for sessions whose cwd lacks the repo's git remote); `doctor` must show it linked. Before creating a code worker:
-  `forecast --sp <the card's Effort, or your SP for a skip> --task <its --branch> --model <your model
-  id>` (you adopt the SP); the SP go into its task brief and the worker keeps that branch. Only this forecast logs a `--task`; never
-  size after the work started (a retro, not accuracy data). The Paradev automation `estimate-nightly` (not yours) runs
+  for sessions whose cwd lacks the repo's git remote); `doctor` must show it linked. No per-task `forecast`
+  before a worker (owner 11-09); the card's Effort goes into its task brief. The Paradev automation `estimate-nightly` (not yours) runs
   `record --all` and `dashboard --all` (no `--repo`) for every linked project; still run `record` after merges and
   before any planning. Agent count (within Capacity) and waves: `plan --agents <n>` or `dashboard`, after `estimate
   setup` named the backlog (`backlog pull` refreshes Tiden cards first). Hours and money: only the script (tiden.md, Effort).

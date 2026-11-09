@@ -54,7 +54,7 @@ Project live-action restrictions apply.
 Urgent production setting fix (owner 11-08): hand-edit it first with undo, PR after (not secrets,
 access, internet exposure); recheck after each release until shipped.
 
-Never accept open blocking/major findings: narrow, follow up or revert. Ready owner-asked
+Never merge an open blocking finding: narrow, follow up or revert. Ready owner-asked
 features ship enabled after merge/deploy, flags and grants included, listed live actions excluded.
 No production step during named live activity; check read-only first.
 
@@ -64,12 +64,11 @@ verification gates; quality and the five stay.
 ## 3. Change paths
 
 Path: consequences and section 2 (reviews.md, Pull request lines); PR line
-`Change path: <path> (<rule>)`. In doubt, name the unresolved risk and use Astra.
+`Change path: <path> (<rule>)`. In doubt, name the risk; Astra.
 
-- AUTO (tests, non-gate process text, docs, a pinned-copy refresh; reviews.md, Rounds 8):
-  merge on green required checks.
-- AUTO+review (other code or gate changes): one independent review (reviews.md, Routing; small
-  fix: orchestrator diff read); VISION.md: the B5 review (tiden.md).
+- AUTO (off section 5's review paths): green required checks, failing-first test; small
+  fix: orchestrator diff read.
+- AUTO+review (a review path, section 5); VISION.md: the B5 review (tiden.md).
 - OWNER (a change, here or in a project's AGENTS.md, that lets agents decide part of section 2's
   five, drops or weakens a section 2 gate, or loosens section 3): plus the owner's words; a quoted request naming the change counts (checked against the diff).
 
@@ -90,16 +89,18 @@ Source done: green `main` evidence (orchestration.md); production done adds depl
 
 ## 5. Reviews
 
-- Astra: `bin/review-codex.sh astra`. Fable: product cards; code only if the task brief names it.
-- Packet, rounds, routing, verdict line: reviews.md. Every Astra task starts with:
-  1. Failure isolation: can an exception, timeout or bad input in the new code break or silence an
-     existing path (`<critical paths>`)? Name the line.
-  2. Data egress vs PR claims: what data leaves the process (model APIs, logs, telemetry, third
-     parties, files), and does it match the PR description and spec? Anything unlisted is
-     a finding.
-  3. Deployed-version compatibility: does it work against what is deployed now (`<deployed
-     consumers>`)? Name the breaking consumer.
-  4. Tests: do new tests fail on the base commit and assert the spec criterion?
+Review paths (owner 11-09): sends/calls, collector sessions, user-data deletion/rewrite,
+access/secrets/CI permissions, live-production operation plans. One first look (Astra r1
+on code, Fable r1 on big product epics, such cards, plan r1), no r2; the orchestrator reads a
+blocking fix's diff. Elsewhere none (reviews.md; Fable on code: brief-named only). Every Astra task starts with:
+
+1. Failure isolation: can an exception, timeout or bad input in the new code break or silence an
+   existing path (`<critical paths>`)? Name the line.
+2. Data egress vs PR claims: what data leaves the process (model APIs, logs, telemetry, third
+   parties, files), and does it match the PR description and spec? Anything unlisted is
+   a finding.
+3. Deployed-version compatibility: does it work against what is deployed now (`<deployed
+   consumers>`)? Name the breaking consumer.
 
 ## 6. Working with the orchestrator
 
