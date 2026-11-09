@@ -259,8 +259,47 @@ class TelethonProvider:
             def get_channel_difference(self,*args):
                 # Also covers the early end when the channel's access hash is missing.
                 if any(isinstance(entry,int) for entry in self.getting_diff_for):provider.read_gap_soon()
+                provider.channel_difference_started(self)
                 return base.get_channel_difference(self,*args)
+            def apply_channel_difference(self,request,diff,*args):
+                result=base.apply_channel_difference(self,request,diff,*args)
+                provider.channel_difference_seen(request,diff)
+                return result
+            def end_channel_difference(self,request,*args):
+                result=base.end_channel_difference(self,request,*args)
+                provider.channel_difference_seen(request,None)
+                return result
         box.__class__=WatchedBox
+
+    def channel_difference_started(self,box):
+        """ANYM-840 gate: remember when and why Telethon starts a channel difference fetch.
+        `timeout` means the channel's no-updates deadline (Telethon NO_UPDATES_TIMEOUT, 15 min) expired;
+        `gap` means a detected pts gap. Called inside Telethon's update loop: never raises."""
+        try:
+            entry=next((entry for entry in box.getting_diff_for if isinstance(entry,int)),None)
+            state=box.map.get(entry) if entry is not None else None
+            if state is None:return
+            now=asyncio.get_running_loop().time()
+            self.__dict__.setdefault('_channel_fetches',{})[entry]=(now,'timeout' if state.deadline<=now else 'gap')
+        except Exception:return
+
+    def channel_difference_seen(self,request,diff):
+        """One log line per channel difference fetch: the stored chat id, the trigger, the message count and
+        timings only (no title, text or provider id). Called inside Telethon's update loop: never raises."""
+        try:
+            from telethon import types
+            entry=request.channel.channel_id
+            started,trigger=self.__dict__.get('_channel_fetches',{}).pop(entry,(None,'unknown'))
+            elapsed=f'{(asyncio.get_running_loop().time()-started)*1000:.0f}' if started is not None else 'none'
+            messages=list(getattr(diff,'new_messages',None) or ())
+            result=('ended_early' if diff is None else 'empty' if isinstance(diff,types.updates.ChannelDifferenceEmpty)
+                else 'too_long' if isinstance(diff,types.updates.ChannelDifferenceTooLong) else 'difference')
+            dates=[m.date for m in messages if isinstance(getattr(m,'date',None),datetime)]
+            oldest=f'{(datetime.now(timezone.utc)-min(dates)).total_seconds():.0f}' if dates else 'none'
+            chat=stable_id('chat',getattr(self.read_gap_state,'account',None),str(-1000000000000-entry))
+            log.info('telegram_channel_difference chat=%s trigger=%s result=%s messages=%d final=%s elapsed_ms=%s oldest_age_s=%s',
+                chat,trigger,result,len(messages),getattr(diff,'final',None),elapsed,oldest)
+        except Exception:return
 
     def read_gap_soon(self):
         # Called inside Telethon's update loop: never block or raise there.
