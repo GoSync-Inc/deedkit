@@ -3,8 +3,11 @@ Description=Check DeedKit main for a new green commit to deploy
 
 [Timer]
 OnBootSec=10min
-OnUnitInactiveSec=5min
-RandomizedDelaySec=30s
+# Every minute after the previous run ended, so a merged commit deploys about a minute after its images are attested
+# (ci-deploy-speed 11-09). A run with nothing new reads only `git ls-remote`.
+OnUnitInactiveSec=1min
+RandomizedDelaySec=10s
+AccuracySec=5s
 Unit=deedkit-autodeploy.service
 
 [Install]

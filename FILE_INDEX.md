@@ -75,6 +75,21 @@ PostgreSQL stemming uses the same configuration for index and query. Auto tries
 each complete query under all four configurations. There is no semantic search
 or implicit spelling correction in file search.
 
+### A file's media state in message reads (ANYM-866)
+
+Each file of `get_context` (`attachments` and `pending_attachments`, compact and full detail) has
+`media: {media_state, next_action, processing}`, plus `reason` when blocked. `get_messages` and `search` keep their
+file fields unchanged. These are the same values the event
+stream shows for that file (SUBSCRIPTIONS.md, "Each file's state in the stream"). `media_state` is one of
+`queued`, `available_on_request`, `ready`, `failed`, `superseded` or `blocked` (`reason`: `collection_excluded`,
+`size_limit`, `policy`). `next_action` is `request_file_download` for a file that waits for a request, `get_attachment`
+for a ready one, and null otherwise. It is separate from the item's own `next_action`, which keeps its diagnostic
+values. `processing` gives `text`, `transcript` and `description` as `queued`, `available_on_request`,
+`ready`, `failed`, `unsupported` or `not_applicable`. Examples:
+
+- A voice note in a group no subscription names: `{media_state: available_on_request, next_action: request_file_download, processing: {text: available_on_request, transcript: not_applicable, description: not_applicable}}` when the account has no audio profile.
+- A downloaded photo whose description is still running: `{media_state: ready, next_action: get_attachment, processing: {text: queued, transcript: not_applicable, description: queued}}`.
+
 ### Media kind and readiness filters (ANYM-661)
 
 `media_kind` is a list of `voice`, `audio`, `image`, `video`, `document`; the provider labels shown in a row's

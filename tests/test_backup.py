@@ -54,7 +54,7 @@ def test_a_restored_schema72_backup_quarantines_and_migrates_to_the_wake_tables(
             restored.migrate()
             restored.migrate()
             with restored.pool.connection() as c:
-                assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='74'
+                assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='75'
                 assert schema_ready(c) is True
                 assert c.execute('SELECT count(*) AS n FROM wake_targets').fetchone()['n']==0
 
@@ -88,7 +88,7 @@ def test_schema70_snapshot_restores_the_activity_counts(database,tmp_path):
     with restore_database(database,tmp_path/'source') as source:
         acked_subscription(source,name='activity-snapshot')
         with source.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='74'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='75'
             before=database_manifest(c)['subscription_activity']
             rows=c.execute('SELECT * FROM subscription_activity ORDER BY metric').fetchall()
         assert before['rows']==2 and [row['metric'] for row in rows]==['matched','scanned']

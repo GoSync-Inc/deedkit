@@ -12,7 +12,9 @@ For a defect, infra change or refactor covered by an existing contract, the brie
 do not create a duplicate card, research round, estimate or wave plan. One executor is the default.
 Research is needed only for a specific unresolved question; reuse existing answers. A new capability,
 changed product criteria, material uncertainty or owner-kept decision uses the appropriate card/plan
-flow. This short route changes no review, live-action, migration, CI or owner-authority gate.
+flow. A small fix (reviews.md, Routing) also takes this route, with no card; its review is the
+orchestrator's diff read. Apart from that, this short route changes no review, live-action,
+migration, CI or owner-authority gate.
 
 ```sh
 bin/task.sh start /private/scratch/task.json --repo /path/to/project \

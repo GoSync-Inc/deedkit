@@ -104,9 +104,12 @@ IMAGE_STICKER=("EXISTS(SELECT FROM message_metadata smd WHERE smd.message=m.id"
 # than voice (music, a recording sent as audio or as a file) is transcribed when an agent asks. Voice notes, personal
 # chats, chats of unknown kind and audio whose message names no media kind keep automatic transcription. Video, round
 # notes included (media_kind video in both adapters), is not audio and is not read by this rule.
-AUDIO_GROUP_CHAT=("EXISTS(SELECT FROM chats gc LEFT JOIN collector_chats gcc ON gcc.account=gc.account"
-    " AND gcc.provider_chat=gc.provider_chat WHERE gc.id=m.chat AND (gc.chat_type IN ('group','channel')"
-    " OR NOT coalesce(gc.chat_type IN ('private','group','channel'),false) AND gcc.peer_kind IN ('chat','channel')))")
+# The chat kind is one set per statement (as ON_REQUEST_CHAT), and it is tested before the per-message metadata probe,
+# so that probe runs only for audio in a group or channel (CI #792: a per-row probe of a near-empty message_metadata
+# planned as a sequential scan per file).
+AUDIO_GROUP_CHAT=("m.chat IN (SELECT gc.id FROM chats gc LEFT JOIN collector_chats gcc ON gcc.account=gc.account"
+    " AND gcc.provider_chat=gc.provider_chat WHERE gc.chat_type IN ('group','channel')"
+    " OR NOT coalesce(gc.chat_type IN ('private','group','channel'),false) AND gcc.peer_kind IN ('chat','channel'))")
 AUDIO_NOT_VOICE=("EXISTS(SELECT FROM message_metadata vmd WHERE vmd.message=m.id"
     " AND vmd.metadata->>'media_kind'<>'voice')")
 def audio_mime(mime):
@@ -114,8 +117,8 @@ def audio_mime(mime):
 def description_shape(mime):
     """An image (by the SQL text `mime`) of message m that is old or a sticker, or non-voice audio in a group (ANYM-890)."""
     return ("(left("+mime+",6)='image/' AND (m.sent_at<statement_timestamp()-interval '"
-        +str(IMAGE_DESCRIPTION_DAYS)+" days' OR "+IMAGE_STICKER+") OR "+audio_mime(mime)+" AND "+AUDIO_NOT_VOICE
-        +" AND "+AUDIO_GROUP_CHAT+")")
+        +str(IMAGE_DESCRIPTION_DAYS)+" days' OR "+IMAGE_STICKER+") OR "+audio_mime(mime)+" AND "+AUDIO_GROUP_CHAT
+        +" AND "+AUDIO_NOT_VOICE+")")
 
 
 DESCRIPTION_SHAPE=description_shape('a.mime')

@@ -1,6 +1,7 @@
 """Independent file readiness with exact occurrence fences and journal atomicity."""
 import json
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 import threading
 
 import pytest
@@ -11,7 +12,7 @@ from messaging_service.enrichment_providers import normalize_result
 from messaging_service.file_extract import Extraction
 from messaging_service.processing_events import artifact_version, safe_identifier
 from messaging_service.store import Store
-from test_archive import archive as archive, media_event
+from test_archive import archive as archive, event, media_event
 from test_enrichment import add_audio, profile, worker as fixture_worker
 from test_file_index import add_file, drain, worker_for
 
@@ -64,6 +65,236 @@ def test_original_ready_does_not_wait_for_text_or_model_processing(archive):
                          (job['id'],)).fetchone()['state'] == 'queued'
         assert c.execute('SELECT state FROM attachment_enrichment WHERE attachment=%s',
                          (job['id'],)).fetchone()['state'] == 'unconfigured'
+
+
+VOICE = {'provider_id': 'synthetic-voice-1', 'filename': 'synthetic voice.ogg', 'mime': 'audio/ogg', 'bytes': 4}
+IMAGE = {'provider_id': 'synthetic-image-1', 'filename': 'synthetic photo.jpg', 'mime': 'image/jpeg', 'bytes': 4}
+FILE_STATE = ('media_state', 'next_action', 'processing')
+
+
+def recent(minutes=1):
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+
+
+@pytest.fixture()
+def watched(archive):
+    # A dynamic subscription (every visible chat) names no chat, so a group's files stay on request (ANYM-805).
+    ar, store, key, _ = archive
+    ar.ingest(event(provider_id='synthetic-seed', sent_at=recent(5), updated_at=recent(5)))
+    store.set_dynamic_subscriptions(True)
+    try:
+        permissions = ['read', 'subscription-write', 'subscription-ack']
+        token = store.issue_key('media-state-watcher', ['archive-test'], permissions=permissions,
+            key_permissions=permissions)
+        sid = store.create_subscription(token, sources={'all_visible_chats': True},
+            kinds=['message.created', 'message.edited', 'attachment.ready'])['subscription_id']
+        yield ar, store, key, token, sid
+    finally:
+        store.set_dynamic_subscriptions(False)
+
+
+def stream(store, token, sid, message, kind, **kwargs):
+    from messaging_service.subscriptions import match_subscriptions
+    match_subscriptions(store)
+    items = store.get_subscription_events(token, sid, limit=50, **kwargs)['items']
+    found = [item for item in items if item.get('message') == message and item['kind'] == kind]
+    assert len(found) == 1, [(item['kind'], item.get('message')) for item in items]
+    return found[0]
+
+
+def download(ar, store):
+    job = ar.claim_media('synthetic-worker')
+    writer = BlobWriter(store.files, reserve_bytes=0)
+    ar.finish_media(job, writer.write([b'data']), writer)
+    return job
+
+
+def read_state(store, key, mid, group):
+    [file] = store.get_context(key, mid)[group]
+    return file['media']
+
+
+def state_of(file):
+    return {name: file[name] for name in FILE_STATE}
+
+
+# spec: ANYM-866
+def test_each_file_in_the_stream_carries_the_state_the_message_read_shows(watched):
+    ar, store, key, token, sid = watched
+    sent = recent()
+    mid = ar.ingest(media_event(sent_at=sent, updated_at=sent))['message']
+    [waiting] = stream(store, token, sid, mid, 'message.created')['attachments']
+    assert waiting == {'attachment_id': waiting['attachment_id'], 'mime': 'text/plain', 'bytes': 4,
+        'media_state': 'queued', 'next_action': None,
+        'processing': {'text': 'queued', 'transcript': 'not_applicable', 'description': 'not_applicable'}}
+    assert read_state(store, key, mid, 'pending_attachments') == state_of(waiting)
+    job = download(ar, store)
+    [ready] = stream(store, token, sid, mid, 'attachment.ready')['attachments']
+    assert ready['attachment_id'] == job['id'] == waiting['attachment_id']
+    assert state_of(ready) == {'media_state': 'ready', 'next_action': 'get_attachment',
+        'processing': {'text': 'queued', 'transcript': 'not_applicable', 'description': 'not_applicable'}}
+    assert read_state(store, key, mid, 'attachments') == state_of(ready)
+    # The created event is read now too: the same file, the same current state.
+    assert stream(store, token, sid, mid, 'message.created')['attachments'] == [ready]
+    compact = stream(store, token, sid, mid, 'attachment.ready', detail='compact')
+    assert compact['attachments'] == [ready]
+    assert 'private' not in json.dumps([waiting, ready])  # no file name or path
+
+
+# spec: ANYM-866
+def test_a_voice_note_of_an_on_request_group_waits_for_a_request_in_the_stream_and_the_read(watched):
+    from test_media_eligibility import publish
+    from test_media_policy import set_kind
+    ar, store, key, token, sid = watched
+    publish(ar)  # a collector run's published window: the read knows the chat's download rule
+    sent = recent()
+    mid = ar.ingest(event(media=[VOICE], sent_at=sent, updated_at=sent))['message']
+    set_kind(store, mid, 'group')
+    [file] = stream(store, token, sid, mid, 'message.created')['attachments']
+    assert state_of(file) == {'media_state': 'available_on_request', 'next_action': 'request_file_download',
+        'processing': {'text': 'available_on_request', 'transcript': 'not_applicable', 'description': 'not_applicable'}}
+    assert read_state(store, key, mid, 'pending_attachments') == state_of(file)
+
+
+# spec: ANYM-866
+def test_a_download_that_failed_for_good_shows_failed_and_no_action_in_the_stream_and_the_read(watched):
+    ar, store, key, token, sid = watched
+    sent = recent()
+    mid = ar.ingest(media_event(sent_at=sent, updated_at=sent))['message']
+    with store.pool.connection() as c:
+        c.execute("UPDATE media_jobs SET state='failed',error_code='network_error' WHERE message=%s", (mid,))
+    [file] = stream(store, token, sid, mid, 'message.created')['attachments']
+    assert state_of(file) == {'media_state': 'failed', 'next_action': None,
+        'processing': {'text': 'failed', 'transcript': 'not_applicable', 'description': 'not_applicable'}}
+    assert read_state(store, key, mid, 'pending_attachments') == state_of(file)
+
+
+# spec: ANYM-866
+def test_a_downloaded_voice_note_of_an_on_request_group_without_an_audio_profile_expects_no_transcript(watched):
+    from test_media_policy import set_kind
+    ar, store, key, token, sid = watched
+    sent = recent()
+    mid = ar.ingest(event(media=[VOICE], sent_at=sent, updated_at=sent))['message']
+    download(ar, store)
+    set_kind(store, mid, 'group')  # e.g. its subscription ended: recognition now waits for a request (ANYM-805)
+    [file] = stream(store, token, sid, mid, 'attachment.ready')['attachments']
+    assert state_of(file) == {'media_state': 'ready', 'next_action': 'get_attachment',
+        'processing': {'text': 'available_on_request', 'transcript': 'not_applicable',
+            'description': 'not_applicable'}}
+    assert read_state(store, key, mid, 'attachments') == state_of(file)
+
+
+# spec: ANYM-866
+@pytest.mark.parametrize('media,profiles,later', [
+    (IMAGE, ['image'], {'transcript': 'not_applicable', 'description': 'queued'}),
+    (VOICE, [], {'transcript': 'not_applicable', 'description': 'not_applicable'}),
+    (VOICE, ['audio'], {'transcript': 'queued', 'description': 'not_applicable'}),
+], ids=['image', 'voice_without_audio_profile', 'voice_with_audio_profile'])
+def test_the_later_stages_are_only_the_ones_a_file_of_its_kind_gets(watched, media, profiles, later):
+    ar, store, key, token, sid = watched
+    with store.pool.connection() as c:
+        for kind in profiles:
+            c.execute('''INSERT INTO processing_profiles(account,kind,provider,model,enabled,expires_at)
+                VALUES('archive-test',%s,'openai','fixture-model',true,now()+interval '1 day')''', (kind,))
+    sent = recent()
+    mid = ar.ingest(event(media=[media], sent_at=sent, updated_at=sent))['message']
+    [waiting] = stream(store, token, sid, mid, 'message.created')['attachments']
+    assert waiting['processing'] == {'text': 'queued', **later}
+    download(ar, store)
+    [ready] = stream(store, token, sid, mid, 'attachment.ready')['attachments']
+    assert ready['media_state'] == 'ready' and ready['processing'] == {'text': 'queued', **later}
+    assert read_state(store, key, mid, 'attachments') == state_of(ready)
+
+
+# spec: ANYM-866
+def test_an_edit_that_replaces_a_file_shows_the_old_one_superseded_and_the_new_one_in_the_edit(watched):
+    ar, store, key, token, sid = watched
+    sent = recent(2)
+    mid = ar.ingest(event(media=[IMAGE], sent_at=sent, updated_at=sent))['message']
+    assert ar.ingest(event(media=[VOICE], body='synthetic replacement', sent_at=sent,
+        updated_at=recent()))['outcome'] == 'edited'
+    [old] = stream(store, token, sid, mid, 'message.created')['attachments']
+    [new] = stream(store, token, sid, mid, 'message.edited')['attachments']
+    assert old['attachment_id'] != new['attachment_id']
+    assert state_of(old) == {'media_state': 'superseded', 'next_action': None,
+        'processing': {'text': 'not_applicable', 'transcript': 'not_applicable', 'description': 'not_applicable'}}
+    assert new['media_state'] == 'queued' and new['mime'] == 'audio/ogg'
+    assert read_state(store, key, mid, 'pending_attachments') == state_of(new)
+
+
+# spec: ANYM-866
+def test_a_corrupt_job_row_degrades_only_its_own_file_and_is_counted(watched, capsys):
+    from messaging_service.attachment_metadata import MEDIA_STATE_ERRORS
+    ar, store, _, token, sid = watched
+    sent = recent()
+    mid = ar.ingest(event(media=[IMAGE, VOICE], sent_at=sent, updated_at=sent))['message']
+    other = ar.ingest(event(provider_id='synthetic-other', media=[VOICE], sent_at=sent, updated_at=sent))['message']
+    with store.pool.connection() as c:
+        c.execute('''UPDATE media_jobs SET descriptor='"synthetic-corrupt"'::jsonb
+            WHERE message=%s AND descriptor->>'mime'='audio/ogg' ''', (mid,))
+    before = MEDIA_STATE_ERRORS['AttributeError']
+    capsys.readouterr()
+    image, broken = stream(store, token, sid, mid, 'message.created')['attachments']
+    assert MEDIA_STATE_ERRORS['AttributeError'] == before + 1  # one page read, one unreadable file
+    assert '"attachment_media_state_unavailable"' in capsys.readouterr().out
+    assert image['media_state'] == 'queued' and image['mime'] == 'image/jpeg'
+    assert broken == {'attachment_id': broken['attachment_id'], 'mime': None, 'bytes': None, 'media_state': None,
+        'next_action': None, 'processing': None, 'media_error': 'AttributeError'}
+    assert [f['media_state'] for f in stream(store, token, sid, other, 'message.created')['attachments']] == ['queued']
+
+
+# spec: ANYM-866
+def test_a_failed_media_lookup_never_fails_the_event_page(watched, monkeypatch, capsys):
+    from messaging_service import result_evidence
+    from messaging_service.attachment_metadata import MEDIA_STATE_ERRORS
+    ar, store, _, token, sid = watched
+    sent = recent()
+    mid = ar.ingest(media_event(sent_at=sent, updated_at=sent))['message']
+
+    def broken(c, items):
+        c.execute('SELECT 1/0')
+    monkeypatch.setattr(result_evidence, 'event_attachments', broken)
+    before = MEDIA_STATE_ERRORS['lookup_failed']
+    capsys.readouterr()
+    item = stream(store, token, sid, mid, 'message.created')
+    assert 'attachments' not in item and item['message'] == mid
+    assert MEDIA_STATE_ERRORS['lookup_failed'] == before + 1
+    assert '"lookup_failed"' in capsys.readouterr().out
+
+
+# spec: ANYM-866
+@pytest.mark.parametrize('method', ['get_subscription_events', 'fetch_subscription_events',
+    'wait_for_subscription_events'])
+def test_a_held_lock_on_a_table_the_lookup_reads_never_holds_the_page_its_receipt_or_the_ack(watched, method):
+    import asyncio
+    import time
+    import psycopg
+    from messaging_service.attachment_metadata import MEDIA_STATE_ERRORS
+    from messaging_service.subscription_consumption import wait_for_subscription_events
+    from messaging_service.subscriptions import match_subscriptions
+    ar, store, _, token, sid = watched
+    sent = recent()
+    mid = ar.ingest(media_event(sent_at=sent, updated_at=sent))['message']
+    match_subscriptions(store)
+    before = MEDIA_STATE_ERRORS['lookup_failed']
+    with psycopg.connect(store.pool.conninfo) as holder:
+        holder.execute('LOCK TABLE processing_profiles IN ACCESS EXCLUSIVE MODE')
+        started = time.monotonic()
+        if method == 'wait_for_subscription_events':
+            page = asyncio.run(wait_for_subscription_events(store, token, sid, timeout=0))
+        else:
+            page = getattr(store, method)(token, sid)
+        elapsed = time.monotonic() - started
+        holder.rollback()
+    assert elapsed < 2.5  # the lookup's own 500 ms budgets, not the pool's 5 s statement timeout
+    [item] = [i for i in page['items'] if i.get('message') == mid and i['kind'] == 'message.created']
+    assert 'attachments' not in item and MEDIA_STATE_ERRORS['lookup_failed'] == before + 1
+    if method != 'get_subscription_events':
+        store.ack_subscription_events(token, sid, page['receipt'], page['ack_version'])
+        assert store.get_subscription_events(token, sid)['subscription']['acked_through'] >= item['event_id']
+    # The next page, with no lock held, carries the files again.
+    [again] = [i for i in store.get_subscription_events(token, sid)['items'] if i.get('event_id') == item['event_id']]
+    assert again['attachments'][0]['media_state'] == 'queued'
 
 
 def test_text_ready_dedup_reuse_is_scoped_and_legacy_updates_are_unchanged(seeded):

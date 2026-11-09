@@ -50,6 +50,14 @@ rounds and the verdict. A project's review notes add its deployed-version list, 
   its scoped recheck is Fable again (Rounds 4; the Sol recheck rule above covers Codex r1s), under
   the same cap (Rounds 5).
   Product cards retain their Fable round (Card review below); it is not repeated on finished code.
+- Small fix: no review (owner 11-09: "such a card needs no review, it is one line; it is simply
+  fixed under a fix, without a card"). A fix of at most 3 SP that touches no migration, data
+  policy, egress, grant, allowlist, key, deploy tool, CI file, gate, user-data DELETE/UPDATE or
+  other named risk (Code r1 above) is one pull request with a failing test first (process.md
+  section 4; the PR shows the failing base run): no card, no card round, no Codex, Fable or
+  subagent review. The orchestrator's diff read replaces r1 (orchestration.md, Merging); merge on green.
+  The brief or the worker's estimate names the route; a diff outside it, or in doubt, takes the
+  routes above. Its PR lines: `Review record: none (small fix)` and the orchestrator's `Diff read:`.
 - Name the model in the pull request's `Review record:`; put `Model: <model> <effort>` (the
   author's) in every pull request description.
 - Astra and Fable are the reviews: do not add `/code-review` or `/security-review` on top of them.
@@ -273,7 +281,8 @@ the owner (orchestration.md, Owner asks): the orchestrator decides it within thi
   need a card first.
 - `Review record:` one line per reviewer and round with its counts, naming one Codex reviewer per
   round, e.g. `Review record: Astra r1 1 blocking, 2 major; Sol r2 1 major; Sol r3 1 major; Sol r4
-  over-cap (<reason>) 0/0`. No findings ledger or per-finding
+  over-cap (<reason>) 0/0`; a small fix (Routing): `Review record: none (small fix)` plus
+  `Diff read: <orchestrator> <head SHA>`. No findings ledger or per-finding
   machine lines are kept.
 - `Owner note:` for a product PR, what the owner will notice in daily use.
 - `Spec impact:` and `Settle text:` on every PR (tiden.md, One Tiden branch per pull request).

@@ -468,7 +468,10 @@ it reused the merge queue's verification qualifies only when the latest merge
 queue run of the same SHA, from this repository's `gh-readonly-queue/main/`
 queue, completed successfully with one successful `checks / verify` and
 `CI gate` in its latest attempt. The push run must still contain exactly one
-`checks / verify` job, concluded `skipped`; an absent job is refused. Every other
+`checks / verify` job, concluded `skipped`; an absent job is refused. Beside that
+skip, and only then, the push run may also skip `native / synthetic`: the queue
+run must then show one successful `native / synthetic` too (through the chain
+below, the pull request run must). Every other
 required job must still pass in the push run itself. Both runs are read again after their jobs, so a rerun that
 starts in between is refused, and run listings are followed across pages. The
 result names the queue run that supplied the test verification next to the
@@ -978,6 +981,46 @@ the release is recorded `unhealthy` with rollback data and `deploy` rolls it bac
 once and pauses. A release adds at most 10 seconds per project; services with a
 healthcheck rely on `--wait` and add none. Docker does not restart an unhealthy
 container; monitor `docker ps`/`health_status` events.
+
+### Only changed services are recreated (ANYM-895)
+
+Builds are not reproducible, so image IDs differ on every release. `prepare` therefore computes an
+input digest per selected service from what the repository and host control: the full content of the
+target's Dockerfile and its context's `.dockerignore`; the stage and build arguments without
+`DEEDKIT_SOURCE_SHA`/`VERSION_REF`; the git objects (with their modes) at the release commit of every
+context path the target's stage chain copies (`COPY --from`, `RUN --mount=from=` and base stages
+included; `<Dockerfile>.dockerignore` too); for an
+image that copies `services/messaging/messaging_service`, its migrations as a part of their own; the
+rendered Compose service without `image`, `build` and the revision and input labels; and sha256 digests
+of its env files, bind-mounted files and the top-level secrets and configs it uses (definition and
+file). A directory mounted read-only is configuration and is hashed by content (each entry's path and
+mode, file content, link target; at most 2000 entries and 64 MiB, beyond that the service is always
+recreated); a writable mounted directory (sessions, spools, data) counts by path only. A version constant (`INPUT_VERSION`) is part of the digest, so a
+change of the rule recreates every service once. A recreated service's container carries the digest as
+the label `io.deedkit.production.inputs`.
+
+A service is **kept** only when its running container (running, not restarting or paused) carries the
+candidate's digest as that label and the current applied release (`current.json`) recorded that very
+container, image and `container_settings` digest with the same digest. Anything else recreates it, as
+before: no label (every container created before ANYM-895, so the first release recreates everything),
+another container (one created by hand with a copied label), a settings drift, a part the digest cannot
+read (an `ONBUILD`, an `ADD` of a URL or an archive, a `RUN --mount=type=bind` of the context, a Dockerfile
+the parser cannot read: never kept), or a `current.json` that is not an applied release (after a rollback
+the next release recreates everything). Apply hashes the host files again right before the first stop and
+refuses with `inputs_changed_since_prepare` when they changed or a kept container no longer runs steadily
+with its label; then prepare again. Kept services are left out of both `stop` and `up`; the call wait
+still runs before any stop. After the last project the tool checks that each kept service still runs the
+same container with the same settings, like a recreated one. Rollback stops and restores only the services
+the release recreated; what it kept keeps running, and image retention keeps its image (`kept_images` in
+the rollback receipt). `status` expects a kept service on the revision its digest names. Unpinned
+packages a Dockerfile installs (apt) arrive only with a service's next recreate.
+
+Receipt fields: `prepared.json` projects carry `inputs` (`{service: {digest, parts}}`), `kept`
+(`{service: {container, image, revision}}`) and `recreated` (`{service: [changed parts]}`, parts from
+`dockerfile recipe code migration compose env mounts secrets`, or `unlabeled`/`unreadable`). `result.json`
+adds `services` (`{project: {service: {"recreated": [...]} | {"kept": {container, revision}}}}`) and
+`boot_id` (the host's boot ID, so a reboot is told from a recreate); its rollback projects add `inputs`
+and `kept` (`{service: revision}`). Digests only, never a value.
 
 A plan A stop never cuts a call (ANYM-442): restarting the calls service ends
 every unfinished call as `interrupted`, and the Telegram collector carries
@@ -1648,7 +1691,8 @@ The messaging `db` service runs with statement statistics and a memory set insid
 `shared_preload_libraries=pg_stat_statements`, `pg_stat_statements.max=5000`, `track_io_timing=on`,
 `shared_buffers=128MB`, `work_mem=4MB`, `effective_cache_size=1536MB` (a planner estimate, no memory),
 `random_page_cost=1.1`, `shm_size: 256m`; `jit` stays on (the JIT-heavy statements set `jit=off` themselves).
-`deploy/compose.yaml` carries them for new installs. Each messaging process names its sessions after its service
+`deploy/compose.yaml` carries them for new installs; the production host runs a larger set ("Production memory split
+(2026-11-09)" below). Each messaging process names its sessions after its service
 (`application_name`: `api`, `http-api`, `collector-telegram`, `collector-whatsapp`, `matcher`, `delivery`,
 `enricher-<profiles>`, `indexer`, `file-lifecycle`, `cold-archive`, `message-purge`, `file-understanding`, `backup`;
 the event router keeps `module-router`). Statement totals come from `pg_stat_statements` by database, user and query
@@ -1741,6 +1785,40 @@ overlay (on 11-09: `/root/anym842-20261109T0422Z/db842.sh undo`); the hash equal
 remove the overlay file. The
 extension may stay (without the preload its view only refuses reads) or `DROP EXTENSION pg_stat_statements`. The
 data stays on the volume.
+
+### Production memory split (2026-11-09)
+
+The production host gives the database more memory than the 2 GiB default (owner 11-09, «свободный 4-7 гигабайта ...
+надо как-то распределить, чтобы мы не упирались точно нигде»). Before: the `db` cgroup sat at its 2 GiB limit
+(`memory.events` max 4,710, no OOM kill) with 264 MB anonymous, 160 MB shared and 1.78 GB page cache, and 741k
+file refaults: its own cache was being evicted. The host had 7,751 MB RAM, no swap, 5.1 GB available. Every other
+container used at most 90 MB anonymous memory and 36% of its limit, with no OOM kill; `file-lifecycle` and
+`cold-archive` touched their 256 MB limit with page cache only (33 MB anonymous) and keep it.
+
+The overlay `/opt/personal-os-probe/compose.db-settings.yaml` now sets `mem_limit: 4g`, `shm_size: 1g`,
+`shared_buffers=1GB`, `effective_cache_size=3GB`, `work_mem=8MB`, `maintenance_work_mem=256MB`,
+`autovacuum_work_mem=128MB` (3 workers × 128 MB, not 3 × 256 MB), and keeps the statement statistics,
+`random_page_cost=1.1` and `jit`. `deploy/compose.yaml` keeps the 2 GiB set for other installs. Budget inside 4 GiB with
+the method above: shared memory 1,068 + 40 sessions × 25 = 1,000 + 14 active × 2 × 2 × 8 MB = 448 + autovacuum 384 +
+parallel 8 × (10 + 2 × 2 × 8) = 336, so 3,236 MB (79%) when every part peaks together. Measured: about 1.85 GB idle
+plus the 600 MB synthetic burst, about 2.45 GB (60%). Host: other services use about 2.36 GB, about 3.2 GB with a
+call and a backup at once, so about 2.9 GB stays free in the expected case and 1.3 GB when everything peaks together.
+
+Applied 2026-11-09 06:56:19-06:56:28Z by the route above (healthy after 8 s, no active call, under the runner lock;
+autodeploy was already halted for the 072 hand release and is not this step's pause). Record, overlays and script are
+in `/root/prodmem-20261109` on the host: hashes `e26841ea…` (before) and `f7a4c4a1…` (after). The comparison named only
+`cmd`, `mem_limit` and `shm_size`, the networks equal the record, and no client container restarted. Client errors
+appear only between 06:56:21 and 06:56:27Z; collector leases, heartbeats, ingest, `subscription_outbox` and the
+listeners resumed. One hour later (07:57Z): no OOM kill (`memory.events` all 0, no `docker events` oom, no kernel
+line), cgroup peak 3.5 GB (shared 1.14 GB, anonymous 196 MB, the rest page cache), host 3.96 GB available. The hit
+ratio over the hour was 99.73% (257.3M hits, 0.71M reads). From 04:35 to 06:56Z it was 94.5% (823.9M hits, 48.0M reads),
+so block reads per minute fell about 29×. Temp use was 2 files and 3 MB in the hour, against 6 files and 85 MB in the
+2 h 21 min before. All 25 `subscription_outbox` rows created after the restart were finished, and 213 messages
+were ingested.
+
+Undo, under the runner lock: `flock --nonblock /opt/personal-os-probe/backups/.runner.lock
+/root/prodmem-20261109/dbmem.sh undo` puts the previous overlay back (`compose.db-settings.before.yaml`, the
+ANYM-842 set) and recreates `db`, so the hash is again `e26841ea…`. Then run step 4 again.
 
 ## Host firewall persistence (ANYM-693)
 
@@ -2865,7 +2943,7 @@ sudo touch /etc/deedkit/autodeploy.pause     # stop deploying; remove the file t
 `deploy` runs as root and holds the global, plan A and HTTP host locks for the
 whole run. It exits quietly (`paused`, `busy`, `current`, `waiting`, exit 0)
 when the pause file exists, another operation holds a lock, `git ls-remote`
-shows no new `main` commit, no newer commit has attested images yet, or, with `--auto` (the timer), the last deploy started less than 20 minutes ago.
+shows no new `main` commit, no newer commit has attested images yet, or, with `--auto` (the timer), the last deploy started less than 5 minutes ago or a git or GHCR read failed less than 4 minutes ago.
 Otherwise it:
 
 1. reads the current plan A release (`current.json`, status `applied`) and the
@@ -2944,7 +3022,10 @@ the count. A failed `git ls-remote` or mirror fetch (any cause, the
 mirror check included) changes nothing: the run prints `fetch_failed` with
 git's last error line, exits 1 and counts it in `deploy.json`
 (`fetch_failures`); a successful fetch resets the count, and the third failure
-in a row (about 15 minutes on the timer) pauses. When apply waited out an
+in a row pauses. An `--auto` run retries a failed git or GHCR read only 4
+minutes (`RETRY_SPACING`) after the last counted failure and ends `waiting`
+before that, so on the one-minute timer the pause still comes after about 10
+minutes of failures; a manual run always reads and counts. When apply waited out an
 active call, or could not read whether one is active, before any change
 ("Apply and verify"), the run ends `waiting` with that reason and keeps the
 prepared release: the next run applies it while that commit is still the
@@ -3066,7 +3147,7 @@ pauses as above without installing. `--dry-run` reports `would update tool
    through `/usr/local/lib/deedkit/production.py`. A pass records `active`; a
    failure switches `current` back to `from`, records `reverted` and pauses.
 4. End the run `tool-updated` (exit 0; `deploy.json` keeps `sha`, `base` and
-   adds `tool_update`, no `started_at`), so the next timer run, about 5 minutes
+   adds `tool_update`, no `started_at`), so the next timer run, about a minute
    later, deploys with the new tool. The replaced release and the one it
    replaced stay, as `tool-update.json` records them (an `active` record, never
    an install time: a reverted or abandoned candidate counts as none); other
@@ -3121,10 +3202,13 @@ Its undo: remove the three links and move the two `.before-<sha>` files back.
 [`deploy/deedkit-autodeploy.service`](../../deploy/deedkit-autodeploy.service)
 runs `deploy --auto` and
 [`deploy/deedkit-autodeploy.timer`](../../deploy/deedkit-autodeploy.timer)
-starts it about 5 minutes after the previous run ended (plus up to 30 seconds
-of jitter and systemd's default one-minute accuracy) and 10 minutes after boot;
-enabled later than that, the first run starts at once. `--auto` keeps at least
-20 minutes between two deploy starts. The unit reads
+starts it about a minute after the previous run ended (plus up to 10 seconds
+of jitter and a 5-second accuracy) and 10 minutes after boot; enabled later
+than that, the first run starts at once. A run with nothing new reads only
+`git ls-remote`. `--auto` keeps at least 5 minutes, about one deploy's
+duration, between two deploy starts; deploys never overlap anyway (the host
+locks and the oneshot unit). The 20 minutes it kept before guarded the GitHub
+API quota, which promotion no longer reads (ANYM-406; ci-deploy-speed 11-09). The unit reads
 `/etc/deedkit/production.json` and `/etc/deedkit/http-production.json` unless
 the optional `/etc/deedkit/autodeploy.env` (root-owned, mode `0600`) sets
 `DEEDKIT_DEPLOY_CONFIG`.

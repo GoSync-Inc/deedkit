@@ -1114,6 +1114,28 @@ guard: the chat's own sends are outgoing and never satisfy `incoming_message` or
 the reply wake rules, so subscribe the chat with `wake_rules` (for example
 `["incoming_message"]`).
 
+**Registry mode (ANYM-849).** The configuration lists one key file per agent
+principal (`keys`, set up once, not per chat) instead of `key_file` and `watches`; a
+file with both refuses to start (`watches_with_keys`). An agent registers its own chat
+with `register_wake_target` ([Wake targets](#wake-targets-pull-waker-rules-schema-73)),
+passing its `CODEX_THREAD_ID`. At the next poll the waker queues one fixed challenge
+to that thread naming the target ID and a one-use code; the chat answers it with
+`confirm_wake_target`, and only then do the target's bound subscriptions wake that
+thread, by the rules above. The waker keeps the code's SHA-256 only and sends one
+challenge per target and thread, inside the thread's hourly budget; a thread change
+starts a new one. Each poll reads every key's targets with `list_wake_targets`;
+server fields are untrusted, so an invalid target is dropped (`invalid_wake_target`)
+and only validated values reach the fixed argv. A paused, disabled, deleted or
+unbound target, or a moved thread, turns its held wakes into `dropped_config`
+(`rule_removed`); `delivery_disabled` stops a key's wakes until the switch lifts. The
+delivery switch, the owner's `deedkit admin wake-targets disable|enable` and a
+restore's quarantine act only in registry mode. `allowed_threads` per key (optional,
+unset by default) locks that key to the listed threads; its refusals show in
+`watch-status` as `thread_not_allowed`. A key whose session or registry read fails is
+skipped for that poll with a fixed code and keeps its held wakes; the other keys run.
+The challenge text and the target ID reach the model provider in the chat's turn, like
+the wake text. Setup: [the package README](packages/wake-relay/README.md#registry-mode-each-chat-sets-up-its-own-wake-anym-849).
+
 ## Event retention
 
 Status: acknowledged-event retention is implemented since **schema 40** (ANYM-446, the
@@ -1761,6 +1783,40 @@ included, and its automatic recognition (transcripts, OCR, descriptions) while t
 does not flip the chat. A paused subscription does not count. A dynamic subscription
 (`sources={all_visible_chats: true}`) names no chat and turns on nothing: to watch a group's files,
 name the group.
+
+## Each file's state in the stream (ANYM-866)
+
+Items of kind `message.created`, `message.edited` and `attachment.ready` carry `attachments`, in full and
+compact pages. Each entry is `{attachment_id, mime, bytes, media_state, next_action, processing}`, plus `reason`
+when the file is `blocked`. `attachment.ready` lists its own file. A message event lists the files of its own revision.
+The state is read when the page is read, not when the event was written. One function computes it for the event and
+for the message read (`media` on each file of `get_context`, compact and full; FILE_INDEX.md), so
+the two agree for the same file at the same moment. No file name, provider ID or path is included.
+
+| `media_state` | `next_action` | Example |
+|---|---|---|
+| `queued` | null | a private chat's voice note while the collector downloads it |
+| `available_on_request` | `request_file_download` | a voice note in a group no subscription names (ANYM-805), or a stored original evicted from disk (the request restores it) |
+| `ready` | `get_attachment` | the same note after `attachment.ready` |
+| `failed` | null | a download whose retries ran out and no stored original: a request does not revive a failed job |
+| `superseded` | null | the photo an edit replaced: the `message.edited` item carries the new file's state |
+| `blocked` | null | a file of an excluded chat: `reason` is `collection_excluded`, `size_limit` or `policy` (storage paused or reserve) |
+
+`processing` is `{text, transcript, description}`. Each value is `queued`, `available_on_request`, `ready`, `failed`,
+`unsupported` or `not_applicable`. `transcript` applies to audio only and `description` to images and
+documents. A model stage is `not_applicable` when the account has no enabled processing profile for that kind,
+before and after the download; a finished result (`ready`, `failed`, `unsupported`) stays. A stored original is
+`ready` (or `available_on_request` when evicted) whatever its provider job says. Stages of
+a file waiting for a request read `available_on_request`, and stages of a failed download read `failed`.
+Stages of a superseded or blocked file read `not_applicable`. For example, a voice note in a chat with no audio
+profile has `transcript: not_applicable`, and a photo always has `transcript: not_applicable`.
+
+A file whose state cannot be computed (a missing or unreadable job row) has `media_state`, `next_action` and
+`processing` null and a `media_error` code. The rest of the page is unaffected. The service counts each code and
+logs one `attachment_media_state_unavailable` line with it. The lookup runs under its own 500 ms lock and statement timeouts: if
+it fails (a held lock, a slow plan), the page and its receipt come back without `attachments` and the code is
+`lookup_failed`. A page reads at most 200 files; items past that carry no `attachments` (`page_file_limit`). A deleted message's wait ends with its `message.deleted` event
+([Deleted messages](#deleted-messages-schema-45)).
 
 ## Remaining extensions and verification boundaries
 

@@ -79,7 +79,7 @@ V69_TABLES={'media_recovery':'job'}
 V70_TABLES={'subscription_activity':'subscription,day,platform,scope_version,metric'}
 # ANYM-848: an agent's own wake targets and their bindings (thread IDs, labels, states; no secret).
 V73_TABLES={'wake_targets':'id','wake_target_subscriptions':'wake_target,subscription'}
-SCHEMAS=range(2,75)
+SCHEMAS=range(2,76)
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
 V17_TABLES={'message_conflicts':'receipt_digest'}

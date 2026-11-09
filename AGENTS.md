@@ -1,6 +1,6 @@
 # DeedKit agent rules
 
-Process: harness egerev/agent-harness @ 0.79.0, ~/agent-harness; this file adds project rules.
+Process: harness egerev/agent-harness @ 0.80.0, ~/agent-harness; this file adds project rules.
 Claude Code loads harness process.md through the SessionStart hook (`.claude/hooks/harness.sh`:
 merged `origin/main`, else the pinned copy). Codex and cloud agents read the pinned copy
 docs/harness/process.md first. If no harness text is in context, stop and report BLOCKED. Each
@@ -78,6 +78,9 @@ live action from it wait for the owner, and so does that document's boundary.
 ## 3. Change paths
 
 The signal grep is in docs/operations/review-protocol.md.
+
+Small fixes (owner 11-09, D55: «такую карточку не нужно ревьють, это одна строка»): harness reviews.md
+Routing "Small fix: no review"; PR lines `Review record: none (small fix)` and `Diff read: <orch> <head SHA>`.
 
 ## 4. Product context and Tiden
 

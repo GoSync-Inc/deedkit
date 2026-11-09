@@ -32,10 +32,32 @@ ACKs cannot downgrade stronger evidence. Group aggregates never assert that a
 named participant or every group member read a message. LID and phone identities
 remain distinct unless the existing identity subsystem has verified their link.
 
-Telegram captures only verified private `UpdateReadHistoryOutbox` boundaries.
-The [provider update](https://core.telegram.org/constructor/updateReadHistoryOutbox)
-contains a maximum outgoing message ID, with no exact read or device-delivery
-time. Groups, channels, inbox read updates and Saved Messages are excluded.
+Telegram captures verified outbox boundaries. A private peer's
+[`UpdateReadHistoryOutbox`](https://core.telegram.org/constructor/updateReadHistoryOutbox)
+gives `audience: private_peer`. A group's boundary (ANYM-868), the same update
+with a basic group peer or
+[`updateReadChannelOutbox`](https://core.telegram.org/constructor/updateReadChannelOutbox)
+for a supergroup, gives `audience: provider_aggregate` on the stored marked
+chat ID. It means that at least one member of the group read the owner's
+messages up to that ID, never who read them or that every member did. Each
+update contains a maximum outgoing message ID, with no exact read or
+device-delivery time. `message.status` publishes the group read as it does a
+private one. A group boundary is recorded only for a chat stored as a group.
+A boundary for a broadcast channel (`chat_type: channel`; one reader among its
+subscribers tells the owner nothing) is skipped with the reason code
+`receipt_broadcast_channel`. A boundary that arrives before its chat is
+discovered or typed stays outside the archive, in the collector's
+`deferred-receipts` spool beside the live spool. The drain tries it again at
+most every 10 seconds: it is recorded and its `message.status` is published once
+the chat is stored as a group, dropped if the chat is a channel, and dropped
+after 7 days otherwise. The spool holds at most 500 boundaries, one retry pass,
+so each pass tries every one; a boundary that finds it full is dropped and
+counted as `receipt_deferred_full`, and collection goes on. An outbox
+update with an unknown peer type is skipped and counted as
+`receipt_peer_unsupported` in `live_capture.rejected_live_captures`. Inbox read
+updates and Saved Messages are excluded. `messenger_reports` below keeps its
+ANYM-659 table, so a Telegram group still shows `[]` there even when a group
+read has arrived.
 WhatsApp listens to the existing client's
 [`message_ack`](https://docs.wwebjs.dev/Client.html#event:message_ack) events;
 it does not poll message info or open a second browser.
