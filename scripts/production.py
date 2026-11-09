@@ -1024,17 +1024,22 @@ def dockerfile_lines(text):
 
 
 def copy_sources(arguments):
-    """The flags and source paths of a COPY or ADD instruction (its last argument is the destination)."""
-    if arguments.startswith("["):
+    """The flags and source paths of a COPY or ADD instruction (its last argument is the destination). Options come
+    first, also before the JSON form."""
+    flags, rest = [], arguments.strip()
+    while rest.startswith("--"):
+        flag, _, rest = rest.partition(" ")
+        flags.append(flag)
+        rest = rest.strip()
+    if rest.startswith("["):
         try:
-            words = json.loads(arguments)
+            words = json.loads(rest)
         except ValueError as exc:
             raise Unreadable("a COPY in JSON form does not parse") from exc
-        flags = []
     else:
-        words = arguments.split()
-        flags = [word for word in words if word.startswith("--")]
-        words = [word for word in words if not word.startswith("--")]
+        words = rest.split()
+        if any(word.startswith("--") for word in words) or any(char in rest for char in "\"'"):
+            raise Unreadable("a COPY with an option after a source or a quoted source")
     if len(words) < 2 or not all(isinstance(word, str) for word in words):
         raise Unreadable("a COPY without a source and a destination")
     return flags, words[:-1]
@@ -1047,18 +1052,22 @@ def dockerfile_stages(text):
     for line in dockerfile_lines(text):
         instruction, _, arguments = line.partition(" ")
         instruction = instruction.upper()
+        if instruction in ("RUN", "COPY", "ADD") and re.search(r"<<-?\s*['\"]?[A-Za-z_]", arguments):
+            raise Unreadable(f"a {instruction} heredoc")
         if instruction == "FROM":
             words = [word for word in arguments.split() if not word.startswith("--")]
-            if not words:
-                raise Unreadable("a FROM without an image")
-            name = words[2] if len(words) == 3 and words[1].upper() == "AS" else str(len(stages))
+            if not words or len(words) not in (1, 3) or len(words) == 3 and words[1].upper() != "AS":
+                raise Unreadable("a FROM the digest cannot read")
+            # Stage names are case-insensitive; an unnamed stage is known by its index only.
+            name = words[2].lower() if len(words) == 3 else str(len(stages))
             known = {stage["name"] for stage in stages}
-            stages.append({"name": name, "base": words[0] if words[0] in known else None, "from": [], "copies": []})
+            stages.append({"name": name, "base": words[0].lower() if words[0].lower() in known else None, "from": [],
+                           "copies": []})
         elif instruction in ("COPY", "ADD"):
             if not stages:
                 raise Unreadable(f"{instruction} before FROM")
             flags, sources = copy_sources(arguments)
-            origin = [flag.partition("=")[2] for flag in flags if flag.startswith("--from=")]
+            origin = [flag.partition("=")[2].lower() for flag in flags if flag.startswith("--from=")]
             if origin:
                 stages[-1]["from"].append(origin[0])
             elif instruction == "ADD" and any(re.match(r"[a-z]+://", source) or re.search(r"\.(tar|gz|tgz|bz2|xz|zst)$", source)
@@ -1068,9 +1077,12 @@ def dockerfile_stages(text):
                 stages[-1]["copies"].extend(sources)
         elif instruction == "ONBUILD":
             raise Unreadable("ONBUILD")
-        elif instruction == "RUN" and re.search(r"--mount=\S*type=bind", arguments) and not re.search(
-                r"--mount=\S*from=", arguments):
-            raise Unreadable("RUN --mount=type=bind reads the build context")
+        elif instruction == "RUN":
+            for option in re.findall(r"--mount=(\S+)", arguments):
+                values = dict(item.partition("=")[::2] for item in option.split(","))
+                # A mount without `type` is a bind mount of the build context unless it names `from`.
+                if values.get("type", "bind") == "bind" and "from" not in values:
+                    raise Unreadable("RUN --mount of the build context")
     if not stages:
         raise Unreadable("a Dockerfile without a stage")
     return stages
@@ -1080,8 +1092,8 @@ def stage_chain(stages, target):
     """The stages a target's image is built from: its stage, the stage it starts from and every COPY --from stage,
     transitively. `target` "" is the last stage. A COPY --from naming an image (not a stage) adds no context path; the
     image reference is part of the Dockerfile content, which the digest hashes whole."""
-    named = {stage["name"]: stage for stage in stages}
-    start = stages[-1] if not target else named.get(target)
+    named = {stage["name"]: stage for stage in stages} | {str(index): stage for index, stage in enumerate(stages)}
+    start = stages[-1] if not target else named.get(target.lower())
     if start is None:
         raise Unreadable(f"stage {target!r} is not in the Dockerfile")
     chain, pending = [], [start]
@@ -1108,10 +1120,11 @@ def context_paths(context, sources):
 
 
 def tree_entries(source):
-    """Every file of the checked-out commit as `mode id path` (git ls-tree), so a mode change is a change too."""
-    listing = run(["git", "-C", str(source), "ls-tree", "-r", "--full-tree", "HEAD"])
+    """Every file of the checked-out commit as `mode id path` (git ls-tree), so a mode change is a change too. `-z`:
+    paths are NUL-separated and never quoted."""
+    listing = run(["git", "-C", str(source), "ls-tree", "-r", "-z", "--full-tree", "HEAD"])
     entries = {}
-    for line in listing.splitlines():
+    for line in listing.split("\0"):
         meta, _, path = line.partition("\t")
         mode, _, rest = meta.partition(" ")
         kind, _, object_id = rest.partition(" ")
@@ -1127,9 +1140,14 @@ def selected_entries(entries, paths):
     named, so a COPY of a file the commit lacks still changes the digest when the file appears."""
     chosen = {}
     for path in paths:
-        found = {name: value for name, value in entries.items()
-                 if not path or name == path or name.startswith(path + "/")
-                 or (any(char in path for char in "*?[") and fnmatch.fnmatchcase(name, path))}
+        pattern = any(char in path for char in "*?[")
+        def under(name):
+            if not path or name == path or name.startswith(path + "/"):
+                return True
+            # A pattern selects each matching file or directory, and a directory brings everything below it.
+            parts = name.split("/")
+            return pattern and any(fnmatch.fnmatchcase("/".join(parts[:end]), path) for end in range(1, len(parts) + 1))
+        found = {name: value for name, value in entries.items() if under(name)}
         chosen.update(found or {path: "missing"})
     return chosen
 
@@ -1142,13 +1160,16 @@ def build_inputs(source, target, entries):
         text = (Path(source) / dockerfile).read_text()
     except OSError as exc:
         raise Unreadable(f"{dockerfile} is not in the release checkout") from exc
-    ignore = Path(source) / context / ".dockerignore"
-    try:
-        ignored = hashlib.sha256(ignore.read_bytes()).hexdigest()
-    except FileNotFoundError:
-        ignored = None
-    except OSError as exc:
-        raise Unreadable(f"{ignore} cannot be read") from exc
+    # Both ignore files and their presence: `<Dockerfile>.dockerignore` next to the Dockerfile takes precedence over
+    # the context's `.dockerignore` (BuildKit).
+    ignored = {}
+    for ignore in (Path(source) / context / ".dockerignore", Path(source) / (dockerfile + ".dockerignore")):
+        try:
+            ignored[str(ignore.relative_to(source))] = hashlib.sha256(ignore.read_bytes()).hexdigest()
+        except FileNotFoundError:
+            ignored[str(ignore.relative_to(source))] = None
+        except OSError as exc:
+            raise Unreadable(f"{ignore} cannot be read") from exc
     copied = [path for item in stage_chain(dockerfile_stages(text), stage) for path in item["copies"]]
     arguments, _ = build_recipe(target, "0" * 40)
     arguments = {key: value for key, value in arguments.items() if key not in REVISION_ARGUMENTS}
@@ -1161,8 +1182,42 @@ def build_inputs(source, target, entries):
             "code": digest(code), "migration": digest(migrations) if copies_package else None}
 
 
-def input_file_digest(path):
-    """The sha256 of a regular host file the service reads; a directory (data, sessions, spools) counts by path only."""
+# A read-only directory mount is configuration (gateway policy and keys, recordings configuration): hashed by content
+# within these bounds, else the service is recreated.
+INPUT_DIRECTORY_FILES = 2000
+INPUT_DIRECTORY_BYTES = 64 << 20
+
+
+def input_directory_digest(path):
+    """The digest of a configuration directory: every entry's relative path, mode and content (a symlink by its
+    target, never followed). Raises Unreadable beyond the bounds or on anything unreadable."""
+    listing, total = {}, 0
+    def refuse(exc):
+        raise exc
+    try:
+        for root, directories, files in os.walk(path, onerror=refuse):
+            directories.sort()
+            for name in sorted(files) + [item for item in directories if os.path.islink(os.path.join(root, item))]:
+                full = os.path.join(root, name)
+                found = os.lstat(full)
+                relative = os.path.relpath(full, path)
+                if stat.S_ISLNK(found.st_mode):
+                    listing[relative] = "link " + os.readlink(full)
+                elif stat.S_ISREG(found.st_mode):
+                    total += found.st_size
+                    if len(listing) >= INPUT_DIRECTORY_FILES or total > INPUT_DIRECTORY_BYTES:
+                        raise Unreadable(f"{path} is too large to hash as configuration")
+                    listing[relative] = f"{found.st_mode:o} " + hashlib.sha256(Path(full).read_bytes()).hexdigest()
+                else:
+                    raise Unreadable(f"{full} is neither a file nor a link")
+    except OSError as exc:
+        raise Unreadable(f"{path} cannot be read") from exc
+    return "directory " + digest(listing)
+
+
+def input_file_digest(path, *, configuration=False):
+    """The sha256 of a regular host file the service reads. A directory counts by path only (data, sessions, spools),
+    unless it is `configuration` (mounted read-only): then by content."""
     try:
         found = os.stat(path)
     except FileNotFoundError:
@@ -1170,7 +1225,7 @@ def input_file_digest(path):
     except OSError as exc:
         raise Unreadable(f"{path} cannot be read") from exc
     if stat.S_ISDIR(found.st_mode):
-        return "directory"
+        return input_directory_digest(path) if configuration else "directory"
     if not stat.S_ISREG(found.st_mode):
         raise Unreadable(f"{path} is neither a file nor a directory")
     try:
@@ -1188,15 +1243,14 @@ def host_inputs(document, service):
         env[path] = input_file_digest(path.replace("$$", "$"))
     for volume in unit.get("volumes") or []:
         if isinstance(volume, dict) and volume.get("type") == "bind" and isinstance(volume.get("source"), str):
-            mounts[volume["source"]] = input_file_digest(volume["source"])
+            mounts[volume["source"]] = input_file_digest(volume["source"], configuration=bool(volume.get("read_only")))
     for kind in ("secrets", "configs"):
         for entry in unit.get(kind) or []:
             name = entry.get("source") if isinstance(entry, dict) else entry
             top = (document.get(kind) or {}).get(name) or {}
-            if isinstance(top.get("file"), str):
-                secrets[kind + ":" + name] = input_file_digest(top["file"])
-            elif top:
-                secrets[kind + ":" + name] = digest(top)
+            # The definition (which file, which variable) and the content: a switch to an equal file is a change too.
+            secrets[kind + ":" + str(name)] = digest({"definition": top, "entry": entry, "content": input_file_digest(top["file"])
+                                                 if isinstance(top.get("file"), str) else None})
     return {"env": digest(env), "mounts": digest(mounts), "secrets": digest(secrets)}
 
 
@@ -1803,6 +1857,27 @@ def service_outcomes(receipt):
             for item in receipt["projects"] if "inputs" in item}
 
 
+def check_inputs(project, item, document):
+    """Refuse with `inputs_changed_since_prepare` when a host file a service reads hashes otherwise than at prepare."""
+    for service, wanted in (item.get("inputs") or {}).items():
+        if wanted["digest"] is None:
+            continue
+        try:
+            host = host_inputs(document, service)
+        except Unreadable:
+            host = None
+        if host != {part: wanted["parts"][part] for part in HOST_PARTS}:
+            raise Refused(f"inputs_changed_since_prepare: a host file {project['name']}/{service} reads changed "
+                          "since preparation; prepare again")
+
+
+def steady(actual):
+    """Whether a container runs steadily: running, neither restarting nor paused, and healthy if it has a healthcheck."""
+    condition = actual.get("State") or {}
+    return bool(condition.get("Running") and not condition.get("Restarting") and not condition.get("Paused")
+                and ("Health" not in condition or (condition["Health"] or {}).get("Status") == "healthy"))
+
+
 def apply(settings, sha, *, backup_waited=0):
     promotable(sha)
     state = Path(settings["state_directory"])
@@ -1812,6 +1887,7 @@ def apply(settings, sha, *, backup_waited=0):
         raise Refused("prepared release does not match the selected production configuration")
     if (release / "attempted.json").exists():
         raise Refused("this release was already attempted; inspect its result before any recovery")
+    documents = {}
     for target, image in receipt["images"].items():
         actual = json.loads(run(["docker", "image", "inspect", image]))[0]
         if (actual["Id"] != image or actual["Config"].get("Labels", {}).get("org.opencontainers.image.revision") != sha):
@@ -1824,17 +1900,9 @@ def apply(settings, sha, *, backup_waited=0):
         if (item["name"] != project["name"] or digest(document) != item["before_digest"]
                 or running != item["running"] or digest(read(item["file"])) != item["digest"]):
             raise Refused("production or prepared configuration changed since preparation")
-        # ANYM-895: the host files a service reads are hashed again right before the stop.
-        for service, wanted in (item.get("inputs") or {}).items():
-            if wanted["digest"] is None:
-                continue
-            try:
-                host = host_inputs(document, service)
-            except Unreadable:
-                host = None
-            if host != {part: wanted["parts"][part] for part in HOST_PARTS}:
-                raise Refused(f"inputs_changed_since_prepare: a host file {project['name']}/{service} reads changed "
-                              "since preparation; prepare again")
+        # ANYM-895: the host files a service reads are hashed again here, after the call waits and before each stop.
+        check_inputs(project, item, document)
+        documents[project["name"]] = document
         for service in item.get("kept") or {}:
             if labels.get(service) != item["inputs"][service]["digest"]:
                 raise Refused(f"inputs_changed_since_prepare: kept {project['name']}/{service} is no longer running "
@@ -1854,6 +1922,8 @@ def apply(settings, sha, *, backup_waited=0):
     # Last remote gate immediately before the first mutation, under the host lock.
     evidence = promotable(sha)
     wait_for_calls(settings, deadline)
+    for project, item in zip(settings["projects"], receipt["projects"], strict=True):
+        check_inputs(project, item, documents[project["name"]])
     write(release / "attempted.json", {"sha": sha, "ci": evidence, "status": "applying"})
     started, touched = {}, []
     for project, item in zip(settings["projects"], receipt["projects"], strict=True):
@@ -1862,22 +1932,31 @@ def apply(settings, sha, *, backup_waited=0):
         services = [service for service in project["services"] if service not in kept]
         for service in kept:  # ANYM-895: never stopped nor `up`; the checks below expect this very container
             started[project["name"], service] = item["running"][service]["container"], item["running"][service]["settings"]
-        if not services:
-            touched.append((project, item))
-            continue
-        if touched:
+        if touched and services:
             wait_for_calls(settings, time.monotonic() + CALL_WAIT)
-        # Stop the existing owners before replacements can connect to their sessions.
-        run(command + ["stop", *services])
+        if touched:  # the first project was checked right before attempted.json
+            check_inputs(project, item, documents[project["name"]])
         touched.append((project, item))
-        try:
-            run(command + ["up", "-d", "--no-build", "--pull", "never", "--no-deps",
-                           "--wait", "--wait-timeout", "180", *services])
-        except Refused as exc:
-            unhealthy(release, sha, receipt, evidence, touched, exc)
+        if services:
+            # Stop the existing owners before replacements can connect to their sessions.
+            run(command + ["stop", *services])
+            try:
+                run(command + ["up", "-d", "--no-build", "--pull", "never", "--no-deps",
+                               "--wait", "--wait-timeout", "180", *services])
+            except Refused as exc:
+                unhealthy(release, sha, receipt, evidence, touched, exc)
         unproven = []
         for service, target in project["services"].items():
             if service in kept:
+                # A kept service skips `up --wait`: it must run steadily (healthy, when it has a healthcheck) and, without
+                # one, not restart during the settle, like a replacement.
+                identity = item["running"][service]["container"]
+                actual = json.loads(run(["docker", "inspect", identity]))[0]
+                if not steady(actual):
+                    unhealthy(release, sha, receipt, evidence, touched,
+                              Refused(f"kept {project['name']}/{service} is not running steadily"))
+                if "Health" not in actual["State"]:
+                    unproven.append((service, identity, actual))
                 continue
             ids = run(command + ["ps", "-q", service]).split()
             if len(ids) != 1:
@@ -1895,6 +1974,10 @@ def apply(settings, sha, *, backup_waited=0):
     restore = []
     for project, item in zip(settings["projects"], receipt["projects"], strict=True):
         document, running = snapshot(project)
+        try:
+            check_inputs(project, item, document)
+        except Refused as exc:
+            raise Refused("production changed while this release was applied; inspect it before any recovery") from exc
         if digest(document) != item["before_digest"] or any(
                 running[service]["image"] != expected_image(receipt, item, service, target)
                 or not started[project["name"], service][0].startswith(running[service]["container"])
@@ -2413,6 +2496,14 @@ def rollback_restore(settings, release, sha, serving, plan):
             actual = json.loads(run(["docker", "inspect", ids[0]]))[0]
             if actual["Image"] != image or not actual["State"]["Running"]:
                 raise Refused("restored service does not run its previous image")
+    # ANYM-895: what the release kept was never touched; it must still run steadily on its own image.
+    for project, before, previous in plan:
+        command = ["docker", "compose", "--profile", "*", "--project-name", project["name"], "-f", str(before)]
+        for service in (service for service in project["services"] if service not in previous):
+            ids = run(command + ["ps", "-q", service]).split()
+            actual = json.loads(run(["docker", "inspect", ids[0]]))[0] if len(ids) == 1 else {}
+            if actual.get("Image") != read(before)["services"][service]["image"] or not steady(actual):
+                raise Refused(f"{project['name']}/{service}, which the release kept, is not running steadily; inspect it")
 
 
 def rollback(settings, sha, http=None):

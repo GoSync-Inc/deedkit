@@ -1509,9 +1509,9 @@ class KeepHost(Host):
                 (Path(argv[2]) / path).parent.mkdir(parents=True, exist_ok=True)
                 (Path(argv[2]) / path).write_text(content)
             return ""
-        if argv[0] == "git" and argv[3:] == ["ls-tree", "-r", "--full-tree", "HEAD"]:
+        if argv[0] == "git" and argv[3:] == ["ls-tree", "-r", "-z", "--full-tree", "HEAD"]:
             self.calls.append(argv)
-            return "".join(f"{mode} blob {hashlib.sha1(content.encode()).hexdigest()}\t{path}\n"
+            return "".join(f"{mode} blob {hashlib.sha1(content.encode()).hexdigest()}\t{path}\0"
                            for path, (mode, content) in sorted(self.files.items()))
         if argv[:2] == ["docker", "compose"] and any(word in argv for word in ("stop", "up", "ps")):
             self.calls.append(argv)
@@ -1632,15 +1632,21 @@ def test_a_container_with_any_doubt_about_its_inputs_is_recreated(tmp_path, monk
 
 # spec: ANYM-895
 @pytest.mark.parametrize("change", ["copied file", "file mode", "run line", "dockerignore", "base pin", "build argument",
-                                    "env file", "mounted file", "secret file", "definition"])
+                                    "env file", "mounted file", "secret file", "definition", "dockerfile ignore",
+                                    "configuration directory", "secret source"])
 def test_the_input_digest_changes_with_each_input_and_not_with_docs_or_another_target(tmp_path, monkeypatch, change):
     files = keep_files()
-    env, mounted, secret = tmp_path / "api.env", tmp_path / "mounted.conf", tmp_path / "secret.txt"
-    for path in (env, mounted, secret):
+    env, mounted, secret, twin = (tmp_path / name for name in ("api.env", "mounted.conf", "secret.txt", "twin.txt"))
+    configuration, data = tmp_path / "configuration", tmp_path / "data"
+    for directory in (configuration, data):
+        directory.mkdir()
+    for path in (env, mounted, secret, twin, configuration / "config.json"):
         path.write_text("synthetic\n")
     document = {"services": {"telegram": {"environment": {"SYNTHETIC": "1"}, "env_file": [str(env)],
                                           "volumes": [{"type": "bind", "source": str(mounted), "target": "/etc/x.conf"},
-                                                      {"type": "bind", "source": str(tmp_path), "target": "/data"}],
+                                                      {"type": "bind", "source": str(data), "target": "/data"},
+                                                      {"type": "bind", "source": str(configuration),
+                                                       "target": "/run/deedkit/configuration", "read_only": True}],
                                           "secrets": [{"source": "token"}]}},
                 "secrets": {"token": {"file": str(secret)}}}
 
@@ -1658,7 +1664,7 @@ def test_the_input_digest_changes_with_each_input_and_not_with_docs_or_another_t
     files["docs/synthetic.md"] = ("100644", "changed\n")
     files["services/gateway/src/agent_gateway/app.py"] = ("100644", "GATEWAY = 9\n")
     files["whatsapp/whatsmeow/main.go"] = ("100644", "package changed\n")
-    (tmp_path / "data.bin").write_text("a mounted directory's content is data, not an input\n")
+    (data / "data.bin").write_text("a writable mounted directory's content is data, not an input\n")
     assert inputs() == original
     dockerfile = files["services/messaging/Dockerfile"][1]
     if change == "copied file":
@@ -1680,26 +1686,54 @@ def test_the_input_digest_changes_with_each_input_and_not_with_docs_or_another_t
         mounted.write_text("synthetic2\n")
     elif change == "secret file":
         secret.write_text("synthetic2\n")
+    elif change == "dockerfile ignore":  # takes precedence over the context's .dockerignore
+        files["services/messaging/Dockerfile.dockerignore"] = ("100644", "**/migrations\n")
+    elif change == "configuration directory":
+        (configuration / "config.json").write_text("synthetic2\n")
+    elif change == "secret source":  # another file with the same bytes
+        document["secrets"]["token"]["file"] = str(twin)
     else:
         document["services"]["telegram"]["environment"]["SYNTHETIC"] = "2"
     changed = inputs()
     assert changed["digest"] != original["digest"]
     part = {"copied file": "code", "file mode": "code", "run line": "dockerfile", "dockerignore": "dockerfile",
             "base pin": "dockerfile", "build argument": "recipe", "env file": "env", "mounted file": "mounts",
-            "secret file": "secrets", "definition": "compose"}[change]
+            "secret file": "secrets", "definition": "compose", "dockerfile ignore": "dockerfile",
+            "configuration directory": "mounts", "secret source": "secrets"}[change]
     assert [name for name in p.INPUT_PARTS if changed["parts"][name] != original["parts"][name]] == [part]
 
 
-def dockerfile_copy_sources(text, chain):
-    """An independent reading of what a stage chain copies from the context: the source words of every COPY or ADD
-    without --from in each stage of `chain`, found by splitting the file at its FROM lines."""
-    sources, stage = set(), None
-    for line in p.dockerfile_lines(text):
+def dockerfile_copy_sources(text, target):
+    """An independent reading of what a target copies from the build context, sharing no code with production.py:
+    stages split at FROM lines, the closure over FROM <stage> and COPY --from=<name or index>, and the source words
+    of every COPY or ADD without --from in it."""
+    joined = re.sub(r"\\\n", " ", "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#")))
+    stages = []
+    for line in joined.splitlines():
         words = line.split()
+        if not words:
+            continue
         if words[0].upper() == "FROM":
-            stage = words[-1] if len(words) >= 4 and words[-2].upper() == "AS" else None
-        elif words[0].upper() in ("COPY", "ADD") and stage in chain and not any(word.startswith("--from=") for word in words):
-            sources.update(word for word in words[1:-1] if not word.startswith("--"))
+            words = [word for word in words[1:] if not word.startswith("--platform")]
+            stages.append({"name": words[2].lower() if len(words) == 3 else None, "base": words[0].lower(),
+                           "needs": [], "sources": set()})
+        elif words[0].upper() in ("COPY", "ADD") and stages:
+            origin = [word.split("=", 1)[1].lower() for word in words if word.startswith("--from=")]
+            if origin:
+                stages[-1]["needs"].append(origin[0])
+            else:
+                stages[-1]["sources"].update(word for word in words[1:-1] if not word.startswith("--"))
+    def find(name):
+        return next((stage for index, stage in enumerate(stages) if name in (stage["name"], str(index))), None)
+    pending, seen, sources = [find(target) if target else stages[-1]], [], set()
+    while pending:
+        stage = pending.pop()
+        if stage is None or any(stage is item for item in seen):
+            continue
+        seen.append(stage)
+        sources |= stage["sources"]
+        pending += [find(stage["base"]) if stage["base"] in {item["name"] for item in stages} else None]
+        pending += [find(name) for name in stage["needs"]]
     return sources
 
 
@@ -1718,9 +1752,7 @@ def test_every_build_target_stage_chain_is_covered_by_the_input_digest():
             continue
         assert built["code"] and built["dockerfile"] and built["recipe"]
         copied = {path for item in chain for path in item["copies"]}
-        named = {item["name"] for item in chain if not item["name"].isdigit()}
-        if named == {item["name"] for item in chain}:  # every stage named: the independent reading applies
-            assert copied == dockerfile_copy_sources(text, named), target
+        assert copied == dockerfile_copy_sources(text, stage), target
         selected = p.selected_entries(entries, p.context_paths(context, sorted(copied)))
         # Every copied path is in the release commit, and the digest holds nothing no stage copies.
         assert "missing" not in selected.values(), (target, sorted(path for path, value in selected.items() if value == "missing"))
@@ -1737,10 +1769,42 @@ def test_every_build_target_stage_chain_is_covered_by_the_input_digest():
 
 # spec: ANYM-895
 @pytest.mark.parametrize("instruction", ["ONBUILD RUN true", "ADD https://example.invalid/x.tgz /x",
-                                         "RUN --mount=type=bind,source=.,target=/src true", "ADD vendor.tar.gz /x"])
+                                         "RUN --mount=type=bind,source=.,target=/src true", "ADD vendor.tar.gz /x",
+                                         "RUN --mount=source=.,target=/src true", "RUN <<EOF\ntrue\nEOF",
+                                         "COPY <<EOF /x\nCOPY a b\nEOF", 'COPY "src file.py" /app/',
+                                         "COPY src --chmod=644 /app/"])
 def test_a_dockerfile_instruction_the_digest_cannot_place_refuses_the_keep(instruction):
     with pytest.raises(p.Unreadable):
         p.dockerfile_stages("FROM python:3.13-slim AS one\n" + instruction + "\n")
+
+
+# spec: ANYM-895
+def test_the_stage_chain_reads_options_before_json_index_references_and_any_case():
+    text = ('FROM python:3.13-slim AS Build\nCOPY --chmod=644 ["src/file.py", "lib", "/app/"]\n'
+            "FROM python:3.13-slim\nCOPY tools /tools\n"
+            "FROM python:3.13-slim\nCOPY --from=0 /app /app\nCOPY --from=1 /tools /tools\nCOPY --from=BUILD /x /x\n")
+    chain = p.stage_chain(p.dockerfile_stages(text), "")
+    assert sorted(path for stage in chain for path in stage["copies"]) == ["lib", "src/file.py", "tools"]
+    assert sorted(dockerfile_copy_sources(text.replace('--chmod=644 ["src/file.py", "lib", "/app/"]', "src/file.py lib /app/"),
+                                          "")) == ["lib", "src/file.py", "tools"]
+
+
+# spec: ANYM-895
+def test_a_glob_selects_directories_with_their_descendants_and_git_paths_are_never_quoted(tmp_path):
+    entries = {"dir1/app.py": "100644 1", "dir2/deep/x.py": "100644 2", "dir3/y.py": "100644 3"}
+    assert sorted(p.selected_entries(entries, ["dir[12]"])) == ["dir1/app.py", "dir2/deep/x.py"]
+    repository = tmp_path / "repository"
+    (repository / "services" / "messaging").mkdir(parents=True)
+    (repository / "services" / "messaging" / "café \"tab\t.py").write_text("x = 1\n")
+    git = ["git", "-C", str(repository), "-c", "user.name=synthetic", "-c", "user.email=synthetic@example.invalid"]
+    for argv in (["init", "--quiet"], ["add", "."], ["commit", "--quiet", "-m", "synthetic"]):
+        subprocess.run(git + argv, check=True, capture_output=True)
+    first = p.tree_entries(repository)
+    assert list(first) == ["services/messaging/café \"tab\t.py"]
+    (repository / "services" / "messaging" / "café \"tab\t.py").write_text("x = 2\n")
+    subprocess.run(git + ["commit", "--quiet", "-am", "change"], check=True, capture_output=True)
+    second = p.tree_entries(repository)
+    assert p.digest(p.selected_entries(second, ["services/messaging"])) != p.digest(p.selected_entries(first, ["services/messaging"]))
 
 
 # spec: ANYM-895
@@ -1764,7 +1828,10 @@ def test_rollback_of_a_release_never_stops_or_recreates_a_service_it_kept(tmp_pa
 
 
 # spec: ANYM-895
-def test_a_kept_container_that_stopped_during_apply_leaves_the_release_unresolved(tmp_path, monkeypatch):
+@pytest.mark.parametrize("state", [{"Running": False, "Status": "exited"}, {"Running": True, "Restarting": True},
+                                   {"Running": True, "Health": {"Status": "unhealthy"}}],
+                         ids=["stopped", "restarting", "unhealthy"])
+def test_a_kept_container_that_fails_during_apply_fails_the_release(tmp_path, monkeypatch, state):
     host = KeepHost(tmp_path, monkeypatch)
     host.release(RELEASES[0])
     host.files["services/gateway/src/agent_gateway/app.py"] = ("100644", "GATEWAY = 2\n")
@@ -1772,18 +1839,33 @@ def test_a_kept_container_that_stopped_during_apply_leaves_the_release_unresolve
     p.prepare(host.settings, RELEASES[1])
     run = host.run
 
-    def dies(argv, **kwargs):
+    def fails(argv, **kwargs):
         if argv[:2] == ["docker", "compose"] and "up" in argv:
-            host.containers["telegram"]["State"] = {"Running": False}
+            host.containers["telegram"]["State"] = dict(state)
         return run(argv, **kwargs)
-    monkeypatch.setattr(p, "run", dies)
-    with pytest.raises(p.Refused):
+    monkeypatch.setattr(p, "run", fails)
+    with pytest.raises(p.Refused, match="health wait"):
         p.apply(host.settings, RELEASES[1])
     assert p.read(host.state / "current.json")["sha"] == RELEASES[0]
+    assert p.read(host.state / RELEASES[1] / "result.json")["status"] == "unhealthy"
 
 
 # spec: ANYM-895
-@pytest.mark.parametrize("path", ["mounted file", "kept restarting"])
+def test_a_kept_container_without_a_healthcheck_that_restarts_during_the_settle_fails_the_release(tmp_path, monkeypatch):
+    host = KeepHost(tmp_path, monkeypatch)
+    host.release(RELEASES[0])
+    host.files["services/gateway/src/agent_gateway/app.py"] = ("100644", "GATEWAY = 2\n")
+    host.main = RELEASES[1]
+    p.prepare(host.settings, RELEASES[1])
+    monkeypatch.setattr(p, "APPLY_SETTLE_SECONDS", 1)
+    monkeypatch.setattr(p.time, "sleep", lambda seconds: host.containers["whatsapp2"].update(RestartCount=1))
+    with pytest.raises(p.Refused, match="health wait"):
+        p.apply(host.settings, RELEASES[1])
+    assert p.read(host.state / RELEASES[1] / "result.json")["status"] == "unhealthy"
+
+
+# spec: ANYM-895
+@pytest.mark.parametrize("path", ["mounted file", "kept restarting", "during the call wait"])
 def test_apply_refuses_before_any_stop_when_an_input_changed_since_prepare(tmp_path, monkeypatch, path):
     host = KeepHost(tmp_path, monkeypatch)
     mounted = tmp_path / "telegram.conf"
@@ -1795,8 +1877,10 @@ def test_apply_refuses_before_any_stop_when_an_input_changed_since_prepare(tmp_p
     p.prepare(host.settings, RELEASES[1])
     if path == "mounted file":
         mounted.write_text("synthetic2\n")
-    else:
+    elif path == "kept restarting":
         host.containers["whatsapp1"]["State"] = {"Running": True, "Restarting": True}
+    else:
+        monkeypatch.setattr(p, "wait_for_calls", lambda settings, deadline: mounted.write_text("synthetic3\n"))
     host.order = []
     with pytest.raises(p.Refused, match="inputs_changed_since_prepare"):
         p.apply(host.settings, RELEASES[1])
