@@ -121,7 +121,7 @@ def _required_permissions(permission,operation,parameters=None):
     values={permission}
     if operation=='send_file':
         values.update(('read','upload') if isinstance(parameters,dict) and 'upload_id' in parameters else ('download',))
-    if operation=='forward_message':values.add('read')
+    if operation in ('forward_message','delete_member_messages'):values.add('read')  # ANYM-934: its preview shows the messages
     return sorted(values)
 
 
@@ -280,6 +280,7 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
                 raise APIError('forbidden',403)
             payload['provider_message_id']=message['provider_id'];refs.append(message_id)
         elif message_id or expected_revision:raise _empty(spec,chat_id,message_id,expected_revision)
+    if operation=='delete_member_messages':from . import member_messages;payload['targets']=member_messages.resolve(c,p,account,chat,parameters)
     if operation==HISTORY and account_row['platform']=='telegram':
         anchor=parameters.get('before_message') or parameters.get('around_message')
         if anchor is not None:
@@ -381,6 +382,7 @@ def preview(store,c,p,account,operation,chat_id='',message_id='',expected_revisi
         from . import button_press
         pressed=payload['parameters']
         shown['earlier_presses']=button_press.earlier_presses(c,account,message_id,pressed['row'],pressed['column'])
+    if operation=='delete_member_messages':from . import member_messages;shown['moderation']=member_messages.shown(c,p,account,_chat(c,p,account,chat_id),payload['targets'])
     return serial({**payload,**shown,'permission':spec['permission'],'mutation':spec['mutation'],
         'required_permissions':payload['authorization_binding']['required_permissions'],
         'preview_digest':_digest(p,payload),'owner_approval_verified_by_server':False,
@@ -415,7 +417,7 @@ VERIFY={'delete_message':{'operation':'get_message_info','requires':'read-live',
     'send_reaction':{'operation':'get_reactions','requires':'read-live',
         'decides':'a reaction with chosen:true was set by this account'},
     'edit_message':{'operation':'get_message_info','requires':'read-live',
-        'decides':'text equal to the requested text means the edit applied'}}
+        'decides':'text equal to the requested text means the edit applied'},'delete_member_messages':{'operation':'get_message_info','requires':'read-live','decides':'per result row in state unknown: exists:false means deleted'}}
 # ANYM-755 (Astra r1, Sol r2): get_message_info shows no formatting, and body_rendered leaves out what it cannot render.
 VERIFY_FORMATTED_EDIT={'operation':'get_messages','requires':'read',
     'decides':'a revision newer than expected_revision whose body_rendered (body_format=html) has lossless true and '
@@ -855,9 +857,9 @@ class CommandWorker:
                 'rate_limited','provider_timeout','invalid_phone','identity_changed','sending_disabled','invite_invalid','invite_expired','chat_full',
                 'join_not_allowed','already_member','invalid_cursor','invalid_anchor','username_not_found',
                 'recipient_not_user','message_changed','password_required','press_uncertain',
-                'button_kind_unsupported') else 'operation_rejected'
+                'button_kind_unsupported','not_admin','missing_admin_right') else 'operation_rejected'
             # Nothing was sent, so a lookup that ran out of time is a retryable read.
-            result={'data':{'code':code,'retry':True}} if code=='provider_timeout' else None
+            result={'data':{'code':code,'retry':True}} if code=='provider_timeout' else {'data':{'code':code,**exc.data}} if code in ('not_admin','missing_admin_right') and isinstance(exc.data,dict) else None
             # ANYM-676: a press refused before it left (the live message differs from the preview) returns the live
             # text and labels so the owner can reconfirm in one round; nothing was sent.
             if code=='message_changed' and isinstance(exc.data,dict):
@@ -890,6 +892,7 @@ class CommandWorker:
             confirmed=answer['outcome']=='confirmed'
             await settle(job,'succeeded' if confirmed else
                 'unknown' if job['mutation'] else 'failed',answer,None if confirmed else 'operation_result_unknown')
+            if job['operation']=='delete_member_messages':from .member_messages import record_deletions;await record_deletions(self.state,job,answer)
         # A cancellation that came while optional work followed a provider change resumes once the receipt is settled.
         if job.get('_cancel_after_settle') and asyncio.current_task().cancelling():raise asyncio.CancelledError
         return True

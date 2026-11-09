@@ -1,4 +1,5 @@
 """Messenger deletion purge: a deleted message keeps no content anywhere (ANYM-511). Synthetic only."""
+import asyncio
 import json
 import logging
 from uuid import uuid4
@@ -170,6 +171,76 @@ def test_deleted_message_content_is_purged_from_every_table(purge):
     assert sends['send_native']['provider_message_id']=='true_62811@c.us_W1' and sends['send_other']['body']=='sentinel-b wire'
     assert row['counts']['sends']==2 and row['counts']['commands']==3
     assert s.get_context(key,other)['message']['body']=='sentinel-b keeps'
+
+
+# spec: ANYM-934
+def test_a_confirmed_member_message_deletion_purges_its_archive_copy_and_keeps_the_tombstone(operator):
+    from messaging_service.commands import CommandWorker
+    from messaging_service.message_purge import Purger
+    s,archive,_,state=operator
+    with s.pool.connection() as c:
+        c.execute("""UPDATE purge_state SET value=CASE name WHEN 'event_cursor' THEN '0' WHEN 'receipt_cursor' THEN ''
+            WHEN 'receipt_backfill' THEN 'pending' ELSE 'true' END""")
+    def spam(provider_id,body,media=()):
+        archive.ingest(event(account='command-fixture',chat='-1001',chat_title='Synthetic supergroup',provider_id=provider_id,
+                             sender='42',body=body,media=list(media),metadata={'chat_type':'group'}))
+        return stable_id('msg','command-fixture','-1001',provider_id)
+    deleted,kept=spam('11','sentinel-m spam',[VOICE]),spam('12','sentinel-n kept')
+    state.chat('-1001','channel')
+    assert leaks(s,'sentinel-m spam') and leaks(s,VOICE['filename'])  # the body and the file's name are archived
+    key=s.issue_key('command-agent',['command-fixture'],permissions=['read','groups-moderate'])
+    s.set_messenger_operations('command-fixture',['delete_member_messages'])
+    args={'account':'command-fixture','operation':'delete_member_messages',
+          'chat_id':stable_id('chat','command-fixture','-1001'),
+          'parameters':{'message_ids':[deleted,kept],'expected_revisions':[1,1]}}
+    draft=s.preview_messenger_operation(key,**args)
+    queued=s.execute_messenger_operation(key,**args,request_id='synthetic-moderation-9',preview_digest=draft['preview_digest'])
+    async def provider(job):  # the read-back confirmed one deletion and found the other message still there
+        return {'outcome':'confirmed','data':{'results':[{'message_id':deleted,'state':'deleted'},
+            {'message_id':kept,'state':'failed','evidence':{'basis':'provider_read_back','message_present':True}}],
+            'deleted':1,'all_deleted':False}}
+    assert asyncio.run(CommandWorker(state,provider).once())
+    assert s.get_messenger_operation(key,queued['operation_id'])['status']=='succeeded'
+    assert Purger(s).run_once()['purged']==1
+    assert leaks(s,'sentinel-m spam')=={} and leaks(s,VOICE['filename'])=={}
+    with s.pool.connection() as c:
+        rows={r['id']:r for r in c.execute('SELECT id,deleted,purged,body FROM messages WHERE id=ANY(%s)',([deleted,kept],))}
+        mark=c.execute('SELECT reason,purged_at,provider_id FROM message_purges WHERE message=%s',(deleted,)).fetchone()
+    assert rows[deleted]['deleted'] and rows[deleted]['purged'] and rows[deleted]['body']==''
+    assert mark['reason']=='telegram_deleted' and mark['purged_at'] and mark['provider_id']=='11'
+    assert not rows[kept]['deleted'] and rows[kept]['body']=='sentinel-n kept'
+
+
+# spec: ANYM-934
+def test_the_archive_write_after_a_member_deletion_frees_the_archive_lock_at_its_deadline(operator,monkeypatch):
+    # Astra r1 (blocking): a slow archive never keeps a waiting transaction past the write's deadline.
+    import time
+    from messaging_service import member_messages
+    s,archive,_,state=operator
+    archive.ingest(event(account='command-fixture',chat='-1001',provider_id='11',sender='42',body='sentinel-l spam',
+                         metadata={'chat_type':'group'}))
+    state.chat('-1001','channel')
+    mid=stable_id('msg','command-fixture','-1001','11')
+    monkeypatch.setattr(member_messages,'ARCHIVE_SECONDS',1)
+    job={'provider_chat':'-1001','targets':[{'message_id':mid,'revision':1,'provider_message_id':'11'}]}
+    answer={'outcome':'confirmed','data':{'results':[{'message_id':mid,'state':'deleted'}]}}
+    with s.pool.connection() as holder:
+        holder.execute('SELECT pg_advisory_lock(hashtextextended(%s,0))',('archive:command-fixture',))
+        async def write_then_look():
+            # Look while the loop still runs, as in the command loop: asyncio.run's exit would wait for the thread.
+            assert await member_messages.record_deletions(state,job,answer)==0
+            ends=time.monotonic()+1.5
+            while True:
+                waiting=holder.execute("SELECT count(*) AS n FROM pg_locks WHERE locktype='advisory' AND NOT granted"
+                                       ).fetchone()['n']
+                if not waiting or time.monotonic()>ends:return waiting
+                time.sleep(0.1)
+        try:
+            assert asyncio.run(write_then_look())==0
+        finally:
+            holder.execute('SELECT pg_advisory_unlock(hashtextextended(%s,0))',('archive:command-fixture',))
+    with s.pool.connection() as c:
+        assert not c.execute('SELECT deleted FROM messages WHERE id=%s',(mid,)).fetchone()['deleted']
 
 
 # spec: ANYM-511
@@ -791,7 +862,7 @@ def test_migration_refuses_an_unusable_events_message_index(database,tmp_path,in
             c.execute('DROP INDEX events_message');c.execute('CREATE INDEX events_message ON events(message)')
         store.migrate()
         with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='84'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='85'
             # A small database also gets the visibility probe's index in place (production: release step 2).
             assert c.execute("SELECT to_regclass('messages_unpurged') IS NOT NULL AS ok").fetchone()['ok']
 
@@ -840,7 +911,7 @@ def test_migration_045_never_holds_a_table_while_it_waits_for_another(database,t
         assert errors==[] and migrate_errors==[] and outcome==['migrated']
         assert max(waits)<0.5,waits
         with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='84'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='85'
 
 
 # spec: ANYM-511

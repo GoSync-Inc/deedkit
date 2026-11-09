@@ -3380,6 +3380,7 @@
             "approve_join_requests",
             "archive_chat",
             "create_group",
+            "delete_member_messages",
             "demote_participant",
             "get_invite_link",
             "join_chat",
@@ -3423,7 +3424,7 @@
         "parameters": {
           "additionalProperties": true,
           "default": {},
-          "description": "Per operation, with chat_id unless noted: open_chat_by_phone {phone, create} (no chat_id; create=true archives the chat); open_chat_by_username {username, create} (Telegram, no chat_id; create=true archives the private chat); archive_chat, unarchive_chat, unmute_chat, pin_chat, unpin_chat, mark_unread, leave_group, get_invite_link, revoke_invite_link none; mute_chat {seconds}; mark_read none, with message_id and expected_revision; set_chat_labels {label_ids}; create_group {title, user_ids} (no chat_id; the receipt's archive is collected with chat_id, or not_collected with archive_reason discovery_disabled, chat_excluded, catalog_timeout or catalog_failed and a next_step); rename_group {title}; set_group_description {description}; add_participant, remove_participant, promote_participant, demote_participant {user_id}; set_group_messages_admins_only, set_group_info_admins_only, set_join_approval {enabled}; set_slow_mode {seconds}; approve_join_requests, reject_join_requests {user_ids}; join_chat {link} (no chat_id; a link checked by check_chat_link).",
+          "description": "Per operation, with chat_id unless noted: open_chat_by_phone {phone, create} (no chat_id; create=true archives the chat); open_chat_by_username {username, create} (Telegram, no chat_id; create=true archives the private chat); archive_chat, unarchive_chat, unmute_chat, pin_chat, unpin_chat, mark_unread, leave_group, get_invite_link, revoke_invite_link none; mute_chat {seconds}; mark_read none, with message_id and expected_revision; set_chat_labels {label_ids}; create_group {title, user_ids} (no chat_id; the receipt's archive is collected with chat_id, or not_collected with archive_reason discovery_disabled, chat_excluded, catalog_timeout or catalog_failed and a next_step); rename_group {title}; set_group_description {description}; add_participant, remove_participant, promote_participant, demote_participant {user_id}; set_group_messages_admins_only, set_group_info_admins_only, set_join_approval {enabled}; set_slow_mode {seconds}; approve_join_requests, reject_join_requests {user_ids}; join_chat {link} (no chat_id; a link checked by check_chat_link); delete_member_messages {message_ids, expected_revisions} (Telegram: 1-20 other people's archived messages of this chat with their current revisions; each result row deleted, failed or unknown, never retried).",
           "type": "object"
         },
         "request_id": {
@@ -3466,6 +3467,7 @@
       "approve_join_requests",
       "archive_chat",
       "create_group",
+      "delete_member_messages",
       "demote_participant",
       "get_invite_link",
       "join_chat",
@@ -3521,6 +3523,19 @@
           "title": "Team",
           "user_ids": [
             "123456789"
+          ]
+        },
+        "dry_run": true
+      },
+      "delete_member_messages": {
+        "account": "telegram-synthetic",
+        "chat_id": "chat_0123456789abcdef0123456789abcdef",
+        "parameters": {
+          "message_ids": [
+            "msg_0123456789abcdef0123456789abcdef"
+          ],
+          "expected_revisions": [
+            1
           ]
         },
         "dry_run": true

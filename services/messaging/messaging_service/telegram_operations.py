@@ -1163,6 +1163,16 @@ async def write_join_requests(op):
             'all_applied': all(row['state'] == 'applied' for row in rows)}
 
 
+async def write_member_messages(op):
+    from .telegram_moderation import delete_member_messages  # ANYM-934: beside this module, imported on first use
+    return await delete_member_messages(op)
+
+
+def member_messages_unsent(job, error):
+    from .telegram_moderation import unsent  # ANYM-934: a flood wait before any request leaves each target failed
+    return unsent(job, error)
+
+
 GROUP_HANDLERS = {
     'check_chat_link': chat_link, 'join_chat': chat_link, 'create_group': write_create_group,
     'rename_group': write_group_change, 'set_group_description': write_group_change,
@@ -1172,6 +1182,7 @@ GROUP_HANDLERS = {
     'set_group_messages_admins_only': write_group_setting, 'set_group_info_admins_only': write_group_setting,
     'set_slow_mode': write_group_setting, 'list_join_requests': read_join_requests,
     'approve_join_requests': write_join_requests, 'reject_join_requests': write_join_requests,
+    'delete_member_messages': write_member_messages,
 }
 
 HANDLERS = {**READ_HANDLERS, **ACCOUNT_HANDLERS, **MESSAGE_HANDLERS, **GROUP_HANDLERS}
@@ -1269,6 +1280,11 @@ def check_link(parameters, job, prepared):
         reject('invalid_parameters')
 
 
+def check_member_targets(parameters, job, prepared):
+    from .telegram_moderation import targets  # ANYM-934: the reviewed targets, before the peer lookup
+    targets(job)
+
+
 # W5-5a: the per-operation checks, run after the shared key checks; a check may store prepared values.
 PARAMETER_CHECKS = {
     'set_slow_mode': check_slow_mode,
@@ -1277,6 +1293,7 @@ PARAMETER_CHECKS = {
     'send_file': check_send_file, 'send_reaction': check_reaction, 'send_poll': check_poll,
     'vote_poll': check_vote, 'send_location': check_location, 'create_group': check_create_group,
     'list_topics': check_topics_page, 'check_chat_link': check_link, 'join_chat': check_link,
+    'delete_member_messages': check_member_targets,
 }
 
 
@@ -1539,6 +1556,7 @@ async def _execute(client, job, *, verified_self=None, governor=None):
         # Do not expose provider exception strings, session paths or invite links.
         if started_mutation:
             return {'outcome': 'unknown', 'error': 'provider_result_unverified'}
+        if operation == 'delete_member_messages' and (answer := member_messages_unsent(job, error)): return answer
         reject('provider_preflight_failed')
     finally:
         if prepared.get('stream') is not None:

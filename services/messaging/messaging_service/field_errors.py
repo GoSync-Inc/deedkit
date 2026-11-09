@@ -7,7 +7,9 @@ import re
 
 FIELD_ERROR_REASONS = frozenset(('required', 'unknown_field', 'type', 'enum', 'min_length',
     'max_length', 'pattern', 'minimum', 'maximum', 'min_items', 'max_items', 'unique',
-    'format', 'blank', 'size', 'expected_message_unknown'))
+    'format', 'blank', 'size', 'expected_message_unknown',
+    # ANYM-934: a delete_member_messages target that is not another person's live message of this collected chat.
+    'message_not_found', 'message_from_other_chat', 'chat_not_collected', 'own_message'))
 MAX_FIELD_ERRORS = 20
 MAX_FIELD_PATH = 128
 MAX_ALLOWED = 50

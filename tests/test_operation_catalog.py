@@ -188,6 +188,59 @@ def test_group_admin_catalog_support():
     assert telegram['set_slow_mode']['parameters_schema']['seconds']['format'].startswith('one of 0, 10')
 
 
+MEMBER_IDS = ['msg_%032x' % n for n in range(1, 22)]
+
+
+# spec: ANYM-934
+def test_delete_member_messages_is_a_telegram_mutation_behind_a_permission_no_key_holds():
+    from messaging_service.policy import LEGACY_PERMISSIONS, PERMISSIONS, effective_permissions
+    spec = operation_spec('delete_member_messages')
+    assert (spec['permission'], spec['target'], spec['mutation'], spec['full_account'], spec['platforms']) == (
+        'groups-moderate', 'chat', True, False, ['telegram'])
+    assert 'groups-moderate' in PERMISSIONS and 'groups-moderate' not in LEGACY_PERMISSIONS
+    assert effective_permissions(['read', 'groups-moderate'], None) == ['read']  # a NULL key ceiling never inherits it
+    telegram = {r['operation']: r for r in operation_manifest('telegram')}['delete_member_messages']
+    assert telegram['supported'] and set(telegram['parameters_schema']) == {'message_ids', 'expected_revisions'}
+    assert 'delete_message' in telegram['parameters_schema']['message_ids']['format']
+    assert all(word in telegram['limitation'] for word in ('not_admin', 'missing_admin_right', 'retry_after_s', 'purged'))
+    for provider in ('whatsmeow', 'webjs'):
+        row = {r['operation']: r for r in operation_manifest('whatsapp', provider=provider)}['delete_member_messages']
+        assert not row['supported'] and 'moderation_unsupported' in row['limitation']
+        with pytest.raises(ValueError, match='^moderation_unsupported$'):
+            validate_operation('whatsapp', 'delete_member_messages', {'message_ids': MEMBER_IDS[:1],
+                                                                      'expected_revisions': [1]}, provider=provider)
+
+
+# spec: ANYM-934
+def test_delete_member_messages_takes_1_to_20_unique_ids_with_one_revision_each():
+    from messaging_service.messenger_operations import ParameterError
+    def errors(parameters):
+        with pytest.raises(ParameterError, match='^invalid_operation_parameters$') as failure:
+            validate_operation('telegram', 'delete_member_messages', parameters)
+        return failure.value.field_errors
+    ok = {'message_ids': MEMBER_IDS[:20], 'expected_revisions': [1] * 19 + [3]}
+    assert validate_operation('telegram', 'delete_member_messages', ok) == ok
+    assert errors({'message_ids': MEMBER_IDS, 'expected_revisions': [1] * 21}) == [
+        {'field': 'message_ids', 'reason': 'max_items', 'expected': 'at most 20 items'},
+        {'field': 'expected_revisions', 'reason': 'max_items', 'expected': 'at most 20 items'}]
+    assert errors({'message_ids': [], 'expected_revisions': []})[0] == {
+        'field': 'message_ids', 'reason': 'min_items', 'expected': 'at least 1 item'}
+    duplicate = errors({'message_ids': [MEMBER_IDS[0], MEMBER_IDS[1], MEMBER_IDS[0]], 'expected_revisions': [1, 1, 1]})
+    assert duplicate == [{'field': 'message_ids/2', 'reason': 'unique', 'expected': 'no duplicate items'}]
+    assert errors({'message_ids': ['person_1'], 'expected_revisions': [1]})[0]['field'] == 'message_ids/0'
+    assert errors({'message_ids': MEMBER_IDS[:2], 'expected_revisions': [1]}) == [
+        {'field': 'expected_revisions', 'reason': 'min_items', 'expected': 'one revision per message_ids item'}]
+    assert errors({'message_ids': MEMBER_IDS[:1], 'expected_revisions': [0]})[0]['field'] == 'expected_revisions/0'
+    assert errors({'message_ids': MEMBER_IDS[:1]})[0] == {'field': 'expected_revisions', 'reason': 'required',
+        'expected': operation_manifest_format('expected_revisions')}
+    assert errors({**ok, 'revoke': False})[0]['reason'] == 'unknown_field'
+
+
+def operation_manifest_format(name):
+    rows = {r['operation']: r for r in operation_manifest('telegram')}
+    return rows['delete_member_messages']['parameters_schema'][name]['format']
+
+
 # spec: ANYM-243
 def test_chat_link_validation():
     from messaging_service.messenger_operations import ParameterError

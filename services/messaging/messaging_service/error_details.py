@@ -37,6 +37,9 @@ def payload(error,operation='',request_id=None):
     # ANYM-519: reviewed counters, states, steps and a header NAME, never a header value or secret.
     for name in ('retry_after_s','next_step','state','header'):
         if hasattr(error,name):info[name]=getattr(error,name)
+    # ANYM-934: a delete_member_messages target of another chat names that chat's archive ID and type (a chat the
+    # key may read), so a channel's comment points the agent to its discussion group.
+    if hasattr(error,'other_chats'):info['other_chats']=error.other_chats
     # ANYM-520: a refused resume's test: its error code and HTTP status, never a response body, and the
     # endpoint version a new resume names.
     for name in ('test_error','http_status','version'):
