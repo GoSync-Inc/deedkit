@@ -597,7 +597,9 @@ def test_each_compact_page_counts_one_reads_compact_and_a_full_page_none(seeded)
     assert waited['wait_status']=='timeout' and len(polls)>1 and compact_reads(store,token,empty)==2
     # Another key counts nothing on a definition it does not own.
     other=identity(store,'compact-other')
-    store.count_compact_read(other,empty)
+    with store.authorized(other) as (_,p):
+        other_scope=p['scope_version']
+    store.count_compact_read(other,empty,other_scope)
     assert compact_reads(store,token,empty)==2
 
 
@@ -693,6 +695,66 @@ def test_a_stalled_counter_skips_counts_beyond_its_slots_and_never_holds_a_read(
         release.set()
         COMPACT_READS.drain()
     assert compact_reads(store,token,sid)==COMPACT_READS.SLOTS
+
+
+# spec: ANYM-826
+def test_a_compact_read_counted_after_a_scope_change_is_dropped_not_moved_to_the_new_scope(seeded,monkeypatch):
+    import threading
+    from messaging_service.subscription_consumption import COMPACT_READS
+    store,_,_=seeded
+    token,sid=dynamic_case(store)
+    with store.authorized(token) as (_,p):
+        before=p['scope_version']
+    release=threading.Event()
+    count=store.count_compact_read
+    def stalled(*args):
+        release.wait(10)
+        return count(*args)
+    monkeypatch.setattr(store,'count_compact_read',stalled)
+    try:
+        assert page_store_call(store,token,'fetch_subscription_events',sid,detail='compact')['items']
+        assert page_store_call(store,token,'wait_for_subscription_events',sid,detail='compact')['items']
+        # The key's scope changes while both counts wait in the counter.
+        store.set_access('compact-dynamic',chats=None)
+        with store.authorized(token) as (_,p):
+            assert p['scope_version']!=before
+    finally:
+        release.set()
+        COMPACT_READS.drain()
+    with store.pool.connection() as c:
+        rows=c.execute("SELECT scope_version,n FROM subscription_activity WHERE subscription=%s AND metric='reads_compact'",
+            (sid,)).fetchall()
+    # Earned under the old scope, never shown again (ANYM-824): neither row moves to the new scope.
+    assert rows==[]
+    assert compact_reads(store,token,sid)==0
+
+
+# spec: ANYM-826
+def test_a_held_principal_lock_drops_the_count_within_its_budget(seeded,capsys):
+    import time
+    from messaging_service.policy import lock_principal
+    from messaging_service.subscription_consumption import COMPACT_READS
+    from messaging_service.subscriptions import match_subscriptions
+    store,_,_=seeded
+    token,sid=static_case(store)
+    match_subscriptions(store)
+    with store.authorized(token) as (_,p):
+        principal=p['id']
+    capsys.readouterr()
+    assert page_store_call(store,token,'get_subscription_events',sid,detail='compact')['items']
+    COMPACT_READS.drain()
+    with store.pool.connection() as blocker:
+        # An operator ACL change holds the principal's exclusive lock: the counter's identity waits for it.
+        lock_principal(blocker,principal)
+        started=time.monotonic()
+        # A read itself would wait for the lock as well; the count of the read above is submitted directly.
+        COMPACT_READS.submit(store,token,sid,p['scope_version'])
+        COMPACT_READS.drain()
+        assert time.monotonic()-started<2
+    logged=[line for line in capsys.readouterr().out.splitlines() if 'subscription_activity_failed' in line]
+    # The lock timeout, as the access layer classifies it; only this count is lost.
+    assert logged==['{"error": "subscription_activity_failed", "code": "service_unavailable"}']
+    assert compact_reads(store,token,sid)==1
 
 
 def tracked_keys(function,item,*args):
