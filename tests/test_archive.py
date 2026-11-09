@@ -764,25 +764,85 @@ def job_of(s,message):
 
 
 # spec: ANYM-867
-def test_a_terminal_fail_media_and_an_edit_locking_message_then_job_do_not_deadlock(archive):
-    # Ingest and the purge lock the message before its jobs; fail_media takes the message before the job row.
+def test_a_terminal_fail_media_and_an_ingest_in_lease_message_job_order_do_not_deadlock(archive):
+    # Ingest takes the collector lease, then the message, then its jobs; fail_media takes them in the same order.
     import threading,psycopg
-    from psycopg.rows import dict_row
     ar,s,_,_=archive
-    mid=ar.ingest(media_event())['message']; job=ar.claim_media('worker')
+    lease=('collector',ar.acquire('archive-test','collector'))
+    mid=ar.ingest(media_event())['message']
+    job=ar.claim_media('worker',account='archive-test',collector_lease=lease)
     errors=[];done=threading.Event()
-    with psycopg.connect(s.pool.conninfo,row_factory=dict_row) as edit:
-        edit.execute('SELECT id FROM messages WHERE id=%s FOR UPDATE',(mid,))
+    with psycopg.connect(s.pool.conninfo) as ingest:
+        ingest.execute("SELECT 1 FROM collector_leases WHERE account='archive-test' FOR UPDATE")
         def fail():
-            try:ar.fail_media(job,'unavailable',permanent=True)
+            try:ar.fail_media(job,'unavailable',permanent=True,collector_lease=lease)
             except Exception as exc:errors.append(exc)
             finally:done.set()
         worker=threading.Thread(target=fail);worker.start()
-        assert not done.wait(0.5)  # fail_media waits for the message, not holding the job
-        edit.execute("UPDATE media_jobs SET requested_until=NULL WHERE id=%s",(job['id'],))
-        edit.commit()
+        assert not done.wait(0.5)  # fail_media waits for the lease, holding neither the message nor the job
+        ingest.execute('SELECT id FROM messages WHERE id=%s FOR UPDATE',(mid,))
+        ingest.execute("UPDATE media_jobs SET requested_until=NULL WHERE id=%s",(job['id'],))
+        ingest.commit()
     worker.join(10)
     assert errors==[] and len(failed_events(s,mid))==1
+
+
+# spec: ANYM-867
+def test_a_sweep_overlapping_a_finish_of_the_same_job_gives_one_terminal_outcome(archive,monkeypatch):
+    import threading,time
+    from messaging_service import file_lifecycle
+    ar,s,_,_=archive
+    mid=ar.ingest(media_event())['message']
+    job=ar.claim_media('worker')
+    with s.pool.connection() as c:
+        job=c.execute("""UPDATE media_jobs SET attempts=%s,lease_until=clock_timestamp()+interval '1 second'
+            WHERE id=%s RETURNING *""",(MEDIA_MAX_ATTEMPTS,job['id'])).fetchone()
+    inside,release=threading.Event(),threading.Event()
+    real=file_lifecycle.register_resident_original
+    def held(*args):
+        inside.set(); assert release.wait(10)  # the finish holds the job row, past its lease's end
+        return real(*args)
+    monkeypatch.setattr(file_lifecycle,'register_resident_original',held)
+    writer=BlobWriter(s.files,reserve_bytes=0); blob=writer.write([b'data'])
+    errors=[]
+    def run(target,*args):
+        try:target(*args)
+        except Exception as exc:errors.append(exc)
+    finishing=threading.Thread(target=run,args=(ar.finish_media,job,blob,writer));finishing.start()
+    assert inside.wait(5)
+    time.sleep(1.2)  # the lease has ended: the sweep sees an exhausted job
+    ar._media_sweeps.clear()
+    sweeping=threading.Thread(target=run,args=(ar.claim_media,'worker'));sweeping.start()
+    time.sleep(0.2); release.set()
+    finishing.join(10); sweeping.join(10)
+    assert errors==[]
+    ar._media_sweeps.clear(); ar.claim_media('worker')  # a later sweep changes nothing either
+    with s.pool.connection() as c:
+        state=c.execute('SELECT state FROM media_jobs WHERE id=%s',(job['id'],)).fetchone()['state']
+        kinds=[r['kind'] for r in c.execute("""SELECT kind FROM events WHERE message=%s
+            AND kind IN ('attachment.ready','attachment.failed')""",(mid,))]
+    assert (state,kinds)==('ready',['attachment.ready'])
+
+
+# spec: ANYM-867
+def test_a_size_refusal_whose_message_is_held_waits_and_other_files_are_claimed(archive):
+    import psycopg
+    ar,s,_,_=archive
+    big=ar.ingest(event(provider_id='18',media=[{'provider_id':'big','filename':'big.bin','mime':'text/plain',
+        'bytes':9}]))['message']
+    small=ar.ingest(media_event(provider_id='19'))['message']
+    with s.pool.connection() as c:  # the oversized job's last lease expired
+        c.execute("""UPDATE media_jobs SET state='leased',attempts=1,lease_owner='gone',
+            lease_until=now()-interval '1 second' WHERE message=%s""",(big,))
+    writer=BlobWriter(s.files,max_bytes=8,reserve_bytes=0)
+    with psycopg.connect(s.pool.conninfo) as edit:
+        edit.execute('SELECT id FROM messages WHERE id=%s FOR UPDATE',(big,))
+        claimed=[ar.claim_media('worker',writer=writer) for _ in range(2)]
+    assert [j['message'] for j in claimed if j]==[small]
+    with s.pool.connection() as c:
+        row=c.execute("""SELECT state,attempts,next_due>clock_timestamp() AS waits FROM media_jobs
+            WHERE message=%s""",(big,)).fetchone()
+    assert row=={'state':'queued','attempts':1,'waits':True} and failed_events(s,big)==[]
 
 
 # spec: ANYM-867

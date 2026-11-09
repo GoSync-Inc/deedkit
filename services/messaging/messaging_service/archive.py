@@ -677,8 +677,10 @@ class Archive:
                         # taken without waiting; an edit or purge holding it now leaves the refusal for a minute later.
                         if not attachment_failures.lock_message(c,job['message']):
                             if recovery:media_recovery.held_back(c,job);return None
-                            c.execute("UPDATE media_jobs SET next_due=clock_timestamp()+interval '60 seconds' WHERE id=%s",
-                                (job['id'],))
+                            # Queued again (an expired lease too, which the claim takes whatever its next_due), no
+                            # attempt spent: other files are claimed meanwhile.
+                            c.execute("""UPDATE media_jobs SET state='queued',lease_until=NULL,
+                                next_due=clock_timestamp()+interval '60 seconds' WHERE id=%s""",(job['id'],))
                             return None
                         if recovery:
                             media_recovery.held_back(c,job,size_limit=True)
@@ -1006,10 +1008,10 @@ class Archive:
         if retry_after is not None and (type(retry_after) is not int or not 1<=retry_after<2**31):
             raise ValueError('invalid_retry_delay')
         with self.store.pool.connection() as c:
-            # ANYM-867: ingest's and the purge's order, the message before the job row: a terminal outcome's
-            # attachment.failed insert takes the message's key-share lock (its foreign key).
-            c.execute('SELECT FROM messages WHERE id=%s FOR KEY SHARE',(job['message'],))
+            # ANYM-867: ingest's order, the collector lease, then the message, then the job row: a terminal
+            # outcome's attachment.failed insert takes the message's key-share lock (its foreign key).
             self.fence(c,job['account'],collector_lease)
+            c.execute('SELECT FROM messages WHERE id=%s FOR KEY SHARE',(job['message'],))
             row=self.job_fence(c,job)
             from .storage_admission import StorageAdmission
             from . import media_recovery
