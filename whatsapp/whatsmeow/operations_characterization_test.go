@@ -425,6 +425,40 @@ func TestCharacterizeAFailedChangeAfterItStartedIsUnknownNotAnError(t *testing.T
 	})
 }
 
+// spec: ANYM-549
+func TestCharacterizeAnErrorBeforeAnyChangeKeepsAWireCodeOrBecomesItsKindsGenericCode(t *testing.T) {
+	kept := []string{"history_rate_limited", "history_anchor_unavailable", "operation_unsupported", "operation_invalid_parameters",
+		"operation_disabled", "operation_expired", "operation_target_invalid", "operation_target_unavailable", "operation_result_too_large",
+		"registered_file_invalid", "invalid_phone", "identity_unresolved", "chat_not_collected", "provider_timeout", "rate_limited",
+		"operation_query_failed", "forbidden", "invite_invalid", "invite_expired", "chat_full", "join_not_allowed", "already_member",
+		"operation_target_changed"}
+	for _, raw := range append(kept, "boom", "context deadline exceeded", "") {
+		for _, tc := range []struct{ op, generic string }{{"list_contacts", "operation_query_failed"}, {"rename_group", "operation_target_unavailable"}} {
+			t.Run(tc.op+"/"+raw, func(t *testing.T) {
+				d := operationsFake(t)
+				characterizeNoWrites(t, &d)
+				d.contacts = func(context.Context) (map[types.JID]types.ContactInfo, error) { return nil, errors.New(raw) }
+				d.group = func(context.Context, types.JID) (*types.GroupInfo, error) { return nil, errors.New(raw) }
+				job := operationJob(tc.op, operationsGroup, map[string]any{"title": "Synthetic"})
+				if tc.op == "list_contacts" {
+					job = operationJob(tc.op, "", nil)
+				}
+				result, err := executeOperation(context.Background(), job, d)
+				want := tc.generic
+				for _, code := range kept {
+					if raw == code {
+						want = raw
+					}
+				}
+				requireError(t, err, want)
+				if result != nil {
+					t.Fatalf("result = %v, want nil", result)
+				}
+			})
+		}
+	}
+}
+
 // spec: ANYM-242
 func TestCharacterizeGroupOperationsRefuseBadParametersAndFailedSettlesBeforeAnyChange(t *testing.T) {
 	group := &types.GroupInfo{JID: characterizeJID(t, operationsGroup)}
@@ -483,6 +517,21 @@ func TestCharacterizeDomainFunctionsRefuseAnOperationOfAnotherDomain(t *testing.
 				t.Fatalf("result = %v, want nil", result)
 			}
 		})
+	}
+}
+
+// spec: ANYM-549
+func TestCharacterizeEveryOperationButTheUnsupportedFourHasAHandler(t *testing.T) {
+	unsupported := wordSet("add_contact delete_contact get_labels set_chat_labels")
+	for op := range operationFields {
+		if _, routed := operationHandlers[op]; routed == unsupported[op] {
+			t.Errorf("%s routed=%v unsupported=%v", op, routed, unsupported[op])
+		}
+	}
+	for op := range operationHandlers {
+		if _, known := operationFields[op]; !known {
+			t.Errorf("%s has a handler but no operationFields entry", op)
+		}
 	}
 }
 

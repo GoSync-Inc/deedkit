@@ -335,17 +335,7 @@ func executeOperation(ctx context.Context, job operationRequest, d operationDepe
 			result, err = operationOutput("unknown", map[string]any{"code": "provider_operation_uncertain"}, "")
 			return
 		}
-		switch err.Error() {
-		case "history_rate_limited", "history_anchor_unavailable", "operation_unsupported", "operation_invalid_parameters", "operation_disabled", "operation_expired", "operation_target_invalid", "operation_target_unavailable", "operation_result_too_large", "registered_file_invalid",
-			"invalid_phone", "identity_unresolved", "chat_not_collected", "provider_timeout", "rate_limited", "operation_query_failed", "forbidden",
-			"invite_invalid", "invite_expired", "chat_full", "join_not_allowed", "already_member", "operation_target_changed":
-		default:
-			if readOperations[job.Operation] {
-				err = errors.New("operation_query_failed")
-			} else {
-				err = errors.New("operation_target_unavailable")
-			}
-		}
+		err = operationErrorCode(job.Operation, err)
 	}()
 	mutate := func(extra string, fn func() error) error {
 		if e := check(extra); e != nil {
@@ -486,86 +476,132 @@ func executeOperation(ctx context.Context, job operationRequest, d operationDepe
 		}
 		return operationOutput("confirmed", map[string]any{"archive_reference": receipt["archive_reference"]}, receipt["provider_message_id"].(string))
 	}
-	op := job.Operation
-	env := &operationEnv{ctx: ctx, job: job, d: d, target: target, check: check, mutate: mutate, read: read, submitted: submitted, getMessage: getMessage, getGroup: getGroup, text: text, integer: integer, user: user, users: users, page: page, contactRow: contactRow, send: send}
-	switch op {
-	case "open_chat_by_phone":
-		return openChatByPhone(ctx, job, d, check)
-	case "request_chat_history":
-		count, e := integer("count", 1, 50, 50)
-		if e != nil {
-			return nil, e
-		}
-		if e = check(""); e != nil {
-			return nil, e
-		}
-		response, e := d.history(ctx, job.ProviderChat, count)
-		if e != nil {
-			if e.Error() == "history_request_unknown" {
-				return operationOutput("unknown", map[string]any{"code": "history_request_unknown", "retry": "explicit_only"}, "")
-			}
-			return nil, e
-		}
-		data, ok := response.(map[string]any)
-		if !ok {
-			return operationOutput("unknown", map[string]any{"code": "provider_operation_uncertain"}, "")
-		}
-		return submitted(data)
-	case "get_profile", "chat_info", "list_participants", "list_contacts", "get_contact", "list_blocked", "get_reactions", "get_pinned_messages", "get_message_info":
-		return env.readOperation(op)
-	case "send_location", "send_poll", "send_contact", "send_file", "forward_message", "edit_message", "delete_message", "send_reaction", "pin_message", "unpin_message", "star_message", "unstar_message", "mark_read", "mark_unread", "archive_chat", "unarchive_chat", "mute_chat", "unmute_chat", "pin_chat", "unpin_chat":
-		return env.messageOperation(op)
-	case "create_group", "rename_group", "set_group_description", "add_participant", "remove_participant", "promote_participant", "demote_participant", "leave_group", "get_invite_link", "revoke_invite_link", "set_group_messages_admins_only", "set_group_info_admins_only", "set_join_approval", "list_join_requests", "approve_join_requests", "reject_join_requests":
-		return env.groupOperation(op)
-	case "check_chat_link", "join_chat":
-		return chatLink(ctx, job, d, mutate, read, &mutating)
-	case "add_contact":
-		return nil, errors.New("operation_unsupported")
-	case "block_contact", "unblock_contact":
-		j, e := user("user_id")
-		if e != nil {
-			return nil, e
-		}
-		extra := LegacyChatID(j)
-		if err = mutate(extra, func() error { return d.block(ctx, j, op == "block_contact") }); err != nil {
-			return nil, err
-		}
-		return submitted(nil)
-	case "update_profile":
-		if len(job.Parameters) == 0 {
-			return nil, errors.New("operation_invalid_parameters")
-		}
-		var name, status *string
-		if _, ok := job.Parameters["name"]; ok {
-			value, e := text("name", 64, false, nil)
-			if e != nil {
-				return nil, e
-			}
-			name = &value
-		}
-		if _, ok := job.Parameters["status"]; ok {
-			value, e := text("status", 139, true, nil)
-			if e != nil {
-				return nil, e
-			}
-			status = &value
-		}
-		if name != nil {
-			if err = mutate("", func() error { return d.patch(ctx, appstate.BuildSettingPushName(*name)) }); err != nil {
-				return nil, err
-			}
-		}
-		if status != nil {
-			if err = mutate("", func() error { return d.status(ctx, *status) }); err != nil {
-				return nil, err
-			}
-		}
-		return submitted(nil)
-	case "delete_contact", "get_labels", "set_chat_labels":
-		return nil, errors.New("operation_unsupported")
-	default:
+	handler, ok := operationHandlers[job.Operation]
+	if !ok {
 		return nil, errors.New("operation_unsupported")
 	}
+	env := &operationEnv{ctx: ctx, job: job, d: d, target: target, check: check, mutate: mutate, read: read, submitted: submitted, getMessage: getMessage, getGroup: getGroup, text: text, integer: integer, user: user, users: users, page: page, contactRow: contactRow, send: send, mutating: &mutating}
+	return handler(env, job.Operation)
+}
+
+// operationErrorCodes are the error codes an operation answers as they are when no change started.
+var operationErrorCodes = wordSet(`history_rate_limited history_anchor_unavailable operation_unsupported operation_invalid_parameters
+	operation_disabled operation_expired operation_target_invalid operation_target_unavailable operation_result_too_large registered_file_invalid
+	invalid_phone identity_unresolved chat_not_collected provider_timeout rate_limited operation_query_failed forbidden
+	invite_invalid invite_expired chat_full join_not_allowed already_member operation_target_changed`)
+
+// operationErrorCode is the error op answers for err when no change started: a code of
+// operationErrorCodes as it is, anything else the generic code of a read or of a change.
+func operationErrorCode(op string, err error) error {
+	if operationErrorCodes[err.Error()] {
+		return err
+	}
+	if readOperations[op] {
+		return errors.New("operation_query_failed")
+	}
+	return errors.New("operation_target_unavailable")
+}
+
+// operationHandler answers one operation, op, of the request env holds.
+type operationHandler func(env *operationEnv, op string) (any, error)
+
+// operationHandlers routes each supported operation; an operationFields entry without one
+// (add_contact, delete_contact, get_labels, set_chat_labels) answers operation_unsupported.
+var operationHandlers = operationTable(map[string]operationHandler{
+	"open_chat_by_phone": func(e *operationEnv, _ string) (any, error) {
+		return openChatByPhone(e.ctx, e.job, e.d, e.check)
+	},
+	"request_chat_history": (*operationEnv).requestChatHistory,
+	"get_profile chat_info list_participants list_contacts get_contact list_blocked get_reactions get_pinned_messages get_message_info": (*operationEnv).readOperation,
+	`send_location send_poll send_contact send_file forward_message edit_message delete_message send_reaction pin_message unpin_message
+	star_message unstar_message mark_read mark_unread archive_chat unarchive_chat mute_chat unmute_chat pin_chat unpin_chat`: (*operationEnv).messageOperation,
+	`create_group rename_group set_group_description add_participant remove_participant promote_participant demote_participant leave_group
+	get_invite_link revoke_invite_link set_group_messages_admins_only set_group_info_admins_only set_join_approval list_join_requests
+	approve_join_requests reject_join_requests`: (*operationEnv).groupOperation,
+	"check_chat_link join_chat": func(e *operationEnv, _ string) (any, error) {
+		return chatLink(e.ctx, e.job, e.d, e.mutate, e.read, e.mutating)
+	},
+	"block_contact unblock_contact": (*operationEnv).blockContact,
+	"update_profile":                (*operationEnv).updateProfile,
+})
+
+// operationTable expands each space-separated key of groups to one entry per operation.
+func operationTable(groups map[string]operationHandler) map[string]operationHandler {
+	out := map[string]operationHandler{}
+	for names, handler := range groups {
+		for _, op := range strings.Fields(names) {
+			if _, twice := out[op]; twice {
+				panic("operation routed twice: " + op)
+			}
+			out[op] = handler
+		}
+	}
+	return out
+}
+
+func (e *operationEnv) requestChatHistory(string) (any, error) {
+	count, err := e.integer("count", 1, 50, 50)
+	if err != nil {
+		return nil, err
+	}
+	if err = e.check(""); err != nil {
+		return nil, err
+	}
+	response, err := e.d.history(e.ctx, e.job.ProviderChat, count)
+	if err != nil {
+		if err.Error() == "history_request_unknown" {
+			return operationOutput("unknown", map[string]any{"code": "history_request_unknown", "retry": "explicit_only"}, "")
+		}
+		return nil, err
+	}
+	data, ok := response.(map[string]any)
+	if !ok {
+		return operationOutput("unknown", map[string]any{"code": "provider_operation_uncertain"}, "")
+	}
+	return e.submitted(data)
+}
+
+func (e *operationEnv) blockContact(op string) (any, error) {
+	j, err := e.user("user_id")
+	if err != nil {
+		return nil, err
+	}
+	if err = e.mutate(LegacyChatID(j), func() error { return e.d.block(e.ctx, j, op == "block_contact") }); err != nil {
+		return nil, err
+	}
+	return e.submitted(nil)
+}
+
+func (e *operationEnv) updateProfile(string) (any, error) {
+	if len(e.job.Parameters) == 0 {
+		return nil, errors.New("operation_invalid_parameters")
+	}
+	var name, status *string
+	if _, ok := e.job.Parameters["name"]; ok {
+		value, err := e.text("name", 64, false, nil)
+		if err != nil {
+			return nil, err
+		}
+		name = &value
+	}
+	if _, ok := e.job.Parameters["status"]; ok {
+		value, err := e.text("status", 139, true, nil)
+		if err != nil {
+			return nil, err
+		}
+		status = &value
+	}
+	if name != nil {
+		if err := e.mutate("", func() error { return e.d.patch(e.ctx, appstate.BuildSettingPushName(*name)) }); err != nil {
+			return nil, err
+		}
+	}
+	if status != nil {
+		if err := e.mutate("", func() error { return e.d.status(e.ctx, *status) }); err != nil {
+			return nil, err
+		}
+	}
+	return e.submitted(nil)
 }
 
 // operationEnv is the per-request state executeOperation hands to its per-domain functions:
@@ -588,6 +624,8 @@ type operationEnv struct {
 	page       func([]any, string, string) (map[string]any, error)
 	contactRow func(types.JID, types.ContactInfo) map[string]any
 	send       func(*waE2E.Message, string) (any, error)
+	// mutating is executeOperation's flag that a change started (chatLink resets it).
+	mutating *bool
 }
 
 func truncate(s string, n int) string {
