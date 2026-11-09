@@ -468,7 +468,10 @@ it reused the merge queue's verification qualifies only when the latest merge
 queue run of the same SHA, from this repository's `gh-readonly-queue/main/`
 queue, completed successfully with one successful `checks / verify` and
 `CI gate` in its latest attempt. The push run must still contain exactly one
-`checks / verify` job, concluded `skipped`; an absent job is refused. Every other
+`checks / verify` job, concluded `skipped`; an absent job is refused. Beside that
+skip, and only then, the push run may also skip `native / synthetic`: the queue
+run must then show one successful `native / synthetic` too (through the chain
+below, the pull request run must). Every other
 required job must still pass in the push run itself. Both runs are read again after their jobs, so a rerun that
 starts in between is refused, and run listings are followed across pages. The
 result names the queue run that supplied the test verification next to the
