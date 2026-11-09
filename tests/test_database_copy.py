@@ -643,9 +643,12 @@ def test_an_expired_copy_whose_resources_are_unconfirmed_keeps_only_its_owner_re
     assert [path.name for path in directory.iterdir()] == ["owner.json"]
 
 
-def rooted(tmp_path, root):
-    """Docker-free settings whose copies go to `root` (`migration.copy_root`)."""
+def rooted(tmp_path, root, monkeypatch=None):
+    """Docker-free settings whose copies go to `root` (`migration.copy_root`); with `monkeypatch`, `volume` below
+    tmp_path reads as another filesystem than the state's."""
     (tmp_path / "state").mkdir(mode=0o700, exist_ok=True)
+    if monkeypatch is not None:
+        monkeypatch.setattr(p, "device", lambda path: 2 if str(path).startswith(str(tmp_path / "volume")) else 1)
     return {"version": 1, "state_directory": str(tmp_path / "state"), "migration": {
         "databases": {"main": {"container": "db", "owner": "probe", "database": "probe"}}, "copy_root": str(root)}}
 
@@ -655,7 +658,7 @@ def test_a_configured_copy_root_takes_new_copies_and_the_states_older_ones_are_s
     # 2026-11-09: the root filesystem was too small for messaging's dump and restore; another disk holds the copies.
     FakeDocker(monkeypatch)
     (tmp_path / "volume").mkdir()
-    settings = rooted(tmp_path, tmp_path / "volume" / "copies")
+    settings = rooted(tmp_path, tmp_path / "volume" / "copies", monkeypatch)
     left, old = unreleased(tmp_path / "state", stamp(1)), unreleased(tmp_path / "state", stamp(50))
     p.write_record(old / "released.json", {"id": old.name})
     made = []
@@ -668,6 +671,7 @@ def test_a_configured_copy_root_takes_new_copies_and_the_states_older_ones_are_s
     # The copy a crash left in the state's own root is released, the expired one deleted, by the same pass.
     assert (left / "released.json").exists() and not old.exists()
     assert [root.name for root in p.copy_roots(settings)] == ["copies", p.COPIES]
+    assert p.read(tmp_path / "state" / p.COPY_ROOTS) == {"roots": [str(tmp_path / "volume" / "copies")]}
 
 
 # spec: ANYM-588
@@ -688,6 +692,107 @@ def test_a_copy_root_below_a_missing_mount_is_refused_and_never_created(tmp_path
         with p.database_copy(settings, "main", SHA):
             pass
     assert not (tmp_path / "unmounted").exists() and list((tmp_path / "state").iterdir()) == []
+
+
+def owner_record(model, directory):
+    """`model`'s owner.json for the copy at `directory` (its ID, container and session prefix)."""
+    return {**p.read(model / "owner.json"), "id": directory.name, "directory": str(directory),
+            "container": "deedkit-copy-" + directory.name, "application_name": "deedkit-copy-" + directory.name}
+
+
+# spec: ANYM-588
+@pytest.mark.parametrize("case", ["bare-mountpoint", "symlinked-parent", "writable-parent"])
+def test_a_copy_root_on_the_states_disk_or_below_an_untrusted_parent_is_refused(tmp_path, monkeypatch, case):
+    # Astra r1 on #807: an unmounted volume keeps its mount point; a parent symlink or a writable parent redirects it.
+    (tmp_path / "volume").mkdir()
+    root = tmp_path / "volume" / "copies"
+    settings = rooted(tmp_path, root, None if case == "bare-mountpoint" else monkeypatch)
+    if case == "symlinked-parent":
+        (tmp_path / "volume-link").symlink_to(tmp_path / "volume")
+        settings["migration"]["copy_root"] = str(tmp_path / "volume-link" / "copies")
+    if case == "writable-parent":
+        (tmp_path / "volume").chmod(0o777)
+    message = {"bare-mountpoint": "is on the state's filesystem",
+               "symlinked-parent": "is a symlink or writable by another user",
+               "writable-parent": "is a symlink or writable by another user"}[case]
+    with pytest.raises(p.Refused, match=message):
+        with p.database_copy(settings, "main", SHA):
+            pass
+    assert not root.exists() and list((tmp_path / "state").iterdir()) == []
+
+
+# spec: ANYM-588
+def test_a_sticky_world_writable_parent_like_tmp_is_trusted(tmp_path, monkeypatch):
+    (tmp_path / "volume").mkdir()
+    (tmp_path / "volume").chmod(0o1777)
+    settings = rooted(tmp_path, tmp_path / "volume" / "copies", monkeypatch)
+    p.trusted_parents(tmp_path / "volume" / "copies", tmp_path / "state")
+    assert p.copy_roots(settings)[:1] == []  # nothing made yet, nothing recorded
+
+
+# spec: ANYM-588
+def test_a_recorded_root_is_tended_after_the_key_moves_halts_while_missing_and_is_forgotten_once_empty(tmp_path,
+                                                                                                       monkeypatch):
+    # Astra r1 on #807: copies on a root the configuration no longer names must still be released and expired.
+    FakeDocker(monkeypatch)
+    (tmp_path / "volume").mkdir()
+    root = tmp_path / "volume" / "copies"
+    settings = rooted(tmp_path, root, monkeypatch)
+    root.mkdir(mode=0o700)
+    p.record_root(tmp_path / "state", root)
+    del settings["migration"]["copy_root"]
+    left = unreleased(tmp_path / "state", stamp(1))
+    moved = root / stamp(2)
+    moved.mkdir(mode=0o700)
+    p.write_record(moved / "owner.json", owner_record(left, moved))
+    p.tend_copies(settings, locked=True)
+    assert (moved / "released.json").exists() and (left / "released.json").exists()
+    assert p.recorded_roots(tmp_path / "state") == [root]
+    # The volume unmounted: its copies cannot be seen, so the run refuses instead of forgetting them.
+    hidden = tmp_path / "volume-away"
+    (tmp_path / "volume").rename(hidden)
+    with pytest.raises(p.Refused, match="records is missing; mount it"):
+        p.tend_copies(settings, locked=True)
+    hidden.rename(tmp_path / "volume")
+    p.expire_copies(tmp_path / "state", at=datetime.now(timezone.utc) + timedelta(hours=49), roots=[root])
+    p.tend_copies(settings, locked=True)
+    assert p.recorded_roots(tmp_path / "state") == []
+
+
+# spec: ANYM-588
+def test_a_copy_id_found_in_two_roots_is_stuck_and_neither_record_is_released_or_expired(tmp_path, monkeypatch):
+    # Astra r1 on #807: one record must never stand for the other's resources.
+    docker = FakeDocker(monkeypatch)
+    (tmp_path / "volume").mkdir()
+    root = tmp_path / "volume" / "copies"
+    settings = rooted(tmp_path, root, monkeypatch)
+    root.mkdir(mode=0o700)
+    p.record_root(tmp_path / "state", root)
+    name = stamp(50)
+    default = unreleased(tmp_path / "state", name)
+    p.write_record(default / "released.json", {"id": name})
+    twin = root / name
+    twin.mkdir(mode=0o700)
+    p.write_record(twin / "owner.json", owner_record(default, twin))
+    with pytest.raises(p.CopyStuck, match=name):
+        p.tend_copies(settings, locked=True)
+    assert default.exists() and twin.exists() and not (twin / "released.json").exists()
+    assert [argv for argv in docker.calls if argv[:2] == ["docker", "stop"]] == []
+
+
+# spec: ANYM-588
+def test_the_keeper_watches_the_reserve_while_a_snapshot_query_runs(tmp_path, monkeypatch):
+    # Astra r1 on #807: the snapshot holds the live database's old row versions between the dumps too.
+    monkeypatch.setattr(p, "filesystem", lambda path: (1 << 30, 76 << 30))
+    keeper = p.Keeper({"id": "synthetic"}, [sys.executable, "-c", "import time; time.sleep(30)"],
+                      p.copy_clock() + 20, [str(tmp_path)])
+    started = time.monotonic()
+    try:
+        with pytest.raises(p.CopyFailed, match="disk_reserve"):
+            keeper.query("SELECT 1;")
+    finally:
+        keeper.close()
+    assert time.monotonic() - started < 5
 
 
 # spec: ANYM-588

@@ -3114,6 +3114,7 @@ def attach_cleanup(state, record, outcome, preflight, retired=None):
 # restored in a capped scratch PostgreSQL. No helper's output is kept or printed (stderr is discarded): a failure is one
 # fixed code. `<id>/owner.json` names every resource before it starts; only `released.json` finishes them.
 COPIES = "migration-copies"
+COPY_ROOTS = "copy-roots.json"
 COPY_RETENTION = 48 * 3600
 COPY_POLL = 2
 COPY_RESERVE = 10 << 30
@@ -3205,17 +3206,40 @@ def write_record(path, value):
     fsync_directory(path.parent)
 
 
-def copies_root(state, *, create=False, root=None):
-    """`<state>/migration-copies` (or `root`, `migration.copy_root`), None when there is none. A configured root is
-    created only below a parent that exists: a missing mount never becomes a directory on the root filesystem."""
-    root = Path(root) if root is not None else Path(state) / COPIES
-    if create:
+def device(path):
+    """The filesystem `path` is on (st_dev)."""
+    return os.stat(path).st_dev
+
+
+def trusted_parents(root, state):
+    """A configured root's parents: each a real directory (no symlink) owned by root or this user and writable by no
+    one else unless sticky, and the last one on another filesystem than the state's, so an unmounted volume whose
+    mount point is still there never takes a copy onto the state's disk (Astra r1 on #807)."""
+    for parent in reversed(root.parents):
         try:
-            root.mkdir(mode=0o700)
-        except FileExistsError:
-            pass
+            found = os.lstat(parent)
         except FileNotFoundError as exc:
             raise Refused(f"the parent of {root} does not exist; no database is copied") from exc
+        except OSError as exc:
+            raise Refused(f"cannot read {parent}; no database is copied") from exc
+        if (not stat.S_ISDIR(found.st_mode) or found.st_uid not in (0, os.geteuid())
+                or found.st_mode & 0o022 and not found.st_mode & stat.S_ISVTX):
+            raise Refused(f"{parent} above migration.copy_root is a symlink or writable by another user; "
+                          "no database is copied")
+    if device(root.parent) == device(state):
+        raise Refused(f"migration.copy_root {root} is on the state's filesystem (is its volume mounted?); "
+                      "no database is copied")
+
+
+def copies_root(state, *, create=False, root=None):
+    """`<state>/migration-copies` (or `root`, `migration.copy_root`), None when there is none. A configured root is
+    read or created only below trusted parents on another filesystem (`trusted_parents`)."""
+    if root is not None:
+        trusted_parents(Path(root), Path(state))
+    root = Path(root) if root is not None else Path(state) / COPIES
+    if create:
+        with suppress(FileExistsError):
+            root.mkdir(mode=0o700)
     try:
         found = os.lstat(root)
     except FileNotFoundError:
@@ -3237,14 +3261,45 @@ def copy_root(settings):
     return Path(named)
 
 
+def recorded_roots(state):
+    """The configured roots a copy was made in (`<state>/copy-roots.json`), in the order they were first used."""
+    record = Path(state) / COPY_ROOTS
+    if not record.exists():
+        return []
+    found = read(record).get("roots")
+    if not isinstance(found, list) or not all(isinstance(item, str) and item.startswith("/") for item in found):
+        raise Refused(f"{record} is malformed; no copy is reconciled")
+    return [Path(item) for item in found]
+
+
+def record_root(state, root):
+    """Remember `root` before the first copy goes there: a later run tends it even after the key changes."""
+    known = recorded_roots(state)
+    if root not in known:
+        write_record(Path(state) / COPY_ROOTS, {"roots": [str(item) for item in [*known, root]]})
+
+
 def copy_roots(settings):
-    """Every copy root that exists: the configured one and the state's own, whose older copies are still released and
-    expired after a move."""
-    state, roots, seen = Path(settings["state_directory"]), [], set()
-    for root in (copies_root(state, root=copy_root(settings)), copies_root(state)):
-        if root is not None and root.resolve() not in seen:
-            seen.add(root.resolve())
-            roots.append(root)
+    """Every copy root to tend: the configured one, every recorded one and the state's own, whose older copies are still
+    released and expired after a move. A recorded root that is gone (an unmounted volume) refuses: its copies would
+    otherwise never be released or expired. A recorded root that holds no copy any more, and is not the configured
+    one, is forgotten."""
+    state, configured = Path(settings["state_directory"]), copy_root(settings)
+    recorded = recorded_roots(state)
+    roots, seen = [], set()
+    for root in dict.fromkeys([*([configured] if configured else []), *recorded]):
+        exists = present(root) if present(root.parent) else None
+        found = copies_root(state, root=root) if exists else None
+        if found is None and root in recorded:
+            raise Refused(f"the copy root {root} that {state / COPY_ROOTS} records is missing; mount it, or remove it "
+                          "from that file once no copy of it remains")
+        if found is not None and found not in seen:
+            seen.add(found)
+            roots.append(found)
+    if (default := copies_root(state)) is not None:
+        roots.append(default)
+    if (keep := [root for root in recorded if root == configured or copy_directories(root)]) != recorded:
+        write_record(state / COPY_ROOTS, {"roots": [str(item) for item in keep]})
     return roots
 
 
@@ -3265,7 +3320,8 @@ def copy_exec(copy, step, container, *argv):
 def copy_room(copy, paths, database_bytes):
     """Before the first dump: the copy's filesystem (`paths[0]`) holds the dumps and the restore, so it needs twice the
     database and the reserve; the live data's filesystem, when another one (`migration.copy_root`), only the reserve:
-    there the copy adds no file, only the WAL its snapshot keeps, which the reserve check during each step watches."""
+    the copy writes no file there. What its snapshot keeps there (WAL, row versions vacuum may not reuse yet) is
+    watched against the reserve every COPY_POLL seconds while the snapshot is held, queries included (Keeper)."""
     for path in paths:
         free, size = filesystem(path)
         if free < (2 * database_bytes if same_filesystem(path, paths[0]) else 0) + copy_reserve(size):
@@ -3275,7 +3331,7 @@ def copy_room(copy, paths, database_bytes):
 def same_filesystem(path, other):
     """Whether two paths share a filesystem; one that cannot be read counts as shared, so the larger need applies."""
     try:
-        return os.stat(path).st_dev == os.stat(other).st_dev
+        return device(path) == device(other)
     except OSError:
         return True
 
@@ -3365,8 +3421,8 @@ class Keeper:
 
     MARK = "deedkit-copy-read"
 
-    def __init__(self, copy, argv, deadline):
-        self.copy, self.deadline = copy, deadline
+    def __init__(self, copy, argv, deadline, paths=()):
+        self.copy, self.deadline, self.paths, self.checked = copy, deadline, paths, None
         self.process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL)
         assert self.process.stdin and self.process.stdout
@@ -3388,9 +3444,14 @@ class Keeper:
                     if line.decode() == self.MARK:
                         return lines
                     lines.append(line.decode())
-                remaining = self.deadline - copy_clock()
+                moment = copy_clock()
+                remaining = self.deadline - moment
                 if remaining <= 0:
                     raise CopyFailed(self.copy["id"], "deadline")
+                if self.paths and (self.checked is None or moment - self.checked >= COPY_POLL):
+                    # The snapshot keeps the live database's old row versions: its filesystem is watched (Astra r1).
+                    self.checked = moment
+                    check_reserve(self.copy, self.paths)
                 if selector.select(min(remaining, 1.0)):
                     chunk = os.read(self.stdout.fileno(), 65536)
                     if not chunk:
@@ -3625,7 +3686,7 @@ def snapshot_copy(copy, timeout, keep, catalog=None):
     paths = [str(directory), data_filesystem(inspected)]
     watch = {"timeout": timeout, "paths": paths}
     keeper = Keeper(copy, copy_exec(copy, "keeper", container, "psql", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1",
-                                    "-U", owner, "-d", database), copy_clock() + timeout)
+                                    "-U", owner, "-d", database), copy_clock() + timeout, paths)
     try:
         found, reference, shape = copy_dumps(copy, keeper, timeout, catalog, container, owner, database, directory, paths, watch)
     finally:
@@ -3732,7 +3793,14 @@ def reconcile_copies(state, roots=None):
     flight) carries the label of a released copy and is removed too. `roots`: copy_roots, else the state's own."""
     roots = [copies_root(state)] if roots is None else roots
     released, stuck, done = [], [], set()
-    found = {directory.name: directory for root in roots for directory in copy_directories(root)}
+    found, ambiguous = {}, set()
+    for directory in [directory for root in roots for directory in copy_directories(root)]:
+        if directory.name in found:
+            ambiguous.add(directory.name)
+        found[directory.name] = directory
+    for name in sorted(ambiguous):  # the same ID in two roots: neither record is trusted (Astra r1 on #807)
+        del found[name]
+        stuck.append(name)
     for directory in found.values():
         if not (directory / "owner.json").exists():
             continue
@@ -3786,7 +3854,9 @@ def expire_copies(state, *, at=None, roots=None):
     resources are not confirmed released stays, so a later run can still stop them."""
     at, expired = at or datetime.now(timezone.utc), []
     roots = [copies_root(state)] if roots is None else roots
-    for directory in [directory for root in roots for directory in copy_directories(root)]:
+    names = [directory.name for root in roots for directory in copy_directories(root)]
+    for directory in [directory for root in roots for directory in copy_directories(root)
+                      if names.count(directory.name) == 1]:
         stamp = COPY_ID.fullmatch(directory.name)
         made = datetime.strptime(stamp[1] if stamp else "", "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
         if (at - made).total_seconds() <= COPY_RETENTION:
@@ -3811,7 +3881,10 @@ def database_copy(settings, name, sha, *, keep=False, catalog=None):
     if not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
         raise Refused("an exact lowercase 40-character commit SHA is required")
     state = Path(settings["state_directory"])
-    root = copies_root(state, create=True, root=copy_root(settings))
+    if (configured := copy_root(settings)) is not None:
+        trusted_parents(configured, state)
+        record_root(state, configured)
+    root = copies_root(state, create=True, root=configured)
     assert root
     settle_copies(state, copy_roots(settings))
     copy_id = f"{sha[:12]}-{name}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
