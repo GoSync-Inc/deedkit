@@ -70,10 +70,10 @@ def test_brief_timezone_must_be_an_iana_zone(value):
 
 # spec: ANYM-239
 def test_a_zone_the_host_cannot_load_still_starts_the_call_with_a_neutral_greeting(tmp_path, monkeypatch):
-    import core
+    import prompt
     def missing(key):
-        raise core.ZoneInfoNotFoundError(key)
-    monkeypatch.setattr(core, 'ZoneInfo', missing)
+        raise prompt.ZoneInfoNotFoundError(key)
+    monkeypatch.setattr(prompt, 'ZoneInfo', missing)
     _, text = instruction(tmp_path, language='id', timezone='Asia/Makassar')
     assert 'local time is unknown' in text and "greet with 'Halo'" in text
 
