@@ -49,6 +49,32 @@ class Refused(Exception):
         self.code = code
 
 
+class EngineFailure(Exception):
+    """Not the input's fault: the worker answers `runtime_failed` and the service 502 `engine_failed`."""
+
+
+def classify(result):
+    """None for a converted document; the refusal of an input Docling itself could not take; EngineFailure otherwise.
+    With `raises_on_error=False` Docling also returns FAILURE when its pipeline (a model, the assembler) raised on a
+    valid input (Astra r1): that is an engine failure, never a final 422. An input Docling marks invalid (its backend
+    could not open it, its own page limit) is `invalid_document`; SKIPPED is a format it does not allow."""
+    status = str(getattr(result.status, "value", result.status))
+    if status in ("success", "partial_success"):
+        return None
+    if status == "skipped":
+        return "unsupported_format"
+    if status == "failure" and not result.input.valid:
+        return "invalid_document"
+    raise EngineFailure(status)
+
+
+def checked(answer):
+    """Every answer, a refusal too, passes here last: an outbound attempt anywhere in this child fails the job."""
+    if ATTEMPTS[0]:
+        raise EngineFailure("network_attempted")
+    return answer
+
+
 def link_artifacts(paths, options):
     """artifacts/<repo with / as -->/<repo path>/<file> -> the verified file; returns the artifacts root."""
     root = Path(options["scratch"]) / "artifacts"
@@ -130,26 +156,25 @@ def assemble(document, max_chars):
 
 
 class Runtime:
-    def __init__(self, converter, revisions, version):
-        self.converter, self.revisions, self.version = converter, revisions, version
+    def __init__(self, converter, revisions, version, stream):
+        self.converter, self.revisions, self.version, self.stream = converter, revisions, version, stream
 
     def run(self, job):
-        from docling.datamodel.base_models import ConversionStatus, DocumentStream
-
         path, max_pages, max_chars = job["file"], int(job["max_pages"]), int(job["max_chars"])
         try:
             kind, _pages = sniff(path, max_pages)
         except Refused as refusal:
-            return {"refused": refusal.code}
+            return checked({"refused": refusal.code})
         with open(path, "rb") as handle:
-            stream = DocumentStream(name=f"document.{kind}", stream=io.BytesIO(handle.read(MAX_BYTES + 1)))
+            stream = self.stream(name=f"document.{kind}", stream=io.BytesIO(handle.read(MAX_BYTES + 1)))
         result = self.converter.convert(stream, raises_on_error=False, max_num_pages=max_pages, max_file_size=MAX_BYTES)
-        if result.status not in (ConversionStatus.SUCCESS, ConversionStatus.PARTIAL_SUCCESS):
-            return {"refused": "invalid_document"}
+        refusal = classify(result)
+        if refusal:
+            return checked({"refused": refusal})
         markdown, truncated, spans, coverage = assemble(result.document, max_chars)
-        return {"markdown": markdown, "truncated": truncated, "page_spans": spans, "coverage": coverage,
-                "engine": {"name": "docling", "version": self.version, "models": self.revisions,
-                           "network_attempts": ATTEMPTS[0], "peak_rss_mb": peak_rss_mb()}}
+        return checked({"markdown": markdown, "truncated": truncated, "page_spans": spans, "coverage": coverage,
+                        "engine": {"name": "docling", "version": self.version, "models": self.revisions,
+                                   "network_attempts": ATTEMPTS[0], "peak_rss_mb": peak_rss_mb()}})
 
     def unload(self):
         self.converter = None
@@ -161,7 +186,7 @@ def load(paths, options):
     from importlib import metadata
 
     from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
-    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.base_models import DocumentStream, InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
     from docling.document_converter import DocumentConverter, PdfFormatOption
 
@@ -177,4 +202,4 @@ def load(paths, options):
     converter = DocumentConverter(allowed_formats=[InputFormat.PDF, InputFormat.DOCX, InputFormat.PPTX],
                                   format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline)})
     converter.initialize_pipeline(InputFormat.PDF)  # loads the layout and table models now, not in the first job
-    return Runtime(converter, dict(options["revisions"]), metadata.version("docling"))
+    return Runtime(converter, dict(options["revisions"]), metadata.version("docling"), DocumentStream)

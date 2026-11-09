@@ -120,19 +120,15 @@ def score_long(got, bound):
 HEADING = re.compile(r"^#{1,6}[ \t]+(.+?)[ \t#]*$")
 
 
-def fold(cell):
-    """A cell as the scorer compares it: whitespace folded, lowercased, without the rouble sign (no PDF text layer of
-    the set carries it, so make_documents.py says the scorer drops it)."""
-    return " ".join(cell.replace("₽", "").split()).lower()
+def fold(cell, pdf):
+    """A cell as the scorer compares it: whitespace folded, lowercased; in a PDF also without the rouble sign (the
+    set's PDF text layer does not carry it, so make_documents.py says the scorer drops it; DOCX and PPTX keep it)."""
+    return " ".join((cell.replace("₽", "") if pdf else cell).split()).lower()
 
 
-def cells(line):
-    return [fold(cell) for cell in line.strip().strip("|").split("|")]
-
-
-def table_rows(markdown):
+def table_rows(markdown, pdf):
     """The rows of every Markdown table, cells folded; separator lines are not rows."""
-    return [cells(line) for line in markdown.splitlines()
+    return [[fold(cell, pdf) for cell in line.strip().strip("|").split("|")] for line in markdown.splitlines()
             if line.lstrip().startswith("|") and not re.fullmatch(r"[\s|:\-]*", line)]
 
 
@@ -156,8 +152,9 @@ def score_documents(outputs, truth, bound):
         if got["peak_rss_mb"] > bound["max_rss_mb"]:
             failures.append(f"{name}: peak RSS {got['peak_rss_mb']} MB > {bound['max_rss_mb']} MB")
         if want.get("table"):
-            rows = table_rows(markdown)
-            found = sum(1 for row in want["table"] if [fold(cell) for cell in row] in rows)
+            pdf = name.endswith(".pdf")
+            rows = table_rows(markdown, pdf)
+            found = sum(1 for row in want["table"] if [fold(cell, pdf) for cell in row] in rows)
             if found < len(want["table"]):
                 failures.append(f"{name}: table rows {found}/{len(want['table'])}")
         if want.get("headings") and name in bound["headings"]:
@@ -170,22 +167,26 @@ def score_documents(outputs, truth, bound):
         kept = sum(1 for word in russian if word in words) / max(1, len(russian))
         if kept < bound["min_ru_word_recall"]:
             failures.append(f"{name}: Russian words kept {kept:.3f} < {bound['min_ru_word_recall']}")
-        failures += page_order(name, markdown, got["page_spans"], want.get("markers") or [])
+        failures += page_order(name, markdown, got["page_spans"], want.get("markers") or [], bound["pages"][name])
     return failures
 
 
-def page_order(name, markdown, spans, markers):
-    """Marker n is on page n (a PDF page, a slide); a document without pages (DOCX) keeps the markers in order."""
-    pages = [span["page"] for span in spans]
-    if pages != sorted(set(pages)):
-        return [f"{name}: page spans out of order {pages}"]
-    if spans:
-        texts = [norm(markdown[span["start"]:span["end"]]) for span in spans]
-        missing = [m for n, m in enumerate(markers) if n >= len(texts) or norm(m) not in texts[n]]
-        return [f"{name}: markers not on their pages {missing}"] if missing else []
-    text = norm(markdown)
-    places = [text.find(norm(m)) for m in markers]
-    return [] if -1 not in places and places == sorted(places) else [f"{name}: markers out of order {places}"]
+def page_order(name, markdown, spans, markers, pages):
+    """The spans are pages 1..`pages` in order (a PDF page, a slide), and marker n is on page n + 1. `pages` None is a
+    DOCX: no spans at all, and the markers in order in the text."""
+    if pages is None:
+        if spans:
+            return [f"{name}: page spans for a document without pages"]
+        text = norm(markdown)
+        places = [text.find(norm(m)) for m in markers]
+        return [] if -1 not in places and places == sorted(places) else [f"{name}: markers out of order {places}"]
+    numbers = [span["page"] for span in spans]
+    if numbers != list(range(1, pages + 1)):
+        return [f"{name}: page spans {numbers}, not pages 1..{pages}"]
+    texts = {span["page"]: norm(markdown[span["start"]:span["end"]]) for span in spans}
+    missing = [m for n, m in enumerate(markers, 1) if norm(m) not in texts.get(n, "")]
+    return [f"{name}: markers not on their pages {missing}"] if missing else []
+
 
 # --- talking to the live service ---------------------------------------------------------------------------------
 def post(url, key, body, content_type, timeout=3600):

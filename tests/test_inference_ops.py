@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 
 import pytest
 
@@ -1809,11 +1810,53 @@ def test_deploy_syncs_the_docling_venv_before_the_release_is_ready():
     commands = SshRecorder().exercise_deploy()
     sync = next(c for c in commands if 'uv sync' in c)
     service = sync.index('sync --locked --group engines')
-    docling = sync.index(f'/Users/_deedkitinf/releases/{SHA}/docling && /opt/homebrew/bin/uv sync --locked --compile-bytecode')
+    docling = sync.index(f'/Users/_deedkitinf/releases/{SHA}/docling && /opt/homebrew/bin/python3.13 -I -c ')
+    assert sync.index('uv sync --locked --compile-bytecode', docling) > docling
     ready = sync.index(f'touch /Users/_deedkitinf/releases/{SHA}/.ready')
     # one `&&` chain: a failed Docling sync leaves no `.ready`, so the release is never pointed at
     assert service < docling < ready
-    assert ';' not in sync[service:ready] and '||' not in sync[service:ready]
+    chain = sync[service:ready].replace(deploy.WHEEL_ONLY, '<wheel-only program>')  # its own `;` are Python's
+    assert ';' not in chain and '||' not in chain
+
+
+# spec: ANYM-850
+def test_the_deploy_sync_keeps_wheels_only_although_uv_reads_no_project_configuration(tmp_path):
+    """Astra r1 (ANYM-850): `UV_NO_CONFIG=1` also drops the project's `[tool.uv] no-build-package`, so a sync that
+    relied on it could build an sdist. Both syncs pass the list explicitly with `--config-file`, written from the
+    release's own pyproject.toml; the real uv, offline and with no project configuration, refuses the build."""
+    sync = next(c for c in SshRecorder().exercise_deploy() if 'uv sync' in c)
+    assert sync.count('pyproject.toml > .wheel-only.toml && /opt/homebrew/bin/uv sync --locked') == 2
+    assert sync.count('--config-file .wheel-only.toml && ') == 2
+    for project in ('services/inference', 'services/inference/docling'):
+        done = subprocess.run([sys.executable, '-I', '-c', deploy.WHEEL_ONLY, str(ROOT / project / 'pyproject.toml')],
+                              capture_output=True, text=True, check=True)
+        names = tomllib.loads(done.stdout)['no-build-package']
+        assert names == tomllib.loads((ROOT / project / 'pyproject.toml').read_text())['tool']['uv']['no-build-package']
+    (tmp_path / 'empty.toml').write_text('[project]\nname = "x"\n')
+    refused = subprocess.run([sys.executable, '-I', '-c', deploy.WHEEL_ONLY, str(tmp_path / 'empty.toml')],
+                             capture_output=True, text=True)
+    assert refused.returncode != 0 and refused.stdout == ''  # no list: the chain stops before any sync
+    uv = shutil.which('uv')
+    assert uv, 'uv is on PATH wherever these tests run (CI runs them with uv run)'
+    sdist, app = tmp_path / 'b', tmp_path / 'a'
+    (sdist / 'src' / 'bpkg').mkdir(parents=True)
+    (sdist / 'src' / 'bpkg' / '__init__.py').write_text('')
+    (sdist / 'pyproject.toml').write_text('[project]\nname = "bpkg"\nversion = "0.1"\n[build-system]\n'
+                                          'requires = ["hatchling"]\nbuild-backend = "hatchling.build"\n')
+    app.mkdir()
+    (app / 'pyproject.toml').write_text('[project]\nname = "a"\nversion = "0.1"\nrequires-python = ">=3.10"\n'
+                                        'dependencies = ["bpkg"]\n[tool.uv]\npackage = false\nno-build-package = ["bpkg"]\n'
+                                        '[tool.uv.sources]\nbpkg = { path = "../b" }\n')
+    env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(tmp_path), 'UV_NO_CONFIG': '1',
+           'UV_CACHE_DIR': str(tmp_path / 'cache'), 'UV_PYTHON': sys.executable, 'UV_PYTHON_DOWNLOADS': 'never'}
+    subprocess.run([uv, 'lock', '--offline'], cwd=app, env=env, check=True, capture_output=True, timeout=120)
+    config = subprocess.run([sys.executable, '-I', '-c', deploy.WHEEL_ONLY, 'pyproject.toml'], cwd=app,
+                            capture_output=True, text=True, check=True).stdout
+    (app / '.wheel-only.toml').write_text(config)
+    kept = subprocess.run([uv, 'sync', '--locked', '--offline', '--config-file', '.wheel-only.toml'], cwd=app, env=env,
+                          capture_output=True, text=True, timeout=120)
+    assert kept.returncode != 0 and '--no-build' in kept.stderr, kept.stderr[-300:]
+    assert not (app / '.venv' / 'lib').exists() or not list((app / '.venv').rglob('bpkg*'))
 
 
 # ---------------------------------------------------------------- criterion 8: probe from production

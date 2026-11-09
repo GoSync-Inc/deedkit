@@ -66,6 +66,7 @@
     "max_seconds": 120,
     "max_rss_mb": 2560,
     "min_ru_word_recall": 0.95,
-    "headings": ["text.pdf", "doc.docx", "deck.pptx"]
+    "headings": ["text.pdf", "doc.docx", "deck.pptx"],
+    "pages": {"text.pdf": 3, "table.pdf": 1, "doc.docx": null, "deck.pptx": 3}
   }
 }

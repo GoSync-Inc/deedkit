@@ -354,7 +354,7 @@ pin, so it cannot join the service venv. `scripts/inference_deploy.py` syncs it 
 same empty environment as the service sync) and refuses the release if that sync fails, so there is no install step of
 its own. The compiled bytecode matters: a cold child starts in 6 to 8 s with it and about 65 s without it. The
 sandbox profile needs no change (reads stay open, the venv sits in the read-only release). The alias is listed as
-available in `/v1/models` only when that venv's packages match the pins in `models.json` and both models verify;
+available in `/v1/models` only when that venv's packages match the pins in `models.json` and the model files are present at their pinned sizes (the full sha256 check runs before every load and a failed one keeps the alias off until the files change);
 otherwise a request gets 503 `engine_unavailable` and nothing else changes.
 
 Models: two pinned artifacts, about 0.39 GB (`docling-layout-heron` 172 MB and TableFormer accurate 213 MB). Pull them

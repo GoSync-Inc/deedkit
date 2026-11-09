@@ -339,7 +339,9 @@ between jobs); the child sniffs the file (zip members, encryption, page count) b
 audit hook in the child counts and refuses every outbound attempt from the Docling import on; an answer whose
 `engine.network_attempts` is not 0 is 502 `engine_failed`. The phase's `rss_limit_gb` (2.5) kills that child alone
 (502, refusal `memory_limit`). `/v1/models` lists the alias as `available` only when that venv's own package metadata
-matches the pins in `models.json` and both models verify.
+matches the pins in `models.json` and the model files are there with their pinned sizes (a stat; the full sha256 check
+runs in a thread before every load, and a failed one keeps the alias unavailable until the files change). A Docling
+FAILURE on an input it could open is 502, never a final 422, and a refusal also fails when the child tried the network.
 
 ### Canary and egress probe
 

@@ -14,6 +14,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from ..errors import ServiceError
+from ..models import phase_dir, phase_key
 from ..schemas import DOCUMENT_MAX_CHARS, DOCUMENT_MAX_PAGES, DOCUMENT_REFUSALS, DocumentResult
 from . import BadOutput, Rejected
 from .pinned import PinnedEngine
@@ -78,10 +79,51 @@ class DoclingEngine(PinnedEngine):
         threads = str(int(self.options.get("threads", 2)))
         return {"OMP_NUM_THREADS": threads, "MKL_NUM_THREADS": threads}
 
+    _failed_stamp = None  # the files' stat when the last full check before a load failed (Astra r1, ANYM-850)
+
     def unavailable(self) -> str | None:
         packages = self.packages("docling")
-        if not packages:
-            return None
+        problem = self.venv_problem(packages) if packages else None
+        return problem or self.model_problem()
+
+    def model_stamp(self):
+        """(problem, stamp) from a stat of the phase's pinned files: present, nothing extra, the pinned sizes. No hash on
+        the event loop; the full sha256 check runs in `prepare` (a thread) before every load."""
+        artifacts = (self.context.models or {}).get("phases", {}).get(phase_key(self.alias, "docling"))
+        if not artifacts:
+            return "model_not_pinned", None
+        stamp = []
+        try:
+            root = phase_dir(self.context.model_dir, self.alias, "docling")
+            for name, entry in artifacts.items():
+                if set(os.listdir(root / name)) != set(entry["files"]):
+                    return "model_files_differ", None
+                for file_name, pinned in entry["files"].items():
+                    info = os.stat(root / name / file_name)
+                    if info.st_size != pinned["size"]:
+                        return "model_file_mismatch", None
+                    stamp.append((name, file_name, info.st_ino, info.st_size, info.st_mtime_ns))
+        except (OSError, TypeError):
+            return "model_missing", None
+        return None, tuple(stamp)
+
+    def model_problem(self) -> str | None:
+        problem, stamp = self.model_stamp()
+        if problem is None and stamp == self._failed_stamp:
+            return "model_file_mismatch"  # the full check failed on exactly these files; a new pull changes the stamp
+        return problem
+
+    def prepare(self, phase_name, cancel=None):
+        _, stamp = self.model_stamp()
+        try:
+            launch = super().prepare(phase_name, cancel)
+        except ServiceError:
+            self._failed_stamp = stamp
+            raise
+        self._failed_stamp = None
+        return launch
+
+    def venv_problem(self, packages) -> str | None:
         interpreter = self.interpreter()
         if not os.path.isfile(interpreter):
             return "environment_missing"

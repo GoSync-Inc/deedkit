@@ -108,7 +108,7 @@ def test_document_canary_passes_the_recorded_docling_run_and_fails_each_regressi
     docx = bad["doc.docx"]
     docx["markdown"] = docx["markdown"].replace("маркер альфа", "marker").replace("маркер бета", "маркер альфа")
     failures = "\n".join(canary.score_documents(bad, DOC_TRUTH, bound))
-    for fragment in ("table.pdf: table rows 7/8", "text.pdf: headings 2/3", "text.pdf: page spans out of order",
+    for fragment in ("table.pdf: table rows 7/8", "text.pdf: headings 2/3", "text.pdf: page spans [2, 1, 3], not pages 1..3",
                      "deck.pptx: 1 outbound attempts", "deck.pptx: 121.0 s > 120", "deck.pptx: peak RSS 2561 MB",
                      "doc.docx: markers out of order"):
         assert fragment in failures, fragment
@@ -120,6 +120,30 @@ def test_document_canary_passes_the_recorded_docling_run_and_fails_each_regressi
     spans[0]["end"], spans[1]["start"] = spans[0]["start"], spans[0]["start"]
     assert any(f.startswith("deck.pptx: markers not on their pages") for f in canary.score_documents(moved, DOC_TRUTH, bound))
     assert canary.score_documents({"text.pdf": {"error": "HTTP 503"}}, DOC_TRUTH, bound)[0] == "text.pdf: no answer: HTTP 503"
+
+
+# spec: ANYM-850
+def test_document_canary_judges_pages_by_their_numbers_and_each_fixture_by_its_own_page_count():
+    """Astra r1: no spans used to pass as a DOCX, and pages shifted by ten passed as long as the markers matched by
+    position. Now every fixture has its page count in expected.json and marker n must sit on page n."""
+    bound = EXPECTED["documents"]
+    assert set(bound["pages"]) == set(DOC_TRUTH) and bound["pages"]["doc.docx"] is None
+    cases = {
+        "no spans": lambda got: got.update(page_spans=[]),
+        "shifted": lambda got: [span.update(page=span["page"] + 10) for span in got["page_spans"]],
+        "last page left out": lambda got: got["page_spans"].pop(),
+    }
+    for label, change in cases.items():
+        for name in ("text.pdf", "deck.pptx"):
+            outputs = recorded()
+            change(outputs[name])
+            assert any(f.startswith(f"{name}: page spans") for f in canary.score_documents(outputs, DOC_TRUTH, bound)), (label, name)
+    outputs = recorded()
+    outputs["doc.docx"]["page_spans"] = [{"page": 1, "start": 0, "end": 10}]
+    assert "doc.docx: page spans for a document without pages" in canary.score_documents(outputs, DOC_TRUTH, bound)
+    outputs = recorded()  # the rouble sign is dropped for the PDF only: a DOCX cell without it is a lost row
+    outputs["doc.docx"]["markdown"] = outputs["doc.docx"]["markdown"].replace("₽", "")
+    assert "doc.docx: table rows 4/5" in canary.score_documents(outputs, DOC_TRUTH, bound)
 
 
 # spec: ANYM-850

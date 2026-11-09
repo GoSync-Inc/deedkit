@@ -3,7 +3,9 @@ its own venv and models, and the runtime's pure parts (format sniffing, page spa
 
 import io
 import json
+import sys
 import zipfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,9 +13,10 @@ from deedkit_inference import models as pins
 from deedkit_inference.config import AliasSpec
 from deedkit_inference.engines import docling as docling_engine
 from deedkit_inference.engines.runtimes import docling_rt
+from deedkit_inference.errors import ServiceError
 from deedkit_inference.pull import pull
 from deedkit_inference.schemas import DOCUMENT_MAX_BYTES, DocumentResult
-from engine_support import engines, sha256
+from engine_support import engines, flip_in_place, sha256, synthetic_store
 from support import fk, multipart, principal
 
 pytestmark = pytest.mark.anyio
@@ -197,7 +200,7 @@ def test_pull_fetches_an_artifact_from_its_repository_folder(tmp_path):
 
 
 def fake_venv(tmp_path, versions):
-    site = tmp_path / "venv" / "lib" / "python3.13" / "site-packages"
+    site = tmp_path / "venv" / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
     site.mkdir(parents=True)
     for name, version in versions.items():
         info = site / f"{name.replace('-', '_')}-{version}.dist-info"
@@ -209,11 +212,12 @@ def fake_venv(tmp_path, versions):
     return str(python)
 
 
-def engine_with(python, models):
+def engine_with(python, models, model_dir=None):
     spec = AliasSpec.model_validate({"kind": "document", "scope": "document", "engine": "docling",
                                      "timeout_seconds": 120, "engine_options": {"python": python},
                                      "phases": [{"name": "docling", "slot": "gpu", "resident_gb": 2.5}]})
-    env = SimpleNamespace(alias=ALIAS, spec=spec, model_dir=None, models=models, work_root=None, testing=False)
+    env = SimpleNamespace(alias=ALIAS, spec=spec, model_dir=model_dir, models=models,
+                          work_root=Path(model_dir) if model_dir else None, testing=False)
     return docling_engine.DoclingEngine("document", spec.engine_options, env)
 
 
@@ -228,10 +232,43 @@ def test_the_engine_is_unavailable_until_its_own_venv_matches_the_pins(tmp_path,
     partial = {k: v for k, v in wanted.items() if k != "docling-parse"}
     assert engine_with(fake_venv(tmp_path / "b", partial), shipped).unavailable() == "package_missing"
     good = engine_with(fake_venv(tmp_path / "c", wanted), shipped)
-    assert good.unavailable() is None
+    assert good.unavailable() == "model_missing"  # the venv matches, the models are not there (Astra r1)
     assert good.interpreter().endswith("/venv/bin/python")
     assert good.revision() == "docling:2.149.0,layout:8f39ad3c0b4c,tableformer:2199320848bb"
 
+
+
+# spec: ANYM-850
+def test_the_alias_is_unavailable_while_its_models_are_missing_or_failed_their_full_check(tmp_path):
+    """Astra r1: /v1/models said available with a matching venv and no model store. A stat (no hash on the event loop)
+    finds missing, extra or wrongly sized files; a same-size corruption is found by the full check before the load, and
+    the alias stays unavailable until the files change (a new pull)."""
+    models_file, store = synthetic_store(tmp_path)
+    models = json.loads(models_file.read_text())
+    models["environments"] = pins.load_models()["environments"]
+    python = fake_venv(tmp_path / "v", models["environments"]["docling"])
+    engine = engine_with(python, models, str(store))
+    assert engine.unavailable() is None
+    artifact = store / ALIAS / "docling" / "model"
+    first = sorted(artifact.iterdir())[0]
+    (artifact / "extra.json").write_text("{}")
+    assert engine.unavailable() == "model_files_differ"
+    (artifact / "extra.json").unlink()
+    data = first.read_bytes()
+    first.write_bytes(data + b"x")
+    assert engine.unavailable() == "model_file_mismatch"
+    first.write_bytes(data)
+    flip_in_place(first)
+    assert engine.unavailable() is None  # same size: only the full check sees it
+    with pytest.raises(ServiceError):
+        engine.prepare("docling")
+    assert engine.unavailable() == "model_file_mismatch"
+    first.unlink()
+    first.write_bytes(data)  # a new pull: new file, new stamp
+    assert engine.unavailable() is None
+    launch = engine.prepare("docling")
+    assert engine.unavailable() is None and launch.argv[0] == python
+    assert engine_with(python, models, str(tmp_path / "nowhere")).unavailable() == "model_missing"
 
 def zip_bytes(names, encrypted=False):
     buffer = io.BytesIO()
@@ -268,6 +305,44 @@ def test_the_child_tells_docx_pptx_and_refusals_apart_from_the_bytes(tmp_path):
             with pytest.raises(docling_rt.Refused) as refusal:
                 docling_rt.sniff(str(path), 100)
             assert refusal.value.code == expected, name
+
+
+# spec: ANYM-850
+def test_a_pipeline_failure_or_an_outbound_attempt_fails_the_engine_and_only_bad_input_is_refused(tmp_path, monkeypatch):
+    """Astra r1: Docling with `raises_on_error=False` answers FAILURE also when its pipeline raised on a valid file;
+    that is a 502, not a final 422. And a refusal must not hide an outbound attempt the audit hook recorded."""
+    path = tmp_path / "doc.docx"
+    path.write_bytes(zip_bytes(["word/document.xml"]))
+    job = {"file": str(path), "max_pages": 100, "max_chars": 1000}
+
+    class Converter:
+        def __init__(self, status, valid=True):
+            self.result = SimpleNamespace(status=SimpleNamespace(value=status), input=SimpleNamespace(valid=valid),
+                                          document=FakeDocument(None, labels=("title",)))
+
+        def convert(self, stream, **_):
+            return self.result
+
+    def runtime(status, valid=True):
+        return docling_rt.Runtime(Converter(status, valid), {"layout": "a" * 40}, "2.149.0", lambda **kw: kw)
+
+    monkeypatch.setattr(docling_rt, "peak_rss_mb", lambda: 900)
+    monkeypatch.setattr(docling_rt, "ATTEMPTS", [0])
+    answer = runtime("success").run(job)
+    assert answer["markdown"] == "# Whole document" and answer["engine"]["network_attempts"] == 0
+    DocumentResult.model_validate(answer)
+    assert runtime("failure", valid=False).run(job) == {"refused": "invalid_document"}
+    assert runtime("skipped").run(job) == {"refused": "unsupported_format"}
+    for status in ("failure", "pending", "started"):  # a valid input whose pipeline failed
+        with pytest.raises(docling_rt.EngineFailure):
+            runtime(status).run(job)
+    monkeypatch.setattr(docling_rt, "ATTEMPTS", [1])
+    for status, valid in (("success", True), ("failure", False)):
+        with pytest.raises(docling_rt.EngineFailure):
+            runtime(status, valid).run(job)
+    (tmp_path / "x.xlsx").write_bytes(zip_bytes(["xl/workbook.xml"]))  # a sniff refusal is checked as well
+    with pytest.raises(docling_rt.EngineFailure):
+        runtime("success").run({**job, "file": str(tmp_path / "x.xlsx")})
 
 
 class FakeDocument:
