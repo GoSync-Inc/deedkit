@@ -2095,6 +2095,37 @@ def wake_targets(run, args, config: dict | None = None) -> dict:
     return ask(run, "messaging", [args.verb + "-wake-target", "--id", wake_target_id])
 
 
+def session_claim(run, args, config: dict | None = None) -> dict:
+    """The provider-session claim list and the operator release (ANYM-914): confirm the other host is down, then one
+    compare-and-set on the generation and holder_id that were read. IDs and times only; no secret exists in the row."""
+    account = getattr(args, "account", None)
+    listed = ask(run, "messaging", ["session-claim-list"] + (["--account", account] if account else []))
+    if args.verb == "list":
+        return listed
+    items = [item for item in listed.get("items", []) if item.get("account") == account]
+    if not items and account not in listed.get("restored_without_claim", []):
+        raise AdminError("session-claim: no claim row and no restored account of that name; nothing changed")
+    previous, expected = (items[0], items[0]["host_id"]) if items else (None, account)
+    print("session-claim: " + safe_text(json.dumps(previous or {"account": account, "restored_without_claim": True})),
+          file=sys.stderr)
+    given = args.other_host_down
+    if given is None:
+        if not sys.stdin.isatty():
+            raise AdminError(f'session-claim: pass --other-host-down "{expected}" after checking that host is down; nothing changed')
+        given = input(f"Type {expected} to confirm that host is down and release {account}: ").strip()
+    if given != expected:
+        raise AdminError("session-claim: the confirmed host_id does not match the row; nothing changed")
+    command = ["session-claim-release", "--account", account]
+    if previous:
+        command += ["--generation", str(previous["generation"]), "--holder-id", previous["holder_id"], "--host-id", previous["host_id"]]
+    done = ask(run, "messaging", command)
+    if not isinstance(done, dict) or done.get("released") is not True:
+        raise AdminError("session-claim: the row changed since it was read (or the account is no longer restored); nothing changed")
+    print("session-claim: released account=" + safe_text(account) + " confirmed=" + safe_text(given) + " previous="
+          + safe_text(json.dumps(previous)), file=sys.stderr)
+    return {"account": account, "released": True, "previous": previous}
+
+
 def main(argv: list[str] | None = None, run=None, docker=None, host=None) -> int:
     parser = argparse.ArgumentParser(prog="deedkit admin", description="DeedKit admin CLI (ANYM-491)")
     parser.add_argument("--config", type=Path, default=CONFIG, help=f"private admin configuration (default {CONFIG})")
@@ -2154,6 +2185,12 @@ def main(argv: list[str] | None = None, run=None, docker=None, host=None) -> int
     wake_enable.add_argument("wake_target_id", nargs="?")
     wake_enable.add_argument("--all", action="store_true", help="every operator-disabled target")
     wake_enable.add_argument("--principal", help="with --all: only this principal's targets")
+    claims = nouns.add_parser("session-claim", help="provider-session owner per account: list and operator release (ANYM-914)")
+    claim_verbs = claims.add_subparsers(dest="verb", required=True)
+    claim_verbs.add_parser("list", help="every claim row and restored account without one, read-only")
+    claim_release = claim_verbs.add_parser("release", help="release one account's claim after its other host is confirmed down")
+    claim_release.add_argument("--account", required=True)
+    claim_release.add_argument("--other-host-down", metavar="HOST_ID", help="the row's host_id; without it a terminal is asked")
     args = parser.parse_args(argv)
     try:
         config = load_json(args.config, "admin configuration")
@@ -2162,6 +2199,9 @@ def main(argv: list[str] | None = None, run=None, docker=None, host=None) -> int
             return 0
         if args.noun == "wake-targets":
             print(json.dumps(wake_targets(run or runner(config), args, config), ensure_ascii=False, indent=2))
+            return 0
+        if args.noun == "session-claim":
+            print(json.dumps(session_claim(run or runner(config), args, config), ensure_ascii=False, indent=2))
             return 0
         if args.noun in ("undo", "profile") or args.verb in ("issue", "extend", "revoke"):
             os.umask(0o077)

@@ -33,6 +33,8 @@ services:
       - ./private/whatsapp1.json:/run/secrets/whatsapp_config:ro
       - ./private/whatsapp1.permit.json:/run/secrets/whatsapp_permit:ro
       - ./private/whatsapp1-session:/sessions
+      # ANYM-914: the canonical host lock directory, one per host, shared by every session opener.
+      - ./private/session-locks:/run/deedkit/session-locks
       - whatsapp1_spool:/spool
       - files:/data
       - file_uploads:/data/files/.uploads:ro
@@ -43,6 +45,8 @@ services:
       - ./private/whatsapp2.json:/run/secrets/whatsapp_config:ro
       - ./private/whatsapp2.permit.json:/run/secrets/whatsapp_permit:ro
       - ./private/whatsapp2-session:/sessions
+      # ANYM-914: the canonical host lock directory, one per host, shared by every session opener.
+      - ./private/session-locks:/run/deedkit/session-locks
       - whatsapp2_spool:/spool
       - files:/data
       - file_uploads:/data/files/.uploads:ro

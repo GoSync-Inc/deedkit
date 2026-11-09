@@ -115,8 +115,16 @@ def test_terminal_pairing_rechecks_secret_lease_identity_and_closes_every_resour
     from messaging_service import telegram_pair as pairing
     calls = []; session = tmp_path / 'owner.session'; session.write_text('synthetic session')
     session.chmod(0o644)
-    cfg = {'account': 'synthetic-tg', 'session_file': str(session)}
+    locks = tmp_path / 'session-locks'; locks.mkdir(mode=0o700)
+    boot = tmp_path / 'boot_id'; boot.write_text('synthetic-boot\n')
+    cfg = {'account': 'synthetic-tg', 'session_file': str(session), 'session_lock_directory': str(locks)}
     auth = {'expected_user_id': 42}
+    # ANYM-914: a synthetic host lock and claim; the claim's database calls are the fake pool's, so stubbed here.
+    monkeypatch.setattr(pairing.session_claim, 'BOOT_ID', boot)
+    monkeypatch.setattr(pairing.session_claim, 'acquire', lambda pool, host, kind: NS())
+    monkeypatch.setattr(pairing.session_claim, 'release', lambda pool, claim: None)
+    async def keep(pool, claim): await asyncio.Event().wait()
+    monkeypatch.setattr(pairing.session_claim, 'keep', keep)
     monkeypatch.setattr(pairing, 'require_owner_terminal', lambda: None)
     monkeypatch.setattr(pairing, 'configuration', lambda _: (cfg, auth))
     dsn = tmp_path / 'test.dsn'; dsn.write_text('synthetic-not-a-connection')

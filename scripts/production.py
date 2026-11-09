@@ -1538,6 +1538,8 @@ def prepare(settings, sha):
         env_files.update({path: env_file_digest(path) for path in named})
         snapshots.append({"project": project, "before": document, "reference": reference, "running": running,
                           "labels": labels})
+    # ANYM-914: the lock directory exists before the inputs below are hashed and before apply stops anything.
+    provide_session_locks(item["before"]["services"][service] for item in snapshots for service in item["project"]["services"])
     images = {}
     targets = sorted({target for project in settings["projects"] for target in project["services"].values()})
     # Every CI-published target is resolved and attested before the first pull.
@@ -1926,7 +1928,141 @@ def check_kept(release, sha, receipt, evidence, touched, project, item):
                       Refused(f"kept {project['name']}/{service} is not running steadily"))
 
 
-def apply(settings, sha, *, backup_waited=0):
+# ANYM-914: one client per provider session. The session services' directories are the bind sources ending in `-session`;
+# every opener takes its lock in the one host directory mounted at SESSION_LOCKS, which the collectors' user owns.
+SESSION_LOCKS = "/run/deedkit/session-locks"
+SESSION_OWNER = (10001, 10001)  # deploy/compose.collectors.yaml and compose.whatsapp.yaml `user: "10001:10001"`
+SESSION_CLAIM = MESSAGING_PACKAGE + "/session_claim.py"
+CLAIM_RECORD = "session-claims.json"  # the first release carrying SESSION_CLAIM that this state recorded `applied`
+
+
+def binds(unit):
+    return [(volume["source"], volume["target"]) for volume in unit.get("volumes") or []
+            if isinstance(volume, dict) and volume.get("type") == "bind" and str(volume.get("source", "")).startswith("/")]
+
+
+def session_store(path, depth=2):
+    """Whether a host path holds a session store: it or an entry at most `depth` levels below is a Telegram `*.session`
+    file, a WhatsApp `auth.sqlite` or a whatsapp-web.js profile directory (`session`, `session-*`). Unreadable counts."""
+    name = os.path.basename(path)
+    if name.endswith(".session") or name == "auth.sqlite" or name != "session-locks" and re.fullmatch(r"session(-.*)?", name):
+        return True
+    if depth == 0 or os.path.islink(path) or not os.path.isdir(path):
+        return False
+    try:
+        with os.scandir(path) as entries:
+            found = [entry.path for entry in entries]
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return True
+    return any(session_store(entry, depth - 1) for entry in found)
+
+
+def started_units(settings, receipt, documents):
+    """(project, service, unit) of each service this apply stops and starts again: selected and not kept (ANYM-895)."""
+    return [(project, service, documents[project["name"]]["services"][service])
+            for project, item in zip(settings["projects"], receipt["projects"], strict=True)
+            for service in project["services"] if service not in (item.get("kept") or {})]
+
+
+def check_session_openers(settings, documents, started):
+    """`foreign_session_opener` (ANYM-914 criterion 6): before a release starts a session service, no running, paused or
+    restarting container mounts a configured session directory, or any bind source holding a session store, unless it is
+    that directory's Compose service container (not a one-off `run`, not another project, not a copied directory)."""
+    if not any(os.path.basename(source).endswith("-session") for _, _, unit in started for source, _ in binds(unit)):
+        return
+    owners = {}
+    for project in settings["projects"]:
+        for service, unit in documents[project["name"]]["services"].items():
+            for source, _ in binds(unit):
+                if os.path.basename(source).endswith("-session"):
+                    owners.setdefault(os.path.realpath(source), set()).add((project["name"], service))
+    containers = run(["docker", "ps", "--all", "--quiet", "--no-trunc"]).split()
+    for actual in json.loads(run(["docker", "inspect", *containers])) if containers else []:
+        condition, labels = actual.get("State") or {}, (actual.get("Config") or {}).get("Labels") or {}
+        if not (condition.get("Running") or condition.get("Paused") or condition.get("Restarting")):
+            continue
+        who = (None if labels.get("com.docker.compose.oneoff") == "True" else
+               (labels.get("com.docker.compose.project"), labels.get("com.docker.compose.service")))
+        for mount in actual.get("Mounts") or []:
+            source = os.path.realpath(mount.get("Source") or "/")
+            if mount.get("Type") != "bind" or who in owners.get(source, ()) or (
+                    source not in owners and not session_store(source)):
+                continue
+            what = "a configured session directory" if source in owners else "a session store"
+            raise Refused(f"foreign_session_opener: container {str(actual.get('Name', '')).lstrip('/')} "
+                          f"({str(actual.get('Id', ''))[:12]}, {'paused' if condition.get('Paused') else 'running'}) "
+                          f"mounts {source}, {what}, and is not that directory's Compose service container; stop or "
+                          "remove it before the release (two clients on one session break it)")
+
+
+def provide_session_locks(units):
+    """ANYM-914 criterion 3: the host directory these units mount at SESSION_LOCKS exists. Created once 0700 for
+    SESSION_OWNER, by prepare before it hashes the inputs (a directory that appears changes them) and checked again by
+    apply before its first stop; an existing one is never changed: refused unless it is that owner's private directory
+    (no symlink, no group or other access)."""
+    for path in sorted({source for unit in units for source, target in binds(unit)
+                        if posixpath.normpath(target) == SESSION_LOCKS}):
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise Refused(f"session_locks_unsafe: {path} cannot be created ({type(exc).__name__})") from exc
+        else:
+            try:
+                descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    os.fchown(descriptor, *SESSION_OWNER)
+                    os.fchmod(descriptor, 0o700)
+                finally:
+                    os.close(descriptor)
+            except OSError as exc:
+                raise Refused(f"session_locks_unsafe: {path} was created but not given to "
+                              f"{SESSION_OWNER[0]}:{SESSION_OWNER[1]} 0700 ({type(exc).__name__})") from exc
+        found = os.lstat(path)
+        if (not stat.S_ISDIR(found.st_mode) or found.st_mode & 0o077 or found.st_uid != SESSION_OWNER[0]):
+            raise Refused(f"session_locks_unsafe: {path} must be a directory (no symlink) of uid {SESSION_OWNER[0]} "
+                          "with no group or other access; it is left as it is")
+
+
+def claims_recorded(state):
+    """The release that first ran session claims here, recorded `applied` (healthy), or None. A release applied by an
+    older tool counts when the current one's source carries SESSION_CLAIM."""
+    if (state / CLAIM_RECORD).exists():
+        return read(state / CLAIM_RECORD)
+    current = read(state / "current.json") if (state / "current.json").exists() else {}
+    if current.get("status") == "applied" and RELEASE_DIRECTORY.fullmatch(str(current.get("sha"))) and (
+            state / current["sha"] / "source" / SESSION_CLAIM).is_file():
+        return {"sha": current["sha"]}
+    return None
+
+
+def check_pre_claim(state, carries, target, reason):
+    """`pre_claim_rollback_refused` (ANYM-914 criterion 6): once claims ran healthy, returning to a tree without
+    SESSION_CLAIM needs `--pre-claim-rollback "<reason>"`. `carries` is called only then. True: the reason let it pass."""
+    if not (first := claims_recorded(state)) or carries():
+        return False
+    if reason:
+        return True
+    raise Refused(f"pre_claim_rollback_refused: {first['sha'][:12]} ran session claims healthy and {target} lacks "
+                  f"{SESSION_CLAIM}; roll forward, or pass --pre-claim-rollback \"<reason>\" (only while one host runs "
+                  "sessions: it falls back to the per-directory locks)")
+
+
+def tree_carries(state, sha, path):
+    """Whether `sha`'s tree has `path`: its release checkout, else the source mirror. Unknown is False."""
+    if (state / sha / "source").is_dir():
+        return (state / sha / "source" / path).is_file()
+    try:
+        return bool(run(["git", "-C", str(state / "deploy-source.git"), "ls-tree", "--name-only", "-z", sha,
+                         path]).strip("\0"))
+    except Refused:
+        return False
+
+
+def apply(settings, sha, *, backup_waited=0, pre_claim=None):
     promotable(sha)
     state = Path(settings["state_directory"])
     release = state / sha
@@ -1972,6 +2108,10 @@ def apply(settings, sha, *, backup_waited=0):
     wait_for_calls(settings, deadline)
     for project, item in zip(settings["projects"], receipt["projects"], strict=True):
         check_inputs(project, item, documents[project["name"]])
+    # ANYM-914: no other opener holds a session this release starts, and the lock directory exists before any stop.
+    started = started_units(settings, receipt, documents)
+    check_session_openers(settings, documents, started)
+    provide_session_locks(unit for _, _, unit in started)
     write(release / "attempted.json", {"sha": sha, "ci": evidence, "status": "applying"})
     started, touched = {}, []
     for project, item in zip(settings["projects"], receipt["projects"], strict=True):
@@ -2041,8 +2181,12 @@ def apply(settings, sha, *, backup_waited=0):
         result.update(services=outcomes, boot_id=boot_id())
     if backup_waited:  # ANYM-744: only a release that waited for a running backup says so
         result["backup_wait_seconds"] = backup_waited
+    if pre_claim:  # ANYM-914: the reason a by-hand apply returned to a tree without session claims
+        result["pre_claim_rollback"] = pre_claim
     write(release / "result.json", result)
     write(state / "current.json", result)
+    if (release / "source" / SESSION_CLAIM).is_file() and not (state / CLAIM_RECORD).exists():
+        write(state / CLAIM_RECORD, {"sha": sha, "recorded_at": now()})
     return result
 
 
@@ -2557,7 +2701,14 @@ def rollback_restore(settings, release, sha, serving, plan):
                 raise Refused(f"{project['name']}/{service}, which the release kept, is not running steadily; inspect it")
 
 
-def rollback(settings, sha, http=None):
+def restored_revisions(plan):
+    """The revisions of the messaging images a rollback restores (their image label), None for an unlabelled one."""
+    return {((json.loads(run(["docker", "image", "inspect", image]))[0].get("Config") or {}).get("Labels") or {}).get(
+                REVISION_LABEL) for project, _, previous in plan for service, image in previous.items()
+            if project["services"][service] in MESSAGING_TARGETS}
+
+
+def rollback(settings, sha, http=None, *, pre_claim=None):
     """Return the current release's selected services to the images and configuration that ran before it, or
     those of a release whose apply failed its health wait (`unhealthy`), which never became current.
 
@@ -2567,9 +2718,15 @@ def rollback(settings, sha, http=None):
     """
     state, release, result, failed, serving, data = rollback_state(settings, sha, http)
     plan = rollback_plan(settings, release, data, failed)
+    # ANYM-914: the restore of a release that failed its health wait (`unhealthy`) is unchanged.
+    bypassed = not failed and check_pre_claim(state, lambda: all(
+        revision and RELEASE_DIRECTORY.fullmatch(revision) and tree_carries(state, revision, SESSION_CLAIM)
+        for revision in restored_revisions(plan)), "the release before " + sha[:12], pre_claim)
     rollback_restore(settings, release, sha, serving, plan)
     outcome = {"sha": sha, "status": "rolled-back", "rolled_back_at": now(),
                "previous_images": {project["name"]: previous for project, _, previous in plan}}
+    if bypassed:
+        outcome["pre_claim_rollback"] = pre_claim
     # ANYM-895: what the rollback left running because the release kept it; image retention keeps these too.
     if kept := {item["name"]: {service: running["image"] for service, running in item["running"].items()
                                if service in (item.get("kept") or {})} for item in data["projects"] if item.get("kept")}:
@@ -5865,7 +6022,7 @@ def host_locks(settings, http, s):
         yield
 
 
-def deploy(settings, http, *, auto=False, dry_run=False, attested=None, configs=(CONFIG, HTTP_CONFIG)):
+def deploy(settings, http, *, auto=False, dry_run=False, attested=None, configs=(CONFIG, HTTP_CONFIG), pre_claim=None):
     """Deploy the newest green main commit with plan A and then plan B, or pause with a reason (production.md)."""
     if PAUSE.exists():
         paused = {"status": "paused", "reason": PAUSE.read_text()[:1000].strip()}
@@ -5918,15 +6075,15 @@ def deploy(settings, http, *, auto=False, dry_run=False, attested=None, configs=
         targets = sorted(set(published_targets(settings)) | set(published_targets(http)) | {PROOF_TARGET})
         return deploy_locked(settings, http, s, auto=auto, dry_run=dry_run, halt=halt, configs=configs,
                              attested=attested or (lambda sha: [published(target, sha) for target in targets]),
-                             backup_waited=waited)
+                             backup_waited=waited, pre_claim=pre_claim)
 
 
-def deploy_locked(settings, http, s, *, auto, dry_run, attested, halt, configs, backup_waited=0):
+def deploy_locked(settings, http, s, *, auto, dry_run, attested, halt, configs, backup_waited=0, pre_claim=None):
     state = Path(settings["state_directory"])
     record = {}
     try:
         return deploy_steps(settings, http, s, auto=auto, dry_run=dry_run, attested=attested, halt=halt, record=record,
-                            configs=configs, backup_waited=backup_waited)
+                            configs=configs, backup_waited=backup_waited, pre_claim=pre_claim)
     except Exception as exc:
         # Every failure the steps do not classify themselves ends here: a pause, unless nothing changed yet
         # and it was the network.
@@ -6252,7 +6409,7 @@ def deploy_finish(settings, s, state, http_state, finish, served, preflight=None
     return outcome
 
 
-def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, configs, backup_waited=0):
+def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, configs, backup_waited=0, pre_claim=None):
     state, http_state = Path(settings["state_directory"]), Path(http["state_directory"])
     # A tool update that stopped between `activating` and `active` is settled before anything else.
     if reconciled := reconcile_tool(settings, configs, s, dry_run=dry_run, halt=halt):
@@ -6314,6 +6471,9 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
         if isinstance(pending[0], ManifestInvalid):
             return halt(reason, code="manifest_invalid", sha=candidate, **fields)
         return halt(reason, code="enroll_required", sha=candidate, **fields)
+    # ANYM-914: before a tool update or a preparation, refused as `deploy_refused` (nothing changed).
+    bypassed = candidate != base and check_pre_claim(state, lambda: tree_carries(state, candidate, SESSION_CLAIM),
+                                                     candidate, pre_claim)
     sql, pending = range_changes(mirror, since, candidate, installed)
     halted, plans = deploy_plan(settings, s, configs, mirror, base, since, candidate, sql, pending, dry_run, halt)
     if halted is not None:
@@ -6329,6 +6489,8 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
     record.update(sha=candidate, base=base, started_at=now(), status="deploying")
     if backup_waited:  # ANYM-744
         record["backup_wait_seconds"] = backup_waited
+    if bypassed:
+        record["pre_claim_rollback"] = pre_claim
     write(state / "deploy.json", record)
     finish, retry = deploy_closers(record, state, misses, halt)
     # ANYM-689: containers of retired HTTP generations and the images they pinned go before the disk check of the
@@ -7820,6 +7982,8 @@ def argument_parser():
     parser.add_argument("--apply", action="store_true", help="enroll: perform the plan named by --plan-digest")
     parser.add_argument("--plan-digest", help="enroll --apply: the plan_digest of the reviewed plan")
     parser.add_argument("--undo", action="store_true", help="enroll: reverse an applied enrollment")
+    parser.add_argument("--pre-claim-rollback", metavar="REASON",
+                        help="deploy, apply, rollback: return to a tree without session_claim.py after claims ran (ANYM-914)")
     parser.add_argument("--verifier", help="self-test: check this staged verifier build against the pin instead of "
                                            "the installed one (attest-verify install, production.md)")
     return parser
@@ -7872,13 +8036,17 @@ def locked_action(args):
             if not re.fullmatch(r"[0-9a-f]{40}", args.sha or ""):
                 raise Refused("an exact lowercase 40-character commit SHA is required")
             if args.action == "apply":
+                # ANYM-914: a by-hand apply returns to a tree without session claims like a deploy does.
+                bypassed = check_pre_claim(state, lambda: (state / args.sha / "source" / SESSION_CLAIM).is_file(),
+                                           args.sha, args.pre_claim_rollback)
                 # ANYM-744: wait for a running backup, then hold its lock for the whole apply (the call wait included).
                 with backup_gate(settings, backup_wait(settings)) as waited:
-                    result = apply(settings, args.sha, backup_waited=waited)
+                    result = apply(settings, args.sha, backup_waited=waited,
+                                   pre_claim=args.pre_claim_rollback if bypassed else None)
                     # Printed only: result.json and current.json stay the release receipts.
                     result = {**result, "image_removal": retain_images(settings)}
             else:
-                result = (rollback(settings, args.sha, http) if args.action == "rollback" else
+                result = (rollback(settings, args.sha, http, pre_claim=args.pre_claim_rollback) if args.action == "rollback" else
                           {"prepare": prepare, "prepare-router": prepare_router}[args.action](settings, args.sha))
     return result
 
@@ -7907,7 +8075,8 @@ def execute_action(args):
         if os.geteuid() != 0:
             raise Refused("deploy requires the production host operator")
         return deploy(config(args.config), http_release_tool().validate_settings(config(args.http_config)),
-                      auto=args.auto, dry_run=args.dry_run, configs=(args.config, args.http_config))
+                      auto=args.auto, dry_run=args.dry_run, configs=(args.config, args.http_config),
+                      pre_claim=args.pre_claim_rollback)
     return locked_action(args)
 
 

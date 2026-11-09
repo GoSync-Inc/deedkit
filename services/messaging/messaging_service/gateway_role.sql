@@ -132,3 +132,5 @@ GRANT INSERT(menu_choice) ON outgoing_messages TO messaging_gateway;
 GRANT SELECT,INSERT ON wake_targets TO messaging_gateway;
 GRANT UPDATE(thread,state,disabled_reason,confirmation,version,updated_at) ON wake_targets TO messaging_gateway;
 GRANT SELECT,INSERT,DELETE ON wake_target_subscriptions TO messaging_gateway;
+-- Schema 76 (ANYM-914): source status shows which host owns each provider session; read only.
+GRANT SELECT ON session_claims TO messaging_gateway;

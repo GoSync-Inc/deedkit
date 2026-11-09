@@ -17,10 +17,12 @@ type Config struct {
 	Account          string `json:"account"`
 	ExpectedWID      string `json:"expected_wid"`
 	SessionDirectory string `json:"session_directory"`
-	EventsDirectory  string `json:"events_directory"`
-	PagesDirectory   string `json:"pages_directory"`
-	MaxMediaBytes    int64  `json:"max_media_bytes"`
-	DiskReserveBytes int64  `json:"disk_reserve_bytes"`
+	// ANYM-914: the canonical host lock directory; empty means /run/deedkit/session-locks.
+	SessionLockDirectory string `json:"session_lock_directory"`
+	EventsDirectory      string `json:"events_directory"`
+	PagesDirectory       string `json:"pages_directory"`
+	MaxMediaBytes        int64  `json:"max_media_bytes"`
+	DiskReserveBytes     int64  `json:"disk_reserve_bytes"`
 	// ANYM-814: the collector's opt-in phone repair of unverified spans (default off).
 	GapRepair bool `json:"whatsapp_gap_repair"`
 }

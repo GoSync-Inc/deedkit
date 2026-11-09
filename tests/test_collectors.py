@@ -886,7 +886,11 @@ def telegram_session(tmp_path,mode):
 
 def run_telegram(monkeypatch,session,store):
     from messaging_service import telegram_collector as tc
-    monkeypatch.setattr(tc,'configuration',lambda _: ({'session_file':str(session)},{}))
+    locks=session.parent.parent/'session-locks'; locks.mkdir(mode=0o700,exist_ok=True)
+    boot=session.parent.parent/'boot_id'; boot.write_text('synthetic-boot\n')
+    monkeypatch.setattr(tc.session_claim,'BOOT_ID',boot)  # ANYM-914: the claim's host lock, synthetic
+    monkeypatch.setattr(tc,'configuration',lambda _: ({'session_file':str(session),'account':'telegram-test',
+        'session_lock_directory':str(locks)},{}))
     monkeypatch.setattr(tc,'Store',store)
     monkeypatch.setattr(tc,'TelethonProvider',lambda *_: pytest.fail('provider constructed'))
     dsn=session.parent.parent/'synthetic.dsn'; dsn.write_text('synthetic-not-a-connection')
@@ -1234,7 +1238,7 @@ def test_backup_covers_collector_positions_and_pending_deletions(worker,tmp_path
     directory=tmp_path/'snapshot'
     create_snapshot(s,directory,[sys.executable,'-c','print("unit-dump-stub")'])
     manifest=json.loads((directory/'manifest.json').read_text())
-    assert manifest['schema_version']==75
+    assert manifest['schema_version']==76
     assert manifest['tables']['collector_chats']['rows']==1
     assert manifest['tables']['provider_tombstones']['rows']==1
     assert verify_snapshot(s,directory)['status']=='verified'

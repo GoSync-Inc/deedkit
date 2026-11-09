@@ -79,7 +79,9 @@ V69_TABLES={'media_recovery':'job'}
 V70_TABLES={'subscription_activity':'subscription,day,platform,scope_version,metric'}
 # ANYM-848: an agent's own wake targets and their bindings (thread IDs, labels, states; no secret).
 V73_TABLES={'wake_targets':'id','wake_target_subscriptions':'wake_target,subscription'}
-SCHEMAS=range(2,76)
+# ANYM-914: one provider-session owner per account (host, boot and lock IDs, times; no secret).
+V76_TABLES={'session_claims':'account'}
+SCHEMAS=range(2,77)
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
 V17_TABLES={'message_conflicts':'receipt_digest'}
@@ -103,7 +105,7 @@ def database_manifest(c):
                        **(V35_TABLES if version>=35 else {}),
                        **(V37_TABLES if version>=37 else {}),
                        **(V38_TABLES if version>=38 else {}),**(V41_TABLES if version>=41 else {}),**(V42_TABLES if version>=42 else {}),**(V43_TABLES if version>=43 else {}),
-                       **(V44_TABLES if version>=44 else {}),**(V45_TABLES if version>=45 else {}),**(V48_TABLES if version>=48 else {}),**(V49_TABLES if version>=49 else {}),**(V50_TABLES if version>=50 else {}),**(V51_TABLES if version>=51 else {}),**(V53_TABLES if version>=53 else {}),**(V56_TABLES if version>=56 else {}),**(V57_TABLES if version>=57 else {}),**(V58_TABLES if version>=58 else {}),**(V61_TABLES if version>=61 else {}),**(V69_TABLES if version>=69 else {}),**(V70_TABLES if version>=70 else {}),**(V73_TABLES if version>=73 else {})}.items():
+                       **(V44_TABLES if version>=44 else {}),**(V45_TABLES if version>=45 else {}),**(V48_TABLES if version>=48 else {}),**(V49_TABLES if version>=49 else {}),**(V50_TABLES if version>=50 else {}),**(V51_TABLES if version>=51 else {}),**(V53_TABLES if version>=53 else {}),**(V56_TABLES if version>=56 else {}),**(V57_TABLES if version>=57 else {}),**(V58_TABLES if version>=58 else {}),**(V61_TABLES if version>=61 else {}),**(V69_TABLES if version>=69 else {}),**(V70_TABLES if version>=70 else {}),**(V73_TABLES if version>=73 else {}),**(V76_TABLES if version>=76 else {})}.items():
         query=sql.SQL('SELECT row_to_json(t) AS record FROM {} t ORDER BY {}').format(
             sql.Identifier(name),sql.SQL(',').join(sql.Identifier(part) for part in order.split(',')))
         sha=hashlib.sha256(); count=0
@@ -380,4 +382,7 @@ def quarantine_restore(store):
         # A snapshot can predate a key revocation. Never revive old credentials on restore.
         c.execute('UPDATE api_keys SET revoked=true')
         c.execute("UPDATE collector_leases SET expires_at=now()-interval '1 second'")
+        # ANYM-914: a restore never proves the original client stopped. Hold every claim (identity untouched) until
+        # `deedkit admin session-claim release`; a pre-claim backup is held by restored_disabled below.
+        if version>=76: c.execute('UPDATE session_claims SET restore_hold=true')
         c.execute("UPDATE source_status SET status='restored_disabled',coverage='unknown',detail_code='requires_reconciliation'")

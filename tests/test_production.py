@@ -1998,6 +1998,202 @@ def test_status_accepts_a_kept_service_on_the_revision_its_digest_names(tmp_path
     assert items["whatsapp1"]["mark"] == "differs from current.json"
 
 
+class SessionHost(KeepHost):
+    """`KeepHost` whose collectors bind their session directories and the canonical lock directory under
+    deploy/private, as compose.collectors.yaml and compose.whatsapp.yaml do (ANYM-914). Every container carries the
+    Compose labels and bind mounts Docker reports; `others` are containers outside the selected services."""
+
+    def __init__(self, tmp_path, monkeypatch):
+        super().__init__(tmp_path, monkeypatch)
+        self.private, self.others = tmp_path / "deploy" / "private", []
+        for service in KEEP_COLLECTORS:
+            (self.private / f"{service}-session").mkdir(parents=True)
+            self.units[service]["volumes"] = [
+                {"type": "bind", "source": str(self.private / f"{service}-session"), "target": "/sessions"},
+                {"type": "bind", "source": str(self.private / "session-locks"), "target": p.SESSION_LOCKS}]
+        self.write_compose()
+        monkeypatch.setattr(p, "SESSION_OWNER", (os.getuid(), os.getgid()))
+
+    def other(self, identity, source, state=None, **labels):
+        self.others.append({"Id": identity, "Name": "/" + identity, "Image": OLD_IMAGE, "State": state or {"Running": True},
+                            "Config": {"Labels": labels}, "Mounts": [{"Type": "bind", "Source": str(source),
+                                                                      "Destination": "/sessions"}]})
+
+    def run(self, argv, **kwargs):
+        for service, container in self.containers.items():
+            container.setdefault("Config", {}).setdefault("Labels", {}).update({
+                "com.docker.compose.project": "synthetic", "com.docker.compose.service": service,
+                "com.docker.compose.oneoff": "False"})
+            container.setdefault("Mounts", [{"Type": "bind", "Source": volume["source"], "Destination": volume["target"]}
+                                            for volume in self.units[service].get("volumes", [])])
+        everything = [*self.containers.values(), *self.others]
+        if argv == ["docker", "ps", "--all", "--quiet", "--no-trunc"]:
+            self.calls.append(argv)
+            return "".join(container["Id"] + "\n" for container in everything)
+        if argv[:2] == ["docker", "inspect"] and "--format" not in argv and (len(argv) > 3 or argv[2].startswith("other")):
+            self.calls.append(argv)
+            return json.dumps([next(item for item in everything if item["Id"] == identity) for identity in argv[2:]])
+        return super().run(argv, **kwargs)
+
+
+# spec: ANYM-914
+def test_a_first_release_on_a_host_without_session_locks_creates_the_directory_before_any_stop_and_starts_the_collectors(
+        tmp_path, monkeypatch):
+    host = SessionHost(tmp_path, monkeypatch)
+    locks, seen, run = host.private / "session-locks", [], host.run
+    for unit in host.units.values():
+        p.validate_runtime(unit)  # the mount sits inside the existing /run/deedkit root
+
+    def observed(argv, **kwargs):
+        if argv[:2] == ["docker", "compose"] and "stop" in argv:
+            seen.append(locks.is_dir())
+        return run(argv, **kwargs)
+    monkeypatch.setattr(p, "run", observed)
+    assert not os.path.lexists(locks)
+    result = host.release(RELEASES[0])
+    assert seen == [True] and sorted(host.stopped()) == sorted(KEEP_SERVICES)
+    found = os.lstat(locks)
+    assert stat.S_ISDIR(found.st_mode) and stat.S_IMODE(found.st_mode) == 0o700
+    assert (found.st_uid, found.st_gid) == p.SESSION_OWNER
+    assert all(host.containers[service]["State"]["Running"] and host.containers[service]["Image"] == host.image(RELEASES[0])
+               for service in KEEP_COLLECTORS) and result["status"] == "applied"
+    # A later release finds the directory and leaves it as it is.
+    host.files["services/messaging/messaging_service/app.py"] = ("100644", "APP = 2\n")
+    assert host.release(RELEASES[1])["status"] == "applied" and os.lstat(locks).st_ino == found.st_ino
+
+
+# spec: ANYM-914
+@pytest.mark.parametrize("case", ["group_readable", "symlink", "file"])
+def test_an_existing_session_lock_path_that_is_not_a_private_directory_refuses_before_any_stop_and_stays_as_it_is(
+        tmp_path, monkeypatch, case):
+    host = SessionHost(tmp_path, monkeypatch)
+    locks = host.private / "session-locks"
+    if case == "group_readable":
+        locks.mkdir(mode=0o700)
+        locks.chmod(0o750)
+    elif case == "symlink":
+        (tmp_path / "elsewhere").mkdir(mode=0o700)
+        locks.symlink_to(tmp_path / "elsewhere")
+    else:
+        locks.write_text("")
+    before = os.lstat(locks)
+    host.main = RELEASES[0]
+    with pytest.raises(p.Refused, match="session_locks_unsafe"):
+        p.prepare(host.settings, RELEASES[0])
+    assert host.stopped() == [] and not (host.state / RELEASES[0] / "prepared.json").exists()
+    assert (os.lstat(locks).st_mode, os.lstat(locks).st_uid) == (before.st_mode, before.st_uid)
+
+
+# spec: ANYM-914
+def test_a_session_lock_directory_opened_to_its_group_after_preparation_refuses_apply_before_any_stop(tmp_path, monkeypatch):
+    host = SessionHost(tmp_path, monkeypatch)
+    host.main = RELEASES[0]
+    p.prepare(host.settings, RELEASES[0])
+    (host.private / "session-locks").chmod(0o750)
+    with pytest.raises(p.Refused, match="session_locks_unsafe"):
+        p.apply(host.settings, RELEASES[0])
+    assert host.stopped() == [] and not (host.state / RELEASES[0] / "attempted.json").exists()
+    assert stat.S_IMODE(os.lstat(host.private / "session-locks").st_mode) == 0o750
+
+
+# spec: ANYM-914
+@pytest.mark.parametrize("case", ["pair_run", "paused_copy", "other_project", "restarting_native_copy"])
+def test_a_container_that_is_not_the_compose_service_of_a_session_directory_refuses_the_release_before_any_stop(
+        tmp_path, monkeypatch, case):
+    host = SessionHost(tmp_path, monkeypatch)
+    if case == "pair_run":  # `compose run` of telegram_pair on the service's own directory
+        host.other("other-pair", host.private / "telegram-session", **{
+            "com.docker.compose.project": "synthetic", "com.docker.compose.service": "telegram",
+            "com.docker.compose.oneoff": "True"})
+    elif case == "paused_copy":  # a legacy container on a copied session directory, paused
+        (host.private / "telegram-session.copy").mkdir()
+        (host.private / "telegram-session.copy" / "synthetic.session").write_text("")
+        host.other("other-legacy", host.private / "telegram-session.copy", {"Running": True, "Paused": True})
+    elif case == "other_project":
+        host.other("other-project", host.private / "whatsapp1-session", **{
+            "com.docker.compose.project": "legacy", "com.docker.compose.service": "whatsapp1"})
+    else:  # outside Compose, on a copy whose store sits one directory down
+        (host.private / "copy" / "whatsapp").mkdir(parents=True)
+        (host.private / "copy" / "whatsapp" / "auth.sqlite").write_text("")
+        host.other("other-native", host.private / "copy", {"Running": True, "Restarting": True})
+    host.main = RELEASES[0]
+    p.prepare(host.settings, RELEASES[0])
+    with pytest.raises(p.Refused, match="foreign_session_opener: container " + host.others[0]["Id"]):
+        p.apply(host.settings, RELEASES[0])
+    assert host.stopped() == [] and not (host.state / RELEASES[0] / "attempted.json").exists()
+
+
+# spec: ANYM-914
+def test_the_session_services_and_containers_without_a_session_store_pass_the_opener_check(tmp_path, monkeypatch):
+    host = SessionHost(tmp_path, monkeypatch)
+    (host.private / "exports").mkdir()
+    (host.private / "exports" / "notes.json").write_text("{}")
+    host.other("other-exports", host.private / "exports")  # no session store
+    host.other("other-pair", host.private / "telegram-session", {"Running": False, "Status": "exited"}, **{
+        "com.docker.compose.project": "synthetic", "com.docker.compose.service": "telegram",
+        "com.docker.compose.oneoff": "True"})  # an exited pair run opens nothing
+    (host.private / "telegram-session" / "synthetic.session").write_text("")
+    assert host.release(RELEASES[0])["status"] == "applied"
+    assert ["docker", "ps", "--all", "--quiet", "--no-trunc"] in host.calls
+    assert sorted(host.stopped()) == sorted(KEEP_SERVICES)
+
+
+# spec: ANYM-914
+def test_after_a_claim_release_ran_healthy_a_rollback_to_a_tree_without_claims_is_refused_unless_a_reason_is_given(
+        tmp_path, monkeypatch):
+    host = KeepHost(tmp_path, monkeypatch)
+    host.release(RELEASES[0])
+    assert not (host.state / p.CLAIM_RECORD).exists()
+    host.files[p.SESSION_CLAIM] = ("100644", "CLAIM = 1\n")
+    host.release(RELEASES[1])
+    assert p.read(host.state / p.CLAIM_RECORD)["sha"] == RELEASES[1]
+    host.order = []
+    with pytest.raises(p.Refused, match="pre_claim_rollback_refused"):
+        p.rollback(host.settings, RELEASES[1])
+    assert host.order == [] and not (host.state / RELEASES[1] / "rollback-attempted.json").exists()
+    outcome = p.rollback(host.settings, RELEASES[1], pre_claim="synthetic: one host runs sessions")
+    assert outcome["pre_claim_rollback"] == "synthetic: one host runs sessions"
+    assert p.read(host.state / RELEASES[1] / "rollback.json") == outcome
+    assert sorted(host.stopped()) == sorted(KEEP_COLLECTORS)
+    assert all(host.containers[service]["Image"] == host.image(RELEASES[0]) for service in KEEP_COLLECTORS)
+
+
+# spec: ANYM-914
+def test_a_rollback_between_two_claim_releases_needs_no_reason(tmp_path, monkeypatch):
+    host = KeepHost(tmp_path, monkeypatch)
+    host.files[p.SESSION_CLAIM] = ("100644", "CLAIM = 1\n")
+    host.release(RELEASES[0])
+    host.files["services/messaging/messaging_service/app.py"] = ("100644", "APP = 2\n")
+    host.release(RELEASES[1])
+    outcome = p.rollback(host.settings, RELEASES[1])
+    assert outcome["status"] == "rolled-back" and "pre_claim_rollback" not in outcome
+
+
+# spec: ANYM-914
+def test_the_restore_of_a_release_that_failed_its_health_wait_needs_no_reason_after_claims_ran(tmp_path, monkeypatch):
+    host = KeepHost(tmp_path, monkeypatch)
+    host.release(RELEASES[0])  # its tree has no session_claim.py
+    p.write(host.state / p.CLAIM_RECORD, {"sha": "9" * 40, "recorded_at": "2026-11-09T00:00:00Z"})
+    host.files["services/messaging/messaging_service/app.py"] = ("100644", "APP = 2\n")
+    host.main = RELEASES[1]
+    p.prepare(host.settings, RELEASES[1])
+    run = host.run
+
+    def fails(argv, **kwargs):
+        output = run(argv, **kwargs)
+        if argv[:2] == ["docker", "compose"] and "up" in argv:
+            raise p.Refused("docker failed (exit 1)")
+        return output
+    monkeypatch.setattr(p, "run", fails)
+    with pytest.raises(p.Refused, match="health wait"):
+        p.apply(host.settings, RELEASES[1])
+    monkeypatch.setattr(p, "run", run)
+    assert p.read(host.state / RELEASES[1] / "result.json")["status"] == "unhealthy"
+    outcome = p.rollback(host.settings, RELEASES[1])
+    assert outcome["status"] == "rolled-back" and "pre_claim_rollback" not in outcome
+    assert all(host.containers[service]["Image"] == host.image(RELEASES[0]) for service in KEEP_COLLECTORS)
+
+
 # ANYM-773: Compose as both tested versions behave. Default `config` inlines env files, prints `$` as `$$` and interpolates;
 # `--no-interpolate` keeps absolute references (a path starting with a variable keeps it after the project directory).
 ENV_CANARY = "synthetic-env-canary-773"
@@ -4293,6 +4489,30 @@ def test_documentation_about_migrations_is_not_an_sql_inventory_change(tmp_path,
     host = Deployer(tmp_path, monkeypatch, changes={NEWER: ["guide/migrations/synthetic-layout.md",
                                                             "services/messaging/migration-notes.md"]})
     assert host.deploy()["status"] == "deployed"
+
+
+# spec: ANYM-914
+def test_after_claims_ran_a_deploy_to_a_tree_without_session_claims_is_refused_before_any_step_unless_a_reason_is_given(
+        tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch, changes={NEWER: ["scripts/production.py"]})
+    p.write(host.state / p.CLAIM_RECORD, {"sha": BASE, "recorded_at": "2026-11-09T00:00:00Z"})
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and outcome["code"] == "deploy_refused"
+    assert "pre_claim_rollback_refused" in outcome["reason"] and host.steps == []  # not even the tool update
+    p.PAUSE.unlink()
+    host.changes = {}
+    outcome = host.deploy(pre_claim="synthetic: one host runs sessions")
+    assert outcome["status"] == "deployed" and outcome["pre_claim_rollback"] == "synthetic: one host runs sessions"
+    assert p.read(host.state / "deploy.json")["pre_claim_rollback"] == "synthetic: one host runs sessions"
+
+
+# spec: ANYM-914
+def test_a_deploy_to_a_tree_that_carries_session_claims_needs_no_reason(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    p.write(host.state / p.CLAIM_RECORD, {"sha": BASE, "recorded_at": "2026-11-09T00:00:00Z"})
+    host.contents[f"{NEWEST}:{p.SESSION_CLAIM}"] = "CLAIM = 1\n"
+    outcome = host.deploy()
+    assert outcome["status"] == "deployed" and "pre_claim_rollback" not in outcome
 
 
 MIGRATION_DIRECTORY = "services/messaging/messaging_service/migrations/"

@@ -844,3 +844,78 @@ def test_wake_targets_list_disable_enable_run_the_messaging_operator_commands(tm
     assert admin.main(base + ["disable", "not-a-uuid"], run=run) == 2
     assert admin.main(base + ["enable"], run=run) == 2
     assert admin.main(base + ["enable", target, "--all"], run=run) == 2 and len(calls) == 4
+
+
+HOST = "a" * 32
+CLAIM = {"account": "tg-main", "host_id": HOST, "boot_id": "boot-1", "lock_ref": "64:12", "holder_id": "b" * 32,
+         "holder_kind": "collector", "generation": 3, "claimed_at": "2026-11-09T10:00:00+00:00",
+         "seen_at": "2026-11-09T10:05:00+00:00", "released_at": None, "released_by": None, "restore_hold": False,
+         "waiting_host_id": None, "waiting_since": None}
+
+
+def claim_admin(tmp_path, listed, released=True):
+    config = tmp_path / "admin.json"
+    config.write_text("{}")
+    config.chmod(0o600)
+    calls = []
+    def run(service, args, data=None):
+        calls.append(args)
+        if args[0] == "session-claim-list":
+            return listed
+        return {"account": args[2], "released": released}
+    return ["--config", str(config), "session-claim"], run, calls
+
+
+# spec: ANYM-914
+def test_session_claim_list_is_read_only_and_release_compares_the_generation_and_holder_read(tmp_path, capsys):
+    base, run, calls = claim_admin(tmp_path, {"items": [CLAIM], "restored_without_claim": []})
+    assert admin.main(base + ["list"], run=run) == 0
+    assert json.loads(capsys.readouterr().out)["items"][0]["generation"] == 3 and calls == [["session-claim-list"]]
+    assert admin.main(base + ["release", "--account", "tg-main", "--other-host-down", HOST], run=run) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["released"] is True
+    assert calls[-1] == ["session-claim-release", "--account", "tg-main", "--generation", "3", "--holder-id", "b" * 32,
+                         "--host-id", HOST]
+    assert "released account=tg-main" in captured.err and "boot-1" in captured.err
+
+
+# spec: ANYM-914
+def test_session_claim_release_with_a_stale_read_is_refused(tmp_path, capsys):
+    base, run, calls = claim_admin(tmp_path, {"items": [CLAIM], "restored_without_claim": []}, released=False)
+    assert admin.main(base + ["release", "--account", "tg-main", "--other-host-down", HOST], run=run) == 2
+    assert "row changed since it was read" in capsys.readouterr().err and calls[-1][0] == "session-claim-release"
+
+
+# spec: ANYM-914
+def test_session_claim_release_clears_a_restore_hold_with_or_without_an_existing_row(tmp_path, capsys):
+    held = dict(CLAIM, restore_hold=True, released_at="2026-11-09T09:00:00+00:00", released_by="holder")
+    base, run, calls = claim_admin(tmp_path, {"items": [held], "restored_without_claim": []})
+    assert admin.main(base + ["release", "--account", "tg-main", "--other-host-down", HOST], run=run) == 0
+    assert calls[-1][:3] == ["session-claim-release", "--account", "tg-main"] and "--generation" in calls[-1]
+    base, run, calls = claim_admin(tmp_path, {"items": [], "restored_without_claim": ["wa-main"]})
+    assert admin.main(base + ["release", "--account", "wa-main", "--other-host-down", "wa-main"], run=run) == 0
+    assert calls[-1] == ["session-claim-release", "--account", "wa-main"]
+    capsys.readouterr()
+    # Neither a row nor a restored account: nothing to release.
+    assert admin.main(base + ["release", "--account", "other", "--other-host-down", "other"], run=run) == 2
+    assert len(calls) == 3
+
+
+# spec: ANYM-914
+def test_session_claim_release_without_the_flag_refuses_on_a_non_tty_and_asks_on_a_tty(tmp_path, capsys, monkeypatch):
+    base, run, calls = claim_admin(tmp_path, {"items": [CLAIM], "restored_without_claim": []})
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    assert admin.main(base + ["release", "--account", "tg-main"], run=run) == 2
+    assert "--other-host-down" in capsys.readouterr().err and calls == [["session-claim-list", "--account", "tg-main"]]
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "wrong")
+    assert admin.main(base + ["release", "--account", "tg-main"], run=run) == 2 and len(calls) == 2
+    monkeypatch.setattr("builtins.input", lambda prompt="": HOST)
+    assert admin.main(base + ["release", "--account", "tg-main"], run=run) == 0 and calls[-1][0] == "session-claim-release"
+
+
+# spec: ANYM-914
+def test_session_claim_release_with_a_mismatching_other_host_down_refuses_before_any_write(tmp_path, capsys):
+    base, run, calls = claim_admin(tmp_path, {"items": [CLAIM], "restored_without_claim": []})
+    assert admin.main(base + ["release", "--account", "tg-main", "--other-host-down", "c" * 32], run=run) == 2
+    assert "does not match" in capsys.readouterr().err and [c[0] for c in calls] == ["session-claim-list"]

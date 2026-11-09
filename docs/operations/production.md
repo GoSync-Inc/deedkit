@@ -1103,6 +1103,24 @@ image/config ([platform-cutover.md](platform-cutover.md)). Do not use `down -v`,
 prune unrelated objects or restart a stale calendar writer. Keep the previous
 images until acceptance.
 
+### Session claim guards (ANYM-914)
+
+A release that runs the session services (the collectors and pairing commands, schema 76) gets three refusals from
+`production.py`; each surfaces as the existing `plan_a_refused` halt with its code in the reason:
+
+- `session_locks_unsafe`: the host directory mounted at `/run/deedkit/session-locks` (`deploy/private/session-locks`)
+  is created once, 0700 for uid 10001, by `prepare` and checked again by `apply`; an existing one that is a symlink, not
+  a directory, group- or other-accessible or of another owner is refused, never repaired. Fix it by hand
+  (`chown 10001:10001`, `chmod 700`); never copy it from another host.
+- `foreign_session_opener`: before a release restarts a service with a `-session` bind, no running, paused or
+  restarting container other than that directory's own Compose service may mount the session directory or a bind source
+  holding a session store (`*.session`, `auth.sqlite`, a browser profile). Stop the one-off or foreign container first.
+- `pre_claim_rollback_refused`: once a release ran claims healthy (`state/session-claims.json`), `rollback`, `deploy`
+  and a by-hand `apply` to a tree without `session_claim.py` need `--pre-claim-rollback "<reason>"`, and only while one
+  host runs sessions (an older tree takes no claim, so a second host could open the same session).
+
+An unreadable container listing or claims record refuses too, so it halts deploys until the agent clears the cause.
+
 ### Waiting for a running backup (ANYM-744)
 
 `apply`, the standalone `seamless_release.py promote` and a manual `deploy` (not `--auto`, not `--dry-run`) wait up to

@@ -7,6 +7,8 @@ services:
     command: [python, -m, messaging_service.telegram_collector, --config, /run/secrets/telegram_config]
     init: true
     restart: unless-stopped
+    # ANYM-914: above the 15 s disconnect bound, so a host shutdown ends in a clean claim release.
+    stop_grace_period: 25s
     depends_on:
       db: {condition: service_healthy}
     environment:
@@ -18,6 +20,8 @@ services:
       - ./private/telegram.credentials.json:/run/secrets/telegram_credentials:ro
       - ./private/telegram.permit.json:/run/secrets/telegram_permit:ro
       - ./private/telegram-session:/sessions
+      # ANYM-914: the canonical host lock directory, one per host, shared by every session opener.
+      - ./private/session-locks:/run/deedkit/session-locks
       - collector_spool:/spool
       - files:/data
       - file_uploads:/data/files/.uploads:ro
