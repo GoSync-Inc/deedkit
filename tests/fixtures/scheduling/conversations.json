@@ -2018,6 +2018,100 @@
   ]
  },
  {
+  "id": "ru-two-refinements-inside-one-option-stay-ambiguous-twelve-first",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-two-refinements-inside-one-option-stay-ambiguous-twelve-first-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай в пятницу",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-13T00:00:00+00:00",
+       "2026-11-14T00:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-two-refinements-inside-one-option-stay-ambiguous-twelve-first-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ок, в пятницу в 12 или в 14",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [
+      [
+       "2026-11-13T00:00:00+00:00",
+       "2026-11-14T00:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-two-refinements-inside-one-option-stay-ambiguous-fourteen-first",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-two-refinements-inside-one-option-stay-ambiguous-fourteen-first-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай в пятницу",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-13T00:00:00+00:00",
+       "2026-11-14T00:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-two-refinements-inside-one-option-stay-ambiguous-fourteen-first-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ок, в пятницу в 14 или в 12",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [
+      [
+       "2026-11-13T00:00:00+00:00",
+       "2026-11-14T00:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
   "id": "en-call-counter-agreed",
   "chat_type": "private",
   "owner_zone": "Europe/Lisbon",

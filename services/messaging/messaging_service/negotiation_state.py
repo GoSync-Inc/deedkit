@@ -123,11 +123,13 @@ def _accept(neg, source):
             # An "ok" naming a time nobody offered is a new offer, not an agreement.
             _counter(neg, source)
         elif len(selected) == 1:
-            # A named time inside the option narrows it («ок, среда 10:00» inside «в среду утром»); a broader one never
-            # widens it («ок, в пятницу» keeps the offered 12:00).
+            # One named time inside the option narrows it («ок, среда 10:00» inside «в среду утром»); a broader one
+            # never widens it («ок, в пятницу» keeps the offered 12:00); two inside it («ок, в 12 или в 14») select
+            # no single time, so the agreement stays ambiguous.
             option = selected[0]
-            narrower = [o for o in named if _inside(o, option) and _key(o) != _key(option)]
-            _agree(neg, source, _entry(narrower[0], source, 'agreed') if narrower else option, False)
+            narrower = {_key(o): o for o in named if _inside(o, option) and _key(o) != _key(option)}
+            if len(narrower) > 1:_agree(neg, source, None, True)
+            else:_agree(neg, source, _entry(next(iter(narrower.values())), source, 'agreed') if narrower else option, False)
         else:
             _agree(neg, source, None, True)
     elif len(current) == 1:
