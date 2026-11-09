@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -317,6 +319,23 @@ func TestNativeTextProtocolRejectsUnknownFieldsAndTrailingJSON(t *testing.T) {
 		if decodeStrict(json.RawMessage(raw), &r) == nil {
 			t.Fatalf("accepted %s", raw)
 		}
+	}
+}
+
+// spec: ANYM-837
+func TestNativeMenuChoiceDecodesThePythonCollectorsSendText(t *testing.T) {
+	// tests/test_menu_choice.py writes the params the Python collector sends and
+	// asserts they equal this file; the native adapter must accept them strictly.
+	raw, err := os.ReadFile(filepath.Join("..", "..", "tests", "fixtures", "menu-send-text.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var r textRequest
+	if err := decodeStrict(json.RawMessage(raw), &r); err != nil {
+		t.Fatal(err)
+	}
+	if r.MenuChoice == nil || r.MenuChoice.OptionID != "card_1" || r.MenuChoice.Label != r.Text || r.MenuChoice.MenuType != "list" || r.ReplyProviderID == "" {
+		t.Fatalf("%+v %+v", r, r.MenuChoice)
 	}
 }
 

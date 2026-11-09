@@ -2,6 +2,7 @@
 PostgreSQL, fake adapters; no provider, session or send)."""
 import asyncio
 import importlib.util
+import json
 import re
 from pathlib import Path
 
@@ -255,6 +256,9 @@ def test_only_the_native_adapter_gets_the_choice_and_a_provider_switch_or_telegr
     assert sent[0][0] == 'send_text' and sent[0][1]['menu_choice'] == {'option_id': 'card_1', 'label': CARDIOLOGY,
         'menu_type': 'list'}
     assert sent[0][1]['text'] == CARDIOLOGY and sent[0][1]['reply_provider_id'] == f'false_{BOT}_MENU1'
+    # The native adapter decodes these params strictly (send_test.go reads the same file).
+    fixture = json.loads((ROOT / 'tests/fixtures/menu-send-text.json').read_text())
+    assert {**sent[0][1], 'send_id': 'synthetic', 'expires_at': 1} == fixture
     sent.clear()
     with pytest.raises(SendRejected, match='menu_choice_unsupported'):
         asyncio.run(through(collector('webjs', sent), dict(job)))
