@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -16,6 +17,9 @@ import (
 	"go.mau.fi/whatsmeow"
 	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	waHistorySync "go.mau.fi/whatsmeow/proto/waHistorySync"
+	waWeb "go.mau.fi/whatsmeow/proto/waWeb"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/encoding/protowire"
@@ -128,6 +132,213 @@ func TestNativeAlbumParentAndHistoryNoticeAreServiceEvents(t *testing.T) {
 			t.Fatal(err)
 		}
 		requireFields(t, v, map[string]any{"messageType": kind, "isService": true, "hasMedia": false, "body": ""})
+	}
+}
+
+var groupJID = types.NewJID("120363000000000009", types.GroupServer)
+
+func member(user string) types.JID { return types.NewJID(user, types.DefaultUserServer) }
+
+// groupEntries returns the journaled group-change entries in journal order.
+func groupEntries(t *testing.T, s *CaptureStore) []map[string]any {
+	t.Helper()
+	rows, err := s.db.Query("SELECT envelope FROM capture ORDER BY seq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var data []byte
+		var v map[string]any
+		if err = rows.Scan(&data); err != nil || json.Unmarshal(data, &v) != nil {
+			t.Fatal("unreadable journal entry", err)
+		}
+		if event, _ := v["event"].(map[string]any); event["messageType"] == "group_change" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func groupChangeOf(t *testing.T, entry map[string]any) map[string]any {
+	t.Helper()
+	event := entry["event"].(map[string]any)
+	requireArchivable(t, event)
+	if entry["origin"] == "live" && (event["isService"] != true || event["chatId"] != "120363000000000009@g.us" || event["body"] != "") {
+		t.Fatalf("not a live service entry in the group: %#v", event)
+	}
+	change, ok := event["groupChange"].(map[string]any)
+	if !ok {
+		t.Fatalf("no groupChange: %#v", event)
+	}
+	return change
+}
+
+func participantsOf(change map[string]any) string {
+	var ids []string
+	for _, id := range change["participants"].([]any) {
+		ids = append(ids, id.(string))
+	}
+	return strings.Join(ids, ",")
+}
+
+// spec: ANYM-869
+func TestNativeGroupInfoChangesAreJournaledOnceEachWithActorAndParticipants(t *testing.T) {
+	p := skipProvider(t)
+	admin, alice, bob := member("333333"), member("444444"), member("555555")
+	at := time.Unix(1700000100, 0)
+	name, topic := "Родители 5Б", "Собрание в пятницу\nв 18:00"
+	cases := []struct {
+		change, actor, participants string
+		value                       any
+		event                       events.GroupInfo
+	}{
+		{"rename", "333333@c.us", "", name, events.GroupInfo{Sender: &admin, Name: &types.GroupName{Name: name}}},
+		{"topic", "333333@c.us", "", topic, events.GroupInfo{Sender: &admin, Topic: &types.GroupTopic{Topic: topic}}},
+		{"join", "444444@c.us", "444444@c.us", nil, events.GroupInfo{Sender: &alice, JoinReason: "invite", Join: []types.JID{alice}}},
+		{"leave", "444444@c.us", "444444@c.us", nil, events.GroupInfo{Sender: &alice, Leave: []types.JID{alice}}},
+		{"add", "333333@c.us", "444444@c.us,555555@c.us", nil, events.GroupInfo{Sender: &admin, Join: []types.JID{bob, alice}}},
+		{"remove", "333333@c.us", "555555@c.us", nil, events.GroupInfo{Sender: &admin, Leave: []types.JID{bob}}},
+		{"promote", "333333@c.us", "444444@c.us", nil, events.GroupInfo{Sender: &admin, Promote: []types.JID{alice}}},
+		{"demote", "333333@c.us", "444444@c.us", nil, events.GroupInfo{Sender: &admin, Demote: []types.JID{alice}}},
+	}
+	for i, c := range cases {
+		e := c.event
+		e.JID, e.Timestamp = groupJID, at.Add(time.Duration(i)*time.Second)
+		if !p.handleGroupEvent(&e) {
+			t.Fatal("handler refused", c.change)
+		}
+		entries := groupEntries(t, p.Capture)
+		if len(entries) != i+1 {
+			t.Fatalf("%s: %d entries, want %d", c.change, len(entries), i+1)
+		}
+		got := groupChangeOf(t, entries[i])
+		if entries[i]["origin"] != "live" || got["change"] != c.change || got["actor"] != c.actor || participantsOf(got) != c.participants || got["value"] != c.value {
+			t.Fatalf("%s: %#v origin=%v", c.change, got, entries[i]["origin"])
+		}
+		if id := entries[i]["event"].(map[string]any)["messageId"]; id != fmt.Sprintf("group_120363000000000009@g.us_%d_%s", e.Timestamp.Unix(), c.change) {
+			t.Fatalf("%s: provider ID %v is not derived from group, time and change", c.change, id)
+		}
+		// A redelivered notification is the same entry.
+		if !p.handleGroupEvent(&e) || len(groupEntries(t, p.Capture)) != i+1 {
+			t.Fatal("redelivery journaled a second entry", c.change)
+		}
+	}
+	// One notification with several changes: one entry each, in a stable order.
+	multi := events.GroupInfo{JID: groupJID, Timestamp: time.Unix(1700000200, 0), Sender: &admin, Name: &types.GroupName{Name: "Новое имя"}, Promote: []types.JID{bob}, Join: []types.JID{alice, admin}, Locked: &types.GroupLocked{IsLocked: true}}
+	if !p.handleGroupEvent(&multi) {
+		t.Fatal("handler refused")
+	}
+	entries := groupEntries(t, p.Capture)[len(cases):]
+	var order []string
+	for _, entry := range entries {
+		order = append(order, groupChangeOf(t, entry)["change"].(string))
+	}
+	if strings.Join(order, ",") != "rename,join,add,promote" {
+		t.Fatal("multi-change order", order)
+	}
+	if got := groupChangeOf(t, entries[1]); participantsOf(got) != "333333@c.us" {
+		t.Fatal("the actor's own add is a join", got)
+	}
+	// A settings-only change (cut from the card) is not archived and not counted.
+	settings := events.GroupInfo{JID: groupJID, Timestamp: time.Unix(1700000300, 0), Sender: &admin, Ephemeral: &types.GroupEphemeral{IsEphemeral: true, DisappearingTimer: 86400}}
+	if !p.handleGroupEvent(&settings) || len(groupEntries(t, p.Capture)) != len(cases)+4 || len(skipCounts(t, p.Capture)) != 0 {
+		t.Fatal("settings change archived or counted")
+	}
+}
+
+// spec: ANYM-869
+func TestNativeJoinedGroupIsJournaledWithItsNameAndMembers(t *testing.T) {
+	p := skipProvider(t)
+	admin := member("333333")
+	joined := &events.JoinedGroup{Sender: &admin, GroupInfo: types.GroupInfo{JID: groupJID, GroupName: types.GroupName{Name: "Кружок робототехники"}, ParticipantVersionID: "1700000400123", GroupCreated: time.Unix(1690000000, 0),
+		Participants: []types.GroupParticipant{{JID: member("555555")}, {JID: admin, IsAdmin: true}, {JID: member("123456")}}}}
+	if !p.handleGroupEvent(joined) || !p.handleGroupEvent(joined) {
+		t.Fatal("handler refused")
+	}
+	entries := groupEntries(t, p.Capture)
+	if len(entries) != 1 {
+		t.Fatalf("%d entries for one join", len(entries))
+	}
+	got := groupChangeOf(t, entries[0])
+	if got["change"] != "joined_group" || got["value"] != "Кружок робототехники" || got["actor"] != "333333@c.us" || participantsOf(got) != "123456@c.us,333333@c.us,555555@c.us" {
+		t.Fatalf("%#v", got)
+	}
+	var title string
+	p.Capture.db.QueryRow("SELECT title FROM chats WHERE chat=?", "120363000000000009@g.us").Scan(&title)
+	if title != "Кружок робототехники" {
+		t.Fatal("local dialog title not set from the join", title)
+	}
+}
+
+// spec: ANYM-869
+func TestNativeHistoryGroupStubMapsToTheLiveEntry(t *testing.T) {
+	p := skipProvider(t)
+	owner := p.Capture.Owner
+	p.Client = nativeClient(&store.Device{ID: &owner})
+	admin := member("333333")
+	live := events.GroupInfo{JID: groupJID, Timestamp: time.Unix(1700000500, 0), Sender: &admin, Name: &types.GroupName{Name: "Дача"}}
+	if !p.handleGroupEvent(&live) {
+		t.Fatal("handler refused")
+	}
+	stub := func(id string, at uint64, kind waWeb.WebMessageInfo_StubType, params ...string) *waHistorySync.HistorySyncMsg {
+		return &waHistorySync.HistorySyncMsg{Message: &waWeb.WebMessageInfo{Key: &waCommon.MessageKey{RemoteJID: proto.String(groupJID.String()), ID: proto.String(id)}, Participant: proto.String("333333@s.whatsapp.net"), MessageTimestamp: proto.Uint64(at), MessageStubType: kind.Enum(), MessageStubParameters: params}}
+	}
+	data := &waHistorySync.HistorySync{Conversations: []*waHistorySync.Conversation{{ID: proto.String(groupJID.String()), Messages: []*waHistorySync.HistorySyncMsg{
+		stub("STUB1", 1700000500, waWeb.WebMessageInfo_GROUP_CHANGE_SUBJECT, "Дача"),
+		stub("STUB2", 1700000400, waWeb.WebMessageInfo_GROUP_PARTICIPANT_ADD, "444444@s.whatsapp.net"),
+	}}}}
+	for range 2 {
+		if err := p.captureHistory(data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries := groupEntries(t, p.Capture)
+	if len(entries) != 2 {
+		t.Fatalf("%d entries, want the live rename and one backfilled add", len(entries))
+	}
+	rename, add := entries[0]["event"].(map[string]any), entries[1]["event"].(map[string]any)
+	if rename["messageId"] != "group_120363000000000009@g.us_1700000500_rename" || entries[0]["origin"] != "live" {
+		t.Fatal("history stub did not map to the live entry", rename["messageId"], entries[0]["origin"])
+	}
+	got := groupChangeOf(t, entries[1])
+	if add["messageId"] != "group_120363000000000009@g.us_1700000400_add" || entries[1]["origin"] != "backfill" || got["actor"] != "333333@c.us" || participantsOf(got) != "444444@c.us" {
+		t.Fatalf("backfilled stub: %v %v %#v", add["messageId"], entries[1]["origin"], got)
+	}
+	var rows int
+	p.Capture.db.QueryRow("SELECT COUNT(*) FROM capture").Scan(&rows)
+	if rows != 2 {
+		t.Fatal("history stub also journaled as a bare notification", rows)
+	}
+}
+
+// spec: ANYM-869
+func TestNativeMalformedGroupChangeIsCountedAndTheNextMessageIsCaptured(t *testing.T) {
+	p := skipProvider(t)
+	admin := member("333333")
+	for _, bad := range []any{
+		&events.GroupInfo{JID: groupJID, Sender: &admin, Name: &types.GroupName{Name: "x"}},                                                     // no time
+		&events.GroupInfo{JID: member("777777"), Timestamp: time.Unix(1700000600, 0), Sender: &admin, Name: &types.GroupName{Name: "x"}},        // not a group
+		&events.GroupInfo{JID: groupJID, Timestamp: time.Unix(1700000600, 0), Sender: &admin, Join: []types.JID{types.NewJID("bad\x00", "x")}}, // unusable member ID
+		&events.JoinedGroup{},
+	} {
+		// true: whatsmeow acknowledges it once and never redelivers it.
+		if !p.handleGroupEvent(bad) {
+			t.Fatalf("malformed group change refused: %#v", bad)
+		}
+	}
+	if got := skipCounts(t, p.Capture); got["skipped_group_change"] != 4 || len(got) != 1 {
+		t.Fatal(got)
+	}
+	if n := spoolFiles(t, p.Config.EventsDirectory); n != 0 || !p.ready.Load() {
+		t.Fatal("malformed change exported or provider stopped", n)
+	}
+	if err := p.handleMessage(fixtureMessage("after", 1700000601)); err != nil {
+		t.Fatal(err)
+	}
+	if n := spoolFiles(t, p.Config.EventsDirectory); n != 1 {
+		t.Fatal("message after a malformed change not captured", n)
 	}
 }
 
