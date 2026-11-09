@@ -1,4 +1,5 @@
 """Synthetic original residency, crash replay and bounded rehydration contracts."""
+from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
 import json
 import os
@@ -6,12 +7,13 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+from threading import Event
 
 import pytest
 
 from messaging_service.media_retry import MEDIA_MAX_ATTEMPTS
 
-from test_archive import archive as archive, event
+from test_archive import archive as archive, event, finished_or_waiting
 
 
 def lifecycle():
@@ -650,6 +652,115 @@ def test_new_shared_occurrence_cannot_publish_ready_after_preflight_eviction(arc
     with s.pool.connection() as c:
         assert c.execute('SELECT state FROM media_jobs WHERE id=%s',(job['id'],)).fetchone()['state']=='leased'
         assert c.execute('SELECT count(*) AS n FROM attachments WHERE id=%s',(job['id'],)).fetchone()['n']==0
+
+
+def evict_with(s, during):
+    """One applied eviction pass; its final locked transaction runs `during()` after the unlink, before the mark."""
+    worker=lifecycle().LifecycleWorker(s);mark=worker._mark_evicted
+    def paused(c,row):during();mark(c,row)
+    worker._mark_evicted=paused
+    return worker.run_once(apply=True)
+
+
+def leased_download(ar, s, provider_id, payload):
+    """A queued original of a new message, leased and written, ready for finish_media."""
+    from messaging_service.blobs import BlobWriter
+    ar.ingest(event(provider_id=provider_id,media=[{'provider_id':'asset-'+provider_id,'filename':'Racing.txt',
+        'mime':'text/plain','bytes':len(payload)}]))
+    job=ar.claim_media('fixture');writer=BlobWriter(s.files,reserve_bytes=0)
+    return job,writer.write([payload]),writer
+
+
+# spec: ANYM-839
+@pytest.mark.parametrize('edit',['adds_media','text_only'])
+def test_an_edit_of_a_message_whose_file_is_being_evicted_waits_for_the_eviction(archive,edit):
+    ar,s,_,_=archive;fid,blob=processed(archive)
+    kept={'provider_id':'asset-lifecycle-1','filename':'Synthetic.txt','mime':'text/plain','bytes':blob.bytes}
+    media=[kept,{'provider_id':'asset-added','filename':'Added.txt','mime':'text/plain','bytes':5}] if edit=='adds_media' else []
+    envelope=event(provider_id='lifecycle-1',body='Edited during eviction',updated_at='2026-10-01T12:05:00+00:00',media=media)
+    seen={}
+    with ThreadPoolExecutor(max_workers=1) as threads:
+        def during():
+            seen['ingest']=finished_or_waiting(threads,s,lambda:ar.ingest(envelope))
+            seen['waited']=not seen['ingest'].done()
+        assert evict_with(s,during)['evicted']==1
+        assert seen['ingest'].result(timeout=10)['outcome']=='edited'
+    assert seen['waited']
+    assert eviction_state(s,blob.digest)==('evicted',['completed'],False)
+    with s.pool.connection() as c:
+        assert c.execute('SELECT active FROM attachments WHERE id=%s',(fid,)).fetchone()['active'] is (edit=='adds_media')
+        added=c.execute("SELECT state FROM media_jobs WHERE descriptor->>'provider_id'='asset-added'").fetchone()
+    assert added==({'state':'queued'} if edit=='adds_media' else None)
+
+
+# spec: ANYM-839
+def test_finish_media_racing_an_eviction_waits_while_text_ingest_goes_on(archive):
+    ar,s,_,_=archive;_,blob=processed(archive)
+    ar.register('archive-other','telegram','Synthetic other',include_chats=['100'])
+    job,racing,writer=leased_download(ar,s,'racing',b'Racing synthetic payload')
+    seen={}
+    with ThreadPoolExecutor(max_workers=2) as threads:
+        def during():
+            seen['finish']=finished_or_waiting(threads,s,lambda:ar.finish_media(job,racing,writer))
+            seen['waited']=not seen['finish'].done()
+            # Text goes on meanwhile. Here another account's: the eviction's lock_lifecycle_sources (033) also holds
+            # the account lock of the original's own account until it commits.
+            seen['text']=threads.submit(ar.ingest,event(account='archive-other',provider_id='text-during-eviction')).result(timeout=4)
+        assert evict_with(s,during)['evicted']==1
+        seen['finish'].result(timeout=10)
+    assert seen['waited'] and seen['text']['outcome']=='created'
+    assert eviction_state(s,blob.digest)==('evicted',['completed'],False)
+    with s.pool.connection() as c:
+        assert c.execute('SELECT state FROM media_jobs WHERE id=%s',(job['id'],)).fetchone()['state']=='ready'
+
+
+def paused_after_account_lock(store, account, entered, release):
+    """`store` whose first `archive:<account>` lock statement, once it ran, waits for `release`."""
+    from contextlib import contextmanager
+    class Connection:
+        def __init__(self,inner):self.inner=inner
+        def __getattr__(self,name):return getattr(self.inner,name)
+        def execute(self,query,params=None,**kwargs):
+            result=self.inner.execute(query,params,**kwargs)
+            if params==('archive:'+account,) and not entered.is_set():
+                entered.set();assert release.wait(15)
+            return result
+    class Pool:
+        conninfo=store.pool.conninfo
+        @contextmanager
+        def connection(self):
+            with store.pool.connection() as inner:yield Connection(inner)
+    class Paused:
+        pool=Pool()
+        def __getattr__(self,name):return getattr(store,name)
+    return Paused()
+
+
+# spec: ANYM-839
+@pytest.mark.parametrize('target',['no_attachment','attachment'])
+def test_text_ingest_paused_between_the_account_and_residency_locks_does_not_deadlock_with_finish_media(archive,target):
+    from messaging_service.archive import Archive
+    ar,s,_,_=archive
+    if target=='attachment':fid,_=stored(archive,mid='paused-target')
+    else:ar.ingest(event(provider_id='paused-target'))
+    job,racing,writer=leased_download(ar,s,'racing',b'Racing synthetic payload')
+    entered,release=Event(),Event()
+    paused=Archive(paused_after_account_lock(s,'archive-test',entered,release))
+    with ThreadPoolExecutor(max_workers=2) as threads:
+        ingest=threads.submit(paused.ingest,event(provider_id='paused-target',body='Edited while paused',
+            updated_at='2026-10-01T12:05:00+00:00'))
+        assert entered.wait(5)
+        # finish_media takes the residency lock, then waits for the account lock the paused ingest holds.
+        finish=finished_or_waiting(threads,s,lambda:ar.finish_media(job,racing,writer))
+        assert not finish.done()
+        release.set()
+        # With attachment rows the ingest rolls back, releasing the account lock, and restarts lifecycle-first.
+        assert ingest.result(timeout=20)['outcome']=='edited'
+        finish.result(timeout=20)
+    with s.pool.connection() as c:
+        assert c.execute('SELECT state FROM media_jobs WHERE id=%s',(job['id'],)).fetchone()['state']=='ready'
+        if target=='attachment':
+            assert c.execute('SELECT active FROM attachments WHERE id=%s',(fid,)).fetchone()['active'] is False
 
 
 def test_corrupt_original_hashes_still_consume_pass_byte_budget(archive,monkeypatch):

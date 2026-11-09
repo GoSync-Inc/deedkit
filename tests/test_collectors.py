@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import time
 from threading import Event
 from types import SimpleNamespace as NS
 
@@ -738,6 +739,56 @@ def test_async_media_stream_and_expired_renewal(worker):
     w.archive.renew_media(job)
     with s.pool.connection() as c: c.execute("UPDATE media_jobs SET lease_until=now()-interval '1 second' WHERE id=%s",(job['id'],))
     with pytest.raises(RuntimeError,match='media_lease_lost'): w.archive.renew_media(job)
+
+
+def idle_loop_wakes_on_own_media(w, ingest):
+    """Runs the collector's media loop: an empty claim is not repeated within the idle wait, and `ingest` (this
+    collector storing a message with media) wakes it within 1 s (ANYM-839)."""
+    from messaging_service import telegram_collector as collector
+    assert collector.MEDIA_IDLE_SECONDS>=5
+    claims=[]; real=w.archive.claim_media
+    def counted(*args,**kwargs):
+        claims.append(time.monotonic()); return real(*args,**kwargs)
+    w.archive.claim_media=counted
+    async def run():
+        loop=asyncio.create_task(w.media_loop())
+        try:
+            while not claims: await asyncio.sleep(.01)
+            await asyncio.sleep(4.5)
+            assert len(claims)==1,[at-claims[0] for at in claims]
+            started=time.monotonic()
+            await ingest()
+            while len(claims)<2 and time.monotonic()-started<3: await asyncio.sleep(.01)
+            assert len(claims)>=2 and claims[1]-started<1,[at-started for at in claims[1:]]
+        finally:
+            loop.cancel(); await asyncio.gather(loop,return_exceptions=True)
+    asyncio.run(run())
+
+
+# spec: ANYM-839
+def test_idle_telegram_media_loop_waits_after_an_empty_claim_and_wakes_on_its_own_media_ingest(worker):
+    w,_,_=worker
+    async def ingest():
+        await w.capture(NS(message=message(30,media=True)))
+        await asyncio.to_thread(w.spool.drain,w.state.apply)
+    idle_loop_wakes_on_own_media(w,ingest)
+
+
+# spec: ANYM-839
+def test_a_contended_backfill_claim_is_retried_at_once_without_an_idle_wait(worker):
+    from messaging_service.archive import MEDIA_CONTENDED
+    w,_,_=worker
+    w.media_backfill=True
+    claims=[]
+    def claim(*args,backfill=False,**kwargs):
+        claims.append(backfill)
+        return MEDIA_CONTENDED if backfill and claims.count(True)==1 else None
+    w.archive.claim_media=claim
+    # An empty main queue, then a backfill claim that lost its rechecks: not idle.
+    assert asyncio.run(w.media_once()) is True
+    # The next claim still has the backfill's turn; only an empty backfill starts its pause.
+    assert asyncio.run(w.media_once()) is False
+    assert claims==[False,True,False,True]
 
 
 def test_delete_during_download_never_publishes_ready(worker):

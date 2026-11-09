@@ -29,6 +29,27 @@ BACKFILL_CANDIDATES = 16
 MEDIA_TIER = '''CASE WHEN j.descriptor->>'mime'=ANY(%(voice_mimes)s)
         AND (j.descriptor->>'bytes')::bigint BETWEEN 0 AND %(voice_max)s THEN 0
     WHEN (j.descriptor->>'bytes')::bigint BETWEEN 0 AND %(small_max)s THEN 1 ELSE 2 END'''
+# A media claim picks its candidate lock-free and leases it after a recheck under the locks (ANYM-839); a call
+# gives up after this many lost rechecks in a row and reports MEDIA_CONTENDED.
+MEDIA_CLAIM_PICKS = 3
+# Marks the lock-free candidate statement (tests find its plan by it).
+MEDIA_PICK_MARK = '-- media claim pick: lock-free, rechecked by id under the locks\n'
+
+
+class _Contended:
+    """claim_media's `contended` outcome: falsy like `empty` (None), so a caller that only leases is unchanged."""
+    __slots__=()
+    def __bool__(self):return False
+    def __repr__(self):return 'MEDIA_CONTENDED'
+
+
+MEDIA_CONTENDED = _Contended()
+
+
+class _LifecycleFirst(Exception):
+    """An attachment-free ingest found attachment rows: its transaction rolls back and ingest restarts lifecycle-first."""
+
+
 # A WhatsApp user identity with and without its device number (`<user>:<device>@lid`) is one
 # sender, as whatsmeow's JID.ToNonAD() reads it. Used for comparison only; senders stay raw.
 WHATSAPP_USER=re.compile(r'([0-9]+)(?::[0-9]+)?@(lid|c\.us)')
@@ -354,13 +375,29 @@ class Archive:
         if not row: raise RuntimeError('collector_lease_lost')
 
     def ingest(self,raw,*,lease=None,identity_observations=(),replay=False):
-        e=validate(raw); captured=e; receipt=hashlib.sha256(canonical(e)).hexdigest()
+        e=validate(raw)
+        # ANYM-839: an envelope with no media whose stored message has no attachment rows never touches an original,
+        # so it skips the global residency lock. Otherwise (media, or attachment rows to flip) it rolls back and
+        # runs lifecycle lock first; the residency trigger fires on finish_media's insert, never here.
+        if not e['media']:
+            try:return self._ingest(e,lease,identity_observations,replay,lifecycle=False)
+            except _LifecycleFirst:pass
+        return self._ingest(e,lease,identity_observations,replay,lifecycle=True)
+
+    def _ingest(self,e,lease,identity_observations,replay,*,lifecycle):
+        captured=e; receipt=hashlib.sha256(canonical(e)).hexdigest()
         aid=e['account']; cid=stable_id('chat',aid,e['chat']); mid=stable_id('msg',aid,e['chat'],e['provider_id'])
         with self.store.pool.connection() as c:
-            from .file_lifecycle import lifecycle_lock
-            lifecycle_lock(c)
+            if lifecycle:
+                from .file_lifecycle import lifecycle_lock
+                lifecycle_lock(c)
             # One bounded transaction per account; no provider/network/file work while holding it.
             c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('archive:'+aid,))
+            # Attachment rows are added only under this account lock (finish_media), so none appears before commit.
+            # A new message has none (the row comes first): its primary key lookup skips the attachments scan.
+            if not lifecycle and c.execute('''SELECT 1 FROM messages m WHERE m.id=%s
+                    AND EXISTS(SELECT FROM attachments a WHERE a.message=m.id)''',(mid,)).fetchone():
+                raise _LifecycleFirst
             self.fence(c,aid,lease)
             policy=c.execute('''SELECT p.*,a.platform FROM account_policies p JOIN accounts a ON a.id=p.account
                 WHERE account=%s''',(aid,)).fetchone()
@@ -571,7 +608,7 @@ class Archive:
     def claim_media(self,owner,*,account=None,ttl=120,collector_lease=None,since=None,writer=None,
                     live_writer=None,live_window_seconds=86400,media_prefetch_days=None,backfill=False):
         from .storage_admission import StorageAdmission
-        from .media_policy import validate_prefetch_days,ON_REQUEST_CHAT,on_request_chat
+        from .media_policy import validate_prefetch_days,ON_REQUEST_CHATS
         from . import media_recovery
         validate_prefetch_days(media_prefetch_days)
         if type(backfill) is not bool: raise ValueError('invalid_backfill')
@@ -587,25 +624,111 @@ class Archive:
         # Backfill reaches out-of-window voice notes and small files of a bounded window
         # (days>0). Its few candidates are chosen before the shared storage locks are taken.
         backfill_ids=self._backfill_candidates(account,since,media_prefetch_days,tiers) if backfill and media_prefetch_days else []
-        with self._media_sweep(account) as sweep, self.store.pool.connection() as c:
-            from .file_lifecycle import lifecycle_lock
-            lifecycle_lock(c)
-            StorageAdmission.lock_and_reap(c)
-            if collector_lease is not None:
-                if account is None: raise ValueError('collector_account_required')
-                self.fence(c,account,collector_lease)
-            if sweep:
-                # Attachment status already reports an expired last-attempt lease as
-                # retry_exhausted until this sweep rewrites it.
-                c.execute("""UPDATE media_jobs SET state='failed',error_code='retry_exhausted',lease_until=NULL
-                    WHERE state='leased' AND attempts>=%s AND lease_until<clock_timestamp()
-                    AND NOT starts_with(coalesce(lease_owner,''),'recovery:')
-                    AND (%s::text IS NULL OR account=%s)""",(MEDIA_MAX_ATTEMPTS,account,account))
-            # One fresh time, taken after the lock waits, bounds the prefetch and live
-            # windows; unlike per-row clock_timestamp() it can bound an index range.
+        params={'live_max':live_max,'live_window':live_window_seconds,'account':account,'since':since,
+            'days':media_prefetch_days,'backfill_ids':backfill_ids,'max_attempts':MEDIA_MAX_ATTEMPTS,**tiers}
+        lost=[]
+        for _ in range(MEDIA_CLAIM_PICKS):
+            # The search runs in a transaction of its own with no advisory or row lock (ANYM-839); a lost
+            # recheck below commits, releasing every lock, before the next pick.
+            pick=self._media_pick(params,lost)
+            with self._media_sweep(account) as sweep, self.store.pool.connection() as c:
+                from .file_lifecycle import lifecycle_lock
+                lifecycle_lock(c)
+                StorageAdmission.lock_and_reap(c)
+                if collector_lease is not None:
+                    if account is None: raise ValueError('collector_account_required')
+                    self.fence(c,account,collector_lease)
+                if sweep:
+                    # Attachment status already reports an expired last-attempt lease as
+                    # retry_exhausted until this sweep rewrites it.
+                    c.execute("""UPDATE media_jobs SET state='failed',error_code='retry_exhausted',lease_until=NULL
+                        WHERE state='leased' AND attempts>=%s AND lease_until<clock_timestamp()
+                        AND NOT starts_with(coalesce(lease_owner,''),'recovery:')
+                        AND (%s::text IS NULL OR account=%s)""",(MEDIA_MAX_ATTEMPTS,account,account))
+                recovery=False
+                if pick is None:
+                    # ANYM-816: an operator recovery job only when no other job of the account is claimable.
+                    job=None if backfill else self._recovery_job(c,account)
+                    if not job: return None
+                    job['_live_media']=False;recovery=True
+                else:
+                    # Every eligibility condition again, on the picked id only, with one fresh time taken
+                    # after the lock waits; the on-request rule is read in this statement (media_policy).
+                    now=c.execute('SELECT clock_timestamp() AS at').fetchone()['at']
+                    job=c.execute(self._media_claim_query('j.*,priority.live_media AS _live_media',
+                        '''EXISTS(SELECT FROM ('''+ON_REQUEST_CHATS+''') orq WHERE orq.chat=m.chat)''',
+                        ' AND j.id=%(pick)s FOR UPDATE OF j SKIP LOCKED'),{**params,'now':now,'pick':pick}).fetchone()
+                    if not job:
+                        # Another claimer leased it, or it stopped being eligible: pick again without it.
+                        lost.append(pick);continue
+                expires=c.execute("SELECT clock_timestamp()+%s*interval '1 second' AS at",(ttl,)).fetchone()['at']
+                reservation=None
+                if writer is not None:
+                    selected_writer=live_writer if job['_live_media'] else writer
+                    try:reservation=StorageAdmission(selected_writer).reserve(c,job,expires)
+                    except ValueError as exc:
+                        if str(exc)!='media_size_limit':raise
+                        if recovery:media_recovery.held_back(c,job,size_limit=True);return None
+                        c.execute("UPDATE media_jobs SET state='failed',error_code='size_limit',lease_until=NULL WHERE id=%s",
+                            (job['id'],))
+                        return None
+                    if reservation is None:
+                        if recovery:media_recovery.held_back(c,job);return None
+                        c.execute('''UPDATE media_jobs SET state='queued',error_code='paused_storage',lease_until=NULL,
+                            next_due=clock_timestamp()+interval '60 seconds' WHERE id=%s''',(job['id'],))
+                        return None
+                if recovery:claimed=media_recovery.lease(c,job,owner,expires)
+                else:claimed=c.execute('''UPDATE media_jobs SET state='leased',attempts=attempts+1,lease_owner=%s,
+                    lease_epoch=lease_epoch+1,lease_until=%s,error_code=NULL
+                    WHERE id=%s RETURNING *''',(owner,expires,job['id'])).fetchone()
+                claimed['_live_media']=job['_live_media']
+                if reservation is not None:claimed['_storage_reservation']=reservation
+                return claimed
+        return MEDIA_CONTENDED
+
+    @staticmethod
+    def _media_claim_query(columns,on_request,tail):
+        """The claim's eligibility rules over media_jobs j (messages m, chats ch, policy p); `on_request` is true
+        for an on-request chat (ANYM-805)."""
+        return ('''SELECT '''+columns+''' FROM media_jobs j JOIN account_policies p ON p.account=j.account
+            JOIN messages m ON m.id=j.message AND m.account=j.account
+            JOIN chats ch ON ch.id=m.chat AND ch.account=j.account
+            CROSS JOIN LATERAL (SELECT COALESCE(%(live_max)s::bigint IS NOT NULL AND
+                (j.descriptor->>'bytes')::bigint BETWEEN 0 AND %(live_max)s::bigint AND
+                m.sent_at>=%(now)s-%(live_window)s*interval '1 second' AND
+                m.sent_at<=%(now)s+interval '5 minutes',false) AS live_media,
+                COALESCE(j.requested_until>clock_timestamp(),false) AS requested,'''+MEDIA_TIER+''' AS tier) priority
+            WHERE p.enabled AND (%(account)s::text IS NULL OR j.account=%(account)s) AND j.attempts<%(max_attempts)s AND
+            NOT m.deleted AND NOT(ch.provider_chat=ANY(p.exclude_chats)) AND
+            (p.discover_chats OR ch.provider_chat=ANY(p.include_chats)) AND
+            (%(since)s::timestamptz IS NULL OR m.sent_at>=%(since)s OR
+                -- Below the bound only explicit demand in a chat whose row confirms this bound (ANYM-477);
+                -- an unconfirmed bound stays history_bound_unknown in media_policy and is not claimed.
+                j.requested_until>clock_timestamp() AND EXISTS(SELECT 1 FROM collector_chats bc
+                    WHERE bc.account=j.account AND bc.provider_chat=ch.provider_chat
+                    AND bc.history_since=%(since)s::timestamptz)) AND
+            -- An on-request chat's job is claimed only by an unexpired request (ANYM-805, media_policy.ON_REQUEST_CHAT).
+            (j.requested_until>clock_timestamp() OR NOT '''+on_request+''' AND (%(days)s::integer IS NULL OR
+                (%(days)s::integer>0 AND m.sent_at>=%(now)s-%(days)s*interval '1 day'
+                    AND m.sent_at<=%(now)s+interval '5 minutes') OR
+                (j.id=ANY(%(backfill_ids)s::text[]) AND priority.tier<2))) AND
+            ((j.state='queued' AND j.next_due<=clock_timestamp()) OR
+             -- An expired recovery lease (ANYM-816) resumes only through media_recovery.next_job.
+             (j.state='leased' AND j.lease_until<clock_timestamp()
+                AND NOT starts_with(coalesce(j.lease_owner,''),'recovery:')))'''+tail)
+
+    def _media_pick(self,params,lost):
+        """The best claimable job id (not one in `lost`) or None: read-only, no advisory or row lock (ANYM-839).
+
+        claim_media rechecks it under the locks and leases it by id."""
+        from .media_policy import ON_REQUEST_CHAT,on_request_chat
+        account,days,backfill_ids=params['account'],params['days'],params['backfill_ids']
+        with self.store.pool.connection() as c:
+            # One fresh time bounds the prefetch and live windows; unlike per-row
+            # clock_timestamp() it can bound an index range.
             now=c.execute('SELECT clock_timestamp() AS at').fetchone()['at']
             candidates=''
-            if media_prefetch_days is not None:
+            if days is not None:
                 # Dormant out-of-window jobs stay queued for explicit requests. Reach only
                 # jobs that can be claimable now: unexpired requests (media_requested) and
                 # messages inside the window (message_scope_date, or message_live_date
@@ -615,7 +738,7 @@ class Archive:
                     +('' if account is None else ' AND r.account=%(account)s')]
                 # An on-request chat's recent messages bring no job into the arm (ANYM-805): its jobs wait
                 # for a request, and the requests arm reaches them.
-                if media_prefetch_days>0:arms.append('''SELECT w.id FROM media_jobs w WHERE w.message=ANY(ARRAY(
+                if days>0:arms.append('''SELECT w.id FROM media_jobs w WHERE w.message=ANY(ARRAY(
                     SELECT wm.id FROM messages wm WHERE wm.sent_at<=%(now)s+interval '5 minutes'
                     AND wm.sent_at>=greatest(%(now)s-%(days)s::integer*interval '1 day',
                         coalesce(%(since)s::timestamptz,'-infinity'))'''
@@ -625,69 +748,15 @@ class Archive:
                 candidates=' AND j.id=ANY(ARRAY('+' UNION ALL '.join(arms)+'))'
             # A cached generic plan of this repeated statement would not see the window bounds.
             c.execute("SET LOCAL plan_cache_mode=force_custom_plan")
-            job=c.execute('''SELECT j.*,priority.live_media AS _live_media FROM media_jobs j JOIN account_policies p ON p.account=j.account
-                JOIN messages m ON m.id=j.message AND m.account=j.account
-                JOIN chats ch ON ch.id=m.chat AND ch.account=j.account
-                CROSS JOIN LATERAL (SELECT COALESCE(%(live_max)s::bigint IS NOT NULL AND
-                    (j.descriptor->>'bytes')::bigint BETWEEN 0 AND %(live_max)s::bigint AND
-                    m.sent_at>=%(now)s-%(live_window)s*interval '1 second' AND
-                    m.sent_at<=%(now)s+interval '5 minutes',false) AS live_media,
-                    COALESCE(j.requested_until>clock_timestamp(),false) AS requested,'''+MEDIA_TIER+''' AS tier) priority
-                WHERE p.enabled AND (%(account)s::text IS NULL OR j.account=%(account)s) AND j.attempts<%(max_attempts)s AND
-                NOT m.deleted AND NOT(ch.provider_chat=ANY(p.exclude_chats)) AND
-                (p.discover_chats OR ch.provider_chat=ANY(p.include_chats)) AND
-                (%(since)s::timestamptz IS NULL OR m.sent_at>=%(since)s OR
-                    -- Below the bound only explicit demand in a chat whose row confirms this bound (ANYM-477);
-                    -- an unconfirmed bound stays history_bound_unknown in media_policy and is not claimed.
-                    j.requested_until>clock_timestamp() AND EXISTS(SELECT 1 FROM collector_chats bc
-                        WHERE bc.account=j.account AND bc.provider_chat=ch.provider_chat
-                        AND bc.history_since=%(since)s::timestamptz)) AND
-                -- An on-request chat's job is claimed only by an unexpired request (ANYM-805, media_policy.ON_REQUEST_CHAT).
-                (j.requested_until>clock_timestamp() OR NOT '''+ON_REQUEST_CHAT+''' AND (%(days)s::integer IS NULL OR
-                    (%(days)s::integer>0 AND m.sent_at>=%(now)s-%(days)s*interval '1 day'
-                        AND m.sent_at<=%(now)s+interval '5 minutes') OR
-                    (j.id=ANY(%(backfill_ids)s::text[]) AND priority.tier<2))) AND
-                ((j.state='queued' AND j.next_due<=clock_timestamp()) OR
-                 -- An expired recovery lease (ANYM-816) resumes only through media_recovery.next_job.
-                 (j.state='leased' AND j.lease_until<clock_timestamp()
-                    AND NOT starts_with(coalesce(j.lease_owner,''),'recovery:')))'''+candidates+'''
+            row=c.execute(MEDIA_PICK_MARK+self._media_claim_query('j.id',ON_REQUEST_CHAT,candidates+'''
+                AND NOT j.id=ANY(%(lost)s::text[])
                 ORDER BY priority.requested DESC,CASE WHEN NOT priority.requested THEN j.id=ANY(%(backfill_ids)s::text[]) END,
                     priority.live_media DESC,
                     CASE WHEN priority.live_media THEN m.sent_at END DESC,
                     CASE WHEN NOT priority.requested THEN priority.tier END,
                     CASE WHEN NOT priority.requested THEN m.sent_at END DESC,j.next_due,j.id
-                FOR UPDATE OF j SKIP LOCKED LIMIT 1''',
-                {'live_max':live_max,'live_window':live_window_seconds,'account':account,'since':since,
-                    'days':media_prefetch_days,'now':now,'backfill_ids':backfill_ids,'max_attempts':MEDIA_MAX_ATTEMPTS,**tiers}).fetchone()
-            # ANYM-816: an operator recovery job only when no other job of the account is claimable.
-            recovery=False
-            if not job and not backfill:
-                job=self._recovery_job(c,account);recovery=job is not None
-                if job:job['_live_media']=False
-            if not job: return None
-            expires=c.execute("SELECT clock_timestamp()+%s*interval '1 second' AS at",(ttl,)).fetchone()['at']
-            reservation=None
-            if writer is not None:
-                selected_writer=live_writer if job['_live_media'] else writer
-                try:reservation=StorageAdmission(selected_writer).reserve(c,job,expires)
-                except ValueError as exc:
-                    if str(exc)!='media_size_limit':raise
-                    if recovery:media_recovery.held_back(c,job,size_limit=True);return None
-                    c.execute("UPDATE media_jobs SET state='failed',error_code='size_limit',lease_until=NULL WHERE id=%s",
-                        (job['id'],))
-                    return None
-                if reservation is None:
-                    if recovery:media_recovery.held_back(c,job);return None
-                    c.execute('''UPDATE media_jobs SET state='queued',error_code='paused_storage',lease_until=NULL,
-                        next_due=clock_timestamp()+interval '60 seconds' WHERE id=%s''',(job['id'],))
-                    return None
-            if recovery:claimed=media_recovery.lease(c,job,owner,expires)
-            else:claimed=c.execute('''UPDATE media_jobs SET state='leased',attempts=attempts+1,lease_owner=%s,
-                lease_epoch=lease_epoch+1,lease_until=%s,error_code=NULL
-                WHERE id=%s RETURNING *''',(owner,expires,job['id'])).fetchone()
-            claimed['_live_media']=job['_live_media']
-            if reservation is not None:claimed['_storage_reservation']=reservation
-            return claimed
+                LIMIT 1'''),{**params,'now':now,'lost':lost}).fetchone()
+        return row['id'] if row else None
 
     @staticmethod
     def _recovery_job(c,account):
