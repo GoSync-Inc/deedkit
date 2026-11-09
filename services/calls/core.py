@@ -774,151 +774,8 @@ class VoiceService:
                 return {"error":"tool_not_allowed"}
             try:
                 args=models[name].model_validate(arguments).model_dump()
-                if name=="lookup_context":
-                    q=args["query"].casefold().strip()
-                    result={"facts":[f for f in v["brief"]["facts"] if not q or q in f["text"].casefold()],
-                            "scope":"selected_snapshot_only","provider_currentness_verified":False}
-                elif name=="record_answer":
-                    if args["field"] not in v["brief"]["success_fields"]:
-                        raise ServiceError("unknown_result_field")
-                    proof=self._quote_event(v,args['evidence'])
-                    v["answers"][args["field"]]={**args,"evidence_event":proof,"status":"reported_needs_review"}
-                    self._supersede_changed_decisions(v)
-                    decision=self._required_decision(v)
-                    # Corrections invalidate an earlier summary/completion outcome.
-                    v["outcome"]="needs_owner" if any(d['status']=='pending' for d in v['decisions']) else "unresolved"
-                    result={"ok":True,"field":args["field"],"evidence_found":bool(proof),"requires_review":True}
-                    if decision:
-                        result['owner_decision']=self._decision_result(decision)
-                elif name=="request_owner_decision":
-                    if any(len(x)>300 for x in args["options"]):
-                        raise ServiceError("decision_limit")
-                    d=self._request_decision(v,args['question'],args['options'],'model_request')
-                    v["outcome"]="needs_owner"
-                    result=self._decision_result(d)
-                elif name=='press_keys':
-                    if v['brief'].get('channel','browser') not in KEYPAD_CHANNELS:
-                        raise ServiceError('keypress_unsupported_channel')
-                    # One admission per call, whichever model session asks (ANYM-451): no press while a handover is pending.
-                    if v.get('handover'):
-                        raise ServiceError('handover_in_progress')
-                    if sum(e['kind']=='tool' and e['name']=='press_keys' and bool(e['result'].get('ok')) for e in v['events'])>=KEYPRESS_LIMIT:
-                        raise ServiceError('keypress_limit')
-                    path,note=self._keypress_path(v,args['keys'])
-                    evidence=bool(self._quote_event(v,args['menu_quote']))
-                    if path=='out_of_band':
-                        result={'ok':True,'keys':args['keys'],'delivery':'out_of_band','dtmf_path':path,'delivery_confirmed':False,
-                                'evidence_found':evidence,'next_action':'The call reconnects in a few seconds; stay silent.'}
-                        v['handover']={'tool_call_id':tool_call_id,'keys':args['keys'],'from_generation':v.get('generation',1),
-                                       'state':'reserved','at':now()}
-                    else:
-                        result={'ok':True,'keys':args['keys'],'delivery':'in_band_audio','dtmf_path':path,'delivery_confirmed':False,
-                                'evidence_found':evidence,'next_action':
-                                'Stay silent and wait a few seconds for the menu to react. A repeat of the same menu, '
-                                'not silence, means the press did not register.'}
-                        if note=='key_already_sent_out_of_band':
-                            result['next_action']='The menu did not accept this key; say so and follow the brief.'
-                    if note:
-                        result['note']=note
-                    press={'keys':args['keys'],'dtmf_path':path,'at':now(),'note':note}
-                    v.setdefault('keypresses',[]).append({**press,'tool_call_id':tool_call_id})
-                    v['last_keypress']=press
-                    self._event(v,{'kind':'keypress',**{k:x for k,x in press.items() if k!='at' and x is not None},
-                                   'generation':v.get('generation',1)})
-                elif name=='consult_supervisor':
-                    consultations=v.setdefault('consultations',[])
-                    if len(consultations)>=6:
-                        raise ServiceError('supervisor_limit')
-                    consultation={'id':str(uuid.uuid4()),'question':args['question'],'status':'pending',
-                                  'created_at':now(),'conditions':self._conditions(v),'tool_call_id':tool_call_id}
-                    consultations.append(consultation)
-                    self._event(v,{'kind':'supervisor_requested','consultation_id':consultation['id'],
-                                   'question':args['question']})
-                    result={'consultation_id':consultation['id'],'status':'pending','advice_only':True,
-                            'external_action_authorized':False}
-                elif name=='propose_closing':
-                    latest=self._latest_human_turn(v)
-                    if not v.get('human_speaking') and self._closing_intent(v,latest,'completed'):
-                        result={'closing_already_confirmed':True,'evidence':latest,'next_action':
-                            'The latest human utterance already says goodbye. Do not ask again. '
-                            'Call end_conversation with this exact quote; wait for permission before saying goodbye.'}
-                    else:
-                        revision=v.get('human_revision',0)
-                        if v.get('closing_offer',{}).get('human_revision')==revision:
-                            raise ServiceError('closing_offer_already_pending')
-                        v['closing_offer']={'human_revision':revision,'summary':args['summary']}
-                        result={'waiting_for_human':True,'next_action':
-                            'Ask ONE short question whether the human wants to end or has more to add. Wait for NEW human speech.'}
-                elif name=='end_conversation':
-                    end_reason=args['reason']
-                    if live_flow:
-                        revision=v.get('human_revision',0)
-                        if v.get('human_speaking'):
-                            raise ServiceError('human_still_speaking')
-                        if v.get('closing_rejected_revision')==revision:
-                            raise ServiceError('closing_retry_requires_new_human_speech')
-                    proof=self._quote_event(v,args['evidence'])
-                    if args['reason'] in {'refused','unavailable'} and not proof:
-                        raise ServiceError('closing_evidence_missing')
-                    if args['reason']=='refused' and not self._closing_intent(v,args['evidence'],'refused'):
-                        raise ServiceError('closing_intent_unconfirmed')
-                    if args['reason']=='needs_owner' and not any(d['status']=='pending' for d in v['decisions']):
-                        raise ServiceError('owner_request_missing')
-                    if live_flow and args['reason'] in {'completed','needs_owner'}:
-                        latest=self._latest_human_turn(v)
-                        question=self._question_before_latest_human(v)
-                        clean=_spoken_words(latest)
-                        exact=_spoken_words(args['evidence'])
-                        same_words=bool(exact and f' {exact} ' in f' {clean} ')
-                        # ASR and the model can punctuate the same speech
-                        # differently. Bind permission to the original latest
-                        # source, accepting only identical spoken words.
-                        if same_words:
-                            proof=self._quote_event(v,latest)
-                        confirmed=same_words and self._closing_answer(question,clean)
-                        if not proof or not (self._closing_intent(v,args['evidence'],'completed') or confirmed):
-                            raise ServiceError('closing_confirmation_required')
-                    if live_flow and args['reason']=='unavailable':
-                        text=self._latest_human_turn(v).casefold()
-                        if not re.search(r'не могу (?:сейчас )?говорить|не могу (?:сейчас )?разговаривать|сейчас занят|перезвоните позже|can.t talk|call (?:me )?later|sedang sibuk|tidak bisa bicara',text):
-                            raise ServiceError('closing_intent_unconfirmed')
-                    social=v['brief'].get('conversation_mode')=='social'
-                    missing=any(f not in v['answers'] for f in v['brief']['success_fields'])
-                    if args['reason']=='completed' and not social and (missing or (not live_flow and not v['summary'])):
-                        raise ServiceError('task_not_collected')
-                    if args['reason']=='completed':
-                        self._required_decision(v)
-                        if any(d['status']=='pending' for d in v['decisions']):
-                            if not live_flow:
-                                raise ServiceError('owner_decision_pending')
-                            # Fresh human closing intent was checked above.
-                            # An asynchronous decision blocks commitments,
-                            # not a goodbye; keep it pending after hangup.
-                            end_reason='needs_owner'
-                        if social and not live_flow and (
-                                not proof or not self._closing_intent(v,args['evidence'],'completed')):
-                            raise ServiceError('closing_confirmation_required')
-                    v['summary']=args['summary']
-                    v['outcome']=end_reason if end_reason!='completed' else (
-                        'needs_owner' if any(d['status']=='pending' for d in v['decisions']) else
-                        'incomplete' if missing else 'collected_needs_review')
-                    v['close_requested']={'reason':end_reason,'evidence_event':proof}
-                    if live_flow:
-                        v['close_requested']['human_revision']=revision
-                    result={'end_requested':True,'reason':end_reason,'outcome':v['outcome'],'requires_review':True,
-                            'callback_available':False}
-                    farewell=self._returned_farewell(v) if live_flow else None
-                    if farewell:
-                        v['close_requested']['farewell_event']=farewell
-                        result.update(farewell_already_said=True,next_action=
-                            'The human returned your completed farewell. Do not speak again. '
-                            'The transport will close after playback; new human speech cancels closing.')
-                else:
-                    self._required_decision(v)
-                    missing=[f for f in v["brief"]["success_fields"] if f not in v["answers"]]
-                    v["summary"]=args["summary"]
-                    v["outcome"]="needs_owner" if any(d["status"]=="pending" for d in v["decisions"]) else "incomplete" if missing else "collected_needs_review"
-                    result={"outcome":v["outcome"],"missing_fields":missing,"requires_review":True}
+                # One handler per tool in `models`, run under the lock above; its ServiceError is the refusal below.
+                result=getattr(self,'_tool_'+name)(v,args,tool_call_id,live_flow)
             except ServiceError as error:
                 result={"error":error.code}
                 if error.code=='handover_in_progress':
@@ -943,6 +800,167 @@ class VoiceService:
             v["tool_results"][tool_call_id]=result
             self._save_call(v)
             return result
+
+    def _tool_lookup_context(self,v,args,tool_call_id,live_flow):
+        q=args["query"].casefold().strip()
+        result={"facts":[f for f in v["brief"]["facts"] if not q or q in f["text"].casefold()],
+                "scope":"selected_snapshot_only","provider_currentness_verified":False}
+        return result
+
+    def _tool_record_answer(self,v,args,tool_call_id,live_flow):
+        if args["field"] not in v["brief"]["success_fields"]:
+            raise ServiceError("unknown_result_field")
+        proof=self._quote_event(v,args['evidence'])
+        v["answers"][args["field"]]={**args,"evidence_event":proof,"status":"reported_needs_review"}
+        self._supersede_changed_decisions(v)
+        decision=self._required_decision(v)
+        # Corrections invalidate an earlier summary/completion outcome.
+        v["outcome"]="needs_owner" if any(d['status']=='pending' for d in v['decisions']) else "unresolved"
+        result={"ok":True,"field":args["field"],"evidence_found":bool(proof),"requires_review":True}
+        if decision:
+            result['owner_decision']=self._decision_result(decision)
+        return result
+
+    def _tool_request_owner_decision(self,v,args,tool_call_id,live_flow):
+        if any(len(x)>300 for x in args["options"]):
+            raise ServiceError("decision_limit")
+        d=self._request_decision(v,args['question'],args['options'],'model_request')
+        v["outcome"]="needs_owner"
+        result=self._decision_result(d)
+        return result
+
+    def _tool_press_keys(self,v,args,tool_call_id,live_flow):
+        if v['brief'].get('channel','browser') not in KEYPAD_CHANNELS:
+            raise ServiceError('keypress_unsupported_channel')
+        # One admission per call, whichever model session asks (ANYM-451): no press while a handover is pending.
+        if v.get('handover'):
+            raise ServiceError('handover_in_progress')
+        if sum(e['kind']=='tool' and e['name']=='press_keys' and bool(e['result'].get('ok')) for e in v['events'])>=KEYPRESS_LIMIT:
+            raise ServiceError('keypress_limit')
+        path,note=self._keypress_path(v,args['keys'])
+        evidence=bool(self._quote_event(v,args['menu_quote']))
+        if path=='out_of_band':
+            result={'ok':True,'keys':args['keys'],'delivery':'out_of_band','dtmf_path':path,'delivery_confirmed':False,
+                    'evidence_found':evidence,'next_action':'The call reconnects in a few seconds; stay silent.'}
+            v['handover']={'tool_call_id':tool_call_id,'keys':args['keys'],'from_generation':v.get('generation',1),
+                           'state':'reserved','at':now()}
+        else:
+            result={'ok':True,'keys':args['keys'],'delivery':'in_band_audio','dtmf_path':path,'delivery_confirmed':False,
+                    'evidence_found':evidence,'next_action':
+                    'Stay silent and wait a few seconds for the menu to react. A repeat of the same menu, '
+                    'not silence, means the press did not register.'}
+            if note=='key_already_sent_out_of_band':
+                result['next_action']='The menu did not accept this key; say so and follow the brief.'
+        if note:
+            result['note']=note
+        press={'keys':args['keys'],'dtmf_path':path,'at':now(),'note':note}
+        v.setdefault('keypresses',[]).append({**press,'tool_call_id':tool_call_id})
+        v['last_keypress']=press
+        self._event(v,{'kind':'keypress',**{k:x for k,x in press.items() if k!='at' and x is not None},
+                       'generation':v.get('generation',1)})
+        return result
+
+    def _tool_consult_supervisor(self,v,args,tool_call_id,live_flow):
+        consultations=v.setdefault('consultations',[])
+        if len(consultations)>=6:
+            raise ServiceError('supervisor_limit')
+        consultation={'id':str(uuid.uuid4()),'question':args['question'],'status':'pending',
+                      'created_at':now(),'conditions':self._conditions(v),'tool_call_id':tool_call_id}
+        consultations.append(consultation)
+        self._event(v,{'kind':'supervisor_requested','consultation_id':consultation['id'],
+                       'question':args['question']})
+        result={'consultation_id':consultation['id'],'status':'pending','advice_only':True,
+                'external_action_authorized':False}
+        return result
+
+    def _tool_propose_closing(self,v,args,tool_call_id,live_flow):
+        latest=self._latest_human_turn(v)
+        if not v.get('human_speaking') and self._closing_intent(v,latest,'completed'):
+            result={'closing_already_confirmed':True,'evidence':latest,'next_action':
+                'The latest human utterance already says goodbye. Do not ask again. '
+                'Call end_conversation with this exact quote; wait for permission before saying goodbye.'}
+        else:
+            revision=v.get('human_revision',0)
+            if v.get('closing_offer',{}).get('human_revision')==revision:
+                raise ServiceError('closing_offer_already_pending')
+            v['closing_offer']={'human_revision':revision,'summary':args['summary']}
+            result={'waiting_for_human':True,'next_action':
+                'Ask ONE short question whether the human wants to end or has more to add. Wait for NEW human speech.'}
+        return result
+
+    def _tool_end_conversation(self,v,args,tool_call_id,live_flow):
+        end_reason=args['reason']
+        if live_flow:
+            revision=v.get('human_revision',0)
+            if v.get('human_speaking'):
+                raise ServiceError('human_still_speaking')
+            if v.get('closing_rejected_revision')==revision:
+                raise ServiceError('closing_retry_requires_new_human_speech')
+        proof=self._quote_event(v,args['evidence'])
+        if args['reason'] in {'refused','unavailable'} and not proof:
+            raise ServiceError('closing_evidence_missing')
+        if args['reason']=='refused' and not self._closing_intent(v,args['evidence'],'refused'):
+            raise ServiceError('closing_intent_unconfirmed')
+        if args['reason']=='needs_owner' and not any(d['status']=='pending' for d in v['decisions']):
+            raise ServiceError('owner_request_missing')
+        if live_flow and args['reason'] in {'completed','needs_owner'}:
+            latest=self._latest_human_turn(v)
+            question=self._question_before_latest_human(v)
+            clean=_spoken_words(latest)
+            exact=_spoken_words(args['evidence'])
+            same_words=bool(exact and f' {exact} ' in f' {clean} ')
+            # ASR and the model can punctuate the same speech
+            # differently. Bind permission to the original latest
+            # source, accepting only identical spoken words.
+            if same_words:
+                proof=self._quote_event(v,latest)
+            confirmed=same_words and self._closing_answer(question,clean)
+            if not proof or not (self._closing_intent(v,args['evidence'],'completed') or confirmed):
+                raise ServiceError('closing_confirmation_required')
+        if live_flow and args['reason']=='unavailable':
+            text=self._latest_human_turn(v).casefold()
+            if not re.search(r'не могу (?:сейчас )?говорить|не могу (?:сейчас )?разговаривать|сейчас занят|перезвоните позже|can.t talk|call (?:me )?later|sedang sibuk|tidak bisa bicara',text):
+                raise ServiceError('closing_intent_unconfirmed')
+        social=v['brief'].get('conversation_mode')=='social'
+        missing=any(f not in v['answers'] for f in v['brief']['success_fields'])
+        if args['reason']=='completed' and not social and (missing or (not live_flow and not v['summary'])):
+            raise ServiceError('task_not_collected')
+        if args['reason']=='completed':
+            self._required_decision(v)
+            if any(d['status']=='pending' for d in v['decisions']):
+                if not live_flow:
+                    raise ServiceError('owner_decision_pending')
+                # Fresh human closing intent was checked above.
+                # An asynchronous decision blocks commitments,
+                # not a goodbye; keep it pending after hangup.
+                end_reason='needs_owner'
+            if social and not live_flow and (
+                    not proof or not self._closing_intent(v,args['evidence'],'completed')):
+                raise ServiceError('closing_confirmation_required')
+        v['summary']=args['summary']
+        v['outcome']=end_reason if end_reason!='completed' else (
+            'needs_owner' if any(d['status']=='pending' for d in v['decisions']) else
+            'incomplete' if missing else 'collected_needs_review')
+        v['close_requested']={'reason':end_reason,'evidence_event':proof}
+        if live_flow:
+            v['close_requested']['human_revision']=revision
+        result={'end_requested':True,'reason':end_reason,'outcome':v['outcome'],'requires_review':True,
+                'callback_available':False}
+        farewell=self._returned_farewell(v) if live_flow else None
+        if farewell:
+            v['close_requested']['farewell_event']=farewell
+            result.update(farewell_already_said=True,next_action=
+                'The human returned your completed farewell. Do not speak again. '
+                'The transport will close after playback; new human speech cancels closing.')
+        return result
+
+    def _tool_finish_task(self,v,args,tool_call_id,live_flow):
+        self._required_decision(v)
+        missing=[f for f in v["brief"]["success_fields"] if f not in v["answers"]]
+        v["summary"]=args["summary"]
+        v["outcome"]="needs_owner" if any(d["status"]=="pending" for d in v["decisions"]) else "incomplete" if missing else "collected_needs_review"
+        result={"outcome":v["outcome"],"missing_fields":missing,"requires_review":True}
+        return result
 
     def _keypress_path(self,v,keys):
         """Server-chosen DTMF path (ANYM-451): the same keys right after an in-band press, or any new keys once an
