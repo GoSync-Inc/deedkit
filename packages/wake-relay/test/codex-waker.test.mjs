@@ -15,6 +15,7 @@ import {workspace} from './helpers.mjs';
 const BIN=fileURLToPath(new URL('../bin/wake-relay.mjs',import.meta.url));
 const TOKEN='dk_synthetic_waker_token_0123456789';
 const SUB='0b6f5c1e-3a2d-4e8f-9c7b-1a2b3c4d5e6f',THREAD='7d3e2f1a-9b8c-4d6e-a5f4-3c2b1a0e9d8c';
+const SUB2='1c7a6d2f-4b3e-4f9a-8d8c-2b3c4d5e6f70',SUB3='2d8b7e3a-5c4f-4a0b-9e9d-3c4d5e6f7081',THREAD2='Second project chat';
 const SECRET_TEXT='synthetic message body that must never leave the waker';
 // Every server and watcher a test opens is closed after it, also when an assertion fails first.
 const opened=[];
@@ -22,7 +23,7 @@ afterEach(async()=>{for(const close of opened.splice(0).reverse())await Promise.
 
 // A DeedKit MCP endpoint with one subscription; its passive page is built like subscriptions.get_subscription_events.
 async function deedkit({tools=['messages_get_subscription_events'],acked=0}={}){
-  const state={items:[],acked,matched:0,requests:0,calls:[],version:0,transform:null,respond:null};
+  const state={items:[],acked,matched:0,requests:0,calls:[],args:[],version:0,transform:null,respond:null,others:{}};
   const server=http.createServer((req,res)=>{
     const chunks=[];
     req.on('data',chunk=>chunks.push(chunk));
@@ -37,14 +38,15 @@ async function deedkit({tools=['messages_get_subscription_events'],acked=0}={}){
       if(body.method==='initialize')return reply({protocolVersion:'2025-06-18',capabilities:{tools:{}},serverInfo:{name:'fake'}});
       if(body.method==='tools/list')return reply({tools:tools.map(name=>({name}))});
       const {name,arguments:args}=body.params;
-      state.calls.push(name);
-      const visible=state.items.filter(item=>item.event_id>args.after).slice(0,args.limit+1);
+      state.calls.push(name);state.args.push(args);
+      const sub=args.subscription_id===SUB?state:(state.others[args.subscription_id]??={items:[],acked:0,matched:0});
+      const visible=sub.items.filter(item=>item.event_id>args.after).slice(0,args.limit+1);
       const items=visible.slice(0,args.limit);
-      let page={subscription:{subscription_id:SUB,state:'active',acked_through:state.acked,matched_through:state.matched},
+      let page={subscription:{subscription_id:args.subscription_id,state:'active',acked_through:sub.acked,matched_through:sub.matched},
         items,has_more:visible.length>args.limit,next_after:items.length?items.at(-1).event_id:args.after,
         consumption:'passive_read_no_ack'};
       if(state.transform)page=state.transform(page);
-      reply({content:[{type:'text',text:JSON.stringify(page)}],structuredContent:page});
+      reply({content:[{type:'text',text:JSON.stringify(page)}],...(state.textOnly?{}:{structuredContent:page})});
     });
   });
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
@@ -53,7 +55,11 @@ async function deedkit({tools=['messages_get_subscription_events'],acked=0}={}){
   const item=(fields={})=>({event_id:next++,kind:'message.created',direction:'incoming',origin:'live',historical:false,
     wake_reason:['incoming_message'],message:{text:SECRET_TEXT},chat:'chat_synthetic',...fields});
   return {state,url:`http://127.0.0.1:${server.address().port}/mcp`,
-    push(count=1,fields={}){for(let i=0;i<count;i++){const value=item(fields);state.items.push(value);state.matched=value.event_id;}},
+    push(count=1,fields={},id=SUB){
+      const sub=id===SUB?state:(state.others[id]??={items:[],acked:0,matched:0});
+      for(let i=0;i<count;i++){const value=item(fields);sub.items.push(value);sub.matched=value.event_id;}
+    },
+    sub:id=>id===SUB?state:(state.others[id]??={items:[],acked:0,matched:0}),
     // Another consumer's fetch issues a receipt bound to the consumption version; its ACK checks that version.
     fetch(){return {receipt:randomUUID(),version:state.version,through:state.matched};},
     ack(receipt){if(receipt.version!==state.version)return false;state.version++;state.acked=receipt.through;return true;},
@@ -75,17 +81,17 @@ if(mode==='hang')setInterval(()=>{},1000);else process.exit(0);
   return {file,setMode:value=>fs.writeFileSync(modeFile,value),calls:()=>fs.existsSync(log)?fs.readFileSync(log,'utf8').trim().split('\n').map(line=>JSON.parse(line)):[]};
 }
 
-function setup({mode='ok',budget,tools,watch={}}={}){
+function setup({mode='ok',budget,tools,watch={},watches}={}){
   const space=workspace(),codex=fakeCodex(space.dir,mode),key=space.file('deedkit.key',TOKEN+'\n');
   const raw={database:path.join(space.dir,'watch.sqlite'),deedkit_url:'https://deedkit.example/mcp',key_file:key,
-    watches:[{subscription_id:SUB,thread:THREAD,...(budget?{hourly_budget:budget}:{}),...watch}]};
+    watches:watches??[{subscription_id:SUB,thread:THREAD,...(budget?{hourly_budget:budget}:{}),...watch}]};
   const env={PATH:`${space.dir}${path.delimiter}${process.env.PATH}`};
   const time={t:Date.UTC(2026,10,9,12),now(){return this.t;},advance(ms){this.t+=ms;}};
   const logs=[];
   return {space,codex,key,raw,env,time,logs,tools,
     async server(){this.dk=await deedkit({tools});return this.dk;},
     start(options={}){
-      const config=loadWatchConfig(raw,{env});
+      const config=loadWatchConfig(options.raw??raw,{env});delete options.raw;
       const watcher=new Watcher({config,clock:time,log:entry=>logs.push(entry),
         client:deedkitClient({url:this.dk.url,keyFile:key,request:http.request}),...options});
       opened.push(()=>{if(!watcher.closed)return watcher.close();});
@@ -147,6 +153,25 @@ test('every DeedKit request: 10 s timeout, no redirect followed, at most 1 MiB, 
 });
 
 // spec: ANYM-844
+test('a server error value is logged only when it is a known code; any other value becomes tool_error',async()=>{
+  const ctx=setup();const dk=await ctx.server();
+  const watcher=ctx.start();await watcher.pollOnce();
+  for(const [error,expected] of [['subscription_closed','subscription_closed'],[TOKEN,'tool_error'],
+    ['dk_private_group_title','tool_error'],[SECRET_TEXT,'tool_error']]){
+    for(const structured of [true,false]){
+      dk.state.textOnly=!structured;dk.state.transform=()=>({error});
+      ctx.logs.length=0;dk.push(1);
+      await watcher.pollOnce();
+      const logged=ctx.logs.filter(entry=>entry.event==='poll_error').map(entry=>entry.error);
+      assert.deepEqual(logged,[expected],`${error} structured=${structured}`);
+      assert.ok(!JSON.stringify(ctx.logs).includes(TOKEN)&&!JSON.stringify(ctx.logs).includes('dk_private_group_title'));
+    }
+  }
+  assert.equal(ctx.codex.calls().length,0);
+  await watcher.close();await dk.close();
+});
+
+// spec: ANYM-844
 test('a key file replaced by a symlink after start is never read and no request is sent',async()=>{
   const ctx=setup();await ctx.server();
   const watcher=ctx.start();
@@ -179,6 +204,24 @@ test('120 historical items then one live item give exactly one wake; the cursor 
   assert.equal(ctx.codex.calls().length,1);
   assert.deepEqual([...new Set(dk.state.calls)],['messages_get_subscription_events'],'never fetch, wait or ACK');
   await watcher.close();await dk.close();
+});
+
+// spec: ANYM-844
+test('each poll reads at most 4 pages of 50 and the next poll continues from the durable cursor',async()=>{
+  const ctx=setup();const dk=await ctx.server();
+  const watcher=ctx.start();await watcher.pollOnce();
+  dk.state.args.length=0;
+  dk.push(300,{historical:true,origin:'backfill',wake_reason:['historical_event']});dk.push(1);
+  await watcher.pollOnce();
+  assert.deepEqual(dk.state.args.map(a=>[a.after,a.limit]),[[0,50],[50,50],[100,50],[150,50]]);
+  assert.equal(watcher.get('SELECT after FROM cursors').after,200);
+  assert.equal(ctx.codex.calls().length,0);
+  dk.state.args.length=0;
+  await watcher.close();
+  const restarted=ctx.start();await restarted.pollOnce();
+  assert.deepEqual(dk.state.args.map(a=>[a.after,a.limit]),[[200,50],[250,50],[300,50]]);
+  assert.equal(ctx.codex.calls().length,1);
+  await restarted.close();await dk.close();
 });
 
 // spec: ANYM-844
@@ -282,6 +325,64 @@ test('the hourly budget per thread holds a wake as budget_held and calls it when
   ctx.time.advance(3600_000);await watcher.pollOnce();
   assert.equal(ctx.codex.calls().length,3);
   assert.equal(readWatchStatus(ctx.raw.database).budget_held,0);
+  await watcher.close();await dk.close();
+});
+
+// spec: ANYM-844
+test('the budget is shared by the watches of one thread, independent per thread, and survives a restart',async()=>{
+  const ctx=setup({watches:[{subscription_id:SUB,thread:THREAD,hourly_budget:2},{subscription_id:SUB2,thread:THREAD},
+    {subscription_id:SUB3,thread:THREAD2,hourly_budget:1}]});
+  const dk=await ctx.server();
+  let watcher=ctx.start();await watcher.pollOnce();
+  const wakeEach=async ids=>{for(const id of ids)dk.push(1,{},id);await watcher.pollOnce();
+    for(const id of ids)dk.sub(id).acked=dk.sub(id).matched;await watcher.pollOnce();ctx.time.advance(60_000);};
+  await wakeEach([SUB,SUB2]);              // two calls on THREAD: its budget (the lowest of its watches, 2) is used up
+  await wakeEach([SUB3]);                  // THREAD2 has its own budget
+  const threads=()=>ctx.codex.calls().map(argv=>argv[2]);
+  assert.deepEqual(threads().sort(),[THREAD,THREAD,THREAD2].sort());
+  await watcher.close();
+  watcher=ctx.start();await watcher.pollOnce();
+  await wakeEach([SUB2]);                  // after a restart THREAD's slots still count: held
+  assert.equal(threads().length,3);
+  assert.equal(readWatchStatus(ctx.raw.database).budget_held,1);
+  ctx.time.advance(3600_000);await watcher.pollOnce();
+  assert.equal(threads().length,4);
+  await watcher.close();await dk.close();
+});
+
+// spec: ANYM-844
+test('held wakes follow the current configuration and are never called with an unreadable key',async()=>{
+  const ctx=setup({watches:[{subscription_id:SUB,thread:THREAD,hourly_budget:1},{subscription_id:SUB2,thread:THREAD}]});
+  const dk=await ctx.server();
+  let watcher=ctx.start();await watcher.pollOnce();
+  dk.push(1,{},SUB);dk.push(1,{},SUB2);await watcher.pollOnce();   // SUB calls; SUB2 is held (budget 1)
+  assert.equal(ctx.codex.calls().length,1);
+  // The key file becomes a symlink while running: the held wake is not called even once its slot opens.
+  const other=ctx.space.file('other.key','dk_other_token_value');
+  fs.rmSync(ctx.key);fs.symlinkSync(other,ctx.key);
+  ctx.time.advance(3600_000);await watcher.pollOnce();
+  assert.equal(ctx.codex.calls().length,1);
+  assert.ok(ctx.logs.some(entry=>entry.error==='unsafe_key_file'));
+  fs.rmSync(ctx.key);fs.writeFileSync(ctx.key,TOKEN,{mode:0o600});
+  await watcher.close();
+  // SUB2 is removed from the configuration: its held wake ends dropped_config and is never called.
+  watcher=ctx.start({raw:{...ctx.raw,watches:[{subscription_id:SUB,thread:THREAD}]}});
+  await watcher.pollOnce();
+  assert.equal(ctx.codex.calls().length,1);
+  assert.equal(watcher.get(`SELECT state FROM wakes WHERE subscription_id=?`,SUB2).state,'dropped_config');
+  await watcher.close();
+  // A held wake of a watch whose thread changed goes to the configured thread.
+  watcher=ctx.start({raw:{...ctx.raw,watches:[{subscription_id:SUB,thread:THREAD,hourly_budget:1}]}});
+  dk.sub(SUB).acked=dk.sub(SUB).matched;dk.push(1,{},SUB);await watcher.pollOnce();   // takes THREAD's one slot
+  dk.sub(SUB).acked=dk.sub(SUB).matched;await watcher.pollOnce();
+  dk.push(1,{},SUB);await watcher.pollOnce();                                         // held
+  assert.equal(watcher.get(`SELECT state FROM wakes WHERE subscription_id=? ORDER BY id DESC`,SUB).state,'budget_held');
+  const before=ctx.codex.calls().length;
+  await watcher.close();
+  watcher=ctx.start({raw:{...ctx.raw,watches:[{subscription_id:SUB,thread:THREAD2}]}});
+  ctx.time.advance(3600_000);await watcher.pollOnce();
+  assert.equal(ctx.codex.calls().length,before+1);
+  assert.equal(ctx.codex.calls().at(-1)[2],THREAD2);
   await watcher.close();await dk.close();
 });
 

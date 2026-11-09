@@ -1043,6 +1043,7 @@ beyond `read`.
 | `unsupported_host` | No `codex` binary, or `codex queue --help` lists no `--thread`. |
 | `call_unknown` | A `calling` row a crash left behind; never called again. |
 | `budget_held` | No slot in the thread's sliding hour (default 12); called when one opens. |
+| `dropped_config` | A held wake whose subscription is no longer in the configuration; never called. A held wake whose watch moved to another thread is called on that thread. |
 
 While a subscription has a `queued` or `queued_not_resumed` wake the ACK position
 has not passed, newer live items fold into it with no new call. Once
@@ -1052,7 +1053,9 @@ folded after that position that the ACK left behind get a wake of their own.
 position: it shows consumption progress, not which chat did it.
 `wake-relay watch-status` prints counts per state, the last wake per watch,
 `budget_held` and `unsupported_host`; the database keeps no key and no event
-content. A lost wake costs no event: the server keeps the ACK position.
+content. A held wake is called only in a poll whose key read succeeded. Logs carry fixed codes; a
+server error value outside the known codes is logged as `tool_error`. A lost wake costs no event: the server keeps the
+ACK position.
 
 `host_turn_verified` stays `false`: the server cannot see the Codex turn. Loop
 guard: the chat's own sends are outgoing and never satisfy `incoming_message` or

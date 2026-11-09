@@ -8,7 +8,8 @@ import {codexQueue,UUID,validThread} from './codex.mjs';
 import {DeedKitError,deedkitClient,readKey} from './mcp.mjs';
 
 const HOUR=3600_000,PAGE=50,PAGES=4,MAX_AFTER=2**53-1;
-export const WAKE_STATES=['budget_held','calling','queued','queued_not_resumed','failed','unsupported_host','call_unknown'];
+export const WAKE_STATES=['budget_held','calling','queued','queued_not_resumed','failed','unsupported_host','call_unknown',
+  'dropped_config'];
 export const TOOLS=['messages_get_subscription_events','get_subscription_events'];
 const SCHEMA=`
 CREATE TABLE IF NOT EXISTS cursors(subscription_id TEXT PRIMARY KEY, after INTEGER NOT NULL, acked_through INTEGER,
@@ -201,8 +202,20 @@ export class Watcher{
     this.log({event:'wake',subscription_id:row.subscription_id,position:row.position,state:result.state,outcome:result.outcome});
   }
 
+  // Held wakes follow the current configuration: a subscription no longer watched ends `dropped_config` (never
+  // called); a watch whose thread changed moves its held wake to the configured thread.
+  reconcile(){
+    const now=this.now(),threads=new Map(this.config.watches.map(watch=>[watch.subscriptionId,watch.thread]));
+    for(const row of this.all(`SELECT id,subscription_id,thread FROM wakes WHERE state='budget_held'`)){
+      const thread=threads.get(row.subscription_id);
+      if(thread===undefined)this.run(`UPDATE wakes SET state='dropped_config',outcome='subscription_not_watched',updated_at=? WHERE id=?`,now,row.id);
+      else if(thread!==row.thread)this.run(`UPDATE wakes SET thread=?,outcome='thread_changed',updated_at=? WHERE id=?`,thread,now,row.id);
+    }
+  }
+
   // Held wakes take a slot as soon as one opens, oldest first.
   async callHeld(){
+    this.reconcile();
     for(const row of this.all(`SELECT id,thread FROM wakes WHERE state='budget_held' ORDER BY id`)){
       const now=this.now();
       const id=this.tx(()=>{
@@ -251,10 +264,11 @@ export class Watcher{
   }
 
   async pollOnce(){
-    await this.callHeld();
+    // The session reads the key first: with an unreadable or swapped key file nothing is called, held wakes included.
     let session;
     try{session=await this.client.open();}
     catch(error){this.log({event:'poll_error',error:code(error)});return;}
+    await this.callHeld();
     for(const watch of this.config.watches){
       if(this.closed)return;
       try{await this.pollWatch(session,watch);}

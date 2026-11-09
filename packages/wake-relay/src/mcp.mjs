@@ -4,7 +4,11 @@ import https from 'node:https';
 import {readSecret} from './relay.mjs';
 
 export const REQUEST_TIMEOUT_MS=10_000,RESPONSE_LIMIT=1024*1024;
-const PROTOCOL='2025-06-18',TOKEN=/^[\x21-\x7e]{1,4096}$/,CODE=/^[a-z][a-z0-9_]{0,63}$/;
+const PROTOCOL='2025-06-18',TOKEN=/^[\x21-\x7e]{1,4096}$/;
+// Server error codes the waker logs as they are; any other value (it is server-controlled) becomes `tool_error`.
+export const SERVER_CODES=new Set(['not_found','not_found_or_forbidden','forbidden','invalid_arguments','invalid_parameters',
+  'invalid_version','invalid_subscription','invalid_subscription_state','subscription_closed','subscription_access_changed',
+  'service_busy','backend_unavailable','module_not_selected','unsupported_by_backend','tool_not_granted','rate_limited']);
 
 export class DeedKitError extends Error{
   constructor(code){super(code);this.code=code;}
@@ -71,7 +75,7 @@ function toolResult(result){
   }
   if(!value||typeof value!=='object'||Array.isArray(value))throw new DeedKitError('deedkit_bad_response');
   if(result.isError||typeof value.error==='string')
-    throw new DeedKitError(CODE.test(String(value.error))?String(value.error):'tool_error');
+    throw new DeedKitError(SERVER_CODES.has(value.error)?value.error:'tool_error');
   return value;
 }
 
