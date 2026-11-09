@@ -159,6 +159,71 @@ def test_a_group_named_by_an_active_subscription_keeps_automatic_media(archive,s
     assert (chat_of(s,mid) in on_request(s))==waits
 
 
+def plan_nodes(node):
+    yield node
+    for child in node.get('Plans',[]):yield from plan_nodes(child)
+
+
+# The rule as it was before one fixed instant: clock_timestamp() per evaluated row (P1, perf audit 2026-11-09).
+def per_row_clock(query):
+    return query.replace('statement_timestamp()','clock_timestamp()')
+
+
+# spec: ANYM-805
+def test_the_on_request_rule_is_one_anti_join_and_keeps_the_same_chats(archive):
+    from test_media_claim_performance import outline
+    from messaging_service.media_policy import ON_REQUEST_CHATS
+    ar,s,_,_=archive;mid=original(ar)
+    set_kind(s,mid,'group')
+    with s.pool.connection() as c:
+        account=c.execute('SELECT account FROM chats WHERE id=%s',(chat_of(s,mid),)).fetchone()['account']
+        chats=[c.execute('''INSERT INTO chats(id,account,title,provider_chat,chat_type)
+            VALUES(%s,%s,'Fixture chat',%s,%s) RETURNING id''',('policy-chat-'+str(n),account,'policy-'+str(n),
+            ('group','channel','private',None)[n%4])).fetchone()['id'] for n in range(48)]
+        c.execute('''INSERT INTO collector_chats(account,provider_chat,peer_kind)
+            SELECT %s,'policy-'||n,(ARRAY['chat','channel','user'])[1+n%%3] FROM generate_series(3,47,4) n''',(account,))
+    token=s.issue_key('policy-watcher',['archive-test'],permissions=['read','subscription-write'],
+        key_permissions=['read','subscription-write'])
+    states=[('active',None,None),('active',2,None),('active',25,None),('closed',None,2),('closed',None,25),
+        ('expired',None,2),('access_changed',None,2),('access_changed',None,25),('paused',None,None)]
+    for n,(state,expired,closed) in enumerate(states):
+        sub=s.create_subscription(token,[chats[n*4],chats[n*4+1],chats[n*4+3]])
+        with s.pool.connection() as c:
+            c.execute('''UPDATE subscriptions SET state=%s,
+                expires_at=CASE WHEN %s::integer IS NULL THEN expires_at ELSE clock_timestamp()-%s*interval '1 hour' END,
+                closed_at=CASE WHEN %s::integer IS NULL THEN closed_at ELSE clock_timestamp()-%s*interval '1 hour' END
+                WHERE id=%s''',(state,expired,expired,closed,closed,sub['subscription_id']))
+    with s.pool.connection() as c:
+        plan=next(iter(c.execute('EXPLAIN (FORMAT JSON) '+ON_REQUEST_CHATS).fetchone().values()))[0]['Plan']
+        # One hashed or merged pass over the subscribed chats, never a subscription scan per chat.
+        assert not [n for n in plan_nodes(plan) if n.get('Parent Relationship')=='SubPlan'], outline(plan)
+        assert any(n.get('Join Type')=='Anti' for n in plan_nodes(plan)), outline(plan)
+        rows={r['chat']:r['reason'] for r in c.execute(ON_REQUEST_CHATS).fetchall()}
+        assert rows=={r['chat']:r['reason'] for r in c.execute(per_row_clock(ON_REQUEST_CHATS)).fetchall()}
+    assert chat_of(s,mid) in rows and 'group_chat_on_request' in rows.values() and 'channel_on_request' in rows.values()
+    assert chats[0] not in rows and chats[2*4] in rows and chats[8*4] in rows
+
+
+# spec: ANYM-805
+@pytest.mark.parametrize('column',['expires_at','closed_at'])
+def test_a_grace_that_ends_while_a_transaction_waits_has_ended_for_its_next_statement(archive,column):
+    from messaging_service.media_policy import ON_REQUEST_CHATS
+    ar,s,_,_=archive;mid=original(ar)
+    set_kind(s,mid,'group')
+    subscribe(s,chat_of(s,mid),state='active' if column=='expires_at' else 'closed')
+    with s.pool.connection() as c:
+        # Claims, requests and eviction checks start their transaction and then wait for the residency lock (the sleep
+        # stands in for that wait). The grace ends 0.2 s into the wait: the next statement sees it ended, as the per-row
+        # clock did; a transaction-start instant (now()) would still call the chat subscribed.
+        c.execute('UPDATE subscriptions SET '+column+"=clock_timestamp()-interval '24 hours'+interval '200 milliseconds'")
+        c.execute('SELECT pg_sleep(0.5)')
+        assert chat_of(s,mid) in {r['chat'] for r in c.execute(ON_REQUEST_CHATS).fetchall()}
+        assert chat_of(s,mid) in {r['chat'] for r in c.execute(per_row_clock(ON_REQUEST_CHATS)).fetchall()}
+        # A grace that has not ended yet still protects the chat.
+        c.execute('UPDATE subscriptions SET '+column+"=clock_timestamp()-interval '24 hours'+interval '1 minute'")
+        assert chat_of(s,mid) not in {r['chat'] for r in c.execute(ON_REQUEST_CHATS).fetchall()}
+
+
 # spec: ANYM-805
 @pytest.mark.parametrize('kind',['group','channel'])
 @pytest.mark.parametrize('days',[7,None])
