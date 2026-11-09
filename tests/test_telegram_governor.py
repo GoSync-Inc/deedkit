@@ -8,6 +8,7 @@ from telethon.errors import FloodWaitError
 
 from messaging_service.telegram_governor import ProviderRateLimited,RequestGovernor
 from messaging_service.telegram_collector import TelegramCollector,TelethonProvider
+from test_archive import archive as archive
 
 
 class Clock:
@@ -219,14 +220,57 @@ def test_every_account_cooldown_is_appended_to_the_cooldown_ring_with_its_phase(
 # spec: ANYM-877
 def test_a_failing_cooldown_ring_write_never_changes_the_cooldown():
     async def scenario():
-        clock=Clock();state=State(clock)
-        def broken(seconds,phase):raise RuntimeError('synthetic')
+        clock=Clock();state=State(clock);tried=[]
+        def broken(seconds,phase):tried.append(seconds);raise RuntimeError('synthetic')
         state.record_cooldown=broken
         gate=tiered(clock,state)
         async def flooded():raise ProviderRateLimited(40)
         with pytest.raises(ProviderRateLimited):await gate.call(flooded,'telegram_history')
-        assert state.until==40 and not gate.lock.locked()
+        assert tried==[40] and state.until==40 and not gate.lock.locked() and not gate.rings
     asyncio.run(scenario())
+
+
+# spec: ANYM-877
+def test_a_caller_cancelled_while_its_cooldown_is_written_still_appends_the_ring_entry():
+    async def scenario():
+        clock=Clock();state=State(clock);entered=Event();release=Event();ring=[]
+        def defer(seconds):
+            entered.set();assert release.wait(3);state.until=clock()+seconds
+        state.defer=defer;state.record_cooldown=lambda seconds,phase:ring.append((seconds,phase))
+        gate=tiered(clock,state)
+        async def flooded():raise ProviderRateLimited(120)
+        task=asyncio.create_task(gate.call(flooded,'telegram_history'))
+        try:
+            assert await asyncio.to_thread(entered.wait,1)
+            task.cancel();await asyncio.sleep(0)
+        finally:release.set()
+        with pytest.raises(asyncio.CancelledError):await task
+        while gate.rings:await asyncio.sleep(0.001)
+        assert state.until==120 and ring==[(120,'telegram_history')] and not gate.lock.locked()
+    asyncio.run(scenario())
+
+
+# spec: ANYM-877
+def test_the_cooldown_ring_keeps_the_last_twenty_beside_other_operations_and_status_still_renders(archive):
+    from messaging_service.collector_state import CollectorState
+    from messaging_service.presentation import render
+    ar,s,key,_=archive
+    state=CollectorState(ar,'archive-test',('ring-owner',ar.acquire('archive-test','ring-owner')))
+    state.media_policy(None,None)
+    for seconds in range(1,26):state.record_cooldown(seconds,'telegram_history' if seconds%2 else 'live_search')
+    with s.pool.connection() as c:
+        value=c.execute("SELECT operations FROM collector_health WHERE account='archive-test'").fetchone()['operations']
+    recent=value['cooldowns']['recent']
+    assert [e['seconds'] for e in recent]==list(range(6,26)) and recent[-1]['phase']=='telegram_history'
+    assert set(recent[0])=={'started_at','seconds','phase'} and recent==sorted(recent,key=lambda e:e['started_at'])
+    assert value['media_policy']['prefetch_days'] is None
+    with pytest.raises(ValueError,match='invalid_cooldown'):state.record_cooldown(5,'Telegram History')
+    full=s.get_sync_status(key)
+    row=next(r for r in full['sources'] if r['account']=='archive-test')
+    assert row['operations']['cooldowns']['recent'][-1]['seconds']==25
+    # The compact overview renders every operations entry as an object (presentation.render).
+    compact=render('get_sync_status',full,'compact')
+    assert next(r for r in compact['sources'] if r['account']=='archive-test')['operations']['cooldowns']=={}
 
 
 def test_cancelled_cooldown_never_calls_provider():

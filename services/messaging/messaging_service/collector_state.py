@@ -567,14 +567,17 @@ class CollectorState:
 
     def record_cooldown(self,seconds,phase):
         """ANYM-877: append an account cooldown (start, seconds, governor phase) to the ring of the last
-        COOLDOWN_RING in operations; counts and times only, inside the row's 16 KiB budget."""
+        COOLDOWN_RING in operations.cooldowns.recent; counts and times only, inside the row's 16 KiB budget.
+        The ring is an object like every other operations entry: status readers, the deployed ones too, render
+        each entry as one."""
         if type(seconds) is not int or not 1<=seconds<2**31 or not isinstance(phase,str) or \
                 not re.fullmatch(r'[a-z_]{1,32}',phase):raise ValueError('invalid_cooldown')
         with self.archive.store.pool.connection() as c:
             row=self._operations(c);value=row['operations']
-            ring=[e for e in value.get('cooldowns') or () if isinstance(e,dict)] if isinstance(value.get('cooldowns'),list) else []
-            value['cooldowns']=ring[-(COOLDOWN_RING-1):]+[
-                {'started_at':row['observed'].isoformat(),'seconds':seconds,'phase':phase}]
+            kept=value.get('cooldowns');kept=kept.get('recent') if isinstance(kept,dict) else None
+            ring=[e for e in kept if isinstance(e,dict)] if isinstance(kept,list) else []
+            value['cooldowns']={'recent':ring[-(COOLDOWN_RING-1):]+[
+                {'started_at':row['observed'].isoformat(),'seconds':seconds,'phase':phase}]}
             self._save_operations(c,value)
 
     def discovery_started(self):

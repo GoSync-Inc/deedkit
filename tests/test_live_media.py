@@ -184,6 +184,28 @@ def test_a_fetched_message_that_no_longer_matches_is_fetched_again():
     assert client.fetches==[[1,2],2]
 
 
+# spec: ANYM-877
+def test_a_fetched_message_serves_once_and_expires_after_ten_minutes(monkeypatch):
+    from test_telegram_governor import Clock
+    from messaging_service import telegram_collector
+    from messaging_service.adapters import telegram_message
+    items={i:document(i,100) for i in (1,2,3,4)}
+    client=Files(items,{i:[b'x'*100] for i in items});provider,_=fake_provider(client,Clock())
+    async def collect(i,burst=()):
+        source={'account':'tg-live','provider_chat':'100','provider_id':str(i),'_burst':list(burst)}
+        return b''.join([c async for c in provider.chunks(source,telegram_message('tg-live',items[i])['media'][0])])
+    asyncio.run(collect(1,[2,3]))
+    at,message=provider._fetched[(100,3)]
+    provider._fetched[(100,3)]=(at-telegram_collector.FETCHED_SECONDS-1,message)  # older than ten minutes
+    asyncio.run(collect(2));asyncio.run(collect(3))
+    assert client.fetches==[[1,2,3],3] and not provider._fetched
+    asyncio.run(collect(2))  # used once: a second job for it fetches again
+    assert client.fetches[-1]==2
+    monkeypatch.setattr(telegram_collector,'FETCHED_MAX',2)
+    asyncio.run(collect(1,[2,3,4]))
+    assert set(provider._fetched)=={(100,3),(100,4)}  # the oldest copy goes first
+
+
 def live_original(ar,mid,*,chat='100',age=60,size=4):
     at=(datetime.now(timezone.utc)-timedelta(seconds=age)).isoformat()
     return ar.ingest(event(chat=chat,provider_id=mid,sent_at=at,updated_at=at,

@@ -160,6 +160,7 @@ class RequestGovernor:
         self.bound=bound
         self.unrecorded=0  # monotonic end of an account cooldown whose write failed; retried before reads
         self.scoped={}  # scope -> monotonic end of a method-scoped FloodWait
+        self.rings=set()  # cooldown ring writes still running (ANYM-877)
         self.budgets={scope:LiveBudget(*limits,clock=clock,wall=wall) for scope,limits in (budgets or LIVE_BUDGETS).items()}
 
     @property
@@ -201,18 +202,24 @@ class RequestGovernor:
         # Commit BEFORE releasing the shared gate or propagating the error. The pause holds in memory
         # first, so a write that fails or times out still gates this process and is retried later.
         self.unrecorded=max(self.unrecorded,self.clock()+seconds)
-        await self._write(seconds)
-        await self._ring(seconds,phase)
+        try:await self._write(seconds)
+        except asyncio.CancelledError:
+            # The cooldown is written (or kept in memory); its ring entry still lands, unawaited.
+            self._ring(seconds,phase);raise
+        ring=self._ring(seconds,phase)
+        if ring is not None:await asyncio.wait({ring},timeout=RECORD_SECONDS+RECORD_GRACE)
 
-    async def _ring(self,seconds,phase):
-        """ANYM-877: append the cooldown to the health ring; best effort, never in the cooldown's way."""
-        if getattr(self._state,'record_cooldown',None) is None:return
+    def _ring(self,seconds,phase):
+        """ANYM-877: start appending the cooldown to the health ring; best effort, never in the cooldown's way."""
+        if getattr(self._state,'record_cooldown',None) is None:return None
         state=self.bound(self._state,time.monotonic()+RECORD_SECONDS) if self.bound else self._state
         task=asyncio.ensure_future(asyncio.to_thread(state.record_cooldown,seconds,phase))
-        task.add_done_callback(lambda t:t.cancelled() or t.exception())
-        # The cooldown itself is already written; a cancelled caller leaves the entry to land by itself.
-        await asyncio.wait({task},timeout=RECORD_SECONDS+RECORD_GRACE)
-        if task.done() and not task.cancelled() and task.exception() is not None:
+        self.rings.add(task);task.add_done_callback(self._ring_done)
+        return task
+
+    def _ring_done(self,task):
+        self.rings.discard(task)
+        if not task.cancelled() and task.exception() is not None:
             logger.warning('cooldown_ring_failed exception_type=%s',type(task.exception()).__name__)
 
     async def _write(self,seconds):
