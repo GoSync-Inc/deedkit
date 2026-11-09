@@ -86,7 +86,7 @@ def run(fn, env, principal, kw):
 
 
 common = dict(
-    query=st.sampled_from(['', 'ab', '@a_%\\x', '@']), chat_types=st.sampled_from([None, ['private', 'group']]),
+    query=st.sampled_from(['', 'Ab', '@a_%\\x', '@']), chat_types=st.sampled_from([None, ['private', 'group']]),
     accounts=st.sampled_from([None, ['acc1']]), exclude_channels=st.booleans(),
     exclude_chats=st.sampled_from([None, ['L', 'x'], ['P']]), my_roles=st.sampled_from([None, None, ['admin', 'member'], []]),
     can_post=st.sampled_from([None, None, True, False]),
