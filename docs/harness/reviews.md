@@ -43,6 +43,12 @@ rounds and the verdict. A project's review notes add its deployed-version list, 
   not apply (the copied text was reviewed here).
 - The authoring model never adds or changes a review gate. Use one independent reviewer in a
   separate session: Sol for ordinary code, Astra for the named risk, never both for the same r1.
+  Fable reviews code only when the task brief names it for that task (the owner or the orchestrator
+  chose it; owner 11-09): then it takes Sol's r1 place (`Agent(subagent_type: "general-purpose",
+  model: "fable")`), never a standing default and never in addition to Sol. The author checks the
+  packet list (Packet) before launching it, as `bin/review-codex.sh` would. It is a no-Codex review:
+  its scoped recheck is Fable again (Rounds 4; the Sol recheck rule above covers Codex r1s), under
+  the same cap (Rounds 5).
   Product cards retain their Fable round (Card review below); it is not repeated on finished code.
 - Name the model in the pull request's `Review record:`; put `Model: <model> <effort>` (the
   author's) in every pull request description.
@@ -243,8 +249,8 @@ Codex run passes `-c service_tier="default"`: the priority tier costs about twic
 token.
 
 Standing approval (owner 10-19): the orchestrator may tune review routing within this document
-(round cap, recheck scope, severity rubric, the Codex line and the reviewer for non-risk code)
-and reports each change in the morning digest. It never removes Astra r1 from a risk path,
+(round cap, recheck scope, severity rubric, the Codex line and the reviewer for non-risk code;
+Fable on code stays per task, Routing, owner 11-09) and reports each change in the morning digest. It never removes Astra r1 from a risk path,
 the never-downgraded list above, the recheck rules of Rounds 4 and 5 or a process.md section 2 item or gate,
 and never raises the round cap past Rounds 5 (one over-cap round per pull request). Routing
 (reviewer, model, level, rounds, an over-cap round, the Codex budget, who merges) is never asked of
