@@ -425,12 +425,13 @@ def flush_hints(store, *, limit=32):
 
 
 def carry_window(c, row, previous_version):
-    """Same-receiver reconfiguration: keep the held range under the new version, re-plan it now."""
+    """Same-receiver reconfiguration: keep the held range under the new version, re-plan it now. A range marked
+    for its rebuild (ANYM-830, REBUILD_DUE) keeps the mark: it is due already, and the tick must rebuild it."""
     c.execute('''UPDATE subscription_hint_windows SET subscription_version=%s,
-        due_at=CASE WHEN first_match_at IS NULL THEN NULL ELSE clock_timestamp() END,
+        due_at=CASE WHEN first_match_at IS NULL THEN NULL WHEN due_at<=%s THEN due_at ELSE clock_timestamp() END,
         silence_state=NULL,silence_fired_at=NULL,silence_due_at=NULL,silence_held_reason=NULL,
         updated_at=clock_timestamp() WHERE subscription=%s AND subscription_version=%s''',
-        (row['version'], row['id'], previous_version))
+        (row['version'], REBUILD_DUE, row['id'], previous_version))
 
 
 def delivery_state(c, row):

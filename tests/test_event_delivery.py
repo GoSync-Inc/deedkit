@@ -1253,7 +1253,8 @@ SECOND_CHAT = {'account': 'telegram-demo', 'chat': 'telegram-demo-chat-2'}
 def outbox(store, sid):
     with store.pool.connection() as c:
         return [(row['id'], row['state'], row['subscription_version']) for row in c.execute(
-            'SELECT id,state,subscription_version FROM subscription_outbox WHERE subscription=%s ORDER BY id',
+            '''SELECT id,state,subscription_version FROM subscription_outbox WHERE subscription=%s
+                ORDER BY through_position,created_at,id''',
             (sid,)).fetchall()]
 
 
@@ -1446,6 +1447,56 @@ def test_swapping_exclusions_with_an_equal_count_rebuilds_the_held_times_and_rea
         assert window['match_count'] == 1 and 'owner_mention' in window['reasons']
         assert window['first_match_at'] == window['last_match_at'] == matched[mention]
         assert pending_hints(store, sid) == 0 and window['held_reason'] == 'batch'
+    finally:
+        store.set_dynamic_subscriptions(False)
+        store.set_source_exclusions(False)
+
+
+# spec: ANYM-830
+def test_a_same_receiver_reconfiguration_after_an_exclusion_swap_keeps_the_rebuild_and_its_deadline(seeded, tmp_path):
+    from datetime import timedelta
+    from psycopg.types.json import Jsonb
+    from messaging_service.delivery_policy import flush_hints
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    store.set_source_exclusions(True)
+    try:
+        token = identity(store)
+        second_chat(store)
+        with store.pool.connection() as c:
+            c.execute("INSERT INTO message_metadata(message,revision,metadata) VALUES('demo-tg-x',1,%s)",
+                (Jsonb({'mentions_owner': True}),))
+        sid = store.create_subscription(token, sources={'all_visible_chats': True})['subscription_id']
+        rid, _ = receiver(store, token, tmp_path)
+        call(store, token, 'configure_subscription_delivery', sid, 1, rid, {'batch_count': 3})
+        version = store.get_subscription(token, sid)['version']
+        mention = emit_in(store, 'demo-tg-x')
+        emit(store)
+        match_subscriptions(store)
+        with store.pool.connection() as c:
+            c.execute("UPDATE subscription_matches SET matched_at=matched_at-interval '100 seconds' WHERE subscription=%s"
+                " AND event=%s", (sid, mention))
+            early = c.execute('SELECT matched_at FROM subscription_matches WHERE subscription=%s AND event=%s',
+                (sid, mention)).fetchone()['matched_at']
+        store.update_subscription(token, sid, version, action='set_exclusions', exclude_chats=[SECOND_CHAT],
+            exclusions_revision=0)
+        flush_hints(store)
+        # Swap with an equal count, then reconfigure to the same receiver before the next tick.
+        store.update_subscription(token, sid, version, action='set_exclusions', exclude_chats=[
+            {'account': 'telegram-demo', 'chat': 'telegram-demo-chat'}], exclusions_revision=1)
+        call(store, token, 'configure_subscription_delivery', sid, version, rid, {'batch_count': 3})
+        current = store.get_subscription(token, sid)
+        assert current['version'] == version + 1
+        flush_hints(store)
+        with store.pool.connection() as c:
+            window = c.execute('''SELECT subscription_version,match_count,reasons,first_match_at,due_at,held_reason
+                FROM subscription_hint_windows WHERE subscription=%s''', (sid,)).fetchone()
+        assert window['subscription_version'] == version + 1 and window['match_count'] == 1
+        assert 'owner_mention' in window['reasons'] and window['first_match_at'] == early
+        # The deadline is planned from the reference the range holds now: its first match plus max_wait_s.
+        wait = store.get_subscription(token, sid)['delivery']['policy']['max_wait_s']
+        assert window['held_reason'] == 'batch' and window['due_at'] == early + timedelta(seconds=wait)
+        assert pending_hints(store, sid) == 0
     finally:
         store.set_dynamic_subscriptions(False)
         store.set_source_exclusions(False)
