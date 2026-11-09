@@ -1,4 +1,9 @@
 """ANYM-810: courtesies=exclude reads a bounded tail per chat over a large synthetic catalogue; no provider or real data."""
+from types import SimpleNamespace
+
+import pytest
+
+from messaging_service import related_chats
 from messaging_service.chat_queries import COURTESY_SCAN, list_chats
 from test_query_reliability import ChatMeasured
 from test_search_performance import scans, visited
@@ -7,6 +12,14 @@ CHATS = 2000
 GAPS = 100
 GAP = 300
 BUSY = 100
+
+
+@pytest.fixture(autouse=True)
+def host_speed_apart(monkeypatch):
+    """The statement plan is under test, not the host's speed (as in test_search_performance): related_chats' 0.3 s
+    budget, spent on a slow runner in one measurement and not the other, dropped its trailing statements from that one
+    and broke the plain-versus-exclude statement comparison (merge-group run 42612458422, `31 == 29 + 1`)."""
+    monkeypatch.setattr(related_chats, 'DEADLINE_SECONDS', 120.0)
 
 
 def own_statistics(c):
@@ -101,6 +114,27 @@ def test_courtesies_exclude_reads_at_most_the_depth_per_chat(seeded, record_prop
     assert 0 < extra <= bound, scans(closing.plans[0]['Plan'])
     assert counted <= base + bound, scans(closing.counts[0]['Plan'])
 
+
+
+# spec: ANYM-810
+def test_a_slow_host_during_one_measurement_leaves_the_statement_comparison_unchanged(seeded, monkeypatch):
+    """Regression (merge-group run 42612458422, `31 == 29 + 1`): a slow runner spent related_chats' budget
+    (DEADLINE_SECONDS) during the plain measurement only, so its trailing statements were missing from that one."""
+    s, _, b = seeded
+    courtesy_catalogue(s)
+    clock = SimpleNamespace(t=0.0, step=0.0)
+
+    def monotonic():
+        clock.t += clock.step
+        return clock.t
+    monkeypatch.setattr(related_chats, 'time', SimpleNamespace(monotonic=monotonic))
+    clock.step = 0.2  # every related_chats clock read costs 0.2 s: the slow host
+    _, plain = measure(s, b)
+    clock.step = 0.0
+    _, closing = measure(s, b, courtesies='exclude')
+    steps = [q.split(' */')[0] for q in plain.sql if q.startswith('/* related_chats:')]
+    assert steps == [q.split(' */')[0] for q in closing.sql if q.startswith('/* related_chats:')] and steps
+    assert len(closing.sql) == len(plain.sql) + 1 and len(closing.counts) == 1
 
 TIES = 100
 
