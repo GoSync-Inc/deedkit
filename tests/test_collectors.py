@@ -1183,6 +1183,134 @@ def test_group_changes_wake_no_default_subscription_but_a_joined_group_and_other
     assert woke==[f'group_{WA_GROUP}_1700000500_joined_group','false_'+WA_GROUP+'_NOTE','false_'+WA_GROUP+'_TEXT']
 
 
+WA_POLL='false_'+WA_GROUP+'_POLL1_444444@c.us'
+
+
+def poll_capture(options=('Да','Нет','Может быть'),mid=WA_POLL,block=None):
+    """The whatsmeow poll creation envelope (polls.go pollBlock), synthetic only."""
+    capture=wa_capture(mid,1700000000,body='Кто в субботу?',kind='poll_creation',actor='444444@c.us')
+    capture['event']['isService']=False
+    capture['event']['poll']=block or {'question':'Кто в субботу?','options':[{'index':i,'text':t} for i,t in enumerate(options)],
+        'selectable_count':0,'truncated':False}
+    return capture
+
+
+def vote_capture(voter,indices,ms,*,origin='live',from_me=False,poll=WA_POLL):
+    """The whatsmeow poll_vote journal entry (polls.go pollVoteEnvelope), synthetic only."""
+    return {'kind':'poll_vote','account':'wa-groups','chat':WA_GROUP,'poll_provider_id':poll,'voter':voter,'from_me':from_me,
+        'option_indices':indices,'voted_at':datetime.fromtimestamp(ms/1000,timezone.utc).isoformat(),
+        'observed_at':'2026-11-09T10:00:00+00:00','origin':origin}
+
+
+def poll_state(store,provider_id=WA_POLL):
+    mid=stable_id('msg','wa-groups',WA_GROUP,provider_id)
+    with store.pool.connection() as c:
+        return (sorted((r['voter'],r['option_index']) for r in c.execute('SELECT voter,option_index FROM poll_voters WHERE message=%s',(mid,))),
+            {r['option_index']:r['voters'] for r in c.execute('SELECT option_index,voters FROM poll_results WHERE message=%s',(mid,))},
+            c.execute("SELECT count(*) AS n FROM events WHERE message=%s AND kind='poll.updated'",(mid,)).fetchone()['n'],
+            c.execute("SELECT count(*) AS n FROM messages WHERE account='wa-groups'").fetchone()['n'])
+
+
+# spec: ANYM-921
+def test_a_whatsapp_vote_is_no_chat_message_and_sets_the_voters_rows_and_counts(wa_groups):
+    state,store,_=wa_groups
+    assert state.apply(poll_capture())['outcome']=='created'
+    _,metadata,_=wa_rows(store,WA_POLL)
+    assert metadata['metadata']['message_kind']=='poll' and metadata['metadata']['poll']['options'][2]=={'index':2,'text':'Может быть'}
+    # Option 7 names nothing in a three-option poll: dropped.
+    assert state.apply(vote_capture('555555@c.us',[0,2,7],1700000100000))['outcome']=='poll_updated'
+    assert poll_state(store)==([('555555@c.us',0),('555555@c.us',2)],{0:1,1:0,2:1},1,1)
+    assert state.apply(vote_capture('555555@c.us',[0],1700000100500,poll='false_'+WA_GROUP+'_NOPOLL_1@c.us'))['outcome']=='poll_unknown'
+    assert poll_state(store)[3]==1
+    # A poll block the archive cannot accept never quarantines the poll message itself.
+    bad=poll_capture(mid='false_'+WA_GROUP+'_POLL2_444444@c.us',block={'question':'x','options':[{'index':5,'text':'a'}],
+        'selectable_count':0,'truncated':False})
+    assert state.apply(bad)['outcome']=='created'
+    _,metadata,_=wa_rows(store,'false_'+WA_GROUP+'_POLL2_444444@c.us')
+    assert metadata['metadata']['message_kind']=='poll' and 'poll' not in metadata['metadata']
+    with pytest.raises(ValueError,match='invalid_poll_vote'):
+        state.apply({**vote_capture('555555@c.us',[0],1700000100000),'option_indices':[0,0]})
+
+
+# spec: ANYM-921
+def test_a_newer_whatsapp_vote_replaces_the_voters_choice_an_older_one_is_ignored_and_an_empty_one_retracts(wa_groups):
+    state,store,_=wa_groups
+    state.apply(poll_capture())
+    state.apply(vote_capture('666666@c.us',[2],1700000050000))
+    assert state.apply(vote_capture('555555@c.us',[0],1700000100000))['outcome']=='poll_updated'
+    assert state.apply(vote_capture('555555@c.us',[1],1700000300000))['outcome']=='poll_updated'
+    assert poll_state(store)[:2]==([('555555@c.us',1),('666666@c.us',2)],{0:0,1:1,2:1})
+    # Delivered late: older than the stored vote of the same voter.
+    assert state.apply(vote_capture('555555@c.us',[0],1700000200000))['outcome']=='stale'
+    assert poll_state(store)[:3]==([('555555@c.us',1),('666666@c.us',2)],{0:0,1:1,2:1},3)
+    assert state.apply(vote_capture('555555@c.us',[],1700000400000))['outcome']=='poll_updated'
+    assert poll_state(store)[:3]==([('666666@c.us',2)],{0:0,1:0,2:1},4)
+    # The retraction is remembered: an older vote cannot bring the voter back.
+    assert state.apply(vote_capture('555555@c.us',[1],1700000350000))['outcome']=='stale'
+    assert poll_state(store)[:2]==([('666666@c.us',2)],{0:0,1:0,2:1})
+
+
+# spec: ANYM-921
+def test_a_whatsapp_poll_and_its_votes_from_history_add_no_duplicates_when_replayed(wa_groups):
+    state,store,_=wa_groups
+    synced=poll_capture();synced['origin']='backfill'
+    assert state.apply(synced)['outcome']=='created'
+    assert state.apply(poll_capture())['outcome']!='created'
+    assert state.apply(vote_capture('555555@c.us',[1],1700000100000))['outcome']=='poll_updated'
+    for _ in range(2):
+        assert state.apply(vote_capture('555555@c.us',[1],1700000100000,origin='backfill'))['outcome']=='stale'
+        assert state.apply(synced)['outcome']!='created'
+    assert poll_state(store)==([('555555@c.us',1)],{0:0,1:1,2:0},1,1)
+
+
+# spec: ANYM-921
+def test_message_reads_show_a_whatsapp_polls_counts_voters_and_the_owners_choice(wa_groups):
+    state,store,key=wa_groups
+    state.apply(poll_capture())
+    named=wa_capture('false_'+WA_GROUP+'_HI_555555@c.us',1700000010,body='привет',actor='555555@c.us')
+    named['event']['senderName']='Синтетик Б'
+    state.apply(named)
+    state.apply(vote_capture('555555@c.us',[1],1700000100000))
+    state.apply(vote_capture('666666@c.us',[1],1700000200000))
+    state.apply(vote_capture('123456@c.us',[0],1700000300000,from_me=True))
+    chat_id=stable_id('chat','wa-groups',WA_GROUP);mid=stable_id('msg','wa-groups',WA_GROUP,WA_POLL)
+    reads={'archive':store.get_messages(key,chat_id)['items'],'conversation':store.get_messages(key,chat_id,view='conversation')['items'],
+        'search':store.search(key,'субботу',chat=chat_id)['items'],'context':[store.get_context(key,mid)['message']]}
+    for name,items in reads.items():
+        poll=next(i for i in items if i['id']==mid)['poll']
+        assert [(o['text'],o['voters']) for o in poll['options']]==[('Да',1),('Нет',2),('Может быть',0)],name
+        assert poll['options'][1]['voted_by']==[{'sender':'666666@c.us','name':None},{'sender':'555555@c.us','name':'Синтетик Б'}],name
+        assert poll['options'][2]=={'index':2,'text':'Может быть','voters':0,'voted_by':[],'voted_by_truncated':False},name
+        assert poll['total_voters']==3 and poll['chosen']==[0] and poll['results_as_of'] and poll['question']=='Кто в субботу?',name
+        assert all('poll' not in i for i in items if i['id']!=mid),name
+    # 60 voters of one option: 50 listed, the rest counted.
+    for n in range(60):state.apply(vote_capture(f'7000{n:02d}@c.us',[2],1700000400000+n))
+    option=store.get_context(key,mid)['message']['poll']['options'][2]
+    assert option['voters']==60 and len(option['voted_by'])==50 and option['voted_by_truncated'] is True
+    # A key without read on the chat gets nothing.
+    Archive(store).register('wa-other','whatsapp','Synthetic other',discover=True)
+    other=store.issue_key('wa-other-reader',['wa-other'],permissions=['read'],key_permissions=['read'])
+    from messaging_service.store import APIError
+    with pytest.raises(APIError):store.get_context(other,mid)
+    assert store.search(other,'субботу')['items']==[]
+
+
+# spec: ANYM-921
+def test_poll_updates_wake_only_a_subscription_that_lists_them(wa_groups):
+    from messaging_service.subscriptions import match_subscriptions
+    state,store,key=wa_groups
+    state.apply(poll_capture())
+    chat_id=stable_id('chat','wa-groups',WA_GROUP)
+    default=store.create_subscription(key,[chat_id])['subscription_id']
+    listed=store.create_subscription(key,[chat_id],kinds=['poll.updated'])['subscription_id']
+    for n in range(30):
+        assert state.apply(vote_capture('555555@c.us',[n%2],1700000100000+n))['outcome']=='poll_updated'
+    match_subscriptions(store)
+    assert store.get_subscription_events(key,default,limit=100)['items']==[]
+    items=store.get_subscription_events(key,listed,limit=100)['items']
+    assert len(items)==30 and {i['kind'] for i in items}=={'poll.updated'}
+
+
 def test_whatsapp_session_directory_with_shared_parent_is_rejected(tmp_path,monkeypatch):
     from messaging_service import whatsapp_collector as wa
     parent=tmp_path/'sessions'; parent.mkdir(mode=0o700)

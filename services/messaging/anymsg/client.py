@@ -168,7 +168,7 @@ _FEEDBACK_FIELDS = {
 }
 _SUBSCRIPTION_KINDS = frozenset({'message.created','message.edited','message.deleted','message.status',
     'attachment.ready','file.text.ready','file.transcript.ready','file.description.ready','file.processing.failed',
-    'send.failed','source.health','attachment.failed'})
+    'send.failed','source.health','attachment.failed','poll.updated'})
 _SUBSCRIPTION_ORIGINS = frozenset({'live','live_recovered','backfill','reconcile','fixture'})
 _WAKE_RULES = frozenset({'incoming_message','owner_mention','reply_to_owner','reply_to_confirmed_send',
     'reply_to_own_send'})

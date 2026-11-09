@@ -408,6 +408,268 @@ func TestNativeMalformedGroupChangeIsCountedAndTheNextMessageIsCaptured(t *testi
 	}
 }
 
+// pollSecrets is an in-memory whatsmeow message-secret store (synthetic keys).
+type pollSecrets map[string]struct {
+	secret []byte
+	sender types.JID
+}
+
+func pollSecretKey(chat, sender types.JID, id types.MessageID) string {
+	return chat.ToNonAD().String() + "|" + sender.ToNonAD().String() + "|" + id
+}
+func (s pollSecrets) PutMessageSecrets(ctx context.Context, inserts []store.MessageSecretInsert) error {
+	for _, i := range inserts {
+		_ = s.PutMessageSecret(ctx, i.Chat, i.Sender, i.ID, i.Secret)
+	}
+	return nil
+}
+func (s pollSecrets) PutMessageSecret(_ context.Context, chat, sender types.JID, id types.MessageID, secret []byte) error {
+	s[pollSecretKey(chat, sender, id)] = struct {
+		secret []byte
+		sender types.JID
+	}{secret, sender}
+	return nil
+}
+func (s pollSecrets) GetMessageSecret(_ context.Context, chat, sender types.JID, id types.MessageID) ([]byte, types.JID, error) {
+	v, ok := s[pollSecretKey(chat, sender, id)]
+	if !ok {
+		return nil, types.EmptyJID, nil
+	}
+	return v.secret, v.sender, nil
+}
+
+func syntheticPoll(id string, question string, options ...string) *events.Message {
+	poll := &waE2E.PollCreationMessage{Name: proto.String(question), SelectableOptionsCount: proto.Uint32(1)}
+	for _, o := range options {
+		poll.Options = append(poll.Options, &waE2E.PollCreationMessage_Option{OptionName: proto.String(o)})
+	}
+	m := &waE2E.Message{PollCreationMessageV3: poll, MessageContextInfo: &waE2E.MessageContextInfo{MessageSecret: bytes.Repeat([]byte{7}, 32)}}
+	e := groupFixture(id, m)
+	e.Info.Chat, e.Info.Sender = groupJID, member("444444")
+	return e
+}
+
+// pollProvider journals a synthetic group poll by 444444 whose secret the store holds,
+// and returns a client of voter 555555 that encrypts votes with the same secret.
+func pollProvider(t *testing.T) (*Provider, *whatsmeow.Client, *events.Message, pollSecrets) {
+	t.Helper()
+	p := skipProvider(t)
+	owner := p.Capture.Owner
+	secrets := pollSecrets{}
+	p.Client = nativeClient(&store.Device{ID: &owner, MsgSecrets: secrets})
+	poll := syntheticPoll("POLL1", "Кто в субботу?", "Да", "Нет", "Может быть")
+	if err := p.handleMessage(poll); err != nil {
+		t.Fatal(err)
+	}
+	_ = secrets.PutMessageSecret(context.Background(), poll.Info.Chat, poll.Info.Sender, poll.Info.ID, poll.Message.GetMessageContextInfo().GetMessageSecret())
+	voter := member("555555")
+	return p, nativeClient(&store.Device{ID: &voter, MsgSecrets: secrets}), poll, secrets
+}
+
+func pollVote(t *testing.T, voter *whatsmeow.Client, poll *events.Message, id string, at int64, selected ...[]byte) *events.Message {
+	t.Helper()
+	update, err := voter.EncryptPollVote(context.Background(), &poll.Info, &waE2E.PollVoteMessage{SelectedOptions: selected})
+	if err != nil {
+		t.Fatal(err)
+	}
+	update.SenderTimestampMS = proto.Int64(at)
+	e := groupFixture(id, &waE2E.Message{PollUpdateMessage: update})
+	e.Info.Chat, e.Info.Sender, e.Info.Timestamp = groupJID, member("555555"), time.UnixMilli(at)
+	return e
+}
+
+func journalKinds(t *testing.T, s *CaptureStore) []map[string]any {
+	t.Helper()
+	rows, err := s.db.Query("SELECT envelope FROM capture ORDER BY seq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var data []byte
+		var v map[string]any
+		if err = rows.Scan(&data); err != nil || json.Unmarshal(data, &v) != nil {
+			t.Fatal("unreadable journal entry", err)
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+func pollOptionHash(name string) []byte { return whatsmeow.HashPollOptions([]string{name})[0] }
+
+// spec: ANYM-921
+func TestNativePollCreationKeepsItsOptionsAndSelectableCount(t *testing.T) {
+	owner := types.NewJID("123456", types.DefaultUserServer)
+	poll := func(name string, count uint32, options ...string) *waE2E.PollCreationMessage {
+		v := &waE2E.PollCreationMessage{Name: proto.String(name), SelectableOptionsCount: proto.Uint32(count)}
+		for _, o := range options {
+			v.Options = append(v.Options, &waE2E.PollCreationMessage_Option{OptionName: proto.String(o)})
+		}
+		return v
+	}
+	for name, m := range map[string]*waE2E.Message{
+		"v1": {PollCreationMessage: poll("Кто в субботу?", 0, "Да", "Нет")},
+		"v2": {PollCreationMessageV2: poll("Кто в субботу?", 0, "Да", "Нет")},
+		"v3": {PollCreationMessageV3: poll("Кто в субботу?", 0, "Да", "Нет")},
+	} {
+		v, err := NormalizeMessage(groupFixture("P"+name, m), owner)
+		if err != nil {
+			t.Fatal(name, err)
+		}
+		requireFields(t, v, map[string]any{"messageType": "poll_creation", "body": "Кто в субботу?"})
+		data, _ := json.Marshal(v["poll"])
+		if string(data) != `{"options":[{"index":0,"text":"Да"},{"index":1,"text":"Нет"}],"question":"Кто в субботу?","selectable_count":0,"truncated":false}` {
+			t.Fatal(name, string(data))
+		}
+	}
+	var many []string
+	for i := range 13 {
+		many = append(many, strconv.Itoa(i)+strings.Repeat("я", 300))
+	}
+	v, err := NormalizeMessage(groupFixture("PBIG", &waE2E.Message{PollCreationMessageV3: poll(strings.Repeat("в", 600), 3, many...)}), owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := v["poll"].(map[string]any)
+	options := block["options"].([]any)
+	if len(options) != 12 || block["truncated"] != true || block["selectable_count"] != uint32(3) || utf8.RuneCountInString(block["question"].(string)) != 512 {
+		t.Fatalf("bounds: %d options, %#v", len(options), block["truncated"])
+	}
+	for i, o := range options {
+		if o.(map[string]any)["index"] != i || utf8.RuneCountInString(o.(map[string]any)["text"].(string)) != 256 {
+			t.Fatal("option bound", i)
+		}
+	}
+	if v, _ := NormalizeMessage(fixtureMessage("TEXT", 1700000000), owner); v["poll"] != nil {
+		t.Fatal("poll block on a text message")
+	}
+}
+
+// spec: ANYM-921
+func TestNativePollVoteIsOneJournalEntryWithTheChosenOptions(t *testing.T) {
+	p, voter, poll, _ := pollProvider(t)
+	vote := pollVote(t, voter, poll, "VOTE1", 1700000100250, pollOptionHash("Нет"), pollOptionHash("Да"), pollOptionHash("forged"))
+	if err := p.handleMessage(vote); err != nil {
+		t.Fatal(err)
+	}
+	entries := journalKinds(t, p.Capture)
+	if len(entries) != 2 || entries[0]["event"].(map[string]any)["poll"] == nil {
+		t.Fatalf("want the poll and one vote entry, got %d", len(entries))
+	}
+	got := entries[1]
+	data, _ := json.Marshal(got["option_indices"])
+	if got["kind"] != "poll_vote" || got["poll_provider_id"] != "false_120363000000000009@g.us_POLL1_444444@c.us" || got["voter"] != "555555@c.us" ||
+		got["from_me"] != false || string(data) != "[0,1]" || got["voted_at"] != "2023-11-14T22:15:00.25Z" || got["chat"] != "120363000000000009@g.us" || got["origin"] != "live" {
+		t.Fatalf("vote entry: %#v", got)
+	}
+	if _, ok := got["event"]; ok {
+		t.Fatal("a vote is not a chat message")
+	}
+	if counts := skipCounts(t, p.Capture); counts["poll_vote_unknown_option"] != 1 || len(counts) != 1 {
+		t.Fatal(counts)
+	}
+	// A retracted vote is an empty selection; a vote of only unknown options is no retraction.
+	if err := p.handleMessage(pollVote(t, voter, poll, "VOTE2", 1700000200000)); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.handleMessage(pollVote(t, voter, poll, "VOTE3", 1700000300000, pollOptionHash("forged"))); err != nil {
+		t.Fatal(err)
+	}
+	entries = journalKinds(t, p.Capture)
+	if len(entries) != 3 || fmt.Sprint(entries[2]["option_indices"]) != "[]" {
+		t.Fatalf("retraction: %d entries", len(entries))
+	}
+}
+
+// spec: ANYM-921
+func TestNativeUndecryptablePollVoteIsCountedWithoutContentAndTheNextMessageIsCaptured(t *testing.T) {
+	p, voter, poll, secrets := pollProvider(t)
+	other := syntheticPoll("POLL2", "Второй?", "А", "Б")
+	_ = secrets.PutMessageSecret(context.Background(), other.Info.Chat, other.Info.Sender, other.Info.ID, other.Message.GetMessageContextInfo().GetMessageSecret())
+	unknown := pollVote(t, voter, other, "VOTE9", 1700000100000, pollOptionHash("А")) // its poll was never journaled
+	lost := pollVote(t, voter, poll, "VOTE7", 1700000100000)                          // its secret is gone below
+	clear(secrets)
+	noSecret := groupFixture("VOTE8", &waE2E.Message{PollUpdateMessage: &waE2E.PollUpdateMessage{
+		PollCreationMessageKey: &waCommon.MessageKey{RemoteJID: proto.String(groupJID.String()), ID: proto.String("POLL1"), Participant: proto.String("444444@s.whatsapp.net")},
+		Vote:                   &waE2E.PollEncValue{EncPayload: []byte("synthetic"), EncIV: bytes.Repeat([]byte{1}, 12)}}})
+	noSecret.Info.Chat, noSecret.Info.Sender = groupJID, member("555555")
+	stderr := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+	for _, vote := range []*events.Message{unknown, noSecret, lost} {
+		if err := p.handleMessage(vote); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w.Close()
+	os.Stderr = stderr
+	logged, _ := io.ReadAll(r)
+	if counts := skipCounts(t, p.Capture); counts["poll_vote_undecryptable"] != 3 || len(counts) != 1 {
+		t.Fatal(counts)
+	}
+	if bytes.Contains(logged, []byte("555555")) || bytes.Contains(logged, []byte("POLL")) || !bytes.Contains(logged, []byte("poll_vote_undecryptable")) {
+		t.Fatalf("log: %s", logged)
+	}
+	if n := spoolFiles(t, p.Config.EventsDirectory); n != 1 || !p.ready.Load() {
+		t.Fatal("undecryptable vote exported or provider stopped", n)
+	}
+	if err := p.handleMessage(fixtureMessage("after", 1700000601)); err != nil {
+		t.Fatal(err)
+	}
+	if n := spoolFiles(t, p.Config.EventsDirectory); n != 2 {
+		t.Fatal("message after an undecryptable vote not captured", n)
+	}
+}
+
+// spec: ANYM-921
+func TestNativeHistoryPollAndItsVotesMatchTheLiveEntriesWithoutDuplicates(t *testing.T) {
+	p, voter, poll, _ := pollProvider(t)
+	if err := p.handleMessage(pollVote(t, voter, poll, "VOTE1", 1700000100000, pollOptionHash("Да"))); err != nil {
+		t.Fatal(err)
+	}
+	creation := proto.Clone(poll.Message).(*waE2E.Message)
+	update := func(id, participant string, at int64, options ...string) *waWeb.PollUpdate {
+		return &waWeb.PollUpdate{PollUpdateMessageKey: &waCommon.MessageKey{RemoteJID: proto.String(groupJID.String()), ID: proto.String(id), Participant: proto.String(participant)},
+			Vote: &waE2E.PollVoteMessage{SelectedOptions: whatsmeow.HashPollOptions(options)}, SenderTimestampMS: proto.Int64(at)}
+	}
+	data := &waHistorySync.HistorySync{Conversations: []*waHistorySync.Conversation{{ID: proto.String(groupJID.String()), Messages: []*waHistorySync.HistorySyncMsg{
+		{Message: &waWeb.WebMessageInfo{Key: &waCommon.MessageKey{RemoteJID: proto.String(groupJID.String()), ID: proto.String("POLL1")}, Participant: proto.String("444444@s.whatsapp.net"),
+			MessageTimestamp: proto.Uint64(uint64(poll.Info.Timestamp.Unix())), Message: creation,
+			PollUpdates: []*waWeb.PollUpdate{
+				update("VOTE1", "555555@s.whatsapp.net", 1700000100000, "Да"), // the live vote again
+				update("VOTE5", "666666@s.whatsapp.net", 1700000150000, "Может быть"),
+				{PollUpdateMessageKey: &waCommon.MessageKey{ID: proto.String("VOTE6")}}, // no vote: counted
+			}}},
+	}}}}
+	journaled := 0
+	for i := range 2 {
+		if err := p.captureHistory(data); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			journaled = len(journalKinds(t, p.Capture))
+		}
+	}
+	if n := len(journalKinds(t, p.Capture)); n != journaled {
+		t.Fatal("a replayed history sync journaled again", n, journaled)
+	}
+	var votes []string
+	for _, entry := range journalKinds(t, p.Capture) {
+		if entry["kind"] == "poll_vote" {
+			votes = append(votes, fmt.Sprintf("%v:%v:%v:%v", entry["voter"], entry["option_indices"], entry["poll_provider_id"], entry["origin"]))
+		}
+	}
+	want := "555555@c.us:[0]:false_120363000000000009@g.us_POLL1_444444@c.us:live 666666@c.us:[2]:false_120363000000000009@g.us_POLL1_444444@c.us:backfill"
+	if strings.Join(votes, " ") != want {
+		t.Fatalf("votes:\n%s\nwant\n%s", strings.Join(votes, " "), want)
+	}
+	if counts := skipCounts(t, p.Capture); counts["poll_vote_undecryptable"] != 2 {
+		t.Fatal(counts)
+	}
+}
+
 // spec: ANYM-471
 func TestNativeBusinessMessagesKeepTheirVisibleText(t *testing.T) {
 	interactive := &waE2E.InteractiveMessage{Header: &waE2E.InteractiveMessage_Header{Title: proto.String("Invoice 42")}, Body: &waE2E.InteractiveMessage_Body{Text: proto.String("Your invoice is ready.")}, Footer: &waE2E.InteractiveMessage_Footer{Text: proto.String("Reply STOP")}}

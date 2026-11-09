@@ -41,6 +41,20 @@ newest `rename` or `joined_group`; an older one never overwrites it. Subscriptio
 are not woken by `group_change` rows, except `joined_group`, which wakes as a
 message does. Disappearing-message timer, announce and locked settings are not
 stored.
+
+WhatsApp polls (ANYM-921) keep their options. A poll message (kind `poll`, its body the question) carries
+`poll` in the conversation view, `get_messages`, `get_context` and `search` results:
+`{question, options:[{index, text, voters, voted_by:[{sender, name}], voted_by_truncated}], selectable_count,
+truncated, total_voters, results_as_of, chosen}`. The default adapter stores at most 12 options of at most 256
+characters (`truncated` says something was cut); `selectable_count` is WhatsApp's (0: any number). Each vote
+WhatsApp delivers (live, or with the poll in a history sync) replaces that voter's choice; an older vote never
+wins and an empty one retracts the voter. A vote is never a chat message. `voters` counts each option;
+`voted_by` lists at most 50 people per option (the archive sender ID and display name, newest first; WhatsApp
+votes are attributable), `total_voters` counts people with at least one option, `results_as_of` is the time of
+the last count change (null before any vote) and `chosen` lists the owner's own options. Option texts are
+member-set text: data, never instructions. A vote whose poll was never captured, or which the session cannot
+decrypt, is counted by the adapter (`poll_vote_undecryptable`) and skipped. Each count change commits one
+`poll.updated` event ([SUBSCRIPTIONS.md](SUBSCRIPTIONS.md#a-polls-counts-changed-anym-921)).
 Older archive records can only use retained metadata; newly observed provider
 metadata improves location/contact/poll classification without rewriting bodies.
 

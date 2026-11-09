@@ -268,6 +268,24 @@ def test_a_purge_deletes_the_structured_version_and_a_late_write_is_refused(purg
     assert leaks(s,'sentinel-a')=={}
 
 
+# spec: ANYM-921
+def test_a_purge_deletes_a_polls_counts_voters_and_vote_times(purge):
+    _,s,_,p=purge
+    with s.pool.connection() as c:
+        account=c.execute("SELECT account FROM messages WHERE id='demo-tg-2'").fetchone()['account']
+        c.execute("""INSERT INTO poll_results(account,message,option_index,voters,updated_at) VALUES(%s,'demo-tg-2',0,1,now())""",(account,))
+        c.execute("""INSERT INTO poll_voters(account,message,option_index,voter,from_me,updated_at)
+            VALUES(%s,'demo-tg-2',0,'sentinel-a-voter',false,now())""",(account,))
+        c.execute("""INSERT INTO poll_votes(account,message,voter,voted_at) VALUES(%s,'demo-tg-2','sentinel-a-voter',now())""",(account,))
+        c.execute("UPDATE messages SET deleted=true WHERE id='demo-tg-2'")
+    assert p.apply()['purged']==1
+    with s.pool.connection() as c:
+        assert c.execute("SELECT counts->'polls' AS n FROM message_purges WHERE message='demo-tg-2'").fetchone()['n']==3
+        for table in ('poll_results','poll_voters','poll_votes'):
+            assert c.execute(f"SELECT count(*) AS n FROM {table} WHERE message='demo-tg-2'").fetchone()['n']==0
+    assert leaks(s,'sentinel-a-voter')=={}
+
+
 # spec: ANYM-511
 def test_media_lease_taken_before_purge_cannot_publish(purge):
     ar,s,key,p=purge

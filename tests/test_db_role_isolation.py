@@ -395,6 +395,37 @@ def test_collector_bound_to_one_account_ingests_it_but_cannot_write_another(arch
         remove(s, role)
 
 
+# spec: ANYM-921
+def test_a_bound_collector_writes_only_its_own_accounts_poll_rows_and_reads_skip_a_forged_one(archive):  # noqa: F811
+    from messaging_service.polls import attach
+    ar, s, _, _ = archive
+    other, _ = other_account(ar, s)
+    mine = ar.ingest(media_event(provider_id='31'))['message']
+    role = install(s, 'collector_role.sql', 'messaging_collector', account='archive-test')
+    try:
+        with as_role(s, role) as c:
+            c.execute("""INSERT INTO poll_voters(account,message,option_index,voter,from_me,updated_at)
+                VALUES('archive-test',%s,0,'555555@c.us',false,now())""", (mine,))
+            c.execute("INSERT INTO poll_votes(account,message,voter,voted_at) VALUES('archive-test',%s,'555555@c.us',now())", (mine,))
+            c.execute("INSERT INTO poll_results(account,message,option_index,voters,updated_at) VALUES('archive-test',%s,0,1,now())", (mine,))
+            # Under its own account name on another account's poll: stored, but never read (below).
+            c.execute("""INSERT INTO poll_voters(account,message,option_index,voter,from_me,updated_at)
+                VALUES('archive-test',%s,0,'forged@c.us',false,now())""", (other,))
+        for table, columns, values in [('poll_voters', 'account,message,option_index,voter,from_me,updated_at', "%s,0,'x@c.us',false,now()"),
+                                       ('poll_votes', 'account,message,voter,voted_at', "%s,'x@c.us',now()"),
+                                       ('poll_results', 'account,message,option_index,voters,updated_at', '%s,0,1,now()')]:
+            with pytest.raises(psycopg.errors.CheckViolation):
+                with as_role(s, role) as c:
+                    c.execute(f"INSERT INTO {table}({columns}) VALUES('archive-other',{values})", (other,))
+        with s.pool.connection() as c:
+            block = {'question': 'q', 'options': [{'index': 0, 'text': 'a'}], 'selectable_count': 0, 'truncated': False}
+            rows = attach(c, [{'id': mine, 'poll': dict(block)}, {'id': other, 'poll': dict(block)}])
+        assert [r['poll']['options'][0]['voted_by'] for r in rows] == [[{'sender': '555555@c.us', 'name': None}], []]
+        assert [r['poll']['total_voters'] for r in rows] == [1, 0]
+    finally:
+        remove(s, role)
+
+
 # spec: ANYM-867
 def test_a_bound_collector_publishes_attachment_failed_with_its_existing_grants(archive):  # noqa: F811
     from messaging_service import attachment_failures
@@ -996,7 +1027,8 @@ def test_activity_grants_add_only_the_new_table_to_each_role(seeded, template, b
         # reads; schema 78 (ANYM-914) its read of session_claims; those blocks' too.
         assert {grant for grant in after if grant[0] not in ('subscription_activity', 'wake_targets',
             'wake_target_subscriptions', 'negotiations', 'negotiation_sources', 'negotiation_times',
-            'attachment_structure', 'structure_profiles', 'session_claims')} - later == before
+            'attachment_structure', 'structure_profiles', 'session_claims', 'poll_results', 'poll_voters',
+            'poll_votes')} - later == before
         assert {grant[2] for grant in after if grant[0] == 'subscription_activity' and grant[1] == ''} == added
         token = store.issue_key('activity-acl', ['telegram-demo'], permissions=['read', 'subscription-write'],
             key_permissions=['read', 'subscription-write'])

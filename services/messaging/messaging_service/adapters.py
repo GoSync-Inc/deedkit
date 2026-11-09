@@ -300,6 +300,12 @@ def whatsapp_message(account,event,*,origin='live',change='message',observed_at=
         # A card the archive cannot accept never quarantines the message itself.
         try:contact=contact_block(contact)
         except ValueError:contact={'status':'parse_failed','contacts':[]}
+    poll=event.get('poll') if kind=='poll' and change!='delete' else None
+    if poll is not None:
+        # A poll's options (ANYM-921, whatsmeow polls.go); a block the archive cannot accept never quarantines the poll.
+        from .polls import poll_block
+        try:poll=poll_block(poll)
+        except ValueError:poll=None
     return validate({'account':account,'platform':'whatsapp','chat':event['chatId'],
         'chat_title':display_text(event.get('chatName'),512) or event['chatId'],'provider_id':event['messageId'],
         'sender':event.get('senderId') or '','body':body,
@@ -321,5 +327,6 @@ def whatsapp_message(account,event,*,origin='live',change='message',observed_at=
                     **({'forward_origin':forward} if forward is not None else {}),
                     **({'contact':contact} if contact is not None else {}),
                     **({'group_change':group} if group is not None else {}),
+                    **({'poll':poll} if poll is not None else {}),
                     **({'sender_is_business_or_verified':True} if event.get('senderIsBusiness') is True else {}),
                     'media_kind':event.get('mediaKind')}})
