@@ -252,8 +252,13 @@ def test_telegram_provider_subscribes_all_live_message_kinds_without_connecting(
     provider.client = NS(add_event_handler=lambda callback, kind: captured.append((callback, kind)))
     message_callback, deletion_callback = object(), object()
     provider.subscribe(message_callback, deletion_callback)
-    assert [type(kind) for _, kind in captured] == [events.NewMessage, events.MessageEdited, events.MessageDeleted]
-    assert [callback for callback, _ in captured] == [message_callback, message_callback, deletion_callback]
+    assert [type(kind) for _, kind in captured] == [events.NewMessage, events.MessageEdited, events.Raw,
+                                                    events.MessageDeleted]
+    # ANYM-847: service messages (which NewMessage skips) arrive through a raw new-message handler.
+    assert captured[2][1].types == (types.UpdateNewMessage, types.UpdateNewChannelMessage)
+    assert captured[2][0] not in (message_callback, deletion_callback) and callable(captured[2][0])
+    assert [callback for i, (callback, _) in enumerate(captured) if i != 2] == [message_callback, message_callback,
+                                                                                deletion_callback]
 
 
 def test_live_capture_is_durable_before_database_and_overload_fails_closed(tmp_path):
