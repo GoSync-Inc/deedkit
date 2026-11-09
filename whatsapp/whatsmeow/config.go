@@ -25,6 +25,10 @@ type Config struct {
 	DiskReserveBytes     int64  `json:"disk_reserve_bytes"`
 	// ANYM-814: the collector's opt-in phone repair of unverified spans (default off).
 	GapRepair bool `json:"whatsapp_gap_repair"`
+	// ANYM-937 serve mode: the holder's session_holder DSN file (0600); unused in child mode.
+	HolderDSNFile string `json:"holder_dsn_file"`
+	// Tests only: the kernel boot ID's path; empty means /proc/sys/kernel/random/boot_id.
+	BootIDPath string `json:"boot_id_path"`
 }
 type Policy struct {
 	Enabled           bool     `json:"enabled"`
@@ -33,6 +37,8 @@ type Policy struct {
 	DiscoverChats     bool     `json:"discover_chats"`
 	IncludeChats      []string `json:"include_chats"`
 	ExcludeChats      []string `json:"exclude_chats"`
+	// ANYM-937: the attached collector's policy version in serve mode; 0 in child mode.
+	Version int64 `json:"-"`
 }
 
 func (p Policy) Allows(chat string) bool {
@@ -115,6 +121,9 @@ func loadConfig(path string) (Config, error) {
 	return c, nil
 }
 func (p *Provider) policy() (Policy, error) {
+	if p.policySource != nil {
+		return p.policySource() // serve mode: only the attached collector's policy (serve.go policyNow)
+	}
 	var saved struct {
 		ExpiresAt float64 `json:"expires_at"`
 		Policy    Policy  `json:"policy"`

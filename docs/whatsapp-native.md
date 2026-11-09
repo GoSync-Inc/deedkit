@@ -24,6 +24,16 @@ logging is disabled for pairing. The code and auth belong on the server. No auth
 copy to a desktop is needed. The pair process checks the expected account before
 success and exits; starting the collector is a separate operator step.
 
+### Serve mode (session holder, ANYM-937)
+
+`anymsg-whatsmeow --serve <socket-dir> --config <path>` runs the adapter as the account's session holder
+(COLLECTORS.md, Session holders): it outlives collector restarts, so recreating the collector no longer reconnects
+WhatsApp. Its config adds `holder_dsn_file`: an absolute path to a 0600 file with the holder login's DSN
+(production.md, Session holder role, step 4), as `host=... port=... dbname=... user=... password=...` or a URL;
+other libpq keys are sent to the server as runtime parameters and refused. `--version` prints the build's
+`holder_source_sha` and the holder protocol range. Child mode (no `--serve`) is unchanged: it still requires the
+collector's inherited claim and exits when its stdin closes.
+
 ## Contract and limits
 
 Both providers use the same fenced session owner, private policy with expiry,

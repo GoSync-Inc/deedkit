@@ -38,6 +38,8 @@ type Provider struct {
 	connectedOnce  atomic.Bool
 	// Orders group cache refreshes across operations (ANYM-431).
 	groupRefresh groupRefresher
+	// ANYM-937: serve mode's policy (serve.go); nil in child mode, which reads the .policy file.
+	policySource func() (Policy, error)
 }
 
 // Connection failures the Python collector retries or blocks on
