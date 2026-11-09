@@ -253,7 +253,7 @@ def test_session_terminal_telegram_media_error_still_stops_collector(worker,erro
 
 
 # spec: ANYM-840
-def test_telegram_channel_difference_fetch_logs_chat_count_and_timing_only(caplog):
+def test_telegram_channel_difference_fetch_logs_chat_count_and_timing_only(capsys):
     from telethon import TelegramClient,types,utils
     from telethon.sessions import StringSession
     from telethon._updates.messagebox import State as BoxState,PossibleGap,PrematureEndReason
@@ -266,7 +266,7 @@ def test_telegram_channel_difference_fetch_logs_chat_count_and_timing_only(caplo
         self_bot=False
         def get(self,entry):return NS(id=entry,hash=99) if entry!=777 else None
         def extend(self,users,chats):pass
-    hashes=Hashes();sent=datetime(2026,11,9,10,0,tzinfo=timezone.utc)
+    hashes=Hashes();sent=datetime(2026,1,1,10,0,tzinfo=timezone.utc)
     def channel_message(i):
         return types.Message(id=i,peer_id=types.PeerChannel(4242),date=sent,message='synthetic private text')
     def difference(final,*ids):
@@ -300,24 +300,23 @@ def test_telegram_channel_difference_fetch_logs_chat_count_and_timing_only(caplo
         assert new_messages(box.apply_channel_difference(request,broken,hashes)[0])==1
         # Every finished fetch left the tracker: it stays bounded.
         assert provider.channel_fetches=={}
-    with caplog.at_level('INFO',logger='messaging_service.telegram_collector'):asyncio.run(scenario())
-    lines=[r.getMessage() for r in caplog.records if r.getMessage().startswith('telegram_channel_difference')]
+    # A stdout event, as the collector's other events: it reaches prod logs without any logging configuration.
+    asyncio.run(scenario())
+    out=capsys.readouterr().out
+    events=[json.loads(line) for line in out.splitlines() if '"telegram_channel_difference"' in line]
     chat=stable_id('chat','tg-gate',str(utils.get_peer_id(types.PeerChannel(4242))))
-    assert len(lines)==8 and all(f'chat={chat} ' in line for line in lines[:6]+lines[7:])
-    expected=['trigger=timeout result=difference page=1 messages=2 final=False ',
-              'trigger=timeout result=difference page=2 messages=1 final=True ',
-              'trigger=gap result=no_response page=1 messages=0 final=None elapsed_ms=',
-              'trigger=gap result=empty page=2 messages=0 final=True ',
-              'trigger=channel_too_long result=too_long page=1 messages=1 final=True ',
-              'trigger=channel_too_long result=ended_early page=2 messages=0 ',
-              'trigger=timeout result=no_access_hash page=0 messages=0 final=None elapsed_ms=none ',
-              'trigger=timeout result=difference page=1 messages=1 ']
-    assert all(part in line for part,line in zip(expected,lines,strict=True))
-    assert stable_id('chat','tg-gate',str(utils.get_peer_id(types.PeerChannel(777)))) in lines[6]
-    assert 'oldest_age_s=none' not in lines[0] and 'oldest_age_s=none' not in lines[4] and 'oldest_age_s=none' in lines[3]
-    assert all('elapsed_ms=' in line and 'fetch_ms=' in line for line in lines)
-    text=' '.join(lines)
-    assert 'synthetic private text' not in text and '4242' not in text and '777' not in text
+    other=stable_id('chat','tg-gate',str(utils.get_peer_id(types.PeerChannel(777))))
+    fields=['trigger','result','page','messages','final']
+    assert [[event[f] for f in fields] for event in events]==[
+        ['timeout','difference',1,2,False],['timeout','difference',2,1,True],['gap','no_response',1,0,None],
+        ['gap','empty',2,0,True],['channel_too_long','too_long',1,1,True],['channel_too_long','ended_early',2,0,None],
+        ['timeout','no_access_hash',0,0,None],['timeout','difference',1,1,True]]
+    assert [event['chat'] for event in events]==[chat]*6+[other,chat]
+    keys={'event','chat',*fields,'elapsed_ms','fetch_ms','oldest_age_s'}
+    assert all(set(event)==keys for event in events)
+    assert events[0]['oldest_age_s']>0 and events[4]['oldest_age_s']>0 and events[3]['oldest_age_s'] is None
+    assert events[6]['elapsed_ms'] is None and all(isinstance(event['fetch_ms'],int) for event in events)
+    assert 'synthetic private text' not in out and '4242' not in out and '777' not in out
 
 
 @pytest.fixture

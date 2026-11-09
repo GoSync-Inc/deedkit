@@ -342,12 +342,13 @@ class TelethonProvider:
         field='messages' if isinstance(diff,types.updates.ChannelDifferenceTooLong) else 'new_messages'
         messages=list(getattr(diff,field,None) or ())
         dates=[m.date for m in messages if isinstance(getattr(m,'date',None),datetime)]
-        oldest=f'{(datetime.now(timezone.utc)-min(dates)).total_seconds():.0f}' if dates else 'none'
-        elapsed=f'{(now-page_started)*1000:.0f}' if page_started is not None else 'none'
+        oldest=round((datetime.now(timezone.utc)-min(dates)).total_seconds()) if dates else None
+        elapsed=round((now-page_started)*1000) if page_started is not None else None
         chat=stable_id('chat',getattr(getattr(self,'read_gap_state',None),'account',None),str(-1000000000000-entry))
-        log.info('telegram_channel_difference chat=%s trigger=%s result=%s page=%d messages=%d final=%s elapsed_ms=%s '
-            'fetch_ms=%.0f oldest_age_s=%s',chat,trigger,result,page,len(messages),getattr(diff,'final',None),elapsed,
-            (now-began)*1000,oldest)
+        # A stdout event like the collector's others: the service configures no INFO logging, so log.info was dropped.
+        print(json.dumps({'event':'telegram_channel_difference','chat':chat,'trigger':trigger,'result':result,'page':page,
+            'messages':len(messages),'final':getattr(diff,'final',None),'elapsed_ms':elapsed,
+            'fetch_ms':round((now-began)*1000),'oldest_age_s':oldest}),flush=True)
 
     def read_gap_soon(self):
         # Called inside Telethon's update loop: never block or raise there.
