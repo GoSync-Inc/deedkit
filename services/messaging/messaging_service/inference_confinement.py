@@ -245,7 +245,9 @@ class Confinement:
         def watch():
             while not self.stopping.wait(self.interval):
                 try:
-                    self.verify()
+                    # ANYM-838: like a claim, the monitor counts a proof that finishes after it asked, so it never
+                    # queues a second full proof in front of a waiting lane.
+                    self.verify(since=self.clock())
                 except ConfinementLost:
                     on_lost()
                     return
