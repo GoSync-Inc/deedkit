@@ -80,7 +80,7 @@ def test_registering_an_original_reads_its_identity_through_an_index_under_the_r
 
 
 # spec: ANYM-223
-@pytest.mark.parametrize('shape',['invalid','partial','other_keys','hash'])
+@pytest.mark.parametrize('shape',['invalid','partial','other_keys','hash','collation','opclass','descending'])
 def test_migration_068_refuses_an_unusable_index_of_its_name_and_builds_it_once_dropped(database,tmp_path,shape):
     # IF NOT EXISTS keeps any relation of that name; the ledger may advance only over the index the lookup needs.
     import psycopg
@@ -88,7 +88,8 @@ def test_migration_068_refuses_an_unusable_index_of_its_name_and_builds_it_once_
     with old_schema_store(database,tmp_path,67) as store:
         with store.pool.connection() as c:
             c.execute('CREATE INDEX attachment_digest_bytes ON attachments '+{'invalid':'(digest,bytes)',
-                'partial':'(digest,bytes) WHERE active','other_keys':'(digest)','hash':'USING hash (digest)'}[shape])
+                'partial':'(digest,bytes) WHERE active','other_keys':'(digest)','hash':'USING hash (digest)','collation':'(digest COLLATE "C",bytes)',
+                'opclass':'(digest text_pattern_ops,bytes)','descending':'(digest DESC,bytes)'}[shape])
             # What an interrupted CREATE INDEX CONCURRENTLY leaves behind.
             if shape=='invalid':
                 c.execute("UPDATE pg_index SET indisvalid=false WHERE indexrelid='attachment_digest_bytes'::regclass")

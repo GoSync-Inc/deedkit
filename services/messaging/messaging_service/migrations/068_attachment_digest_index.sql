@@ -13,18 +13,23 @@
 SET LOCAL lock_timeout='2s';
 CREATE INDEX IF NOT EXISTS attachment_digest_bytes ON attachments(digest,bytes);
 SET LOCAL lock_timeout=DEFAULT;
--- IF NOT EXISTS keeps any relation of that name: an interrupted concurrent build (INVALID), a partial index or other
--- keys. Only a valid, ready, plain btree on exactly (digest,bytes) lets the ledger advance.
+-- IF NOT EXISTS keeps any relation of that name: an interrupted concurrent build (INVALID), a partial index, other
+-- keys, another collation or operator class. Only a valid, ready, plain btree on exactly (digest,bytes), each key
+-- with its column's collation and the type's default btree operator class, lets the ledger advance.
 DO $$ BEGIN
  IF NOT EXISTS(SELECT FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class x ON x.oid=i.indexrelid
+   JOIN pg_catalog.pg_attribute d ON d.attrelid=i.indrelid AND d.attname='digest'
+   JOIN pg_catalog.pg_attribute b ON b.attrelid=i.indrelid AND b.attname='bytes'
    WHERE i.indexrelid=to_regclass('public.attachment_digest_bytes') AND i.indrelid='public.attachments'::regclass
     AND i.indisvalid AND i.indisready AND i.indpred IS NULL AND i.indexprs IS NULL
-    AND i.indnatts=2 AND i.indnkeyatts=2
+    AND i.indnatts=2 AND i.indnkeyatts=2 AND i.indoption[0]=0 AND i.indoption[1]=0
     AND x.relam=(SELECT a.oid FROM pg_catalog.pg_am a WHERE a.amname='btree')
-    AND i.indkey[0]=(SELECT t.attnum FROM pg_catalog.pg_attribute t
-     WHERE t.attrelid='public.attachments'::regclass AND t.attname='digest')
-    AND i.indkey[1]=(SELECT t.attnum FROM pg_catalog.pg_attribute t
-     WHERE t.attrelid='public.attachments'::regclass AND t.attname='bytes')) THEN
+    AND i.indkey[0]=d.attnum AND i.indkey[1]=b.attnum
+    AND i.indcollation[0]=d.attcollation AND i.indcollation[1]=b.attcollation
+    AND i.indclass[0]=(SELECT c.oid FROM pg_catalog.pg_opclass c WHERE c.opcmethod=x.relam
+     AND c.opcintype=d.atttypid AND c.opcdefault)
+    AND i.indclass[1]=(SELECT c.oid FROM pg_catalog.pg_opclass c WHERE c.opcmethod=x.relam
+     AND c.opcintype=b.atttypid AND c.opcdefault)) THEN
   RAISE EXCEPTION 'attachment_digest_bytes is not a valid btree index on attachments(digest,bytes): DROP INDEX CONCURRENTLY public.attachment_digest_bytes, then migrate again';
  END IF;
 END $$;
