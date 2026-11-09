@@ -13,6 +13,14 @@ from .policy import scope_filter
 HEAD_FRESHNESS = timedelta(minutes=5)
 HEAD_LIMIT = 64
 CATCHUP_WINDOW = timedelta(minutes=30)
+# ANYM-915: a group with at most ATTENTION_WINDOW incoming messages since the owner's latest one is walked as before.
+# A longer one reads only its candidates (the owner-attention boolean keys and the replies to the chat's outgoing
+# messages) while both sides stay bounded: at most ATTENTION_OWNER_MESSAGES outgoing messages to probe replies for, and
+# at most ATTENTION_ARCHIVE_KEYS boolean-key rows in the whole archive (the partial index's own pg_class count), since
+# each costs one primary-key probe whatever account it is in. Otherwise the history is walked, as before.
+ATTENTION_WINDOW = 100
+ATTENTION_OWNER_MESSAGES = 200
+ATTENTION_ARCHIVE_KEYS = 10000
 CLOCK_SKEW = timedelta(minutes=5)  # as_of is the read transaction's start; a marker may be a moment newer
 # ANYM-454: what an agent does next for each reason a conversation block is unclear. Reading a chat
 # cannot refresh a stale head (the collector does), hence answer_with_caveat rather than a retry; nor does it
@@ -292,6 +300,15 @@ def group_after_owner_sql(platform='a.platform', *, same_time=False):
         OR ({platform}='whatsapp' AND m.sent_at=owner_last.sent_at))'''
 
 
+def quoted_stanza_sql(quoted='quoted', provider_chat='c.provider_chat'):
+    """The reply reference a WhatsApp group stanza ID answers to, the inverse of provider_reply_matches' scoped arm."""
+    prefix=f"CASE WHEN left({quoted}.provider_id,5)='true_' THEN 'true_' ELSE 'false_' END"
+    return f'''CASE WHEN right({provider_chat},5)='@g.us'
+        AND (left({quoted}.provider_id,length('true_'||{provider_chat}||'_'))='true_'||{provider_chat}||'_'
+          OR left({quoted}.provider_id,length('false_'||{provider_chat}||'_'))='false_'||{provider_chat}||'_')
+        THEN split_part(substr({quoted}.provider_id,length(({prefix})||{provider_chat}||'_')+1),'_',1) END'''
+
+
 def group_thread_query(projection, *, account='c.account',chat='c.id',
         provider_chat='c.provider_chat',platform='a.platform',enabled='true',
         criteria='true',limit=None,count=False):
@@ -299,9 +316,12 @@ def group_thread_query(projection, *, account='c.account',chat='c.id',
 
     Any later meaningful owner message in the group answers earlier attention,
     as in the archive view; others' chatter neither answers nor renews it. The
-    owner head is one bounded indexed tail read, and scoped messages drive
-    current metadata PK reads before materialization, so other accounts and
-    chats cannot enlarge the candidate pool.
+    owner head is one bounded indexed tail read. Up to ATTENTION_WINDOW incoming
+    messages since it are walked as they are; beyond that (ANYM-915), while the
+    route is bounded, the candidates are the messages whose metadata names the
+    owner and the replies to this chat's outgoing messages, a superset of the
+    answer that the same filters below then decide, so the result never depends
+    on the route. Scoped messages drive every other read.
     """
     from .conversation import meaningful_sql
     from .chat_queries import latest_sql,number
@@ -309,17 +329,50 @@ def group_thread_query(projection, *, account='c.account',chat='c.id',
         LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision
         WHERE {enabled} AND m.account={account} AND m.chat={chat} AND m.direction='outgoing'
           AND {meaningful_sql()}'''
-    sql=f'''WITH owner_last AS MATERIALIZED ({latest_sql(owner,platform=platform)}),
-      thread_messages AS MATERIALIZED (
-        SELECT m.id,m.account,m.chat,m.provider_id,m.revision,m.sender,m.body,m.sent_at,m.direction,
-          md.metadata AS thread_metadata FROM messages m JOIN LATERAL (
+    window=ATTENTION_WINDOW
+    scoped=f"m.account={account} AND m.chat={chat} AND m.direction='incoming'"
+    thread=f'''SELECT m.id,m.account,m.chat,m.provider_id,m.revision,m.sender,m.body,m.sent_at,m.direction,
+          md.metadata AS thread_metadata FROM @source JOIN LATERAL (
           SELECT md.metadata FROM message_metadata md WHERE md.message=m.id AND md.revision=m.revision
             AND (md.metadata->'mentions_owner'='true'::jsonb OR md.metadata->'reply_to_owner'='true'::jsonb
               OR md.metadata->>'reply_to_provider_id' IS NOT NULL) OFFSET 0) md ON true
         LEFT JOIN owner_last ON true
-        WHERE {enabled} AND m.account={account} AND m.chat={chat} AND m.direction='incoming'
+        WHERE @route AND {enabled} AND {scoped}
           AND m.sent_at>=coalesce(owner_last.sent_at,'-infinity'::timestamptz) AND {group_after_owner_sql(platform)}
-          AND {meaningful_sql()} AND {criteria} AND {group_attention_sql(provider_chat=provider_chat)})
+          AND {meaningful_sql()} AND {criteria} AND {group_attention_sql(provider_chat=provider_chat)}'''
+    walked=f'(SELECT count(*) FROM attention_window)<={window}'
+    candidates='(SELECT candidates FROM attention_route)'
+    sql=f'''WITH owner_last AS MATERIALIZED ({latest_sql(owner,platform=platform)}),
+      attention_window AS MATERIALIZED (
+        SELECT m.* FROM messages m WHERE {enabled} AND {scoped} AND NOT m.deleted AND {criteria}
+          AND m.sent_at>=coalesce((SELECT sent_at FROM owner_last),'-infinity'::timestamptz)
+        ORDER BY m.sent_at DESC LIMIT {window+1}),
+      attention_route AS MATERIALIZED (
+        SELECT CASE WHEN {walked} THEN false ELSE (SELECT count(*) FROM (SELECT FROM messages quoted
+            WHERE {enabled} AND quoted.account={account} AND quoted.chat={chat} AND quoted.direction='outgoing'
+              AND NOT quoted.deleted LIMIT {ATTENTION_OWNER_MESSAGES+1}) owned)<={ATTENTION_OWNER_MESSAGES}
+          AND coalesce((SELECT x.reltuples BETWEEN 0 AND {ATTENTION_ARCHIVE_KEYS} FROM pg_catalog.pg_class x
+            WHERE x.oid=to_regclass('public.message_metadata_owner_attention')),false) END AS candidates),
+      attention_candidates AS MATERIALIZED (
+        -- Each candidate is one primary-key read of its message (OFFSET 0 keeps the planner from hashing the chat).
+        SELECT md.message AS id FROM message_metadata md CROSS JOIN LATERAL (SELECT 1 FROM messages m
+            WHERE m.id=md.message AND m.revision=md.revision AND {scoped} AND {criteria} OFFSET 0) m
+          WHERE {candidates} AND (md.metadata->'mentions_owner'='true'::jsonb OR md.metadata->'reply_to_owner'='true'::jsonb)
+        UNION
+        SELECT md.message FROM messages quoted
+          CROSS JOIN LATERAL (VALUES (quoted.provider_id),({quoted_stanza_sql('quoted',provider_chat)})) reference(id)
+          -- One reply_reference index probe per reference, never a join over the metadata table.
+          CROSS JOIN LATERAL (SELECT md.message FROM message_metadata md CROSS JOIN LATERAL (SELECT 1 FROM messages m
+              WHERE m.id=md.message AND m.revision=md.revision AND {scoped} AND {criteria} OFFSET 0) m
+            WHERE md.metadata->>'reply_to_provider_id'=reference.id OFFSET 0) md
+          WHERE {candidates} AND {enabled} AND quoted.account={account} AND quoted.chat={chat}
+            AND quoted.direction='outgoing' AND NOT quoted.deleted),
+      thread_messages AS MATERIALIZED (
+        {thread.replace('@source','attention_window m').replace('@route',walked)}
+        UNION ALL
+        {thread.replace('@source','attention_candidates ac CROSS JOIN LATERAL (SELECT * FROM messages m WHERE m.id=ac.id OFFSET 0) m').replace('@route',candidates)}
+        UNION ALL
+        {thread.replace('@source','messages m').replace('@route','NOT '+walked+' AND NOT '+candidates)})
       SELECT {projection} FROM thread_messages m
       CROSS JOIN LATERAL (SELECT m.thread_metadata AS metadata) md
       LEFT JOIN owner_last ON true'''

@@ -132,7 +132,7 @@ def test_quarantine_restore_holds_every_claim(seeded,locks,monkeypatch):
             executed.append(sql)
             if 'session_claims' in sql: return self.c.execute(sql,*args)
             if 'current_database' in sql: return NS(fetchone=lambda:{'name':'x_restore_test'})
-            if 'schema_version' in sql: return NS(fetchone=lambda:{'value':'78'})
+            if 'schema_version' in sql: return NS(fetchone=lambda:{'value':'79'})
             return NS(fetchone=lambda:None,fetchall=lambda:[],rowcount=0)
     class Pool:
         def connection(self):

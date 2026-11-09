@@ -156,7 +156,7 @@ def attention_answers(s,key,account,chat):
     with s.authorized(key,'list_chats') as (c,p):
         answers.append(conversation_state(c,p,account,chat))
         answers.append(conversation_states(c,p,[(account,chat)]))
-        for view,waiting in (('conversation',False),('conversation',True),('activity',False),('activity',True)):
+        for view,waiting in (('conversation',False),('conversation',True),('archive',False),('archive',True)):
             answers.append(list_chats(s,c,p,'',25,order='activity',view=view,include_coverage=False,
                 awaiting_reply=waiting,awaiting_reply_days=0)['items'])
     return answers
@@ -165,21 +165,23 @@ def attention_answers(s,key,account,chat):
 # spec: ANYM-915
 @settings(max_examples=40,deadline=None,suppress_health_check=[HealthCheck.function_scoped_fixture,HealthCheck.too_slow])
 @given(platform=st.sampled_from(['telegram','whatsapp']),messages=st.lists(attention_message,min_size=1,max_size=14),
-    window=st.sampled_from([0,1,3,100]))
-def test_group_attention_candidates_answer_as_the_history_walk(seeded,platform,messages,window):
+    window=st.sampled_from([0,1,3,100]),owned=st.sampled_from([0,2,200]))
+def test_group_attention_candidates_answer_as_the_history_walk(seeded,platform,messages,window,owned):
     from group_attention_legacy import legacy_group_thread_query
     from messaging_service import chat_queries,conversation_state
     s,owner,_=seeded
     account,chat=seed_attention_group(s,platform,messages)
     restricted=s.issue_key(f'attention-{chat}',[account],chats=[chat])
     with pytest.MonkeyPatch.context() as patched:
-        # The window decides which route reads the candidates; every route answers as today's walk.
+        # The bounds decide the route (the window, the candidates, the full walk); every route answers as today's walk.
         patched.setattr(conversation_state,'ATTENTION_WINDOW',window,raising=False)
+        patched.setattr(conversation_state,'ATTENTION_OWNER_MESSAGES',owned,raising=False)
         live=[attention_answers(s,key,account,chat) for key in (owner,restricted)]
         patched.setattr(conversation_state,'group_thread_query',legacy_group_thread_query)
         patched.setattr(chat_queries,'group_thread_query',legacy_group_thread_query)
         old=[attention_answers(s,key,account,chat) for key in (owner,restricted)]
-    assert live==old
+    from test_search_performance import timeless
+    assert timeless(live)==timeless(old)
 
 
 def test_whatsapp_stanza_reply_matches_only_same_account_and_group(seeded):
