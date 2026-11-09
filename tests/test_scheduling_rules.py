@@ -114,6 +114,19 @@ def test_explicit_zone_markers(text, zone):
 
 
 # spec: ANYM-892
+@pytest.mark.parametrize('text,count', [('Call tomorrow morning London time or tomorrow at 12 MSK', 2), ('Давай завтра утром или в 10', 2),
+    ('Давай утром или в 10', 2), ('tomorrow morning at 10', 1), ('Давай завтра утром в 10', 1), ('Утром в 10?', 1)])
+def test_part_of_day_drops_only_when_its_own_clock_is_inside_it(text, count):
+    assert len(signals(text, MONDAY, 'in', LISBON)['times']) == count
+
+
+# spec: ANYM-892
+def test_meeting_host_comes_from_the_parsed_hostname():
+    text = 'Давай в 16:00 https://us02web.zoom.us/j/1 и https://meet.google.com/abc'
+    assert signals(text, MONDAY, 'in', LISBON)['links'] == ['meet.google.com', 'zoom.us']
+
+
+# spec: ANYM-892
 def test_summer_abbreviation_keeps_its_own_offset_in_winter():
     (time,) = signals('Thursday 3pm CEST works for you?', MONDAY, 'in', LISBON)['times']
     assert time['start'] == '2026-11-12T15:00:00+02:00'
@@ -171,21 +184,24 @@ def test_link_paths_and_queries_are_never_parsed_or_spanned(text):
 
 
 # spec: ANYM-892
-@pytest.mark.parametrize('text', ['https://zoom.us.evil.test/j/1', 'https://zoom.us@evil.test/j/1', 'https://notzoom.us/j/1'])
+@pytest.mark.parametrize('text', ['https://zoom.us.evil.test/j/1', 'https://zoom.us@evil.test/j/1', 'https://notzoom.us/j/1',
+    'https://zoom.us:443@evil.test/j/1', 'https://evil.test/?next=https://zoom.us/j/1', 'https://evil.test/zoom.us/j/1'])
 def test_lookalike_meeting_hosts_are_not_kept(text):
     assert signals(text, MONDAY, 'in', LISBON)['links'] == []
 
 
 # spec: ANYM-892
 @pytest.mark.parametrize('text,intent', [('Не получится, перенесём?', 'reschedule'), ('Can we reschedule?', 'reschedule'),
-    ('Давай перенесём файлы на диск', 'none')])
+    ('Давай перенесём файлы на диск', 'none'), ('Мне нужно файлы перенести.', 'none'), ('Давай файлы перенесём?', 'none'),
+    ('Может, перенесём?', 'reschedule'), ('We need to postpone', 'reschedule')])
 def test_rescheduling_word_stands_alone_only_when_unambiguous(text, intent):
     assert signals(text, MONDAY, 'in', LISBON)['intent'] == intent
 
 
 # spec: ANYM-892
 @pytest.mark.parametrize('text,expected', [('Отменяем встречу в пятницу', ['rejected']),
-    ('Отменим созвон в пятницу, давай в понедельник', ['rejected', 'offered']), ("Let's cancel Friday, let's do Monday", ['rejected', 'offered'])])
+    ('Отменим созвон в пятницу, давай в понедельник', ['rejected', 'offered']), ("Let's cancel Friday, let's do Monday", ['rejected', 'offered']),
+    ("Cancel tomorrow at 10, let's do at 11", ['rejected', 'offered']), ('Отменим завтра в 10, давай в 11', ['rejected', 'offered'])])
 def test_cancelled_times_are_rejected(text, expected):
     got = signals(text, MONDAY, 'in', LISBON)
     assert got['intent'] == 'cancel' and [t['polarity'] for t in got['times']] == expected
@@ -310,6 +326,13 @@ def test_property_input_is_truncated_before_matching(head, sent_at, zone):
     big = (head * (65536 // len(head) + 1))[:65536] if head else 'x' * 65536
     assert len(big) == 65536
     assert signals(big, sent_at, 'in', zone) == signals(big[:MAX_CHARS], sent_at, 'in', zone)
+
+
+# spec: ANYM-892
+def test_long_input_stays_fast():
+    start = perf_counter()
+    signals('давай в 10 во вторник, не могу в 3. ' * 2000, MONDAY, 'in', LISBON)
+    assert perf_counter() - start < 2
 
 
 # spec: ANYM-892

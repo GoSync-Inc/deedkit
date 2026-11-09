@@ -7,6 +7,7 @@ Chat text is data: nothing in it is ever executed.
 import re
 import unicodedata
 from bisect import bisect_right
+from urllib.parse import urlsplit
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -16,8 +17,6 @@ MAX_CHARS = 4096
 INTENTS = ('ask_availability', 'propose', 'accept', 'decline', 'cancel', 'reschedule', 'none')
 MEDIA = ('call', 'video_call', 'meeting', 'unknown')
 LINK_HOSTS = ('zoom.us', 'meet.google.com', 'teams.microsoft.com', 'telemost.yandex.ru')
-# The host must end where the authority ends: "zoom.us.evil.test" and "zoom.us@evil.test" are not zoom.us.
-LINK = re.compile(r'https?://(?:[\w-]+\.)*(' + '|'.join(re.escape(h) for h in LINK_HOSTS) + r')(?=[/:?#\s]|$)\S*', re.I)
 ANY_LINK = re.compile(r'https?://\S+', re.I)
 
 
@@ -56,10 +55,12 @@ CUES = {
         r'\bкогда\s+(?:ты|вы)\s+свобод\w*', r'\bты\s+свобод\w*', r'\bвы\s+свобод\w*', r'\bwhen\s+(?:are\s+you|is\s+good|works)\b',
         r'\bwhat\s+time\s+works\b', r'\bare\s+you\s+free\b', r'\bare\s+you\s+available\b'),
 }
-# A rescheduling word that says it alone ("can we reschedule?"); «перенесём» does so only at the end of its sentence.
-RESCHEDULE_WORD = re.compile(r'reschedul|postpone', re.I)
+# A rescheduling request that stands alone is its whole clause: «перенесём?», "can we reschedule?"; «давай файлы перенесём» is not.
+RESCHEDULE_ALONE = re.compile(r"(?:(?:может|давай|можем|можно|let'?s|can\s+we|could\s+we|shall\s+we|maybe|(?:i|we)?\s*need\s+to)\s+)?"
+    r'(?:перенес\w*|перенест\w*|перенос\w*|reschedul\w*|postpone\w*)(?:\s+(?:it|this|that|это|е[её]|его))?', re.I)
 # A clause opener: «лучше в среду» or "how about Wednesday" starts a new clause after a decline.
 # A dot or comma between digits ("12.11", "15.00", "12,5") is part of a number, never a break.
+OR_WORD = re.compile(r'\b(?:или|либо|or)\b', re.I)
 SENTENCE_END = re.compile(r'[.!?](?!\d)|\n')
 CLAUSE_BREAK = re.compile(r'[.;!?](?!\d)|\n|,(?!\d)|\b(?:лучше|давай\w*|но|зато|а\s+вот|but|how\s+about|what\s+about|instead|maybe|let\'?s)\b', re.I)
 PAST_CLAUSE = _rx(r'\bвчера\b', r'\bпозавчера\b', r'\bпрошл\w*', r'\bназад\b', r'\byesterday\b', r'\blast\b', r'\bago\b',
@@ -290,6 +291,13 @@ def _breaks(rx, text):
     return [(m.start(), m.end(), m.group(0)[:1].isalpha()) for m in rx.finditer(text)]
 
 
+def _meeting_host(url):
+    """The allowed meeting host of one whole link, from its parsed hostname (userinfo, port and query never count)."""
+    try:host = (urlsplit(url).hostname or '').rstrip('.')
+    except ValueError:return None
+    return next((h for h in LINK_HOSTS if host == h or host.endswith('.' + h)), None)
+
+
 def _first(rx, text):
     m = rx.search(text)
     return m.span() if m else None
@@ -308,9 +316,9 @@ def signals(text, sent_at, direction, zone):
     raw = (text or '')[:MAX_CHARS]
     # Quoted or forwarded lines are someone else's words: blank them, keeping offsets.
     work = re.sub(r'(?m)^[ \t]*(?:>|»).*$', lambda m: ' ' * len(m.group(0)), raw)
-    hosts = sorted({m.group(1).lower() for m in LINK.finditer(work)})
     # A link's path and query are never read: blanked, keeping offsets, and each link ends a sentence.
     links = [m.span() for m in ANY_LINK.finditer(work)]
+    hosts = sorted({h for h in (_meeting_host(work[s:e]) for s, e in links) if h})
     for s, e in links:work = work[:s] + ' ' * (e - s) + work[e:]
     owner_tz, label = zone
     owner_source = 'utc_fallback' if label == 'UTC_fallback' else 'owner'
@@ -372,22 +380,27 @@ def signals(text, sent_at, direction, zone):
                     assumed.append('default_duration')
                 granularity, rule_ids = c[4], [r for r in (day and day[3], c[5]) if r]
         except (OverflowError, ValueError, TypeError):continue
-        resolved.append((span, c, start, end, granularity, rule_ids, assumed, tz, zone_source))
-    # A clock inside a part of day of the same day ("tomorrow morning at 10") makes the part redundant.
-    clock_starts = [(r[2], r[3]) for r in resolved if r[4] == 'time']
-    resolved = [r for r in resolved if not (r[4] == 'part_of_day' and any(r[2] <= s < r[3] for s, _ in clock_starts))]
+        resolved.append((span, c, start, end, granularity, rule_ids, assumed, tz, zone_source, day))
+    # A clock inside a part of day on the same day reference ("tomorrow morning at 10") makes the part redundant;
+    # alternatives ("tomorrow morning or tomorrow at 12", «утром или в 10») stay.
+    def redundant(r):
+        return r[4] == 'part_of_day' and any(o[4] == 'time' and o[9] is r[9] and r[2] <= o[2] < r[3]
+            and (r[9] is not None or sentences.index(o[1][0]) == sentences.index(r[1][0]))
+            and not OR_WORD.search(work[min(o[1][1], r[1][1]):max(o[1][0], r[1][0])]) for o in resolved)
+    resolved = [r for r in resolved if not redundant(r)]
     past = {}
     final = []
-    for span, c, start, end, granularity, rule_ids, assumed, tz, zone_source in sorted(resolved, key=lambda r: r[0]):
+    for span, c, start, end, granularity, rule_ids, assumed, tz, zone_source, _ in sorted(resolved, key=lambda r: r[0]):
         here = sentences.index(span[0])
         if here not in past:past[here] = bool(PAST_CLAUSE.search(work[slice(*sentences.bounds(span[0]))]))
         if past[here] and not cues['reschedule']:continue
-        clause = work[slice(*clauses.bounds(span[0]))]
+        # The clause of the clock itself, not of the day it borrowed ("cancel tomorrow at 10, let's do at 11").
+        clause = work[slice(*clauses.bounds(c[0] if c else span[0]))]
         polarity = 'rejected' if CUES['decline'].search(clause) or CUES['cancel'].search(clause) else 'offered'
         final.append({'start': start.isoformat(), 'end': end.isoformat(), 'granularity': granularity,
             'zone': getattr(tz, 'key', None) or 'UTC', 'zone_source': zone_source, 'assumed': sorted(set(assumed)),
             'span': list(span), 'rule': '+'.join(rule_ids), 'polarity': polarity})
-    intent, cue = _intent(work, cues, final, medium, sentences)
+    intent, cue = _intent(work, cues, final, medium, clauses)
     result.update({'intent': intent, 'times': final, 'cue_span': list(cue) if cue else None})
     result['rules'] = rules + sorted({t['rule'] for t in final}) + ([f'intent:{intent}'] if intent != 'none' else []) + (
         ['zone:explicit'] if any(t['zone_source'] == 'explicit' for t in final) else [])
@@ -397,16 +410,15 @@ def signals(text, sent_at, direction, zone):
     return result
 
 
-def _intent(text, cues, times, medium, sentences):
+def _intent(text, cues, times, medium, clauses):
     """The winning move and its cue span. A scheduling move needs a time or a medium, except accept and decline
-    replies, which stand alone ("ок", "не могу"), and a rescheduling word that ends its sentence ("перенесём?")."""
+    replies, which stand alone ("ок", "не могу"), and a rescheduling request that is its whole clause ("перенесём?")."""
     found = {k: v for k, v in cues.items() if v}
     # An accept word that opens the message ("ок, среда 10:00") outranks a proposal word later in it.
     if 'accept' in found and found['accept'][0] <= 12 and not any(k in found for k in ('cancel', 'reschedule', 'decline')):
         return 'accept', found['accept']
     resched = found.get('reschedule')
-    alone = bool(resched) and (RESCHEDULE_WORD.match(text, resched[0]) is not None
-        or not text[resched[1]:sentences.bounds(resched[0])[1]].strip(' \t?!.…'))
+    alone = bool(resched) and RESCHEDULE_ALONE.fullmatch(text[slice(*clauses.bounds(resched[0]))].strip(' \t?!.…,')) is not None
     for intent in ('cancel', 'reschedule', 'decline'):
         if intent in found and (times or medium != 'unknown' or intent == 'decline' or (intent == 'reschedule' and alone)):
             return intent, found[intent]
