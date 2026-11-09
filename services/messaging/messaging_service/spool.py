@@ -24,6 +24,10 @@ class PoisonItem(ValueError):
     """A durably queued item that can never be applied; quarantine it instead of retrying."""
 
 
+class KeepItem(Exception):
+    """Raised by a drain callback for a valid item that cannot apply yet: it stays for a later drain (ANYM-868)."""
+
+
 class InvalidCapture(ValueError):
     """The validator deterministically rejected an item; nothing was written.
 
@@ -146,6 +150,7 @@ class DurableSpool:
                 try:ingest(item)  # Return only after DB commit.
                 except PoisonItem as exc:
                     self.quarantine(path,reason_code(exc)); continue
+                except KeepItem:continue
                 # Writers never reuse a committed name; removal needs no queue lock.
                 path.unlink(missing_ok=True); fsync_dir(self.path); count+=1
         return count

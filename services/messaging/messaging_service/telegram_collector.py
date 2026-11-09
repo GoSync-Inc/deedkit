@@ -27,7 +27,7 @@ from .archive import MEDIA_CONTENDED,Archive
 from .blobs import BlobWriter
 from .envelope import stable_id
 from .collector_state import LIVE_REJECT_CODES,CaptureSpool,CollectorState,PeerKindConflict,session_lock
-from .spool import DurableSpool,InvalidCapture,PoisonItem
+from .spool import DurableSpool,InvalidCapture,KeepItem,PoisonItem
 from .collector_common import DbBackoff,commit_items,validate_common,validate_ranges
 from .store import Store
 from .telegram_governor import BACKGROUND,LIVE_BUDGETS,LIVE_MEDIA,LIVE_STATE,ProviderRateLimited,RequestGovernor
@@ -217,6 +217,7 @@ def peer_kind(message):
 class TelethonProvider:
     supports_receipts=True
     supports_owner_reads=True
+    supports_group_receipts=True
     fetches_bursts=True  # chunks() reads source['_tier'] and source['_burst'] (ANYM-877)
     def __init__(self,cfg,auth,*,receive_updates=True):
         from telethon import TelegramClient
@@ -402,7 +403,7 @@ class TelethonProvider:
         if before is not None:await before()
         return await operation()
 
-    def subscribe(self,capture,deleted,receipts=None,*,owner_reads=None):
+    def subscribe(self,capture,deleted,receipts=None,*,owner_reads=None,group_receipts=None):
         from telethon import events,types
         self.client.add_event_handler(capture,events.NewMessage())
         self.client.add_event_handler(capture,events.MessageEdited())
@@ -415,6 +416,9 @@ class TelethonProvider:
             self.client.add_event_handler(receipts,events.Raw(types.UpdateReadHistoryOutbox))
         if owner_reads is not None:
             self.client.add_event_handler(owner_reads,events.Raw([types.UpdateReadHistoryInbox,types.UpdateReadChannelInbox]))
+        if group_receipts is not None:
+            # ANYM-868: a basic group's boundary shares the private one's update type; each handler takes its own peers.
+            self.client.add_event_handler(group_receipts,events.Raw([types.UpdateReadHistoryOutbox,types.UpdateReadChannelOutbox]))
 
     def service_messages(self,capture):
         from telethon import types
@@ -665,6 +669,16 @@ BURST_FETCH=20; FETCHED_SECONDS=600; FETCHED_MAX=200
 # Deterministic failures of a pure parser on malformed provider input. Resource,
 # I/O and unexpected errors are not among them and still fail capture closed.
 PARSE_ERRORS=(ValueError,TypeError,KeyError,AttributeError,IndexError,RecursionError)
+# ANYM-868: a group read boundary whose chat has no stored type is retried at most this often, and dropped once its
+# observation is this old (a chat still untyped after a week is not one the owner is waiting on).
+DEFERRED_RECEIPT_RETRY_S=10
+DEFERRED_RECEIPT_DAYS=7
+DEFERRED_RECEIPT_BATCH=500
+
+
+def deferred_expired(item,now=None):
+    observed=datetime.fromisoformat(item['observed_at'])
+    return (now or datetime.now(timezone.utc))-observed>timedelta(days=DEFERRED_RECEIPT_DAYS)
 # Live capture backpressure (ANYM-291): at most CAPTURE_WRITES spool writes run at once;
 # further callbacks wait in arrival order. More than CAPTURE_WAITERS waiting callbacks, or one
 # wait longer than CAPTURE_WAIT_SECONDS, fails the collector closed with capture_overload.
@@ -734,6 +748,18 @@ class TelegramCollector:
             self._history_spool=DurableSpool(live.path/'history',validator=live.validator,
                 max_bytes=live.max_bytes,max_entries=live.max_entries,reserve_bytes=live.reserve_bytes)
         return self._history_spool
+
+    @property
+    def deferred_receipts(self):
+        # ANYM-868: group read boundaries whose chat has no stored type yet (receipts.record `receipt_deferred`),
+        # beside the live spool and outside the archive, so no runtime reads them before the chat is known.
+        if getattr(self,'_deferred_receipts',None) is None:
+            from .spool import DurableSpool
+            live=self.spool
+            # Capacity equals one retry pass, so every pass visits every kept file (no boundary starves another).
+            self._deferred_receipts=DurableSpool(live.path/'deferred-receipts',validator=live.validator,
+                max_bytes=live.max_bytes,max_entries=DEFERRED_RECEIPT_BATCH,reserve_bytes=live.reserve_bytes)
+        return self._deferred_receipts
 
     @property
     def edit_spool(self):
@@ -861,15 +887,16 @@ class TelegramCollector:
         finally:
             if pending:self.release_capture()
 
-    async def receipt(self,event):
+    async def receipt(self,event,*,normalize=None):
         if self.stopping.is_set() or self.failed.is_set(): return
         pending=False
         try:
-            from .telegram_receipts import telegram_receipt
+            from .telegram_receipts import UnsupportedReceiptPeer,telegram_receipt
             try:
-                capture=telegram_receipt(self.account,event,
+                capture=(normalize or telegram_receipt)(self.account,event,
                     verified_self=getattr(self.provider,'verified_self',None),
                     expected_user_id=getattr(self.provider,'expected_user_id',None))
+            except UnsupportedReceiptPeer as exc:self.reject(exc.code);return
             except PARSE_ERRORS as exc:
                 if isinstance(exc,OSError): raise
                 self.reject('receipt_parse_failed'); return
@@ -884,6 +911,11 @@ class TelegramCollector:
         except Exception as exc: self.capture_failed(exc)
         finally:
             if pending:self.release_capture()
+
+    async def group_receipt(self,event):
+        """A group's outbox boundary (ANYM-868) through the private receipt's own spool, policy and capture slot."""
+        from .telegram_receipts import telegram_group_receipt
+        await self.receipt(event,normalize=telegram_group_receipt)
 
     async def commit_page(self,messages,chat,title,kind,origin):
         ids=[]
@@ -1097,15 +1129,31 @@ class TelegramCollector:
             except PeerKindConflict as exc:raise PoisonItem('peer_kind_conflict') from exc
         def apply(item):
             nonlocal last,count
-            settle(item);last=item;count+=1
+            defer(item,settle(item));last=item;count+=1
             # ANYM-813: the first committed live message of a batch, kept until a status write succeeds
             # (capture_progress records it for the native WhatsApp provider only).
             if (getattr(self,'first_live',None) is None and isinstance(item,dict) and item.get('kind')=='message'
                     and isinstance(item.get('envelope'),dict) and item['envelope'].get('origin')=='live'):
                 self.first_live=item
+        def defer(item,result):
+            # Kept durably before the drain removes the item from its own spool (ANYM-868); an expired one is dropped.
+            # A full deferred spool (or the disk reserve) drops this boundary and counts it: it never stops the drain.
+            if isinstance(result,dict) and result.get('outcome')=='receipt_deferred' and not deferred_expired(item):
+                try:self.deferred_receipts.put(item)
+                except RuntimeError as exc:
+                    if str(exc) not in ('spool_full','disk_reserve'):raise
+                    self.reject('receipt_deferred_full')
         gap_lock=getattr(getattr(self,'provider',None),'read_gap_lock',None) or nullcontext()
         async with gap_lock:await self.flush_read_gap()
         for spool in spools:await asyncio.to_thread(spool.drain,apply,100)
+        if isinstance(live,DurableSpool) and time.monotonic()>=getattr(self,'_next_deferred_retry',0):
+            self._next_deferred_retry=time.monotonic()+DEFERRED_RECEIPT_RETRY_S
+            def retry(item):
+                result=self.state.apply(item)
+                # Still untyped: the file stays where it is (a put of the same item would dedupe onto it).
+                if isinstance(result,dict) and result.get('outcome')=='receipt_deferred' and not deferred_expired(item):
+                    raise KeepItem()
+            await asyncio.to_thread(self.deferred_receipts.drain,retry,DEFERRED_RECEIPT_BATCH)
         # History pages were applied inline when fetched. Replaying them is
         # idempotent and is neither live progress nor live backlog.
         for spool in history_spools:await asyncio.to_thread(spool.drain,settle,100)
@@ -1338,7 +1386,8 @@ class TelegramCollector:
                 with suppress(OSError):await asyncio.to_thread(sweep)
             if hasattr(self.provider,'bind_state'):self.provider.bind_state(self.state)
             if getattr(self.provider,'supports_owner_reads',False) is True:
-                self.provider.subscribe(self.capture,self.deleted,self.receipt,owner_reads=self.owner_read)
+                groups={'group_receipts':self.group_receipt} if getattr(self.provider,'supports_group_receipts',False) is True else {}
+                self.provider.subscribe(self.capture,self.deleted,self.receipt,owner_reads=self.owner_read,**groups)
             elif getattr(self.provider,'supports_receipts',False) is True:
                 self.provider.subscribe(self.capture,self.deleted,self.receipt)
             else:self.provider.subscribe(self.capture,self.deleted)

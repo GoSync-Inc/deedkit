@@ -86,6 +86,58 @@ def test_receipt_is_not_captured_before_owner_verification():
         expected_user_id=42, observed_at=OBSERVED) is None
 
 
+def group_normalize(event, owner=None, expected=42):
+    from messaging_service.telegram_receipts import telegram_group_receipt
+    return telegram_group_receipt('tg-fixture', event,
+        verified_self=owner or types.User(id=42, is_self=True),
+        expected_user_id=expected, observed_at=OBSERVED)
+
+
+# spec: ANYM-868
+@pytest.mark.parametrize(('event', 'chat'), [
+    (update(types.PeerChat(100)), '-100'), (types.UpdateReadChannelOutbox(100, 23), '-1000000000100'),
+], ids=['basic-group', 'supergroup'])
+def test_group_outbox_boundary_is_an_aggregate_read_of_the_marked_chat(event, chat):
+    assert group_normalize(event) == {
+        'kind': 'message_receipt', 'account': 'tg-fixture', 'platform': 'telegram',
+        'chat': chat, 'provider_id': None, 'max_id': 23, 'state': 'read',
+        'basis': 'telegram_outbox_boundary', 'audience': 'provider_aggregate',
+        'observed_at': OBSERVED.isoformat(), 'provider_at': None,
+    }
+
+
+# spec: ANYM-868
+@pytest.mark.parametrize('event', [
+    update(), update(types.PeerUser(42)),
+    types.UpdateReadHistoryInbox(types.PeerChat(100), 23, 0, 10, 1),
+    types.UpdateReadChannelInbox(channel_id=100, max_id=23, still_unread_count=0, pts=1),
+    types.UpdateReadChannelOutbox(0, 23), types.UpdateReadChannelOutbox(True, 23), types.UpdateReadChannelOutbox(-5, 23),
+    types.UpdateReadChannelOutbox(2**63, 23), types.UpdateReadChannelOutbox(100, 0), types.UpdateReadChannelOutbox(100, '23'),
+    update(types.PeerChat(0)), update(types.PeerChat(True)), update(types.PeerChat(100), max_id=2**63),
+    NS(peer=types.PeerChat(100), max_id=23),
+], ids=['private', 'saved-messages', 'group-inbox', 'channel-inbox', 'channel-zero', 'channel-bool', 'channel-negative',
+        'channel-too-large', 'max-zero', 'max-text', 'chat-zero', 'chat-bool', 'max-too-large', 'not-an-update'])
+def test_group_normalizer_leaves_private_inbox_and_malformed_updates(event):
+    assert group_normalize(event) is None
+
+
+# spec: ANYM-868
+@pytest.mark.parametrize('owner,expected', [
+    (types.User(id=42), 42), (types.User(id=99, is_self=True), 42),
+    (types.User(id=42, is_self=True), True), (NS(id=42, is_self=True), 42),
+], ids=['not-self', 'other-user', 'bool-expected', 'not-a-user'])
+def test_group_receipt_requires_the_cached_verified_owner(owner, expected):
+    assert group_normalize(types.UpdateReadChannelOutbox(100, 23), owner=owner, expected=expected) is None
+
+
+# spec: ANYM-868
+def test_an_outbox_boundary_with_an_unknown_peer_type_raises_its_reason_code():
+    from messaging_service.telegram_receipts import UnsupportedReceiptPeer
+    for peer in (types.PeerChannel(100), NS(chat_id=100)):
+        with pytest.raises(UnsupportedReceiptPeer) as raised: group_normalize(update(peer))
+        assert raised.value.code == 'receipt_peer_unsupported'
+
+
 class State:
     account = 'tg-fixture'
 
@@ -240,6 +292,125 @@ def test_cancelled_capture_waiter_never_leaks_a_slot(tmp_path):
     assert len(list(worker.spool.path.glob('*.json'))) == 1
 
 
+def dispatch(registered, event):
+    """Telethon's dispatch of one raw update: every registered Raw handler whose types match gets it."""
+    for callback, builder in registered:
+        if isinstance(builder, events.Raw) and builder.filter(event): asyncio.run(callback(event))
+
+
+# spec: ANYM-868
+def test_provider_registers_the_group_callback_for_both_outbox_update_types():
+    registered = []
+    provider = TelethonProvider.__new__(TelethonProvider)
+    provider.client = NS(add_event_handler=lambda callback, event: registered.append((callback, event)))
+    groups = object()
+    provider.subscribe(object(), object(), object(), owner_reads=object(), group_receipts=groups)
+    assert provider.supports_group_receipts is True and len(registered) == 7  # with the ANYM-847 service handler
+    assert registered[-1][0] is groups
+    assert registered[-1][1].types == (types.UpdateReadHistoryOutbox, types.UpdateReadChannelOutbox)
+
+
+# spec: ANYM-868
+def test_group_boundaries_reach_the_spool_through_the_registered_callbacks_and_a_private_one_once(tmp_path):
+    worker = collector(tmp_path); registered = []
+    provider = TelethonProvider.__new__(TelethonProvider)
+    provider.client = NS(add_event_handler=lambda callback, event: registered.append((callback, event)))
+    provider.subscribe(worker.capture, worker.deleted, worker.receipt, owner_reads=worker.owner_read,
+        group_receipts=worker.group_receipt)
+    for event in (update(types.PeerChat(100)), types.UpdateReadChannelOutbox(100, 24), update()):
+        dispatch(registered, event)
+    assert not worker.failed.is_set() and not worker.rejected
+    asyncio.run(worker.drain_captures([worker.spool]))
+    assert sorted((item['chat'], item['max_id'], item['audience']) for item in worker.state.applied) == [
+        ('-100', 23, 'provider_aggregate'), ('-1000000000100', 24, 'provider_aggregate'), ('100', 23, 'private_peer')]
+
+
+# spec: ANYM-868
+def test_an_unknown_outbox_peer_type_is_counted_by_its_reason_code_and_capture_continues(tmp_path):
+    worker = collector(tmp_path)
+    asyncio.run(worker.group_receipt(update(types.PeerChannel(100))))
+    asyncio.run(worker.group_receipt(types.UpdateReadChannelOutbox(100, 23)))
+    assert not worker.failed.is_set() and worker.rejected == {'receipt_peer_unsupported': 1}
+    assert len(list(worker.spool.path.glob('*.json'))) == 1
+    asyncio.run(worker.drain_captures([worker.spool]))
+    assert [item['chat'] for item in worker.state.applied] == ['-1000000000100']
+
+
+# spec: ANYM-868
+def test_a_deferred_group_boundary_is_kept_retried_and_dropped_after_its_week(tmp_path):
+    from messaging_service.telegram_receipts import telegram_group_receipt
+    worker = collector(tmp_path); outcomes = []
+    def apply(item):
+        worker.state.applied.append(item)
+        return outcomes.pop(0) if outcomes else {'outcome': 'receipt_deferred'}
+    worker.state.apply = apply
+    fresh = telegram_group_receipt('tg-fixture', types.UpdateReadChannelOutbox(100, 23),
+        verified_self=types.User(id=42, is_self=True), expected_user_id=42, observed_at=datetime.now(timezone.utc))
+    stale = group_normalize(update(types.PeerChat(100)))  # observed weeks before now
+    worker.spool.put(fresh); worker.spool.put(stale)
+    asyncio.run(worker.drain_captures([worker.spool]))
+    deferred = lambda: [p.read_text() for p in worker.deferred_receipts.path.glob('*.json')]
+    # Both applied once from the live spool, the fresh one once more from the deferred spool; the stale one dropped.
+    assert [item['chat'] for item in worker.state.applied] == ['-1000000000100', '-100', '-1000000000100']
+    assert not list(worker.spool.path.glob('*.json')) and len(deferred()) == 1 and '-1000000000100' in deferred()[0]
+    asyncio.run(worker.drain_captures([worker.spool]))  # inside the retry interval
+    assert len(worker.state.applied) == 3 and len(deferred()) == 1
+    outcomes.append({'outcome': 'receipt_recorded'}); worker._next_deferred_retry = 0
+    asyncio.run(worker.drain_captures([worker.spool]))
+    assert len(worker.state.applied) == 4 and deferred() == [] and not worker.failed.is_set()
+
+
+def fresh_group(channel_id):
+    from messaging_service.telegram_receipts import telegram_group_receipt
+    return telegram_group_receipt('tg-fixture', types.UpdateReadChannelOutbox(channel_id, 23),
+        verified_self=types.User(id=42, is_self=True), expected_user_id=42, observed_at=datetime.now(timezone.utc))
+
+
+# spec: ANYM-868
+def test_a_full_deferred_spool_drops_and_counts_the_boundary_and_the_drain_goes_on(tmp_path, monkeypatch):
+    """Sol r3 #1: a put into a full deferred spool never stops the live drain (and with it collection and sends)."""
+    monkeypatch.setattr(telegram_collector, 'DEFERRED_RECEIPT_BATCH', 1)
+    worker = collector(tmp_path)
+    worker.state.apply = lambda item: worker.state.applied.append(item) or {'outcome': 'receipt_deferred'}
+    worker._next_deferred_retry = float('inf')  # no retry pass frees a place in between
+    health = []; worker.state.capture_progress = lambda last, count, pending, **extra: health.append(extra)
+    for channel in (100, 101): worker.spool.put(fresh_group(channel))
+    worker.spool.put(normalize(update()))  # a later private boundary in the same drain
+    asyncio.run(worker.drain_captures([worker.spool]))
+    assert not worker.failed.is_set() and not list(worker.spool.path.glob('*.json'))
+    assert len(list(worker.deferred_receipts.path.glob('*.json'))) == 1
+    assert [item['chat'] for item in worker.state.applied] == ['-1000000000100', '-1000000000101', '100']
+    assert health[-1]['rejected'] == {'receipt_deferred_full': 1}
+
+
+# spec: ANYM-868
+def test_every_retry_pass_visits_every_deferred_boundary(tmp_path, monkeypatch):
+    """Sol r3 #2: the deferred spool holds at most one pass, so a boundary whose chat became a group never waits
+    behind older unresolved ones."""
+    monkeypatch.setattr(telegram_collector, 'DEFERRED_RECEIPT_BATCH', 3)
+    worker = collector(tmp_path); ready = set(); passes = []
+    def apply(item):
+        worker.state.applied.append(item['chat'])
+        return {'outcome': 'receipt_recorded'} if item['chat'] in ready else {'outcome': 'receipt_deferred'}
+    worker.state.apply = apply
+    for channel in (100, 101, 102, 103): worker.spool.put(fresh_group(channel))
+    asyncio.run(worker.drain_captures([worker.spool]))
+    kept = len(list(worker.deferred_receipts.path.glob('*.json')))
+    assert kept == worker.deferred_receipts.max_entries == 3
+    ready.add('-1000000000102'); del worker.state.applied[:]
+    worker._next_deferred_retry = 0; asyncio.run(worker.drain_captures([worker.spool]))
+    passes.append(sorted(worker.state.applied))
+    assert passes == [['-1000000000100', '-1000000000101', '-1000000000102']]
+    assert len(list(worker.deferred_receipts.path.glob('*.json'))) == 2
+
+
+# spec: ANYM-868
+def test_group_receipts_honor_the_chat_policy(tmp_path):
+    worker = collector(tmp_path); worker.policy['exclude_chats'] = ['-1000000000100']
+    asyncio.run(worker.group_receipt(types.UpdateReadChannelOutbox(100, 23)))
+    assert not list(worker.spool.path.glob('*.json')) and not worker.failed.is_set()
+
+
 def test_unsupported_receipt_does_not_overload_message_capture(tmp_path):
     worker = collector(tmp_path); worker.capture_count = 16
     asyncio.run(worker.receipt(update(types.PeerChat(100))))
@@ -302,6 +473,28 @@ def test_receipt_callback_is_subscribed_before_connect_with_explicit_capability(
     asyncio.run(worker.run())
     assert lifecycle == ['subscribe', 'connect', 'disconnect', 'release']
     if supports is True: assert subscribed[2] == worker.receipt
+
+
+# spec: ANYM-868
+@pytest.mark.parametrize('supports', [True, False, 1, None])
+def test_the_collector_subscribes_its_group_callback_only_with_the_explicit_capability(tmp_path, supports):
+    worker = collector(tmp_path); subscribed = {}
+    def subscribe(*callbacks, **named): subscribed.update(callbacks=callbacks, named=named)
+    async def connect(): worker.stopping.set()
+    async def disconnect(): pass
+    async def heartbeat(): await asyncio.Event().wait()
+    worker.provider = NS(supports_receipts=True, supports_owner_reads=True, supports_group_receipts=supports,
+        subscribe=subscribe, connect=connect, disconnect=disconnect)
+    state = NS(policy=lambda: worker.policy, status=lambda *args: None,
+        phase=lambda *args, **identity: None, connection_gate=lambda: {'blocked': False, 'remaining_seconds': 0},
+        connection_failed=lambda code: pytest.fail(code))
+    worker.state_class = lambda *args: state
+    worker.archive = NS(acquire=lambda *args: 1, release=lambda *args: None)
+    worker.heartbeat = heartbeat
+    asyncio.run(worker.run())
+    assert subscribed['callbacks'] == (worker.capture, worker.deleted, worker.receipt)
+    assert subscribed['named'] == {'owner_reads': worker.owner_read,
+        **({'group_receipts': worker.group_receipt} if supports is True else {})}
 
 
 def test_subscription_type_error_is_not_misinterpreted_as_old_provider_signature(tmp_path):
