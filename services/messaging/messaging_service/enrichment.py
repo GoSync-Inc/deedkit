@@ -101,11 +101,15 @@ BACKPRESSURE_CAP_SECONDS=900
 # After a pass that failed on a transient database error: this delay, doubled per consecutive failure up to the limit.
 DB_RETRY_SECONDS=5
 DB_RETRY_LIMIT_SECONDS=60
-# ANYM-838: an idle main lane looks for work every IDLE_SECONDS; the audio lane looks every LANE_PROBE_SECONDS with a
-# lock-free read and claims only what it found. At stop, the main lane waits LANE_JOIN_SECONDS for the audio lane's
-# requeue (run in parallel with its own), inside the 90 s stop grace (deploy/compose.enrichment.yaml).
+# ANYM-838: an idle main lane looks for work every IDLE_SECONDS. An idle audio lane reads the newest attachment.ready
+# event every LANE_PROBE_SECONDS (one step back on the events primary key, 0.2 ms on prod); it runs the lock-free
+# candidate read (due(), about 50 ms) only when that mark moved, after a job, or every LANE_FULL_PROBE_SECONDS (jobs
+# that become due by time: retries, expired leases, requests), and claims only what that read found. At stop, the main
+# lane waits LANE_JOIN_SECONDS for the audio lane's requeue (run in parallel with its own), inside the 90 s stop grace
+# (deploy/compose.enrichment.yaml).
 IDLE_SECONDS=10
 LANE_PROBE_SECONDS=1
+LANE_FULL_PROBE_SECONDS=10
 LANE_JOIN_SECONDS=REQUEUE_SECONDS+15
 DB_TRANSIENT=(psycopg.errors.QueryCanceled,psycopg.errors.LockNotAvailable,psycopg.errors.DeadlockDetected,
     psycopg.errors.SerializationFailure,psycopg.errors.AdminShutdown,psycopg.errors.CrashShutdown,
@@ -318,6 +322,11 @@ class EnrichmentWorker:
                     OR (e.state='unsupported' AND e.profile_hash IS DISTINCT FROM %s))
                 ''',(kind,ph,eligible,ph,list(FINAL_LIMIT_CODES),ph,ph)
 
+    def ready_mark(self):
+        """ANYM-838: the newest attachment.ready event id, the usual sign that a new file may be due."""
+        with self.connection() as c:
+            return c.execute("SELECT max(id) AS id FROM events WHERE kind='attachment.ready'").fetchone()['id']
+
     def due(self):
         """ANYM-838: whether claim() would find a job of this lane's kinds, read with no advisory or row lock and no
         write, so an idle lane can look every LANE_PROBE_SECONDS without queueing on the residency or admission lock.
@@ -527,16 +536,20 @@ class EnrichmentWorker:
             if unwritten:raise unwritten
         return True
     def lane_loop(self,failure):
-        """ANYM-838: the audio lane, a thread of run(). An idle pass is a lock-free probe every LANE_PROBE_SECONDS; only a
-        probe that finds a job proves the confinement and claims. Transient database errors back off as in run(); any
-        other error ends the whole worker through the stop path, as an error of the main lane does."""
-        delay=DB_RETRY_SECONDS
+        """ANYM-838: the audio lane, a thread of run(). An idle pass reads the ready mark every LANE_PROBE_SECONDS and the
+        lock-free candidate read only when needed (see LANE_FULL_PROBE_SECONDS); only a read that finds a job proves the
+        confinement and claims. Transient database errors back off as in run(); any other error ends the whole worker
+        through the stop path, as an error of the main lane does."""
+        delay=DB_RETRY_SECONDS;seen=None;full_at=0.0
         try:
             while not STOP.is_set():
                 try:
-                    found=self.due()
+                    mark=self.ready_mark();found=False
+                    if mark!=seen or time.monotonic()>=full_at:
+                        found=self.due();seen=mark;full_at=time.monotonic()+LANE_FULL_PROBE_SECONDS
                     if found and self.confinement:self.confinement.ensure()
-                    if not (found and self.once()):STOP.wait(LANE_PROBE_SECONDS)
+                    if found and self.once():full_at=0.0  # more audio may be due: read again at once
+                    else:STOP.wait(LANE_PROBE_SECONDS)
                 except psycopg.OperationalError as error:
                     if STOP.is_set() or self.requeueing or not transient_database_error(error):raise
                     database_retry(error,delay)

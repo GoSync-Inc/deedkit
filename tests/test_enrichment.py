@@ -1465,6 +1465,14 @@ def run_in_thread(w,module,limit=30):
     return thread,errors,watchdog
 
 
+def announce(s):
+    """The attachment.ready event a finished download publishes (the audio lane's wake mark)."""
+    import uuid
+    from messaging_service.store import Store
+    with s.pool.connection() as c:
+        Store.append_event(c,'telegram-demo','demo-tg-2','attachment.ready',event_key='event_lane-'+uuid.uuid4().hex)
+
+
 def enrichment_states(s):
     with s.pool.connection() as c:
         return {r['attachment']:(r['state'],r['attempts']) for r in c.execute(
@@ -1506,7 +1514,7 @@ def test_a_voice_note_is_transcribed_while_an_image_job_is_still_running(seeded,
     add_image(s)
     thread,errors,watchdog=run_in_thread(w,module)
     assert image_started.wait(20)
-    add_audio(s)
+    add_audio(s);announce(s)
     thread.join(40);watchdog.cancel()
     assert not thread.is_alive() and errors==[] and order==['image','audio']
     assert enrichment_states(s)=={'enrich-audio':('ready',1),'enrich-image':('ready',1)}
@@ -1518,43 +1526,63 @@ def test_a_voice_note_is_transcribed_while_an_image_job_is_still_running(seeded,
 
 
 # spec: ANYM-838
-def test_an_idle_audio_lane_probes_without_the_locks_and_claims_a_due_note_on_its_next_probe(seeded,tmp_path,monkeypatch,stop_state):
+def test_an_idle_audio_lane_reads_only_its_mark_and_claims_a_new_note_on_its_next_read(seeded,tmp_path,monkeypatch,stop_state):
     import threading
     import messaging_service.file_lifecycle as lifecycle
     module=stop_state;s,_,_=seeded
     monkeypatch.setattr(module,'IDLE_SECONDS',600)  # the main lane claims once, then stays asleep
+    monkeypatch.setattr(module,'LANE_FULL_PROBE_SECONDS',600)  # only a moved mark makes the lane read candidates
     calls=[];claimed=threading.Event()
     def processor(files,row,profile):
         claimed.set();module.STOP.set();return normalize_result({'text':'synthetic','segments':[]},audio=True)
     w=two_kind_worker(s,tmp_path,processor)
-    real_lock,real_due,real_claim=lifecycle.lifecycle_lock,EnrichmentWorker.due,EnrichmentWorker.claim
+    real_lock,real_mark,real_due,real_claim=(lifecycle.lifecycle_lock,EnrichmentWorker.ready_mark,
+        EnrichmentWorker.due,EnrichmentWorker.claim)
     def lock(c):
         calls.append(('lock',threading.current_thread().name));return real_lock(c)
+    def mark(self):
+        calls.append(('mark',None));return real_mark(self)
     def due(self):
         found=real_due(self);calls.append(('due',found));return found
     def claim(self):
         calls.append(('claim',self.kinds));return real_claim(self)
-    monkeypatch.setattr(lifecycle,'lifecycle_lock',lock)
+    monkeypatch.setattr(lifecycle,'lifecycle_lock',lock);monkeypatch.setattr(EnrichmentWorker,'ready_mark',mark)
     monkeypatch.setattr(EnrichmentWorker,'due',due);monkeypatch.setattr(EnrichmentWorker,'claim',claim)
     thread,errors,watchdog=run_in_thread(w,module)
     deadline=time.monotonic()+20
-    while sum(1 for kind,_ in calls if kind=='due')<3 and time.monotonic()<deadline:time.sleep(0.05)
+    while sum(1 for kind,_ in calls if kind=='mark')<4 and time.monotonic()<deadline:time.sleep(0.05)
     idle=list(calls)
-    # Idle: the audio lane only probes; it neither claims nor takes the residency lock.
-    assert [found for kind,found in idle if kind=='due'][:3]==[False,False,False]
+    # Idle: after its first candidate read the lane reads only the mark; it neither claims nor takes the residency lock.
+    assert [found for kind,found in idle if kind=='due']==[False]
     assert ('claim',frozenset({'audio'})) not in idle
     assert not [name for kind,name in idle if kind=='lock' and name=='enrichment-audio-lane']
     before=len(calls)
-    add_audio(s)
+    add_audio(s);announce(s)
     assert claimed.wait(20)
     thread.join(30);watchdog.cancel()
     assert not thread.is_alive() and errors==[]
     after=calls[before:]
-    # The note is claimed on the first or second probe after it became due (one may have started just before).
-    probes=[i for i,(kind,_) in enumerate(after) if kind=='due']
+    # The note is read and claimed on the first or second mark read after it was announced (one may have begun before).
     first=next(i for i,(kind,found) in enumerate(after) if kind=='due' and found)
-    assert probes.index(first)<=1 and ('claim',frozenset({'audio'})) in after[first:]
+    assert sum(1 for kind,_ in after[:first] if kind=='mark')<=2 and ('claim',frozenset({'audio'})) in after[first:]
     assert enrichment_states(s)['enrich-audio']==('ready',1)
+
+
+# spec: ANYM-838
+def test_an_audio_job_due_without_a_new_event_is_found_by_the_periodic_candidate_read(seeded,tmp_path,monkeypatch,stop_state):
+    import threading
+    module=stop_state;s,_,_=seeded
+    monkeypatch.setattr(module,'IDLE_SECONDS',600);monkeypatch.setattr(module,'LANE_FULL_PROBE_SECONDS',0.3)
+    claimed=threading.Event()
+    def processor(files,row,profile):
+        claimed.set();module.STOP.set();return normalize_result({'text':'synthetic','segments':[]},audio=True)
+    w=two_kind_worker(s,tmp_path,processor)
+    thread,errors,watchdog=run_in_thread(w,module)
+    time.sleep(0.5)
+    add_audio(s)  # due with no attachment.ready event, like a retry whose backoff ended
+    assert claimed.wait(20)
+    thread.join(30);watchdog.cancel()
+    assert not thread.is_alive() and errors==[] and enrichment_states(s)['enrich-audio']==('ready',1)
 
 
 # spec: ANYM-838
