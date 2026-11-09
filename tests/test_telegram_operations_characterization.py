@@ -74,7 +74,7 @@ def test_parameter_shape_is_rejected_before_any_provider_call(operation, paramet
     assert client.calls == []
 
 
-# spec: ANYM-168
+# spec: ANYM-171
 @pytest.mark.parametrize('operation, parameters, extra, code', [
     ('edit_message', {'text': 'x' * 4001}, {}, 'invalid_parameters'),
     ('send_file', {'caption': 'x' * 1025}, {}, 'invalid_parameters'),
@@ -115,7 +115,7 @@ def test_each_parameter_check_answers_its_code_before_any_provider_call(operatio
     assert client.calls == []
 
 
-# spec: ANYM-168
+# spec: ANYM-170
 def test_send_file_closes_the_descriptor_of_a_refused_attachment(tmp_path, monkeypatch):
     pipe = tmp_path / 'pipe'
     os.mkfifo(pipe)
@@ -137,7 +137,7 @@ def test_send_file_closes_the_descriptor_of_a_refused_attachment(tmp_path, monke
     assert len(opened) == 1 and opened[0].closed
 
 
-# spec: ANYM-168
+# spec: ANYM-170
 def test_a_failing_close_of_a_refused_attachment_escapes_unmapped(tmp_path, monkeypatch):
     """`_execute`'s `finally` closes the stream outside its exception mapper, so a close error is not a rejection."""
     pipe = tmp_path / 'pipe'
