@@ -1640,6 +1640,10 @@ def now():
 # backup and is not checked.
 BACKUP_RUNNER = Path("/opt/personal-os-probe/ops/backup_runner.py")
 BACKUP_RUNNER_SOURCE = "services/messaging/messaging_service/backup_runner.py"
+# W5-9: a release whose runner keeps its recordings and calls profiles in a module beside it ships that file too; the
+# host program loads it from its own directory (`backup_profiles.py`, or `.backup_profiles.py.<sha>.tmp` beside the
+# staged `.backup_runner.py.<sha>.tmp` its `--check` runs as). A release without the file installs the runner alone.
+BACKUP_PROFILES_SOURCE = "services/messaging/messaging_service/backup_profiles.py"
 # Messaging's runner lock: messaging's run and the calendar's (its `host_lock`, ANYM-608) hold it. A manual `deploy`,
 # `apply` and the standalone HTTP `promote` wait for a running backup (ANYM-744) and then hold it for their run;
 # `deploy --auto` runs under the unit's `flock` wrapper on the same file (DEEDKIT_BACKUP_LOCK).
@@ -1861,6 +1865,26 @@ def runner_blobs(source, sha):
     return git_blob(content), expected
 
 
+def profiles_blobs(source, sha):
+    """`(installed, expected)` of the runner's profiles module (BACKUP_PROFILES_SOURCE) beside the host runner, the
+    installed one None while the file is absent; None when `sha` has no such module."""
+    if BACKUP_PROFILES_SOURCE not in run(["git", "-C", str(source), "ls-tree", "-z", "--name-only", sha,
+                                          BACKUP_PROFILES_SOURCE]).split("\0"):
+        return None
+    expected = run(["git", "-C", str(source), "rev-parse", f"{sha}:{BACKUP_PROFILES_SOURCE}"]).strip()
+    path = BACKUP_RUNNER.with_name(Path(BACKUP_PROFILES_SOURCE).name)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None, expected
+    except OSError as exc:
+        raise Refused(f"cannot read the backup runner's {path}: {type(exc).__name__}") from exc
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise Refused(f"the backup runner's {path} is not a regular file")
+        return git_blob(handle.read()), expected
+
+
 def check_backup_runner(source, sha):
     if (found := runner_blobs(source, sha)) is None:
         return
@@ -1868,6 +1892,9 @@ def check_backup_runner(source, sha):
     if installed != expected:
         raise Refused(f"the backup runner {BACKUP_RUNNER} is blob {installed[:12]}, not {sha[:12]}'s {expected[:12]}; "
                       "install it with its backup image (production.md, Backup runner)")
+    if (profiles := profiles_blobs(source, sha)) and profiles[0] != profiles[1]:
+        raise Refused(f"the backup runner's profiles beside {BACKUP_RUNNER} are blob {(profiles[0] or 'absent')[:12]}, "
+                      f"not {sha[:12]}'s {profiles[1][:12]}; install them with its backup image (production.md, Backup runner)")
 
 
 def expected_image(receipt, item, service, target):
@@ -5457,7 +5484,9 @@ def install_backup_runner(settings, candidate, release):
     `.before-<candidate>` copy, keeping owner and mode; the runner is read back by its blob. The receipt is
     `<candidate>/backup-runner.json`. A manual `apply` keeps refusing a mismatch (check_backup_runner)."""
     source, receipt = release / "source", release / "backup-runner.json"
-    if (found := runner_blobs(source, candidate)) is None or found[0] == found[1]:
+    found = runner_blobs(source, candidate)
+    profiles = profiles_blobs(source, candidate) if found else None
+    if found is None or (found[0] == found[1] and (profiles is None or profiles[0] == profiles[1])):
         # A run that stopped after the last rename (the runner's) and before its receipt: the receipt follows.
         with suppress(FileNotFoundError, ValueError, OSError, KeyError, TypeError):
             if found and read(receipt)["status"] == "installing":
@@ -5474,6 +5503,12 @@ def install_backup_runner(settings, candidate, release):
     runner = run(["git", "-C", str(source), "cat-file", "blob", f"{candidate}:{BACKUP_RUNNER_SOURCE}"], binary=True)
     if git_blob(runner) != expected:
         raise Refused(f"the backup runner of {candidate[:12]} does not read as its blob {expected[:12]}")
+    # Its profiles module goes beside it when it is not the candidate's yet (BACKUP_PROFILES_SOURCE).
+    module = BACKUP_RUNNER.with_name(Path(BACKUP_PROFILES_SOURCE).name) if profiles and profiles[0] != profiles[1] else None
+    if module:
+        sibling = run(["git", "-C", str(source), "cat-file", "blob", f"{candidate}:{BACKUP_PROFILES_SOURCE}"], binary=True)
+        if git_blob(sibling) != profiles[1]:
+            raise Refused(f"the backup runner's profiles of {candidate[:12]} do not read as their blob {profiles[1][:12]}")
     # The backup target is no Compose service, so preparation did not resolve it: pulled by its attested digest. A
     # failed pull (a registry or network error, a timeout) waits like the producer pin's (follow_producer).
     try:
@@ -5494,7 +5529,7 @@ def install_backup_runner(settings, candidate, release):
     # staged: (path, temporary, before, after); copies: the `.before-<candidate>` files this run wrote.
     directories, staged, copies = {}, [], []
     try:
-        for path in (BACKUP_RUNNER, *configs):
+        for path in (BACKUP_RUNNER, *([module] if module else []), *configs):
             directories[path] = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
             old, before = leaf_read(directories[BACKUP_RUNNER], BACKUP_RUNNER.name)
@@ -5506,6 +5541,26 @@ def install_backup_runner(settings, candidate, release):
                                  "the backup runner")
         copies += [BACKUP_RUNNER] if wrote else []
         staged.append((BACKUP_RUNNER, work, installed, expected))
+        if module:
+            try:
+                current, kept = leaf_read(directories[module], module.name)
+            except FileNotFoundError:
+                current = None
+            except OSError as exc:
+                raise Refused(f"cannot read the backup runner's {module}: {type(exc).__name__}") from exc
+            if current is None:
+                # The first install of the module: a new file with the runner's owner and mode, no copy (undo: remove it).
+                temporary = f".{module.name}.{candidate}.tmp"
+                with suppress(FileNotFoundError):
+                    os.unlink(temporary, dir_fd=directories[module])
+                leaf_write(directories[module], temporary, sibling, before)
+            else:
+                if git_blob(current) != profiles[0]:
+                    raise MigrationRefused(f"{module} changed while deploy read it; inspect it")
+                temporary, wrote = stage_leaf(directories[module], module, current, kept, sibling, candidate,
+                                              "the backup runner's profiles")
+                copies += [module] if wrote else []
+            staged.append((module, temporary, profiles[0], profiles[1]))
         for path in configs:
             try:
                 old, before = leaf_read(directories[path], path.name)
@@ -5529,20 +5584,23 @@ def install_backup_runner(settings, candidate, release):
                 raise MigrationRefused(f"the new backup runner's --check of {path} with image {image[:19]} failed: "
                                        f"{exc} (exit 3: an unfinished journal, production.md Backup runner)") from exc
         record = {"sha": candidate, "status": "installing", "at": now(), "image": image,
-                  "files": [{"path": str(path), "before": old, "after": new, "undo": f"{path}.before-{candidate}"}
-                            for path, _, old, new in staged]}
+                  "files": [{"path": str(path), "before": old, "after": new,
+                             "undo": f"{path}.before-{candidate}" if old else None} for path, _, old, new in staged]}
         # No production change during an active call (AGENTS.md section 1): checked last before the first rename; a
         # call (or an unreadable call state) ends the run with the staged files removed, so nothing changed.
         wait_for_calls(settings, time.monotonic() + CALL_POLL)
         copies.clear()  # from here on the copies are the undo
         write_record(receipt, record)
         try:
-            # runner.json first: the new runner may write a worker.json key an older worker refuses (BACKUP.md).
+            # runner.json first: the new runner may write a worker.json key an older worker refuses (BACKUP.md). The
+            # profiles module before both: no runner that loads it runs before it is in place (the older one never does).
             for path, temporary, _, _ in [*staged[1:], staged[0]]:
                 os.replace(temporary, path.name, src_dir_fd=directories[path], dst_dir_fd=directories[path])
                 os.fsync(directories[path])
             if runner_blobs(source, candidate) != (expected, expected):
                 raise Refused(f"{BACKUP_RUNNER} does not read back as {expected[:12]}")
+            if module and profiles_blobs(source, candidate) != (profiles[1], profiles[1]):
+                raise Refused(f"{module} does not read back as {profiles[1][:12]}")
         except Exception as exc:
             detail = str(exc) if isinstance(exc, Refused) else type(exc).__name__
             raise MigrationRefused(f"the backup runner install of {candidate} stopped after it began to rename: "
@@ -6886,7 +6944,7 @@ MODULE_DIRECTORY = "deploy/modules/"
 ENROLL_OWNER = 0  # the env file's owner on the host: root
 ENROLL_FORBIDDEN_SERVICES = frozenset({"db", "calendar-db", "database", "postgres", "operator"})
 VERIFY_SCRIPT = re.compile(r"scripts/[a-z0-9_]+_egress_check\.py")
-BACKUP_FILES = re.compile(r"services/messaging/messaging_service/backup_runner\.py|deploy/[^/]*backup[^/]*\.(service|timer)")
+BACKUP_FILES = re.compile(r"services/messaging/messaging_service/backup_(runner|profiles)\.py|deploy/[^/]*backup[^/]*\.(service|timer)")
 MODULE_NAME = re.compile(r"[a-z][a-z0-9-]{0,40}")
 NETWORK_NAME = re.compile(r"[a-z0-9][a-z0-9_.-]{0,62}")
 BRIDGE_NAME = re.compile(r"[a-z][a-z0-9-]{0,14}")
