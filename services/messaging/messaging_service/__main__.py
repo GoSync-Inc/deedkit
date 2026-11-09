@@ -30,12 +30,15 @@ def read_token(path):
 
 
 def migrate_expand(args, parser):
-    # ANYM-596: one bounded connection and no application pool; one JSON line, a fixed error code and exit 1 on
-    # refusal. PostgreSQL's message is never printed: psycopg's own logger is off in this process.
+    # ANYM-596: one bounded connection and no application pool; the answer is the last JSON line, a fixed error code
+    # and exit 1 on refusal. PostgreSQL's message is never printed: psycopg's own logger is off in this process.
+    # A committed --plan prints {"transaction_ms": N} on the line before it (the rehearsal's time; a reader of the
+    # last line alone, an older deploy tool, ignores it).
     import logging
     from . import store
     if args.status not in (None,'ledger') or not (args.status or args.plan): parser.error('migrate-expand requires --plan or --status')
     logging.getLogger('psycopg').disabled=True
+    timing={}
     try:
         dsn=Path(os.environ['DATABASE_URL_FILE']).read_text().strip()
         name=os.environ.get('PGAPPNAME') or None
@@ -43,9 +46,10 @@ def migrate_expand(args, parser):
         else:
             try: plan=json.loads(args.plan.read_text())
             except (OSError,ValueError): raise store.ExpandError('plan_invalid') from None
-            result=store.migrate_expand(dsn,plan if isinstance(plan,dict) else {},application_name=name)
+            result=store.migrate_expand(dsn,plan if isinstance(plan,dict) else {},application_name=name,timing=timing)
     except store.ExpandError as error: result=error.code
     except Exception: result='failed'
+    if isinstance(result,dict) and 'transaction_ms' in timing: print(json.dumps({'transaction_ms':timing['transaction_ms']}))
     print(json.dumps(result if isinstance(result,dict) else {'error':result}))
     return 0 if isinstance(result,dict) else 1
 
