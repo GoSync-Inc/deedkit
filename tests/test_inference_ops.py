@@ -1820,6 +1820,8 @@ def test_deploy_syncs_the_docling_venv_before_the_release_is_ready():
 
 
 # spec: ANYM-850
+# reads: services/inference/pyproject.toml
+# reads: services/inference/docling/pyproject.toml
 def test_the_deploy_sync_keeps_wheels_only_although_uv_reads_no_project_configuration(tmp_path):
     """Astra r1 (ANYM-850): `UV_NO_CONFIG=1` also drops the project's `[tool.uv] no-build-package`, so a sync that
     relied on it could build an sdist. Both syncs pass the list explicitly with `--config-file`, written from the
@@ -1827,11 +1829,11 @@ def test_the_deploy_sync_keeps_wheels_only_although_uv_reads_no_project_configur
     sync = next(c for c in SshRecorder().exercise_deploy() if 'uv sync' in c)
     assert sync.count('pyproject.toml > .wheel-only.toml && /opt/homebrew/bin/uv sync --locked') == 2
     assert sync.count('--config-file .wheel-only.toml && ') == 2
-    for project in ('services/inference', 'services/inference/docling'):
-        done = subprocess.run([sys.executable, '-I', '-c', deploy.WHEEL_ONLY, str(ROOT / project / 'pyproject.toml')],
+    for pyproject in (ROOT / 'services/inference/pyproject.toml', ROOT / 'services/inference/docling/pyproject.toml'):
+        done = subprocess.run([sys.executable, '-I', '-c', deploy.WHEEL_ONLY, str(pyproject)],
                               capture_output=True, text=True, check=True)
         names = tomllib.loads(done.stdout)['no-build-package']
-        assert names == tomllib.loads((ROOT / project / 'pyproject.toml').read_text())['tool']['uv']['no-build-package']
+        assert names == tomllib.loads(pyproject.read_text())['tool']['uv']['no-build-package']
     (tmp_path / 'empty.toml').write_text('[project]\nname = "x"\n')
     refused = subprocess.run([sys.executable, '-I', '-c', deploy.WHEEL_ONLY, str(tmp_path / 'empty.toml')],
                              capture_output=True, text=True)
