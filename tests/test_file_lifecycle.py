@@ -59,6 +59,52 @@ def test_backup_fence_remains_active_after_connection_closes(archive):
             api.begin_backup_fence(c,'synthetic-backup-1')
 
 
+# spec: ANYM-223
+def test_registering_an_original_reads_its_identity_through_an_index_under_the_residency_lock(archive):
+    # Regression (production 11-09): every attachment INSERT calls register_resident_original, which checks
+    # attachments by digest and bytes while it holds the global residency lock. Without an index that check read
+    # the whole table (56,523 rows, 7 ms) under the lock. enable_seqscan=off stands in for production's size: the
+    # planner still takes a sequential scan when no index can answer the check.
+    _,s,_,_=archive
+    _,blob=stored(archive)
+    # The backend's pending counters may still hold earlier transactions' scans: compare before and after.
+    count="SELECT seq_scan,idx_scan FROM pg_stat_xact_user_tables WHERE relid='public.attachments'::regclass"
+    with s.pool.connection() as c:
+        c.execute('SET LOCAL enable_seqscan=off')
+        before=c.execute(count).fetchone()
+        assert lifecycle().register_resident_original(c,blob.digest,blob.bytes)
+        after=c.execute(count).fetchone()
+        assert after['seq_scan']==before['seq_scan'] and after['idx_scan']>before['idx_scan']
+        index=c.execute("SELECT pg_get_indexdef('public.attachment_digest_bytes'::regclass) AS d").fetchone()['d']
+    assert index=='CREATE INDEX attachment_digest_bytes ON public.attachments USING btree (digest, bytes)'
+
+
+# spec: ANYM-223
+@pytest.mark.parametrize('shape',['invalid','partial','other_keys','hash','collation','opclass','descending'])
+def test_migration_068_refuses_an_unusable_index_of_its_name_and_builds_it_once_dropped(database,tmp_path,shape):
+    # IF NOT EXISTS keeps any relation of that name; the ledger may advance only over the index the lookup needs.
+    import psycopg
+    from test_extend_key import old_schema_store
+    with old_schema_store(database,tmp_path,67) as store:
+        with store.pool.connection() as c:
+            c.execute('CREATE INDEX attachment_digest_bytes ON attachments '+{'invalid':'(digest,bytes)',
+                'partial':'(digest,bytes) WHERE active','other_keys':'(digest)','hash':'USING hash (digest)','collation':'(digest COLLATE "C",bytes)',
+                'opclass':'(digest text_pattern_ops,bytes)','descending':'(digest DESC,bytes)'}[shape])
+            # What an interrupted CREATE INDEX CONCURRENTLY leaves behind.
+            if shape=='invalid':
+                c.execute("UPDATE pg_index SET indisvalid=false WHERE indexrelid='attachment_digest_bytes'::regclass")
+        with pytest.raises(psycopg.errors.RaiseException,match='not a valid btree index'):store.migrate()
+        with store.pool.connection() as c:
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='67'
+            c.execute('DROP INDEX attachment_digest_bytes')
+        store.migrate();store.migrate()
+        with store.pool.connection() as c:
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='68'
+            assert c.execute('''SELECT i.indisvalid,pg_get_indexdef(i.indexrelid) AS d FROM pg_index i
+                WHERE i.indexrelid='attachment_digest_bytes'::regclass''').fetchone()=={'indisvalid':True,
+                'd':'CREATE INDEX attachment_digest_bytes ON public.attachments USING btree (digest, bytes)'}
+
+
 @pytest.fixture(autouse=True)
 def clear_lifecycle_state(database):
     with database.pool.connection() as c:
