@@ -40,6 +40,7 @@
       "mcp__claude_ai_Deedkit__messages_list_delivery_endpoints",
       "mcp__claude_ai_Deedkit__messages_list_feedback",
       "mcp__claude_ai_Deedkit__messages_list_messenger_operations",
+      "mcp__claude_ai_Deedkit__messages_list_negotiations",
       "mcp__claude_ai_Deedkit__messages_list_reply_dismissals",
       "mcp__claude_ai_Deedkit__messages_list_subscriptions",
       "mcp__claude_ai_Deedkit__messages_list_wake_targets",

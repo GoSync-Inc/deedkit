@@ -44,6 +44,43 @@ def named_calls(value, shown):
     return value
 
 
+# ANYM-909: a call of any module by its public name, and a messaging call by its backend operation too. Other
+# modules' operation names repeat across modules, so only their public names count.
+CALLS = {**{name: name for name in CATALOG}, **MESSAGING_CALLS}
+
+
+def next_entries(entries, shown):
+    """A `next` list keeps each entry that is one whole call `{tool, arguments}` of a tool `shown` lists, named by
+    its public name; an unlisted, unknown or malformed entry is dropped whole, never passed on in part."""
+    kept = []
+    for entry in entries if isinstance(entries, list) else ():
+        tool = entry.get("tool") if isinstance(entry, dict) else None
+        name = CALLS.get(tool) if isinstance(tool, str) else None
+        if name in shown and set(entry) == {"tool", "arguments"} and isinstance(entry["arguments"], dict):
+            kept.append({"tool": name, "arguments": entry["arguments"]})
+    return kept
+
+
+def negotiation_calls(result, visible):
+    """`messages_list_negotiations` (ANYM-909): each item's `next` and the last page's `changed.next` name only
+    calls in the caller's tool list, for any module; an item keeps an empty list when none is left."""
+    if not isinstance(result, dict):
+        return result
+    shown = set(visible)
+    items = result.get("items")
+    for item in items if isinstance(items, list) else ():
+        if isinstance(item, dict) and "next" in item:
+            item["next"] = next_entries(item["next"], shown)
+    changed = result.get("changed")
+    if isinstance(changed, dict) and "next" in changed:
+        kept = next_entries([changed["next"]], shown)
+        if kept:
+            changed["next"] = kept[0]
+        else:
+            del changed["next"]
+    return result
+
+
 def transports(rows, shown):
     """ANYM-518: a delivery transport is listed only when the caller's tool list has every tool of it;
     long polling also shows the gateway's wait pool."""

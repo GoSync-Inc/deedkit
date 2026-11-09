@@ -66,6 +66,7 @@
   {"name": "messages_list_delivery_endpoints", "read_only": true},
   {"name": "messages_list_feedback", "read_only": true},
   {"name": "messages_list_messenger_operations", "read_only": true},
+  {"name": "messages_list_negotiations", "read_only": true},
   {"name": "messages_list_reply_dismissals", "read_only": true},
   {"name": "messages_list_subscriptions", "read_only": true},
   {"name": "messages_list_wake_targets", "read_only": true},

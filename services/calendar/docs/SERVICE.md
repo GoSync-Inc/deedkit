@@ -266,6 +266,12 @@ person, one linked in another family, a disabled member or one with a calendar t
 only and reads nothing from messaging. Only `fcs_gateway` may read it (`db-roles` after `migrate`); before that every
 person UUID is `not_found` and names and member IDs work as before. `calendar_schedule` takes no member argument.
 
+Negotiations (ANYM-909): messaging's `list_negotiations` puts a `calendar_find_time` call in each item's `next`, with
+only the owner's messaging person UUID in `people`, a `{from, to}` window around the proposed or agreed time and a
+duration (60 minutes, 30 for a call). For an owner without a member link the answer is `not_found`, and the agent
+skips the calendar check. DeedKit's messaging never calls the calendar. The agent's steps: CONVERSATION.md, "Help with
+the schedule".
+
 ## Coverage and read errors
 
 iCloud recurrences are expanded lazily: at most 500 instances in one calendar window, the same as in agenda/slots responses (`event_limit`). Before expansion each RRULE is estimated from above without generating: dateutil walks all instances from DTSTART to the end of the window. More than 100 000 per resource or 1 000 000 per calendar give `coverage_incomplete`, for example `FREQ=MINUTELY`/`SECONDLY` or an hourly event running for more than 11 years. An hourly reminder gives 744 events in 31 days, so such a window stays `unknown`, while a window of up to 20 days is read in full. The limit of 500 is not raised: agenda and slots apply the same one, so a larger limit of one worker would not give coverage. On `coverage_incomplete` caused by a dense calendar, request a shorter window.

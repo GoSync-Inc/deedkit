@@ -1,4 +1,6 @@
 """The `subscriptions` and `events` capability blocks name only calls in the caller's gateway tool list (ANYM-528)."""
+import hashlib
+import json
 import tomllib
 from pathlib import Path
 
@@ -6,8 +8,10 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
+from agent_gateway.app import create_app
 from agent_gateway.catalog import CATALOG
 from test_diagnostics import configured, HEADERS
+from test_policy import config
 from test_transport import rpc
 
 PROFILES = sorted((Path(__file__).resolve().parents[3] / "config/profiles").glob("*.toml"))
@@ -169,3 +173,102 @@ def test_call_fields_never_name_an_unlisted_or_unknown_call(tmp_path, backend):
     listed, blocks, platform = observed(tmp_path, tools, **backend)
     assert_truthful(listed, blocks, platform)
     assert blocks["events"] == {} and "delivery_policy" not in blocks["subscriptions"]
+
+
+# ANYM-909: list_negotiations items carry `next` read calls of any module; the gateway keeps only the caller's.
+GET_CONTEXT = {"tool": "get_context", "arguments": {"message_id": "msg_" + "a" * 32}}
+FIND_TIME = {"tool": "calendar_find_time", "arguments": {
+    "people": ["6f1c2a3e-4b5d-4e6f-8a7b-9c0d1e2f3a4b"], "duration": 30,
+    "window": {"from": "2026-11-10T14:30:00+01:00", "to": "2026-11-10T16:00:00+01:00"}}}
+CHANGED = {"count": 1, "next": {"tool": "list_negotiations", "arguments": {"updated_since": "2026-11-09T10:00:00Z"}}}
+
+
+def negotiations(tmp_path, tools, items):
+    """A messaging and calendar deployment; the messaging backend answers list_negotiations with `items`."""
+    value = config()
+    value["deployment"] = {"modules": ["messaging", "calendar"], "backends": {
+        "messaging": {"url": "http://messaging.test"}, "calendar": {"url": "http://calendar.test"}}}
+    value["profiles"]["reader"]["tools"] = tools
+    principal = value["principals"][0]
+    principal["grants"] = {"messaging": ["read"], "calendar": ["agenda:read", "availability:read"]}
+    principal["credentials"] = {}
+    for module in ("messaging", "calendar"):
+        key = tmp_path / f"{module}.key"
+        key.write_text("synthetic-backend-key-" + module)
+        key.chmod(0o600)
+        principal["credentials"][module] = {"key_file": str(key), "key_sha256": hashlib.sha256(key.read_bytes()).hexdigest()}
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps(value))
+    path.chmod(0o600)
+    calendar_calls = []
+
+    def messaging(request):
+        if request.url.path == "/v1/capabilities":
+            return httpx.Response(200, json={"permissions": ["read"]})
+        return httpx.Response(200, json={"items": items, "as_of": "2026-11-09T10:00:00Z", "cursor": None,
+                                         "changed": dict(CHANGED)})
+
+    def calendar(request):
+        calendar_calls.append(request.url.path)
+        return httpx.Response(500)
+    app = create_app(path, "http://testserver", transports={"messaging": httpx.MockTransport(messaging),
+                                                            "calendar": httpx.MockTransport(calendar)})
+    with TestClient(app) as client:
+        rest = client.post("/v1/messages_list_negotiations", json={}, headers=HEADERS)
+        mcp = rpc(client, "tools/call", {"name": "messages_list_negotiations", "arguments": {}}).json()["result"]
+    assert rest.status_code == 200 and not mcp.get("isError") and rest.json() == mcp["structuredContent"]
+    assert calendar_calls == []
+    return rest.json()
+
+
+READER = ["messages_capabilities", "messages_list_negotiations", "messages_get_context"]
+
+
+# spec: ANYM-909
+def test_negotiation_next_keeps_only_the_callers_calls_of_any_module(tmp_path):
+    item = {"id": "neg_" + "1" * 32, "next": [GET_CONTEXT, FIND_TIME]}
+    # A caller without calendar_find_time gets only get_context, under its public name.
+    without = negotiations(tmp_path, READER, [dict(item)])
+    assert without["items"][0]["next"] == [{"tool": "messages_get_context", "arguments": GET_CONTEXT["arguments"]}]
+    # A caller with it gets both entries, the calendar call unchanged.
+    both = negotiations(tmp_path, [*READER, "calendar_find_time"], [dict(item)])
+    assert both["items"][0]["next"] == [{"tool": "messages_get_context", "arguments": GET_CONTEXT["arguments"]},
+                                        FIND_TIME]
+    # Without messages_get_context nothing but the calendar call is left.
+    only = negotiations(tmp_path, ["messages_list_negotiations", "calendar_find_time"], [dict(item)])
+    assert only["items"][0]["next"] == [FIND_TIME]
+    # The last page's re-read is kept for a caller that lists it.
+    assert both["changed"]["next"] == {"tool": "messages_list_negotiations", "arguments": CHANGED["next"]["arguments"]}
+
+
+# spec: ANYM-909
+def test_negotiation_next_leaves_no_malformed_entry(tmp_path):
+    malformed = [
+        {**FIND_TIME, "fill": {"people": "participants"}},  # a field to fill is never passed on
+        {"tool": "calendar_plan", "arguments": {}},  # a tool the caller does not list
+        {"tool": "calendar_unknown_v2", "arguments": {}},  # a tool no catalog names
+        {"tool": 7, "arguments": {}}, {"tool": "calendar_find_time"}, {"tool": "get_context", "arguments": "x"},
+        "get_context", None,
+    ]
+    items = [{"id": "neg_" + "2" * 32, "next": [*malformed, GET_CONTEXT]}, {"id": "neg_" + "3" * 32, "next": "x"}]
+    seen = negotiations(tmp_path, [*READER, "calendar_find_time"], items)
+    assert seen["items"][0]["next"] == [{"tool": "messages_get_context", "arguments": GET_CONTEXT["arguments"]}]
+    assert seen["items"][1]["next"] == []
+    for entry in (e for i in seen["items"] for e in i["next"]):
+        assert set(entry) == {"tool", "arguments"} and entry["tool"] in CATALOG
+
+
+# spec: ANYM-909
+def test_the_deployed_gateways_catalog_keeps_working_with_the_new_messaging_api(tmp_path, monkeypatch):
+    """The previous catalog (this one without the new entry) against a messaging backend that has the tool: the
+    gateway lists and routes only what it knows, so the tool is simply absent until the gateway deploys."""
+    monkeypatch.delitem(CATALOG, "messages_list_negotiations")
+    tools = ["platform_capabilities", "messages_capabilities", "messages_list_reply_dismissals"]
+    listed, blocks, platform = observed(tmp_path, tools, permissions=["read"],
+                                        manifest=[*CALLS, "list_negotiations", "list_reply_dismissals"])
+    assert "messages_list_negotiations" not in listed and listed >= {"messages_list_reply_dismissals"}
+    with TestClient(app(tmp_path, tools, permissions=["read"])) as client:
+        unknown = rpc(client, "tools/call", {"name": "messages_list_negotiations", "arguments": {}}).json()
+        other = client.post("/v1/messages_list_reply_dismissals", json={}, headers=HEADERS)
+    assert "error" in unknown or unknown["result"].get("isError")
+    assert other.status_code == 200 and other.json()["synthetic"] is True

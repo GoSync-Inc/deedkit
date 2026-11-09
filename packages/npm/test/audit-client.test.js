@@ -25,7 +25,7 @@ test('all seven consumption and feedback helpers preserve wire arguments',async(
     assert.deepEqual(await client[method](args),{future_field:{verified:false}});
     assert.ok(tools.includes(operation),operation);
   }
-  assert.equal(tools.length,53);
+  assert.equal(tools.length,54);
   assert.deepEqual(seen,Object.values(methods).map(([operation,args])=>[
     `https://archive.example/prefix/v1/${operation}`,args]));
 });
@@ -194,6 +194,19 @@ test('the attempt listing helper sends its wire arguments and checks them before
     ['https://archive.example/prefix/v1/list_delivery_attempts',{endpoint_id:ENDPOINT,limit:5,before:ENDPOINT}]]);
 });
 
+
+// spec: ANYM-909
+test('the negotiation listing helper reads list_negotiations with its wire arguments',async()=>{
+  const seen=[];
+  const client=new AnyMsgClient({...options,fetch:async(url,request)=>{
+    seen.push([String(url),JSON.parse(request.body)]);return Response.json({items:[],cursor:null});
+  }});
+  assert.ok(tools.includes('list_negotiations'));
+  await client.listNegotiations();
+  await client.listNegotiations({states:['past'],detail:'full',limit:5});
+  assert.deepEqual(seen,[['https://archive.example/prefix/v1/list_negotiations',{}],
+    ['https://archive.example/prefix/v1/list_negotiations',{states:['past'],detail:'full',limit:5}]]);
+});
 
 // spec: ANYM-519
 test('the five endpoint helpers send their wire arguments to the REST operations',async()=>{
