@@ -622,6 +622,10 @@ def differing(before: dict, after: dict, skip: frozenset = frozenset()) -> list[
 SHOWN_VALUES = frozenset({"status", "priority", "position", "type", "parentId", "componentId"})
 
 
+# Fields the server derives, never written by a merge: a spec's child count (ANYM-598).
+DERIVED = frozenset({"childrenCount"})
+
+
 def changes(before: dict, after: dict, skip: frozenset = frozenset()) -> list[str]:
     """The fields that differ, each structural one with its values (`status: Active -> Done`, absent as none)."""
     def value(item) -> str:
@@ -660,11 +664,12 @@ def ready_check(cli: str, product: str, name: str) -> tuple[set[int], dict[int, 
         if number in versions and number not in main:
             problems.append(f"ANYM-{number} is a text change of a spec that is not on main")
         if number in main:
-            # The listings and the preview's two versions must both keep main's structure.
+            # The listings and the preview's two versions must both keep main's structure. A parent's child count is
+            # derived by the server and a branch copy's may differ: no structure (ANYM-598).
             item = versions.get(number, {})
-            fields = set(differing(structure(main[number]), structure(spec)))
+            fields = set(differing(structure(main[number]), structure(spec), DERIVED))
             if isinstance(item.get("mainVersion"), dict) and isinstance(item.get("branchVersion"), dict):
-                fields |= set(differing(structure(item["mainVersion"]), structure(item["branchVersion"])))
+                fields |= set(differing(structure(item["mainVersion"]), structure(item["branchVersion"]), DERIVED))
             if fields:
                 problems.append(f"ANYM-{number} changes more than its text on {name} ({', '.join(sorted(fields))})")
         if line is None:
@@ -741,7 +746,7 @@ def ready_merge(cli: str, product: str, name: str, report, dry: bool = False) ->
         expected = (main.get(number) or branch[number])["id"]
         if spec["id"] != expected:
             problems.append(f"ANYM-{number} is record {spec['id']} on main, not {expected}")
-        fields = changes(card(branch[number]), card(spec))
+        fields = changes(card(branch[number]), card(spec), DERIVED)
         if fields:
             problems.append(f"ANYM-{number} on main differs from the checked branch copy ({', '.join(fields)})")
     # Everything of a spec the branch did not change stays, its parent included. A parent's child count is derived by
@@ -749,7 +754,7 @@ def ready_merge(cli: str, product: str, name: str, report, dry: bool = False) ->
     for number in sorted(set(main) - numbers):
         before, after = main[number], now.get(number)
         fields = ["no longer listed"] if after is None else (["id"] if after["id"] != before["id"] else []) + changes(
-            card(before), card(after), frozenset({"childrenCount"}))
+            card(before), card(after), DERIVED)
         if fields:
             problems.append(f"ANYM-{number} changed on main, but not on the checked branch ({', '.join(fields)})")
     if problems:

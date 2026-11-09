@@ -532,7 +532,8 @@ Tiden main only when:
    priority, position, status and sources (by their fields) stay as main has
    them, in the listings (which name a parent, absent for none) and in the
    preview's two versions; only a branch copy's own record ID, branch and
-   times differ;
+   times differ, and a parent's child count may (the server derives it:
+   ANYM-598);
 5. every changed spec has a `Ready:` record with text after the colon that
    starts its line (bold, or a top-level `- ` item at most), outside fenced
    code and code spans; a spec with a raw `<pre>`, `<script>`, `<style>`,
@@ -549,7 +550,8 @@ read and the merge stays; the read-back closes it by detection, not
 prevention: main must then hold the specs it had (same record, same fields
 except their child count, which the server derives, so it is no evidence
 either way: ANYM-598), plus exactly the checked branch copies (parent
-included, so a new spec's placement is checked on the spec itself), a text
+included, so a new spec's placement is checked on the spec itself; their
+child count again excepted), a text
 change in main's record and a new spec in its branch record (no record is
 created on a merge: 2026-10-26, the main specs that merged branches changed
 kept their `createdAt`, and none was created at a merge). Its output, each
