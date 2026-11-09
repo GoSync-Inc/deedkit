@@ -74,6 +74,15 @@ def test_parameter_shape_is_rejected_before_any_provider_call(operation, paramet
     assert client.calls == []
 
 
+# spec: ANYM-549
+@pytest.mark.parametrize('operation', ['get_message_info', 'delete_message'])
+def test_a_message_id_past_the_signed_32_bit_range_is_rejected_before_any_provider_call(operation):
+    client = Client()
+    with pytest.raises(Exception, match='invalid_parameters'):
+        run(client, operation, {}, provider_message_id=str(2**31))
+    assert client.calls == []
+
+
 # spec: ANYM-171
 @pytest.mark.parametrize('operation, parameters, extra, code', [
     ('edit_message', {'text': 'x' * 4001}, {}, 'invalid_parameters'),
@@ -222,6 +231,16 @@ def test_forward_answered_from_another_chat_reports_the_provider_reference_misma
                  source_provider_message='23')
     assert result == {'outcome': 'unknown', 'data': {'error': 'provider_reference_mismatch'}}
     assert any(isinstance(c, tuple) and c[0] == 'forward_messages' for c in client.calls)
+
+
+# spec: ANYM-549
+def test_forward_from_a_source_chat_the_policy_excludes_is_refused_before_any_provider_call():
+    client = Client()
+    with pytest.raises(Exception, match='operation_access_changed'):
+        run(client, 'forward_message', {}, provider_chat='200', source_provider_chat='300',
+            source_provider_message='23',
+            _policy={'enabled': True, 'discover_chats': True, 'include_chats': [], 'exclude_chats': ['300']})
+    assert client.calls == []
 
 
 # spec: ANYM-549
