@@ -242,12 +242,15 @@ def decorate(c,rows,*,order_key=None,with_body=False,media=False,groups=None):
 
 # ANYM-866: the files one event page reads (a page has at most 100 items of up to 32 files each).
 PAGE_FILES=200
+# The events that name their own files (ANYM-867 adds the terminal download failure).
+FILE_EVENTS=('attachment.ready','attachment.failed')
 
 
 def event_attachments(c,items):
-    """ANYM-866: the files of already visible message.created, message.edited and attachment.ready items, each with
-    the state a message read shows now (media_fields). A message event names its own revision's files, so a file an
-    edit removed reads superseded; attachment.ready names its file. No file name leaves; a file's error stays its own."""
+    """ANYM-866: the files of already visible message.created, message.edited, attachment.ready and attachment.failed
+    items, each with the state a message read shows now (media_fields). A message event names its own revision's files,
+    so a file an edit removed reads superseded; attachment.ready names its file and attachment.failed its failed files
+    (ANYM-867). No file name leaves; a file's error stays its own."""
     from .envelope import canonical,stable_id
     pairs=[(i['message'],i['revision']) for i in items
         if i['kind'] in ('message.created','message.edited') and isinstance(i.get('message'),str)]
@@ -260,11 +263,16 @@ def event_attachments(c,items):
             files[(r['message'],r['revision'])]=[stable_id('file',r['message'],hashlib.sha256(canonical(d)).hexdigest())
                 for d in (r['media'] if isinstance(r['media'],list) else [])]
     for i in items:
-        ident=(i.get('processing') or {}).get('attachment_id') if i['kind']=='attachment.ready' else None
+        processing=i.get('processing') if isinstance(i.get('processing'),dict) else {}
+        ident=processing.get('attachment_id') if i['kind']=='attachment.ready' else None
         if isinstance(ident,str):files[('ready',i['event_id'])]=[ident]
+        failed=processing.get('failed') if i['kind']=='attachment.failed' else None
+        if isinstance(failed,list):
+            files[('ready',i['event_id'])]=[f['attachment'] for f in failed
+                if isinstance(f,dict) and isinstance(f.get('attachment'),str)][:32]
     # A bounded page: at most PAGE_FILES files; the items past the bound carry no attachments, counted once.
     def key_of(i):
-        return ('ready',i['event_id']) if i['kind']=='attachment.ready' else (i.get('message'),i.get('revision'))
+        return ('ready',i['event_id']) if i['kind'] in FILE_EVENTS else (i.get('message'),i.get('revision'))
     kept,total=set(),0
     for key in dict.fromkeys(key_of(i) for i in items if key_of(i) in files):  # page order
         total+=len(files[key])
@@ -286,5 +294,5 @@ def event_attachments(c,items):
             'bytes':row['bytes'] if row['bytes'] is not None else descriptor.get('bytes'),**media_fields(row)}
     for i in items:
         key=key_of(i)
-        if i['kind'] in ('message.created','message.edited','attachment.ready') and key in files:
+        if i['kind'] in ('message.created','message.edited',*FILE_EVENTS) and key in files:
             i['attachments']=[view(f,i.get('message')) for f in files[key]]

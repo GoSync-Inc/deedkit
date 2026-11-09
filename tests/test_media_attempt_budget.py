@@ -417,6 +417,36 @@ def test_adapter_error_frame_reaches_the_stored_job_and_its_status_line(worker,t
     assert line[0]['explanation']!='Provider or archive observation; inspect the scoped sync evidence.'
 
 
+# spec: ANYM-867
+def test_the_media_loop_and_ingest_keep_running_while_the_failure_event_always_fails(worker,monkeypatch):
+    from messaging_service import attachment_failures
+    from messaging_service.telegram_collector import ProviderUnavailable
+    w,s,key=worker
+    for mid in (9,10):asyncio.run(w.capture(SimpleNamespace(message=message(mid,media=True))))
+    w.spool.drain(w.state.apply)
+    calls=[]
+    async def chunks(*_):
+        calls.append(1)
+        if len(calls)==1:raise ProviderUnavailable()
+        yield b'data'
+    w.provider.chunks=chunks
+    def poisoned(c,account,message,group):
+        c.execute('SELECT 1/0')
+    monkeypatch.setattr(attachment_failures,'_append',poisoned)
+    before=attachment_failures.SET_ASIDE['DivisionByZero']
+    assert asyncio.run(w.media_once())  # the terminal failure: its event fails three times and is set aside
+    assert asyncio.run(w.media_once())  # the next file downloads
+    with s.pool.connection() as c:
+        states=sorted(r['state'] for r in c.execute('SELECT state FROM media_jobs WHERE account=%s',(w.account,)))
+        kinds=[r['kind'] for r in c.execute("SELECT kind FROM events WHERE account=%s AND kind LIKE 'attachment.%%'",
+            (w.account,))]
+    assert states==['failed','ready'] and kinds==['attachment.ready']
+    assert attachment_failures.SET_ASIDE['DivisionByZero']==before+1
+    # New messages are still collected.
+    asyncio.run(w.capture(SimpleNamespace(message=message(11))));w.spool.drain(w.state.apply)
+    assert 'message 11' in [i['body'] for i in s.get_updates(key,'after-poison')['items']]
+
+
 def wa_failed(ar, s, mid, *, sent_days, queued_days=0, code='media_network_error', platform='whatsapp'):
     """A failed job of a message sent `sent_days` ago whose job was created `queued_days` ago."""
     account='budget-wa' if platform=='whatsapp' else 'archive-test'

@@ -90,6 +90,10 @@ values. `processing` gives `text`, `transcript` and `description` as `queued`, `
 - A voice note in a group no subscription names: `{media_state: available_on_request, next_action: request_file_download, processing: {text: available_on_request, transcript: not_applicable, description: not_applicable}}` when the account has no audio profile.
 - A downloaded photo whose description is still running: `{media_state: ready, next_action: get_attachment, processing: {text: queued, transcript: not_applicable, description: queued}}`.
 
+A download that fails for good (`media_state: failed`) also commits one `attachment.failed` event on its message
+(ANYM-867). The event lists the failed files with `reason` `retry_exhausted` or `size_limit`, and every
+subscription that waits for `attachment.ready` receives it (SUBSCRIPTIONS.md, "A download that failed for good").
+
 ### Media kind and readiness filters (ANYM-661)
 
 `media_kind` is a list of `voice`, `audio`, `image`, `video`, `document`; the provider labels shown in a row's

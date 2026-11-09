@@ -19,7 +19,9 @@ from .policy import effective_permissions, lock_principal, targets
 
 EVENT_KINDS = frozenset(('message.created', 'message.edited', 'message.deleted',
     'message.status', 'attachment.ready', 'file.text.ready', 'file.transcript.ready',
-    'file.description.ready', 'file.processing.failed', 'send.failed', 'source.health'))
+    'file.description.ready', 'file.processing.failed', 'send.failed', 'source.health', 'attachment.failed'))
+# ANYM-867: a kind a selector receives without naming it, because it ends the same wait as a kind it names.
+IMPLIED_KINDS = {'attachment.failed': 'attachment.ready'}
 # ANYM-535: journal rows that name no archived message, matched by their own rule and never by default.
 FAILURE_KINDS = frozenset(('send.failed', 'source.health'))
 # A journal write the send or collector path survived, per kind, since process start.
@@ -817,6 +819,8 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
         'matched_at': event['matched_at'], 'delivered_at': delivered_at(event),
         'historical': origin in ('backfill', 'reconcile'),
         'matching_basis': 'exact_event_revision'} for event, origin in zip(events, seen)]
+    from .attachment_failures import keep_null_actions
+    keep_null_actions(items)
     # ANYM-866: each file's state as a message read shows it now. The lookup runs in a savepoint under its own lock
     # and statement timeouts (the caller's are restored after): a failure (a held lock, a slow plan, a bad row) leaves
     # the page, its receipt and the subscription row lock's holding time within the budget, without attachments,
@@ -962,7 +966,8 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                         _failure_audience(event, selected, row, p))
                 else:
                     matches = selected
-                    if matches and event['kind'] not in selector['kinds']:
+                    if matches and event['kind'] not in selector['kinds'] and (
+                            IMPLIED_KINDS.get(event['kind']) not in selector['kinds']):
                         matches, metric = False, 'left_out_kind'
                     if matches and not origin_selected(event['origin'], selector['origins']):
                         matches, metric = False, 'left_out_origin'
