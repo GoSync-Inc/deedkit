@@ -1686,43 +1686,57 @@ The change is not `production.py`'s: the tool never promotes `db` (and runs Comp
 recreates it). It is one reviewed production operation, none of it during an active call:
 
 All commands run in `/opt/personal-os-probe` with the project's files in place (they reference `./private/...`
-relative to the first file, so never run Compose on copies). `F` is `-p personal-os-probe --project-directory
-/opt/personal-os-probe` plus `-f` for each file the container names, in that order (`docker ps --filter
-name=personal-os-probe-db-1 --format '{{.Label "com.docker.compose.project.config_files"}}'`).
+relative to the first file, so never run Compose on copies). `F` is exactly `production.py`'s own Compose arguments
+for the project (`compose(project)`, scripts/production.py:490): `--profile '*' --project-name personal-os-probe
+--project-directory /opt/personal-os-probe`, `-f` for each of the project's `files` and `--env-file` for each of its
+`env_files`, in the order of the plan A configuration (`production.py`'s `active_config()`). Never the container's
+`com.docker.compose.project.config_files` label: on 2026-11-09 it named 4 of the 21 files, and a recreation from
+those 4 would drop `delivery_db` and `inference_db` (declared in `compose.delivery.yaml` and
+`compose.enrichment-mini.yaml`) and cut the dispatcher and the mini worker off the database.
 
 1. Read-only pre-check and undo record. No active call: `python3 -I -c 'import runpy;
    p=runpy.run_path("/usr/local/lib/deedkit/production.py"); print(p["active_calls"](p["config"](p["active_config"]())))'`
-   prints an empty list. Record in a dated root-only directory: the container's `com.docker.compose.config-hash` label
-   (same `docker ps --format` form), the sha256 of each file in `F`, the member list of each `personal-os-probe_*`
-   network (`docker network inspect -f '{{range .Containers}}{{.Name}} {{end}}'`) and `SHOW` of every setting above.
-   `docker compose F config --hash db` must print the recorded hash: that is the undo command's configuration, proven
-   before anything changes. Write the overlay `/opt/personal-os-probe/compose.db-settings.yaml` (0600) with only
-   `services.db.command` and `services.db.shm_size` as in `deploy/compose.yaml`. Compare without printing either
-   resolved document (Compose resolves env files into it, the database password included): a host-side `python3 -I`
-   script renders both (`F`, and `F` plus the overlay) in memory and prints only the sorted names of the db keys whose
-   values differ, which must be `command shm_size`; plus the overlay's `--hash db`.
-2. Pause autodeploy (`/etc/deedkit/autodeploy.pause` with the reason, after the unit is not active). Then take the
-   backup runner lock in a root shell that keeps it to the end, undo included: `flock --nonblock
-   /opt/personal-os-probe/backups/.runner.lock bash`. Inside it, before step 3, check under the lock (as `production.py`
-   does, ANYM-744): `personal-os-backup.service`, `deedkit-calendar-backup.service` and
-   `deedkit-calendar-backup-catchup.service` read `inactive` or `failed`, and
-   `/opt/personal-os-probe/backups/.runner.lock.unsettled` is absent. Any other answer: leave the shell, remove the
-   pause, try later. Check for an active call again.
-3. `docker compose F -f compose.db-settings.yaml up -d --no-deps db`: the `database` volume is kept, the backend
-   network and its `db` alias come back. Wait for healthy (`docker inspect --format '{{.State.Health.Status}}'`).
-   Not healthy within 2 minutes (a preload or setting refused at start): the undo below at once.
-4. Attach the networks the database joined live: `docker network connect --alias db personal-os-probe_delivery_db
-   personal-os-probe-db-1` and the same for `personal-os-probe_inference_db`; every member list equals the record.
+   prints an empty list. Record in a dated root-only directory: the sha256 of each file in `F`, the member list of each
+   `personal-os-probe_*` network (`docker network inspect -f '{{range .Containers}}{{.Name}} {{end}}'`) and `SHOW` of
+   every setting above. Prove that `F` renders the running container, without printing either side (Compose resolves
+   env files into the render, the database password included): a host-side `python3 -I` script compares the
+   running container with `docker compose F config --format json` for db, key by key (env per key, resources,
+   command, mounts, networks, labels, image, user, healthcheck), values by sha256 in memory, and prints only the
+   names of keys that differ: none, apart from the volume's name form (`database` vs `personal-os-probe_database`).
+   Then `docker compose F config --hash db` is the undo baseline (the container's own hash label may not be
+   reproducible: Compose's hash of the same service changes with the file set). Write the overlay
+   `/opt/personal-os-probe/compose.db-settings.yaml` (0600) with only `services.db.command` and
+   `services.db.shm_size` as in `deploy/compose.yaml`; the same comparison with `F` plus the overlay names only `cmd`
+   and `shm_size`; record the overlay's `--hash db`.
+2. Pause autodeploy (`/etc/deedkit/autodeploy.pause` with the reason, after the unit is not active). Then run the
+   change under the backup runner lock, undo included: `flock --nonblock /opt/personal-os-probe/backups/.runner.lock
+   <script>`. The script first checks again, under the lock (as `production.py` does, ANYM-744), that
+   `personal-os-backup.service`, `deedkit-calendar-backup.service` and `deedkit-calendar-backup-catchup.service` read
+   `inactive` or `failed`, that `/opt/personal-os-probe/backups/.runner.lock.unsettled` is absent and that no call
+   is active. Any other answer: stop, remove the pause, try later.
+3. `docker compose F -f compose.db-settings.yaml up -d --no-build --pull never --no-deps db`: the `database` volume
+   is kept and the database comes back in every network `F` declares for it, each with its `db` alias. Wait for
+   healthy (`docker inspect --format '{{.State.Health.Status}}'`). Not healthy within 2 minutes (a preload or
+   setting refused at start): the undo below at once, in the same script.
+4. Every `personal-os-probe_*` member list equals the record, apart from one-off `compose run` containers that ended
+   meanwhile (`--rm`).
 5. As the bootstrap superuser: `CREATE EXTENSION IF NOT EXISTS pg_stat_statements` in `messaging_probe`; no role gets
    a grant.
-6. Verify: `SHOW` returns the new values; `SELECT count(*) FROM pg_stat_statements` works; the api health endpoint
-   answers; the collectors' leases renew (`collector_health.heartbeat_at` moves); the matcher and delivery positions
-   advance; `pg_stat_activity` shows the service names. Then leave the lock shell and remove the pause.
+6. Verify: `SHOW` returns the new values; `SELECT count(*) FROM pg_stat_statements` works; the API answers; the
+   collectors' leases renew (`collector_leases.expires_at` moves ahead, `collector_health.receiving_heartbeat_at`
+   stays fresh); `subscription_outbox` rows are created and finished after the restart; `pg_stat_activity` shows
+   the service names; client errors stop after the restart instant (delivery lanes log `AdminShutdown` once each).
+   Then remove the pause.
 7. Watch 24 h: no OOM kill (`memory.events` `oom_kill` of the container and `docker events --filter event=oom`),
    hit ratio and temp bytes per hour before and after, and a top-20 by total time (query ids, calls, times).
 
-Undo (inside the lock shell; after it, take the lock again as in step 2): `docker compose F up -d --no-deps db`
-without the overlay; the container's config hash equals the record. Step 4 again, then remove the overlay file. The
+Applied 2026-11-09 04:27:53-04:28:02Z (healthy after 8 s; pause 04:27:45-04:30:45Z), record and scripts in
+`/root/anym842-20261109T0422Z` on the host: undo baseline `d6a514a8…`, overlay `e26841ea…`; no client container
+restarted.
+
+Undo, under the runner lock as in step 2: `docker compose F up -d --no-build --pull never --no-deps db` without the
+overlay (on 11-09: `/root/anym842-20261109T0422Z/db842.sh undo`); the hash equals the undo baseline. Step 4 again, then
+remove the overlay file. The
 extension may stay (without the preload its view only refuses reads) or `DROP EXTENSION pg_stat_statements`. The
 data stays on the volume.
 
