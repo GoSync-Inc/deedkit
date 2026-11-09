@@ -128,6 +128,20 @@ def telegram_contact(media):
     return {'status':'truncated' if cut or number_cut else 'parsed','contacts':[contact]}
 
 
+def telegram_location(media):
+    """A shared point or venue as Telegram states it (ANYM-922); a live location is only {live: true}, never its track.
+    No stated point is no block; the envelope validator drops one out of range."""
+    from telethon import types
+    if isinstance(media,types.MessageMediaGeoLive):return {'live':True}
+    geo=getattr(media,'geo',None)
+    if not isinstance(media,(types.MessageMediaGeo,types.MessageMediaVenue)) or not isinstance(geo,types.GeoPoint):return None
+    accuracy=geo.accuracy_radius
+    venue=isinstance(media,types.MessageMediaVenue)
+    return {'latitude':geo.lat,'longitude':geo.long,'accuracy_m':accuracy if type(accuracy) is int and accuracy>=0 else None,
+        'title':(contact_text(media.title)[0] or None) if venue else None,
+        'address':(contact_text(media.address)[0] or None) if venue else None,'live':False}
+
+
 def telegram_forward_origin(message):
     """Origin stated by fwd_from and the entities Telethon cached from this update; never a lookup."""
     from telethon import types,utils
@@ -220,6 +234,7 @@ def telegram_message(account,message,*,chat_title='',origin='live',verified_self
     shared=getattr(message,'media',None)
     contact=telegram_contact(shared) if isinstance(shared,types.MessageMediaContact) and contact_card_capture() else None
     preview_id=telegram_web_preview_id(shared) if web_preview_capture() else None
+    location=telegram_location(shared) if kind=='location' else None
     data={'account':account,'platform':'telegram','chat':str(message.chat_id),
         'chat_title':(chat_title if chat_title and chat_title!=str(message.chat_id) else observed_title) or str(message.chat_id),
         'provider_id':str(message.id),
@@ -244,6 +259,7 @@ def telegram_message(account,message,*,chat_title='',origin='live',verified_self
             **({'forward_origin':forward} if forward else {}),
             **({'contact':contact} if contact else {}),
             **({'web_preview_id':preview_id} if preview_id else {}),
+            **({'location':location} if location else {}),
             # Only a stated flag is captured; an absent one is unknown, never "not verified".
             **({'sender_is_business_or_verified':True} if provider_flags_capture() and isinstance(entity,types.User)
                 and (getattr(entity,'verified',None) is True or getattr(entity,'support',None) is True) else {}),
@@ -306,6 +322,8 @@ def whatsapp_message(account,event,*,origin='live',change='message',observed_at=
         from .polls import poll_block
         try:poll=poll_block(poll)
         except ValueError:poll=None
+    # A shared place (ANYM-922, whatsmeow capture.go); validate() drops a block it cannot accept, never the message.
+    location=event.get('location') if kind=='location' and change!='delete' else None
     return validate({'account':account,'platform':'whatsapp','chat':event['chatId'],
         'chat_title':display_text(event.get('chatName'),512) or event['chatId'],'provider_id':event['messageId'],
         'sender':event.get('senderId') or '','body':body,
@@ -328,5 +346,6 @@ def whatsapp_message(account,event,*,origin='live',change='message',observed_at=
                     **({'contact':contact} if contact is not None else {}),
                     **({'group_change':group} if group is not None else {}),
                     **({'poll':poll} if poll is not None else {}),
+                    **({'location':location} if location is not None else {}),
                     **({'sender_is_business_or_verified':True} if event.get('senderIsBusiness') is True else {}),
                     'media_kind':event.get('mediaKind')}})

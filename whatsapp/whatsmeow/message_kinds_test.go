@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -498,6 +500,134 @@ func journalKinds(t *testing.T, s *CaptureStore) []map[string]any {
 }
 
 func pollOptionHash(name string) []byte { return whatsmeow.HashPollOptions([]string{name})[0] }
+
+// spec: ANYM-922
+func TestNativeLocationKeepsItsPointTitleAndAddressAndALiveOneOnlyTheFact(t *testing.T) {
+	owner := types.NewJID("123456", types.DefaultUserServer)
+	v, err := NormalizeMessage(groupFixture("LOC1", &waE2E.Message{LocationMessage: &waE2E.LocationMessage{
+		DegreesLatitude: proto.Float64(55.75582612), DegreesLongitude: proto.Float64(37.6173), AccuracyInMeters: proto.Uint32(20),
+		Name: proto.String("Парк"), Address: proto.String(strings.Repeat("я", 300)), URL: proto.String("https://example.invalid/p")}}), owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireFields(t, v, map[string]any{"messageType": "location", "body": "Парк"})
+	block := v["location"].(map[string]any)
+	if block["latitude"] != 55.75582612 || block["longitude"] != 37.6173 || block["accuracy_m"] != uint32(20) || block["title"] != "Парк" ||
+		utf8.RuneCountInString(block["address"].(string)) != 256 || block["live"] != false || len(block) != 6 {
+		t.Fatalf("point: %#v", block)
+	}
+	// No name, address or accuracy stated: null, never guessed.
+	v, _ = NormalizeMessage(groupFixture("LOC2", &waE2E.Message{LocationMessage: &waE2E.LocationMessage{
+		DegreesLatitude: proto.Float64(-33.9), DegreesLongitude: proto.Float64(151.2)}}), owner)
+	if data, _ := json.Marshal(v["location"]); string(data) != `{"accuracy_m":null,"address":null,"latitude":-33.9,"live":false,"longitude":151.2,"title":null}` {
+		t.Fatal(string(data))
+	}
+	// JSON cannot carry NaN: the coordinate is null (the archive drops the block) and the message is still journaled.
+	v, err = NormalizeMessage(groupFixture("LOCNAN", &waE2E.Message{LocationMessage: &waE2E.LocationMessage{
+		DegreesLatitude: proto.Float64(math.NaN()), DegreesLongitude: proto.Float64(math.Inf(1)), Name: proto.String("Парк")}}), owner)
+	if err != nil || v["location"].(map[string]any)["latitude"] != nil || v["location"].(map[string]any)["longitude"] != nil {
+		t.Fatal(err, v["location"])
+	}
+	requireFields(t, v, map[string]any{"messageType": "location", "body": "Парк"})
+	// A live location, in either form, is only the fact that it was shared: no point of the track.
+	for name, m := range map[string]*waE2E.Message{
+		"live": {LiveLocationMessage: &waE2E.LiveLocationMessage{DegreesLatitude: proto.Float64(55.7), DegreesLongitude: proto.Float64(37.6),
+			Caption: proto.String("иду"), SequenceNumber: proto.Int64(1)}},
+		"flagged": {LocationMessage: &waE2E.LocationMessage{DegreesLatitude: proto.Float64(55.7), DegreesLongitude: proto.Float64(37.6), IsLive: proto.Bool(true)}},
+	} {
+		v, err := NormalizeMessage(groupFixture("LIVE"+name, m), owner)
+		if err != nil {
+			t.Fatal(name, err)
+		}
+		requireFields(t, v, map[string]any{"messageType": "location"})
+		data, _ := json.Marshal(v)
+		if loc, _ := json.Marshal(v["location"]); string(loc) != `{"live":true}` || strings.Contains(string(data), "55.7") || strings.Contains(string(data), "37.6") {
+			t.Fatal(name, string(data))
+		}
+	}
+	// A later position of the same share is the same envelope (no new row, no new revision);
+	// one sent to WhatsApp's location broadcast is no chat message at all.
+	update := func(seq int64, lat float64, chat types.JID) *events.Message {
+		e := groupFixture("LIVE1", &waE2E.Message{LiveLocationMessage: &waE2E.LiveLocationMessage{DegreesLatitude: proto.Float64(lat),
+			DegreesLongitude: proto.Float64(37.6), Caption: proto.String("иду"), SequenceNumber: proto.Int64(seq)}})
+		e.Info.Chat = chat
+		return e
+	}
+	group := types.NewJID("120363000000000001", types.GroupServer)
+	first, _ := NormalizeMessage(update(1, 55.70, group), owner)
+	later, _ := NormalizeMessage(update(9, 55.79, group), owner)
+	if first["body"] != later["body"] || fmt.Sprint(first["location"]) != fmt.Sprint(later["location"]) || first["messageId"] != later["messageId"] {
+		t.Fatalf("live update changed the envelope: %#v %#v", first, later)
+	}
+	if _, err := NormalizeMessage(update(10, 55.80, types.NewJID("location", types.BroadcastServer)), owner); err == nil || err.Error() != "unsupported_chat" {
+		t.Fatal("location broadcast captured", err)
+	}
+	if v, _ := NormalizeMessage(fixtureMessage("TEXT", 1700000000), owner); v["location"] != nil {
+		t.Fatal("location block on a text message")
+	}
+}
+
+// spec: ANYM-922
+func TestNativeLiveLocationLeavesNoTrackInTheJournalAndItsMovesAddNoRow(t *testing.T) {
+	s := openTestStore(t)
+	le := func(f float64) []byte {
+		b := make([]byte, 8)
+		binary.LittleEndian.PutUint64(b, math.Float64bits(f))
+		return b
+	}
+	forms := map[string]func(lat float64, seq int64) *waE2E.Message{
+		"live": func(lat float64, seq int64) *waE2E.Message {
+			return &waE2E.Message{LiveLocationMessage: &waE2E.LiveLocationMessage{DegreesLatitude: proto.Float64(lat), DegreesLongitude: proto.Float64(37.6123),
+				AccuracyInMeters: proto.Uint32(uint32(seq)), SpeedInMps: proto.Float32(1.5), Caption: proto.String("иду"), SequenceNumber: proto.Int64(seq), JPEGThumbnail: le(lat)}}
+		},
+		"flagged": func(lat float64, seq int64) *waE2E.Message {
+			return &waE2E.Message{LocationMessage: &waE2E.LocationMessage{DegreesLatitude: proto.Float64(lat), DegreesLongitude: proto.Float64(37.6123),
+				AccuracyInMeters: proto.Uint32(uint32(seq)), Name: proto.String("иду"), IsLive: proto.Bool(true), JPEGThumbnail: le(lat)}}
+		},
+	}
+	for name, form := range forms {
+		id := "LIVE" + strings.ToUpper(name)
+		var lats []float64
+		var last *events.Message
+		for n := range 10 {
+			lat := 55.7001 + float64(n)/997
+			lats = append(lats, lat)
+			inner := form(lat, int64(n+1))
+			// Wrapped on the wire and in the history copy, as whatsmeow delivers an ephemeral chat's message.
+			wrapped := &waE2E.Message{EphemeralMessage: &waE2E.FutureProofMessage{Message: inner}}
+			last = groupFixture(id, inner)
+			last.RawMessage = wrapped
+			last.SourceWebMsg = &waWeb.WebMessageInfo{Key: &waCommon.MessageKey{RemoteJID: proto.String("120363000000000001@g.us"), ID: proto.String(id)},
+				MessageTimestamp: proto.Uint64(1700000000), Message: proto.Clone(wrapped).(*waE2E.Message)}
+			if err := s.Put(last, "live"); err != nil {
+				t.Fatal(name, n, err)
+			}
+		}
+		if last.Message.GetLiveLocationMessage().GetDegreesLatitude()+last.Message.GetLocationMessage().GetDegreesLatitude() != lats[9] {
+			t.Fatal(name, "the caller's event was changed")
+		}
+		var rows int
+		var stored []byte
+		s.db.QueryRow("SELECT COUNT(*), MAX(raw) FROM capture WHERE message_id LIKE ?", "%"+id+"%").Scan(&rows, &stored)
+		if rows != 1 {
+			t.Fatalf("%s: %d journal rows for ten moves", name, rows)
+		}
+		saved, err := unmarshalMessage(stored)
+		if err != nil || saved.SourceWebMsg == nil || saved.RawMessage.GetEphemeralMessage() == nil {
+			t.Fatal(name, err)
+		}
+		wire, _ := proto.Marshal(saved.RawMessage)
+		web, _ := proto.Marshal(saved.SourceWebMsg)
+		for _, lat := range append(lats, 37.6123) {
+			if bytes.Contains(wire, le(lat)) || bytes.Contains(web, le(lat)) {
+				t.Fatalf("%s: a position %v is in the journal", name, lat)
+			}
+		}
+		if got := saved.Message.GetLiveLocationMessage().GetCaption() + saved.Message.GetLocationMessage().GetName(); got != "иду" {
+			t.Fatalf("%s: caption %q", name, got)
+		}
+	}
+}
 
 // spec: ANYM-921
 func TestNativePollCreationKeepsItsOptionsAndSelectableCount(t *testing.T) {

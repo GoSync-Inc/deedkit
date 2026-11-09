@@ -477,6 +477,32 @@ def test_confirmed_edit_hand_off_becomes_one_next_revision(worker,order):
         assert c.execute("SELECT count(*) AS n FROM message_conflicts").fetchone()['n']==0
 
 
+# spec: ANYM-922
+def test_a_telegram_live_location_is_kept_as_the_fact_and_its_moves_make_no_revision(worker):
+    from telethon import types
+    w,s,key=worker
+    def live(lat,edited=None):
+        m=message(9,edited=edited)
+        m.media=types.MessageMediaGeoLive(geo=types.GeoPoint(long=37.6,lat=lat,access_hash=1,accuracy_radius=5),period=900)
+        return m
+    asyncio.run(w.capture(NS(message=live(55.70))))
+    assert drained(w)==['created']
+    for n in range(10):
+        asyncio.run(w.capture(NS(message=live(55.71+n/1000,edited=datetime(2026,10,1,12,n+1,tzinfo=timezone.utc)))))
+    assert all(outcome in ('duplicate','unchanged') for outcome in drained(w))
+    mid=stable_id('msg',w.account,'100','9')
+    with s.pool.connection() as c:
+        assert c.execute('SELECT revision FROM messages WHERE id=%s',(mid,)).fetchone()['revision']==1
+        assert c.execute('SELECT count(*) AS n FROM message_revisions WHERE message=%s',(mid,)).fetchone()['n']==1
+        stored=c.execute('SELECT metadata FROM message_metadata WHERE message=%s',(mid,)).fetchone()['metadata']
+    # Only the fact that it was shared: no point of the track is anywhere in the archive.
+    assert stored['message_kind']=='location' and stored['location']=={'live':True}
+    with s.pool.connection() as c:
+        dump=json.dumps([r['snapshot'] for r in c.execute('SELECT snapshot FROM message_revisions WHERE message=%s',(mid,))])
+        dump+=json.dumps([r['snapshot'] for r in c.execute('SELECT snapshot FROM events WHERE message=%s',(mid,))])
+    assert '55.7' not in dump and '37.6' not in dump
+
+
 # spec: ANYM-755
 def test_a_confirmed_formatted_edit_archives_its_formatting_with_the_next_revision(worker):
     from telethon import types
@@ -1293,6 +1319,42 @@ def test_message_reads_show_a_whatsapp_polls_counts_voters_and_the_owners_choice
     from messaging_service.store import APIError
     with pytest.raises(APIError):store.get_context(other,mid)
     assert store.search(other,'субботу')['items']==[]
+
+
+# spec: ANYM-922
+def test_message_reads_return_a_shared_whatsapp_location_and_never_its_live_track(wa_groups):
+    state,store,key=wa_groups
+    point={'latitude':55.755826,'longitude':37.6173,'accuracy_m':None,'title':'Парк Синтетик','address':'ул. Тестовая 1','live':False}
+    shared=wa_capture('false_'+WA_GROUP+'_LOC1_444444@c.us',1700000000,body='Парк Синтетик',kind='location',actor='444444@c.us')
+    shared['event'].update(location=point,isService=False)
+    live=wa_capture('false_'+WA_GROUP+'_LOC2_444444@c.us',1700000010,body='иду',kind='location',actor='444444@c.us')
+    live['event'].update(location={'live':True},isService=False)
+    state.apply(wa_capture('false_'+WA_GROUP+'_HI_555555@c.us',1700000020,body='Парк Синтетик рядом',actor='555555@c.us'))
+    subscription=store.create_subscription(key,[stable_id('chat','wa-groups',WA_GROUP)])['subscription_id']
+    state.apply(shared);state.apply(live)
+    chat_id=stable_id('chat','wa-groups',WA_GROUP)
+    mid,lid=(stable_id('msg','wa-groups',WA_GROUP,'false_'+WA_GROUP+f'_LOC{n}_444444@c.us') for n in (1,2))
+    reads={'archive':store.get_messages(key,chat_id)['items'],'conversation':store.get_messages(key,chat_id,view='conversation')['items'],
+        'search':store.search(key,'Синтетик',chat=chat_id)['items'],'context':[store.get_context(key,mid)['message']]}
+    for name,items in reads.items():
+        assert next(i for i in items if i['id']==mid)['location']==point,name
+        assert all('location' not in i for i in items if i['id'] not in (mid,lid)),name
+    assert next(i for i in reads['archive'] if i['id']==lid)['location']=={'live':True}
+    # Subscription references carry IDs and kinds, never the place.
+    from messaging_service.subscriptions import match_subscriptions
+    match_subscriptions(store)
+    references=store.get_subscription_events(key,subscription,limit=100)['items']
+    assert len(references)>=2 and '55.75' not in json.dumps(references,default=str,ensure_ascii=False) and 'Тестовая' not in json.dumps(references,default=str,ensure_ascii=False)
+    # A deleted message keeps no place.
+    gone=wa_capture('false_'+WA_GROUP+'_LOC1_444444@c.us',1700000000,kind='location',actor='444444@c.us')
+    gone['event']['isService']=False;gone.update(change='delete');state.apply(gone)
+    assert 'location' not in store.get_context(key,mid)['message']
+    # A key without read on the chat gets nothing.
+    Archive(store).register('wa-other','whatsapp','Synthetic other',discover=True)
+    other=store.issue_key('wa-other-reader',['wa-other'],permissions=['read'],key_permissions=['read'])
+    from messaging_service.store import APIError
+    with pytest.raises(APIError):store.get_context(other,lid)
+    assert store.search(other,'Синтетик')['items']==[]
 
 
 # spec: ANYM-921

@@ -437,8 +437,8 @@ class Archive:
                 e={**e,'deleted':True,'body':'','media':[],
                    'updated_at':max(tombstone,datetime.fromisoformat(e['updated_at'])).isoformat()}
                 if 'formatting' in e:e['formatting']=unknown_formatting()
-                if 'contact' in e.get('metadata',{}) or 'buttons' in e.get('metadata',{}):
-                    e['metadata']={k:v for k,v in e['metadata'].items() if k not in ('contact','buttons')}
+                if {'contact','buttons','location'}&set(e.get('metadata',{})):
+                    e['metadata']={k:v for k,v in e['metadata'].items() if k not in ('contact','buttons','location')}
             if (identity_observations and not e['deleted']
                     and c.execute('SELECT 1 FROM messages WHERE id=%s AND NOT deleted',(mid,)).fetchone()):
                 # A capture's identity evidence that contradicts a recorded pair is kept as a fence

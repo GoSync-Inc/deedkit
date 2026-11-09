@@ -364,6 +364,7 @@ func personalUser(user string) bool {
 	}
 	return true
 }
+
 func NormalizeMessage(e *events.Message, owner types.JID, ownerAliases ...types.JID) (map[string]any, error) {
 	if e == nil || e.Info.ID == "" || len(e.Info.ID) > 120 || e.Info.Timestamp.Unix() <= 0 || e.Info.Timestamp.Unix() > maxEnvelopeUnix {
 		return nil, errors.New("invalid_provider_message")
@@ -380,7 +381,7 @@ func NormalizeMessage(e *events.Message, owner types.JID, ownerAliases ...types.
 	m := e.Message
 	body, kind, media := "", "unknown", ""
 	var filename, mime, size, duration, reply, mentions, replyOwner, forwarded, edited any
-	var forwardOrigin, contactCard, poll map[string]any
+	var forwardOrigin, contactCard, poll, location map[string]any
 	if e.IsEdit && e.Info.MsgBotInfo.EditSenderTimestampMS.UnixMilli() > 0 {
 		edited = envelopeEditStamp(e.Info.MsgBotInfo.EditSenderTimestampMS.UnixMilli(), e.Info.Timestamp.Unix())
 	}
@@ -468,9 +469,8 @@ func NormalizeMessage(e *events.Message, owner types.JID, ownerAliases ...types.
 				}
 				contactCard = contactBlock(cards)
 			}
-		case m.GetLocationMessage() != nil:
-			kind = "location"
-			body = m.GetLocationMessage().GetName()
+		case m.GetLocationMessage() != nil, m.GetLiveLocationMessage() != nil: // a point, never a live track (ANYM-922, location.go)
+			kind, body, location = sharedLocation(m)
 		case pollCreation(m) != nil: // V1-V3 keep their options (ANYM-921, polls.go)
 			kind, body, poll = "poll_creation", pollCreation(m).GetName(), pollBlock(pollCreation(m))
 		// Business messages keep their visible text; header media is not fetched.
@@ -601,9 +601,7 @@ func NormalizeMessage(e *events.Message, owner types.JID, ownerAliases ...types.
 	if contactCard != nil {
 		value["contactCard"] = contactCard
 	}
-	if poll != nil {
-		value["poll"] = poll
-	}
+	withBlocks(value, map[string]map[string]any{"poll": poll, "location": location})
 	// Only a stated certificate is captured; no VerifiedName is unknown, never "not a business".
 	if providerFlagsCapture() && !e.Info.IsFromMe && e.Info.VerifiedName != nil {
 		value["senderIsBusiness"] = true
