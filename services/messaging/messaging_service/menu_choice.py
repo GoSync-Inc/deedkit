@@ -99,7 +99,7 @@ def options(body):
 
 
 def column_present(c):
-    """True when outgoing_messages has the menu_choice column (schema 70+); a plain send never asks."""
+    """True when outgoing_messages has the menu_choice column (schema 71+); a plain send never asks."""
     return c.execute('''SELECT 1 FROM pg_attribute WHERE attrelid='outgoing_messages'::regclass
         AND attname='menu_choice' AND NOT attisdropped''').fetchone() is not None
 

@@ -491,7 +491,7 @@ def test_upgrade_and_rollback_keep_feed_order_and_cursors(schema36_store, monkey
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '70'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '71'
         assert c.execute('SELECT * FROM archive_migrations WHERE version<=36 ORDER BY version').fetchall() == migrations
     assert feed_state(store) == before
     try:
@@ -901,7 +901,9 @@ def test_activity_grants_add_only_the_new_table_to_each_role(seeded, template, b
     try:
         before, after = role_grants(store, previous), role_grants(store, role)
         # Existing ACLs are unchanged; the only addition is this table, with exactly the named privileges.
-        assert {grant for grant in after if grant[0] != 'subscription_activity'} == before
+        # A later schema's block (71, ANYM-837: the gateway's INSERT of outgoing_messages.menu_choice) is not this one's.
+        later = {('outgoing_messages', 'menu_choice', 'INSERT')} if base == 'messaging_gateway' else set()
+        assert {grant for grant in after if grant[0] != 'subscription_activity'} - later == before
         assert {grant[2] for grant in after if grant[0] == 'subscription_activity' and grant[1] == ''} == added
         token = store.issue_key('activity-acl', ['telegram-demo'], permissions=['read', 'subscription-write'],
             key_permissions=['read', 'subscription-write'])

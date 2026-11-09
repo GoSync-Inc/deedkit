@@ -348,7 +348,7 @@ def test_the_base_commits_dispatch_and_send_text_refuse_a_menu_row_with_no_adapt
 def test_a_database_without_the_column_queues_nothing_and_plain_sends_and_purges_still_work(native):
     s, _, _, key = native
     digest = preview(s, key)['preview_digest']
-    migration = (ROOT / 'services/messaging/messaging_service/migrations/070_menu_choice.sql').read_text()
+    migration = (ROOT / 'services/messaging/messaging_service/migrations/071_menu_choice.sql').read_text()
     with s.pool.connection() as c:c.execute('ALTER TABLE outgoing_messages DROP COLUMN menu_choice')
     try:
         failure = refused(lambda: send(s, key, digest=digest))
@@ -416,16 +416,16 @@ def test_an_inexact_or_native_flow_id_is_shown_but_never_choosable(native):
 
 
 # spec: ANYM-837
-def test_migration_070_and_its_grant_qualify_for_the_unattended_release():
+def test_migration_071_and_its_grant_qualify_for_the_unattended_release():
     import subprocess
     from messaging_service.migration_rollout import new_tables, role_class, unattended_class
     source = ROOT / 'services/messaging/messaging_service'
-    text = (source / 'migrations/070_menu_choice.sql').read_text()
+    text = (source / 'migrations/071_menu_choice.sql').read_text()
     # production.py's unattended plan runs unattended_class per added file and role_class per changed role file.
     assert unattended_class(text, {'outgoing_messages'}) == 'expand'
     base = subprocess.run(['git', 'show', 'origin/main:services/messaging/messaging_service/gateway_role.sql'],
         cwd=ROOT, capture_output=True, text=True)
-    old = base.stdout if base.returncode == 0 else (source / 'gateway_role.sql').read_text().rsplit('-- Schema 70', 1)[0]
+    old = base.stdout if base.returncode == 0 else (source / 'gateway_role.sql').read_text().rsplit('-- Schema 71', 1)[0]
     current = (source / 'gateway_role.sql').read_text()
     assert current.startswith(old) and role_class(old, current, new_tables(text, {})) == 'additive'
 

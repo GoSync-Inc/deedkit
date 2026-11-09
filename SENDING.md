@@ -410,7 +410,7 @@ Honest scope: this is not exactly-once delivery. Changed text, another chat or r
 child steps are not covered. Against a messaging service from before this change a call with
 `allow_duplicate` fails closed (`invalid_parameters`, `unknown_field`); one without it works as before.
 
-### Menu choices: answering a WhatsApp bot menu (`menu_choice`, ANYM-837, schema 70)
+### Menu choices: answering a WhatsApp bot menu (`menu_choice`, ANYM-837, schema 71)
 
 Many WhatsApp bots act only on the structured reply a phone sends when the user taps a menu option; a
 text reply sends them back to their menu. A menu is archived with numbered options and their IDs
