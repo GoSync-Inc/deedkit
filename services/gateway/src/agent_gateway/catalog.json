@@ -2917,7 +2917,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Discover implemented operations and your account/key permissions.\n\nUnsupported provider operations are omitted. Passive archive/policy read;\nno provider request. Inspect conditional support,\nlimitations, target, full-account requirements and permission before planning.\nCatalog presence does not grant access or prove current provider acceptance.\nExisting keys gain no new roles. No arbitrary provider method or raw API payload.\n",
+    "description": "Discover implemented operations and your account/key permissions.\n\nUnsupported provider operations are omitted. Passive archive/policy read;\nno provider request. Inspect conditional support,\nlimitations, target, full-account requirements and permission before planning.\nCatalog presence does not grant access or prove current provider acceptance.\nExisting keys gain no new roles. No arbitrary provider method or raw API payload.\nitems lists the operations granted to you. not_granted lists implemented operations you are not granted,\neach with missing: profile_action, principal_action, gateway_scope:<scope> or backend_permission:<scope>.\nSuch an operation exists: do not report a missing feature; ask the owner for the named grant, e.g.\n\"grant groups-manage and the create_group action to this key\".\n",
     "inputSchema": {
       "properties": {
         "account": {

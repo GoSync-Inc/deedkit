@@ -91,7 +91,18 @@ requires `download`. A send-only key cannot export content it cannot read.
 
 1. Discover the account catalog and resolve permitted **archive IDs**. Do not
    replace them with arbitrary provider IDs. Message actions use the current
-   `message_id` and its exact `expected_revision`.
+   `message_id` and its exact `expected_revision`. Through the gateway,
+   `list_messenger_operations` keeps `items` to the operations you are granted and
+   adds `not_granted: [{operation, missing}]` for every implemented operation you
+   are not (ANYM-846). `missing` names each layer that withholds it:
+   `profile_action` and `principal_action` (the operation is not in that
+   `actions.messenger_operations` list), `gateway_scope:<scope>` (the principal's
+   gateway messaging grants lack the scope) and `backend_permission:<scope>` (the
+   backend key lacks it). Such an operation exists: do not report a missing
+   feature. Ask the owner for the named grant, for example "grant groups-manage
+   and the create_group action to key codex-live". The list grants nothing:
+   discovery, preview, execute and receipts stay denied until the grant is made.
+   Account opt-in and full-account scope stay in the backend's `available`.
 2. Call `preview_messenger_operation` with the exact operation and `parameters`.
    Preview validates against archived evidence and policy without making a live
    provider call or creating a command.
