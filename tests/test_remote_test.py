@@ -509,7 +509,7 @@ def test_the_root_suite_gets_a_postgres_on_localhost_and_a_private_dsn_file(mini
     assert 'skipped: needs docker (CI covers)' in result.stderr
 
 
-# spec: ANYM-638
+# spec: ANYM-639
 def test_the_local_lane_runs_here_with_no_ssh_or_sudo_and_a_ci_postgres_container(local, worktree):
     home, env = local
     result = remote(env, worktree, 'root', 'tests/test_app.py')
@@ -534,7 +534,7 @@ def test_the_local_lane_runs_here_with_no_ssh_or_sudo_and_a_ci_postgres_containe
     assert not (home / 'service' / 'deedkit-ci').exists()
 
 
-# spec: ANYM-638
+# spec: ANYM-639
 def test_the_local_lane_without_docker_running_exits_92_and_ci_covers(local, worktree):
     home, env = local
     result = remote(env, worktree, 'root', 'tests/test_app.py', FAKE_DOCKER_DOWN='1')
@@ -543,7 +543,7 @@ def test_the_local_lane_without_docker_running_exits_92_and_ci_covers(local, wor
     assert not log_lines(home, 'docker run') and not log_lines(home, 'uv ')
 
 
-# spec: ANYM-638
+# spec: ANYM-639
 def test_a_killed_local_runner_leaves_no_database_container_behind(local, worktree):
     home, env = local
     process = background(env, worktree, 'root', 'tests/test_app.py', FAKE_UV_SLEEP='60')
@@ -557,7 +557,7 @@ def test_a_killed_local_runner_leaves_no_database_container_behind(local, worktr
     assert not alive(pid_of(log_lines(home, 'uv run pytest')[0]))
 
 
-# spec: ANYM-638
+# spec: ANYM-639
 def test_the_local_lane_runs_two_suites_at_once_by_default(local, worktree):
     home, env = local
     first = background(env, worktree, 'root', 'tests/test_app.py', FAKE_UV_SLEEP='5', DEEDKIT_REMOTE_WORKER='lane_a')
@@ -569,7 +569,7 @@ def test_the_local_lane_runs_two_suites_at_once_by_default(local, worktree):
     assert len(log_lines(home, 'docker run')) == 2
 
 
-# spec: ANYM-638
+# spec: ANYM-639
 def test_a_run_takes_the_next_test_host_only_when_one_is_down_or_not_set_up(local, worktree):
     home, env = local
     env = {k: v for k, v in env.items() if k != 'DEEDKIT_REMOTE_HOST'}
@@ -591,7 +591,7 @@ def test_a_run_takes_the_next_test_host_only_when_one_is_down_or_not_set_up(loca
     assert 'trying the next test host' not in busy.stderr and len(log_lines(home, 'postgres -D')) == 1
 
 
-# spec: ANYM-638
+# spec: ANYM-639
 def test_cleanup_and_load_reach_every_test_host_and_skip_one_that_is_down(local, worktree):
     home, env = local
     env = {k: v for k, v in env.items() if k != 'DEEDKIT_REMOTE_HOST'}
@@ -610,7 +610,7 @@ def test_cleanup_and_load_reach_every_test_host_and_skip_one_that_is_down(local,
     assert not (home / 'local' / 'shared' / 'stage' / WORKER).exists()
 
 
-# spec: ANYM-638
+# spec: ANYM-639
 def test_a_worktree_that_fails_to_stage_sends_nothing_and_runs_no_suite(mini, worktree):
     home, env = mini
     # The laptop's own tar fails to pack (a file vanished, say); the runner's PATH keeps the real one.
@@ -622,7 +622,7 @@ def test_a_worktree_that_fails_to_stage_sends_nothing_and_runs_no_suite(mini, wo
     assert not log_lines(home, 'uv ')
 
 
-# spec: ANYM-638
+# spec: ANYM-639
 def test_a_stage_removal_that_fails_on_one_host_still_cleans_the_next(local, worktree):
     home, env = local
     env = {k: v for k, v in env.items() if k != 'DEEDKIT_REMOTE_HOST'}
@@ -633,7 +633,7 @@ def test_a_stage_removal_that_fails_on_one_host_still_cleans_the_next(local, wor
     assert not (home / 'local' / 'ci' / WORKER).exists() and not (home / 'local' / 'shared' / 'stage' / WORKER).exists()
 
 
-# spec: ANYM-638
+# spec: ANYM-639
 def test_a_local_run_keeps_its_record_while_docker_cannot_say_the_container_is_gone(local, worktree):
     home, env = local
     process = background(env, worktree, 'root', 'tests/test_app.py', FAKE_UV_SLEEP='3')
