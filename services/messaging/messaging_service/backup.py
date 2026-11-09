@@ -95,7 +95,7 @@ V83_TABLES={'poll_results':'message,option_index','poll_voters':'message,voter,o
 # ANYM-920: a Telegram poll's ID, option keys, Telegram's total, the owner's choice, the voter-list read time and the
 # voters' display names (no message text).
 V84_TABLES={'telegram_polls':'message'}
-SCHEMAS=range(2,85)
+SCHEMAS=range(2,86)
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
 V17_TABLES={'message_conflicts':'receipt_digest'}

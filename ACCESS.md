@@ -27,6 +27,7 @@ pasted into conversations or saved in tracked Git files.
 | `feedback-write` together with `read` | A local private feedback record with verified source references; no external sending |
 | `delivery-write` together with `read` | Registering, listing, changing, testing and deleting the key's own webhook endpoints inside the operator's host policy, and binding them to own subscriptions (ANYM-519); registering, listing, changing, confirming and deleting the key's own chat wake targets (ANYM-848, SUBSCRIPTIONS.md "Wake targets") |
 | `bot-press` | Pressing one inline callback button of a Telegram bot message after the owner's exact confirmation (`press_button`, ANYM-676; MESSENGER_OPERATIONS.md "Pressing a bot's inline button"); not inherited by existing keys, needs the account opt-in |
+| `groups-moderate` | Deleting other people's messages in a Telegram group, discussion group or channel after the owner's exact confirmation (`delete_member_messages`, ANYM-934; MESSENGER_OPERATIONS.md "Moderation"); not inherited by existing keys, needs the account opt-in |
 | `capabilities` | Available to any valid key, including one without operational permissions |
 
 A chat the account joins later (`join_chat`, ANYM-243) is visible to no existing

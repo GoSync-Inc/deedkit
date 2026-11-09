@@ -61,6 +61,7 @@ python -m messaging_service set-messenger-operations --account account-demo --op
 | `read-state` | Explicit provider mark-read / mark-unread |
 | `chat-manage` | Archive, mute and provider-specific chat pins, stars and labels |
 | `groups-read` / `groups-manage` | Participants/topics / group and membership changes |
+| `groups-moderate` | Deleting other people's messages in a Telegram group, discussion group or channel (`delete_member_messages`, ANYM-934; "Moderation" below): a destructive live action toward other people in the owner's name, never inherited by an existing key |
 | `contacts-read` / `contacts-manage` | Contact/blocked lists / contact and block changes |
 | `profile-read` / `profile-manage` | Read / update allowed account profile fields |
 
@@ -442,6 +443,61 @@ the chat title, and are not logged. `preview_message`, `send_message` and
 
 ```sh
 python -m messaging_service set-messenger-operations --account telegram-demo --operations send_file open_chat_by_username
+```
+
+## Moderation
+
+Moderation acts on other people in the owner's name and cannot be undone: each call is destructive, needs the
+owner's exact confirmation of that call (the preview), acts on at most the targets it lists and is never retried
+when its outcome is unknown. It is Telegram only; on WhatsApp the operation answers `moderation_unsupported`.
+
+### Deleting other people's messages (ANYM-934)
+
+`delete_member_messages` deletes for everyone 1-20 archived messages of other people in one chat (`chat_id`):
+`parameters` are `message_ids` (archive message IDs from `get_messages` or search) and `expected_revisions` (each
+message's current archive revision, in the same order). Only archived messages can be targeted; own messages keep
+using `delete_message`. It needs the key permission `groups-moderate` (with `read`, because the preview shows the
+messages) and the account opt-in.
+
+The owner must be the chat's creator, an admin with the `delete_messages` right in a supergroup, discussion group or
+channel, or an admin of a basic group. Without the right the operation fails with `missing_admin_right` and
+`evidence.missing_right: "delete_messages"`; a non-admin gets `not_admin`; nothing is deleted either way. An admin
+whom the owner may not override is demoted in the Telegram app first.
+
+Comments under a channel post are messages of the channel's linked discussion group, a chat of its own: that group
+must be a collected chat for its messages to be targeted. A channel's `chat_id` with a comment's message ID is
+refused with `message_from_other_chat`, and the refusal's `other_chats` names that message's chat ID and type, so the
+agent repeats the call on the discussion group.
+
+The preview (`preview_messenger_operation`) states the chat type (`channel`, `discussion group of <channel>`,
+`supergroup` or `basic group`; from the archive) and lists each message with its sender's display name, username if
+any and archive sender ID, its time, kind and first 200 characters, the count, and the line "the archive copy is
+purged as well". Names and text are untrusted provider data. `preview_digest` binds the message IDs and their
+revisions: a message edited since its revision refuses with `operation_target_changed`.
+
+Refusals name each bad item in `field_errors` (`message_ids/<n>`): `message_not_found` (unknown, deleted or not
+readable by the key), `message_from_other_chat`, `own_message`, `unique` (a repeated ID); more than 20 is
+`max_items` on `message_ids`, so split the call; `chat_not_collected` on `chat_id` when the collection policy excludes
+the chat. An `expected_revisions` list of another length is `min_items`/`max_items` on that field.
+
+Execution sends one `delete_messages(..., revoke=True)` request for the listed IDs, then one read-back of the same
+IDs (as `delete_message`, ANYM-666). The receipt's `result.data.results` has one row per message: `deleted` (the
+read-back finds no message), `failed` (Telegram refused the request, or the message is still there:
+`evidence.message_present: true`) or `unknown`; `deleted` counts them. A flood wait before the request was sent is
+`failed` with `evidence.retry_after_s` (safe to repeat after the wait); a flood wait after it, or any other
+uncertain answer, is `unknown` (check the chat with `get_message_info` first, never repeat blindly).
+
+Each deletion the read-back confirms goes through the archive's provider-deletion path
+([docs/DATA-POLICY.md](docs/DATA-POLICY.md), Deletion): the message's content, file names and derived text are
+purged within minutes and a content-free tombstone stays. This is the service-run deletion the card names.
+
+The operation ships opted out. Enabling it is one owner confirmation for the agent key's `groups-moderate`
+permission and the account opt-in; the moderation feature's ban story documents the command sequence for all three
+moderation operations. For one key and account (`--permissions` is the key's whole list: keep its other permissions):
+
+```sh
+python -m messaging_service set-key-permissions --key-id <credential-uuid> --permissions read read-live groups-moderate
+python -m messaging_service set-messenger-operations --account telegram-demo --operations delete_member_messages
 ```
 
 ## Group restrictions and join requests

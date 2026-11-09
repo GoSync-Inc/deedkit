@@ -97,6 +97,17 @@ CONTACTS_QUERY_LIMITATION = ('Telegram: one call per account reads the whole con
 LIVE_CHAT_TYPES = ('private', 'group', 'channel')
 LIVE_FILTERS = ('documents', 'photos', 'links', 'voice')
 BATCH_LIMITATION = ('One row per ID: applied, refused, unknown or not_attempted; an uncertain ID is never retried.')
+# ANYM-934: deleting other people's messages, a destructive live action toward them in the owner's name.
+MODERATION = 'delete_member_messages'
+MODERATION_MAX = 20
+MODERATION_LIMITATION = ('Telegram only: deletes for everyone 1-20 archived messages of other people in this group, '
+    'discussion group or channel, after the owner\'s exact confirmation; own messages use delete_message. The owner '
+    'must be the creator, an admin with the delete_messages right (supergroup, discussion group, channel) or an admin '
+    'of a basic group: else not_admin or missing_admin_right and nothing is deleted. Comments under a channel post are '
+    'messages of its discussion group, a chat of its own. One provider request, then one read-back: each message is '
+    'deleted, failed or unknown and is never retried; a flood wait before the request was sent is failed with '
+    'retry_after_s, after it unknown. The archive copy of each confirmed deletion is purged as well (a content-free '
+    'tombstone stays).')
 OPERATIONS = {
     'chat_info': _spec('read-live'),
     'list_participants': _spec('groups-read', fields=_page),
@@ -188,6 +199,9 @@ OPERATIONS = {
         limitation='First page of pending requests; names and notes are untrusted requester text.'),
     'approve_join_requests': _spec('groups-manage', mutation=True, fields=_users, limitation=BATCH_LIMITATION),
     'reject_join_requests': _spec('groups-manage', mutation=True, fields=_users, limitation=BATCH_LIMITATION),
+    MODERATION: _spec('groups-moderate', mutation=True, platforms=('telegram',), fields={
+        'message_ids': _field('message_ids', required=True),
+        'expected_revisions': _field('revisions', required=True)}, limitation=MODERATION_LIMITATION),
     'check_chat_link': _spec('groups-read', 'account', full_account=True, fields=_link,
         limitation='Passive live read of an invite or public link; no member list, inviter or description.'),
     'join_chat': _spec('groups-manage', 'account', mutation=True, full_account=True, fields=_link,
@@ -236,7 +250,8 @@ OPERATION_TOOLS = {
                     'rename_group', 'set_group_description', 'add_participant', 'remove_participant',
                     'promote_participant', 'demote_participant', 'leave_group', 'get_invite_link',
                     'revoke_invite_link', 'set_group_messages_admins_only', 'set_group_info_admins_only',
-                    'set_slow_mode', 'set_join_approval', 'approve_join_requests', 'reject_join_requests', 'join_chat'),
+                    'set_slow_mode', 'set_join_approval', 'approve_join_requests', 'reject_join_requests', 'join_chat',
+                    MODERATION),
     'change_contacts': ('add_contact', 'delete_contact', 'block_contact', 'unblock_contact'),
     'read_contacts': ('list_contacts', 'get_contact', 'list_blocked', 'get_labels'),
 }
@@ -349,6 +364,8 @@ def operation_manifest(platform, *, provider=None):
             row['limitation'] = 'Unsupported here: Telegram accounts only.'
         elif platform == 'whatsapp' and name == 'delete_message':
             row['limitation'] = 'Unsupported: upstream global revoke can silently fallback to local deletion.'
+        elif platform == 'whatsapp' and name == MODERATION:
+            row['limitation'] = 'Unsupported: no WhatsApp moderation (moderation_unsupported); Telegram accounts only.'
         elif platform not in spec['platforms']:
             row['limitation'] = 'No implemented adapter for this provider-specific operation.'
         rows.append(row)
@@ -411,6 +428,10 @@ def parameter_format(platform, kind):
                 'WhatsApp user JID digits@c.us or digits@lid, such as sender_id from search_people; '
                 'not person_* or a bare phone number')
     return {'contact_ids': '1-20 unique items, each a ' + parameter_format(platform, 'contact_id'),
+        'message_ids': ('1-20 unique archive message IDs (msg_ plus 32 lowercase hex characters) of other people\'s '
+            'messages in this chat, from get_messages or search; own messages use delete_message'),
+        'revisions': ('one integer of at least 1 per message_ids item, in the same order: that message\'s current '
+            'archive revision, from get_messages or search'),
         'message_id': 'archive message ID msg_ plus 32 lowercase hex characters, from get_messages or search',
         'attachment_id': 'archive attachment ID att_ plus 32 lowercase hex characters, from message attachments or search_files',
         'upload_id': 'own upload ID up_ plus 32 lowercase hex characters, from prepare_file_upload',
@@ -509,17 +530,23 @@ def _problem(platform, descriptor, value, field):
         if not re.fullmatch(pattern, value) or kind == 'contact_id' and platform == 'telegram' and int(value) >= 2**63:
             return fail('format', parameter_format(platform, kind))
         return None
-    if kind in ('contact_ids', 'poll_options', 'poll_indices', 'label_ids'):
+    if kind in ('contact_ids', 'poll_options', 'poll_indices', 'label_ids', 'message_ids', 'revisions'):
         if not isinstance(value, list): return fail('type', 'array')
         maximum = 10 if kind == 'poll_options' else 20
         if len(value) > maximum: return fail('max_items', 'at most %d items' % maximum)
-        minimum = 2 if kind == 'poll_options' else 1 if kind == 'contact_ids' else 0
+        minimum = 2 if kind == 'poll_options' else 1 if kind in ('contact_ids', 'message_ids', 'revisions') else 0
         if len(value) < minimum: return fail('min_items', 'at least %d item%s' % (minimum, 's' * (minimum > 1)))
         item = {'poll_options': _field('string', maximum=100, nonempty=True), 'contact_ids': _field('contact_id'),
-                'poll_indices': _field('integer', minimum=0, maximum=9), 'label_ids': _field('label_id')}[kind]
+                'poll_indices': _field('integer', minimum=0, maximum=9), 'label_ids': _field('label_id'),
+                'message_ids': _field('message_id'), 'revisions': _field('integer', minimum=1, maximum=2147483647)}[kind]
         errors = [e for i, x in enumerate(value) for e in (_problem(platform, item, x, '%s/%d' % (field, i)) or ())]
         if errors: return errors
-        return None if len(set(value)) == len(value) else fail('unique', 'no duplicate items')
+        if kind == 'revisions': return None  # one per message: equal revisions are expected
+        repeated = next((i for i, x in enumerate(value) if x in value[:i]), None)
+        # ANYM-934: a repeated message ID is named by its position, so the agent drops exactly that item.
+        if repeated is not None and kind == 'message_ids':
+            return fail('unique', 'no duplicate items', path='%s/%d' % (field, repeated))
+        return None if repeated is None else fail('unique', 'no duplicate items')
     if kind == 'chat_types':
         if not isinstance(value, list): return fail('type', 'array')
         if not 1 <= len(value) <= 3: return fail('min_items' if not value else 'max_items', parameter_format(platform, kind))
@@ -559,6 +586,8 @@ def live_cursor_binding(account, chat_id, parameters):
 
 def validate_operation(platform, operation, parameters, *, provider=None):
     spec = operation_spec(operation, platform)
+    # ANYM-934: WhatsApp has no moderation of other people's messages here; named, not a generic unsupported.
+    if operation == MODERATION and platform != 'telegram': raise ValueError('moderation_unsupported')
     if not _supported(platform, operation, spec, provider): raise ValueError('unsupported_operation')
     if parameters is None: parameters = {}
     if not isinstance(parameters, dict): raise ParameterError(field_error('parameters', 'type', 'object'))
@@ -605,6 +634,10 @@ def validate_operation(platform, operation, parameters, *, provider=None):
         for name, default in EDIT_DEFAULTS.items():
             if output.get(name, default) == default and type(output.get(name, default)) is type(default):
                 output.pop(name, None)
+    if operation == MODERATION and len(output['expected_revisions']) != len(output['message_ids']):
+        short = len(output['expected_revisions']) < len(output['message_ids'])
+        raise ParameterError(field_error('expected_revisions', 'min_items' if short else 'max_items',
+                                         'one revision per message_ids item'))
     if operation == 'update_profile' and not output:
         raise ParameterError(field_error('parameters', 'required', 'at least one of ' + ', '.join(fields)))
     if operation == 'send_file' and (('attachment_id' in output)+('upload_id' in output)!=1):

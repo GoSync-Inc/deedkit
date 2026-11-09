@@ -26,6 +26,9 @@
   "delete_contact": [
     "contacts-manage"
   ],
+  "delete_member_messages": [
+    "groups-moderate"
+  ],
   "delete_message": [
     "message-delete"
   ],

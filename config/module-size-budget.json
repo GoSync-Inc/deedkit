@@ -26,7 +26,7 @@
     "services/messaging/messaging_service/store.py": {"lines": 1785, "longest_function": 81},
     "services/messaging/messaging_service/subscriptions.py": {"lines": 1504, "longest_function": 122},
     "services/messaging/messaging_service/telegram_collector.py": {"lines": 1831, "longest_function": 96},
-    "services/messaging/messaging_service/telegram_operations.py": {"lines": 1966, "longest_function": 200},
+    "services/messaging/messaging_service/telegram_operations.py": {"lines": 1978, "longest_function": 200},
     "services/messaging/messaging_service/whatsapp_collector.py": {"lines": 947, "longest_function": 45},
     "services/recordings/src/deedkit_recordings/archive_store.py": {"lines": 1406, "longest_function": 75},
     "whatsapp/whatsmeow/capture.go": {"lines": 920, "longest_function": 250},

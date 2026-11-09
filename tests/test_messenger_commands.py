@@ -344,6 +344,132 @@ def test_mutations_never_retry_an_ambiguous_provider_result(operator,outcome,sta
     assert queue(s,key)['status']==status and len(calls)==1
 
 
+SPAM='Synthetic spam offer '*20
+MODERATOR=['read','read-live','groups-read','groups-moderate']
+
+
+def moderation(operator,permissions=MODERATOR):
+    """A supergroup (-1001), a channel (-1002) and its discussion group (-1003) with other people's messages."""
+    s,archive,_,state=operator
+    def message(chat,provider_id,title,kind,**changes):
+        archive.ingest(event(account='command-fixture',chat=chat,chat_title=title,provider_id=provider_id,
+                             metadata={'chat_type':kind},**changes))
+        return stable_id('msg','command-fixture',chat,provider_id)
+    ids={'spam':message('-1001','11','Synthetic supergroup','group',sender='42',body=SPAM,
+                        sender_profile={'display_name':'Synthetic Seller','username':'synthetic_seller'}),
+         'spam2':message('-1001','12','Synthetic supergroup','group',sender='43',body='Second synthetic spam'),
+         'own':message('-1001','13','Synthetic supergroup','group',sender='7',direction='outgoing',body='Own text'),
+         'post':message('-1002','21','Synthetic news','channel',sender='-1002',body='Synthetic post'),
+         'forwarded':message('-1003','31','Synthetic news chat','group',sender='-1002',body='Synthetic post copy'),
+         'comment':message('-1003','32','Synthetic news chat','group',sender='44',body='Synthetic comment spam')}
+    for chat in ('-1001','-1002','-1003'):state.chat(chat,'channel')
+    key=s.issue_key('command-agent',['command-fixture'],permissions=permissions)
+    s.set_messenger_operations('command-fixture',['delete_member_messages','delete_message'])
+    return s,archive,key,state,ids
+
+
+def moderation_args(chat,*messages,revisions=None):
+    return {'account':'command-fixture','operation':'delete_member_messages',
+            'chat_id':stable_id('chat','command-fixture',chat),
+            'parameters':{'message_ids':list(messages),'expected_revisions':revisions or [1]*len(messages)}}
+
+
+def refused_fields(s,key,args):
+    with pytest.raises(APIError,match='^invalid_operation_parameters$') as failure:
+        s.preview_messenger_operation(key,**args)
+    return failure.value
+
+
+# spec: ANYM-934
+def test_delete_member_messages_preview_names_each_sender_and_the_chat_type(operator):
+    s,_,key,_,ids=moderation(operator)
+    draft=s.preview_messenger_operation(key,**moderation_args('-1001',ids['spam'],ids['spam2']))
+    shown=draft['moderation']
+    assert shown['chat']['chat_type']=='supergroup' and shown['count']==2
+    assert shown['archive']=='the archive copy is purged as well'
+    first,second=shown['messages']
+    assert (first['message_id'],first['sender_id'],first['sender_name'],first['sender_username'])==(
+        ids['spam'],'42','Synthetic Seller','synthetic_seller')
+    assert first['text']==SPAM[:200] and first['kind'] and first['sent_at'].startswith('2026-10-01')
+    assert second['sender_id']=='43' and second['sender_username'] is None
+    assert draft['required_permissions']==['groups-moderate','read'] and draft['mutation'] is True
+    assert [t['message_id'] for t in draft['targets']]==[ids['spam'],ids['spam2']]
+    comments=s.preview_messenger_operation(key,**moderation_args('-1003',ids['comment']))['moderation']['chat']
+    assert comments['chat_type']=='discussion group of Synthetic news'
+    assert s.preview_messenger_operation(key,**moderation_args('-1002',ids['post']))['moderation']['chat'][
+        'chat_type']=='channel'
+
+
+# spec: ANYM-934
+def test_delete_member_messages_digest_binds_the_revisions_and_an_edit_refuses(operator):
+    s,archive,key,_,ids=moderation(operator)
+    args=moderation_args('-1001',ids['spam'])
+    draft=s.preview_messenger_operation(key,**args)
+    archive.ingest(event(account='command-fixture',chat='-1001',provider_id='11',sender='42',body='Edited synthetic spam',
+                         metadata={'chat_type':'group'},updated_at='2026-10-01T12:01:00Z'))
+    with pytest.raises(APIError,match='^operation_target_changed$'):
+        s.execute_messenger_operation(key,**args,request_id='synthetic-moderation-1',preview_digest=draft['preview_digest'])
+    with pytest.raises(APIError,match='^preview_mismatch$'):
+        s.execute_messenger_operation(key,**moderation_args('-1001',ids['spam'],revisions=[2]),
+                                      request_id='synthetic-moderation-2',preview_digest=draft['preview_digest'])
+
+
+# spec: ANYM-934
+def test_delete_member_messages_names_each_target_it_refuses(operator):
+    s,_,key,_,ids=moderation(operator)
+    failure=refused_fields(s,key,moderation_args('-1002',ids['spam'],ids['comment'],ids['post']))
+    assert [(e['field'],e['reason']) for e in failure.field_errors]==[
+        ('message_ids/0','message_from_other_chat'),('message_ids/1','message_from_other_chat')]
+    assert failure.other_chats==[
+        {'field':'message_ids/0','chat_id':stable_id('chat','command-fixture','-1001'),'chat_type':'supergroup'},
+        {'field':'message_ids/1','chat_id':stable_id('chat','command-fixture','-1003'),
+         'chat_type':'discussion group of Synthetic news'}]
+    unknown='msg_'+'f'*32
+    failure=refused_fields(s,key,moderation_args('-1001',unknown,ids['own'],ids['spam']))
+    assert [(e['field'],e['reason']) for e in failure.field_errors]==[
+        ('message_ids/0','message_not_found'),('message_ids/1','own_message')]
+    with s.pool.connection() as c:
+        c.execute("UPDATE account_policies SET exclude_chats=ARRAY['-1001'] WHERE account='command-fixture'")
+    assert [(e['field'],e['reason']) for e in refused_fields(s,key,moderation_args('-1001',ids['spam'])).field_errors]==[
+        ('chat_id','chat_not_collected')]
+
+
+# spec: ANYM-934
+def test_delete_member_messages_needs_groups_moderate_and_a_telegram_account(operator):
+    s,archive,_,_,ids=moderation(operator)
+    plain=s.issue_key('command-agent',['command-fixture'],permissions=['read','read-live','groups-manage','message-delete'])
+    with pytest.raises(APIError,match='^forbidden$'):
+        s.preview_messenger_operation(plain,**moderation_args('-1001',ids['spam']))
+    listed={i['operation']:i for i in s.list_messenger_operations(plain,'command-fixture')['items']}
+    assert listed['delete_member_messages']['key_permitted'] is False
+    archive.register('moderation-wa','whatsapp','Synthetic WhatsApp',discover=True)
+    archive.ingest(event(account='moderation-wa',platform='whatsapp',chat='900@g.us',provider_id='1'))
+    wa=s.issue_key('command-agent',['moderation-wa'],permissions=MODERATOR)
+    with pytest.raises(APIError,match='^moderation_unsupported$'):
+        s.preview_messenger_operation(wa,account='moderation-wa',operation='delete_member_messages',
+            chat_id=stable_id('chat','moderation-wa','900@g.us'),
+            parameters={'message_ids':[stable_id('msg','moderation-wa','900@g.us','1')],'expected_revisions':[1]})
+
+
+# spec: ANYM-934
+def test_a_rights_refusal_fails_the_operation_with_its_evidence_and_deletes_nothing(operator):
+    from messaging_service.commands import CommandRejected,CommandWorker
+    s,_,key,state,ids=moderation(operator)
+    args=moderation_args('-1001',ids['spam'])
+    draft=s.preview_messenger_operation(key,**args)
+    queued=s.execute_messenger_operation(key,**args,request_id='synthetic-moderation-3',preview_digest=draft['preview_digest'])
+    jobs=[]
+    async def provider(job):
+        jobs.append(job);raise CommandRejected('missing_admin_right',data={'evidence':{'missing_right':'delete_messages'}})
+    assert asyncio.run(CommandWorker(state,provider).once())
+    receipt=s.get_messenger_operation(key,queued['operation_id'])
+    assert (receipt['status'],receipt['error_code'])==('failed','missing_admin_right')
+    assert receipt['result']['data']=={'code':'missing_admin_right','evidence':{'missing_right':'delete_messages'}}
+    assert jobs[0]['targets']==[{'message_id':ids['spam'],'revision':1,'provider_message_id':'11'}]
+    with s.pool.connection() as c:
+        assert not c.execute('SELECT deleted FROM messages WHERE id=%s',(ids['spam'],)).fetchone()['deleted']
+
+
 def test_status_is_bound_to_originating_key(operator):
     s,_,key,_=operator
     queued=queue(s,key)
