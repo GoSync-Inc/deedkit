@@ -255,8 +255,28 @@ func TestMenuReplyShapesEndsAtASlowLaterRowWhileCaptureKeepsWriting(t *testing.T
 	if err := s.Put(fixtureMessage("FIRST", 1700000011), "live"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.db.Exec("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?) INSERT INTO capture(digest,chat,message_id,source_ts,raw,envelope,published,created_at) SELECT 'slow'||i,'111111@c.us','m'||i,i,x'',x'7b7d',1,0 FROM n", menuShapeSlowRows); err != nil {
-		t.Fatal(err)
+	// Enough rows that stepping over them all takes at least menuShapeSlowStep, with or
+	// without the race detector: the rows grow until a full uninterrupted pass is that slow.
+	rows, full := 0, time.Duration(0)
+	for full < menuShapeSlowStep {
+		more := menuShapeSlowRows
+		if full > 0 {
+			more = int(float64(rows)*(float64(menuShapeSlowStep)/float64(full))*1.3) - rows
+		}
+		if rows+more > menuShapeMaxSlowRows {
+			t.Fatalf("%d rows step in %v, under %v", rows, full, menuShapeSlowStep)
+		}
+		if _, err := s.db.Exec("WITH RECURSIVE n(i) AS (SELECT ? UNION ALL SELECT i+1 FROM n WHERE i<?) INSERT INTO capture(digest,chat,message_id,source_ts,raw,envelope,published,created_at) SELECT 's'||i,'c','',i,x'',x'',1,0 FROM n", rows+1, rows+more); err != nil {
+			t.Fatal(err)
+		}
+		rows += more
+		// The pager's own statement, uninterrupted: it steps over every slow row.
+		began := time.Now()
+		var seq int64
+		if err := s.db.QueryRow("SELECT seq FROM capture WHERE seq>1 AND length(raw)>0 ORDER BY seq LIMIT 1").Scan(&seq); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("calibration: %v", err)
+		}
+		full = time.Since(began)
 	}
 	if err := s.Put(menuShapeEvent("REPLY2", 1700000012, true, &waE2E.Message{ListResponseMessage: &waE2E.ListResponseMessage{ContextInfo: quoting("NONE")}}), "live"); err != nil {
 		t.Fatal(err)
@@ -266,11 +286,12 @@ func TestMenuReplyShapesEndsAtASlowLaterRowWhileCaptureKeepsWriting(t *testing.T
 		t.Fatal(err)
 	}
 	defer func(d time.Duration) { menuShapeTimeout = d }(menuShapeTimeout)
-	menuShapeTimeout = 300 * time.Millisecond
-	// The owning adapter writes 50 ms after the scan's first statement. The fast
+	menuShapeTimeout = min(full/5, 300*time.Millisecond)
+	delay := menuShapeTimeout / 6
+	// The owning adapter writes shortly after the scan's first statement. The fast
 	// first row ends that statement at once; the second steps over the slow rows
-	// and must end by journal_read_timeout (300 ms), so the write lands while the
-	// read holds its lock.
+	// and must end by journal_read_timeout, so the write lands while the read holds
+	// its lock.
 	type write struct {
 		began time.Time
 		took  time.Duration
@@ -283,7 +304,7 @@ func TestMenuReplyShapesEndsAtASlowLaterRowWhileCaptureKeepsWriting(t *testing.T
 		switch scanned {
 		case 0:
 			go func() {
-				time.Sleep(50 * time.Millisecond)
+				time.Sleep(delay)
 				began := time.Now()
 				err := s.Put(fixtureMessage("LIVE", 1700002000), "live")
 				written <- write{began, time.Since(began), err}
@@ -304,12 +325,12 @@ func TestMenuReplyShapesEndsAtASlowLaterRowWhileCaptureKeepsWriting(t *testing.T
 	case <-time.After(10 * time.Second):
 		t.Fatal("the capture write beside the scan never finished")
 	}
-	t.Logf("scan %v, capture write %v", scan, w.took)
+	t.Logf("%d slow rows step in %v; scan %v, capture write %v", rows, full, scan, w.took)
 	if w.err != nil {
 		t.Fatalf("a capture write failed beside the scan: %v", w.err)
 	}
 	// The write waited at most for the interrupted statement, not for the slow rows.
-	if w.took > 1500*time.Millisecond || scan > 3*time.Second {
+	if w.took > full/2 || scan > 3*time.Second {
 		t.Fatalf("the read held the journal: write %v, scan %v", w.took, scan)
 	}
 	if second.IsZero() || !second.Before(w.began) || !w.began.Before(second.Add(menuShapeTimeout)) {
@@ -324,5 +345,10 @@ func TestMenuReplyShapesEndsAtASlowLaterRowWhileCaptureKeepsWriting(t *testing.T
 	}
 }
 
-// Enough rows that stepping over them takes well past the statement timeout.
-const menuShapeSlowRows = 600000
+// The slow rows: a first batch, the pass they must take at least, and a bound on
+// the journal file (max_page_count 131072).
+const (
+	menuShapeSlowRows    = 400000
+	menuShapeSlowStep    = 250 * time.Millisecond
+	menuShapeMaxSlowRows = 9000000
+)
