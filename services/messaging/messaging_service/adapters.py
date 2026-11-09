@@ -20,6 +20,12 @@ def timestamp(value):
     return value
 
 
+def call_times(call):
+    """The adapter's call start and end in Unix seconds as UTC instants; any other value is left for validation."""
+    if not isinstance(call,dict):return call
+    return {**call,**{k:timestamp(call[k]) for k in ('started_at','ended_at') if type(call.get(k)) is int and 0<call[k]<=253402300799}}
+
+
 MAX_MEDIA_BYTES=8*1024**3
 
 
@@ -306,6 +312,9 @@ def whatsapp_message(account,event,*,origin='live',change='message',observed_at=
     # A pushed group change (ANYM-869, whatsmeow capture.go) keeps its own kind and details.
     group=event.get('groupChange') if native_type=='group_change' else None
     if group is not None:kind='group_change'
+    # An incoming call (ANYM-923, whatsmeow calls.go) keeps its own kind and details; envelope.call_block checks them.
+    call=event.get('call') if native_type=='call' else None
+    if call is not None:kind='call'
     if native_type is None and event.get('mediaKind'):
         kind='video' if event['mediaKind']=='animation' else event['mediaKind'] if event['mediaKind']!='other' else 'unknown'
     body=event.get('body') or ''
@@ -352,6 +361,7 @@ def whatsapp_message(account,event,*,origin='live',change='message',observed_at=
                     **({'forward_origin':forward} if forward is not None else {}),
                     **({'contact':contact} if contact is not None else {}),
                     **({'group_change':group} if group is not None else {}),
+                    **({'call':call_times(call)} if call is not None else {}),
                     **({'poll':poll} if poll is not None else {}),
                     **({'location':location} if location is not None else {}),
                     **({'sender_is_business_or_verified':True} if event.get('senderIsBusiness') is True else {}),

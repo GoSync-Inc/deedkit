@@ -32,7 +32,7 @@ ASSETS = (
 NATIVE_SOURCES = (
     "go.mod", "go.sum", "main.go", "config.go", "runtime.go", "capture.go",
     "history.go", "store.go", "send.go", "media.go", "operations.go", "ops_read.go", "ops_message.go", "ops_group.go",
-    "group_iq.go", "vcard.go", "repair.go", "repair_requests.go", "menu.go", "menu_shapes.go", "polls.go", "location.go",
+    "group_iq.go", "vcard.go", "repair.go", "repair_requests.go", "menu.go", "menu_shapes.go", "polls.go", "location.go", "calls.go",
     "claim.go", "serve.go", "serve_lanes.go", "opjournal.go", "capture_fence.go", "peercred_linux.go", "peercred_darwin.go",
     "runtime_test.go", "send_test.go", "media_test.go", "operations_test.go", "menu_shapes_test.go",
     "operations_characterization_test.go",

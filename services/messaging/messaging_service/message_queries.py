@@ -297,6 +297,30 @@ def filters(p, *, account='',chat='',sender='',accounts=None,chats=None,senders=
     return clauses,args,normalized
 
 
+# The row's current metadata, or its snapshot's for synthetic and restored records (conversation.metadata_sql).
+KIND_METADATA=("coalesce((SELECT k.metadata FROM message_metadata k WHERE k.message=m.id AND k.revision=m.revision),"
+    "(SELECT r.snapshot->'metadata' FROM message_revisions r WHERE r.message=m.id AND r.revision=m.revision),'{}'::jsonb)")
+
+
+def kind_filter(clauses, args, message_kinds=None, call_outcome=''):
+    """ANYM-923: message_kinds keeps rows of the listed kinds; call_outcome keeps calls with that outcome (alone it
+    implies the call kind; other listed kinds are unaffected). Returns the sorted kinds the cursor binds, or None."""
+    from .store import APIError
+    from .conversation import KINDS
+    from .envelope import CALL_OUTCOMES
+    if message_kinds is not None and (not isinstance(message_kinds,list) or not message_kinds
+            or not all(isinstance(k,str) and k in KINDS for k in message_kinds)):
+        raise APIError('invalid_filter')
+    if not isinstance(call_outcome,str) or call_outcome not in ('',*CALL_OUTCOMES):raise APIError('invalid_filter')
+    if call_outcome and message_kinds is not None and 'call' not in message_kinds:raise APIError('invalid_filter')
+    if message_kinds is None and not call_outcome:return None
+    kinds=sorted(set(message_kinds or ['call']))
+    outcome=" AND (x.md->>'message_kind'<>'call' OR x.md->'call'->>'outcome'=%s)" if call_outcome else ''
+    clauses.append('EXISTS(SELECT 1 FROM (SELECT '+KIND_METADATA+" AS md) x WHERE x.md->>'message_kind'=ANY(%s)"+outcome+')')
+    args.extend([kinds,call_outcome] if call_outcome else [kinds])
+    return kinds
+
+
 def named_chats(c, p, chat='', chats=None):
     """Every explicitly named chat that is unknown or outside the key's scope is one not_found.
 
@@ -317,7 +341,8 @@ def named_chats(c, p, chat='', chats=None):
 def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time='',after='',limit=20,
            *,accounts=None,chats=None,senders=None,query_mode='all',order='asc',before='',direction='',
            search_language='auto',fuzzy=False,compact=False,body_chars=None,include_coverage=True,view='archive',include_system=False,
-           exclude_channels=False,chat_types=None,include_channels=None,collapse_forwards=True,person='',body_format='',include_media_text=True):
+           exclude_channels=False,chat_types=None,include_channels=None,collapse_forwards=True,person='',body_format='',include_media_text=True,
+           message_kinds=None,call_outcome=''):
     from .store import APIError,bounded,serial
     from .formatting_readback import option
     body_format=option(body_format)
@@ -343,6 +368,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
     clauses,args,normalized=filters(p,account=account,chat=chat,sender=sender,accounts=accounts,
         chats=chats,senders=senders,from_time=from_time,to_time=to_time,direction=direction,exclude_channels=exclude_channels,
         chat_types=chat_types,include_channels=include_channels)
+    kinds=kind_filter(clauses,args,message_kinds,call_outcome)
     # ANYM-283: an owner-made person narrows to the exact (account,sender) pairs this key can read.
     members=digest=None
     if person!='':
@@ -367,6 +393,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
         **({'collapse_forwards':False} if flat else {}),
         **({'include_media_text':False} if body_only else {}),
         **({'person':person} if members is not None else {}),
+        **({'message_kinds':kinds,'call_outcome':call_outcome} if kinds is not None else {}),
         **({'view':view,'include_system':include_system,'conversation_version':1} if conversation else {})})
     extra_join=' LEFT JOIN message_metadata cmd ON cmd.message=m.id AND cmd.revision=m.revision' if conversation else ''
     if conversation and not include_system:clauses.append(visible_sql('m','cmd'))

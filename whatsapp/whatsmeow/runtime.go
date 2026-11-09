@@ -302,6 +302,13 @@ func (p *Provider) start(ctx context.Context) (result any, err error) {
 				return false
 			}
 			return p.handleGroupEvent(e)
+		case *events.CallOffer, *events.CallOfferNotice, *events.CallAccept, *events.CallReject, *events.CallTerminate:
+			// ANYM-923: a passive record; nothing is ever sent toward the caller.
+			if !p.identityOK() {
+				p.fail("whatsapp_identity_mismatch")
+				return false
+			}
+			return p.handleCallEvent(e)
 		}
 		return true
 	})
@@ -361,6 +368,7 @@ func (p *Provider) replayPending() error {
 func (p *Provider) replayWorker(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	var swept time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -374,6 +382,11 @@ func (p *Provider) replayWorker(ctx context.Context, interval time.Duration) {
 		if err := p.replayPending(); err != nil {
 			p.fail(safeError(err))
 			return
+		}
+		// ANYM-923: calls with no end seen close as unknown; a failure never stops capture.
+		if now := time.Now(); now.Sub(swept) >= time.Minute {
+			swept = now
+			p.sweepCalls(now)
 		}
 	}
 }
@@ -579,6 +592,9 @@ func (p *Provider) handleMessage(e *events.Message) error {
 	}
 	if unwrapped.Message.GetPollUpdateMessage() != nil {
 		return p.capturePollVote(unwrapped, "live")
+	}
+	if handled, err := p.captureCallLog(unwrapped.Info.Chat, unwrapped.Info.Sender, unwrapped.Info.ID, unwrapped.Info.IsFromMe, unwrapped.Info.Timestamp.Unix(), unwrapped.Message.GetCallLogMesssage(), "live"); handled {
+		return err
 	}
 	return p.Capture.putOrSkip(e, "live")
 }

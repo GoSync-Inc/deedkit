@@ -937,6 +937,57 @@
           ],
           "title": "Body Format",
           "description": "html adds body_rendered {format,text,lossless,omitted_types} to Telegram rows whose formatting is known: the complete body as HTML for preview_message/send_message text with format=html, verified by the server; lossless=false lists omitted_types; otherwise body_rendered_unavailable names the reason. Empty or absent adds nothing. Not with detail=transcript."
+        },
+        "message_kinds": {
+          "anyOf": [
+            {
+              "items": {
+                "enum": [
+                  "text",
+                  "photo",
+                  "video",
+                  "voice",
+                  "audio",
+                  "document",
+                  "sticker",
+                  "location",
+                  "contact",
+                  "poll",
+                  "system",
+                  "group_change",
+                  "call",
+                  "unknown"
+                ],
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Keep rows of these kinds (ANYM-923). Calls are service rows: add include_system=true in the conversation view.",
+          "title": "Message Kinds"
+        },
+        "call_outcome": {
+          "anyOf": [
+            {
+              "enum": [
+                "missed",
+                "rejected",
+                "answered",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Keep WhatsApp calls with this outcome; alone it implies message_kinds=['call'].",
+          "title": "Call Outcome"
         }
       },
       "type": "object",
@@ -4649,11 +4700,12 @@
                   "send.failed",
                   "source.health",
                   "attachment.failed",
-                  "poll.updated"
+                  "poll.updated",
+                  "call"
                 ],
                 "type": "string"
               },
-              "maxItems": 13,
+              "maxItems": 14,
               "minItems": 1,
               "type": "array"
             },

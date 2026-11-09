@@ -18,9 +18,11 @@ import (
 	"unicode/utf8"
 
 	"go.mau.fi/whatsmeow"
+	waBinary "go.mau.fi/whatsmeow/binary"
 	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waHistorySync "go.mau.fi/whatsmeow/proto/waHistorySync"
+	waSyncAction "go.mau.fi/whatsmeow/proto/waSyncAction"
 	waWeb "go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
@@ -407,6 +409,271 @@ func TestNativeMalformedGroupChangeIsCountedAndTheNextMessageIsCaptured(t *testi
 	}
 	if n := spoolFiles(t, p.Config.EventsDirectory); n != 1 {
 		t.Fatal("message after a malformed change not captured", n)
+	}
+}
+
+// callEntries returns the journaled call entries (ANYM-923) in journal order.
+func callEntries(t *testing.T, s *CaptureStore) []map[string]any {
+	t.Helper()
+	out := []map[string]any{}
+	for _, v := range journalKinds(t, s) {
+		if event, _ := v["event"].(map[string]any); event["messageType"] == "call" {
+			requireArchivable(t, event)
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func callOf(t *testing.T, entry map[string]any) (map[string]any, map[string]any) {
+	t.Helper()
+	event := entry["event"].(map[string]any)
+	call, ok := event["call"].(map[string]any)
+	if !ok || event["isService"] != true || event["body"] != "" || event["fromMe"] != false {
+		t.Fatalf("not a call service entry: %#v", event)
+	}
+	return event, call
+}
+
+var caller = member("444444")
+
+func callMeta(id string, at int64) types.BasicCallMeta {
+	return types.BasicCallMeta{From: caller, Timestamp: time.Unix(at, 0), CallCreator: caller, CallID: id}
+}
+
+func callOffer(id string, at int64, media ...string) *events.CallOffer {
+	node := &waBinary.Node{Tag: "offer"}
+	children := []waBinary.Node{}
+	for _, m := range media {
+		children = append(children, waBinary.Node{Tag: m})
+	}
+	node.Content = children
+	return &events.CallOffer{BasicCallMeta: callMeta(id, at), Data: node}
+}
+
+// spec: ANYM-923
+func TestNativeIncomingCallIsOneServiceEntryWithItsOutcome(t *testing.T) {
+	p := skipProvider(t)
+	group := callMeta("CALLG", 1700001400)
+	group.GroupJID = groupJID
+	cases := []struct {
+		id, outcome, media, chat string
+		group                    bool
+		events                   []any
+		ended                    any
+	}{
+		{"CALLMISSED", "missed", "audio", "444444@c.us", false, []any{callOffer("CALLMISSED", 1700001000, "audio"), &events.CallTerminate{BasicCallMeta: callMeta("CALLMISSED", 1700001030), Reason: "timeout"}}, float64(1700001030)},
+		{"CALLANSWERED", "answered", "video", "444444@c.us", false, []any{callOffer("CALLANSWERED", 1700001100, "audio", "video"), &events.CallAccept{BasicCallMeta: callMeta("CALLANSWERED", 1700001105)}, &events.CallTerminate{BasicCallMeta: callMeta("CALLANSWERED", 1700001300)}}, float64(1700001300)},
+		// A terminate after the reject changes nothing: the call already has its one entry.
+		{"CALLREJECTED", "rejected", "audio", "444444@c.us", false, []any{callOffer("CALLREJECTED", 1700001200, "audio"), &events.CallReject{BasicCallMeta: callMeta("CALLREJECTED", 1700001204)}, &events.CallTerminate{BasicCallMeta: callMeta("CALLREJECTED", 1700001205)}}, float64(1700001204)},
+		{"CALLG", "missed", "video", "120363000000000009@g.us", true, []any{&events.CallOfferNotice{BasicCallMeta: group, Media: "video", Type: "group"}, &events.CallTerminate{BasicCallMeta: callMeta("CALLG", 1700001460)}}, float64(1700001460)},
+		{"CALLNOMEDIA", "missed", "", "444444@c.us", false, []any{callOffer("CALLNOMEDIA", 1700001500), &events.CallTerminate{BasicCallMeta: callMeta("CALLNOMEDIA", 1700001510)}}, float64(1700001510)},
+	}
+	for _, c := range cases {
+		for i, e := range c.events {
+			if !p.handleCallEvent(e) {
+				t.Fatalf("%s: handler refused %T", c.id, e)
+			}
+			if i == 0 && len(callEntries(t, p.Capture)) != 0 && c.id == "CALLMISSED" {
+				t.Fatal("an offer alone is not journaled before its end")
+			}
+		}
+	}
+	entries := callEntries(t, p.Capture)
+	if len(entries) != len(cases) {
+		t.Fatalf("%d call entries, want one per call", len(entries))
+	}
+	for i, c := range cases {
+		event, call := callOf(t, entries[i])
+		var media any
+		if c.media != "" {
+			media = c.media
+		}
+		want := map[string]any{"call_id": c.id, "direction": "incoming", "media": media, "group": c.group, "started_at": event["timestamp"], "ended_at": c.ended, "outcome": c.outcome}
+		if len(call) != len(want) {
+			t.Fatalf("%s: call block keys %#v", c.id, call)
+		}
+		requireFields(t, call, want)
+		requireFields(t, event, map[string]any{"messageId": "call_" + c.id, "chatId": c.chat, "senderId": "444444@c.us"})
+		if entries[i]["origin"] != "live" {
+			t.Fatal(c.id, entries[i]["origin"])
+		}
+	}
+	if n := spoolFiles(t, p.Config.EventsDirectory); n != len(cases) {
+		t.Fatal("call entries not exported", n)
+	}
+}
+
+// spec: ANYM-923
+func TestNativeCallWithNoEndWithinTwoHoursIsUnknown(t *testing.T) {
+	p := skipProvider(t)
+	start := time.Unix(1700002000, 0)
+	if !p.handleCallEvent(callOffer("CALLOPEN", start.Unix(), "audio")) {
+		t.Fatal("handler refused")
+	}
+	// An accept seen is still no end: without a terminate the outcome stays unknown.
+	if !p.handleCallEvent(&events.CallAccept{BasicCallMeta: callMeta("CALLOPEN", start.Unix()+5)}) {
+		t.Fatal("handler refused")
+	}
+	if err := p.expireCalls(start.Add(2*time.Hour - time.Second)); err != nil || len(callEntries(t, p.Capture)) != 0 {
+		t.Fatal("a call under two hours old was closed", err)
+	}
+	if err := p.expireCalls(start.Add(2*time.Hour + time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	entries := callEntries(t, p.Capture)
+	if len(entries) != 1 {
+		t.Fatal(len(entries))
+	}
+	_, call := callOf(t, entries[0])
+	requireFields(t, call, map[string]any{"call_id": "CALLOPEN", "outcome": "unknown", "ended_at": nil, "started_at": float64(start.Unix())})
+	// A late terminate and a second sweep add nothing.
+	if !p.handleCallEvent(&events.CallTerminate{BasicCallMeta: callMeta("CALLOPEN", start.Unix()+8000)}) {
+		t.Fatal("handler refused")
+	}
+	if err := p.expireCalls(start.Add(3 * time.Hour)); err != nil || len(callEntries(t, p.Capture)) != 1 {
+		t.Fatal("a closed call was journaled twice", err)
+	}
+}
+
+func callLogHistory(chat types.JID, id string, at uint64, outcome waE2E.CallLogMessage_CallOutcome, video bool, duration int64, fromMe bool) *waHistorySync.HistorySync {
+	wm := &waWeb.WebMessageInfo{Key: &waCommon.MessageKey{RemoteJID: proto.String(chat.String()), ID: proto.String(id), FromMe: proto.Bool(fromMe)}, MessageTimestamp: proto.Uint64(at),
+		Message: &waE2E.Message{CallLogMesssage: &waE2E.CallLogMessage{IsVideo: proto.Bool(video), CallOutcome: outcome.Enum(), DurationSecs: proto.Int64(duration)}}}
+	return &waHistorySync.HistorySync{Conversations: []*waHistorySync.Conversation{{ID: proto.String(chat.String()), Messages: []*waHistorySync.HistorySyncMsg{{Message: wm}}}}}
+}
+
+// spec: ANYM-923
+func TestNativeRedeliveredCallAndItsHistoryLogMapToTheSameEntry(t *testing.T) {
+	p := skipProvider(t)
+	offer, end := callOffer("CALLREDELIVER", 1700003000, "audio"), &events.CallTerminate{BasicCallMeta: callMeta("CALLREDELIVER", 1700003020)}
+	for _, e := range []any{offer, end, offer, end} {
+		if !p.handleCallEvent(e) {
+			t.Fatal("handler refused")
+		}
+	}
+	// The same call synced later, as a call-log message and as a call log record, names the same row.
+	if err := p.captureHistory(callLogHistory(caller, "CALLREDELIVER", 1700003000, waE2E.CallLogMessage_MISSED, false, 0, false)); err != nil {
+		t.Fatal(err)
+	}
+	records := &waHistorySync.HistorySync{CallLogRecords: []*waSyncAction.CallLogRecord{{CallID: proto.String("CALLREDELIVER"), IsIncoming: proto.Bool(true), StartTime: proto.Int64(1700003000), CallCreatorJID: proto.String(caller.String()), CallResult: waSyncAction.CallLogRecord_MISSED.Enum()}}}
+	if err := p.captureHistory(records); err != nil {
+		t.Fatal(err)
+	}
+	entries := callEntries(t, p.Capture)
+	if len(entries) != 1 || entries[0]["origin"] != "live" {
+		t.Fatalf("%d entries, want the one live entry", len(entries))
+	}
+	var rows int
+	p.Capture.db.QueryRow("SELECT COUNT(*) FROM capture").Scan(&rows)
+	if rows != 1 {
+		t.Fatal("the synced call log was also journaled as a message", rows)
+	}
+	if _, call := callOf(t, entries[0]); call["outcome"] != "missed" {
+		t.Fatal(call)
+	}
+}
+
+// spec: ANYM-923
+func TestNativeHistoryCallLogAloneIsOneEntryWithOutcomeAndDuration(t *testing.T) {
+	p := skipProvider(t)
+	owner := p.Capture.Owner
+	p.Client = nativeClient(&store.Device{ID: &owner}) // parses the outgoing call log as before ANYM-923
+	if err := p.captureHistory(callLogHistory(caller, "CALLHIST1", 1700004000, waE2E.CallLogMessage_CONNECTED, true, 95, false)); err != nil {
+		t.Fatal(err)
+	}
+	// An outgoing call is no call entry (out of scope); a call log record of another call is.
+	if err := p.captureHistory(callLogHistory(caller, "CALLOUT", 1700004100, waE2E.CallLogMessage_CONNECTED, false, 10, true)); err != nil {
+		t.Fatal(err)
+	}
+	records := &waHistorySync.HistorySync{CallLogRecords: []*waSyncAction.CallLogRecord{
+		{CallID: proto.String("CALLREC"), IsIncoming: proto.Bool(true), StartTime: proto.Int64(1700004200), Duration: proto.Int64(0), CallCreatorJID: proto.String(caller.String()), CallResult: waSyncAction.CallLogRecord_MISSED.Enum()},
+		{CallID: proto.String("CALLRECOUT"), IsIncoming: proto.Bool(false), StartTime: proto.Int64(1700004300), CallCreatorJID: proto.String(caller.String()), CallResult: waSyncAction.CallLogRecord_CONNECTED.Enum()},
+	}}
+	if err := p.captureHistory(records); err != nil {
+		t.Fatal(err)
+	}
+	entries := callEntries(t, p.Capture)
+	if len(entries) != 2 {
+		t.Fatalf("%d entries, want the incoming log message and the incoming record", len(entries))
+	}
+	event, call := callOf(t, entries[0])
+	requireFields(t, call, map[string]any{"call_id": "CALLHIST1", "outcome": "answered", "media": "video", "group": false, "started_at": float64(1700004000), "ended_at": float64(1700004095)})
+	requireFields(t, event, map[string]any{"messageId": "call_CALLHIST1", "chatId": "444444@c.us", "senderId": "444444@c.us", "durationSeconds": float64(95)})
+	if entries[0]["origin"] != "backfill" {
+		t.Fatal(entries[0]["origin"])
+	}
+	_, call = callOf(t, entries[1])
+	requireFields(t, call, map[string]any{"call_id": "CALLREC", "outcome": "missed", "media": "audio", "started_at": float64(1700004200), "ended_at": float64(1700004200)})
+}
+
+// spec: ANYM-923
+func TestNativeMalformedCallEventIsCountedAndTheNextMessageIsCaptured(t *testing.T) {
+	p := skipProvider(t)
+	bad := []any{
+		(*events.CallOffer)(nil), (*events.CallOfferNotice)(nil), (*events.CallTerminate)(nil), (*events.CallAccept)(nil), (*events.CallReject)(nil),
+		&events.CallOffer{BasicCallMeta: callMeta("", 1700005000)},                                                  // no call ID
+		&events.CallOffer{BasicCallMeta: callMeta("CALLX", 0)},                                                      // no time
+		&events.CallOffer{BasicCallMeta: callMeta("BAD\x00ID", 1700005000)},                                         // unusable call ID
+		&events.CallOffer{BasicCallMeta: types.BasicCallMeta{Timestamp: time.Unix(1700005000, 0), CallID: "CALLY"}}, // no caller
+		&events.CallTerminate{BasicCallMeta: callMeta(strings.Repeat("A", 300), 1700005000)},                        // oversized call ID
+	}
+	for _, e := range bad {
+		// true: whatsmeow acknowledges it once and never redelivers it.
+		if !p.handleCallEvent(e) {
+			t.Fatalf("malformed call event refused: %#v", e)
+		}
+	}
+	if got := skipCounts(t, p.Capture); got["skipped_call_event"] != len(bad) || len(got) != 1 {
+		t.Fatal(got)
+	}
+	if n := spoolFiles(t, p.Config.EventsDirectory); n != 0 || !p.ready.Load() {
+		t.Fatal("malformed call exported or provider stopped", n)
+	}
+	// A terminate of a call never offered here is not a malformed event: nothing is known about it.
+	if !p.handleCallEvent(&events.CallTerminate{BasicCallMeta: callMeta("NEVEROFFERED", 1700005001)}) || len(callEntries(t, p.Capture)) != 0 {
+		t.Fatal("a terminate without an offer was journaled")
+	}
+	if err := p.handleMessage(fixtureMessage("after", 1700005002)); err != nil {
+		t.Fatal(err)
+	}
+	if !p.handleCallEvent(callOffer("CALLOK", 1700005003, "audio")) || !p.handleCallEvent(&events.CallTerminate{BasicCallMeta: callMeta("CALLOK", 1700005010)}) {
+		t.Fatal("handler refused")
+	}
+	if n := spoolFiles(t, p.Config.EventsDirectory); n != 2 || len(callEntries(t, p.Capture)) != 1 {
+		t.Fatal("message and call after a malformed call event not captured", n)
+	}
+}
+
+// spec: ANYM-923
+func TestNativeCallEventsSendNothingToWhatsApp(t *testing.T) {
+	// The provider has no client: any reject, accept, receipt or other node sent for a call would panic here.
+	p := skipProvider(t)
+	if p.Client != nil {
+		t.Fatal("test provider must have no client")
+	}
+	group := callMeta("CALLSILENT2", 1700006000)
+	group.GroupJID = groupJID
+	for _, e := range []any{callOffer("CALLSILENT", 1700006000, "audio"), &events.CallAccept{BasicCallMeta: callMeta("CALLSILENT", 1700006001)}, &events.CallReject{BasicCallMeta: callMeta("CALLSILENT", 1700006002)},
+		&events.CallOfferNotice{BasicCallMeta: group, Media: "audio"}, &events.CallTerminate{BasicCallMeta: callMeta("CALLSILENT2", 1700006009)}} {
+		if !p.handleCallEvent(e) {
+			t.Fatal("handler refused")
+		}
+	}
+	if err := p.expireCalls(time.Unix(1700006000, 0).Add(3 * time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if len(callEntries(t, p.Capture)) != 2 {
+		t.Fatal("calls not recorded")
+	}
+	// The call capture code holds no client and no call or send API at all.
+	src, err := os.ReadFile("calls.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"Client", "RejectCall", "SendNode", "SendMessage", "sendNode", "DangerousInternals"} {
+		if bytes.Contains(src, []byte(forbidden)) {
+			t.Fatalf("calls.go names %s", forbidden)
+		}
 	}
 }
 

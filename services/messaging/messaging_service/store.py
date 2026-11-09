@@ -834,7 +834,7 @@ class Store:
                to_time='', after='', limit=20, *, accounts=None, chats=None, senders=None, collapse_forwards=True,
                query_mode='all', order='asc', before='', direction='', search_language='auto',
                fuzzy=False, compact=False, body_chars=None, include_coverage=True,view='archive',include_system=False,exclude_channels=False,
-               chat_types=None,include_channels=False,person='',body_format='',include_media_text=True,_scope=None):
+               chat_types=None,include_channels=False,person='',body_format='',include_media_text=True,_scope=None,**kinds):  # kinds: message_kinds, call_outcome (ANYM-923)
         # None is the internal no-default sentinel of message_queries.search, never a public value.
         if type(include_channels) is not bool:raise APIError('invalid_filter')
         from .message_queries import named_chats
@@ -847,7 +847,7 @@ class Store:
                 accounts=accounts,chats=chats,senders=senders,collapse_forwards=collapse_forwards,query_mode=query_mode,
                 order=order,before=before,direction=direction,search_language=search_language,
                 fuzzy=fuzzy,compact=compact,body_chars=body_chars,include_coverage=include_coverage,view=view,include_system=include_system,exclude_channels=exclude_channels,
-                chat_types=chat_types,include_channels=include_channels,person=person,body_format=body_format,include_media_text=include_media_text)
+                chat_types=chat_types,include_channels=include_channels,person=person,body_format=body_format,include_media_text=include_media_text,**kinds)
             self._search_suggestion(c,p,account,accounts,chat,chats,chat_types,exclude_channels,result)
             return result
 

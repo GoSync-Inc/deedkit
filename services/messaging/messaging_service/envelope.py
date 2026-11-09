@@ -144,6 +144,25 @@ def group_change(value):
     return {'change':value['change'],'actor':value['actor'],'participants':list(participants),'value':named}
 
 
+CALL_OUTCOMES=('missed','rejected','answered','unknown')
+CALL_FIELDS={'call_id','direction','media','group','started_at','ended_at','outcome'}
+
+
+def call_block(value):
+    """{call_id, direction, media, group, started_at, ended_at, outcome} of an incoming WhatsApp call (ANYM-923)."""
+    if (not isinstance(value,dict) or set(value)!=CALL_FIELDS or not isinstance(value['call_id'],str)
+            or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}',value['call_id']) or value['direction']!='incoming'
+            or value['media'] not in (None,'audio','video') or type(value['group']) is not bool
+            or value['outcome'] not in CALL_OUTCOMES):
+        raise ValueError('invalid_metadata')
+    try:
+        started=utc(value['started_at'])
+        ended=None if value['ended_at'] is None else utc(value['ended_at'])
+    except ValueError: raise ValueError('invalid_metadata') from None
+    if ended is not None and datetime.fromisoformat(ended)<datetime.fromisoformat(started):raise ValueError('invalid_metadata')
+    return {**value,'started_at':started,'ended_at':ended}
+
+
 def text(value, maximum, name, empty=False):
     if not isinstance(value, str) or '\x00' in value or len(value)>maximum or (not empty and not value):
         raise ValueError('invalid_'+name)
@@ -197,7 +216,7 @@ def validate(data):
         metadata=data['metadata']
         if not isinstance(metadata,dict) or set(metadata)-{'reply_to_provider_id','forwarded','media_kind','mentions_owner','reply_to_owner','sender_is_bot','chat_type','sender_identity_basis','is_service','is_self_chat','sender_is_contact','sender_is_business_or_verified',
                 'message_kind','provider_message_type','timestamp_resolution','media_duration_seconds','forward_origin','contact',
-                'web_preview_id','buttons','group_change','poll','poll_results','location'}:
+                'web_preview_id','buttons','group_change','call','poll','poll_results','location'}:
             raise ValueError('invalid_metadata')
         result['metadata']={}
         for key,value in metadata.items():
@@ -224,6 +243,10 @@ def validate(data):
                 # A pushed WhatsApp group change (ANYM-869); names and topics are member-set data.
                 if metadata.get('message_kind')!='group_change' or result['platform']!='whatsapp':raise ValueError('invalid_metadata')
                 value=group_change(value)
+            elif key=='call':
+                # An incoming WhatsApp call (ANYM-923): caller, media, times and outcome, never content.
+                if metadata.get('message_kind')!='call' or result['platform']!='whatsapp':raise ValueError('invalid_metadata')
+                value=call_block(value)
             elif key=='poll':
                 # A poll's question and options (ANYM-921); option texts are member-set data.
                 if metadata.get('message_kind')!='poll':raise ValueError('invalid_metadata')
@@ -253,7 +276,7 @@ def validate(data):
                     raise ValueError('invalid_metadata')
                 if key=='sender_identity_basis' and value!='authenticated_self':
                     raise ValueError('invalid_metadata')
-                if key=='message_kind' and value not in ('text','photo','video','voice','audio','document','sticker','location','contact','poll','system','group_change','unknown'):
+                if key=='message_kind' and value not in ('text','photo','video','voice','audio','document','sticker','location','contact','poll','system','group_change','call','unknown'):
                     raise ValueError('invalid_metadata')
                 if key=='timestamp_resolution' and value not in ('second','unknown'):
                     raise ValueError('invalid_metadata')
