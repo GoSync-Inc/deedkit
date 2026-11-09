@@ -1601,7 +1601,7 @@ without `activity`. Retention: with the operator's retention activation, the ret
 rows older than 35 days in bounded batches (a held definition keeps them), and the retirement of a
 closed definition (tombstone) deletes its rows. Rollout: migration 70 (expand: one table),
 `subscription_role.sql` (SELECT, INSERT, UPDATE, DELETE on this table only) and `gateway_role.sql`
-(SELECT on it); no switch.
+(SELECT, INSERT, UPDATE on it: the API adds read counts such as `reads_compact`, ANYM-826; no DELETE); no switch.
 
 ## Files of a named group or channel (ANYM-805)
 

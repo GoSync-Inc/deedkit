@@ -6,7 +6,7 @@
 -- savepoint); get_subscription shows the last 7 days of the key's current scope version; the retention job deletes
 -- rows older than 35 days and a retired definition's rows. A schema-69 runtime ignores the table; a schema-70 runtime
 -- on a schema-69 database skips the counts and answers get_subscription without `activity`. Grants: the worker role
--- reads and writes this table only (subscription_role.sql), the API role reads it (gateway_role.sql).
+-- reads and writes this table only (subscription_role.sql), the API role reads it and adds read counts, no DELETE (gateway_role.sql).
 SET LOCAL lock_timeout='2s';
 CREATE TABLE IF NOT EXISTS subscription_activity (
     subscription uuid NOT NULL REFERENCES subscriptions(id), day date NOT NULL, platform text NOT NULL,

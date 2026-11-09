@@ -891,7 +891,7 @@ def role_grants(store, role):
 # spec: ANYM-824
 @pytest.mark.parametrize(('template', 'base', 'added'), [
     ('subscription_role.sql', 'messaging_subscriptions', {'SELECT', 'INSERT', 'UPDATE', 'DELETE'}),
-    ('gateway_role.sql', 'messaging_gateway', {'SELECT'})])
+    ('gateway_role.sql', 'messaging_gateway', {'SELECT', 'INSERT', 'UPDATE'})])
 def test_activity_grants_add_only_the_new_table_to_each_role(seeded, template, base, added):
     store, _, _ = seeded
     previous = 'anym824_' + uuid4().hex[:10]
@@ -912,8 +912,8 @@ def test_activity_grants_add_only_the_new_table_to_each_role(seeded, template, b
             VALUES(%s,current_date,'telegram',1,'scanned',1)''', (sid,)),
             ('UPDATE subscription_activity SET n=n+1', ()), ('DELETE FROM subscription_activity', ())]
         for statement, params in writes:
-            if base == 'messaging_gateway':
-                # The API reads the counts and never writes them.
+            if base == 'messaging_gateway' and statement.startswith('DELETE'):
+                # The API reads and adds counts (ANYM-826 reads_compact) and never deletes them.
                 refused(store, role, statement, params)
             else:
                 with as_role(store, role) as c:
