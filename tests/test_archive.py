@@ -1340,6 +1340,67 @@ def test_identity_record_waits_for_the_account_lock(archive):
         assert c.execute('SELECT count(*) AS n FROM whatsapp_identity_observations WHERE source_message=%s',(mid,)).fetchone()['n']==1
 
 
+def advisory_waiters(s):
+    """Sessions waiting on an advisory lock (the residency or an account lock)."""
+    with s.pool.connection() as c:
+        return c.execute("SELECT count(*) AS n FROM pg_locks WHERE locktype='advisory' AND NOT granted").fetchone()['n']
+
+
+def finished_or_waiting(threads, s, call):
+    """Submits `call`; returns its future once it finished or waits on an advisory lock (at most 4 s)."""
+    import time
+    future=threads.submit(call); deadline=time.monotonic()+4
+    while not future.done() and not advisory_waiters(s) and time.monotonic()<deadline: time.sleep(.02)
+    return future
+
+
+def ingest_while_residency_held(ar, s, envelope):
+    """Ingests `envelope` while another transaction holds the global residency lock: whether it committed before
+    the lock was released (else it waited for it), and its result."""
+    from concurrent.futures import ThreadPoolExecutor
+    from messaging_service.file_lifecycle import lifecycle_lock
+    with ThreadPoolExecutor(max_workers=1) as threads:
+        with s.pool.connection() as holder:
+            lifecycle_lock(holder)
+            future=finished_or_waiting(threads,s,lambda:ar.ingest(envelope))
+            committed=future.done()
+        return committed,future.result(timeout=10)
+
+
+def with_original(ar, s, provider_id):
+    """A stored message with one downloaded original: an active attachment row."""
+    mid=ar.ingest(event(provider_id=provider_id,media=[{'provider_id':'asset-'+provider_id,'filename':'Synthetic.txt',
+        'mime':'text/plain','bytes':9}]))['message']
+    job=ar.claim_media('fixture',account='archive-test')
+    writer=BlobWriter(s.files,reserve_bytes=0);ar.finish_media(job,writer.write([b'synthetic']),writer)
+    return mid
+
+
+# spec: ANYM-839
+@pytest.mark.parametrize('case,waits',[('new_text',False),('text_edit',False),('media',True),
+    ('attachment_active',True),('attachment_inactive',True)])
+def test_text_ingest_without_attachment_rows_does_not_wait_for_the_residency_lock(archive,case,waits):
+    ar,s,_,_=archive
+    later='2026-10-01T12:05:00+00:00'
+    if case=='text_edit':ar.ingest(event(provider_id='lock-free'))
+    if case.startswith('attachment'):
+        with_original(ar,s,'lock-free')
+        if case=='attachment_inactive':
+            # An edit without the file leaves its attachment row inactive.
+            assert ar.ingest(event(provider_id='lock-free',body='Без файла',updated_at=later))['outcome']=='edited'
+            later='2026-10-01T12:10:00+00:00'
+    if case=='new_text':envelope=event(provider_id='lock-free')
+    elif case=='media':envelope=event(provider_id='lock-free',media=[{'provider_id':'asset-new','filename':'New.txt',
+        'mime':'text/plain','bytes':3}])
+    else:envelope=event(provider_id='lock-free',body='Edited text',updated_at=later)
+    committed,result=ingest_while_residency_held(ar,s,envelope)
+    assert committed is not waits
+    assert result['outcome']==('created' if case in ('new_text','media') else 'edited')
+    with s.pool.connection() as c:
+        active=[r['active'] for r in c.execute('SELECT active FROM attachments WHERE message=%s',(result['message'],))]
+    assert active==([False] if case.startswith('attachment') else [])
+
+
 # spec: ANYM-559
 def test_whatsapp_alias_capture_with_a_contradicting_observation_stays_a_conflict_and_fences(archive):
     from messaging_service.whatsapp_collector import WhatsAppState

@@ -10,7 +10,7 @@ from messaging_service.blobs import BlobWriter
 from messaging_service.storage_admission import STREAM_WORKSPACE_BYTES
 from messaging_service.telegram_collector import configuration
 from test_archive import archive as archive, event
-from test_collectors import worker as worker
+from test_collectors import idle_loop_wakes_on_own_media, worker as worker
 
 
 def original(ar, *, mid='17', age=300, size=4):
@@ -107,6 +107,25 @@ def test_worker_streams_original_without_waiting_for_analysis(worker,monkeypatch
     result=s.get_attachment(key,attachment['id'])
     assert result['download_status']=='ready'
     assert result['enrichment_status']!='ready'
+
+
+# spec: ANYM-839
+def test_idle_whatsapp_media_loop_waits_after_an_empty_claim_and_wakes_on_its_own_media_ingest(seeded,tmp_path):
+    from messaging_service.archive import Archive
+    from messaging_service.collector_state import CaptureSpool
+    from messaging_service.whatsapp_collector import WhatsAppCollector,WhatsAppState
+    s,_,_=seeded;ar=Archive(s);ar.register('wa-one','whatsapp','Synthetic WA',discover=True)
+    w=WhatsAppCollector(ar,'wa-one',SimpleNamespace(),CaptureSpool(tmp_path/'pages',reserve_bytes=0),
+        events_spool=CaptureSpool(tmp_path/'events',reserve_bytes=0),writer=BlobWriter(s.files,reserve_bytes=0),
+        owner='wa-fixture')
+    epoch=ar.acquire(w.account,w.owner);w.state=WhatsAppState(ar,w.account,(w.owner,epoch));w.policy=w.state.policy()
+    at=(datetime.now(timezone.utc)-timedelta(minutes=1)).isoformat()
+    envelope=event(account='wa-one',platform='whatsapp',chat='123@c.us',chat_title='Fixture',provider_id='wake-1',
+        sender='42@c.us',sent_at=at,updated_at=at,
+        media=[{'provider_id':'media-wake-1','filename':'voice.ogg','mime':'audio/ogg','bytes':4}])
+    async def ingest():
+        await asyncio.to_thread(w.state.apply,{'kind':'message','peer_kind':'user','envelope':envelope})
+    idle_loop_wakes_on_own_media(w,ingest)
 
 
 def config_path(tmp_path,**overrides):

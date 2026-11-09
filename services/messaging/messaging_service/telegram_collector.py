@@ -22,7 +22,7 @@ import time
 import traceback
 
 from .adapters import telegram_message
-from .archive import Archive
+from .archive import MEDIA_CONTENDED,Archive
 from .blobs import BlobWriter
 from .envelope import stable_id
 from .collector_state import LIVE_REJECT_CODES,CaptureSpool,CollectorState,PeerKindConflict,session_lock
@@ -592,6 +592,9 @@ CHAT_ATTEMPTS=3; CHAT_RETRY_DELAYS=(1,2,4)
 # Out-of-window backfill: at most one original per MEDIA_BACKFILL_INTERVAL seconds, and a
 # MEDIA_BACKFILL_IDLE pause once nothing is left, on top of the governor's request pacing.
 MEDIA_BACKFILL_INTERVAL=15; MEDIA_BACKFILL_IDLE=600
+# An idle media loop claims again after this many seconds, or at once when its own collector stores a message with
+# media; a contended claim (Archive.claim_media) is retried at once (ANYM-839).
+MEDIA_IDLE_SECONDS=5
 # Unapplied deletions (ANYM-789): a deletion event applies in line, so this sweep only repairs a crash between the
 # tombstone's commit and that call, or a chat whose peer_kind arrives later. Its query scans the account's archive.
 TOMBSTONE_SWEEP_SECONDS=60
@@ -1099,14 +1102,15 @@ class TelegramCollector:
         job=await asyncio.to_thread(self.archive.claim_media,self.owner,account=self.account,
                                     collector_lease=self.state.lease,since=self.history_since,writer=self.writer,
                                     media_prefetch_days=self.media_prefetch_days,**priority)
-        if not job and self.media_backfill and time.monotonic()>=self._backfill_due:
+        if job is None and self.media_backfill and time.monotonic()>=self._backfill_due:
             # Old voice notes and small files, one at a time between idle window claims,
             # paced so live media and history keep the shared provider budget.
             job=await asyncio.to_thread(self.archive.claim_media,self.owner,account=self.account,
                 collector_lease=self.state.lease,since=self.history_since,writer=self.writer,
                 media_prefetch_days=self.media_prefetch_days,backfill=True,**priority)
-            self._backfill_due=time.monotonic()+(MEDIA_BACKFILL_INTERVAL if job else MEDIA_BACKFILL_IDLE)
-        if not job: return False
+            self._backfill_due=time.monotonic()+(MEDIA_BACKFILL_IDLE if job is None else MEDIA_BACKFILL_INTERVAL)
+        # A contended claim is not idle: the loop claims again at once.
+        if not job: return job is MEDIA_CONTENDED
         writer=self.live_writer if job.get('_live_media') else self.writer
         async def renew():
             while True:
@@ -1175,15 +1179,27 @@ class TelegramCollector:
                 await asyncio.to_thread(self.archive.release_media_reservation,job)
         return True
 
+    def media_ingested(self):
+        """Wakes an idle media loop. The state calls it, from any thread, after it stored a message with media."""
+        wake=getattr(self,'_media_wake',None)
+        if wake is None:return
+        loop,event=wake
+        with suppress(RuntimeError):loop.call_soon_threadsafe(event.set)  # a closed loop has no media loop left
+
     async def media_loop(self):
         backoff=DbBackoff(self)
+        wake=asyncio.Event(); self._media_wake=(asyncio.get_running_loop(),wake)
+        if self.state is not None:self.state.media_ingested=self.media_ingested
         while True:
+            # Cleared before the claim, so an ingest during the claim ends the next wait at once.
+            wake.clear()
             try:active=await self.media_once()
             except database_errors():
                 # An unfinished job's lease expires and it is claimed again later.
                 await backoff.wait(); continue
             backoff.reset()
-            if not active: await asyncio.sleep(1)
+            if not active:
+                with suppress(TimeoutError):await asyncio.wait_for(wake.wait(),MEDIA_IDLE_SECONDS)
 
     def disk_floors(self):
         """Media and capture floors of this run per volume (ANYM-350)."""

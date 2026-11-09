@@ -1,4 +1,5 @@
 """An idle media claim reaches only claimable jobs, however large the dormant backlog."""
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json
@@ -88,7 +89,7 @@ def explained(ar, plans):
                 plan=self.c.execute('EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) '+query,params).fetchone()
                 self.c.execute('ROLLBACK TO SAVEPOINT explain_claim')
                 plans.append((query,next(iter(plan.values()))[0]['Plan']))
-                if 'FOR UPDATE OF j SKIP LOCKED' in query:
+                if archive_module.MEDIA_PICK_MARK in query:
                     assert self.c.execute('SHOW plan_cache_mode').fetchone()['plan_cache_mode']=='force_custom_plan'
             return self.c.execute(query,params,**kwargs)
 
@@ -142,7 +143,8 @@ def assert_bounded(plans, indexes):
 
 
 def selection_is_indexed(plans):
-    query,plan=next((q,p) for q,p in plans if 'FOR UPDATE OF j SKIP LOCKED' in q)
+    # The lock-free pick (ANYM-839) is the selection; its recheck reads one id.
+    query,plan=next((q,p) for q,p in plans if archive_module.MEDIA_PICK_MARK in q)
     text=json.dumps(plan)
     # The whole plan in the message: pytest truncates the compared JSON, and a plan that skips an index is
     # rare enough (one CI run in many) that the failure report must carry it.
@@ -379,6 +381,139 @@ def test_job_found_by_both_paths_is_claimed_once_and_locked_rows_are_skipped(bac
     with s.pool.connection() as c:
         assert c.execute('SELECT state,attempts FROM media_jobs WHERE message=%s',(other,)).fetchone()=={
             'state':'queued','attempts':0}
+
+
+@contextmanager
+def lock_holds(ar, holds):
+    """Milliseconds each transaction held the global residency lock: clock_timestamp() right after its lock
+    statement and again before its commit."""
+    from messaging_service.file_lifecycle import LOCK_NAME
+    pool=ar.store.pool; real=pool.connection
+
+    @contextmanager
+    def connection(*args,**kwargs):
+        with real(*args,**kwargs) as c:
+            started=[]
+
+            class Timed:
+                def __getattr__(self,name): return getattr(c,name)
+                def execute(self,query,params=None,**kwargs):
+                    result=c.execute(query,params,**kwargs)
+                    if not started and 'pg_advisory_xact_lock' in query and params==(LOCK_NAME,):
+                        started.append(c.execute('SELECT clock_timestamp() AS at').fetchone()['at'])
+                    return result
+            yield Timed()
+            if started:
+                ended=c.execute('SELECT clock_timestamp() AS at').fetchone()['at']
+                holds.append((ended-started[0]).total_seconds()*1000)
+
+    pool.connection=connection
+    try: yield holds
+    finally: pool.connection=real
+
+
+def picks(monkeypatch, after):
+    """Calls `after(picked, lost)` right after each lock-free pick of a claim, before its locks are taken."""
+    real=archive_module.Archive._media_pick
+    def pick(self,params,lost):
+        picked=real(self,params,lost); after(picked,list(lost)); return picked
+    monkeypatch.setattr(archive_module.Archive,'_media_pick',pick)
+
+
+# spec: ANYM-839
+def test_a_job_another_claimer_leases_between_pick_and_lock_is_not_leased_twice(backlog, monkeypatch):
+    ar,s,claim,_=backlog
+    first=message(ar,'first',3600); second=message(ar,'second',7200)
+    rival=[]
+    def lease_it_first(picked,lost):
+        if not rival:
+            rival.append(None); rival[0]=claim()
+    picks(monkeypatch,lease_it_first)
+    job=claim()
+    assert rival[0]['message']==first and job['message']==second
+    with s.pool.connection() as c:
+        assert c.execute('''SELECT array_agg(attempts ORDER BY message) AS n FROM media_jobs
+            WHERE message=ANY(%s)''',([first,second],)).fetchone()['n']==[1,1]
+
+
+# spec: ANYM-839
+def test_concurrent_claimers_never_lease_the_same_job(backlog):
+    ar,s,claim,_=backlog
+    jobs=[message(ar,f'many-{n}',3600+n) for n in range(12)]
+    def claims():
+        leased=[]
+        while (job:=claim()) is not None:
+            if job: leased.append(job['id'])
+        return leased
+    with ThreadPoolExecutor(max_workers=4) as threads:
+        leased=[job for got in threads.map(lambda _:claims(),range(4)) for job in got]
+    assert len(leased)==len(set(leased))==len(jobs)
+    with s.pool.connection() as c:
+        assert c.execute('SELECT array_agg(DISTINCT attempts) AS n FROM media_jobs WHERE message=ANY(%s)',
+            (jobs,)).fetchone()['n']==[1]
+
+
+# spec: ANYM-839
+@pytest.mark.parametrize('change',['deleted','superseded','cooldown','on_request'])
+def test_a_job_that_becomes_ineligible_between_pick_and_lock_is_not_leased(backlog, monkeypatch, change):
+    ar,s,claim,_=backlog;mid=message(ar,'recent',3600)
+    def make_ineligible(picked,lost):
+        if picked and not lost:
+            with s.pool.connection() as c:
+                if change=='deleted':c.execute('UPDATE messages SET deleted=true WHERE id=%s',(mid,))
+                elif change=='superseded':c.execute("UPDATE media_jobs SET state='superseded' WHERE message=%s",(mid,))
+                elif change=='cooldown':c.execute("UPDATE media_jobs SET next_due=clock_timestamp()+interval '1 hour' WHERE message=%s",(mid,))
+                # A group chat without a subscription is on request (ANYM-805): its unrequested job waits.
+                else:c.execute("UPDATE chats SET chat_type='group' WHERE id=(SELECT chat FROM messages WHERE id=%s)",(mid,))
+    picks(monkeypatch,make_ineligible)
+    assert claim() is None
+    with s.pool.connection() as c:
+        assert c.execute('SELECT attempts,lease_owner FROM media_jobs WHERE message=%s',(mid,)).fetchone()=={
+            'attempts':0,'lease_owner':None}
+
+
+# spec: ANYM-839
+def test_three_lost_picks_return_contended_and_the_next_claim_leases(backlog):
+    ar,s,claim,_=backlog
+    held=[message(ar,f'held-{n}',3600+n) for n in range(3)]; spare=message(ar,'spare',7200)
+    with s.pool.connection() as lock:
+        # Another transaction (an ingest of the same message, say) holds each of the three best jobs' rows.
+        lock.execute('SELECT id FROM media_jobs WHERE message=ANY(%s) FOR UPDATE',(held,))
+        result=claim()
+        assert result is archive_module.MEDIA_CONTENDED and not result
+    with s.pool.connection() as c:
+        assert c.execute('SELECT sum(attempts) AS n FROM media_jobs WHERE message=ANY(%s)',(held+[spare],)).fetchone()['n']==0
+    assert claim()['message']==held[0]
+
+
+def grow_cooling(s, count):
+    """Recent queued jobs of the personal chat in their retry cooldown: the window reaches every one, none is due."""
+    with s.pool.connection() as c:
+        c.execute("SET LOCAL statement_timeout='120s'")
+        chat=stable_id('chat',ACCOUNT,'100')
+        c.execute('''INSERT INTO chats(id,account,title,provider_chat) VALUES(%s,%s,'Fixture room','100')
+            ON CONFLICT DO NOTHING''',(chat,ACCOUNT))
+        c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at)
+            SELECT 'cooling-msg-'||n,%s,%s,'cooling-'||n,'42','',clock_timestamp()-(n%%6000)*interval '1 minute'
+            FROM generate_series(1,%s::int) n''',(ACCOUNT,chat,count))
+        c.execute('''INSERT INTO media_jobs(id,account,message,descriptor,state,attempts,next_due,error_code)
+            SELECT 'cooling-job-'||n,%s,'cooling-msg-'||n,jsonb_build_object('provider_id','cooling-'||n,'mime','audio/ogg',
+                'bytes',4),'queued',1,clock_timestamp()+interval '1 hour','network_error'
+            FROM generate_series(1,%s::int) n''',(ACCOUNT,count))
+        c.execute('ANALYZE messages'); c.execute('ANALYZE media_jobs')
+
+
+# spec: ANYM-839
+def test_an_empty_claim_holds_the_residency_lock_under_5_ms_over_16000_queued_jobs(backlog):
+    ar,s,claim,_=backlog
+    grow_cooling(s,16_000)
+    assert claim() is None  # the due sweep, once
+    holds=[]
+    with lock_holds(ar,holds):
+        for _ in range(5): assert claim() is None
+    assert len(holds)==5,holds
+    print(f'\n16000 cooling jobs: empty claim lock hold ms {sorted(holds)}')
+    assert sorted(holds)[2]<5,holds
 
 
 def test_ordering_ties_follow_next_due_then_id(backlog):

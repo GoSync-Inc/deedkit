@@ -590,6 +590,10 @@ class CollectorState:
             if not self.allows(self.policy(),e['chat']): return {'outcome':'excluded'}
             self.chat(e['chat'],capture['peer_kind'])
             result=self.archive.ingest(e,lease=self.lease,identity_observations=capture.get('identity_observations',[]))
+            if e['media'] and result['outcome'] in ('created','edited'):
+                # A new media job: the collector's idle media loop claims it at once (ANYM-839).
+                wake=getattr(self,'media_ingested',None)
+                if wake is not None:wake()
             if result['outcome'] not in ('excluded','conflict','stale','tombstoned','deleted'):
                 from .whatsapp_identity import record
                 record(self.archive,e,capture.get('identity_observations',[]),self.lease)
