@@ -159,8 +159,10 @@ def next_job(c, account):
             continue
         if row['_recovery_attempts'] >= RECOVERY_BUDGET:
             # Its last attempt's lease expired: the collector stopped or lost it mid-transfer.
-            _settle(c, row['id'], 'still_failing', code='lease_expired', leased=leased)
             from . import attachment_failures
+            # The job row is held: the message is taken without waiting, else the claim gives its turn back.
+            if not attachment_failures.lock_message(c, row['message']): return None
+            _settle(c, row['id'], 'still_failing', code='lease_expired', leased=leased)
             attachment_failures.publish(c, [{**row, 'reason': 'retry_exhausted'}])
             continue
         return row

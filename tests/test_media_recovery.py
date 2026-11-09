@@ -307,6 +307,26 @@ def test_an_operator_requeue_that_fails_again_commits_a_new_failure_and_one_that
             WHERE j.id=%s AND e.kind='attachment.ready' ''', (other,)).fetchone()['n'] == 1
 
 
+# spec: ANYM-867
+def test_a_recovery_that_ends_on_a_size_refusal_or_a_spent_lease_commits_its_failure_once(wa):
+    ar, s = wa
+    big = failed_for_good(ar, s, '1')
+    recover(s)
+    assert ar.claim_media('worker', account=ACCOUNT, writer=BlobWriter(s.files, max_bytes=3, reserve_bytes=0)) is None
+    assert recovery(s, big)['state'] == 'still_failing' and recovery(s, big)['last_code'] == 'size_limit'
+    assert [e['processing']['failed'][0]['reason'] for e in failure_events(s, big)] == ['retry_exhausted', 'size_limit']
+    # The last recovery attempt's lease ran out: the claim ends it still_failing and commits its failure once.
+    spent = failed_for_good(ar, s, '2')
+    recover(s)
+    assert claim(ar)['id'] == spent
+    with s.pool.connection() as c:
+        c.execute("UPDATE media_recovery SET attempts=%s,lease_until=now()-interval '1 second' WHERE job=%s",
+            (mr.RECOVERY_BUDGET, spent))
+    assert claim(ar) is None and claim(ar) is None
+    assert recovery(s, spent)['state'] == 'still_failing' and recovery(s, spent)['last_code'] == 'lease_expired'
+    assert len(failure_events(s, spent)) == 2
+
+
 # spec: ANYM-816
 @pytest.mark.parametrize('status', ['403', '404', '410'])
 def test_a_cdn_refusal_ends_provider_unavailable(wa, status):

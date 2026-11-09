@@ -758,6 +758,58 @@ def test_attachment_failed_has_one_event_per_sweep_through_replay_race_and_crash
     assert len({e['event_key'] for e in failed_events(s)})==2
 
 
+def job_of(s,message):
+    with s.pool.connection() as c:
+        return c.execute('SELECT id FROM media_jobs WHERE message=%s',(message,)).fetchone()['id']
+
+
+# spec: ANYM-867
+def test_a_terminal_fail_media_and_an_edit_locking_message_then_job_do_not_deadlock(archive):
+    # Ingest and the purge lock the message before its jobs; fail_media takes the message before the job row.
+    import threading,psycopg
+    from psycopg.rows import dict_row
+    ar,s,_,_=archive
+    mid=ar.ingest(media_event())['message']; job=ar.claim_media('worker')
+    errors=[];done=threading.Event()
+    with psycopg.connect(s.pool.conninfo,row_factory=dict_row) as edit:
+        edit.execute('SELECT id FROM messages WHERE id=%s FOR UPDATE',(mid,))
+        def fail():
+            try:ar.fail_media(job,'unavailable',permanent=True)
+            except Exception as exc:errors.append(exc)
+            finally:done.set()
+        worker=threading.Thread(target=fail);worker.start()
+        assert not done.wait(0.5)  # fail_media waits for the message, not holding the job
+        edit.execute("UPDATE media_jobs SET requested_until=NULL WHERE id=%s",(job['id'],))
+        edit.commit()
+    worker.join(10)
+    assert errors==[] and len(failed_events(s,mid))==1
+
+
+# spec: ANYM-867
+def test_a_held_message_delays_only_its_own_sweep_and_never_holds_ingest(archive):
+    import threading,time,psycopg
+    ar,s,key,_=archive
+    free=ar.ingest(media_event())['message']
+    held=ar.ingest(media_event(provider_id='19'))['message']
+    with s.pool.connection() as c:
+        c.execute("UPDATE media_jobs SET state='leased',lease_owner='worker',attempts=%s,lease_until=now()-interval '1 second'",
+            (MEDIA_MAX_ATTEMPTS,))
+    with psycopg.connect(s.pool.conninfo) as edit:
+        edit.execute('SELECT id FROM messages WHERE id=%s FOR UPDATE',(held,))
+        ar._media_sweeps.clear()
+        sweeping=threading.Thread(target=ar.claim_media,args=('worker',));sweeping.start()
+        started=time.monotonic()
+        ar.ingest(event(provider_id='20',body='ingest during the sweep'))  # no account lock or feed counter held
+        sweeping.join(10)
+        assert not sweeping.is_alive() and time.monotonic()-started<2
+    assert len(failed_events(s,free))==1 and failed_events(s,held)==[]
+    with s.pool.connection() as c:
+        assert c.execute('SELECT state FROM media_jobs WHERE id=%s',(job_of(s,held),)).fetchone()['state']=='leased'
+    ar._media_sweeps.clear()
+    assert ar.claim_media('worker') is None  # the next sweep takes the released message's job
+    assert len(failed_events(s,held))==1
+
+
 # spec: ANYM-867
 def test_a_publication_that_keeps_failing_sets_the_job_aside_and_the_sweep_moves_on(archive,monkeypatch):
     from messaging_service import attachment_failures,subscriptions
@@ -771,6 +823,8 @@ def test_a_publication_that_keeps_failing_sets_the_job_aside_and_the_sweep_moves
             tries.append(message); c.execute('SELECT 1/0')
         return real(c,account,message,group)
     monkeypatch.setattr(attachment_failures,'_append',poisoned)
+    def closed_stdout(*args,**kwargs):raise BrokenPipeError()
+    monkeypatch.setattr(attachment_failures,'print',closed_stdout,raising=False)  # its log line cannot be written
     before=attachment_failures.SET_ASIDE['DivisionByZero'],subscriptions.JOURNAL_FAILURES['attachment.failed']
     expire_last_attempt(ar,s)
     assert ar.claim_media('worker') is None

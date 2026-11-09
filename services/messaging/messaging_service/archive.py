@@ -20,7 +20,9 @@ from .incoming_formatting import credential_link, known as known_formatting, unk
 # The retry-exhausted sweep has no selective index: one Archive (a collector)
 # runs it on its first media claim for an account, then at most once per this.
 MEDIA_SWEEP_SECONDS = 60
+# ANYM-867: jobs one sweep fails, and its time, beyond which the remaining messages wait for the next sweep.
 MEDIA_SWEEP_LIMIT = 100
+MEDIA_SWEEP_BUDGET_SECONDS = 5
 # Out-of-window originals the background backfill fetches by itself: voice notes, then
 # small files. Larger ones stay available on an explicit request.
 BACKFILL_VOICE_MIMES = ('audio/ogg','audio/opus')
@@ -633,30 +635,21 @@ class Archive:
         params={'live_max':live_max,'live_window':live_window_seconds,'account':account,'since':since,
             'days':media_prefetch_days,'backfill_ids':backfill_ids,'max_attempts':MEDIA_MAX_ATTEMPTS,**tiers}
         lost=[]
+        # Attachment status already reports an expired last-attempt lease as retry_exhausted until this sweep
+        # rewrites it. ANYM-867: it runs in transactions of its own, outside this claim's lifecycle and storage locks.
+        with self._media_sweep(account) as sweep:
+            if sweep:self._sweep_exhausted_media(account)
         for _ in range(MEDIA_CLAIM_PICKS):
             # The search runs in a transaction of its own with no advisory or row lock (ANYM-839); a lost
             # recheck below commits, releasing every lock, before the next pick.
             pick=self._media_pick(params,lost)
-            with self._media_sweep(account) as sweep, self.store.pool.connection() as c:
+            with self.store.pool.connection() as c:
                 from .file_lifecycle import lifecycle_lock
                 lifecycle_lock(c)
                 StorageAdmission.lock_and_reap(c)
                 if collector_lease is not None:
                     if account is None: raise ValueError('collector_account_required')
                     self.fence(c,account,collector_lease)
-                if sweep:
-                    # Attachment status already reports an expired last-attempt lease as
-                    # retry_exhausted until this sweep rewrites it.
-                    # ANYM-867: at most MEDIA_SWEEP_LIMIT jobs per sweep (the rest wait for the next one), so the
-                    # events written below hold the claim's locks for a bounded time.
-                    swept=c.execute("""UPDATE media_jobs SET state='failed',error_code='retry_exhausted',lease_until=NULL
-                        WHERE id IN (SELECT id FROM media_jobs WHERE state='leased' AND attempts>=%s
-                        AND lease_until<clock_timestamp() AND NOT starts_with(coalesce(lease_owner,''),'recovery:')
-                        AND (%s::text IS NULL OR account=%s) ORDER BY id LIMIT %s FOR UPDATE SKIP LOCKED)
-                        RETURNING id,account,message,attempts""",
-                        (MEDIA_MAX_ATTEMPTS,account,account,MEDIA_SWEEP_LIMIT)).fetchall()
-                    # The jobs this statement moved to failed: one event per message, in this transaction.
-                    if swept:attachment_failures.publish(c,[{**r,'reason':'retry_exhausted'} for r in swept])
                 recovery=False
                 if pick is None:
                     # ANYM-816: an operator recovery job only when no other job of the account is claimable.
@@ -680,6 +673,13 @@ class Archive:
                     try:reservation=StorageAdmission(selected_writer).reserve(c,job,expires)
                     except ValueError as exc:
                         if str(exc)!='media_size_limit':raise
+                        # ANYM-867: the failure event needs the message, and the job row is already held, so it is
+                        # taken without waiting; an edit or purge holding it now leaves the refusal for a minute later.
+                        if not attachment_failures.lock_message(c,job['message']):
+                            if recovery:media_recovery.held_back(c,job);return None
+                            c.execute("UPDATE media_jobs SET next_due=clock_timestamp()+interval '60 seconds' WHERE id=%s",
+                                (job['id'],))
+                            return None
                         if recovery:
                             media_recovery.held_back(c,job,size_limit=True)
                             attachment_failures.publish(c,[{**job,'reason':'size_limit'}])
@@ -701,6 +701,35 @@ class Archive:
                 if reservation is not None:claimed['_storage_reservation']=reservation
                 return claimed
         return MEDIA_CONTENDED
+
+    def _sweep_exhausted_media(self,account):
+        """ANYM-867: fail the expired last-attempt leases (at most MEDIA_SWEEP_LIMIT, the rest wait for the next sweep)
+        in one short transaction per message, in ingest's and the purge's order: the message, its jobs, then the
+        attachment.failed event. A message an edit, delete or purge holds is skipped at once (NOWAIT) and its jobs
+        wait for the next sweep; no account lock is taken, so ingest never waits for a sweep. Each transaction runs
+        under attachment_failures.BUDGET timeouts and the pass under MEDIA_SWEEP_BUDGET_SECONDS."""
+        import psycopg
+        exhausted="""state='leased' AND attempts>=%(max)s AND lease_until<clock_timestamp()
+            AND NOT starts_with(coalesce(lease_owner,''),'recovery:')"""
+        with self.store.pool.connection() as c:
+            rows=c.execute('SELECT id,account,message FROM media_jobs WHERE '+exhausted+
+                ' AND (%(account)s::text IS NULL OR account=%(account)s) ORDER BY id LIMIT %(limit)s',
+                {'max':MEDIA_MAX_ATTEMPTS,'account':account,'limit':MEDIA_SWEEP_LIMIT}).fetchall()
+        groups={}
+        for r in rows:groups.setdefault((r['account'],r['message']),[]).append(r['id'])
+        deadline=monotonic()+MEDIA_SWEEP_BUDGET_SECONDS
+        for (aid,mid),ids in groups.items():
+            if monotonic()>deadline:break
+            try:
+                with self.store.pool.connection() as c:
+                    attachment_failures.bounded(c)
+                    c.execute('SELECT FROM messages WHERE id=%s FOR KEY SHARE NOWAIT',(mid,))
+                    swept=c.execute("UPDATE media_jobs SET state='failed',error_code='retry_exhausted',lease_until=NULL "
+                        'WHERE id=ANY(%(ids)s) AND '+exhausted+' RETURNING id,account,message,attempts',
+                        {'ids':ids,'max':MEDIA_MAX_ATTEMPTS}).fetchall()
+                    attachment_failures.publish(c,[{**r,'reason':'retry_exhausted'} for r in swept])
+            except (psycopg.errors.LockNotAvailable,psycopg.errors.QueryCanceled):
+                continue  # held by an edit, a delete or a purge: the next sweep takes these jobs
 
     @staticmethod
     def _media_claim_query(columns,on_request,tail):
@@ -977,6 +1006,9 @@ class Archive:
         if retry_after is not None and (type(retry_after) is not int or not 1<=retry_after<2**31):
             raise ValueError('invalid_retry_delay')
         with self.store.pool.connection() as c:
+            # ANYM-867: ingest's and the purge's order, the message before the job row: a terminal outcome's
+            # attachment.failed insert takes the message's key-share lock (its foreign key).
+            c.execute('SELECT FROM messages WHERE id=%s FOR KEY SHARE',(job['message'],))
             self.fence(c,job['account'],collector_lease)
             row=self.job_fence(c,job)
             from .storage_admission import StorageAdmission
