@@ -985,11 +985,14 @@ Builds are not reproducible, so image IDs differ on every release. `prepare` the
 input digest per selected service from what the repository and host control: the full content of the
 target's Dockerfile and its context's `.dockerignore`; the stage and build arguments without
 `DEEDKIT_SOURCE_SHA`/`VERSION_REF`; the git objects (with their modes) at the release commit of every
-context path the target's stage chain copies (`COPY --from` stages and base stages included); for an
+context path the target's stage chain copies (`COPY --from`, `RUN --mount=from=` and base stages
+included; `<Dockerfile>.dockerignore` too); for an
 image that copies `services/messaging/messaging_service`, its migrations as a part of their own; the
 rendered Compose service without `image`, `build` and the revision and input labels; and sha256 digests
-of its env files, bind-mounted files and the files of the top-level secrets and configs it uses (a
-mounted directory counts by path only). A version constant (`INPUT_VERSION`) is part of the digest, so a
+of its env files, bind-mounted files and the top-level secrets and configs it uses (definition and
+file). A directory mounted read-only is configuration and is hashed by content (each entry's path and
+mode, file content, link target; at most 2000 entries and 64 MiB, beyond that the service is always
+recreated); a writable mounted directory (sessions, spools, data) counts by path only. A version constant (`INPUT_VERSION`) is part of the digest, so a
 change of the rule recreates every service once. A recreated service's container carries the digest as
 the label `io.deedkit.production.inputs`.
 

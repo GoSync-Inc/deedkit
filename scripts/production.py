@@ -1052,7 +1052,7 @@ def dockerfile_stages(text):
     for line in dockerfile_lines(text):
         instruction, _, arguments = line.partition(" ")
         instruction = instruction.upper()
-        if instruction in ("RUN", "COPY", "ADD") and re.search(r"<<-?\s*['\"]?[A-Za-z_]", arguments):
+        if instruction in ("RUN", "COPY", "ADD") and "<<" in arguments:  # a heredoc (or a here-string): not read
             raise Unreadable(f"a {instruction} heredoc")
         if instruction == "FROM":
             words = [word for word in arguments.split() if not word.startswith("--")]
@@ -1070,19 +1070,21 @@ def dockerfile_stages(text):
             origin = [flag.partition("=")[2].lower() for flag in flags if flag.startswith("--from=")]
             if origin:
                 stages[-1]["from"].append(origin[0])
-            elif instruction == "ADD" and any(re.match(r"[a-z]+://", source) or re.search(r"\.(tar|gz|tgz|bz2|xz|zst)$", source)
+            elif instruction == "ADD" and any(re.match(r"[a-z]+://|git@", source) or re.search(r"\.(tar|gz|tgz|bz2|xz|zst)$", source)
                                               for source in sources):
                 raise Unreadable("ADD of a URL or an archive")
             else:
                 stages[-1]["copies"].extend(sources)
         elif instruction == "ONBUILD":
             raise Unreadable("ONBUILD")
-        elif instruction == "RUN":
+        elif instruction == "RUN" and stages:
             for option in re.findall(r"--mount=(\S+)", arguments):
                 values = dict(item.partition("=")[::2] for item in option.split(","))
                 # A mount without `type` is a bind mount of the build context unless it names `from`.
                 if values.get("type", "bind") == "bind" and "from" not in values:
                     raise Unreadable("RUN --mount of the build context")
+                if "from" in values:  # a stage (or an image, which the Dockerfile content names) the RUN reads
+                    stages[-1]["from"].append(values["from"].lower())
     if not stages:
         raise Unreadable("a Dockerfile without a stage")
     return stages
@@ -1197,19 +1199,23 @@ def input_directory_digest(path):
     try:
         for root, directories, files in os.walk(path, onerror=refuse):
             directories.sort()
-            for name in sorted(files) + [item for item in directories if os.path.islink(os.path.join(root, item))]:
+            for name in sorted(files) + directories:
                 full = os.path.join(root, name)
                 found = os.lstat(full)
                 relative = os.path.relpath(full, path)
+                if len(listing) >= INPUT_DIRECTORY_FILES:
+                    raise Unreadable(f"{path} has too many entries to hash as configuration")
                 if stat.S_ISLNK(found.st_mode):
                     listing[relative] = "link " + os.readlink(full)
+                elif stat.S_ISDIR(found.st_mode):
+                    listing[relative] = f"directory {found.st_mode:o}"
                 elif stat.S_ISREG(found.st_mode):
                     total += found.st_size
-                    if len(listing) >= INPUT_DIRECTORY_FILES or total > INPUT_DIRECTORY_BYTES:
+                    if total > INPUT_DIRECTORY_BYTES:
                         raise Unreadable(f"{path} is too large to hash as configuration")
                     listing[relative] = f"{found.st_mode:o} " + hashlib.sha256(Path(full).read_bytes()).hexdigest()
                 else:
-                    raise Unreadable(f"{full} is neither a file nor a link")
+                    raise Unreadable(f"{full} is neither a file, a directory nor a link")
     except OSError as exc:
         raise Unreadable(f"{path} cannot be read") from exc
     return "directory " + digest(listing)
@@ -1243,7 +1249,8 @@ def host_inputs(document, service):
         env[path] = input_file_digest(path.replace("$$", "$"))
     for volume in unit.get("volumes") or []:
         if isinstance(volume, dict) and volume.get("type") == "bind" and isinstance(volume.get("source"), str):
-            mounts[volume["source"]] = input_file_digest(volume["source"], configuration=bool(volume.get("read_only")))
+            mounts[volume["source"] + " -> " + str(volume.get("target"))] = input_file_digest(
+                volume["source"], configuration=bool(volume.get("read_only")))
     for kind in ("secrets", "configs"):
         for entry in unit.get(kind) or []:
             name = entry.get("source") if isinstance(entry, dict) else entry
@@ -1878,6 +1885,16 @@ def steady(actual):
                 and ("Health" not in condition or (condition["Health"] or {}).get("Status") == "healthy"))
 
 
+def check_kept(release, sha, receipt, evidence, touched, project, item):
+    """After a project's settle and again after the last project: every service the release kept still runs steadily
+    (healthy, when it has a healthcheck); otherwise the release is `unhealthy`, like a failed replacement."""
+    for service in item.get("kept") or {}:
+        actual = json.loads(run(["docker", "inspect", item["running"][service]["container"]]))[0]
+        if not steady(actual):
+            unhealthy(release, sha, receipt, evidence, touched,
+                      Refused(f"kept {project['name']}/{service} is not running steadily"))
+
+
 def apply(settings, sha, *, backup_waited=0):
     promotable(sha)
     state = Path(settings["state_directory"])
@@ -1969,10 +1986,12 @@ def apply(settings, sha, *, backup_waited=0):
                 unproven.append((service, ids[0], actual))
         if failure := restart_loop(project, item, unproven):
             unhealthy(release, sha, receipt, evidence, touched, Refused(failure))
+        check_kept(release, sha, receipt, evidence, touched, project, item)
     # What rollback must find unchanged before it stops anything, captured the way prepare captures the baseline.
     # It must still be what this apply started: a change meanwhile leaves the attempt unresolved.
     restore = []
     for project, item in zip(settings["projects"], receipt["projects"], strict=True):
+        check_kept(release, sha, receipt, evidence, touched, project, item)
         document, running = snapshot(project)
         try:
             check_inputs(project, item, document)
@@ -2015,7 +2034,8 @@ def restart_loop(project, item, unproven):
         condition = actual.get("State", {})
         kept = identity.startswith(item["running"][service]["container"])
         allowed = first.get("RestartCount", 0) if kept else 0
-        if condition.get("Restarting") or not condition.get("Running") or actual.get("RestartCount", 0) > allowed:
+        if (condition.get("Restarting") or condition.get("Paused") or not condition.get("Running")
+                or actual.get("RestartCount", 0) > allowed):
             return (f"replacement {project['name']}/{service} is restarting or stopped {APPLY_SETTLE_SECONDS} s after "
                     f"it started (restarts: {actual.get('RestartCount', 0)})")
     return None

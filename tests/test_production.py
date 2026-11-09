@@ -1717,6 +1717,9 @@ def dockerfile_copy_sources(text, target):
             words = [word for word in words[1:] if not word.startswith("--platform")]
             stages.append({"name": words[2].lower() if len(words) == 3 else None, "base": words[0].lower(),
                            "needs": [], "sources": set()})
+        elif words[0].upper() == "RUN" and stages:
+            stages[-1]["needs"] += [option.split("from=", 1)[1].split(",")[0].lower() for option in words
+                                    if option.startswith("--mount=") and "from=" in option]
         elif words[0].upper() in ("COPY", "ADD") and stages:
             origin = [word.split("=", 1)[1].lower() for word in words if word.startswith("--from=")]
             if origin:
@@ -1772,7 +1775,8 @@ def test_every_build_target_stage_chain_is_covered_by_the_input_digest():
                                          "RUN --mount=type=bind,source=.,target=/src true", "ADD vendor.tar.gz /x",
                                          "RUN --mount=source=.,target=/src true", "RUN <<EOF\ntrue\nEOF",
                                          "COPY <<EOF /x\nCOPY a b\nEOF", 'COPY "src file.py" /app/',
-                                         "COPY src --chmod=644 /app/"])
+                                         "COPY src --chmod=644 /app/", "RUN <<1\nFROM scratch\n1",
+                                         "ADD git@example.invalid:x.git /x"])
 def test_a_dockerfile_instruction_the_digest_cannot_place_refuses_the_keep(instruction):
     with pytest.raises(p.Unreadable):
         p.dockerfile_stages("FROM python:3.13-slim AS one\n" + instruction + "\n")
@@ -1782,11 +1786,34 @@ def test_a_dockerfile_instruction_the_digest_cannot_place_refuses_the_keep(instr
 def test_the_stage_chain_reads_options_before_json_index_references_and_any_case():
     text = ('FROM python:3.13-slim AS Build\nCOPY --chmod=644 ["src/file.py", "lib", "/app/"]\n'
             "FROM python:3.13-slim\nCOPY tools /tools\n"
-            "FROM python:3.13-slim\nCOPY --from=0 /app /app\nCOPY --from=1 /tools /tools\nCOPY --from=BUILD /x /x\n")
+            "FROM python:3.13-slim AS mounted\nCOPY vendor /vendor\n"
+            "FROM python:3.13-slim\nCOPY --from=0 /app /app\nCOPY --from=1 /tools /tools\nCOPY --from=BUILD /x /x\n"
+            "RUN --mount=type=bind,from=Mounted,target=/m true\n")
     chain = p.stage_chain(p.dockerfile_stages(text), "")
-    assert sorted(path for stage in chain for path in stage["copies"]) == ["lib", "src/file.py", "tools"]
+    assert sorted(path for stage in chain for path in stage["copies"]) == ["lib", "src/file.py", "tools", "vendor"]
     assert sorted(dockerfile_copy_sources(text.replace('--chmod=644 ["src/file.py", "lib", "/app/"]', "src/file.py lib /app/"),
-                                          "")) == ["lib", "src/file.py", "tools"]
+                                          "")) == ["lib", "src/file.py", "tools", "vendor"]
+
+
+# spec: ANYM-895
+def test_a_configuration_directory_digest_covers_every_entry_within_its_bounds(tmp_path, monkeypatch):
+    configuration = tmp_path / "configuration"
+    (configuration / "nested").mkdir(parents=True)
+    (configuration / "nested" / "policy.json").write_text("{}\n")
+    first = p.input_directory_digest(configuration)
+    (configuration / "nested").chmod(0o750)
+    assert p.input_directory_digest(configuration) != first  # a directory mode is an input
+    # A source mounted read-only and writable keeps the read-only mount's content digest.
+    unit = {"volumes": [{"type": "bind", "source": str(configuration), "target": "/run/deedkit/a", "read_only": True},
+                        {"type": "bind", "source": str(configuration), "target": "/data/b"}]}
+    before = p.host_inputs({"services": {"api": unit}}, "api")
+    (configuration / "nested" / "policy.json").write_text('{"changed": true}\n')
+    assert p.host_inputs({"services": {"api": unit}}, "api")["mounts"] != before["mounts"]
+    monkeypatch.setattr(p, "INPUT_DIRECTORY_FILES", 3)
+    for index in range(3):
+        (configuration / f"link{index}").symlink_to("nested")
+    with pytest.raises(p.Unreadable):
+        p.input_directory_digest(configuration)
 
 
 # spec: ANYM-895
@@ -1851,17 +1878,23 @@ def test_a_kept_container_that_fails_during_apply_fails_the_release(tmp_path, mo
 
 
 # spec: ANYM-895
-def test_a_kept_container_without_a_healthcheck_that_restarts_during_the_settle_fails_the_release(tmp_path, monkeypatch):
+@pytest.mark.parametrize("change", ["restarted", "paused", "unhealthy"])
+def test_a_kept_container_that_fails_during_the_settle_fails_the_release(tmp_path, monkeypatch, change):
     host = KeepHost(tmp_path, monkeypatch)
     host.release(RELEASES[0])
     host.files["services/gateway/src/agent_gateway/app.py"] = ("100644", "GATEWAY = 2\n")
     host.main = RELEASES[1]
     p.prepare(host.settings, RELEASES[1])
     monkeypatch.setattr(p, "APPLY_SETTLE_SECONDS", 1)
-    monkeypatch.setattr(p.time, "sleep", lambda seconds: host.containers["whatsapp2"].update(RestartCount=1))
-    with pytest.raises(p.Refused, match="health wait"):
+    changes = {"restarted": {"RestartCount": 1}, "paused": {"State": {"Running": True, "Paused": True}},
+               "unhealthy": {"State": {"Running": True, "Health": {"Status": "unhealthy"}}}}
+    monkeypatch.setattr(p.time, "sleep", lambda seconds: host.containers["whatsapp2"].update(changes[change]))
+    # A paused container is not a state rollback restores from (snapshot): the attempt stays unresolved for inspection.
+    with pytest.raises(p.Refused, match="inspect it before any recovery" if change == "paused" else "health wait"):
         p.apply(host.settings, RELEASES[1])
-    assert p.read(host.state / RELEASES[1] / "result.json")["status"] == "unhealthy"
+    assert p.read(host.state / "current.json")["sha"] == RELEASES[0]
+    assert not (host.state / RELEASES[1] / "result.json").exists() if change == "paused" else (
+        p.read(host.state / RELEASES[1] / "result.json")["status"] == "unhealthy")
 
 
 # spec: ANYM-895
