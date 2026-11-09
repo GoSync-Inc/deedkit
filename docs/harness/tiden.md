@@ -113,8 +113,10 @@ New work comes from the owner, agent feedback (`submit_feedback`), production is
 audits. A worker that finds work outside its task reports it to the orchestrator.
 
 Covered defects, infra and refactors take the short `Problem / Expected / Proof` route in
-task-flow.md, linking the existing spec/issue; no duplicate card, research or wave plan. New
-capabilities or changed product criteria keep intake below. Real access/data/live-action and
+task-flow.md, linking the existing spec/issue; no duplicate card, research or wave plan. A small
+fix (reviews.md, Routing) takes the same route with no card even where no spec covers it yet: its
+`Spec:` line names the nearest story spec, and the missing criterion is written in the next Tiden
+maintenance window. Other new capabilities or changed product criteria keep intake below. Real access/data/live-action and
 owner gates apply equally to both routes.
 
 1. **Triage.** Search Tiden main and open branches. A match, merged or not, is updated, not

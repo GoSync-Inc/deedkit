@@ -33,7 +33,7 @@ affect every pull request make parallel edits collide.
   conflict in another task's files goes to the orchestrator.
 - Draft first (owner 10-27, paid CI minutes): workers open pull requests as drafts, run the
   project's local checks before every push and mark the pull request ready (`gh pr ready <n>`)
-  once local checks pass and either reviews pass or the push that carries the fixes of every open
+  once local checks pass and either reviews pass (a small fix: no review, below) or the push that carries the fixes of every open
   finding is made (only the confirming recheck left): then CI runs alongside the recheck (owner
   10-29); the recheck never waits for that run (reviews.md, Rounds 4). A recheck finding returns
   it to draft (`gh pr ready <n> --undo`) and cancels that head's run in flight (`gh run cancel <id>`) before its fix; that costs one more CI run. Nothing skips a
@@ -49,7 +49,19 @@ affect every pull request make parallel edits collide.
   required job skipped (Draft first), the worker arms the merge itself (`gh pr merge <n> --squash
   --auto`, or the project's merge step) without waiting for the orchestrator; the required checks
   gate it. Exception: when the project's merge lock or a rule for paths its AGENTS.md marks shared,
-  or the brief, names the orchestrator as merger, the worker reports and the orchestrator arms.
+  or the brief, names the orchestrator as merger, or for a small fix (below), the worker reports
+  and the orchestrator arms.
+- Small fix (reviews.md, Routing; owner 11-09): the orchestrator is the merger. The worker marks
+  the pull request ready once local checks pass, runs the conflict guard, reports and pushes no
+  more unless the orchestrator asks. The
+  orchestrator reads the whole diff at the head SHA (`gh pr diff <n>`), checking: the scope is
+  still a small fix (no excluded path or named risk, at most 3 SP, nothing unrelated); a test
+  asserts the fix and the PR shows its failing base run (command and failing line); the `Spec:`, `Change path:` and VERSION lines where the project needs them.
+  Then it adds `Diff read: <orchestrator> <head SHA>` to the description and arms once the ready
+  run has finished (Draft first). A head other than the read SHA (auto-merge stays armed across
+  pushes): `gh pr merge <n> --disable-auto`, read the new diff, arm again. A diff outside the scope goes
+  back for the ordinary r1. The digest gets one line listing the small fixes merged since the
+  previous one (pull request, what it fixed); no `r<n>`.
 - Conflict guard before arming (study 10-29: conflicts cost queue re-entries): the worker runs
   `bin/merge-guard.sh [base]` in its worktree on its pushed head before it arms, or before it
   reports ready when the orchestrator arms (which then arms only on a clean guard). Exit 3: push
