@@ -142,6 +142,9 @@ export interface SubscriptionSources {
   /** 1–4 distinct types kept before any match (source_filters_disabled until the operator's switch).
    * WhatsApp chats are untyped (unknown) today; include_channels needs channel listed. */
   chat_types?: SubscriptionChatType[];
+  /** ANYM-830: up to 40 chats the key can see, left out before any match (source_exclusions_disabled until the
+   * operator's switch); replace with updateSubscription action set_exclusions. A preference, not authorization. */
+  exclude_chats?: {account: string; chat: string}[];
 }
 export interface SubscriptionSelection {
   /** Frozen 1–64 authorized archive chat IDs, never names or arbitrary provider references. */
@@ -171,8 +174,12 @@ export interface DynamicSubscriptionSelection extends Omit<SubscriptionSelection
 export interface SubscriptionLifecycleAction {
   subscription_id: string;
   version: number;
-  action: 'pause' | 'resume' | 'close';
+  action: 'pause' | 'resume' | 'close' | 'set_exclusions';
   resume_policy?: 'catch_up' | 'skip';
+  /** set_exclusions only: the whole new list (empty clears it); version and queued hints stay. */
+  exclude_chats?: {account: string; chat: string}[];
+  /** set_exclusions only: the definition's current sources.exclusions_revision (0 before its first list). */
+  exclusions_revision?: number;
 }
 /** ANYM-827: where the server stands, on get_subscription, fetch and event pages; the server never sees your local cursor. */
 export interface SubscriptionPositions {

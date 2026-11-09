@@ -1173,7 +1173,7 @@ def hint_body(c, hint, row, p):
         (row['id'],)).fetchone()
     after = consumption['acked_through'] if consumption else row['start_position']
     # 049's definer function: IDs, timing and wake evidence only, never message text; scope-filtered here.
-    from .subscriptions import dynamic, scope
+    from .subscriptions import dynamic, excluded_chats, scope
     accounts, chats = scope(row, p)
     matches = c.execute('SELECT * FROM public.subscription_hint_references(%s,%s,%s,%s,%s)',
         (row['id'], after, hint['through_position'], accounts, chats)).fetchall()
@@ -1181,10 +1181,16 @@ def hint_body(c, hint, row, p):
     flags = {}
     if dynamic(row):
         # ANYM-522: references the operator hid stay out of the list and the count; own-send evidence is the matcher's.
-        flags = {item['event']: item for item in c.execute('''SELECT event,hidden,own_send_reply,
+        # ANYM-830: so do references to a chat the definition's exclusion list names now (a hint staged before).
+        left_accounts, left_chats = excluded_chats(row)
+        flags = {item['event']: item for item in c.execute('''SELECT event,own_send_reply,
+            hidden OR EXISTS(SELECT FROM unnest(%s::text[],%s::text[]) AS x(account,chat)
+                WHERE x.account=m.account AND x.chat=m.chat) AS hidden,
             coalesce(account=ANY(%s) AND (%s::text[] IS NULL OR chat=ANY(%s)),false) AS in_scope
-            FROM subscription_matches WHERE subscription=%s AND event>%s AND event<=%s AND (hidden OR own_send_reply)''',
-            (accounts, chats, chats, row['id'], after, hint['through_position'])).fetchall()}
+            FROM subscription_matches m WHERE subscription=%s AND event>%s AND event<=%s AND (hidden OR own_send_reply
+            OR EXISTS(SELECT FROM unnest(%s::text[],%s::text[]) AS x(account,chat) WHERE x.account=m.account AND x.chat=m.chat))''',
+            (left_accounts, left_chats, accounts, chats, chats, row['id'], after, hint['through_position'],
+             left_accounts, left_chats)).fetchall()}
         total -= sum(1 for item in flags.values() if item['hidden'] and item['in_scope'])
         matches = [item for item in matches if not flags.get(item['event'], {}).get('hidden')]
     from .subscription_consumption import wake_reason

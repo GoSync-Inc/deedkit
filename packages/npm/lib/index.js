@@ -147,7 +147,8 @@ const SUBSCRIPTION_FIELDS = Object.freeze({
     'wake_rules','reply_to_send','delivery']],
   list_subscriptions: [[],['limit']],
   get_subscription: [['subscription_id'],['subscription_id']],
-  update_subscription: [['subscription_id','version','action'],['subscription_id','version','action','resume_policy']],
+  update_subscription: [['subscription_id','version','action'],
+    ['subscription_id','version','action','resume_policy','exclude_chats','exclusions_revision']],
   get_subscription_events: [['subscription_id'],['subscription_id','after','limit','detail','include']],
   fetch_subscription_events: [['subscription_id'],['subscription_id','limit','detail','include']],
   ack_subscription_events: [['subscription_id','receipt','version'],['subscription_id','receipt','version']],
@@ -228,13 +229,20 @@ function subscriptionReference(value) {
   return typeof value==='string' && value.length>0 && [...value].length<=256 && !/[\x00-\x20\x7f]/.test(value);
 }
 const SOURCE_CHAT_TYPES = new Set(['private','group','channel','unknown']);
+function excludedChats(value) {
+  // ANYM-830: a list of {account, chat} string pairs; the server checks lengths, the 40-pair and 6,000-byte
+  // bounds (invalid_filter) and visibility (not_found), so every entry point answers with the same code.
+  return Array.isArray(value) && value.every(pair=>plainObject(pair) && Object.keys(pair).length===2 &&
+    typeof pair.account==='string' && typeof pair.chat==='string');
+}
 function subscriptionSources(value) {
   // ANYM-522 dynamic sources; chat_types (ANYM-825): 1-4 distinct types, include_channels needs channel.
   if (!plainObject(value) || value.all_visible_chats!==true || Object.keys(value).some(name=>
-      !['all_visible_chats','account_ids','include_channels','include_bots','chat_types'].includes(name))) return false;
+      !['all_visible_chats','account_ids','include_channels','include_bots','chat_types','exclude_chats'].includes(name))) return false;
   if (value.account_ids!==undefined && !(Array.isArray(value.account_ids) && value.account_ids.length>=1 &&
       value.account_ids.length<=64 && value.account_ids.every(subscriptionReference))) return false;
   if (['include_channels','include_bots'].some(name=>value[name]!==undefined && typeof value[name]!=='boolean')) return false;
+  if (value.exclude_chats!==undefined && !excludedChats(value.exclude_chats)) return false;
   const types=value.chat_types;
   if (types===undefined) return true;
   return Array.isArray(types) && types.length>=1 && types.length<=4 && new Set(types).size===types.length &&
@@ -311,6 +319,8 @@ function subscriptionArguments(method,args) {
       Object.keys(value).every(name=>['endpoint_id','delivery_policy'].includes(name)) && uuid(value.endpoint_id) &&
       (value.delivery_policy===undefined || plainObject(value.delivery_policy)) && JSON.stringify(value).length<=4096;
     else if (key==='sources') valid=subscriptionSources(value);
+    else if (key==='exclude_chats') valid=excludedChats(value);
+    else if (key==='exclusions_revision') valid=Number.isSafeInteger(value) && value>=0;
     // ANYM-826: subscription page projection.
     else if (key==='detail') valid=value==='full' || value==='compact';
     else if (key==='include') valid=Array.isArray(value) && value.length<=4 &&
@@ -318,7 +328,7 @@ function subscriptionArguments(method,args) {
     else if (key==='reply_to_send') valid=value===null || typeof value==='string' && [...value].length>=1 && [...value].length<=128;
     else if (key==='label') valid=typeof value==='string' && [...value].length<=128 && !/[\x00-\x1f\x7f]/.test(value);
     else if (['action','direction','resume_policy'].includes(key))
-      valid=typeof value==='string' && {action:method==='update_subscription'?['pause','resume','close']:
+      valid=typeof value==='string' && {action:method==='update_subscription'?['pause','resume','close','set_exclusions']:
           ['rotate_secret','set_headers','pause','resume'],
         direction:['','incoming','outgoing'],resume_policy:['catch_up','skip']}[key].includes(value);
     else if (key==='expires_at') {

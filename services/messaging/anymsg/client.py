@@ -143,7 +143,7 @@ _SUBSCRIPTION_FIELDS = {
     'list_subscriptions': (set(), {'limit'}),
     'get_subscription': ({'subscription_id'}, {'subscription_id'}),
     'update_subscription': ({'subscription_id','version','action'},
-        {'subscription_id','version','action','resume_policy'}),
+        {'subscription_id','version','action','resume_policy','exclude_chats','exclusions_revision'}),
     'get_subscription_events': ({'subscription_id'}, {'subscription_id','after','limit','detail','include'}),
     'fetch_subscription_events': ({'subscription_id'}, {'subscription_id','limit','detail','include'}),
     'ack_subscription_events': ({'subscription_id','receipt','version'}, {'subscription_id','receipt','version'}),
@@ -169,7 +169,8 @@ _SUBSCRIPTION_KINDS = frozenset({'message.created','message.edited','message.del
 _SUBSCRIPTION_ORIGINS = frozenset({'live','live_recovered','backfill','reconcile','fixture'})
 _WAKE_RULES = frozenset({'incoming_message','owner_mention','reply_to_owner','reply_to_confirmed_send',
     'reply_to_own_send'})
-_SOURCE_OPTIONS = frozenset({'all_visible_chats','account_ids','include_channels','include_bots','chat_types'})
+_SOURCE_OPTIONS = frozenset({'all_visible_chats','account_ids','include_channels','include_bots','chat_types',
+    'exclude_chats'})
 _SOURCE_CHAT_TYPES = frozenset({'private','group','channel','unknown'})
 
 
@@ -183,12 +184,21 @@ def _subscription_sources(value):
         return False
     if any(name in value and type(value[name]) is not bool for name in ('include_channels','include_bots')):
         return False
+    if 'exclude_chats' in value and not _excluded_chats(value['exclude_chats']):
+        return False
     if 'chat_types' not in value:
         return True
     named=value['chat_types']
     return (isinstance(named,list) and 1<=len(named)<=4 and all(isinstance(t,str) and t in _SOURCE_CHAT_TYPES
         for t in named) and len(set(named))==len(named) and (value.get('include_channels') is not True or
         'channel' in named))
+
+
+def _excluded_chats(value):
+    """ANYM-830: a list of {account, chat} string pairs; the server checks lengths, the 40-pair and 6,000-byte
+    bounds (invalid_filter) and visibility (not_found), so every entry point answers with the same code."""
+    return isinstance(value,list) and all(isinstance(pair,dict) and pair.keys()=={'account','chat'}
+        and isinstance(pair['account'],str) and isinstance(pair['chat'],str) for pair in value)
 
 
 def _subscription_reference(value):
@@ -258,6 +268,8 @@ def _subscription_parameters(operation, parameters):
                 and not value.keys()-{'endpoint_id','delivery_policy'} and _uuid(value['endpoint_id'])
                 and isinstance(value.get('delivery_policy',{}),dict) and len(json.dumps(value))<=4096)
         elif name=='sources':valid=_subscription_sources(value)
+        elif name=='exclude_chats':valid=_excluded_chats(value)
+        elif name=='exclusions_revision':valid=type(value) is int and 0<=value<=9007199254740991
         elif name=='reply_to_send':valid=value is None or isinstance(value,str) and 1<=len(value)<=128
         # ANYM-826: subscription page projection.
         elif name=='detail':valid=value in ('full','compact')
@@ -268,7 +280,7 @@ def _subscription_parameters(operation, parameters):
         elif name=='label':valid=isinstance(value,str) and len(value)<=128 and not re.search(r'[\x00-\x1f\x7f]',value)
         elif name in ('action','direction','resume_policy'):
             valid=isinstance(value,str) and value in {
-                'action':('pause','resume','close') if operation=='update_subscription'
+                'action':('pause','resume','close','set_exclusions') if operation=='update_subscription'
                     else ('rotate_secret','set_headers','pause','resume'), 'direction':('','incoming','outgoing'),
                 'resume_policy':('catch_up','skip')}[name]
         elif name=='expires_at':
@@ -686,10 +698,15 @@ class Client:
         positions: acked_through, fetched_through, open_receipts, oldest_open_receipt_expires_at, expired_unacked."""
         return self.call('get_subscription',{'subscription_id':subscription_id})
 
-    def update_subscription(self, *, subscription_id, version, action, resume_policy='catch_up'):
-        """Version-checked pause/resume/close. After uncertainty, read before retrying."""
-        return self.call('update_subscription',dict(subscription_id=subscription_id,version=version,
-            action=action,resume_policy=resume_policy))
+    def update_subscription(self, *, subscription_id, version, action, resume_policy='catch_up', exclude_chats=None,
+                            exclusions_revision=None):
+        """Version-checked pause/resume/close, or set_exclusions: replace sources.exclude_chats of a dynamic
+        definition with its exclusions_revision (version and queued hints stay). After uncertainty, read before
+        retrying."""
+        arguments=dict(subscription_id=subscription_id,version=version,action=action,resume_policy=resume_policy)
+        if exclude_chats is not None:arguments['exclude_chats']=exclude_chats
+        if exclusions_revision is not None:arguments['exclusions_revision']=exclusions_revision
+        return self.call('update_subscription',arguments)
 
     def get_subscription_events(self, *, subscription_id, after=0, limit=50, detail=None, include=None):
         """Inspect durable matched references; never ACK, wake an agent or mark provider read.

@@ -519,7 +519,7 @@ def test_chat_types_validate_their_form_and_wait_for_the_source_filters_switch(s
             'include_bots': False}
         # Mixed versions: the deployed matcher reports the same package version and no build features; it would
         # store group matches for such a definition. The dynamic and delivery switches still accept it.
-        assert current == __version__ + '+source-filters'
+        assert current == __version__ + '+source-filters.source-exclusions'
         beat(__version__)
         assert store.set_source_filters(True, verify_components=True) == {'error': 'component_feature_missing',
             'component': 'matcher', 'version': __version__, 'expected': current}
@@ -1147,6 +1147,269 @@ def test_disabling_source_filters_masks_chat_type_definitions_and_cancels_their_
         # Definitions without chat_types are untouched.
         assert store.get_subscription(token, plain)['state'] == 'active'
         assert store.get_subscription(token, explicit)['state'] == 'active'
+        posts = []
+        dispatch_hints(store, transport=lambda *a, **k: posts.append(a) or 204, resolver=lambda *a, **k: ['93.184.216.34'])
+        assert posts == []
+
+
+class source_exclusions:
+    """ANYM-830: the dynamic and exclusion switches on for the block, off afterwards."""
+    def __init__(self, store):
+        self.store = store
+
+    def __enter__(self):
+        self.store.set_dynamic_subscriptions(True)
+        self.store.set_source_exclusions(True)
+
+    def __exit__(self, *exc):
+        self.store.set_source_exclusions(False)
+        self.store.set_dynamic_subscriptions(False)
+
+
+DEMO_CHAT = {'account': 'telegram-demo', 'chat': 'telegram-demo-chat'}
+NOISY_CHAT = {'account': 'telegram-demo', 'chat': 'telegram-demo-chat-830'}
+
+
+def set_exclusions(store, token, sid, pairs, revision, version=None):
+    version = store.get_subscription(token, sid)['version'] if version is None else version
+    return store.update_subscription(token, sid, version, action='set_exclusions', exclude_chats=pairs,
+        exclusions_revision=revision)
+
+
+# spec: ANYM-830
+def test_an_exclusion_list_is_bounded_by_forty_pairs_and_six_thousand_bytes():
+    import json
+    from messaging_service.subscriptions import _exclusion_pairs
+    def size(pairs):
+        return len(json.dumps(pairs, ensure_ascii=False).encode())
+    # Maximum-length identifiers: the byte limit stops the list long before 40 pairs.
+    longest = [{'account': 'a' * 62 + '%02d' % n, 'chat': 'c' * 256} for n in range(40)]
+    fitting = max(n for n in range(41) if size(longest[:n]) <= 6000)
+    assert 10 < fitting < 40
+    assert len(_exclusion_pairs(longest[:fitting])) == fitting
+    with pytest.raises(APIError, match='invalid_filter'):
+        _exclusion_pairs(longest[:fitting + 1])
+    # Many short ones: the 40-pair limit stops it.
+    short = [{'account': 'a', 'chat': 'c%d' % n} for n in range(41)]
+    assert size(short) < 6000 and len(_exclusion_pairs(short[:40])) == 40
+    with pytest.raises(APIError, match='invalid_filter'):
+        _exclusion_pairs(short)
+    # Duplicates collapse, the order is canonical, and the selector stays inside its 14,000 bytes.
+    assert _exclusion_pairs([NOISY_CHAT, DEMO_CHAT, NOISY_CHAT]) == [DEMO_CHAT, NOISY_CHAT]
+    assert size({'sources': {**ALL_VISIBLE, 'exclude_chats': longest[:fitting]}}) < 14000
+    for bad in ('telegram-demo-chat', [{'account': 'telegram-demo'}], [{**DEMO_CHAT, 'title': 'x'}],
+            [{'account': '', 'chat': 'c'}], [{'account': 'a' * 65, 'chat': 'c'}], [{'account': 'a', 'chat': 'c' * 257}],
+            [{'account': 'a', 'chat': 'c\x00'}], [{'account': 1, 'chat': 'c'}], ['telegram-demo-chat']):
+        with pytest.raises(APIError, match='invalid_filter'):
+            _exclusion_pairs(bad)
+
+
+# spec: ANYM-830
+def test_exclude_chats_wait_for_the_source_exclusions_switch_and_name_chats_the_key_can_see(seeded):
+    from messaging_service import __version__
+    from messaging_service.heartbeats import identity
+    from messaging_service.store import RUNTIME_SCHEMA
+    store, _, _ = seeded
+    token = dynamic_key(store)
+    narrow = dynamic_key(store, 'narrow-reader')
+    chat_message(store, 'telegram-demo-chat-830', 'demo-tg-830')
+    listed = {**ALL_VISIBLE, 'exclude_chats': [NOISY_CHAT]}
+    store.set_dynamic_subscriptions(True)
+    with store.pool.connection() as c:
+        saved = c.execute('SELECT * FROM component_heartbeats').fetchall()
+    current = identity()
+    def beat(matcher_version):
+        with store.pool.connection() as c:
+            for component, version in (('api', current), ('matcher', matcher_version), ('dispatcher', current)):
+                c.execute('''INSERT INTO component_heartbeats(component,version,schema_version,beat_at)
+                    VALUES(%s,%s,%s,clock_timestamp()) ON CONFLICT(component) DO UPDATE SET version=EXCLUDED.version,
+                    schema_version=EXCLUDED.schema_version,beat_at=EXCLUDED.beat_at''', (component, version, RUNTIME_SCHEMA))
+    try:
+        with pytest.raises(APIError, match='source_exclusions_disabled'):
+            store.create_subscription(token, sources=listed)
+        plain = store.create_subscription(token, sources=ALL_VISIBLE)
+        assert 'exclude_chats' not in plain['sources'] and 'exclusions_revision' not in plain['sources']
+        with pytest.raises(APIError, match='source_exclusions_disabled'):
+            set_exclusions(store, token, plain['subscription_id'], [NOISY_CHAT], 0)
+        # Mixed versions: the ANYM-825 build reports source-filters only; its matcher would match listed chats.
+        assert current == __version__ + '+source-filters.source-exclusions'
+        beat(__version__ + '+source-filters')
+        assert store.set_source_exclusions(True, verify_components=True) == {'error': 'component_feature_missing',
+            'component': 'matcher', 'version': __version__ + '+source-filters', 'expected': current}
+        with pytest.raises(APIError, match='source_exclusions_disabled'):
+            store.create_subscription(token, sources=listed)
+        beat(current)
+        assert store.set_source_exclusions(True, verify_components=True) == {'source_exclusions': 'enabled'}
+        # An unknown pair, another account's chat and a chat outside the key's chat scope are not_found.
+        store.set_access('narrow-reader', chats=['telegram-demo-chat'])
+        for who, pair in ((token, {'account': 'telegram-demo', 'chat': 'no-such-chat'}),
+                (token, {'account': 'whatsapp-demo-1', 'chat': 'telegram-demo-chat'}), (narrow, NOISY_CHAT)):
+            with pytest.raises(APIError, match='not_found'):
+                store.create_subscription(who, sources={**ALL_VISIBLE, 'exclude_chats': [pair]})
+        created = store.create_subscription(token, sources=listed)
+        assert created['sources']['exclude_chats'] == [NOISY_CHAT] and created['sources']['exclusions_revision'] == 1
+        explicit = create(store, token)
+        with pytest.raises(APIError, match='invalid_filter'):
+            set_exclusions(store, token, explicit['subscription_id'], [NOISY_CHAT], 0)
+        with pytest.raises(APIError, match='invalid_filter'):
+            store.create_subscription(token, ['telegram-demo-chat'], sources=listed)
+    finally:
+        store.set_source_exclusions(False)
+        store.set_dynamic_subscriptions(False)
+        with store.pool.connection() as c:
+            c.execute('DELETE FROM component_heartbeats')
+            for row in saved:
+                c.execute('INSERT INTO component_heartbeats(component,version,schema_version,beat_at) VALUES(%s,%s,%s,%s)',
+                    (row['component'], row['version'], row['schema_version'], row['beat_at']))
+
+
+# spec: ANYM-830
+def test_excluded_chats_never_match_cost_no_budget_and_count_as_left_out_on_both_platforms(seeded, monkeypatch):
+    from messaging_service import subscriptions
+    store, _, _ = seeded
+    archive = typed_archive(store)
+    left = []
+    monkeypatch.setattr(subscriptions, 'left_out', lambda row, event, reason: left.append(reason))
+    # One stored match per definition: a listed chat's event that took the budget would block the kept one.
+    monkeypatch.setenv('SUBSCRIPTION_MAX_MATCHES', '1')
+    with source_exclusions(store):
+        token = typed_key(store)
+        telegram_in(archive, 830, 1)
+        whatsapp_in(archive, '4830@c.us', 2)
+        with store.pool.connection() as c:
+            pairs = [{'account': row['account'], 'chat': row['id']} for row in c.execute(
+                "SELECT id,account FROM chats WHERE account IN ('tg-types','wa-types')").fetchall()]
+        assert len(pairs) == 2
+        sid = store.create_subscription(token, sources={**ALL_VISIBLE, 'exclude_chats': pairs})['subscription_id']
+        telegram_in(archive, 830, 3)
+        whatsapp_in(archive, '4830@c.us', 4)
+        match_subscriptions(store)
+        view = store.get_subscription(token, sid)
+        assert view['matched_event_count'] == 0 and view['blocked_reason'] is None
+        assert view['delivery']['hint_counts'] == {}
+        assert activity(store, token, sid) == {'telegram': {'scanned': 1, 'left_out_excluded_chat': 1},
+            'whatsapp': {'scanned': 1, 'left_out_excluded_chat': 1}}
+        assert left == ['excluded_chat', 'excluded_chat']
+        kept = telegram_in(archive, 831, 5)
+        match_subscriptions(store)
+        assert message_events(store, token, sid) == [kept]
+        assert store.get_subscription(token, sid)['blocked_reason'] is None
+
+
+# spec: ANYM-830
+def test_a_send_failure_in_an_excluded_chat_matches_but_changes_no_count_and_no_hint(seeded, tmp_path):
+    store, _, _ = seeded
+    with source_exclusions(store):
+        token = dynamic_key(store)
+        sid = store.create_subscription(token, sources={**ALL_VISIBLE, 'exclude_chats': [DEMO_CHAT]},
+            kinds=['message.created', 'send.failed'])['subscription_id']
+        bind(store, token, sid, tmp_path, 'dynamic-reader')
+        failure_event(store, 'send.failed', token)
+        match_subscriptions(store)
+        with store.pool.connection() as c:
+            stored = c.execute('SELECT chat FROM subscription_matches WHERE subscription=%s', (sid,)).fetchall()
+        # The matcher keeps the failure's own rule; every read, count and hint leaves the listed chat out.
+        assert [row['chat'] for row in stored] == ['telegram-demo-chat']
+        assert activity(store, token, sid) == {'telegram': {'matched_failure': 1}}
+        view = store.get_subscription(token, sid)
+        assert view['matched_event_count'] == 0 and event_ids(store, token, sid) == []
+        assert view['delivery']['hint_counts'] == {}
+        assert store.fetch_subscription_events(token, sid)['items'] == []
+
+
+# spec: ANYM-830
+def test_set_exclusions_replaces_the_list_keeps_the_version_and_refuses_a_stale_revision(seeded):
+    store, _, _ = seeded
+    with source_exclusions(store):
+        token = dynamic_key(store)
+        chat_message(store, 'telegram-demo-chat-830', 'demo-tg-830')
+        sid = store.create_subscription(token, sources=ALL_VISIBLE)['subscription_id']
+        view = store.get_subscription(token, sid)
+        version = view['version']
+        for kwargs in ({'action': 'set_exclusions', 'exclusions_revision': 0},
+                {'action': 'set_exclusions', 'exclude_chats': [DEMO_CHAT]},
+                {'action': 'pause', 'exclude_chats': [], 'exclusions_revision': 0}):
+            with pytest.raises(APIError, match='invalid_parameters'):
+                store.update_subscription(token, sid, version, **kwargs)
+        with pytest.raises(APIError, match='subscription_conflict'):
+            set_exclusions(store, token, sid, [DEMO_CHAT], 1)
+        with pytest.raises(APIError, match='subscription_conflict'):
+            set_exclusions(store, token, sid, [DEMO_CHAT], 0, version=version + 1)
+        first = set_exclusions(store, token, sid, [DEMO_CHAT], 0)
+        assert first['version'] == version and first['updated_at'] > view['updated_at']
+        assert first['sources']['exclude_chats'] == [DEMO_CHAT] and first['sources']['exclusions_revision'] == 1
+        # An unchanged list is a no-op: no revision, no updated_at.
+        same = set_exclusions(store, token, sid, [DEMO_CHAT], 1)
+        assert same['updated_at'] == first['updated_at'] and same['sources']['exclusions_revision'] == 1
+        with pytest.raises(APIError, match='subscription_conflict'):
+            set_exclusions(store, token, sid, [NOISY_CHAT], 0)
+        both = set_exclusions(store, token, sid, [NOISY_CHAT, DEMO_CHAT], 1)
+        assert both['sources']['exclude_chats'] == [DEMO_CHAT, NOISY_CHAT] and both['version'] == version
+        paused = store.update_subscription(token, sid, version, action='pause')
+        cleared = set_exclusions(store, token, sid, [], 2)
+        assert cleared['state'] == 'paused' and cleared['version'] == paused['version']
+        assert cleared['sources']['exclude_chats'] == [] and cleared['sources']['exclusions_revision'] == 3
+        closed = store.update_subscription(token, sid, cleared['version'], action='close')
+        with pytest.raises(APIError, match='invalid_subscription_state'):
+            set_exclusions(store, token, sid, [DEMO_CHAT], 3, version=closed['version'])
+
+
+# spec: ANYM-830
+def test_an_exclusion_hides_stored_references_until_removed_and_an_ack_past_them_skips_them(seeded):
+    store, _, _ = seeded
+    with source_exclusions(store):
+        token = dynamic_key(store)
+        chat_message(store, 'telegram-demo-chat-830', 'demo-tg-830')
+        acked, unacked = (store.create_subscription(token, sources=ALL_VISIBLE)['subscription_id'] for _ in range(2))
+        noisy, kept = emit(store, 'demo-tg-830'), emit(store)
+        match_subscriptions(store)
+        for sid in (acked, unacked):
+            assert event_ids(store, token, sid) == [noisy, kept]
+            hidden = set_exclusions(store, token, sid, [NOISY_CHAT], 0)
+            assert hidden['matched_event_count'] == 1 and event_ids(store, token, sid) == [kept]
+        page = store.fetch_subscription_events(token, acked)
+        assert [item['event_id'] for item in page['items']] == [kept]
+        ack = store.ack_subscription_events(token, acked, page['receipt'], page['ack_version'])
+        assert ack['acked_through'] >= kept
+        for sid in (acked, unacked):
+            shown = set_exclusions(store, token, sid, [], 1)
+            assert shown['matched_event_count'] == 2 and event_ids(store, token, sid) == [noisy, kept]
+        # Acknowledged while hidden: never fetched again. Not acknowledged: fetched normally.
+        assert store.fetch_subscription_events(token, acked)['items'] == []
+        assert [item['event_id'] for item in store.fetch_subscription_events(token, unacked)['items']] == [noisy, kept]
+        # A stored pair whose chat left the key's scope is not shown; scope applies first.
+        set_exclusions(store, token, unacked, [NOISY_CHAT, DEMO_CHAT], 2)
+        store.set_access('dynamic-reader', chats=['telegram-demo-chat'])
+        assert store.get_subscription(token, unacked)['sources']['exclude_chats'] == [DEMO_CHAT]
+        assert event_ids(store, token, unacked) == []
+
+
+# spec: ANYM-830
+def test_disabling_source_exclusions_masks_definitions_with_a_list_and_cancels_their_hints(seeded, tmp_path):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    with source_exclusions(store):
+        token = dynamic_key(store)
+        chat_message(store, 'telegram-demo-chat-830', 'demo-tg-830')
+        listed = store.create_subscription(token, sources={**ALL_VISIBLE, 'exclude_chats': [NOISY_CHAT]},
+            label='Synthetic excluded')['subscription_id']
+        cleared = store.create_subscription(token, sources=ALL_VISIBLE)['subscription_id']
+        set_exclusions(store, token, cleared, [], 0)
+        plain = store.create_subscription(token, sources=ALL_VISIBLE)['subscription_id']
+        bind(store, token, listed, tmp_path, 'dynamic-reader')
+        emit(store)
+        match_subscriptions(store)
+        assert store.get_subscription(token, listed)['delivery']['hint_counts'] == {'pending': 1}
+        result = store.set_source_exclusions(False)
+        # A definition whose list was cleared still carries its revision: an older matcher must not serve it either.
+        assert result['source_exclusions'] == 'disabled' and result['access_changed'] == sorted([listed, cleared])
+        assert len(result['cancelled_hints']) == 1
+        view = store.get_subscription(token, listed)
+        assert set(view) == {'subscription_id', 'state', 'version', 'recreate_required', 'scope_masked'}
+        assert 'Synthetic excluded' not in str(store.list_subscriptions(token))
+        with pytest.raises(APIError, match='source_exclusions_disabled'):
+            store.create_subscription(token, sources={**ALL_VISIBLE, 'exclude_chats': [NOISY_CHAT]})
+        assert store.get_subscription(token, plain)['state'] == 'active'
         posts = []
         dispatch_hints(store, transport=lambda *a, **k: posts.append(a) or 204, resolver=lambda *a, **k: ['93.184.216.34'])
         assert posts == []

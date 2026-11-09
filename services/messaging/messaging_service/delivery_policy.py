@@ -7,7 +7,7 @@ row, and outbox uniqueness on (subscription, version, kind, window) prevents a d
 """
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import re
 
 from psycopg.types.json import Jsonb
@@ -24,6 +24,9 @@ _CLOCK = re.compile(r'(?:[01][0-9]|2[0-3]):[0-5][0-9]')
 _ZONE = re.compile(r'[A-Za-z][A-Za-z0-9_+-]*(?:/[A-Za-z0-9_+-]+){0,2}')
 _EMPTY = dict(first_match_at=None, last_match_at=None, match_count=0, through_position=None,
     reasons=[], due_at=None, held_reason=None)
+# ANYM-830: set_exclusions marks a held range for a rebuild with this due time (the API role may write due_at only);
+# a real due time is never before the epoch's second day.
+REBUILD_DUE = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _NO_SILENCE = dict(silence_state=None, silence_fired_at=None, silence_due_at=None, silence_held_reason=None)
 
 
@@ -274,6 +277,8 @@ def _absorb(c, row, binding, window, p=None, *, limit=1000, pages=16):
     count, match time or on-time reply: the next tick replays the same committed matches. A
     caller settles nothing on False: the progress is saved and the next tick continues.
     """
+    if p is not None and window['first_match_at'] is not None:
+        _rebuild_excluded(c, row, window, p)
     for _ in range(pages):
         if _absorb_page(c, row, binding, window, limit, p) < limit:
             return True
@@ -282,6 +287,26 @@ def _absorb(c, row, binding, window, p=None, *, limit=1000, pages=16):
     through = window['through_position'] if window['through_position'] is not None else window['hinted_through']
     return c.execute('SELECT 1 FROM subscription_matches WHERE subscription=%s AND event>%s LIMIT 1',
         (row['id'], through)).fetchone() is None
+
+
+def _rebuild_excluded(c, row, window, p):
+    """ANYM-830: a held range absorbed before its definition's exclusion list changed counts references it can
+    no longer show (or misses ones shown again). When its count differs from the references visible now in the
+    same range, the range starts over above hinted_through, so the pages below rebuild count, reasons and match
+    times from visible references only. Version, queued hints and the silence timer stay."""
+    from .subscriptions import dynamic, visible_filter
+    if not dynamic(row) or 'exclusions_revision' not in row['selector']['sources']:
+        return
+    if window['due_at'] is not None and window['due_at'] <= REBUILD_DUE:
+        # The list changed since the range was absorbed: equal counts can still hide other references.
+        window.update(_EMPTY)
+        return
+    low = window['hinted_through'] if window['hinted_through'] is not None else row['start_position']
+    where, args = visible_filter(row, p)
+    shown = c.execute('SELECT count(*) AS n FROM subscription_matches m WHERE m.subscription=%s AND m.event>%s AND '
+        'm.event<=%s AND ' + where, (row['id'], low, window['through_position'], *args)).fetchone()['n']
+    if min(1000000, shown) != window['match_count']:
+        window.update(_EMPTY)
 
 
 def _absorb_page(c, row, binding, window, limit, p=None):
@@ -400,12 +425,13 @@ def flush_hints(store, *, limit=32):
 
 
 def carry_window(c, row, previous_version):
-    """Same-receiver reconfiguration: keep the held range under the new version, re-plan it now."""
+    """Same-receiver reconfiguration: keep the held range under the new version, re-plan it now. A range marked
+    for its rebuild (ANYM-830, REBUILD_DUE) keeps the mark: it is due already, and the tick must rebuild it."""
     c.execute('''UPDATE subscription_hint_windows SET subscription_version=%s,
-        due_at=CASE WHEN first_match_at IS NULL THEN NULL ELSE clock_timestamp() END,
+        due_at=CASE WHEN first_match_at IS NULL THEN NULL WHEN due_at<=%s THEN due_at ELSE clock_timestamp() END,
         silence_state=NULL,silence_fired_at=NULL,silence_due_at=NULL,silence_held_reason=NULL,
         updated_at=clock_timestamp() WHERE subscription=%s AND subscription_version=%s''',
-        (row['version'], row['id'], previous_version))
+        (row['version'], REBUILD_DUE, row['id'], previous_version))
 
 
 def delivery_state(c, row):
@@ -418,7 +444,8 @@ def delivery_state(c, row):
         window = None
     held = [(window[at], window[reason]) for at, reason in
         (('due_at', 'held_reason'), ('silence_due_at', 'silence_held_reason'))] if window else []
-    held = sorted(item for item in held if item[0] is not None)
+    # A range marked for its rebuild (ANYM-830) shows no due time until the next tick has rebuilt it.
+    held = sorted(item for item in held if item[0] is not None and item[0] > REBUILD_DUE)
     silence = None
     if binding['silence_deadline'] is not None:
         if window and window['silence_state']:

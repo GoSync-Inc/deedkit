@@ -1247,6 +1247,348 @@ def test_endpoint_hint_of_a_dynamic_definition_lists_only_references_visible_now
     assert hidden not in [ref['event_id'] for ref in payload['references']]
 
 
+SECOND_CHAT = {'account': 'telegram-demo', 'chat': 'telegram-demo-chat-2'}
+
+
+def outbox(store, sid):
+    with store.pool.connection() as c:
+        return [(row['id'], row['state'], row['subscription_version']) for row in c.execute(
+            '''SELECT id,state,subscription_version FROM subscription_outbox WHERE subscription=%s
+                ORDER BY through_position,created_at,id''',
+            (sid,)).fetchall()]
+
+
+# spec: ANYM-830
+def test_an_exclusion_keeps_a_queued_hint_posts_only_allowed_references_and_cancels_an_all_excluded_one(
+        seeded, tmp_path, monkeypatch):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    store.set_source_exclusions(True)
+    try:
+        token, endpoint, _, _ = endpoint_setup(store, tmp_path, monkeypatch, events=0)
+        second_chat(store)
+        sid = store.create_subscription(token, sources={'all_visible_chats': True},
+            delivery={'endpoint_id': endpoint['endpoint_id']})['subscription_id']
+        kept, excluded = emit(store), emit_in(store, 'demo-tg-x')
+        match_subscriptions(store)
+        queued = outbox(store, sid)
+        version = store.get_subscription(token, sid)['version']
+        assert [state for _, state, _ in queued] == ['pending']
+        # After staging, before the POST: the same hint stays queued under the same version.
+        view = store.update_subscription(token, sid, version, action='set_exclusions', exclude_chats=[SECOND_CHAT],
+            exclusions_revision=0)
+        assert view['version'] == version and outbox(store, sid) == queued
+        assert view['delivery']['hint_counts'] == {'pending': 1}
+        sent = []
+        resolver = lambda *a, **k: ['93.184.216.34']  # noqa: E731
+        # endpoint_setup's own explicit subscription posts its hint to the same endpoint: keep this definition's.
+        post = lambda url, body, headers, **k: (json.loads(body)['subscription_id'] == sid and sent.append(body)) or 204  # noqa: E731
+        dispatch_hints(store, transport=post, resolver=resolver)
+        assert len(sent) == 1 and [state for _, state, _ in outbox(store, sid)] == ['delivered']
+        payload = json.loads(sent[0])
+        assert [ref['event_id'] for ref in payload['references']] == [kept] and payload['references_omitted'] == 0
+        assert excluded not in [ref['event_id'] for ref in payload['references']]
+        # A hint whose references are all in a chat listed after it was staged is cancelled by the fence.
+        store.update_subscription(token, sid, version, action='set_exclusions', exclude_chats=[], exclusions_revision=1)
+        only = emit_in(store, 'demo-tg-x')
+        match_subscriptions(store)
+        assert [state for _, state, _ in outbox(store, sid)] == ['delivered', 'pending']
+        store.update_subscription(token, sid, version, action='set_exclusions', exclude_chats=[SECOND_CHAT],
+            exclusions_revision=2)
+        assert store.get_subscription(token, sid)['delivery']['hint_counts'] == {'delivered': 1}
+        dispatch_hints(store, transport=post, resolver=resolver)
+        assert len(sent) == 1 and [state for _, state, _ in outbox(store, sid)] == ['delivered', 'cancelled']
+        assert only not in [item['event_id'] for item in store.get_subscription_events(token, sid)['items']]
+    finally:
+        store.set_delivery_features(False)
+        store.set_source_exclusions(False)
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-830
+def test_a_held_hint_window_survives_an_exclusion_and_its_hint_posts_only_allowed_references(seeded, tmp_path):
+    from psycopg.types.json import Jsonb
+    from messaging_service.delivery_policy import flush_hints
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    store.set_source_exclusions(True)
+    try:
+        token = identity(store)
+        second_chat(store)
+        with store.pool.connection() as c:
+            c.execute("INSERT INTO message_metadata(message,revision,metadata) VALUES('demo-tg-x',1,%s)",
+                (Jsonb({'mentions_owner': True}),))
+        sid = store.create_subscription(token, sources={'all_visible_chats': True})['subscription_id']
+        rid, _ = receiver(store, token, tmp_path)
+        call(store, token, 'configure_subscription_delivery', sid, 1, rid, {'batch_count': 2})
+        version = store.get_subscription(token, sid)['version']
+        excluded = emit_in(store, 'demo-tg-x')
+        match_subscriptions(store)
+        assert pending_hints(store, sid) == 0 and store.get_subscription(token, sid)['delivery']['held_reason'] == 'batch'
+        view = store.update_subscription(token, sid, version, action='set_exclusions', exclude_chats=[SECOND_CHAT],
+            exclusions_revision=0)
+        assert view['version'] == version
+        # The next hint tick rebuilds the held range from references visible under the new list: an entirely
+        # excluded range holds nothing, keeps the version and stages no hint.
+        flush_hints(store)
+        held = hint_window(store, sid)
+        assert held['subscription_version'] == version and held['match_count'] == 0 and held['held_reason'] is None
+        assert held['reasons'] == [] and pending_hints(store, sid) == 0
+        assert store.get_subscription(token, sid)['delivery']['held_reason'] is None
+        # One allowed match does not complete a batch of two: the excluded match no longer counts.
+        first = emit(store)
+        match_subscriptions(store)
+        held = hint_window(store, sid)
+        assert pending_hints(store, sid) == 0 and held['match_count'] == 1 and 'owner_mention' not in held['reasons']
+        kept = emit(store)
+        match_subscriptions(store)
+        assert pending_hints(store, sid) == 1
+        posts = []
+        def transport(endpoint, body, headers, **kwargs):
+            posts.append(body)
+            return 204
+        assert dispatch_hints(store, transport=transport, resolver=lambda *a, **k: ['93.184.216.34'])['delivered'] == 1
+        assert json.loads(posts[0])['through'] == kept
+        assert [item['event_id'] for item in store.get_subscription_events(token, sid)['items']] == [first, kept]
+        assert excluded < first
+    finally:
+        store.set_dynamic_subscriptions(False)
+        store.set_source_exclusions(False)
+
+
+def hint_window(store, sid):
+    with store.pool.connection() as c:
+        return c.execute("""SELECT subscription_version,match_count,reasons,through_position,held_reason
+            FROM subscription_hint_windows WHERE subscription=%s""", (sid,)).fetchone()
+
+
+# spec: ANYM-830
+def test_a_partly_excluded_held_range_is_rebuilt_with_only_its_allowed_references(seeded, tmp_path):
+    from messaging_service.delivery_policy import flush_hints
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    store.set_source_exclusions(True)
+    try:
+        token = identity(store)
+        second_chat(store)
+        sid = store.create_subscription(token, sources={'all_visible_chats': True})['subscription_id']
+        rid, _ = receiver(store, token, tmp_path)
+        call(store, token, 'configure_subscription_delivery', sid, 1, rid, {'batch_count': 3})
+        version = store.get_subscription(token, sid)['version']
+        emit(store)
+        emit_in(store, 'demo-tg-x')
+        match_subscriptions(store)
+        assert hint_window(store, sid)['match_count'] == 2
+        store.update_subscription(token, sid, version, action='set_exclusions', exclude_chats=[SECOND_CHAT],
+            exclusions_revision=0)
+        flush_hints(store)
+        held = hint_window(store, sid)
+        assert held['match_count'] == 1 and held['held_reason'] == 'batch' and pending_hints(store, sid) == 0
+        # Two more allowed matches complete the batch of three; the excluded one never counted.
+        emit(store)
+        match_subscriptions(store)
+        assert pending_hints(store, sid) == 0
+        emit(store)
+        match_subscriptions(store)
+        assert pending_hints(store, sid) == 1
+    finally:
+        store.set_dynamic_subscriptions(False)
+        store.set_source_exclusions(False)
+
+
+# spec: ANYM-830
+def test_swapping_exclusions_with_an_equal_count_rebuilds_the_held_times_and_reasons(seeded, tmp_path):
+    from datetime import timedelta
+    from psycopg.types.json import Jsonb
+    from messaging_service.delivery_policy import flush_hints
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    store.set_source_exclusions(True)
+    try:
+        token = identity(store)
+        second_chat(store)
+        with store.pool.connection() as c:
+            c.execute("INSERT INTO message_metadata(message,revision,metadata) VALUES('demo-tg-x',1,%s)",
+                (Jsonb({'mentions_owner': True}),))
+        sid = store.create_subscription(token, sources={'all_visible_chats': True})['subscription_id']
+        rid, _ = receiver(store, token, tmp_path)
+        call(store, token, 'configure_subscription_delivery', sid, 1, rid, {'batch_count': 3})
+        version = store.get_subscription(token, sid)['version']
+        mention = emit_in(store, 'demo-tg-x')
+        plain = emit(store)
+        match_subscriptions(store)
+        with store.pool.connection() as c:
+            matched = {row['event']: row['matched_at'] for row in c.execute(
+                'SELECT event,matched_at FROM subscription_matches WHERE subscription=%s', (sid,)).fetchall()}
+            # Distinct match times, so the rebuilt range shows which reference it holds.
+            c.execute("UPDATE subscription_matches SET matched_at=matched_at-interval '100 seconds' WHERE subscription=%s"
+                " AND event=%s", (sid, mention))
+        matched[mention] = matched[mention] - timedelta(seconds=100)
+        def held():
+            with store.pool.connection() as c:
+                return c.execute('''SELECT match_count,reasons,first_match_at,last_match_at,held_reason
+                    FROM subscription_hint_windows WHERE subscription=%s''', (sid,)).fetchone()
+        store.update_subscription(token, sid, version, action='set_exclusions', exclude_chats=[SECOND_CHAT],
+            exclusions_revision=0)
+        # Marked for its rebuild: no due time is shown until the tick has rebuilt it.
+        assert store.get_subscription(token, sid)['delivery']['next_hint_at'] is None
+        flush_hints(store)
+        window = held()
+        assert window['match_count'] == 1 and 'owner_mention' not in window['reasons']
+        assert window['first_match_at'] == window['last_match_at'] == matched[plain]
+        assert store.get_subscription(token, sid)['delivery']['held_reason'] == 'batch'
+        # The other chat instead: still one reference, but the other one, with its own time and reason.
+        store.update_subscription(token, sid, version, action='set_exclusions', exclude_chats=[
+            {'account': 'telegram-demo', 'chat': 'telegram-demo-chat'}], exclusions_revision=1)
+        flush_hints(store)
+        window = held()
+        assert window['match_count'] == 1 and 'owner_mention' in window['reasons']
+        assert window['first_match_at'] == window['last_match_at'] == matched[mention]
+        assert pending_hints(store, sid) == 0 and window['held_reason'] == 'batch'
+    finally:
+        store.set_dynamic_subscriptions(False)
+        store.set_source_exclusions(False)
+
+
+# spec: ANYM-830
+def test_a_same_receiver_reconfiguration_after_an_exclusion_swap_keeps_the_rebuild_and_its_deadline(seeded, tmp_path):
+    from datetime import timedelta
+    from psycopg.types.json import Jsonb
+    from messaging_service.delivery_policy import flush_hints
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    store.set_source_exclusions(True)
+    try:
+        token = identity(store)
+        second_chat(store)
+        with store.pool.connection() as c:
+            c.execute("INSERT INTO message_metadata(message,revision,metadata) VALUES('demo-tg-x',1,%s)",
+                (Jsonb({'mentions_owner': True}),))
+        sid = store.create_subscription(token, sources={'all_visible_chats': True})['subscription_id']
+        rid, _ = receiver(store, token, tmp_path)
+        call(store, token, 'configure_subscription_delivery', sid, 1, rid, {'batch_count': 3})
+        version = store.get_subscription(token, sid)['version']
+        mention = emit_in(store, 'demo-tg-x')
+        emit(store)
+        match_subscriptions(store)
+        with store.pool.connection() as c:
+            c.execute("UPDATE subscription_matches SET matched_at=matched_at-interval '100 seconds' WHERE subscription=%s"
+                " AND event=%s", (sid, mention))
+            early = c.execute('SELECT matched_at FROM subscription_matches WHERE subscription=%s AND event=%s',
+                (sid, mention)).fetchone()['matched_at']
+        store.update_subscription(token, sid, version, action='set_exclusions', exclude_chats=[SECOND_CHAT],
+            exclusions_revision=0)
+        flush_hints(store)
+        # Swap with an equal count, then reconfigure to the same receiver before the next tick.
+        store.update_subscription(token, sid, version, action='set_exclusions', exclude_chats=[
+            {'account': 'telegram-demo', 'chat': 'telegram-demo-chat'}], exclusions_revision=1)
+        call(store, token, 'configure_subscription_delivery', sid, version, rid, {'batch_count': 3})
+        current = store.get_subscription(token, sid)
+        assert current['version'] == version + 1
+        flush_hints(store)
+        with store.pool.connection() as c:
+            window = c.execute('''SELECT subscription_version,match_count,reasons,first_match_at,due_at,held_reason
+                FROM subscription_hint_windows WHERE subscription=%s''', (sid,)).fetchone()
+        assert window['subscription_version'] == version + 1 and window['match_count'] == 1
+        assert 'owner_mention' in window['reasons'] and window['first_match_at'] == early
+        # The deadline is planned from the reference the range holds now: its first match plus max_wait_s.
+        wait = store.get_subscription(token, sid)['delivery']['policy']['max_wait_s']
+        assert window['held_reason'] == 'batch' and window['due_at'] == early + timedelta(seconds=wait)
+        assert pending_hints(store, sid) == 0
+    finally:
+        store.set_dynamic_subscriptions(False)
+        store.set_source_exclusions(False)
+
+
+# spec: ANYM-830
+@pytest.mark.parametrize('mixed', [True, False], ids=['mixed', 'all_excluded'])
+def test_an_exclusion_committed_after_the_dispatcher_leased_a_hint_applies_at_its_fence(
+        seeded, tmp_path, monkeypatch, mixed):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    store.set_source_exclusions(True)
+    try:
+        token, endpoint, _, _ = endpoint_setup(store, tmp_path, monkeypatch, events=0)
+        second_chat(store)
+        sid = store.create_subscription(token, sources={'all_visible_chats': True},
+            delivery={'endpoint_id': endpoint['endpoint_id']})['subscription_id']
+        kept = emit(store) if mixed else None
+        excluded = emit_in(store, 'demo-tg-x')
+        match_subscriptions(store)
+        version = store.get_subscription(token, sid)['version']
+        changed = []
+        def resolver(*args, **kwargs):
+            # Runs after the reservation committed (state leased) and before the fence: commit the exclusion here.
+            if not changed:
+                with store.pool.connection() as c:
+                    changed.append(c.execute('SELECT state FROM subscription_outbox WHERE subscription=%s',
+                        (sid,)).fetchone()['state'])
+                store.update_subscription(token, sid, version, action='set_exclusions', exclude_chats=[SECOND_CHAT],
+                    exclusions_revision=0)
+            return ['93.184.216.34']
+        sent = []
+        def post(url, body, headers, **kwargs):
+            if json.loads(body)['subscription_id'] == sid:
+                sent.append(body)
+            return 204
+        dispatch_hints(store, transport=post, resolver=resolver)
+        assert changed == ['leased']
+        if mixed:
+            assert len(sent) == 1 and [ref['event_id'] for ref in json.loads(sent[0])['references']] == [kept]
+            assert [state for _, state, _ in outbox(store, sid)] == ['delivered']
+        else:
+            assert sent == [] and [state for _, state, _ in outbox(store, sid)] == ['cancelled']
+        assert excluded not in [item['event_id'] for item in store.get_subscription_events(token, sid)['items']]
+    finally:
+        store.set_delivery_features(False)
+        store.set_source_exclusions(False)
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-830
+def test_set_exclusions_waits_for_an_inflight_fetch_and_the_cursor_passes_excluded_references(seeded):
+    import threading
+    from messaging_service.subscription_consumption import fetch_subscription_events
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    store.set_source_exclusions(True)
+    try:
+        token = identity(store)
+        second_chat(store)
+        sid = store.create_subscription(token, sources={'all_visible_chats': True})['subscription_id']
+        kept, excluded = emit(store), emit_in(store, 'demo-tg-x')
+        match_subscriptions(store)
+        version = store.get_subscription(token, sid)['version']
+        done = []
+        def change():
+            done.append(store.update_subscription(token, sid, version, action='set_exclusions',
+                exclude_chats=[SECOND_CHAT], exclusions_revision=0))
+        with store.authorized(token, 'fetch_subscription_events') as (c, p):
+            page = fetch_subscription_events(store, c, p, sid)
+            update = threading.Thread(target=change)
+            update.start()
+            update.join(0.5)
+            # The update waits for the read in flight, which saw the old list.
+            assert update.is_alive() and done == []
+        update.join(10)
+        assert not update.is_alive() and done[0]['version'] == version
+        assert [item['event_id'] for item in page['items']] == [kept, excluded]
+        # The same version: a receipt issued before the update still ACKs its whole range.
+        ack = call(store, token, 'ack_subscription_events', sid, page['receipt'], page['ack_version'])
+        assert ack['acked_through'] == excluded
+        assert call(store, token, 'fetch_subscription_events', sid)['items'] == []
+        later, hidden = emit(store), emit_in(store, 'demo-tg-x')
+        match_subscriptions(store)
+        after = call(store, token, 'fetch_subscription_events', sid)
+        assert [item['event_id'] for item in after['items']] == [later] and hidden > later
+    finally:
+        store.set_dynamic_subscriptions(False)
+        store.set_source_exclusions(False)
+
+
 # spec: ANYM-535
 def test_failure_kind_hints_carry_only_reference_fields(seeded, tmp_path, monkeypatch):
     from messaging_service.archive import Archive
@@ -2061,7 +2403,7 @@ def test_dispatcher_heartbeat_reports_version_and_stops_when_a_lane_stalls(seede
     legacy, [component] = rows()
     assert len(legacy) == 1
     # ANYM-825: the package version plus the build's gate features (heartbeats.identity).
-    assert (component['version'], component['schema_version']) == (__version__ + '+source-filters', RUNTIME_SCHEMA)
+    assert (component['version'], component['schema_version']) == (__version__ + '+source-filters.source-exclusions', RUNTIME_SCHEMA)
 
 
 # spec: ANYM-534

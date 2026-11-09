@@ -39,7 +39,8 @@ from .tool_types import (  # noqa: F401  (the moved names stay importable from h
     EventKind, SubscriptionEventKind, EventOrigin, MessageFormat, SubscriptionReference,
     SubscriptionReferences, SubscriptionKinds, SubscriptionOrigins, SubscriptionLimit, SubscriptionVersion,
     SubscriptionPosition, LocalClock, QuietWindow, QuietHours, DeliveryPolicy, EndpointReference,
-    EndpointUrl, SigningSecret, EndpointHeaders, EndpointLabel, AttemptLimit, SubscriptionSources,
+    EndpointUrl, SigningSecret, EndpointHeaders, EndpointLabel, AttemptLimit, SubscriptionSources, ExcludedChat, ExcludedChats,
+    ExclusionsRevision,
     SubscriptionEndpoint, subscription_expiry, SubscriptionExpiry)
 # The only calls whose body may pass 16 KiB (ANYM-547: inline files of messages_send); REST path or MCP tool name.
 # Both stage bytes as uploads, so only a key that may upload (upload_file_chunk) reads more than 16 KiB.
@@ -92,6 +93,8 @@ OMITTED_WHEN_NONE = {'create_subscription':('chat_ids','sources','wake_rules','r
     # ANYM-826: an omitted detail keeps every page and audit record as before.
     'get_subscription_events':('detail','include'),'fetch_subscription_events':('detail','include'),
     'wait_for_subscription_events':('detail','include'),
+    # ANYM-830: pause, resume and close keep their payloads and audit records.
+    'update_subscription':('exclude_chats','exclusions_revision'),
     # ANYM-736: an omitted guard keeps every request, hash and stored row as before.
     # ANYM-748: so does an omitted allow_duplicate.
     # ANYM-837: so does an omitted menu_choice.
@@ -1161,6 +1164,10 @@ def register_subscription_tools(mcp, call, async_call, read, upload_write):
         unknown] keeps Telegram private chats and all WhatsApp chats. Naming channel lets channels in;
         include_channels without channel is invalid_filter. It needs a second operator switch
         (source_filters_disabled).
+        exclude_chats (up to 40 {account, chat} pairs the key can see, 6,000 bytes) leaves those chats
+        out before any match, hint or budget and hides their stored references; replace it later with
+        update_subscription(action='set_exclusions'). It is a preference, not authorization (scope
+        applies first), and needs a third operator switch (source_exclusions_disabled).
         Recommended wake_rules for them: [reply_to_owner, owner_mention, reply_to_own_send];
         reply_to_own_send (dynamic only) catches an exact native reply to any confirmed send of
         this key. Optional sender_ids (explicit chats only) are exact account-scoped IDs from search_people.
@@ -1207,18 +1214,25 @@ def register_subscription_tools(mcp, call, async_call, read, upload_write):
         destructiveHint=False,idempotentHint=False,openWorldHint=False))
     def update_subscription(ctx: Context,subscription_id: SubscriptionReference,
                             version: SubscriptionVersion,
-                            action: Literal['pause','resume','close'],
-                            resume_policy: Literal['catch_up','skip']='catch_up') -> dict[str,Any]:
+                            action: Literal['pause','resume','close','set_exclusions'],
+                            resume_policy: Literal['catch_up','skip']='catch_up',
+                            exclude_chats: ExcludedChats=None,
+                            exclusions_revision: ExclusionsRevision=None) -> dict[str,Any]:
         """Version-checked pause/resume/close of your own subscription, without a provider action.
 
         Requires read + explicit subscription-write. Read the current version first.
         Resume catch_up keeps the prior matching boundary; skip intentionally advances
         to the current committed boundary. Inspect any reported gap. Closed definitions
-        cannot be resumed. Selection edits and credential transfer are not supported.
+        cannot be resumed. set_exclusions replaces the exclude_chats list of an active or
+        paused all-visible-chats definition (an empty list clears it); it needs version and
+        sources.exclusions_revision (0 before the first list), keeps version and queued hints,
+        and returns source_exclusions_disabled until the operator enables it. No other
+        selection edit and no credential transfer is supported.
         After an uncertain result, read the definition before retrying its old version.
         """
         return call(ctx,'update_subscription',subscription_id=subscription_id,version=version,
-            action=action,resume_policy=resume_policy)
+            action=action,resume_policy=resume_policy,exclude_chats=exclude_chats,
+            exclusions_revision=exclusions_revision)
 
     @mcp.tool(structured_output=True,annotations=read)
     def get_subscription_events(ctx: Context,subscription_id: SubscriptionReference,

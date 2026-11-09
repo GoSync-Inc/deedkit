@@ -63,7 +63,8 @@ def main():
         'set-subscription-retention','link-person','unlink-person','delete-person','list-people','set-person-channel','key-info',
         'principal-info','delivery-endpoints-list','disable-delivery-endpoint','enable-delivery-endpoint',
         'reload-delivery-policy','set-delivery-features','migrate-expand','set-module-cursor','abandon-module-gap',
-        'module-router-status','set-dynamic-subscriptions','set-source-filters'])
+        'module-router-status','set-dynamic-subscriptions','set-source-filters',
+        'set-source-exclusions'])
     parser.add_argument('--principal')
     parser.add_argument('--accounts',nargs='+')
     parser.add_argument('--key-file',type=Path)
@@ -328,6 +329,13 @@ def main():
             if not (args.enable or args.disable):
                 parser.error('set-source-filters requires --enable or --disable')
             result=store.set_source_filters(args.enable,verify_components=True)
+            print(json.dumps(result))
+            if 'error' in result:raise SystemExit(1)
+        elif args.command=='set-source-exclusions':
+            # ANYM-830: the same checks for sources.exclude_chats; --disable moves those definitions to access_changed.
+            if not (args.enable or args.disable):
+                parser.error('set-source-exclusions requires --enable or --disable')
+            result=store.set_source_exclusions(args.enable,verify_components=True)
             print(json.dumps(result))
             if 'error' in result:raise SystemExit(1)
         elif args.command=='reload-delivery-policy':

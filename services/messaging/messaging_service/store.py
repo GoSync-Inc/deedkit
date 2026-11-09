@@ -1145,11 +1145,12 @@ class Store:
         with self.authorized(token, 'get_subscription') as (c, p):
             return get_subscription(self, c, p, subscription_id)
 
-    def update_subscription(self, token, subscription_id, version, *, action, resume_policy='catch_up'):
+    def update_subscription(self, token, subscription_id, version, *, action, resume_policy='catch_up',
+                            exclude_chats=None, exclusions_revision=None):
         from .subscriptions import update_subscription
         with self.authorized(token, 'update_subscription') as (c, p):
-            return update_subscription(self, c, p, subscription_id, version,
-                action=action, resume_policy=resume_policy)
+            return update_subscription(self, c, p, subscription_id, version, action=action,
+                resume_policy=resume_policy, exclude_chats=exclude_chats, exclusions_revision=exclusions_revision)
 
     def get_subscription_events(self, token, subscription_id, *, after=0, limit=50, module_after=None, detail=None,
                                 include=None):
@@ -1277,6 +1278,11 @@ class Store:
         # Operator only (`set-source-filters`, ANYM-825); disabling is the rollback before older code runs.
         from .subscriptions import set_source_filters
         return set_source_filters(self, enabled, verify_components=verify_components)
+
+    def set_source_exclusions(self, enabled, *, verify_components=False):
+        # Operator only (`set-source-exclusions`, ANYM-830); disabling is the rollback before older code runs.
+        from .subscriptions import set_source_exclusions
+        return set_source_exclusions(self, enabled, verify_components=verify_components)
 
     def set_delivery_features(self, enabled, *, verify_components=False):
         # Operator only (`set-delivery-features`, ANYM-534); disabling cancels queued endpoint hints and tests.

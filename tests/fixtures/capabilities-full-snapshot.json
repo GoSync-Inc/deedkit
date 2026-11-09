@@ -731,6 +731,15 @@
     "unknown"
    ]
   },
+  "source_exclusions": {
+   "disabled_error": "source_exclusions_disabled",
+   "field": "sources.exclude_chats",
+   "keeps_version": true,
+   "max_bytes": 6000,
+   "max_pairs": 40,
+   "revision_field": "sources.exclusions_revision",
+   "update_action": "set_exclusions"
+  },
   "activity": {
    "counts_model_runs": false,
    "cost_estimate": false,
@@ -754,7 +763,8 @@
     "left_out_wake_rule",
     "match_budget_blocked",
     "matched_failure",
-    "reads_compact"
+    "reads_compact",
+    "left_out_excluded_chat"
    ],
    "operation": "get_subscription",
    "retention_days": 35,

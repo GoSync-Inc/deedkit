@@ -59,12 +59,19 @@ WAKE_RULES = frozenset(('incoming_message', 'owner_mention', 'reply_to_owner', '
 # the shared lock, so --disable waits for every creation that read it enabled.
 DYNAMIC_GATE = 'dynamic_subscriptions'
 DYNAMIC_LOCK = 'dynamic-subscriptions'
-SOURCE_OPTIONS = frozenset(('all_visible_chats', 'account_ids', 'include_channels', 'include_bots', 'chat_types'))
+SOURCE_OPTIONS = frozenset(('all_visible_chats', 'account_ids', 'include_channels', 'include_bots', 'chat_types',
+    'exclude_chats'))
 # ANYM-825: the chat types of a dynamic definition (the ANYM-272 vocabulary; an untyped chat is unknown) and
 # the operator's second switch (set-source-filters), read and fenced like the dynamic one.
 CHAT_TYPES = frozenset(('private', 'group', 'channel', 'unknown'))
 SOURCE_FILTER_GATE = 'source_filters'
 SOURCE_FILTER_LOCK = 'source-filters'
+# ANYM-830: chats a dynamic definition leaves out ({account, chat} pairs the key can see), behind a third switch
+# (set-source-exclusions); `exclusions_revision` in the sources is the list's own conflict counter.
+SOURCE_EXCLUSION_GATE = 'source_exclusions'
+SOURCE_EXCLUSION_LOCK = 'source-exclusions'
+EXCLUDE_CHATS_MAX = 40
+EXCLUDE_CHATS_BYTES = 6000
 
 
 def _bound_setting(name, default, minimum, maximum):
@@ -115,6 +122,19 @@ def source_filters_on(c, *, fence=True):
         AS enabled""", (SOURCE_FILTER_GATE,)).fetchone()['enabled']
 
 
+def source_exclusions_on(c, *, fence=True):
+    if fence:
+        c.execute('SELECT pg_advisory_xact_lock_shared(hashtextextended(%s,0))', (SOURCE_EXCLUSION_LOCK,))
+    return c.execute("""SELECT EXISTS(SELECT FROM probe_metadata WHERE name=%s AND value='enabled')
+        AS enabled""", (SOURCE_EXCLUSION_GATE,)).fetchone()['enabled']
+
+
+def excluded_chats(row):
+    """ANYM-830: ([accounts], [chats]) of the pairs a dynamic definition leaves out; ([], []) when none."""
+    pairs = ((row['selector'].get('sources') or {}).get('exclude_chats') or []) if dynamic(row) else []
+    return [pair['account'] for pair in pairs], [pair['chat'] for pair in pairs]
+
+
 def scope(row, p):
     """(accounts, chats) a definition may disclose now: a dynamic one the key's current scope narrowed by
     its account_ids; chats None means every chat of those accounts."""
@@ -133,8 +153,15 @@ def visible_filter(row, p, alias='m'):
     if not dynamic(row):
         return 'true', []
     accounts, chats = scope(row, p)
-    return ('coalesce(NOT ' + alias + '.hidden AND ' + alias + '.account=ANY(%s) AND (%s::text[] IS NULL OR ' +
-        alias + '.chat=ANY(%s)),false)', [accounts, chats, chats])
+    where, args = ('NOT ' + alias + '.hidden AND ' + alias + '.account=ANY(%s) AND (%s::text[] IS NULL OR ' +
+        alias + '.chat=ANY(%s))', [accounts, chats, chats])
+    left_accounts, left_chats = excluded_chats(row)
+    if left_accounts:
+        # ANYM-830: a listed chat's stored references stay out of every read, count and hint fence.
+        where += (' AND NOT EXISTS(SELECT FROM unnest(%s::text[],%s::text[]) AS x(account,chat) WHERE x.account=' +
+            alias + '.account AND x.chat=' + alias + '.chat)')
+        args += [left_accounts, left_chats]
+    return 'coalesce(' + where + ',false)', args
 
 
 def reference_columns(row, p, alias='m'):
@@ -294,8 +321,14 @@ def _view(c, row, p=None):
     # ANYM-518: the consumer's ACK position; before its first fetch, the start.
     consumption = c.execute('SELECT acked_through FROM subscription_consumption WHERE subscription=%s',
         (row['id'],)).fetchone()
+    selector = row['selector']
+    if dynamic(row) and 'exclude_chats' in selector['sources']:
+        # ANYM-830: a stored pair whose chat left the key's scope is not shown.
+        accounts, chats = scope(row, p)
+        selector = {**selector, 'sources': {**selector['sources'], 'exclude_chats': [pair for pair in
+            selector['sources']['exclude_chats'] if pair['account'] in accounts and (chats is None or pair['chat'] in chats)]}}
     return serial({'subscription_id': row['id'], 'state': row['state'], 'version': row['version'],
-        'label': row['label'], **row['selector'], 'created_at': row['created_at'],
+        'label': row['label'], **selector, 'created_at': row['created_at'],
         'updated_at': row['updated_at'], 'expires_at': row['expires_at'], 'closed_at': row.get('closed_at'),
         'start_position': row['start_position'], 'matched_through': row['matched_through'],
         'matcher_caught_up': row['state'] == 'active' and row['matched_through'] == head,
@@ -420,7 +453,45 @@ def _sources(p, sources, sender_ids, reply_to_send):
                 result['include_channels'] and 'channel' not in named):
             raise APIError('invalid_filter')
         result['chat_types'] = sorted(named)
+    if 'exclude_chats' in sources:
+        result['exclude_chats'] = _exclusion_pairs(sources['exclude_chats'])
+        result['exclusions_revision'] = 1
     return result
+
+
+def _exclusion_pairs(value):
+    """ANYM-830: the form of an exclusion list: at most 40 {account, chat} pairs and 6,000 serialized bytes;
+    sorted and without duplicates. Visibility is checked against the key's scope by `_visible_exclusions`."""
+    from .store import APIError
+    if not isinstance(value, list) or len(value) > EXCLUDE_CHATS_MAX:
+        raise APIError('invalid_filter')
+    pairs = set()
+    for pair in value:
+        if not isinstance(pair, dict) or set(pair) != {'account', 'chat'}:
+            raise APIError('invalid_filter')
+        for name, longest in (('account', 64), ('chat', 256)):
+            text = pair[name]
+            if (not isinstance(text, str) or not 1 <= len(text) <= longest or
+                    any(ord(ch) < 32 or ord(ch) == 127 for ch in text)):
+                raise APIError('invalid_filter')
+        pairs.add((pair['account'], pair['chat']))
+    result = [{'account': account, 'chat': chat} for account, chat in sorted(pairs)]
+    if len(json.dumps(result, ensure_ascii=False).encode()) > EXCLUDE_CHATS_BYTES:
+        raise APIError('invalid_filter')
+    return result
+
+
+def _visible_exclusions(c, p, pairs):
+    """An unknown pair, or one outside the key's scope, is not_found (as account_ids are)."""
+    from .store import APIError
+    if not pairs:
+        return
+    found = c.execute('''SELECT count(*) AS n FROM chats c JOIN unnest(%s::text[],%s::text[]) AS x(account,chat)
+        ON c.account=x.account AND c.id=x.chat WHERE c.account=ANY(%s) AND (%s::text[] IS NULL OR c.id=ANY(%s))''',
+        ([pair['account'] for pair in pairs], [pair['chat'] for pair in pairs], p['accounts'], p['chat_ids'],
+         p['chat_ids'])).fetchone()['n']
+    if found != len(pairs):
+        raise APIError('not_found', 404)
 
 
 def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=None, kinds=None,
@@ -460,6 +531,11 @@ def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=
     if dynamic_sources and 'chat_types' in dynamic_sources and not source_filters_on(c):
         # An older matcher would store every type's matches for it, and readers do not filter stored ones.
         raise APIError('source_filters_disabled', 409)
+    if dynamic_sources and 'exclude_chats' in dynamic_sources:
+        if not source_exclusions_on(c):
+            # An older matcher would match listed chats, and older readers would show their references.
+            raise APIError('source_exclusions_disabled', 409)
+        _visible_exclusions(c, p, dynamic_sources['exclude_chats'])
     sources = c.execute('SELECT id,account FROM chats WHERE id=ANY(%s) AND account=ANY(%s)',
         (chats, p['accounts'])).fetchall()
     if (len(sources) != len(chats) or
@@ -565,22 +641,34 @@ def get_subscription(store, c, p, subscription_id):
     return view
 
 
-def update_subscription(store, c, p, subscription_id, version, *, action, resume_policy='catch_up'):
+def update_subscription(store, c, p, subscription_id, version, *, action, resume_policy='catch_up',
+        exclude_chats=None, exclusions_revision=None):
     from .store import APIError
     if 'read' not in p['permissions']:
         raise APIError('forbidden', 403)
     if type(version) is not int or not 1 <= version <= 2**53 - 1:
         raise APIError('invalid_version')
-    if action not in ('pause', 'resume', 'close') or resume_policy not in ('catch_up', 'skip'):
+    if action not in ('pause', 'resume', 'close', 'set_exclusions') or resume_policy not in ('catch_up', 'skip'):
         raise APIError('invalid_subscription_state')
     if action != 'resume' and resume_policy != 'catch_up':
         raise APIError('invalid_subscription_state')
+    if (action == 'set_exclusions') != (exclude_chats is not None) or (
+            action == 'set_exclusions') != (exclusions_revision is not None):
+        raise APIError('invalid_parameters')
+    if action == 'set_exclusions':
+        pairs = _exclusion_pairs(exclude_chats)
+        if type(exclusions_revision) is not int or not 0 <= exclusions_revision <= 2**53 - 1:
+            raise APIError('invalid_version')
+        if not source_exclusions_on(c):
+            raise APIError('source_exclusions_disabled', 409)
     row = _owned(c, p, subscription_id)
     if row['state'] == 'access_changed':
         # Do not include the old version, selectors or counts in an error.
         raise APIError('subscription_access_changed', 409)
     if row['version'] != version:
         raise APIError('subscription_conflict', 409)
+    if action == 'set_exclusions':
+        return _set_exclusions(c, p, row, pairs, exclusions_revision)
     if row['state'] in ('closed', 'expired'):
         raise APIError('subscription_closed', 409)
     from . import module_events
@@ -609,6 +697,37 @@ def update_subscription(store, c, p, subscription_id, version, *, action, resume
     row = c.execute('''UPDATE subscriptions SET state=%s,version=version+1,
         matched_through=%s,gap=%s,blocked_reason=NULL,updated_at=clock_timestamp()
         WHERE id=%s RETURNING *''', (state, position, Jsonb(gap) if gap else None, row['id'])).fetchone()
+    return _view(c, row, p)
+
+
+def _set_exclusions(c, p, row, pairs, revision):
+    """ANYM-830: replace the whole list under the definition's row lock (the matcher's pass waits, so the next
+    pass already leaves the chats out). `version` stays: queued, leased and held hints are keyed to it and stay
+    valid; the fence and the webhook body hide the listed chats' references. Only `exclusions_revision` and
+    `updated_at` move; an unchanged list changes nothing."""
+    from .store import APIError
+    if not dynamic(row):
+        raise APIError('invalid_filter')
+    if row['state'] not in ('active', 'paused'):
+        raise APIError('invalid_subscription_state', 409)
+    sources = row['selector']['sources']
+    if revision != sources.get('exclusions_revision', 0):
+        raise APIError('subscription_conflict', 409)
+    _visible_exclusions(c, p, pairs)
+    if 'exclusions_revision' in sources and sources.get('exclude_chats') == pairs:
+        return _view(c, row, p)
+    selector = {**row['selector'], 'sources': {**sources, 'exclude_chats': pairs, 'exclusions_revision': revision + 1}}
+    if len(json.dumps(selector, ensure_ascii=False).encode()) > 14000:
+        raise APIError('invalid_filter')
+    row = c.execute('''UPDATE subscriptions SET selector=%s,updated_at=clock_timestamp() WHERE id=%s
+        RETURNING *''', (Jsonb(selector), row['id'])).fetchone()
+    # A held range absorbed under the old list is marked (delivery_policy.REBUILD_DUE, already due), so the next
+    # hint tick rebuilds it from the references visible under the new one before it settles; the version stays.
+    # A paused definition holds no range for long: its resume bumps the version, which restarts held ranges.
+    from .delivery_policy import REBUILD_DUE
+    if row['state'] == 'active':
+        c.execute('''UPDATE subscription_hint_windows SET due_at=%s,updated_at=clock_timestamp()
+            WHERE subscription=%s AND first_match_at IS NOT NULL''', (REBUILD_DUE, row['id']))
     return _view(c, row, p)
 
 
@@ -775,6 +894,7 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                 (row['id'],)).fetchone()['n']
             lookup = {(source['account'], source['chat']): source['sender_ids'] for source in sources}
             selector = row['selector']
+            excluded = set(zip(*excluded_chats(row)))
             # ANYM-522: one locked scope snapshot per batch; the shared principal lock holds it until commit.
             visible, own = None, set()
             if dynamic(row):
@@ -820,7 +940,8 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                     if matches and not origin_selected(event['origin'], selector['origins']):
                         matches, metric = False, 'left_out_origin'
                     if matches and visible is not None:
-                        left = _dynamic_match(selector['sources'], visible[source], snapshot)
+                        left = ('excluded_chat' if source in excluded else
+                            _dynamic_match(selector['sources'], visible[source], snapshot))
                         if left is not None:
                             left_out(row, event, left)
                             matches, metric = False, 'left_out_' + left
@@ -1250,3 +1371,31 @@ def set_source_filters(store, enabled, *, verify_components=False):
             WHERE subscription IN (SELECT id FROM subscriptions WHERE selector->'sources' ? 'chat_types')
             AND state IN ('pending','leased') RETURNING id""").fetchall()]
     return {'source_filters': 'disabled', 'access_changed': sorted(moved), 'cancelled_hints': sorted(cancelled)}
+
+
+def set_source_exclusions(store, enabled, *, verify_components=False):
+    """Operator only (ANYM-830), built like set_source_filters. Enabling (the CLI) refuses unless the API, matcher
+    and dispatcher heartbeats report the source-exclusions feature, because an older matcher matches listed chats
+    and older readers show their references. Disabling is the rollback before older code is deployed: every
+    definition that carries an exclusion list (or its revision) becomes access_changed and its queued hints are
+    cancelled; agents recreate them after a new enable."""
+    with store.pool.connection() as c:
+        c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))', (SOURCE_EXCLUSION_LOCK,))
+        if enabled and verify_components:
+            from .heartbeats import mismatch
+            problem = mismatch(c, features=('source-exclusions',))
+            if problem is not None:
+                return problem
+        c.execute('''INSERT INTO probe_metadata(name,value) VALUES(%s,%s)
+            ON CONFLICT(name) DO UPDATE SET value=EXCLUDED.value''', (SOURCE_EXCLUSION_GATE, 'enabled' if enabled else 'disabled'))
+        if enabled:
+            return {'source_exclusions': 'enabled'}
+        listed = "(selector->'sources' ? 'exclude_chats' OR selector->'sources' ? 'exclusions_revision')"
+        moved = [str(row['id']) for row in c.execute("""UPDATE subscriptions SET state='access_changed',
+            version=version+1,updated_at=clock_timestamp() WHERE """ + listed + """
+            AND state<>'access_changed' RETURNING id""").fetchall()]
+        cancelled = [str(row['id']) for row in c.execute("""UPDATE subscription_outbox SET state='cancelled',
+            finished_at=clock_timestamp(),error_code='source_exclusions_disabled',lease_token=NULL,lease_until=NULL
+            WHERE subscription IN (SELECT id FROM subscriptions WHERE """ + listed + """)
+            AND state IN ('pending','leased') RETURNING id""").fetchall()]
+    return {'source_exclusions': 'disabled', 'access_changed': sorted(moved), 'cancelled_hints': sorted(cancelled)}
