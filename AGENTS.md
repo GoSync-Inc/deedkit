@@ -79,6 +79,9 @@ live action from it wait for the owner, and so does that document's boundary.
 
 The signal grep is in docs/operations/review-protocol.md.
 
+Small fixes (owner 11-09, D55: «такую карточку не нужно ревьють, это одна строка»): harness reviews.md
+Routing "Small fix: no review"; PR lines `Review record: none (small fix)` and `Diff read: <orch> <head SHA>`.
+
 ## 4. Product context and Tiden
 
 Product IDs and DeedKit's queue rules: docs/operations/tiden-product-workflow.md; CI: TIDEN-CI.md.
