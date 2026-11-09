@@ -299,10 +299,12 @@ and the artifact again, then uploads the evidence unchanged as this run's
 `ci-evidence` with a `publication.json` record that names this push run as
 publisher and the queue run attempt and artifact as producer. A failure there
 fails the push run: `checks` is skipped and `CI gate` turns red. On a validated
-reuse `checks / verify`, `checks / python`, `checks / load` and `checks / evidence` are skipped;
-`native / synthetic`, the image builds, `publish` and the release record run as on
-every push. `CI gate` accepts a skipped `checks / verify` only for a validated
-reuse of this commit; otherwise `checks / verify` must have tested this commit.
+reuse `checks / verify`, `checks / python`, `checks / load`, `checks / evidence` and
+`native / synthetic` are skipped (the queue run, or the pull request run it reused,
+passed it on the same tree, and `production.py verify` requires that run to show
+it); the image builds, `publish` and the release record run as on every push.
+`CI gate` accepts a skipped `checks / verify` or `native / synthetic` only for a
+validated reuse of this commit; otherwise `checks / verify` must have tested this commit.
 
 After a queue run that reused a pull request run (the PR→queue chain), the
 push run reuses that pull request run's evidence instead. The queue run's

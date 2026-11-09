@@ -647,9 +647,10 @@ def test_a_reusing_push_skips_only_the_test_jobs_and_still_builds_publishes_and_
     assert tiden["needs"] == ["documentation", "evidence"] and tiden["if"].startswith("${{ always() && !cancelled()")
     assert "reuse_queue_evidence" not in json.dumps(tiden)
     assert "if" not in ci["jobs"]["images"] and "needs" not in ci["jobs"]["images"]
-    # native skips only on the queue's pull request reuse, never on a main push (pr_reuse is skipped there).
-    assert ci["jobs"]["native"]["needs"] == ["added_list", "pr_reuse"]
-    assert ci["jobs"]["native"]["if"] == "${{ !cancelled() && needs.pr_reuse.outputs.decision != 'reuse' }}"
+    # native skips only on the queue's pull request reuse or a main push's validated queue reuse (production.py verify
+    # then requires the verifying run to show it passed).
+    assert ci["jobs"]["native"]["needs"] == ["added_list", "reuse", "pr_reuse"]
+    assert ci["jobs"]["native"]["if"] == NATIVE_IF
     assert ci["jobs"]["publish"]["needs"] == ["gate"] and ci["jobs"]["release"]["needs"] == ["gate", "publish", "checks"]
     # The queue still gets no Tiden credential.
     assert ci["jobs"]["checks"]["secrets"]["TIDEN_API_TOKEN"] == (
@@ -1017,6 +1018,32 @@ def test_ci_gate_passes_a_queue_run_with_skipped_verify_only_for_its_validated_p
     assert (completed.returncode == 0) == passes
 
 
+NATIVE_IF = ("${{ !cancelled() && needs.pr_reuse.outputs.decision != 'reuse' "
+             "&& needs.reuse.outputs.decision != 'reuse' }}")
+
+
+# spec: ANYM-322
+@pytest.mark.parametrize("native, decision, passes", [
+    ("skipped", "reuse", True), ("skipped", "full", False), ("skipped", "", False), ("success", "reuse", True),
+    ("failure", "reuse", False), ("cancelled", "reuse", False),
+], ids=["skipped-on-queue-reuse", "skipped-on-full-push", "skipped-without-decision", "ran-on-queue-reuse",
+        "failed-on-queue-reuse", "cancelled-on-queue-reuse"])
+def test_ci_gate_accepts_a_skipped_native_job_on_a_main_push_only_with_the_queue_reuse(native, decision, passes):
+    ci, _ = workflows()
+    first, second = ci["jobs"]["gate"]["steps"][:2]
+    assert first["env"]["DECISION"] == second["env"]["DECISION"] == "${{ needs.reuse.outputs.decision }}"
+    values = {"ADDED_LIST_RESULT": "success", "CHECKS_RESULT": "success", "NATIVE_RESULT": native, "IMAGES_RESULT": "success",
+              "PR_DECISION": "", "DECISION": decision, "SOURCE_REF": "", "EXPECTED_SHA": SHA}
+    completed = subprocess.run(["bash", "-e", "-c", first["run"]], env={"PATH": "/usr/bin:/bin", **values},
+                               capture_output=True)
+    assert (completed.returncode == 0) == passes
+    # The second step still refuses a `reuse` decision that is not a validated queue reuse of this exact main commit.
+    refused = subprocess.run(["bash", "-e", "-c", second["run"]], env={
+        "PATH": "/usr/bin:/bin", "DECISION": "reuse", "REUSE_RESULT": "failure", "REUSED_SHA": SHA, "VERIFIED_SHA": "",
+        "EVENT_NAME": "push", "REF": "refs/heads/main", "EXPECTED_SHA": SHA}, capture_output=True)
+    assert refused.returncode != 0
+
+
 # spec: ANYM-322
 @pytest.mark.parametrize("native, decision, passes", [
     ("success", "", True), ("success", "full", True), ("success", "reuse", True), ("skipped", "reuse", True),
@@ -1026,9 +1053,9 @@ def test_ci_gate_passes_a_queue_run_with_skipped_verify_only_for_its_validated_p
 def test_ci_gate_accepts_a_skipped_native_job_only_with_the_queue_pull_request_reuse(native, decision, passes):
     ci, _ = workflows()
     job = ci["jobs"]["native"]
-    assert job["needs"] == ["added_list", "pr_reuse"] and job["uses"] == "./.github/workflows/whatsmeow.yml"
-    # Any doubt about the decision (a failed or skipped pr_reuse leaves no `reuse`) runs the native suite.
-    assert job["if"] == "${{ !cancelled() && needs.pr_reuse.outputs.decision != 'reuse' }}"
+    assert job["needs"] == ["added_list", "reuse", "pr_reuse"] and job["uses"] == "./.github/workflows/whatsmeow.yml"
+    # Any doubt about the decision (a failed or skipped pr_reuse or reuse leaves no `reuse`) runs the native suite.
+    assert job["if"] == NATIVE_IF
     first, second = ci["jobs"]["gate"]["steps"][:2]
     assert first["env"]["PR_DECISION"] == second["env"]["PR_DECISION"] == "${{ needs.pr_reuse.outputs.decision }}"
     environment = {"ADDED_LIST_RESULT": "success", "CHECKS_RESULT": "success", "NATIVE_RESULT": native, "IMAGES_RESULT": "success",

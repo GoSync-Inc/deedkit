@@ -158,10 +158,12 @@ jobs:
       TIDEN_API_TOKEN: ${{ github.event_name != 'merge_group' && secrets.TIDEN_API_TOKEN || '' }}
   native:
     # A merge queue group that reuses a pull request run skips this job too: that run's CI gate required it on exactly
-    # this tree. Every other run, and any doubt, runs it; the main push always does (production.py REQUIRED_JOBS).
+    # this tree. A main push that reuses the queue verification skips it as well: the queue run, or the pull request
+    # run it reused, passed it on this tree, and production.py verify requires that run to show it passed. Every
+    # other run, and any doubt, runs it.
     # It also needs the event's exclusion inventory (ANYM-578); without one its strip step fails closed.
-    needs: [added_list, pr_reuse]
-    if: ${{ !cancelled() && needs.pr_reuse.outputs.decision != 'reuse' }}
+    needs: [added_list, reuse, pr_reuse]
+    if: ${{ !cancelled() && needs.pr_reuse.outputs.decision != 'reuse' && needs.reuse.outputs.decision != 'reuse' }}
     uses: ./.github/workflows/whatsmeow.yml # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ workflow calls.
     with:
       source_ref: ${{ inputs.source_ref || '' }}
@@ -184,15 +186,16 @@ jobs:
           NATIVE_RESULT: ${{ needs.native.result }}
           IMAGES_RESULT: ${{ needs.images.result }}
           PR_DECISION: ${{ needs.pr_reuse.outputs.decision }}
+          DECISION: ${{ needs.reuse.outputs.decision }}
           SOURCE_REF: ${{ inputs.source_ref || '' }}
           EXPECTED_SHA: ${{ github.sha }}
         run: |
           test "$ADDED_LIST_RESULT" = success
           test "$CHECKS_RESULT" = success
-          # native / synthetic is skipped only with the pull request reuse, which the next step validates. An if, not
-          # an `&&` list: `bash -e` ignores a failure on the left of `&&`.
+          # native / synthetic is skipped only with the pull request reuse or the queue reuse, which the next step
+          # validates. An if, not an `&&` list: `bash -e` ignores a failure on the left of `&&`.
           if [ "$NATIVE_RESULT" = skipped ]; then
-            test "$PR_DECISION" = reuse
+            [ "$PR_DECISION" = reuse ] || [ "$DECISION" = reuse ]
           else
             test "$NATIVE_RESULT" = success
           fi
