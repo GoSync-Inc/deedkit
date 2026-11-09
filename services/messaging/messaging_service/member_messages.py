@@ -10,6 +10,7 @@ read-back, `record_deletions` sends each confirmed deletion through the archive'
 import asyncio
 from datetime import datetime, timezone
 import logging
+import time
 
 from .field_errors import refusal
 from .store import APIError
@@ -17,9 +18,12 @@ from .store import APIError
 log = logging.getLogger('messaging_service.member_messages')
 PREVIEW_TEXT = 200
 PURGE_LINE = 'the archive copy is purged as well'
-# The archive write after a confirmed deletion shares the command's 30 s; past this it is left to the provider's own
-# deletion event and the tombstone sweep, and the receipt stays as settled.
+# The archive write after a settled receipt has its own deadline, which PostgreSQL enforces (DeadlinePool: transaction,
+# lock and statement timeouts), so it never holds the archive lock or the lease fence past it; the command loop waits
+# at most ARCHIVE_GRACE longer. Past it the deletion is left to Telegram's own deletion event and the tombstone sweep.
 ARCHIVE_SECONDS = 10
+ARCHIVE_GRACE = 1
+UNREADABLE_CHANNEL = 'a channel this key cannot read'
 OTHER_CHAT = 'a message of this chat; a channel post\'s comments are messages of its discussion group'
 
 
@@ -27,30 +31,38 @@ def _refused(*errors):
     return refusal('invalid_operation_parameters', errors)
 
 
-def chat_type(c, account, chat):
+def chat_type(c, p, account, chat):
     """How the preview names the chat: channel, supergroup, basic group or discussion group of <channel title>.
 
-    From the archive alone: a group whose archived messages include one sent as an archived broadcast channel of the
-    account (the post Telegram copies into a channel's discussion group) is that channel's discussion group."""
+    From the archive alone: Telegram copies each channel post into the channel's discussion group as a forwarded
+    message sent as that channel, so a group holding such a message from an archived broadcast channel of the account
+    is its discussion group (a member posting as a channel sends no forward). The channel's title is shown only to a
+    key that may read that channel."""
+    from .commands import permitted
     if chat['chat_type'] == 'channel':
         return 'channel'
     if chat['chat_type'] != 'group':
         return chat['chat_type'] or 'unknown'
     if not str(chat['provider_chat']).startswith('-100'):
         return 'basic group'
-    linked = c.execute('''SELECT ch.title FROM chats ch WHERE ch.account=%s AND ch.chat_type='channel'
-        AND ch.provider_chat LIKE '-100%%' AND EXISTS(SELECT 1 FROM messages m WHERE m.account=ch.account
-            AND m.sender=ch.provider_chat AND m.chat=%s AND NOT m.deleted) ORDER BY ch.id LIMIT 1''',
+    linked = c.execute('''SELECT ch.id,ch.title FROM chats ch WHERE ch.account=%s AND ch.chat_type='channel'
+        AND ch.provider_chat LIKE '-100%%' AND EXISTS(SELECT 1 FROM messages m
+            JOIN message_revisions r ON r.message=m.id AND r.revision=m.revision
+            WHERE m.account=ch.account AND m.sender=ch.provider_chat AND m.chat=%s AND NOT m.deleted
+            AND r.snapshot->'metadata'->>'forwarded'='true') ORDER BY ch.id LIMIT 1''',
         (account, chat['id'])).fetchone()
-    return 'discussion group of ' + linked['title'] if linked else 'supergroup'
+    if not linked:
+        return 'supergroup'
+    return 'discussion group of ' + (linked['title'] if permitted(p, account, linked['id']) else UNREADABLE_CHANNEL)
 
 
-def resolve(c, p, account, chat, parameters, *, permitted):
+def resolve(c, p, account, chat, parameters):
     """The reviewed targets of one call, in the caller's order, or a refusal naming each bad item.
 
     Each item must be another person's live archived message of this chat at its current revision; a message the
     key may not read is not_found, never another chat's (nothing of a chat outside the key's scope is shown)."""
     from .collector_state import CollectorState
+    from .commands import permitted
     policy = c.execute('SELECT * FROM account_policies WHERE account=%s', (account,)).fetchone()
     if chat['chat_type'] not in ('group', 'channel'):
         raise APIError('unsupported_operation')
@@ -68,7 +80,7 @@ def resolve(c, p, account, chat, parameters, *, permitted):
         elif row['chat'] != chat['id']:
             errors.append((path, 'message_from_other_chat', OTHER_CHAT))
             elsewhere = {'id': row['chat'], 'chat_type': row['chat_type'], 'provider_chat': row['provider_chat']}
-            other.append({'field': path, 'chat_id': row['chat'], 'chat_type': chat_type(c, account, elsewhere)})
+            other.append({'field': path, 'chat_id': row['chat'], 'chat_type': chat_type(c, p, account, elsewhere)})
         elif row['direction'] == 'outgoing':
             errors.append((path, 'own_message', 'another person\'s message; own messages use delete_message'))
         else:
@@ -84,7 +96,7 @@ def resolve(c, p, account, chat, parameters, *, permitted):
     return targets
 
 
-def shown(c, account, chat, targets):
+def shown(c, p, account, chat, targets):
     """What the owner confirms: the chat type and, per message, its sender, time, kind and first 200 characters."""
     rows = {r['id']: r for r in c.execute('''SELECT m.id,m.sender,m.sent_at,m.body,
         r.snapshot->'metadata'->>'message_kind' AS kind,r.snapshot->'sender_profile'->>'display_name' AS snapshot_name,
@@ -100,7 +112,7 @@ def shown(c, account, chat, targets):
         messages.append({'message_id': target['message_id'], 'revision': target['revision'],
             'sender_id': row['sender'], 'sender_name': name, 'sender_username': username,
             'sent_at': row['sent_at'], 'kind': row['kind'] or 'unknown', 'text': (row['body'] or '')[:PREVIEW_TEXT]})
-    return {'chat': {'chat_id': chat['id'], 'title': chat['title'], 'chat_type': chat_type(c, account, chat)},
+    return {'chat': {'chat_id': chat['id'], 'title': chat['title'], 'chat_type': chat_type(c, p, account, chat)},
             'count': len(messages), 'messages': messages, 'archive': PURGE_LINE,
             'untrusted': ['chat.title', 'messages.sender_name', 'messages.sender_username', 'messages.text']}
 
@@ -122,14 +134,17 @@ def confirmed_ids(job, answer):
 async def record_deletions(state, job, answer):
     """Each deletion the read-back confirmed enters the archive as the provider's own deletion would (tombstone,
     deleted mark, purge). Best effort and total: the receipt is already settled, and the provider's deletion event
-    and the tombstone sweep still apply it if this write fails or runs out of time."""
+    and the tombstone sweep still apply it if this write fails or runs out of time. Every transaction of the write
+    ends at the deadline on the server, so a slow archive frees its locks then even while this thread stalls."""
+    from .telegram_collector import bounded_state
     ids = confirmed_ids(job, answer)
     if not ids:
         return 0
     capture = {'kind': 'telegram_delete', 'account': state.account, 'chat': str(job.get('provider_chat')),
                'ids': ids, 'observed_at': datetime.now(timezone.utc).isoformat()}
     try:
-        await asyncio.wait_for(asyncio.to_thread(state.apply, capture), ARCHIVE_SECONDS)
+        bounded = bounded_state(state, time.monotonic() + ARCHIVE_SECONDS)
+        await asyncio.wait_for(asyncio.to_thread(bounded.apply, capture), ARCHIVE_SECONDS + ARCHIVE_GRACE)
     except asyncio.CancelledError:
         raise
     except Exception as exc:

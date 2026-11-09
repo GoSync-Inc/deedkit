@@ -147,6 +147,20 @@ def test_a_flood_wait_before_the_request_is_failed_and_after_it_unknown_with_ret
 
 
 # spec: ANYM-934
+def test_a_flood_wait_in_the_peer_lookup_is_failed_with_retry_after_for_each_target():
+    # Astra r1 (major): the lookup runs before the handler; nothing was sent, so each row is failed, safe to repeat.
+    client = Client(channel(creator=True, megagroup=True))
+
+    async def limited(peer):
+        client.calls.append(('get_input_entity', peer))
+        raise ProviderRateLimited(20)
+    client.get_input_entity = limited
+    result = run(client)
+    assert states(result) == ['failed'] * 3 and result['outcome'] == 'confirmed' and not deletes(client)
+    assert all(row['evidence'] == {'basis': 'provider_read_back', 'retry_after_s': 20} for row in result['data']['results'])
+
+
+# spec: ANYM-934
 def test_a_refused_request_is_failed_and_any_other_error_after_sending_is_unknown():
     refused = Client(channel(creator=True, megagroup=True),
                      raises={'delete_messages': errors.MessageDeleteForbiddenError(request=None)})

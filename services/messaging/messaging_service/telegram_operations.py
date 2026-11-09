@@ -1168,6 +1168,11 @@ async def write_member_messages(op):
     return await delete_member_messages(op)
 
 
+def member_messages_unsent(job, error):
+    from .telegram_moderation import unsent  # ANYM-934: a flood wait before any request leaves each target failed
+    return unsent(job, error)
+
+
 GROUP_HANDLERS = {
     'check_chat_link': chat_link, 'join_chat': chat_link, 'create_group': write_create_group,
     'rename_group': write_group_change, 'set_group_description': write_group_change,
@@ -1551,6 +1556,7 @@ async def _execute(client, job, *, verified_self=None, governor=None):
         # Do not expose provider exception strings, session paths or invite links.
         if started_mutation:
             return {'outcome': 'unknown', 'error': 'provider_result_unverified'}
+        if operation == 'delete_member_messages' and (answer := member_messages_unsent(job, error)): return answer
         reject('provider_preflight_failed')
     finally:
         if prepared.get('stream') is not None:

@@ -280,7 +280,7 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
                 raise APIError('forbidden',403)
             payload['provider_message_id']=message['provider_id'];refs.append(message_id)
         elif message_id or expected_revision:raise _empty(spec,chat_id,message_id,expected_revision)
-    if operation=='delete_member_messages':from . import member_messages;payload['targets']=member_messages.resolve(c,p,account,chat,parameters,permitted=permitted)
+    if operation=='delete_member_messages':from . import member_messages;payload['targets']=member_messages.resolve(c,p,account,chat,parameters)
     if operation==HISTORY and account_row['platform']=='telegram':
         anchor=parameters.get('before_message') or parameters.get('around_message')
         if anchor is not None:
@@ -382,7 +382,7 @@ def preview(store,c,p,account,operation,chat_id='',message_id='',expected_revisi
         from . import button_press
         pressed=payload['parameters']
         shown['earlier_presses']=button_press.earlier_presses(c,account,message_id,pressed['row'],pressed['column'])
-    if operation=='delete_member_messages':from . import member_messages;shown['moderation']=member_messages.shown(c,account,_chat(c,p,account,chat_id),payload['targets'])
+    if operation=='delete_member_messages':from . import member_messages;shown['moderation']=member_messages.shown(c,p,account,_chat(c,p,account,chat_id),payload['targets'])
     return serial({**payload,**shown,'permission':spec['permission'],'mutation':spec['mutation'],
         'required_permissions':payload['authorization_binding']['required_permissions'],
         'preview_digest':_digest(p,payload),'owner_approval_verified_by_server':False,

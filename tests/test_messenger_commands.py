@@ -351,16 +351,18 @@ MODERATOR=['read','read-live','groups-read','groups-moderate']
 def moderation(operator,permissions=MODERATOR):
     """A supergroup (-1001), a channel (-1002) and its discussion group (-1003) with other people's messages."""
     s,archive,_,state=operator
-    def message(chat,provider_id,title,kind,**changes):
+    def message(chat,provider_id,title,kind,forwarded=False,**changes):
         archive.ingest(event(account='command-fixture',chat=chat,chat_title=title,provider_id=provider_id,
-                             metadata={'chat_type':kind},**changes))
+                             metadata={'chat_type':kind,**({'forwarded':True} if forwarded else {})},**changes))
         return stable_id('msg','command-fixture',chat,provider_id)
     ids={'spam':message('-1001','11','Synthetic supergroup','group',sender='42',body=SPAM,
                         sender_profile={'display_name':'Synthetic Seller','username':'synthetic_seller'}),
          'spam2':message('-1001','12','Synthetic supergroup','group',sender='43',body='Second synthetic spam'),
          'own':message('-1001','13','Synthetic supergroup','group',sender='7',direction='outgoing',body='Own text'),
          'post':message('-1002','21','Synthetic news','channel',sender='-1002',body='Synthetic post'),
-         'forwarded':message('-1003','31','Synthetic news chat','group',sender='-1002',body='Synthetic post copy'),
+         'forwarded':message('-1003','31','Synthetic news chat','group',True,sender='-1002',body='Synthetic post copy'),
+         # A member posting as the channel in an unrelated supergroup: sent as the channel, but no forward.
+         'as_channel':message('-1001','14','Synthetic supergroup','group',sender='-1002',body='Synthetic post as channel'),
          'comment':message('-1003','32','Synthetic news chat','group',sender='44',body='Synthetic comment spam')}
     for chat in ('-1001','-1002','-1003'):state.chat(chat,'channel')
     key=s.issue_key('command-agent',['command-fixture'],permissions=permissions)
@@ -398,6 +400,20 @@ def test_delete_member_messages_preview_names_each_sender_and_the_chat_type(oper
     assert comments['chat_type']=='discussion group of Synthetic news'
     assert s.preview_messenger_operation(key,**moderation_args('-1002',ids['post']))['moderation']['chat'][
         'chat_type']=='channel'
+
+
+# spec: ANYM-934
+def test_delete_member_messages_preview_hides_an_unreadable_channel_and_needs_its_forwarded_post(operator):
+    # Astra r1 (major): the linked channel's title only for a key that may read that channel; a sender alone links none.
+    s,_,_,_,ids=moderation(operator)
+    scoped=s.issue_key('command-agent',['command-fixture'],chats=[stable_id('chat','command-fixture','-1003')],
+                       permissions=MODERATOR)
+    chat=s.preview_messenger_operation(scoped,**moderation_args('-1003',ids['comment']))['moderation']['chat']
+    assert chat['chat_type']=='discussion group of a channel this key cannot read'
+    assert 'Synthetic news' not in str(s.preview_messenger_operation(scoped,**moderation_args('-1003',ids['comment'])))
+    full=s.issue_key('command-agent',['command-fixture'],permissions=MODERATOR)
+    assert s.preview_messenger_operation(full,**moderation_args('-1001',ids['spam']))['moderation']['chat'][
+        'chat_type']=='supergroup'
 
 
 # spec: ANYM-934

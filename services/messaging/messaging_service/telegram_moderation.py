@@ -63,6 +63,15 @@ def rows(items, state, **evidence):
              if evidence else {})} for message_id, _ in items]
 
 
+def unsent(job, error):
+    """Astra r1: a flood wait in the peer lookup, before the handler runs and before any delete request, is each
+    target `failed` with retry_after_s (safe to repeat after the wait); None for any other error."""
+    from .telegram_governor import ProviderRateLimited
+    if not isinstance(error, ProviderRateLimited):
+        return None
+    return settled(rows(targets(job), 'failed', retry_after_s=error.seconds))
+
+
 def settled(results):
     deleted = sum(row['state'] == 'deleted' for row in results)
     return {'outcome': 'confirmed' if all(row['state'] in ('deleted', 'failed') for row in results) else 'unknown',

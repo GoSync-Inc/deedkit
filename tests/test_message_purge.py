@@ -211,6 +211,36 @@ def test_a_confirmed_member_message_deletion_purges_its_archive_copy_and_keeps_t
     assert not rows[kept]['deleted'] and rows[kept]['body']=='sentinel-n kept'
 
 
+# spec: ANYM-934
+def test_the_archive_write_after_a_member_deletion_frees_the_archive_lock_at_its_deadline(operator,monkeypatch):
+    # Astra r1 (blocking): a slow archive never keeps a waiting transaction past the write's deadline.
+    import time
+    from messaging_service import member_messages
+    s,archive,_,state=operator
+    archive.ingest(event(account='command-fixture',chat='-1001',provider_id='11',sender='42',body='sentinel-l spam',
+                         metadata={'chat_type':'group'}))
+    state.chat('-1001','channel')
+    mid=stable_id('msg','command-fixture','-1001','11')
+    monkeypatch.setattr(member_messages,'ARCHIVE_SECONDS',1)
+    job={'provider_chat':'-1001','targets':[{'message_id':mid,'revision':1,'provider_message_id':'11'}]}
+    answer={'outcome':'confirmed','data':{'results':[{'message_id':mid,'state':'deleted'}]}}
+    with s.pool.connection() as holder:
+        holder.execute('SELECT pg_advisory_lock(hashtextextended(%s,0))',('archive:command-fixture',))
+        try:
+            assert asyncio.run(member_messages.record_deletions(state,job,answer))==0
+            ends=time.monotonic()+1.5
+            while True:
+                waiting=holder.execute("SELECT count(*) AS n FROM pg_locks WHERE locktype='advisory' AND NOT granted"
+                                       ).fetchone()['n']
+                if not waiting or time.monotonic()>ends:break
+                time.sleep(0.1)
+            assert waiting==0
+        finally:
+            holder.execute('SELECT pg_advisory_unlock(hashtextextended(%s,0))',('archive:command-fixture',))
+    with s.pool.connection() as c:
+        assert not c.execute('SELECT deleted FROM messages WHERE id=%s',(mid,)).fetchone()['deleted']
+
+
 # spec: ANYM-511
 def test_history_import_after_purge_stays_content_free(purge):
     ar,s,key,p=purge
