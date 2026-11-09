@@ -220,7 +220,7 @@ runner_env() {
   local dir
   ROOT_DIR="${DEEDKIT_CI_ROOT:-$HOME/deedkit-ci}"
   # Read once; the suite (this script's own tests among them) never inherits the lane's settings.
-  unset DEEDKIT_LOCAL_LANE DEEDKIT_REMOTE_SHARED DEEDKIT_CI_ROOT
+  unset DEEDKIT_LOCAL_LANE DEEDKIT_REMOTE_SHARED DEEDKIT_CI_ROOT DEEDKIT_LOCAL_ROOT DEEDKIT_TEST_HOSTS DEEDKIT_REMOTE_HOST
   # The shim's PATH lacks Homebrew; node@24 is keg-only there (the repo's Node 24).
   for dir in ${DEEDKIT_RUNNER_PATH_DIRS-/usr/local/bin /opt/homebrew/sbin /opt/homebrew/bin /opt/homebrew/opt/node@24/bin}; do
     if [ -d "$dir" ]; then PATH="$dir:$PATH"; fi
@@ -410,8 +410,13 @@ signal_recorded() {
   done < "$dir/owned"
 }
 
-# A container is gone once docker lists it no more, running or not (`--rm` removes it as it exits).
-container_alive() { [ -n "$(docker ps -aq --filter "name=^$1\$" 2>/dev/null)" ]; }
+# A container is gone once docker lists it no more, running or not (`--rm` removes it as it exits). A lookup that fails
+# (docker unreachable) counts as alive, so the record stays for the next run or --cleanup.
+container_alive() {
+  local out
+  out="$(docker ps -aq --filter "name=^$1\$" 2>/dev/null)" || return 0
+  [ -n "$out" ]
+}
 
 recorded_alive() {
   local dir="$1" kind id stamp
@@ -987,14 +992,16 @@ start_on_host() {
       say "the mini's service user $SERVICE_USER is not set up (exit $status), CI covers"; return "$NOT_SET_UP" ;;
   esac
   # The local stage (kept until the next run of this worker) mirrors exactly the files that may leave.
+  # The caller tests this function's status, so errexit is off in here: every staging step is checked, and the stage
+  # counts as made only once all of them succeeded.
   if [ -z "$STAGED" ]; then
-    STAGED="${DEEDKIT_REMOTE_STAGE:-${TMPDIR:-/tmp}/deedkit-remote-test/$worker}"
-    rm -rf "$STAGED/src"
-    mkdir -p "$STAGED/src"
-    list_files "$tree" > "$STAGED/files"
-    tar -C "$tree" --null -T "$STAGED/files" -cf - | tar -C "$STAGED/src" -xpf -
+    local stage="${DEEDKIT_REMOTE_STAGE:-${TMPDIR:-/tmp}/deedkit-remote-test/$worker}"
     # The mini stage is read by _deedkitci, not its owner, the admin account: readable to all (rsync -a keeps modes).
-    chmod -R go+rX "$STAGED/src"
+    if ! { rm -rf "$stage/src" && mkdir -p "$stage/src" && list_files "$tree" > "$stage/files" &&
+           tar -C "$tree" --null -T "$stage/files" -cf - | tar -C "$stage/src" -xpf - && chmod -R go+rX "$stage/src"; }; then
+      die "staging the worktree in $stage failed; nothing was sent"
+    fi
+    STAGED="$stage"
   fi
   status=0
   on_host "mkdir -p $(printf '%q' "$SHARED/stage/$worker")" || status=1
@@ -1095,7 +1102,10 @@ case "${1:-}" in
       as_service --here cleanup "$worker" || one=$?
       if [ "$one" = 255 ] && [ "${#HOSTS[@]}" -gt 1 ]; then say "$host unreachable, skipped"; continue; fi
       [ "$one" = 0 ] || status="$one"
-      on_host "rm -rf $(printf '%q' "$SHARED/stage/$worker")"
+      if ! on_host "rm -rf $(printf '%q' "$SHARED/stage/$worker")"; then
+        say "$host: removing the stage of $worker failed; run --cleanup again later"
+        [ "$status" != 0 ] || status=1
+      fi
     done
     exit "$status" ;;
   --full|*)

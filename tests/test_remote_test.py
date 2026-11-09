@@ -62,7 +62,7 @@ exit 0
 [ "${{FAKE_UV_IGNORE_TERM:-0}}" = 0 ] || trap '' TERM
 dsn=""; mode=""
 if [ -n "${{PROBE_TEST_DSN_FILE:-}}" ]; then dsn="$(cat "$PROBE_TEST_DSN_FILE")"; mode="$(ls -l "$PROBE_TEST_DSN_FILE" | cut -c1-10)"; fi
-echo "uv $* | cwd=${{PWD##*/}} dsn=$dsn dsnmode=$mode shard=${{DEEDKIT_TEST_SHARD:-}} fcs=${{FCS_TEST_DSN:-}} container=${{ANYMSG_TEST_POSTGRES_CONTAINER:-}} pid=$$" >> "$FAKE_LOG"
+echo "uv $* | cwd=${{PWD##*/}} dsn=$dsn dsnmode=$mode shard=${{DEEDKIT_TEST_SHARD:-}} fcs=${{FCS_TEST_DSN:-}} container=${{ANYMSG_TEST_POSTGRES_CONTAINER:-}} lane=${{DEEDKIT_LOCAL_LANE:-}}${{DEEDKIT_TEST_HOSTS:-}}${{DEEDKIT_LOCAL_ROOT:-}} pid=$$" >> "$FAKE_LOG"
 [ "$1" = run ] || exit 0
 for arg in "$@"; do case "$arg" in --junitxml=*)
   [ -z "${{FAKE_JUNIT:-}}" ] || printf '%s' "$FAKE_JUNIT" > "${{arg#--junitxml=}}"
@@ -133,6 +133,8 @@ echo "createdb $*" >> "$FAKE_LOG"
 # The local lane's docker (OrbStack): a container is a file in FAKE_DOCKER_STATE while it runs; FAKE_DOCKER_DOWN=1 is a
 # stopped daemon. `run` logs whether the password came through the environment, never its value.
 LOCAL_DOCKER = '''#!/usr/bin/env bash
+# While the file FAKE_DOCKER_STATE.down exists, docker becomes unreachable mid-run: every lookup and kill fails.
+case "$1" in ps|kill) [ ! -e "$FAKE_DOCKER_STATE.down" ] || exit 1 ;; esac
 case "$1" in
   info) [ "${FAKE_DOCKER_DOWN:-0}" = 0 ]; exit ;;
   run) name=""; prev=""; for arg in "$@"; do [ "$prev" = --name ] && name="$arg"; prev="$arg"; done
@@ -198,7 +200,7 @@ def mini(tmp_path):
                DEEDKIT_RUNNER_PATH_DIRS=f"{tmp_path / 'bin'} {tmp_path / 'rbin'}",
                DEEDKIT_PG_BIN=str(tmp_path / 'pgbin'), DEEDKIT_REMOTE_WORKER=WORKER)
     for name in ('DEEDKIT_CI_ROOT', 'PROBE_TEST_DSN_FILE', 'FCS_TEST_DSN', 'DEEDKIT_TEST_SHARD', 'DEEDKIT_LOCAL_LANE',
-                 'DEEDKIT_LOCAL_ROOT', 'ANYMSG_TEST_POSTGRES_CONTAINER'):
+                 'DEEDKIT_LOCAL_ROOT', 'DEEDKIT_TEST_HOSTS', 'ANYMSG_TEST_POSTGRES_CONTAINER'):
         env.pop(name, None)
     return tmp_path, env
 
@@ -523,6 +525,7 @@ def test_the_local_lane_runs_here_with_no_ssh_or_sudo_and_a_ci_postgres_containe
     assert dsn_text.startswith('postgresql://probe_owner:') and dsn_text.endswith('@127.0.0.1:55432/messaging_probe_test')
     assert dsn_text.split(':')[2].split('@')[0] not in run
     assert f' container={name} ' in pytest_line
+    assert ' lane= ' in pytest_line  # the lane's own settings never reach the suite (its tests run this script too)
     # Stopped at exit (immediate shutdown) and gone; the run's directory and load line are the local lane's own.
     assert log_lines(home, f'docker kill --signal=QUIT {name}') and not list((home / 'containers').iterdir())
     assert not list((home / 'local' / 'ci' / WORKER / 'runs').iterdir())
@@ -581,6 +584,7 @@ def test_a_run_takes_the_next_test_host_only_when_one_is_down_or_not_set_up(loca
     assert down.returncode == 0, down.stderr
     assert 'orb start' in down.stderr and 'test host 2 of 2' in down.stderr
     assert len(log_lines(home, 'docker run')) == 1 and log_lines(home, 'postgres -D')
+    assert ' lane= ' in log_lines(home, 'uv run pytest')[-1]  # the host list never reaches the suite
     # A busy host keeps the run in its own queue (here past its deadline: 90); the next host never sees it.
     busy = remote(env, worktree, 'root', 'tests/test_app.py', DEEDKIT_TEST_HOSTS='local mini', FAKE_LOAD='99.0')
     assert busy.returncode == 90, busy.stderr
@@ -588,17 +592,62 @@ def test_a_run_takes_the_next_test_host_only_when_one_is_down_or_not_set_up(loca
 
 
 # spec: ANYM-638
-def test_cleanup_reaches_every_test_host_and_skips_one_that_is_down(local, worktree):
+def test_cleanup_and_load_reach_every_test_host_and_skip_one_that_is_down(local, worktree):
     home, env = local
     env = {k: v for k, v in env.items() if k != 'DEEDKIT_REMOTE_HOST'}
     assert remote(env, worktree, 'root', 'tests/test_app.py', DEEDKIT_TEST_HOSTS='local').returncode == 0
     assert remote(env, worktree, 'root', 'tests/test_app.py', DEEDKIT_TEST_HOSTS='mini').returncode == 0
     assert (home / 'local' / 'ci' / WORKER).exists() and worker_dir(home).exists()
-    result = remote(env, '--cleanup', WORKER, DEEDKIT_TEST_HOSTS='admin@air.invalid local mini', FAKE_SSH_FAIL='air.invalid')
+    hosts = dict(DEEDKIT_TEST_HOSTS='admin@air.invalid local mini', FAKE_SSH_FAIL='air.invalid')
+    load = remote(env, '--load', **hosts)
+    assert load.returncode == 0, load.stderr
+    assert load.stdout.splitlines()[0] == '# admin@air.invalid' and 'admin@air.invalid unreachable, skipped' in load.stderr
+    assert '# local' in load.stdout and '# mini' in load.stdout and load.stdout.count(f'{WORKER}\troot') == 2
+    result = remote(env, '--cleanup', WORKER, **hosts)
     assert result.returncode == 0, result.stderr
     assert 'admin@air.invalid unreachable, skipped' in result.stderr
     assert not (home / 'local' / 'ci' / WORKER).exists() and not worker_dir(home).exists()
     assert not (home / 'local' / 'shared' / 'stage' / WORKER).exists()
+
+
+# spec: ANYM-638
+def test_a_worktree_that_fails_to_stage_sends_nothing_and_runs_no_suite(mini, worktree):
+    home, env = mini
+    # The laptop's own tar fails to pack (a file vanished, say); the runner's PATH keeps the real one.
+    write(home / 'tbin' / 'tar', f'#!/usr/bin/env bash\ncase " $* " in *" -cf "*) exit 1 ;; esac\nexec {shutil.which("tar")} "$@"\n')
+    result = remote(env, worktree, 'root', 'tests/test_app.py', PATH=f"{home / 'tbin'}:{env['PATH']}")
+    assert result.returncode == 2, result.stderr
+    assert 'staging the worktree' in result.stderr and 'nothing was sent' in result.stderr
+    assert not [line for line in log_lines(home, 'ssh') if '--run' in line or 'rsync' in line]
+    assert not log_lines(home, 'uv ')
+
+
+# spec: ANYM-638
+def test_a_stage_removal_that_fails_on_one_host_still_cleans_the_next(local, worktree):
+    home, env = local
+    env = {k: v for k, v in env.items() if k != 'DEEDKIT_REMOTE_HOST'}
+    assert remote(env, worktree, 'root', 'tests/test_app.py', DEEDKIT_TEST_HOSTS='local').returncode == 0
+    result = remote(env, '--cleanup', WORKER, DEEDKIT_TEST_HOSTS='mini local', FAKE_SSH_FAIL='rm -rf')
+    assert result.returncode == 1, result.stderr
+    assert f'mini: removing the stage of {WORKER} failed' in result.stderr
+    assert not (home / 'local' / 'ci' / WORKER).exists() and not (home / 'local' / 'shared' / 'stage' / WORKER).exists()
+
+
+# spec: ANYM-638
+def test_a_local_run_keeps_its_record_while_docker_cannot_say_the_container_is_gone(local, worktree):
+    home, env = local
+    process = background(env, worktree, 'root', 'tests/test_app.py', FAKE_UV_SLEEP='3')
+    wait_for(lambda: log_lines(home, 'uv run pytest'), 60)
+    (home / 'containers.down').touch()
+    _, stderr = process.communicate(timeout=90)
+    # The stop cannot be confirmed: the run fails and its record, naming the container, stays.
+    assert process.returncode == 1, stderr
+    runs = home / 'local' / 'ci' / WORKER / 'runs'
+    assert list(runs.iterdir()) and len(list((home / 'containers').iterdir())) == 1
+    (home / 'containers.down').unlink()
+    result = remote(env, '--cleanup', WORKER)
+    assert result.returncode == 0, result.stderr
+    assert not list((home / 'containers').iterdir()) and not (home / 'local' / 'ci' / WORKER).exists()
 
 
 JUNIT = '''<testsuites><testsuite>
