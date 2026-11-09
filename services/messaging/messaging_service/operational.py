@@ -19,6 +19,7 @@ MEDIA_ERRORS = set(CODES['media_errors'])
 INELIGIBLE = ('outside_prefetch_window','outside_history_bounds','history_bound_unknown','collection_excluded',
     'group_chat_on_request','channel_on_request')  # the last two: ANYM-805
 LOCAL_STORAGE_ERRORS = {'storage_unavailable','media_storage_unavailable'}
+RECOVERY_STATES = ('queued','running','recovered','provider_unavailable','still_failing','refused')
 # The fixed causes of a fail-closed live capture write (ANYM-352).
 CAPTURE_STOP_DETAILS = {'spool_full','disk_reserve','spool_io_error','capture_error'}
 # Which bound a capture_overload stop tripped (ANYM-291); status and supervisor line only, not telemetry.
@@ -165,7 +166,10 @@ def operations(row, history, files, now=None, *, eligibility=None):
         **{reason+'_jobs':ineligible.get(reason) for reason in INELIGIBLE},
         'storage_unavailable_jobs':storage_unavailable,
         'terminal_failed_jobs':counts['failed'],'needs_attention':bool(counts['failed']),
-        'retry_queued_jobs':retry_queued}
+        'retry_queued_jobs':retry_queued,
+        # ANYM-816: the operator recovery of failed originals, by state (media_recovery.STATES).
+        # None: this database or role cannot read them (status of a schema-67 database), not zero.
+        'recovery':files.get('download_recovery')}
     return phases
 
 

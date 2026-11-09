@@ -572,6 +572,7 @@ class Archive:
                     live_writer=None,live_window_seconds=86400,media_prefetch_days=None,backfill=False):
         from .storage_admission import StorageAdmission
         from .media_policy import validate_prefetch_days,ON_REQUEST_CHAT,on_request_chat
+        from . import media_recovery
         validate_prefetch_days(media_prefetch_days)
         if type(backfill) is not bool: raise ValueError('invalid_backfill')
         if not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',owner) or not 10<=ttl<=600: raise ValueError('invalid_worker')
@@ -598,6 +599,7 @@ class Archive:
                 # retry_exhausted until this sweep rewrites it.
                 c.execute("""UPDATE media_jobs SET state='failed',error_code='retry_exhausted',lease_until=NULL
                     WHERE state='leased' AND attempts>=%s AND lease_until<clock_timestamp()
+                    AND NOT starts_with(coalesce(lease_owner,''),'recovery:')
                     AND (%s::text IS NULL OR account=%s)""",(MEDIA_MAX_ATTEMPTS,account,account))
             # One fresh time, taken after the lock waits, bounds the prefetch and live
             # windows; unlike per-row clock_timestamp() it can bound an index range.
@@ -646,7 +648,9 @@ class Archive:
                         AND m.sent_at<=%(now)s+interval '5 minutes') OR
                     (j.id=ANY(%(backfill_ids)s::text[]) AND priority.tier<2))) AND
                 ((j.state='queued' AND j.next_due<=clock_timestamp()) OR
-                 (j.state='leased' AND j.lease_until<clock_timestamp()))'''+candidates+'''
+                 -- An expired recovery lease (ANYM-816) resumes only through media_recovery.next_job.
+                 (j.state='leased' AND j.lease_until<clock_timestamp()
+                    AND NOT starts_with(coalesce(j.lease_owner,''),'recovery:')))'''+candidates+'''
                 ORDER BY priority.requested DESC,CASE WHEN NOT priority.requested THEN j.id=ANY(%(backfill_ids)s::text[]) END,
                     priority.live_media DESC,
                     CASE WHEN priority.live_media THEN m.sent_at END DESC,
@@ -655,6 +659,11 @@ class Archive:
                 FOR UPDATE OF j SKIP LOCKED LIMIT 1''',
                 {'live_max':live_max,'live_window':live_window_seconds,'account':account,'since':since,
                     'days':media_prefetch_days,'now':now,'backfill_ids':backfill_ids,'max_attempts':MEDIA_MAX_ATTEMPTS,**tiers}).fetchone()
+            # ANYM-816: an operator recovery job only when no other job of the account is claimable.
+            recovery=False
+            if not job and not backfill:
+                job=self._recovery_job(c,account);recovery=job is not None
+                if job:job['_live_media']=False
             if not job: return None
             expires=c.execute("SELECT clock_timestamp()+%s*interval '1 second' AS at",(ttl,)).fetchone()['at']
             reservation=None
@@ -663,19 +672,35 @@ class Archive:
                 try:reservation=StorageAdmission(selected_writer).reserve(c,job,expires)
                 except ValueError as exc:
                     if str(exc)!='media_size_limit':raise
+                    if recovery:media_recovery.held_back(c,job,size_limit=True);return None
                     c.execute("UPDATE media_jobs SET state='failed',error_code='size_limit',lease_until=NULL WHERE id=%s",
                         (job['id'],))
                     return None
                 if reservation is None:
+                    if recovery:media_recovery.held_back(c,job);return None
                     c.execute('''UPDATE media_jobs SET state='queued',error_code='paused_storage',lease_until=NULL,
                         next_due=clock_timestamp()+interval '60 seconds' WHERE id=%s''',(job['id'],))
                     return None
-            claimed=c.execute('''UPDATE media_jobs SET state='leased',attempts=attempts+1,lease_owner=%s,
+            if recovery:claimed=media_recovery.lease(c,job,owner,expires)
+            else:claimed=c.execute('''UPDATE media_jobs SET state='leased',attempts=attempts+1,lease_owner=%s,
                 lease_epoch=lease_epoch+1,lease_until=%s,error_code=NULL
                 WHERE id=%s RETURNING *''',(owner,expires,job['id'])).fetchone()
             claimed['_live_media']=job['_live_media']
             if reservation is not None:claimed['_storage_reservation']=reservation
             return claimed
+
+    @staticmethod
+    def _recovery_job(c,account):
+        # Isolated in a savepoint: a database without the recovery table or a collector role without its grant
+        # (collector_role.sql) claims as before, it never stops the ordinary downloads.
+        import logging
+        import psycopg
+        from . import media_recovery
+        try:
+            with c.transaction():return media_recovery.next_job(c,account)
+        except (psycopg.errors.InsufficientPrivilege,psycopg.errors.UndefinedTable):
+            logging.getLogger(__name__).warning('media_recovery_unavailable')
+            return None
 
     def _backfill_candidates(self,account,since,days,tiers):
         # Read-only and lock-free: one bounded pass over the due queue that the
@@ -691,7 +716,8 @@ class Archive:
                 JOIN chats ch ON ch.id=m.chat AND ch.account=j.account
                 CROSS JOIN LATERAL (SELECT '''+MEDIA_TIER+''' AS tier) priority
                 WHERE ((j.state='queued' AND j.next_due<=clock_timestamp()) OR
-                    (j.state='leased' AND j.lease_until<clock_timestamp())) AND j.attempts<%(max_attempts)s AND
+                    (j.state='leased' AND j.lease_until<clock_timestamp()
+                        AND NOT starts_with(coalesce(j.lease_owner,''),'recovery:'))) AND j.attempts<%(max_attempts)s AND
                 (%(account)s::text IS NULL OR j.account=%(account)s) AND p.enabled AND NOT m.deleted AND
                 NOT(ch.provider_chat=ANY(p.exclude_chats)) AND (p.discover_chats OR ch.provider_chat=ANY(p.include_chats)) AND
                 (%(since)s::timestamptz IS NULL OR m.sent_at>=%(since)s) AND
@@ -729,6 +755,10 @@ class Archive:
             AND (p.discover_chats OR ch.provider_chat=ANY(p.include_chats)) FOR UPDATE OF j''',
             (job['id'],job['lease_owner'],job['lease_epoch'])).fetchone()
         if not row: raise RuntimeError('media_lease_lost')
+        if str(row['lease_owner'] or '').startswith('recovery:') and not c.execute('''SELECT 1 FROM media_recovery
+                WHERE job=%s AND state='running' AND lease_until>clock_timestamp() FOR UPDATE''',(job['id'],)).fetchone():
+            # A recovery lease's expiry is media_recovery.lease_until (media_recovery.LEASE_HOLD).
+            raise RuntimeError('media_lease_lost')
         return row
 
     def renew_media(self,job,ttl=120,*,collector_lease=None):
@@ -740,7 +770,10 @@ class Archive:
             StorageAdmission.lock(c)
             self.fence(c,job['account'],collector_lease)
             self.job_fence(c,job)
-            row=c.execute("UPDATE media_jobs SET lease_until=clock_timestamp()+%s*interval '1 second' WHERE id=%s RETURNING lease_until",
+            from . import media_recovery
+            # A recovery lease (ANYM-816) renews in media_recovery; media_jobs keeps its far-future hold.
+            if media_recovery.recovery_lease(job):row=media_recovery.renew(c,job,ttl)
+            else:row=c.execute("UPDATE media_jobs SET lease_until=clock_timestamp()+%s*interval '1 second' WHERE id=%s RETURNING lease_until",
                       (ttl,job['id'])).fetchone()
             changed=c.execute('''UPDATE media_reservations SET expires_at=%s WHERE job=%s AND lease_epoch=%s''',
                 (row['lease_until'],job['id'],job['lease_epoch'])).rowcount
@@ -776,6 +809,7 @@ class Archive:
         except OSError as error:raise RuntimeError('blob_corrupt') from error
         with self.store.pool.connection() as c:
             from .file_lifecycle import lifecycle_lock,register_resident_original
+            from . import media_recovery
             lifecycle_lock(c)
             try:current_identity=os.stat(self.store.files/blob.digest,follow_symlinks=False)
             except OSError as error:raise RuntimeError('blob_corrupt') from error
@@ -799,6 +833,7 @@ class Archive:
             # may invalidate the retained text, ASR or description triggers.
             register_resident_original(c,blob.digest,blob.bytes)
             c.execute("UPDATE media_jobs SET state='ready',error_code=NULL,lease_until=NULL WHERE id=%s",(job['id'],))
+            if media_recovery.recovery_lease(current):media_recovery.finished(c,job)
             source=c.execute('''SELECT m.revision,r.snapshot->>'origin' AS origin FROM messages m
                 JOIN message_revisions r ON r.message=m.id AND r.revision=m.revision WHERE m.id=%s''',
                 (job['message'],)).fetchone()
@@ -830,6 +865,13 @@ class Archive:
         with self.store.pool.connection() as c:
             self.fence(c,job['account'],collector_lease)
             row=self.job_fence(c,job)
+            from .storage_admission import StorageAdmission
+            from . import media_recovery
+            if media_recovery.recovery_lease(row):
+                media_recovery.failed(c,job,code,permanent=permanent,retry_after=retry_after,
+                    local=code in {'disk_reserve','paused_storage'}|LOCAL_STORAGE_ERRORS)
+                StorageAdmission.release(c,job)
+                return
             local_pause=code in ('disk_reserve','paused_storage')
             # Unwritable local storage is operator-fixable: it never consumes a
             # provider attempt or fails the original terminally.
