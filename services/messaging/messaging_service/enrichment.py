@@ -628,6 +628,9 @@ def main():
     from .telemetry import configure
     configure('enricher')
     cfg=configuration(args.config)
+    from .store import name_sessions
+    # ANYM-842: enricher-<profiles> names this worker's sessions (enricher-mini and enricher-local differ by profiles).
+    name_sessions('enricher-'+'-'.join(sorted(cfg['profiles'])))
     guard=inference_confinement.Confinement(inference_confinement.mini_hosts(cfg),blocked=inference_confinement.blocked_targets(cfg)) if inference_confinement.required(cfg) else None
     worker=EnrichmentWorker(private_text(os.environ['DATABASE_URL_FILE']).strip(),os.environ['PROBE_FILES'],cfg,confinement=guard)
     for sig in (signal.SIGINT,signal.SIGTERM):signal.signal(sig,lambda *_:request_stop())

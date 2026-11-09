@@ -697,6 +697,8 @@ def status(store,config=None):
 
 
 def main(argv=None):
+    from .store import name_sessions
+    name_sessions('cold-archive')  # ANYM-842: this service's sessions carry its name
     import argparse
     import signal
     from .store import Store

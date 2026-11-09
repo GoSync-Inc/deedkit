@@ -876,6 +876,8 @@ async def run_config(path):
 
 
 def main():
+    from .store import name_sessions
+    name_sessions('collector-whatsapp')  # ANYM-842: this service's sessions carry its name
     import argparse
     from .telemetry import configure, capture
     configure('whatsapp')

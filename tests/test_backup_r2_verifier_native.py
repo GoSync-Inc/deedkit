@@ -41,6 +41,8 @@ dsn=make_conninfo(**base,dbname='deedkit_fixture')
 store=Store(dsn,root/'originals','http://synthetic.invalid')
 try:
     store.migrate();store.seed()
+    # ANYM-842: production's database has the statement statistics extension; the dump carries its definition.
+    with store.pool.connection() as c:c.execute('CREATE EXTENSION pg_stat_statements')
     content=(b'SYNTHETIC_STREAMING_ORIGINAL_ONLY\n'*(6*1024**2//32+1))[:6*1024**2]
     digest=hashlib.sha256(content).hexdigest();(store.files/digest).write_bytes(content)
     with store.pool.connection() as c:
@@ -53,6 +55,7 @@ try:
     # ANYM-627: the image's pg_dump writes a zstd custom-format dump; the seven checks below restore it.
     listing=subprocess.run(['pg_restore','--list',str(root/'snapshot/database.dump')],check=True,capture_output=True,text=True).stdout
     assert ';     Compression: zstd' in listing.splitlines()
+    assert any(line.split()[3:]==['EXTENSION','-','pg_stat_statements'] for line in listing.splitlines())
     recovery=b'{\"synthetic_recovery_setting\":true}\n';recovery_sha=hashlib.sha256(recovery).hexdigest()
     (root/'snapshot/recovery').mkdir(mode=0o700);(root/'snapshot/recovery'/recovery_sha).write_bytes(recovery)
     manifest=json.loads((root/'snapshot/manifest.json').read_text());assert len(manifest['blobs'])>=2
@@ -122,6 +125,13 @@ def test_real_pg18_age_stream_restore_runs_all_seven_checks_in_isolated_owned_co
         proof=verifier.make_proof(receipt,facts,restore_run)
         assert proof['verification']['schema_version']==69
         assert proof['verification']['checks']=={name:True for name in r2.CHECKS}
+        # ANYM-842: the restore as restore_owner re-created the extension; its view reads back (no preload here, so
+        # its columns, not its rows).
+        restored=engine.command('container','exec',verifier.names(restore_run)['postgres'],'psql','-X','-A','-t',
+            '-U','restore_owner','-d',verifier.DATABASE,'-c',"SELECT e.extname||' '||count(a.attname) FROM pg_extension e "
+            "JOIN pg_attribute a ON a.attrelid='pg_stat_statements'::regclass AND a.attname IN ('queryid','calls','total_exec_time') "
+            "WHERE e.extname='pg_stat_statements' GROUP BY e.extname")
+        assert restored.decode().strip()=='pg_stat_statements 3'
         helper=engine.inspect_owned('helper',verifier.names(restore_run)['helper'],restore_run)
         network=engine.inspect_owned('network',verifier.names(restore_run)['network'],restore_run)
         pg=engine.inspect_owned('postgres',verifier.names(restore_run)['postgres'],restore_run)

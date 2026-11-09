@@ -91,6 +91,8 @@ def run(store, stop, *, transport=_transport, resolver=None, interval=2, proxy=N
 
 
 def main():
+    from .store import name_sessions
+    name_sessions('delivery')  # ANYM-842: this service's sessions carry its name
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--once', action='store_true')
     group = parser.add_mutually_exclusive_group()

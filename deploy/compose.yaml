@@ -4,6 +4,12 @@ services:
     image: ${POSTGRES_IMAGE:-postgres:18-bookworm@sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c}
     env_file: ./private/postgres.env
     restart: unless-stopped
+    # ANYM-842: statement statistics and I/O timing, and the memory set the measured budget allows inside mem_limit
+    # (docs/operations/production.md, "Database settings"). work_mem is per sort or hash step: never raise it here.
+    command: [postgres, -c, shared_preload_libraries=pg_stat_statements, -c, pg_stat_statements.max=5000,
+              -c, track_io_timing=on, -c, shared_buffers=128MB, -c, work_mem=4MB, -c, effective_cache_size=1536MB,
+              -c, random_page_cost=1.1]
+    shm_size: 256m
     volumes:
       - database:/var/lib/postgresql
     networks: [backend]

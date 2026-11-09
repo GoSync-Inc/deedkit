@@ -155,6 +155,22 @@ def test_a_role_membership_the_bootstrap_superuser_granted_restores_in_the_copy(
         psql("postgres", f"DROP ROLE IF EXISTS {member}; DROP ROLE IF EXISTS {group};")
 
 
+# spec: ANYM-842
+def test_a_source_with_the_statement_statistics_extension_restores_it_in_the_copy(source):
+    # Production's database has pg_stat_statements (ANYM-842); the copy restores as the scratch bootstrap superuser.
+    settings, database = source
+    psql(database, "CREATE EXTENSION pg_stat_statements")
+    columns = ("SELECT e.extname || ' ' || count(a.attname) FROM pg_extension e JOIN pg_attribute a ON a.attrelid ="
+               " 'pg_stat_statements'::regclass AND a.attname IN ('queryid', 'calls', 'total_exec_time')"
+               " WHERE e.extname = 'pg_stat_statements' GROUP BY e.extname")
+    assert psql(database, columns) == "pg_stat_statements 3"
+    with p.database_copy(settings, "main", SHA, keep=True) as record:
+        assert record["verified"]
+        # No preload on the test servers, so the view's columns read back, not its rows.
+        assert scratch_sql(record["id"], database, columns) == "pg_stat_statements 3"
+    released(settings, record["id"])
+
+
 # spec: ANYM-588
 def test_a_check_whose_text_reads_back_flattened_still_verifies_the_copy(source):
     # Incident 11-06: a BETWEEN inside an AND is stored nested and prints `((a) AND (b)) AND (c)`; parsed again it

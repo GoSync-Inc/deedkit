@@ -487,6 +487,8 @@ class FileUnderstandingWorker:
 
 
 def main():
+    from .store import name_sessions
+    name_sessions('file-understanding')  # ANYM-842: this service's sessions carry its name
     import argparse
     import signal
     import threading

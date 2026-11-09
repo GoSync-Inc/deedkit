@@ -419,6 +419,8 @@ def register_resident_original(c,digest,bytes):
 
 
 def main(argv=None):
+    from .store import name_sessions
+    name_sessions('file-lifecycle')  # ANYM-842: this service's sessions carry its name
     import argparse
     import json
     import signal

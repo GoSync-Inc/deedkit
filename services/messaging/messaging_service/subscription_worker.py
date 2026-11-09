@@ -21,6 +21,8 @@ RETIRE_INTERVAL_S = 60
 
 
 def main():
+    from .store import name_sessions
+    name_sessions('matcher')  # ANYM-842: this service's sessions carry its name
     configure('subscriptions')
     parser = argparse.ArgumentParser()
     parser.add_argument('--once', action='store_true')

@@ -1636,6 +1636,92 @@ unattempted candidate directory for the same SHA is renamed (for example to
 `prepared-older-tool-<sha>`), never deleted or edited, because preparation
 refuses an existing directory; receipts and their digests are never rewritten.
 
+## Database settings (ANYM-842)
+
+The messaging `db` service runs with statement statistics and a memory set inside its `mem_limit` (2 GiB):
+`shared_preload_libraries=pg_stat_statements`, `pg_stat_statements.max=5000`, `track_io_timing=on`,
+`shared_buffers=128MB`, `work_mem=4MB`, `effective_cache_size=1536MB` (a planner estimate, no memory),
+`random_page_cost=1.1`, `shm_size: 256m`; `jit` stays on (the JIT-heavy statements set `jit=off` themselves).
+`deploy/compose.yaml` carries them for new installs. Each messaging process names its sessions after its service
+(`application_name`: `api`, `http-api`, `collector-telegram`, `collector-whatsapp`, `matcher`, `delivery`,
+`enricher-<profiles>`, `indexer`, `file-lifecycle`, `cold-archive`, `message-purge`, `file-understanding`, `backup`;
+the event router keeps `module-router`). Statement totals come from `pg_stat_statements` by database, user and query
+id: services that share a role and a statement share an entry, so a perf pass reads it with `pg_stat_activity`
+samples. The view keeps normalized SQL text on the database host (SECURITY.md, docs/DATA-POLICY.md); a report
+carries query ids, calls and times only.
+
+Memory budget (measured on prod 2026-11-09, read-only). `max_connections` 100, `max_worker_processes` 8,
+`max_parallel_workers` 8 (2 per gather), `autovacuum_max_workers` 3, `maintenance_work_mem` 64MB,
+`hash_mem_multiplier` 2. A 4-minute `pg_stat_activity` sample every 0.5 s: at most 35 client sessions, 14 active,
+2 parallel workers, 1 autovacuum worker. The cgroup held 736 MB anonymous memory; the backends' `RssAnon` summed to
+781 MB for 31 sessions (15-52 MB each, idle collector sessions about 35 MB: their caches stay), and shared memory
+162 MB (128 MB of it shared_buffers). The budget, with idle sessions counted, not only active ones:
+
+| Part | MB |
+|---|---|
+| shared_buffers + other shared memory (34 MB measured, pg_stat_statements about 10 MB) | sb + 44 |
+| 40 sessions (35 observed + 5) × 25 MB measured private memory | 1,000 |
+| 14 active × 2 × `hash_mem_multiplier` 2 × `work_mem` 4 MB | 224 |
+| 3 autovacuum workers × `maintenance_work_mem` 64 MB | 192 |
+| 8 parallel workers × (10 MB + 2 × 2 × 4 MB) | 208 |
+
+At sb = 128 MB that is 1,796 MB, above 75% of 2 GiB (1,536 MB); the other parts alone are 1,668 MB, so no
+shared_buffers value gives 25% headroom under this limit and today's sessions. The measured view agrees: a synthetic
+peak run (2026-11-09, disposable PostgreSQL 18 under the same 2 GiB limit and these settings; 600k messages, 150k
+attachments, 2.4 GB; 35 sessions, 14 running the media claim, the enrichment claim, sync status, a selective search
+and a parallel join for 180 s, up to 7 parallel workers; the broad searches ran into the 5 s statement timeout, as
+they would on prod) rose 593 MiB above its idle 205 MiB to 798 MiB anonymous plus shared memory, with no OOM kill
+(the OrbStack cgroup reports no kernel memory; `memory.current` minus page cache, 585 MiB, agrees). Prod's long-lived
+sessions already hold 954 MB (anonymous 736, shared 162, kernel 56), so the same burst there reaches about 1,550 MB
+at 128 MB and about 1,930 MB at 512 MB. Decision (ANYM-842 criterion 3 as revised on its Tiden branch): shared_buffers
+stays at 128 MB, the value prod already runs, so this change adds only pg_stat_statements' shared memory (about
+10 MB) to today's footprint; more shared_buffers needs a larger `mem_limit` or fewer idle sessions (smaller pools),
+each its own card.
+
+The change is not `production.py`'s: the tool never promotes `db` (and runs Compose with `--no-deps`, so no deploy
+recreates it). It is one reviewed production operation, none of it during an active call:
+
+All commands run in `/opt/personal-os-probe` with the project's files in place (they reference `./private/...`
+relative to the first file, so never run Compose on copies). `F` is `-p personal-os-probe --project-directory
+/opt/personal-os-probe` plus `-f` for each file the container names, in that order (`docker ps --filter
+name=personal-os-probe-db-1 --format '{{.Label "com.docker.compose.project.config_files"}}'`).
+
+1. Read-only pre-check and undo record. No active call: `python3 -I -c 'import runpy;
+   p=runpy.run_path("/usr/local/lib/deedkit/production.py"); print(p["active_calls"](p["config"](p["active_config"]())))'`
+   prints an empty list. Record in a dated root-only directory: the container's `com.docker.compose.config-hash` label
+   (same `docker ps --format` form), the sha256 of each file in `F`, the member list of each `personal-os-probe_*`
+   network (`docker network inspect -f '{{range .Containers}}{{.Name}} {{end}}'`) and `SHOW` of every setting above.
+   `docker compose F config --hash db` must print the recorded hash: that is the undo command's configuration, proven
+   before anything changes. Write the overlay `/opt/personal-os-probe/compose.db-settings.yaml` (0600) with only
+   `services.db.command` and `services.db.shm_size` as in `deploy/compose.yaml`. Compare without printing either
+   resolved document (Compose resolves env files into it, the database password included): a host-side `python3 -I`
+   script renders both (`F`, and `F` plus the overlay) in memory and prints only the sorted names of the db keys whose
+   values differ, which must be `command shm_size`; plus the overlay's `--hash db`.
+2. Pause autodeploy (`/etc/deedkit/autodeploy.pause` with the reason, after the unit is not active). Then take the
+   backup runner lock in a root shell that keeps it to the end, undo included: `flock --nonblock
+   /opt/personal-os-probe/backups/.runner.lock bash`. Inside it, before step 3, check under the lock (as `production.py`
+   does, ANYM-744): `personal-os-backup.service`, `deedkit-calendar-backup.service` and
+   `deedkit-calendar-backup-catchup.service` read `inactive` or `failed`, and
+   `/opt/personal-os-probe/backups/.runner.lock.unsettled` is absent. Any other answer: leave the shell, remove the
+   pause, try later. Check for an active call again.
+3. `docker compose F -f compose.db-settings.yaml up -d --no-deps db`: the `database` volume is kept, the backend
+   network and its `db` alias come back. Wait for healthy (`docker inspect --format '{{.State.Health.Status}}'`).
+   Not healthy within 2 minutes (a preload or setting refused at start): the undo below at once.
+4. Attach the networks the database joined live: `docker network connect --alias db personal-os-probe_delivery_db
+   personal-os-probe-db-1` and the same for `personal-os-probe_inference_db`; every member list equals the record.
+5. As the bootstrap superuser: `CREATE EXTENSION IF NOT EXISTS pg_stat_statements` in `messaging_probe`; no role gets
+   a grant.
+6. Verify: `SHOW` returns the new values; `SELECT count(*) FROM pg_stat_statements` works; the api health endpoint
+   answers; the collectors' leases renew (`collector_health.heartbeat_at` moves); the matcher and delivery positions
+   advance; `pg_stat_activity` shows the service names. Then leave the lock shell and remove the pause.
+7. Watch 24 h: no OOM kill (`memory.events` `oom_kill` of the container and `docker events --filter event=oom`),
+   hit ratio and temp bytes per hour before and after, and a top-20 by total time (query ids, calls, times).
+
+Undo (inside the lock shell; after it, take the lock again as in step 2): `docker compose F up -d --no-deps db`
+without the overlay; the container's config hash equals the record. Step 4 again, then remove the overlay file. The
+extension may stay (without the preload its view only refuses reads) or `DROP EXTENSION pg_stat_statements`. The
+data stays on the volume.
+
 ## Host firewall persistence (ANYM-693)
 
 What is persisted and where (ufw owns `DOCKER-USER`, so a second restore file would flush or duplicate a hook):
