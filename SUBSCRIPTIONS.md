@@ -1005,6 +1005,60 @@ turn. A relay `accepted` row plus the run's own `fetch_subscription_events` and
 `ack_subscription_events` (ACK position advanced in `get_subscription`) is the
 host-turn evidence the live acceptance of ANYM-228 records.
 
+### Codex chat (pull waker)
+
+`wake-relay watch` (ANYM-844, configuration in [the package README](packages/wake-relay/README.md#watch-wake-an-existing-codex-chat-pull-waker))
+wakes an existing Codex Desktop chat on the agent Mac without a webhook, inbound
+port or public name. It polls outward with the agent's own key and needs no grant
+beyond `read`.
+
+- **Passive reads only.** Every poll (default 30 s, at least 10 s) reads
+  `get_subscription_events` from its own durable inspection cursor, at most 4 pages
+  of 50, advancing to each page's `next_after`. The cursor starts at the
+  subscription's `acked_through`. That read issues no receipt and moves no ACK
+  position, so another client's open receipt stays valid. The waker never calls
+  fetch, wait or ACK. A page with a malformed or hostile cursor or event ID is
+  refused whole: nothing moves and nothing is called.
+- **Wake decision.** An item whose `wake_reason` is `historical_event` never
+  wakes. With `wake_rules` the server returns only matching items, so any other
+  item wakes; without them, any non-historical item wakes.
+- **One call per wake.** `codex queue --thread <thread> --message <M> --resume`,
+  no shell, a 30 s timeout, an explicit binary. M is a fixed template holding only
+  the subscription UUID and the integer wake position; never message text, names,
+  titles or an instruction to ACK. The chat reads the events with
+  `fetch_subscription_events` under its own instructions and ACKs what it handled.
+  The queued text enters the thread's model context through the Codex model
+  provider like any user turn.
+- **The daemon.** `--resume` starts a turn only while `codex app-server daemon`
+  runs (probed with codex-cli 0.166.0). Without it the CLI queues the message,
+  prints a "could not resume" warning and runs no turn: the wake is
+  `queued_not_resumed`, and the turn runs when the thread is next resumed.
+
+| Wake state | Meaning |
+|---|---|
+| `calling` | Committed before the subprocess starts. |
+| `queued` | `codex queue` exited 0 with no resume warning. |
+| `queued_not_resumed` | Exit 0 with the "could not resume" warning: no daemon. |
+| `failed` | Another exit status, or the 30 s timeout. Not retried: the queue call is not idempotent. |
+| `unsupported_host` | No `codex` binary, or `codex queue --help` lists no `--thread`. |
+| `call_unknown` | A `calling` row a crash left behind; never called again. |
+| `budget_held` | No slot in the thread's sliding hour (default 12); called when one opens. |
+
+While a subscription has a `queued` or `queued_not_resumed` wake the ACK position
+has not passed, newer live items fold into it with no new call. Once
+`acked_through` passes its position the next live item may wake again, and items
+folded after that position that the ACK left behind get a wake of their own.
+`ack_observed` is set when a later read shows `acked_through` at or past a wake's
+position: it shows consumption progress, not which chat did it.
+`wake-relay watch-status` prints counts per state, the last wake per watch,
+`budget_held` and `unsupported_host`; the database keeps no key and no event
+content. A lost wake costs no event: the server keeps the ACK position.
+
+`host_turn_verified` stays `false`: the server cannot see the Codex turn. Loop
+guard: the chat's own sends are outgoing and never satisfy `incoming_message` or
+the reply wake rules, so subscribe the chat with `wake_rules` (for example
+`["incoming_message"]`).
+
 ## Event retention
 
 Status: acknowledged-event retention is implemented since **schema 40** (ANYM-446, the
