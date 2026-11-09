@@ -45,9 +45,9 @@ lower tier still gets at least one of every five admissions, so under continuous
 a reconcile pass can take up to about five times longer. A FloodWait or account cooldown
 stops every tier; each one is also kept as `{started_at, seconds, phase}` in
 `collector_health.operations.cooldowns.recent` (the last 20), which the full `get_sync_status`
-shows under `operations.cooldowns`. A reconcile pass reads no head page of a chat whose last catalog (discovery every 900 s) shows no message above
-its cursor; such a chat reads its recent-overlap page every pass while its last message is under a day old, and
-otherwise once in 24 passes (by a stable hash of the chat ID), so an unchanged chat costs about no requests. The journal records it as `reconcile`; if it was sent
+shows under `operations.cooldowns`. A reconcile pass reads no head page of a chat whose dialog catalog, seen at most 30 minutes ago in a pass whose
+discovery did not fail, shows no message above its cursor; it still rereads the newest page every pass, and the
+catalog's time becomes the chat's `last_head_scan_at`. An unchanged chat costs one request per pass instead of two. The journal records it as `reconcile`; if it was sent
 at most 6 hours before, live subscriptions read it as `live_recovered` and match it
 (SUBSCRIPTIONS.md, ANYM-733).
 Stateless MCP does not wake an idle agent: the client must call read/updates.
