@@ -1665,42 +1665,60 @@ Memory budget (measured on prod 2026-11-09, read-only). `max_connections` 100, `
 | 3 autovacuum workers × `maintenance_work_mem` 64 MB | 192 |
 | 8 parallel workers × (10 MB + 2 × 2 × 4 MB) | 208 |
 
-At sb = 128 MB that is 1,796 MB: already above 75% of 2 GiB (1,536 MB), so shared_buffers stays at 128 MB and the
-card's 512 MB (2,180 MB) does not fit. A synthetic peak run (2026-11-09, disposable PostgreSQL 18 under the same
-2 GiB limit and these settings; 600k messages, 150k attachments, 2.4 GB; 35 sessions, 14 running the media claim, the
-enrichment claim, sync status, search and a parallel join for 180 s, up to 7 parallel workers) peaked at 798 MiB
-anonymous plus shared memory, 593 MiB above its idle 205 MiB, with no OOM kill. Prod's long-lived sessions already
-hold 954 MB (anonymous 736, shared 162, kernel 56), so the same burst there reaches about 1,550 MB at 128 MB and
-about 1,930 MB at 512 MB. Raising shared_buffers needs a larger `mem_limit` or fewer idle sessions (smaller pools):
-each is its own card.
+At sb = 128 MB that is 1,796 MB, above 75% of 2 GiB (1,536 MB); the other parts alone are 1,668 MB, so no
+shared_buffers value gives 25% headroom under this limit and today's sessions. The measured view agrees: a synthetic
+peak run (2026-11-09, disposable PostgreSQL 18 under the same 2 GiB limit and these settings; 600k messages, 150k
+attachments, 2.4 GB; 35 sessions, 14 running the media claim, the enrichment claim, sync status, a selective search
+and a parallel join for 180 s, up to 7 parallel workers; the broad searches ran into the 5 s statement timeout, as
+they would on prod) rose 593 MiB above its idle 205 MiB to 798 MiB anonymous plus shared memory, with no OOM kill
+(the OrbStack cgroup reports no kernel memory; `memory.current` minus page cache, 585 MiB, agrees). Prod's long-lived
+sessions already hold 954 MB (anonymous 736, shared 162, kernel 56), so the same burst there reaches about 1,550 MB
+at 128 MB and about 1,930 MB at 512 MB. Decision (ANYM-842 criterion 3 as revised on its Tiden branch): shared_buffers
+stays at 128 MB, the value prod already runs, so this change adds only pg_stat_statements' shared memory (about
+10 MB) to today's footprint; more shared_buffers needs a larger `mem_limit` or fewer idle sessions (smaller pools),
+each its own card.
 
 The change is not `production.py`'s: the tool never promotes `db` (and runs Compose with `--no-deps`, so no deploy
 recreates it). It is one reviewed production operation, none of it during an active call:
 
-1. Read-only pre-check. No active call: `python3 -I -c 'import runpy; p=runpy.run_path("/usr/local/lib/deedkit/production.py"); print(p["active_calls"](p["config"](p["active_config"]())))'` prints an empty list. No running backup: the three backup services read `inactive` or `failed`,
-   `/opt/personal-os-probe/backups/.runner.lock.unsettled` is absent. Save the undo: `cp -p` of every Compose file the
-   container names (`docker ps --filter name=personal-os-probe-db-1 --format '{{.Label "com.docker.compose.project.config_files"}}'`)
-   into a dated directory, the container's config hash label, its networks (`docker network inspect -f
-   '{{range .Containers}}{{.Name}} {{end}}'` of each `personal-os-probe_*` network) and `SHOW` of every setting above.
-2. Pause autodeploy (`/etc/deedkit/autodeploy.pause` with the reason, after the unit is not active) and hold the backup
-   runner lock (`flock --nonblock /opt/personal-os-probe/backups/.runner.lock`) through steps 3-5.
-3. Write the overlay `/opt/personal-os-probe/compose.db-settings.yaml` (0600) with only `services.db.command` and
-   `services.db.shm_size` as in `deploy/compose.yaml`. `docker compose -p personal-os-probe -f <the container's files>
-   -f /opt/personal-os-probe/compose.db-settings.yaml config --hash db` differs from the saved hash only because of
-   these keys (the same files without the overlay give the saved hash). Then `docker compose ... up -d --no-deps db`
-   with the same files: the `database` volume is kept, the backend network and its `db` alias come back.
+All commands run in `/opt/personal-os-probe` with the project's files in place (they reference `./private/...`
+relative to the first file, so never run Compose on copies). `F` is `-p personal-os-probe --project-directory
+/opt/personal-os-probe` plus `-f` for each file the container names, in that order (`docker ps --filter
+name=personal-os-probe-db-1 --format '{{.Label "com.docker.compose.project.config_files"}}'`).
+
+1. Read-only pre-check and undo record. No active call: `python3 -I -c 'import runpy;
+   p=runpy.run_path("/usr/local/lib/deedkit/production.py"); print(p["active_calls"](p["config"](p["active_config"]())))'`
+   prints an empty list. Record in a dated root-only directory: the container's `com.docker.compose.config-hash` label
+   (same `docker ps --format` form), the sha256 of each file in `F`, the member list of each `personal-os-probe_*`
+   network (`docker network inspect -f '{{range .Containers}}{{.Name}} {{end}}'`) and `SHOW` of every setting above.
+   `docker compose F config --hash db` must print the recorded hash: that is the undo command's configuration, proven
+   before anything changes. Write the overlay `/opt/personal-os-probe/compose.db-settings.yaml` (0600) with only
+   `services.db.command` and `services.db.shm_size` as in `deploy/compose.yaml`; `docker compose F -f
+   compose.db-settings.yaml config --format json` shows db with exactly those two keys changed.
+2. Pause autodeploy (`/etc/deedkit/autodeploy.pause` with the reason, after the unit is not active). Then take the
+   backup runner lock in a root shell that keeps it to the end, undo included: `flock --nonblock
+   /opt/personal-os-probe/backups/.runner.lock bash`. Inside it, before step 3, check under the lock (as `production.py`
+   does, ANYM-744): `personal-os-backup.service`, `deedkit-calendar-backup.service` and
+   `deedkit-calendar-backup-catchup.service` read `inactive` or `failed`, and
+   `/opt/personal-os-probe/backups/.runner.lock.unsettled` is absent. Any other answer: leave the shell, remove the
+   pause, try later. Check for an active call again.
+3. `docker compose F -f compose.db-settings.yaml up -d --no-deps db`: the `database` volume is kept, the backend
+   network and its `db` alias come back. Wait for healthy (`docker inspect --format '{{.State.Health.Status}}'`).
+   Not healthy within 2 minutes (a preload or setting refused at start): the undo below at once.
 4. Attach the networks the database joined live: `docker network connect --alias db personal-os-probe_delivery_db
-   personal-os-probe-db-1` and the same for `personal-os-probe_inference_db`; the member lists equal the saved ones.
+   personal-os-probe-db-1` and the same for `personal-os-probe_inference_db`; every member list equals the record.
 5. As the bootstrap superuser: `CREATE EXTENSION IF NOT EXISTS pg_stat_statements` in `messaging_probe`; no role gets
-   a grant (readers: `pg_read_all_stats` and each role for its own statements).
+   a grant.
 6. Verify: `SHOW` returns the new values; `SELECT count(*) FROM pg_stat_statements` works; the api health endpoint
    answers; the collectors' leases renew (`collector_health.heartbeat_at` moves); the matcher and delivery positions
-   advance; `pg_stat_activity` shows the service names after their next restart. Release the lock and the pause.
+   advance; `pg_stat_activity` shows the service names. Then leave the lock shell and remove the pause.
 7. Watch 24 h: no OOM kill (`memory.events` `oom_kill` of the container and `docker events --filter event=oom`),
    hit ratio and temp bytes per hour before and after, and a top-20 by total time (query ids, calls, times).
 
-Undo: `docker compose -p personal-os-probe -f <the saved files> up -d --no-deps db` without the overlay (the saved
-hash comes back), step 4 again, then `DROP EXTENSION pg_stat_statements` if it must go. The data stays on the volume.
+Undo (inside the lock shell; after it, take the lock again as in step 2): `docker compose F up -d --no-deps db`
+without the overlay; the container's config hash equals the record. Step 4 again, then remove the overlay file. The
+extension may stay (without the preload its view only refuses reads) or `DROP EXTENSION pg_stat_statements`. The
+data stays on the volume.
 
 ## Host firewall persistence (ANYM-693)
 

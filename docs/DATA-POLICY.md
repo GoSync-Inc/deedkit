@@ -50,11 +50,14 @@ volume) (owner 11-03, see Data egress).
   11-02 «5 да» to the question «Превью ссылок и опросы. Храним по правилам текста?»). Invoices,
   contact cards and other message parts this file does not name: proposal.
 - Statement statistics (ANYM-842, docs/operations/production.md "Database settings"): `pg_stat_statements` keeps
-  normalized SQL text (constants replaced by `$n`; comments and identifiers stay, so it is not redaction), with call
-  counts and times, on the database host in PostgreSQL's data directory. Dumps, so backups and database copies,
-  carry only the extension's definition, never the statistics. Readers: the bootstrap superuser, roles granted
-  `pg_read_all_stats` (none on prod, 11-09) and each role for its own statements; no role gets a new grant.
-  Reports carry query ids, calls and times only. Reset: `SELECT pg_stat_statements_reset()` as the bootstrap superuser.
+  SQL text normalized as PostgreSQL does it (constants usually replaced by `$n`, but not always: a text can keep its
+  constants, for example after its entry was deallocated and re-entered; comments and identifiers stay), with call
+  counts and times, on the database host in PostgreSQL's memory and data directory. The logical dumps of the backups
+  and database copies carry only the extension's definition, never the statistics. Readers of the text and query
+  ids: the bootstrap superuser, roles granted `pg_read_all_stats` (none on prod, 11-09) and each role for its own
+  statements; other roles see the rows' counts and times with the text and query id hidden. No role gets a new
+  grant. Reports carry query ids, calls and times only. Reset: `SELECT pg_stat_statements_reset()` as the bootstrap
+  superuser.
 - Pre-migration database copies and backups (ANYM-588, docs/operations/production.md "Migration risk
   tiers" and "Database copies"): only a critical migration (it deletes or rewrites existing rows or
   drops a table or column) gets a fresh verified backup; any other gets none, and the latest verified
