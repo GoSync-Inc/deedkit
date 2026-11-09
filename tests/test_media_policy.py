@@ -166,7 +166,7 @@ def plan_nodes(node):
 
 # The rule as it was before one fixed instant: clock_timestamp() per evaluated row (P1, perf audit 2026-11-09).
 def per_row_clock(query):
-    return query.replace('now()','clock_timestamp()')
+    return query.replace('statement_timestamp()','clock_timestamp()')
 
 
 # spec: ANYM-805
@@ -206,20 +206,22 @@ def test_the_on_request_rule_is_one_anti_join_and_keeps_the_same_chats(archive):
 
 # spec: ANYM-805
 @pytest.mark.parametrize('column',['expires_at','closed_at'])
-def test_a_protection_ending_during_a_statement_is_judged_at_its_transaction_start(archive,column):
+def test_a_grace_that_ends_while_a_transaction_waits_has_ended_for_its_next_statement(archive,column):
     from messaging_service.media_policy import ON_REQUEST_CHATS
     ar,s,_,_=archive;mid=original(ar)
     set_kind(s,mid,'group')
     subscribe(s,chat_of(s,mid),state='active' if column=='expires_at' else 'closed')
     with s.pool.connection() as c:
-        # The 24-hour grace ends 0.2 s after this transaction began: the fixed instant still protects the chat
-        # (its files are neither evicted nor withheld sooner than before), the per-row clock no longer does.
-        c.execute('UPDATE subscriptions SET '+column+"=now()-interval '24 hours'+interval '200 milliseconds'")
+        # Claims, requests and eviction checks start their transaction and then wait for the residency lock (the sleep
+        # stands in for that wait). The grace ends 0.2 s into the wait: the next statement sees it ended, as the per-row
+        # clock did; a transaction-start instant (now()) would still call the chat subscribed.
+        c.execute('UPDATE subscriptions SET '+column+"=clock_timestamp()-interval '24 hours'+interval '200 milliseconds'")
         c.execute('SELECT pg_sleep(0.5)')
-        assert chat_of(s,mid) not in {r['chat'] for r in c.execute(ON_REQUEST_CHATS).fetchall()}
-        assert chat_of(s,mid) in {r['chat'] for r in c.execute(per_row_clock(ON_REQUEST_CHATS)).fetchall()}
-    with s.pool.connection() as c:
         assert chat_of(s,mid) in {r['chat'] for r in c.execute(ON_REQUEST_CHATS).fetchall()}
+        assert chat_of(s,mid) in {r['chat'] for r in c.execute(per_row_clock(ON_REQUEST_CHATS)).fetchall()}
+        # A grace that has not ended yet still protects the chat.
+        c.execute('UPDATE subscriptions SET '+column+"=clock_timestamp()-interval '24 hours'+interval '1 minute'")
+        assert chat_of(s,mid) not in {r['chat'] for r in c.execute(ON_REQUEST_CHATS).fetchall()}
 
 
 # spec: ANYM-805

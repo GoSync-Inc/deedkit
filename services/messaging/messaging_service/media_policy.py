@@ -58,10 +58,11 @@ def published_window(account):
 # unknown, which counts as personal. Subscribed: listed in subscription_sources of a subscription that is active with
 # expires_at unset or less than 24 hours past (expiry is lazy), or closed, expired or access_changed less than 24
 # hours ago, so a renewal gap does not flip the chat. A dynamic subscription (all visible chats) lists no chat.
-# The 24 hours are counted from one fixed instant, the transaction's start (now()): a volatile clock_timestamp() in
-# the NOT EXISTS kept it a subscription scan per chat (perf audit 2026-11-09: 18.7k scans/s, 0.2-0.3 s each), now()
-# lets the planner run it as one anti-join per statement. A grace that ends while the transaction runs still counts,
-# so a chat is never judged on-request sooner than with the per-row clock. It reads and never writes, and follows
+# The 24 hours are counted from one fixed instant, the start of the statement that reads the rule: a volatile
+# clock_timestamp() in the NOT EXISTS kept it a subscription scan per chat (perf audit 2026-11-09: 18.7k scans/s,
+# 0.2-0.3 s each); the stable statement_timestamp() lets the planner run it as one anti-join. Not now(): callers
+# start their transaction and then wait for the residency lock, and a grace that ends during that wait must have
+# ended for the claim, request or eviction check that follows it. It reads and never writes, and follows
 # subscriptions as they start and end without rewriting a row. The worker roles read only these columns
 # (*_role.sql, column grants).
 ON_REQUEST_CHATS='''SELECT oc.id AS chat,CASE okind.kind WHEN 'channel' THEN 'channel_on_request'
@@ -72,8 +73,8 @@ ON_REQUEST_CHATS='''SELECT oc.id AS chat,CASE okind.kind WHEN 'channel' THEN 'ch
         WHEN occ.peer_kind='channel' THEN 'channel' END AS kind) okind
     WHERE okind.kind IN ('group','channel') AND NOT EXISTS(SELECT FROM subscription_sources oss
         JOIN subscriptions os ON os.id=oss.subscription WHERE oss.chat=oc.id AND oss.account=oc.account
-        AND (os.state='active' AND (os.expires_at IS NULL OR os.expires_at>now()-interval '24 hours')
-            OR os.state IN ('closed','expired','access_changed') AND os.closed_at>now()-interval '24 hours'))'''
+        AND (os.state='active' AND (os.expires_at IS NULL OR os.expires_at>statement_timestamp()-interval '24 hours')
+            OR os.state IN ('closed','expired','access_changed') AND os.closed_at>statement_timestamp()-interval '24 hours'))'''
 def on_request_chat(alias='m'):
     """`<alias>.chat` (a messages alias) is an on-request chat."""
     return alias+'.chat IN (SELECT orc.chat FROM ('+ON_REQUEST_CHATS+') orc)'
