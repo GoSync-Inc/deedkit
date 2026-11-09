@@ -290,6 +290,29 @@ class TelethonProvider:
     # Telegram said so; unknown: begun before the hooks), the page, the message count and timings only: never a
     # title, text or provider id. Every hook runs inside Telethon's update loop and never raises.
     CHANNEL_FETCHES_MAX=1000
+    CHANNEL_EVENTS_MAX=1000
+
+    @cached_property
+    def channel_events(self):
+        """The gate lines leave Telethon's loop through this bounded queue to a writer thread, so a stalled log pipe
+        (Docker's blocking log delivery) stalls only that thread; a full queue drops the line and counts it. They go to
+        stderr, each as one write of the whole line: the collector's own stdout events are printed from the loop
+        (body and newline in two writes), so sharing stdout from a second thread could splice two records."""
+        import queue,sys,threading
+        events=queue.Queue(self.CHANNEL_EVENTS_MAX)
+        def write():
+            while True:
+                line=events.get()
+                try:sys.stderr.write(line+'\n');sys.stderr.flush()
+                except Exception:pass
+                finally:events.task_done()
+        threading.Thread(target=write,name='channel-difference-events',daemon=True).start()
+        return events
+
+    def channel_event(self,event):
+        import queue
+        try:self.channel_events.put_nowait(json.dumps(event))
+        except queue.Full:self.channel_events_dropped=getattr(self,'channel_events_dropped',0)+1
 
     @cached_property
     def channel_fetches(self):
@@ -342,12 +365,13 @@ class TelethonProvider:
         field='messages' if isinstance(diff,types.updates.ChannelDifferenceTooLong) else 'new_messages'
         messages=list(getattr(diff,field,None) or ())
         dates=[m.date for m in messages if isinstance(getattr(m,'date',None),datetime)]
-        oldest=f'{(datetime.now(timezone.utc)-min(dates)).total_seconds():.0f}' if dates else 'none'
-        elapsed=f'{(now-page_started)*1000:.0f}' if page_started is not None else 'none'
+        oldest=round((datetime.now(timezone.utc)-min(dates)).total_seconds()) if dates else None
+        elapsed=round((now-page_started)*1000) if page_started is not None else None
         chat=stable_id('chat',getattr(getattr(self,'read_gap_state',None),'account',None),str(-1000000000000-entry))
-        log.info('telegram_channel_difference chat=%s trigger=%s result=%s page=%d messages=%d final=%s elapsed_ms=%s '
-            'fetch_ms=%.0f oldest_age_s=%s',chat,trigger,result,page,len(messages),getattr(diff,'final',None),elapsed,
-            (now-began)*1000,oldest)
+        # A JSON event like the collector's others (the service configures no INFO logging), written off the loop.
+        self.channel_event({'event':'telegram_channel_difference','chat':chat,'trigger':trigger,'result':result,
+            'page':page,'messages':len(messages),'final':getattr(diff,'final',None),'elapsed_ms':elapsed,
+            'fetch_ms':round((now-began)*1000),'oldest_age_s':oldest})
 
     def read_gap_soon(self):
         # Called inside Telethon's update loop: never block or raise there.
