@@ -1475,7 +1475,7 @@ The negotiation worker (`negotiations` in `deploy/compose.subscriptions.yaml`, `
 messaging_service.negotiation_worker`) is the only writer of the ANYM-907 tables. It reads the journal and the
 archive, never sends, calls a model or opens a provider, and no collector, send or hint path imports it. No
 release starts it: it runs only once the steps below select it. A new role file and migration
-`078_negotiation_heartbeat.sql` (manual: the `component_heartbeats` CHECK gains `negotiations`, and an RLS
+`081_negotiation_heartbeat.sql` (manual: the `component_heartbeats` CHECK gains `negotiations`, and an RLS
 policy limits the role to that row) pause autodeploy; release them by hand at once ("Migration releases" item
 4). Neither deletes or rewrites user data (non-critical tier). None of it runs during an active call (check
 read-only first).

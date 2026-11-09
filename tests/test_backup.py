@@ -54,7 +54,7 @@ def test_a_restored_schema72_backup_quarantines_and_migrates_to_the_wake_tables(
             restored.migrate()
             restored.migrate()
             with restored.pool.connection() as c:
-                assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='80'
+                assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='81'
                 assert schema_ready(c) is True
                 assert c.execute('SELECT count(*) AS n FROM wake_targets').fetchone()['n']==0
 
@@ -135,7 +135,7 @@ def test_a_restored_schema76_backup_migrates_to_the_structure_tables(database,tm
             quarantine_restore(restored)
             restored.migrate()
             with restored.pool.connection() as c:
-                assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='80'
+                assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='81'
                 assert c.execute('SELECT count(*) AS n FROM attachment_structure').fetchone()['n']==0
                 assert c.execute('SELECT count(*) AS n FROM structure_profiles').fetchone()['n']==0
 
@@ -162,7 +162,7 @@ def test_schema77_backup_carries_the_structured_versions_and_a_schema76_receiver
             with pytest.raises(ValueError,match='unsupported_backup'):verify_bundle(capture)
             with source.pool.connection() as c,pytest.raises(ValueError,match='unsupported_backup_schema'):
                 database_manifest(c)
-        assert verify_bundle(capture)['schema_version']==80
+        assert verify_bundle(capture)['schema_version']==81
         with snapshot_restored(source,tmp_path/'restore') as restored:
             with restored.pool.connection() as c:
                 manifest=database_manifest(c)
@@ -212,7 +212,7 @@ def test_schema70_snapshot_restores_the_activity_counts(database,tmp_path):
     with restore_database(database,tmp_path/'source') as source:
         acked_subscription(source,name='activity-snapshot')
         with source.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='80'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='81'
             before=database_manifest(c)['subscription_activity']
             rows=c.execute('SELECT * FROM subscription_activity ORDER BY metric').fetchall()
         assert before['rows']==2 and [row['metric'] for row in rows]==['matched','scanned']

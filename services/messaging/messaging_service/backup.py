@@ -87,7 +87,7 @@ V76_TABLES={'negotiations':'id','negotiation_sources':'message,negotiation','neg
 V77_TABLES={'attachment_structure':'attachment','structure_profiles':'account'}
 # ANYM-914: one provider-session owner per account (host, boot and lock IDs, times; no secret).
 V78_TABLES={'session_claims':'account'}
-SCHEMAS=range(2,81)
+SCHEMAS=range(2,82)
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
 V17_TABLES={'message_conflicts':'receipt_digest'}
