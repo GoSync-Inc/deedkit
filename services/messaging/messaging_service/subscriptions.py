@@ -987,6 +987,20 @@ def _record_pass_activity(c, row, p, counts, *, logged):
         return False
 
 
+def record_compact_read(c, p, subscription_id):
+    """ANYM-826: a compact page read adds one `reads_compact` (platform `all`) through the same upsert, in a
+    savepoint, so a failed count (a missing table, a lost grant, a lock timeout) never fails the read it counts.
+    Callers pass the ID of the page the key just read: the key's own subscription only."""
+    try:
+        with c.transaction():
+            record_activity(c, subscription_id, p['scope_version'], {('all', 'reads_compact'): 1})
+        return True
+    except Exception as error:
+        print(json.dumps({'error': 'subscription_activity_failed',
+            'code': getattr(error, 'sqlstate', None) or type(error).__name__}), flush=True)
+        return False
+
+
 ACTIVITY_DAYS = 7
 
 

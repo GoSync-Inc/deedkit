@@ -1155,16 +1155,33 @@ class Store:
                                 include=None):
         from .subscription_consumption import page_detail, project_page
         from .subscriptions import get_subscription_events
+        from .subscriptions import record_compact_read
         view = page_detail(detail, include)
         with self.authorized(token, 'get_subscription_events') as (c, p):
-            return project_page(get_subscription_events(self, c, p, subscription_id, after=after, limit=limit,
-                module_after=module_after), *view)
+            page = get_subscription_events(self, c, p, subscription_id, after=after, limit=limit,
+                module_after=module_after)
+            if view[0] == 'compact':
+                record_compact_read(c, p, page['subscription']['subscription_id'])
+            return project_page(page, *view)
 
     def fetch_subscription_events(self, token, subscription_id, *, limit=50, detail=None, include=None):
         from .subscription_consumption import fetch_subscription_events, page_detail, project_page
+        from .subscriptions import record_compact_read
         view = page_detail(detail, include)
         with self.authorized(token, 'fetch_subscription_events') as (c, p):
-            return project_page(fetch_subscription_events(self, c, p, subscription_id, limit=limit), *view)
+            page = fetch_subscription_events(self, c, p, subscription_id, limit=limit)
+            if view[0] == 'compact':
+                record_compact_read(c, p, page['subscription']['subscription_id'])
+            return project_page(page, *view)
+
+    def count_compact_read(self, token, subscription_id):
+        """ANYM-826: one `reads_compact` for a compact page `wait_for_subscription_events` returned (its polls read
+        full pages). `subscription_id` is the returned page's own ID; the count never fails the wait."""
+        from .subscriptions import _subscription_id, record_compact_read
+        with self.authorized(token, 'wait_for_subscription_events') as (c, p):
+            if c.execute('SELECT 1 FROM subscriptions WHERE id=%s AND principal=%s AND key_id=%s',
+                    (_subscription_id(subscription_id), p['id'], p['key_id'])).fetchone():
+                record_compact_read(c, p, subscription_id)
 
     def ack_subscription_events(self, token, subscription_id, receipt, version):
         from .subscription_consumption import ack_subscription_events

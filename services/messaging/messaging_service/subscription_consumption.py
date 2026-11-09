@@ -2,6 +2,7 @@
 from __future__ import annotations
 import asyncio
 import hashlib
+import json
 import secrets
 import time
 import threading
@@ -267,7 +268,19 @@ async def wait_for_subscription_events(store, token, subscription_id, *, timeout
         raise APIError('invalid_parameters')
     view = page_detail(detail, include)
     # Polls read full pages (the loop reads the subscription state); only the returned page is projected.
-    return project_page(await _wait(store, token, subscription_id, timeout, limit), *view)
+    page = await _wait(store, token, subscription_id, timeout, limit)
+    if view[0] == 'compact':
+        await _count_compact_read(store, token, page['subscription']['subscription_id'])
+    return project_page(page, *view)
+
+
+async def _count_compact_read(store, token, subscription_id):
+    """ANYM-826: one `reads_compact` per returned compact page, not per poll; a failed count never fails the wait."""
+    try:
+        await asyncio.to_thread(store.count_compact_read, token, subscription_id)
+    except Exception as error:
+        print(json.dumps({'error': 'subscription_activity_failed',
+            'code': getattr(error, 'code', None) or type(error).__name__}), flush=True)
 
 
 async def _wait(store, token, subscription_id, timeout, limit):

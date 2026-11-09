@@ -558,6 +558,75 @@ def test_compact_page_of_fifty_forwarded_media_items_is_smaller(seeded):
     assert compact_bytes<full_bytes
 
 
+def compact_reads(store,token,sid):
+    from tests.test_subscriptions import activity
+    return activity(store,token,sid).get('all',{}).get('reads_compact',0)
+
+
+# spec: ANYM-826
+def test_each_compact_page_counts_one_reads_compact_and_a_full_page_none(seeded):
+    from tests.test_event_delivery import identity
+    from messaging_service.subscriptions import match_subscriptions
+    store,_,_=seeded
+    token,sid=static_case(store)
+    match_subscriptions(store)
+    for method in ('get_subscription_events','fetch_subscription_events','wait_for_subscription_events'):
+        assert page_store_call(store,token,method,sid)['items']
+        assert page_store_call(store,token,method,sid,detail='full',include=['delivery'])['items']
+    assert compact_reads(store,token,sid)==0
+    for count,method in enumerate(('get_subscription_events','fetch_subscription_events',
+            'wait_for_subscription_events'),1):
+        assert page_store_call(store,token,method,sid,detail='compact')['items']
+        assert compact_reads(store,token,sid)==count
+    assert store.get_subscription(token,sid)['activity']['days'][0]['platforms']['all']=={'reads_compact':3}
+    # A wait that polls an empty definition until its timeout returns one page and counts it once.
+    empty=store.create_subscription(token,['telegram-demo-chat'])['subscription_id']
+    page=page_store_call(store,token,'wait_for_subscription_events',empty,detail='compact')
+    assert page['items']==[] and compact_reads(store,token,empty)==1
+    import asyncio
+    from messaging_service.subscription_consumption import wait_for_subscription_events
+    polls=[]
+    read=store.fetch_subscription_events
+    store.fetch_subscription_events=lambda *a,**k:polls.append(1) or read(*a,**k)
+    try:
+        waited=asyncio.run(wait_for_subscription_events(store,token,empty,timeout=1,detail='compact'))
+    finally:
+        del store.fetch_subscription_events
+    assert waited['wait_status']=='timeout' and len(polls)>1 and compact_reads(store,token,empty)==2
+    # Another key counts nothing on a definition it does not own.
+    other=identity(store,'compact-other')
+    store.count_compact_read(other,empty)
+    assert compact_reads(store,token,empty)==2
+
+
+# spec: ANYM-826
+def test_a_failed_compact_read_count_never_fails_the_read_and_logs_its_code(seeded,capsys):
+    from messaging_service.subscriptions import match_subscriptions
+    store,_,_=seeded
+    token,sid=static_case(store)
+    match_subscriptions(store)
+    with store.pool.connection() as c:
+        c.execute("""CREATE FUNCTION compact_read_failure() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'synthetic compact read count failure'; END $$""")
+        c.execute('''CREATE TRIGGER compact_read_failure BEFORE INSERT ON subscription_activity
+            FOR EACH ROW EXECUTE FUNCTION compact_read_failure()''')
+    capsys.readouterr()
+    try:
+        pages={method:page_store_call(store,token,method,sid,detail='compact')
+            for method in ('get_subscription_events','fetch_subscription_events','wait_for_subscription_events')}
+    finally:
+        with store.pool.connection() as c:
+            c.execute('DROP TRIGGER compact_read_failure ON subscription_activity')
+            c.execute('DROP FUNCTION compact_read_failure()')
+    logged=[line for line in capsys.readouterr().out.splitlines() if 'subscription_activity_failed' in line]
+    assert logged==['{"error": "subscription_activity_failed", "code": "P0001"}']*3
+    full=store.fetch_subscription_events(token,sid)
+    for page in pages.values():
+        assert [item['event_id'] for item in page['items']]==[item['event_id'] for item in full['items']]
+    assert pages['fetch_subscription_events']['receipt'] and pages['wait_for_subscription_events']['receipt']
+    assert compact_reads(store,token,sid)==0
+
+
 def tracked_keys(function,item,*args):
     seen=set()
 
