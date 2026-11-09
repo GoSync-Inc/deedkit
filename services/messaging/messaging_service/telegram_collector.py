@@ -294,14 +294,16 @@ class TelethonProvider:
 
     @cached_property
     def channel_events(self):
-        """The gate lines leave Telethon's loop through this bounded queue to a writer thread, so a stalled stdout
-        (Docker's blocking log delivery) stalls only that thread; a full queue drops the line and counts it."""
-        import queue,threading
+        """The gate lines leave Telethon's loop through this bounded queue to a writer thread, so a stalled log pipe
+        (Docker's blocking log delivery) stalls only that thread; a full queue drops the line and counts it. They go to
+        stderr, each as one write of the whole line: the collector's own stdout events are printed from the loop
+        (body and newline in two writes), so sharing stdout from a second thread could splice two records."""
+        import queue,sys,threading
         events=queue.Queue(self.CHANNEL_EVENTS_MAX)
         def write():
             while True:
                 line=events.get()
-                try:print(line,flush=True)
+                try:sys.stderr.write(line+'\n');sys.stderr.flush()
                 except Exception:pass
                 finally:events.task_done()
         threading.Thread(target=write,name='channel-difference-events',daemon=True).start()
@@ -366,7 +368,7 @@ class TelethonProvider:
         oldest=round((datetime.now(timezone.utc)-min(dates)).total_seconds()) if dates else None
         elapsed=round((now-page_started)*1000) if page_started is not None else None
         chat=stable_id('chat',getattr(getattr(self,'read_gap_state',None),'account',None),str(-1000000000000-entry))
-        # A stdout event like the collector's others (the service configures no INFO logging), written off the loop.
+        # A JSON event like the collector's others (the service configures no INFO logging), written off the loop.
         self.channel_event({'event':'telegram_channel_difference','chat':chat,'trigger':trigger,'result':result,
             'page':page,'messages':len(messages),'final':getattr(diff,'final',None),'elapsed_ms':elapsed,
             'fetch_ms':round((now-began)*1000),'oldest_age_s':oldest})

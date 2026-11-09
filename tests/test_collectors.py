@@ -300,9 +300,9 @@ def test_telegram_channel_difference_fetch_logs_chat_count_and_timing_only(capsy
         assert new_messages(box.apply_channel_difference(request,broken,hashes)[0])==1
         # Every finished fetch left the tracker: it stays bounded.
         assert provider.channel_fetches=={}
-    # A stdout event, as the collector's other events: it reaches prod logs without any logging configuration.
+    # A JSON event on stderr: it reaches prod logs without any logging configuration.
     asyncio.run(scenario());provider.channel_events.join()
-    out=capsys.readouterr().out
+    out=capsys.readouterr().err
     events=[json.loads(line) for line in out.splitlines() if '"telegram_channel_difference"' in line]
     chat=stable_id('chat','tg-gate',str(utils.get_peer_id(types.PeerChannel(4242))))
     other=stable_id('chat','tg-gate',str(utils.get_peer_id(types.PeerChannel(777))))
@@ -320,7 +320,7 @@ def test_telegram_channel_difference_fetch_logs_chat_count_and_timing_only(capsy
 
 
 # spec: ANYM-840
-def test_a_stalled_stdout_never_blocks_the_channel_difference_hooks(monkeypatch):
+def test_a_stalled_log_pipe_never_blocks_the_channel_difference_hooks(monkeypatch):
     import sys,threading,time
     from telethon import TelegramClient
     from telethon.sessions import StringSession
@@ -334,7 +334,7 @@ def test_a_stalled_stdout_never_blocks_the_channel_difference_hooks(monkeypatch)
         def write(self,text):
             release.wait(10);written.append(text);return len(text)
         def flush(self):pass
-    monkeypatch.setattr(sys,'stdout',Stalled())
+    monkeypatch.setattr(sys,'stderr',Stalled())
     calls=provider.CHANNEL_EVENTS_MAX+50
     async def scenario():
         ticks=[];loop=asyncio.get_running_loop();loop.call_soon(ticks.append,1)
@@ -351,6 +351,39 @@ def test_a_stalled_stdout_never_blocks_the_channel_difference_hooks(monkeypatch)
     lines=[line for line in written if line.strip()]
     assert len(lines)==calls-provider.channel_events_dropped
     assert all(json.loads(line)['event']=='telegram_channel_difference' for line in lines)
+
+
+# spec: ANYM-840
+def test_gate_events_and_the_collectors_stdout_events_never_splice(monkeypatch):
+    import sys,threading
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    from messaging_service.telegram_collector import TelethonProvider
+    client=TelegramClient(StringSession(),1,'synthetic',receive_updates=False)
+    provider=object.__new__(TelethonProvider);provider.client=client
+    provider.bind_state(NS(account='tg-splice',update_gap=lambda:None))
+    chunks={'out':[],'err':[]};lock=threading.Lock()
+    class Recorder:
+        # Every write call is one chunk; a record split across calls could interleave with another thread's.
+        def __init__(self,name):self.name=name
+        def write(self,text):
+            with lock:chunks[self.name].append(text)
+            return len(text)
+        def flush(self):pass
+    monkeypatch.setattr(sys,'stdout',Recorder('out'));monkeypatch.setattr(sys,'stderr',Recorder('err'))
+    async def scenario():
+        loop=asyncio.get_running_loop()
+        for i in range(300):
+            provider.channel_fetch_log(4242,['timeout',loop.time(),1,None],'empty',None,loop.time())
+            # The collector's existing stdout events, printed from the loop at the same time.
+            print(json.dumps({'event':'telegram_discovery','dialogs':i}),flush=True)
+            await asyncio.sleep(0)
+    asyncio.run(scenario());provider.channel_events.join()
+    # Gate events are whole lines on stderr, one write each; stdout holds only the collector's own events.
+    assert len(chunks['err'])==300 and all(chunk.endswith('\n') and chunk.count('\n')==1 for chunk in chunks['err'])
+    assert all(json.loads(chunk)['event']=='telegram_channel_difference' for chunk in chunks['err'])
+    printed=[line for line in ''.join(chunks['out']).splitlines() if line]
+    assert len(printed)==300 and all(json.loads(line)['event']=='telegram_discovery' for line in printed)
 
 
 @pytest.fixture
