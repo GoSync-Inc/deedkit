@@ -1648,7 +1648,8 @@ The messaging `db` service runs with statement statistics and a memory set insid
 `shared_preload_libraries=pg_stat_statements`, `pg_stat_statements.max=5000`, `track_io_timing=on`,
 `shared_buffers=128MB`, `work_mem=4MB`, `effective_cache_size=1536MB` (a planner estimate, no memory),
 `random_page_cost=1.1`, `shm_size: 256m`; `jit` stays on (the JIT-heavy statements set `jit=off` themselves).
-`deploy/compose.yaml` carries them for new installs. Each messaging process names its sessions after its service
+`deploy/compose.yaml` carries them for new installs; the production host runs a larger set ("Production memory split
+(2026-11-09)" below). Each messaging process names its sessions after its service
 (`application_name`: `api`, `http-api`, `collector-telegram`, `collector-whatsapp`, `matcher`, `delivery`,
 `enricher-<profiles>`, `indexer`, `file-lifecycle`, `cold-archive`, `message-purge`, `file-understanding`, `backup`;
 the event router keeps `module-router`). Statement totals come from `pg_stat_statements` by database, user and query
@@ -1741,6 +1742,35 @@ overlay (on 11-09: `/root/anym842-20261109T0422Z/db842.sh undo`); the hash equal
 remove the overlay file. The
 extension may stay (without the preload its view only refuses reads) or `DROP EXTENSION pg_stat_statements`. The
 data stays on the volume.
+
+### Production memory split (2026-11-09)
+
+The production host gives the database more memory than the 2 GiB default (owner 11-09, «свободный 4-7 гигабайта ...
+надо как-то распределить, чтобы мы не упирались точно нигде»). Before: the `db` cgroup sat at its 2 GiB limit
+(`memory.events` max 4,710, no OOM kill) with 264 MB anonymous, 160 MB shared and 1.78 GB page cache, and 741k
+file refaults: its own cache was being evicted. The host had 7,751 MB RAM, no swap, 5.1 GB available. Every other
+container used at most 90 MB anonymous memory and 36% of its limit, with no OOM kill; `file-lifecycle` and
+`cold-archive` touched their 256 MB limit with page cache only (33 MB anonymous) and keep it.
+
+The overlay `/opt/personal-os-probe/compose.db-settings.yaml` now sets `mem_limit: 4g`, `shm_size: 1g`,
+`shared_buffers=1GB`, `effective_cache_size=3GB`, `work_mem=8MB`, `maintenance_work_mem=256MB`,
+`autovacuum_work_mem=128MB` (3 workers × 128 MB, not 3 × 256 MB), and keeps the statement statistics,
+`random_page_cost=1.1` and `jit`. `deploy/compose.yaml` keeps the 2 GiB set for other installs. Budget inside 4 GiB with
+the method above: shared memory 1,068 + 40 sessions × 25 = 1,000 + 14 active × 2 × 2 × 8 MB = 448 + autovacuum 384 +
+parallel 8 × (10 + 2 × 2 × 8) = 336, so 3,236 MB (79%) when every part peaks together. Measured: about 1.85 GB idle
+plus the 600 MB synthetic burst, about 2.45 GB (60%). Host: other services use about 2.36 GB, about 3.2 GB with a
+call and a backup at once, so about 2.9 GB stays free in the expected case and 1.3 GB when everything peaks together.
+
+Applied 2026-11-09 06:56:19-06:56:28Z by the route above (healthy after 8 s, no active call, under the runner lock;
+autodeploy was already halted for the 072 hand release and is not this step's pause). Record, overlays and script are
+in `/root/prodmem-20261109` on the host: hashes `e26841ea…` (before) and `f7a4c4a1…` (after). The comparison named only
+`cmd`, `mem_limit` and `shm_size`, the networks equal the record, and no client container restarted. Client errors
+appear only between 06:56:21 and 06:56:27Z; collector leases, heartbeats, ingest, `subscription_outbox` and the
+listeners resumed.
+
+Undo, under the runner lock: `flock --nonblock /opt/personal-os-probe/backups/.runner.lock
+/root/prodmem-20261109/dbmem.sh undo` puts the previous overlay back (`compose.db-settings.before.yaml`, the
+ANYM-842 set) and recreates `db`, so the hash is again `e26841ea…`. Then run step 4 again.
 
 ## Host firewall persistence (ANYM-693)
 
