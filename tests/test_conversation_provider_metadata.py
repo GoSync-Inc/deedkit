@@ -113,6 +113,22 @@ def test_an_invalid_location_block_is_dropped_and_the_message_is_still_stored(bl
     assert 'invalid_location' in caplog.text and '55.7' not in caplog.text
 
 
+# spec: ANYM-922
+@pytest.mark.parametrize('block', [
+    {'latitude': 10**400, 'longitude': 0, 'accuracy_m': None, 'title': None, 'address': None, 'live': False},
+    {'latitude': 0, 'longitude': -10**400, 'accuracy_m': None, 'title': None, 'address': None, 'live': False},
+    {'latitude': 1, 'longitude': 1, 'accuracy_m': 10**400, 'title': None, 'address': None, 'live': False},
+    {'latitude': 1, 'longitude': 1, 'accuracy_m': None, 'title': 'я' * 600_000, 'address': None, 'live': False},
+], ids=['huge_latitude', 'huge_longitude', 'huge_accuracy', 'oversized_title'])
+def test_a_huge_number_or_an_oversized_location_never_costs_the_message(block, caplog):
+    # Astra r1 M1, M2: no OverflowError and no envelope_too_large for a block the archive would drop anyway.
+    for result in (whatsapp_message('wa-fixture', whatsapp(messageType='location', body='Парк', location=block)),
+                   validate({**whatsapp_message('wa-fixture', whatsapp(messageType='location', body='Парк')),
+                       'metadata': {'message_kind': 'location', 'location': block}})):
+        assert result['body'] == 'Парк' and 'location' not in result['metadata']
+    assert 'invalid_location' in caplog.text
+
+
 def test_telegram_voice_duration_is_observed_without_changing_body_or_revision_hash():
     result = telegram_message('tg-fixture', telegram(message='caption', voice=True,
         file=SimpleNamespace(name='voice.ogg', ext='.ogg', mime_type='audio/ogg',

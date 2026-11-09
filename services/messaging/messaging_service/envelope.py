@@ -108,7 +108,9 @@ def location_block(value):
     """A shared point or venue (ANYM-922): coordinates, accuracy, title and address as the sender stated them.
     A live location is only the fact that it was shared, {live: true}: never a point of its track."""
     def coordinate(item,limit):
-        if type(item) not in (int,float) or not math.isfinite(item) or not -limit<=item<=limit:raise ValueError('invalid_location')
+        # Type and range before any float conversion: a huge integer is out of range, never an OverflowError; NaN fails
+        # every comparison (Astra r1 M1).
+        if type(item) not in (int,float) or not -limit<=item<=limit:raise ValueError('invalid_location')
         return round(float(item),6)
     def label(item):
         if item is not None and (not isinstance(item,str) or '\x00' in item or len(item)>256):raise ValueError('invalid_location')
@@ -148,20 +150,24 @@ def text(value, maximum, name, empty=False):
     return value
 
 
-def without_unencodable_location(data):
-    """A location JSON cannot carry (NaN, infinity) is dropped before the envelope is encoded, never the message (ANYM-922)."""
+def checked_location(data):
+    """The shared place is validated before the envelope is encoded or measured (ANYM-922): a block the archive cannot
+    accept (out of range, NaN, a huge number, an oversized title, not a location message) is dropped and only the reason
+    code is logged, never the coordinates; the message itself is still stored (Astra r1 M1, M2)."""
     metadata=data.get('metadata')
-    if not isinstance(metadata,dict) or 'location' not in metadata:return data
-    try:canonical(metadata['location'])
-    except (TypeError,ValueError):
+    if not isinstance(metadata,dict) or metadata.get('location') is None:return data
+    try:
+        if metadata.get('message_kind')!='location':raise ValueError('invalid_location')
+        location=location_block(metadata['location'])
+    except (ValueError,TypeError,OverflowError):
         log.warning('location_dropped reason=invalid_location')
         return {**data,'metadata':{k:v for k,v in metadata.items() if k!='location'}}
-    return data
+    return {**data,'metadata':{**metadata,'location':location}}
 
 
 def validate(data):
     if not isinstance(data, dict): raise ValueError('invalid_envelope')
-    data=without_unencodable_location(data)
+    data=checked_location(data)
     if len(canonical(data))>MAX_ENVELOPE: raise ValueError('envelope_too_large')
     allowed={'account','platform','chat','chat_title','provider_id','sender','body','sent_at',
              'updated_at','deleted','direction','origin','media','sender_profile','metadata','formatting'}
@@ -225,14 +231,8 @@ def validate(data):
                 value=poll_block(value)
             elif key=='location':
                 # A place someone shared (ANYM-922). A block the archive cannot accept never costs the message:
-                # it is dropped and only the reason code is logged, never the coordinates.
+                # it was dropped by checked_location() before the envelope was measured.
                 if value is None:continue
-                try:
-                    if metadata.get('message_kind')!='location':raise ValueError('invalid_location')
-                    value=location_block(value)
-                except ValueError:
-                    log.warning('location_dropped reason=invalid_location')
-                    continue
             elif key=='web_preview_id':
                 # Telegram's link preview page ID in its unsigned 64-bit decimal form (ANYM-611).
                 if value is not None and (type(value) is not str or not re.fullmatch(r'[0-9]{1,20}',value)):

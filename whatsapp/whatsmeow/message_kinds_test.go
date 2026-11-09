@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -563,6 +564,68 @@ func TestNativeLocationKeepsItsPointTitleAndAddressAndALiveOneOnlyTheFact(t *tes
 	}
 	if v, _ := NormalizeMessage(fixtureMessage("TEXT", 1700000000), owner); v["location"] != nil {
 		t.Fatal("location block on a text message")
+	}
+}
+
+// spec: ANYM-922
+func TestNativeLiveLocationLeavesNoTrackInTheJournalAndItsMovesAddNoRow(t *testing.T) {
+	s := openTestStore(t)
+	le := func(f float64) []byte {
+		b := make([]byte, 8)
+		binary.LittleEndian.PutUint64(b, math.Float64bits(f))
+		return b
+	}
+	forms := map[string]func(lat float64, seq int64) *waE2E.Message{
+		"live": func(lat float64, seq int64) *waE2E.Message {
+			return &waE2E.Message{LiveLocationMessage: &waE2E.LiveLocationMessage{DegreesLatitude: proto.Float64(lat), DegreesLongitude: proto.Float64(37.6123),
+				AccuracyInMeters: proto.Uint32(uint32(seq)), SpeedInMps: proto.Float32(1.5), Caption: proto.String("иду"), SequenceNumber: proto.Int64(seq), JPEGThumbnail: le(lat)}}
+		},
+		"flagged": func(lat float64, seq int64) *waE2E.Message {
+			return &waE2E.Message{LocationMessage: &waE2E.LocationMessage{DegreesLatitude: proto.Float64(lat), DegreesLongitude: proto.Float64(37.6123),
+				AccuracyInMeters: proto.Uint32(uint32(seq)), Name: proto.String("иду"), IsLive: proto.Bool(true), JPEGThumbnail: le(lat)}}
+		},
+	}
+	for name, form := range forms {
+		id := "LIVE" + strings.ToUpper(name)
+		var lats []float64
+		var last *events.Message
+		for n := range 10 {
+			lat := 55.7001 + float64(n)/997
+			lats = append(lats, lat)
+			inner := form(lat, int64(n+1))
+			// Wrapped on the wire and in the history copy, as whatsmeow delivers an ephemeral chat's message.
+			wrapped := &waE2E.Message{EphemeralMessage: &waE2E.FutureProofMessage{Message: inner}}
+			last = groupFixture(id, inner)
+			last.RawMessage = wrapped
+			last.SourceWebMsg = &waWeb.WebMessageInfo{Key: &waCommon.MessageKey{RemoteJID: proto.String("120363000000000001@g.us"), ID: proto.String(id)},
+				MessageTimestamp: proto.Uint64(1700000000), Message: proto.Clone(wrapped).(*waE2E.Message)}
+			if err := s.Put(last, "live"); err != nil {
+				t.Fatal(name, n, err)
+			}
+		}
+		if last.Message.GetLiveLocationMessage().GetDegreesLatitude()+last.Message.GetLocationMessage().GetDegreesLatitude() != lats[9] {
+			t.Fatal(name, "the caller's event was changed")
+		}
+		var rows int
+		var stored []byte
+		s.db.QueryRow("SELECT COUNT(*), MAX(raw) FROM capture WHERE message_id LIKE ?", "%"+id+"%").Scan(&rows, &stored)
+		if rows != 1 {
+			t.Fatalf("%s: %d journal rows for ten moves", name, rows)
+		}
+		saved, err := unmarshalMessage(stored)
+		if err != nil || saved.SourceWebMsg == nil || saved.RawMessage.GetEphemeralMessage() == nil {
+			t.Fatal(name, err)
+		}
+		wire, _ := proto.Marshal(saved.RawMessage)
+		web, _ := proto.Marshal(saved.SourceWebMsg)
+		for _, lat := range append(lats, 37.6123) {
+			if bytes.Contains(wire, le(lat)) || bytes.Contains(web, le(lat)) {
+				t.Fatalf("%s: a position %v is in the journal", name, lat)
+			}
+		}
+		if got := saved.Message.GetLiveLocationMessage().GetCaption() + saved.Message.GetLocationMessage().GetName(); got != "иду" {
+			t.Fatalf("%s: caption %q", name, got)
+		}
 	}
 }
 
