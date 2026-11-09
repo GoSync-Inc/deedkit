@@ -37,6 +37,8 @@ func main() {
 	flag.StringVar(&fixture, "normalize-fixture", "", "offline synthetic fixture; no provider/session access")
 	var mediaKeys bool
 	flag.BoolVar(&mediaKeys, "media-keys", false, "read-only capture journal lookup for the operator media inventory; no provider/session access")
+	var menuShapes bool
+	flag.BoolVar(&menuShapes, "menu-reply-shapes", false, "read-only capture journal scan: field relations of the owner's menu replies, no values (ANYM-837); no provider/session access")
 	flag.Parse()
 	code := 0
 	var err error
@@ -44,6 +46,8 @@ func main() {
 		err = normalizeFixture(fixture)
 	} else if mediaKeys {
 		err = serveMediaKeys(path, os.Stdin, os.Stdout)
+	} else if menuShapes {
+		err = serveMenuReplyShapes(path, os.Stdout)
 	} else {
 		err = execute(path, pair)
 	}

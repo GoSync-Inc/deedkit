@@ -38,7 +38,9 @@ EXPECTED_GO_SAFE_ONLY = {
     'collector_disabled', 'history_request_unknown', 'invalid_cursor', 'invalid_limit', 'invalid_policy',
     'invalid_request', 'message_target_unavailable', 'operation_invalid', 'operation_outcome_unknown',
     'owner_terminal_required', 'policy_expired', 'provider_already_started', 'provider_response_too_large',
-    'session_already_owned', 'unsupported_method'}
+    'session_already_owned', 'unsupported_method',
+    # ANYM-837: the operator's read-only --menu-reply-shapes scan reports it on stderr; no collector reads it.
+    'menu_shapes_unavailable'}
 
 
 def _strings(text, quote):
