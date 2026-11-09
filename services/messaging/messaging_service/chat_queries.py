@@ -11,6 +11,31 @@ from .conversation_state import conversation_state,group_thread_query
 from .time_references import owner_zone,passed_reference
 
 CHAT_TYPES=('private','group','channel','unknown')
+# The Telegram collector schedules its next dialog discovery pass this long after one finishes
+# (telegram_collector.py, `_next_discovery`): a scheduling interval, not a deadline (ANYM-845).
+DISCOVERY_INTERVAL_S=900
+
+
+def catalog_refresh(c,p,accounts):
+    """ANYM-845: per account in scope, when a dialog discovery pass last refreshed its chat catalog. No chat is named."""
+    scope=p['accounts'] if accounts is None else [a for a in accounts if a in p['accounts']]
+    rows=c.execute('''SELECT a.id AS account,a.platform,h.discovery_started_at,h.discovery_completed_at,
+        h.discovery_limited FROM accounts a LEFT JOIN collector_health h ON h.account=a.id
+        WHERE a.id=ANY(%s) ORDER BY a.id''',(scope,)).fetchall()
+    result=[]
+    for row in rows:
+        started,completed=row['discovery_started_at'],row['discovery_completed_at']
+        if row['platform']!='telegram':
+            # Only the Telegram collector runs discovery passes.
+            result.append({'account':row['account'],'last_started_at':None,'last_completed_at':None,
+                           'limited':None,'interval_s':None,'state':'not_applicable'});continue
+        if started is None and completed is None:state='never'
+        elif started is not None and (completed is None or started>completed):state='incomplete'
+        elif row['discovery_limited']:state='limited'
+        else:state='complete'
+        result.append({'account':row['account'],'last_started_at':started,'last_completed_at':completed,
+                       'limited':row['discovery_limited'],'interval_s':DISCOVERY_INTERVAL_S,'state':state})
+    return result
 
 
 def meaningful(alias='m',metadata='md'):
@@ -822,5 +847,6 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         'awaiting_reply_scope':'private_and_explicit_group_attention' if awaiting_reply else None,
         'group_attention_coverage':'observed_mentions_and_replies_only',
         'catalog_coverage':'archived_chats_only','provider_read_state':'per_chat_observation_or_unknown',
+        **({'catalog_refresh':catalog_refresh(c,p,accounts)} if include_coverage else {}),
         **({'unknown_role_rows':unknown_roles,'hint':'role_captured_on_next_catalog_pass'} if unknown_roles else {}),
         **coverage(store,c,p,include_coverage)})

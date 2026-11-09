@@ -148,6 +148,68 @@ def test_cancelled_group_catalog_write_still_settles_the_confirmed_receipt_first
     assert answer['data']['archive_reason'] == 'catalog_failed' and 'chat_id' not in answer['data']
 
 
+def creation_notice(mid, chat=GROUP):
+    """The live service message Telegram sends when a basic group is created in the app (no DeedKit operation)."""
+    from telethon import types
+    return types.MessageService(id=mid, peer_id=types.PeerChat(-int(chat)), from_id=types.PeerUser(42),
+                                date=datetime(2026, 11, 9, 1, 10, tzinfo=timezone.utc), out=False,
+                                action=types.MessageActionChatCreate(title='Synthetic team', users=[42]))
+
+
+def registered_events(update):
+    """The events the handlers TelethonProvider.subscribe registers for capture build from one raw update."""
+    from messaging_service.telegram_collector import TelethonProvider
+    handlers = []
+
+    class Client:
+        def add_event_handler(self, callback, event):
+            handlers.append((callback, event))
+    provider = TelethonProvider.__new__(TelethonProvider)
+    provider.client = Client()
+    capture = object()
+    provider.subscribe(capture, object())
+    builders = [event for callback, event in handlers if callback is capture]
+    assert builders
+    return [event for event in (type(b).build(update, None, None) for b in builders) if event is not None]
+
+
+# spec: ANYM-845
+@pytest.mark.parametrize('policy,listed', [({}, True), ({'exclude': [GROUP]}, False), ({'discover': False}, False)],
+                         ids=['discovery_on', 'excluded', 'discovery_off_not_included'])
+def test_a_group_whose_only_message_is_its_creation_notice_is_listed_after_the_next_discovery_pass_not_live(
+        worker, policy, listed):
+    from telethon import types
+    w, s, key = worker
+    if policy:
+        set_policy(w, policy)
+    w.policy = w.state.policy()
+    chat_id = stable_id('chat', w.account, GROUP)
+
+    def chats():
+        return [c['id'] for c in s.list_chats(key, accounts=[w.account])['items']]
+    assert chat_id not in chats()
+    # The registered handlers build an event from an ordinary new message in the same chat ...
+    text = types.Message(id=8, peer_id=types.PeerChat(-int(GROUP)), date=datetime(2026, 11, 9, 1, 11, tzinfo=timezone.utc),
+                         message='Synthetic text', from_id=types.PeerUser(42), out=False)
+    assert len(registered_events(types.UpdateNewMessage(message=text, pts=2, pts_count=1))) == 1
+    # ... but none from the creation notice: Telethon 1.45.0 NewMessage skips MessageService updates.
+    assert registered_events(types.UpdateNewMessage(message=creation_notice(7), pts=1, pts_count=1)) == []
+    w.spool.drain(w.state.apply)
+    assert chat_id not in chats() and not w.failed.is_set()
+    # The next dialog discovery pass lists the group, as far as the account's policy allows it.
+    async def dialogs(limit):
+        return [(GROUP, 'chat', 'Synthetic team', 'group')]
+    w.provider.dialogs, w.provider.messages, w._next_discovery = dialogs, [], 0
+    asyncio.run(w.sync_once())
+    assert (chat_id in chats()) is listed
+    if listed:
+        w.archive.set_sending(w.account, True)
+        w.state.phase('connection', 'connected', 'provider_ready')
+        sender = s.issue_key('notice-sender', [w.account], permissions=['read', 'send'])
+        preview = s.preview_message(sender, w.account, chat_id, 'Synthetic hello')
+        assert preview['chat_id'] == chat_id and preview.get('preview_digest')
+
+
 def test_history_gap_does_not_mark_connection_or_live_capture_failed(wa):
     w,s,_=wa
     w.state.phase('connection','connected','provider_ready')

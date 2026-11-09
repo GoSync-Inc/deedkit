@@ -81,6 +81,118 @@ def test_failed_discovery_saves_partial_batches_and_its_code_outlives_the_histor
     assert status['detail']['next_action']=='wait_for_retry'
 
 
+T0=datetime(2026,11,9,1,0,tzinfo=timezone.utc)
+T1=datetime(2026,11,9,1,5,tzinfo=timezone.utc)
+
+
+def refresh(s,key,**args):
+    return {row['account']:row for row in s.list_chats(key,**args)['catalog_refresh']}
+
+
+def at(value):
+    return None if value is None else datetime.fromisoformat(value.replace('Z','+00:00'))
+
+
+def set_health(s,account,started,completed,limited=False):
+    with s.pool.connection() as c:
+        c.execute('''INSERT INTO collector_health(account,discovery_started_at,discovery_completed_at,discovery_limited)
+            VALUES(%s,%s,%s,%s) ON CONFLICT(account) DO UPDATE SET discovery_started_at=excluded.discovery_started_at,
+            discovery_completed_at=excluded.discovery_completed_at,discovery_limited=excluded.discovery_limited''',
+            (account,started,completed,limited))
+
+
+# spec: ANYM-845
+@pytest.mark.parametrize('started,completed,limited,state',[
+    (None,None,False,'never'),
+    (T0,None,False,'incomplete'),
+    (T1,T0,True,'incomplete'),
+    (T0,T1,True,'limited'),
+    (T0,T1,False,'complete'),
+],ids=['never','first_pass_running_or_failed','later_pass_running_or_failed','limited','complete'])
+def test_list_chats_names_each_accounts_last_catalog_refresh_and_its_state(worker,started,completed,limited,state):
+    w,s,key=worker
+    set_health(s,w.account,started,completed,limited)
+    row=refresh(s,key)[w.account]
+    assert set(row)=={'account','last_started_at','last_completed_at','limited','interval_s','state'}
+    assert row['state']==state and row['interval_s']==900 and row['limited'] is limited
+    assert (at(row['last_started_at']),at(row['last_completed_at']))==(started,completed)
+    assert 'catalog_refresh' not in s.list_chats(key,include_coverage=False)
+
+
+# spec: ANYM-845
+def test_a_first_discovery_pass_that_fails_before_any_completion_is_incomplete_with_no_completed_time(worker):
+    from telethon import errors
+    from messaging_service.telegram_collector import DiscoveryFailed
+    w,s,key=worker
+    async def failing(limit):
+        yield [('100','user','First','private')]
+        raise DiscoveryFailed(errors.RpcCallFailError(None))
+    w.provider.dialog_batches=failing
+    asyncio.run(w.sync_once())
+    row=refresh(s,key)[w.account]
+    assert row['state']=='incomplete' and row['last_started_at'] and row['last_completed_at'] is None
+    with s.pool.connection() as c:
+        status=get_sync_status(c,{'accounts':[w.account],'chat_ids':None})['sources'][0]
+    assert status['detail_code']=='discovery_provider_error'
+
+
+# spec: ANYM-845
+def test_a_failed_pass_after_a_good_one_is_incomplete_and_keeps_the_good_completed_time(worker):
+    import time
+    from telethon import errors
+    from messaging_service.telegram_collector import DiscoveryFailed
+    w,s,key=worker
+    async def first(limit):
+        yield [('100','user','First','private')]
+    w.provider.dialog_batches=first
+    asyncio.run(w.sync_once())
+    good=refresh(s,key)[w.account]
+    assert good['state']=='complete' and good['last_completed_at']
+    # The interval it reports is the one the collector schedules the next pass with.
+    assert abs(w._next_discovery-time.monotonic()-good['interval_s'])<60
+    async def failing(limit):
+        yield [('300','user','Third','private')]
+        raise DiscoveryFailed(errors.RpcCallFailError(None))
+    w.provider.dialog_batches=failing;w._next_discovery=0
+    asyncio.run(w.sync_once())
+    row=refresh(s,key)[w.account]
+    assert row['state']=='incomplete' and row['last_completed_at']==good['last_completed_at']
+    assert at(row['last_started_at'])>at(row['last_completed_at'])
+
+
+# spec: ANYM-845
+def test_catalog_refresh_covers_every_account_in_scope_and_only_those(worker):
+    w,s,_=worker
+    w.archive.register('wa-refresh','whatsapp','Synthetic WhatsApp',discover=True)
+    w.archive.register('tg-outside','telegram','Synthetic outside',discover=True)
+    set_health(s,w.account,T0,T1)
+    set_health(s,'tg-outside',T0,T1)
+    key=s.issue_key('refresh-two',[w.account,'wa-refresh'])
+    both=refresh(s,key,accounts=[w.account,'wa-refresh'])
+    assert set(both)=={w.account,'wa-refresh'} and set(refresh(s,key))==set(both)
+    assert both[w.account]['state']=='complete'
+    # WhatsApp runs no dialog discovery pass.
+    assert both['wa-refresh']=={'account':'wa-refresh','last_started_at':None,'last_completed_at':None,
+                                'limited':None,'interval_s':None,'state':'not_applicable'}
+    assert set(refresh(s,key,accounts=['wa-refresh']))=={'wa-refresh'}
+
+
+# spec: ANYM-845
+def test_a_chat_scoped_key_sees_its_own_accounts_refresh_and_no_chat(worker):
+    import json
+    w,s,_=worker
+    asyncio.run(w.sync_once())
+    w.archive.register('tg-outside','telegram','Synthetic outside',discover=True)
+    set_health(s,'tg-outside',T0,T1)
+    chat=stable_id('chat',w.account,'100')
+    scoped=s.issue_key('refresh-scoped',[w.account],chats=[chat])
+    result=s.list_chats(scoped)
+    assert [row['account'] for row in result['catalog_refresh']]==[w.account]
+    assert result['catalog_refresh'][0]['state']=='complete'
+    text=json.dumps(result['catalog_refresh'])
+    assert chat not in text and '"100"' not in text and 'tg-outside' not in text
+
+
 def test_persisted_cooldown_is_monotonic_and_survives_state_recreation(worker):
     w,s,_=worker
     w.state.defer(300)
