@@ -538,6 +538,53 @@ def test_fresh_voice_is_selected_before_old_backlog(configured):
     w=make();row,_=w.claim();assert row['attachment']=='fresh';assert w.finish(row,normalize_result({'text':'new'}))
 
 
+def age(s,message,interval):
+    with s.pool.connection() as c:
+        c.execute('UPDATE messages SET sent_at=clock_timestamp()-%s::interval WHERE id=%s',(interval,message))
+
+
+# spec: ANYM-69
+@pytest.mark.parametrize('limit',['max_jobs_per_day','profile_max_jobs_per_day','account_max_jobs_per_day'])
+def test_old_backlog_leaves_a_daily_reserve_for_fresh_images(configured,tmp_path,limit):
+    """Prod 11-08: the image backlog spent the whole daily cap by 15:00 UTC, so images sent later waited for midnight.
+    Old work stops at backlog_share of every daily cap; a fresh image may still use the rest."""
+    s,make,_=configured
+    for n in range(4):add_file(s,f'old-{n}','demo-tg-1',mime='image/png')
+    add_file(s,'fresh-image','demo-tg-2',mime='image/png')
+    age(s,'demo-tg-1','1 year');age(s,'demo-tg-2','1 hour')
+    cap={'max_jobs_per_day':4,'profile_max_jobs_per_day':{'image':4},'account_max_jobs_per_day':{'telegram-demo':4}}[limit]
+    w=make({'image':cloud_profile(tmp_path)},backlog_share=0.5,**{limit:cap})
+    with s.pool.connection() as c:c.execute("UPDATE attachment_enrichment SET next_due=clock_timestamp()+interval '1 hour' WHERE attachment='fresh-image'")
+    for _ in range(2):
+        row,_=w.claim();assert row['attachment'].startswith('old-');assert w.finish(row,normalize_result({'title':'old'}))
+    assert w.claim() is None and not w.due()  # the rest of the day is held for fresh work
+    with s.pool.connection() as c:c.execute("UPDATE attachment_enrichment SET next_due=clock_timestamp() WHERE attachment='fresh-image'")
+    assert w.due();row,_=w.claim();assert row['attachment']=='fresh-image'
+    assert w.finish(row,normalize_result({'title':'fresh'}))
+
+
+# spec: ANYM-69
+def test_backlog_share_one_keeps_the_whole_cap_for_old_work(configured,tmp_path):
+    s,make,_=configured
+    for n in range(3):add_file(s,f'old-{n}','demo-tg-1',mime='image/png')
+    age(s,'demo-tg-1','1 year')
+    w=make({'image':cloud_profile(tmp_path)},backlog_share=1.0,max_jobs_per_day=2)
+    for _ in range(2):
+        row,_=w.claim();assert w.finish(row,normalize_result({'title':'old'}))
+    assert w.claim() is None
+
+
+def test_configuration_backlog_share_is_a_fraction(tmp_path):
+    path=tmp_path/'config.json'
+    base={'enabled':True,'accounts':['fixture'],'profiles':{'audio':{'provider':'faster_whisper','model':str(tmp_path)}}}
+    for value in (0,0.7,1):
+        path.write_text(json.dumps({**base,'backlog_share':value}));path.chmod(0o600)
+        assert configuration(path)['backlog_share']==value
+    for value in (-0.1,1.5,True,'0.5',None):
+        path.write_text(json.dumps({**base,'backlog_share':value}));path.chmod(0o600)
+        with pytest.raises(ValueError,match='invalid_enrichment_budget'):configuration(path)
+
+
 def test_worker_passes_inherited_fence_into_isolated_process(tmp_path,monkeypatch):
     import messaging_service.enrichment as module
     data=b'synthetic';digest=hashlib.sha256(data).hexdigest();(tmp_path/digest).write_bytes(data)

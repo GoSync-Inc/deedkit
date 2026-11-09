@@ -30,7 +30,7 @@ from .inference_confinement import ConfinementLost
 def configuration(path):
     raw=json.loads(private_text(path,65536))
     if not isinstance(raw,dict) or set(raw)-{'enabled','profiles','max_jobs_per_day','accounts',
-            'profile_max_jobs_per_day','account_max_jobs_per_day','confinement_blocked'}:
+            'profile_max_jobs_per_day','account_max_jobs_per_day','backlog_share','confinement_blocked'}:
         raise ValueError('invalid_enrichment_config')
     if raw.get('enabled') is not True:raise ValueError('enrichment_disabled')
     profiles=raw.get('profiles')
@@ -46,6 +46,8 @@ def configuration(path):
         if (not isinstance(limits,dict) or set(limits)-set(allowed)
                 or any(type(value) is not int or not 1<=value<=10000 for value in limits.values())):
             raise ValueError('invalid_enrichment_budget')
+    share=raw.get('backlog_share',BACKLOG_SHARE)
+    if type(share) not in (int,float) or not 0<=share<=1:raise ValueError('invalid_enrichment_budget')
     if 'confinement_blocked' in raw:inference_confinement.parse_targets(raw['confinement_blocked'])
     return {**raw,'max_jobs_per_day':maximum,'profiles':{k:validate_profile(v,k) for k,v in profiles.items()}}
 
@@ -111,6 +113,10 @@ IDLE_SECONDS=10
 LANE_PROBE_SECONDS=1
 LANE_FULL_PROBE_SECONDS=10
 LANE_JOIN_SECONDS=REQUEUE_SECONDS+15
+# Old work (not fresh: see _candidate_queries) may spend only this share of each daily cap (the shared one, the kind's
+# and the account's); fresh work may spend the rest. Prod 11-06..08: the image backlog spent the whole cap of 1,500 by
+# mid-afternoon every day, and images sent later waited for midnight UTC. Config `backlog_share`; 1 = the old behaviour.
+BACKLOG_SHARE=0.7
 DB_TRANSIENT=(psycopg.errors.QueryCanceled,psycopg.errors.LockNotAvailable,psycopg.errors.DeadlockDetected,
     psycopg.errors.SerializationFailure,psycopg.errors.AdminShutdown,psycopg.errors.CrashShutdown,
     psycopg.errors.CannotConnectNow,psycopg.errors.IdleSessionTimeout,psycopg.errors.TooManyConnections,
@@ -292,15 +298,21 @@ class EnrichmentWorker:
         from .file_lifecycle import PROCESSABLE_ORIGINAL
         account_used={r['account']:r['n'] for r in c.execute('''SELECT account,sum(attempts) n
             FROM processing_budget WHERE day=current_date GROUP BY account''').fetchall()}
+        share=self.config.get('backlog_share',BACKLOG_SHARE)
+        used_total=c.execute('SELECT coalesce(max(attempts),0) AS n FROM enrichment_budget WHERE day=current_date').fetchone()['n']
+        account_cap=lambda account:self.config.get('account_max_jobs_per_day',{}).get(account,10000)
         for kind,profile in self.config['profiles'].items():
             if kind not in self.kinds:continue
             used_profile=c.execute('''SELECT coalesce(sum(attempts),0) n FROM processing_budget
                 WHERE day=current_date AND kind=%s''',(kind,)).fetchone()['n']
-            if used_profile>=self.config.get('profile_max_jobs_per_day',{}).get(kind,10000):continue
+            profile_cap=self.config.get('profile_max_jobs_per_day',{}).get(kind,10000)
+            if used_profile>=profile_cap:continue
             ph=profile_hash(profile)
-            eligible=[account for account in self.config['accounts'] if account_used.get(account,0)<
-                self.config.get('account_max_jobs_per_day',{}).get(account,10000)]
+            eligible=[account for account in self.config['accounts'] if account_used.get(account,0)<account_cap(account)]
             if not eligible:continue
+            # Old work only below its share of all three caps; an empty list keeps this kind to fresh work.
+            backlog=[account for account in eligible if account_used.get(account,0)<share*account_cap(account)] if (
+                used_profile<share*profile_cap and used_total<share*self.config['max_jobs_per_day']) else []
             condition={'audio':"(a.mime LIKE 'audio/%%' OR a.mime='application/ogg')",'image':"a.mime LIKE 'image/%%'",
                 'document':"a.mime NOT LIKE 'audio/%%' AND a.mime<>'application/ogg' AND a.mime NOT LIKE 'image/%%' AND f.state='ready' AND f.source_revision=m.revision AND f.source_digest=a.digest AND length(f.text_content)>0"}[kind]
             # A note downloaded on request today is as fresh as one sent today (ANYM-455).
@@ -315,12 +327,12 @@ class EnrichmentWorker:
                 LEFT JOIN attachment_text f ON f.attachment=a.id'''+residency+'''
                 LEFT JOIN processing_control pc ON pc.account=m.account AND pc.kind=%s AND pc.profile_hash=%s
                 WHERE '''+PROCESSABLE_ORIGINAL+''' AND NOT '''+withheld+''' AND (pc.pause_reason IS NULL OR pc.paused_until<=clock_timestamp()) AND a.active AND NOT m.deleted AND e.source_digest=a.digest AND e.source_revision=m.revision
-                AND m.account=ANY(%s) AND '''+condition+''' AND e.next_due<=clock_timestamp()
+                AND m.account=ANY(%s) AND (('''+fresh+''') OR m.account=ANY(%s)) AND '''+condition+''' AND e.next_due<=clock_timestamp()
                 AND ((e.state IN ('unconfigured','queued','failed') AND (e.attempts<3 OR e.profile_hash IS DISTINCT FROM %s)
                         AND NOT (e.state='failed' AND coalesce(e.error_code,'')=ANY(%s) AND e.profile_hash IS NOT DISTINCT FROM %s))
                     OR (e.state='leased' AND e.lease_until<clock_timestamp() AND e.attempts<3)
                     OR (e.state='unsupported' AND e.profile_hash IS DISTINCT FROM %s))
-                ''',(kind,ph,eligible,ph,list(FINAL_LIMIT_CODES),ph,ph)
+                ''',(kind,ph,eligible,backlog,ph,list(FINAL_LIMIT_CODES),ph,ph)
 
     def ready_mark(self):
         """ANYM-838: the newest attachment.ready event id, the usual sign that a new file may be due."""
