@@ -694,8 +694,8 @@ def register_conversation_tools(mcp, call, read):
                    can_post: StrictBool | None=None,awaiting_their_reply: StrictBool=False,
                    min_wait_hours: StrictInt | None=None,
                    courtesies: Literal['include','exclude','only']='include') -> dict[str, Any]:
-        """List permitted chats. order: activity (default) or last_activity_desc = recent first; id = stable catalogue traversal. query also matches a channel @username. account/accounts: each account's source status and last ingest, and catalog_refresh; a new empty group shows after the next pass. No provider read changes.
-        awaiting_reply: private incoming, excluding known bots, or explicit group owner mention/reply; heuristic, not obligation. Attention expires after awaiting_reply_days (0 = no age limit) from the attention message time; group evidence survives others' chatter and clears after owner writes. priority requires awaiting_reply=true; score/reasons are transparent heuristics (an owner group mention without a question mark scores owner_request; detail=full adds awaiting_reply_priority_components). Private-only: chat_types=['private']. A due snooze returns with snoozed_until and snooze_due.
+        """List permitted chats. order: activity (default) or last_activity_desc = recent first; id = stable catalogue traversal. query also matches a channel @username. account/accounts: each account's source status and last ingest; catalog_refresh; new empty groups wait for the next pass. No provider read changes.
+        awaiting_reply: private incoming, excluding known bots, or explicit group owner mention/reply; heuristic, not obligation. Attention expires after awaiting_reply_days (0 = no age limit) from the attention message time; group evidence survives others' chatter and clears after owner writes. priority requires awaiting_reply=true; score/reasons are transparent heuristics (an owner group mention without a question mark scores owner_request; detail=full adds awaiting_reply_priority_components). chat_types=['private']. A due snooze returns with snoozed_until and snooze_due.
         courtesies=exclude (excluded_courtesies_total) hides thanks/ok/sticker ends; review courtesies=only once.
         Compact rows omit values the row fixes (rows without type omit nothing); an absent field means the value below.
         last_turn: not_applicable on groups, and on channel and self_chat rows without suggested_action;
@@ -708,8 +708,8 @@ def register_conversation_tools(mcp, call, read):
         Without conversation.basis beside a hint, the hint's confidence, else its basis, gives the reason.
         next_step: provider_head_stale, provider_head_not_verified, history_has_gaps, message_version_conflict -> answer_with_caveat.
         next_step: ambiguous_message_order, ambiguous_attention_reply_order, head_candidates_truncated -> answer_with_caveat.
-        next_step: message_revision_changed_during_read -> reread_now; rate_limited, provider_temporarily_unavailable -> wait_for_provider_cooldown.
-        next_step: provider_unavailable, provider_chat_error -> check_provider_access; no_archived_messages -> wait_for_history.
+        next_step: message_revision_changed_during_read -> reread_now. next_step: rate_limited, provider_temporarily_unavailable -> wait_for_provider_cooldown.
+        next_step: provider_unavailable, provider_chat_error -> check_provider_access. next_step: no_archived_messages -> wait_for_history.
         next_step: unclassified_latest_message, chat_type_unknown, any other code -> get_context.
         A known head conflict (Telegram only) keeps the row's action; caveat: known_conflicts. retry_after_s: seconds left of a rate limit. catchup (WhatsApp): moving, queued, stalled or unknown.
         Compact rows omit an unknown my_role.
