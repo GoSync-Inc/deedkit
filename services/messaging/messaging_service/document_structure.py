@@ -145,24 +145,29 @@ class StructureWork:
                 +ineligible_sql(recognition_withheld(c),PROCESSABLE_ORIGINAL)+' IS NULL')
 
     def sweep(self):
-        """Lock-free reads, then bounded writes. A purge that removes a file between the read and the INSERT makes the
-        INSERT fail its foreign key: nothing is written and the next sweep reads again."""
+        """Lock-free reads, then bounded writes, each statement its own transaction: no sweep holds a structure row
+        while it waits for an attachment_text row (the INSERT's foreign key check), so it cannot deadlock with a purge,
+        whose DELETE cascades from attachment_text to these rows. A purge that removes a file between the read and the
+        INSERT makes the INSERT fail its foreign key: nothing is written, and step() pauses structure work."""
         with self.worker.connection() as c:
             # A lease that passed at the last attempt ends final, so no row stays `leased` forever.
             c.execute('''UPDATE attachment_structure SET state='failed',error_code='lease_expired',lease_token=NULL,
                 lease_until=NULL,updated_at=clock_timestamp()
                 WHERE state='leased' AND lease_until<clock_timestamp() AND attempts>=%s''',(ATTEMPTS,))
+        with self.worker.connection() as c:
             # A changed original starts over.
             c.execute('''UPDATE attachment_structure s SET source_digest=a.digest,state='queued',markdown='',truncated=false,
                 engine='{}',metadata='{}',error_code=NULL,attempts=0,lease_token=NULL,lease_until=NULL,
                 next_due=clock_timestamp(),indexed_at=NULL,updated_at=clock_timestamp()
                 FROM attachments a WHERE a.id=s.attachment AND a.digest<>s.source_digest''')
+        with self.worker.connection() as c:
             c.execute('''INSERT INTO attachment_structure(attachment,source_digest,next_due,updated_at)
                 SELECT a.id,a.digest,clock_timestamp(),clock_timestamp() FROM attachment_text f
                 JOIN attachments a ON a.id=f.attachment JOIN messages m ON m.id=a.message
                 WHERE NOT EXISTS(SELECT FROM attachment_structure s WHERE s.attachment=a.id) AND '''+self.eligible(c)+'''
                 ORDER BY m.sent_at DESC,a.id LIMIT %s ON CONFLICT(attachment) DO NOTHING''',
                 (self.accounts,DISCOVERY_LIMIT))
+        with self.worker.connection() as c:
             # Identical bytes already converted: the ready result is copied, with its engine; no request and no attempt.
             c.execute('''UPDATE attachment_structure s SET state='ready',markdown=t.markdown,truncated=t.truncated,
                 engine=t.engine,metadata=t.metadata,error_code=NULL,lease_token=NULL,lease_until=NULL,

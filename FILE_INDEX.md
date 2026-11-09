@@ -328,6 +328,37 @@ timeout behavior and exact coverage metadata under fixed CPU/RAM/page limits.
 Keep it opt-in unless measured quality justifies its additional model footprint.
 No private documents or production workloads were sent to an external service.
 
+Result (research doc-extract-11-09, owner 2026-11-09): on the synthetic set Docling kept 8 of 8 table rows where
+today's text keeps 0 of 8, so it runs beside today's path, never instead of it. ANYM-850 adds the conversion route on
+the owner's Mac mini (`POST /v1/documents/convert`, alias `document-structure`: CPU torch, pinned versions and model
+hashes, OCR off, no outbound network, one job of at most 120 s and 2.5 GB). ANYM-851 sends each PDF, DOCX and PPTX
+of the configured accounts there and stores the Markdown in `attachment_structure` (schema 76) next to today's
+text; the enricher-mini worker does it (ENRICHMENT.md, "Structured documents"). Today's extracted text, its search
+index, `search_files`, `text_excerpt` and the message excerpt are not read or written by this work, and search does
+not read the Markdown.
+
+`get_file_text content='structured'` reads it, paged like `extracted` (`offset`/`limit` in characters, at most
+8,000 a page, offset at most 1,000,000). A ready version gives `text`, `next_offset`, `source_spans` of kind `page`
+(offsets into the whole Markdown), `content_coverage` (`retained_chars`, `truncated`, `complete`, `pages`,
+`pages_with_text`, `tables`, `headings`), `provenance` (`content: structured`, `extractor: docling <version>`,
+`models`, `indexed_at`) and the untrusted-text `notice`. When `pages_with_text` is below `pages` (a mixed scan),
+`next_action` names `content='extracted'` for the OCR text of the other pages. A version that is not ready gives an
+empty `text`, `empty_reason` and `next_action` (always naming `content='extracted'`):
+
+| `empty_reason` | when |
+|---|---|
+| `structure_pending` | queued, converting, or the original changed |
+| `processing_paused` | the mini asked to wait (backpressure) |
+| `structure_failed` | with `failure_reason` and `retryable` (one retry an hour later; refusals are final) |
+| `structure_unsupported` | the mini read the file as no PDF, DOCX or PPTX |
+| `not_eligible` | `empty_reason_detail`: `scanned_pdf` (every page OCR: today's text is better), `page_limit` (over 100 pages), `size_limit` (over 32 MiB), `original_evicted` or `withheld` (both name `request_file_download`), `account_not_configured`, `text_failed` (today's text failed) |
+| `not_applicable` | not a PDF, DOCX or PPTX |
+| `processing_not_configured` | no worker serves the `structure` key |
+
+The default and `content='extracted'` reads of a PDF, DOCX or PPTX gain one field, `structured_text: {state,
+next_action}` (`state` is `ready` or one of the reasons above), so a PPTX's `unsupported_format` answer tells the agent
+to ask for `content='structured'`. Every other field is unchanged, and `content='enriched'` is unchanged.
+
 ## Schema 16: retained text and passages
 
 ### Version 0.9.5: current message captions

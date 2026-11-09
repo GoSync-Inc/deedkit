@@ -655,12 +655,19 @@ def get_file_text(store, c, p, attachment_id, offset=0, limit=4000, *, content=N
         # ANYM-851: a PDF, DOCX or PPTX says whether its structured version exists and how to get it (one additive
         # field); every other field stays as it was.
         from . import document_structure
-        state = document_structure.read_state(c, row['attachment_id'])
         if structured:
+            state = document_structure.read_state(c, row['attachment_id'])
             found = document_structure.read_text(c, row['attachment_id'], offset, limit) if state and state['state'] == 'ready' else None
             response = document_structure.structured_response(response, state, found, offset)
-        elif state is not None:
-            response['structured_text'] = {'state': state['state'], 'next_action': state['next_action']}
+        else:
+            # In a savepoint: a database without schema 76 (or any error here) leaves the read exactly as before.
+            try:
+                with c.transaction():
+                    state = document_structure.read_state(c, row['attachment_id'])
+            except psycopg.Error:
+                state = None
+            if state is not None:
+                response['structured_text'] = {'state': state['state'], 'next_action': state['next_action']}
     return serial({**response, **store.dataset(c, p)})
 
 

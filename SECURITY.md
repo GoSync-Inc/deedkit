@@ -52,7 +52,8 @@ hidden like any other header value. A request that may have reached the vendor i
 (SUBSCRIPTIONS.md, Vendor hosts).
 
 The inference service on the owner's Mac mini (`services/inference`, ANYM-682 to ANYM-688) processes
-audio, photos and document text locally. It binds only loopback; Tailscale Serve (never Funnel) is its
+audio, photos and document text locally, and converts PDF, DOCX and PPTX originals to Markdown (Docling, OCR off, no
+outbound network; ANYM-850, ANYM-851). It binds only loopback; Tailscale Serve (never Funnel) is its
 one tailnet entry on port 443, and the tailnet policy gets one additive rule that lets the production host
 reach it (access the policy already grants to other devices is not changed, so the effective reachability is
 whatever the policy and its recorded before and after matrices say). Each calling service has its own key;

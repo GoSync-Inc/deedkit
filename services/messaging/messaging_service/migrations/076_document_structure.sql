@@ -9,9 +9,9 @@
 -- enricher-mini worker's publication that the structure work is configured for an account (the processing kinds'
 -- CHECKs of 018 and 020 admit audio, image and document only), with a pause it set. A schema-75 runtime never names
 -- either table. Grants: enrichment_role.sql (the worker) and gateway_role.sql (reads). No column default calls a
--- function other than now() (the expand grammar).
+-- function other than now() (the expand grammar). IF NOT EXISTS keeps a rerun over a rewound ledger idempotent.
 SET LOCAL lock_timeout='2s';
-CREATE TABLE attachment_structure (
+CREATE TABLE IF NOT EXISTS attachment_structure (
  attachment text PRIMARY KEY REFERENCES attachment_text(attachment) ON DELETE CASCADE,
  source_digest text NOT NULL CHECK(source_digest ~ '^[a-f0-9]{64}$'),
  state text NOT NULL DEFAULT 'queued' CHECK(state IN ('queued','leased','ready','failed','unsupported')),
@@ -31,10 +31,10 @@ CREATE TABLE attachment_structure (
  CHECK(state<>'leased' OR (lease_token IS NOT NULL AND lease_until IS NOT NULL)),
  CHECK(state<>'ready' OR indexed_at IS NOT NULL)
 );
-CREATE INDEX attachment_structure_due ON attachment_structure(state,next_due);
-CREATE INDEX attachment_structure_day ON attachment_structure(attempt_day);
-CREATE INDEX attachment_structure_digest ON attachment_structure(source_digest);
-CREATE TABLE structure_profiles (
+CREATE INDEX IF NOT EXISTS attachment_structure_due ON attachment_structure(state,next_due);
+CREATE INDEX IF NOT EXISTS attachment_structure_day ON attachment_structure(attempt_day);
+CREATE INDEX IF NOT EXISTS attachment_structure_digest ON attachment_structure(source_digest);
+CREATE TABLE IF NOT EXISTS structure_profiles (
  account text PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
  provider text NOT NULL CHECK(provider ~ '^[a-z_]{1,32}$'),
  model text NOT NULL CHECK(model ~ '^[A-Za-z0-9_.:-]{1,128}$'),

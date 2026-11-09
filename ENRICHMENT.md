@@ -139,6 +139,48 @@ bytes it needs. The original always stays in the archive; the metadata says what
   oversized output ends the job with `invalid_image` and nothing is sent. The ffmpeg run takes a fixed list of image
   demuxers, `-protocol_whitelist file,pipe`, no stdin, the worker's time and file-size limits.
 
+## Structured documents (ANYM-851, schema 76)
+
+A top-level `structure` key in the enricher-mini config (not one of `profiles`) turns on Markdown versions of PDF,
+DOCX and PPTX files (FILE_INDEX.md, "Docling evaluation boundary"):
+
+```json
+"structure": {"provider": "deedkit_inference", "local_inference": true, "model": "document-structure",
+  "base_url": "https://<mini>.<tailnet>.ts.net/v1", "api_key_file": "/run/secrets/inference/inference.key",
+  "timeout_seconds": 150, "max_jobs_per_day": 1000}
+```
+
+`timeout_seconds` is at most 150 (the mini's alias allows 120), `max_jobs_per_day` defaults to 1000,
+`backpressure_seconds` to 120 and `memory_limit_mb` (the job's child) to 1024. Without the key nothing changes.
+
+- **What reaches the mini.** The digest-verified original of an eligible file (at most 32 MiB), sent by the job's
+  child under the child limits, as `document.pdf|docx|pptx` with the canonical type: no part of the chat's filename.
+  Eligible: today's text `ready` (PDF, DOCX) or `unsupported` (a PPTX by MIME or `.pptx` name), a PDF of at most
+  100 pages that is not scanned on every page (OCR is off in Docling, so today's OCR text is the better one), a
+  resident original that is not withheld (ANYM-805 on-request chats), an account in `accounts`. Markdown,
+  page spans, coverage and the engine's version and model revisions come back and are stored in
+  `attachment_structure`; the mini keeps nothing after the job.
+- **Lanes.** The main lane (image, document) also serves structure jobs and alternates when both are due, so a worker
+  has at most two requests at the mini (main and audio): the enricher key's `max_concurrent` 2
+  (docs/operations/inference-mini-setup.md), and a fresh voice note is never refused 429 because of this work.
+- **States.** Discovery inserts a `queued` row for each eligible file (identical bytes already converted are copied,
+  with their engine, and cost no request). A claim leases one due row (fresh files first). A 422 refusal
+  (`unsupported_format`, `page_limit`, `invalid_document`) is final; `engine_timeout`, `engine_failed`, an invalid
+  answer or a timed-out child counts one attempt and is due again an hour later, two attempts in all; a lease that
+  passes at the second attempt ends `failed` `lease_expired`. Backpressure (connection refused, 429, a 503
+  `queue_full`/`slot_busy`/`engine_unavailable`/..., a Tailscale 502/503/504, a 404 from a mini without the route)
+  costs no attempt: the row goes back to `queued` with the ANYM-685 cooldown and the lane pauses as long.
+- **Budget.** The cap counts attempts, not rows: each claim adds one to the row's `day_attempts` for today, and the
+  cap compares their sum; a backpressure deferral gives its attempt back. `processing_profiles`,
+  `processing_budget`, `processing_control` and `enrichment_budget` are not touched.
+- **Containment.** Any other error in a structure step, a database error included, marks the row if it can, pauses
+  structure work for 10 minutes and is logged by code (`structure_paused`); image, document and audio work go on.
+  Only a stop or a lost confinement ends the worker, as before; a stop requeues the job inside the stop grace. The
+  worker publishes `structure_profiles` (per account, with a pause) for the reads; a publication error is logged
+  (`structure_publication_failed`) and changes nothing else.
+- **Enable and undo.** Add the key to the prod enricher-mini config and restart the worker once (ANYM-685 apply in
+  docs/operations/production.md, with a copy of the file); undo: remove the key and restart.
+
 ## Retained descriptions and video (schema 34)
 
 `messaging_service.file_understanding` is a separate optional worker for a

@@ -389,6 +389,25 @@ def test_the_default_read_gains_only_structured_text_and_search_is_unchanged(see
     assert ids(search(s, a, 'Z-9999')) == [] and ids(search(s, a, 'Прайс')) == []
 
 
+# spec: ANYM-851
+def test_a_structure_lookup_error_leaves_the_default_read_as_it_was(seeded, monkeypatch):
+    import psycopg
+    from messaging_service import document_structure
+    from test_document_structure import add_document
+    s, a, _ = seeded
+    add_document(s, 'struct-isolated')
+    with monkeypatch.context() as patch:
+        patch.setattr(document_structure, 'read_state', lambda c, attachment: None)
+        before = text(s, a, 'struct-isolated')
+
+    def missing(c, attachment):  # a database before schema 76, or any error in the lookup
+        c.execute('SELECT * FROM attachment_structure_absent_table')
+    monkeypatch.setattr(document_structure, 'read_state', missing)
+    assert text(s, a, 'struct-isolated') == before
+    with pytest.raises(psycopg.errors.UndefinedTable):
+        text(s, a, 'struct-isolated', content='structured')
+
+
 def test_file_index_revision_digest_delete_and_inactive_invalidate_immediately(seeded):
     s, a, b = seeded
     add_file(s, 'file-stale', 'demo-tg-1', b'oldconfidential')
