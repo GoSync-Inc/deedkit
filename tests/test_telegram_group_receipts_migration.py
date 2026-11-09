@@ -27,11 +27,13 @@ VERSION = int(MIGRATION.name[:3])
 # Migration numbers may skip one another lane holds; PREVIOUS is the newest file before this one.
 FILES = sorted(int(p.name[:3]) for p in SOURCE.glob('migrations/[0-9][0-9][0-9]_*.sql'))
 PREVIOUS = max(v for v in FILES if v < VERSION)
+# A release from PREVIOUS applies this file and every later one (ANYM-851's 076 came after it).
+TARGET = FILES[-1]
 
 
 def batch(base):
     """How many files a release from `base` applies."""
-    return sum(base < v <= VERSION for v in FILES)
+    return sum(base < v <= TARGET for v in FILES)
 # The production schema the card names (N-1 is 70 or 71): a release from it applies 071 (outgoing_messages.menu_choice
 # with its CHECK and a gateway grant), 072 (an attachments index) and this file in one migrate-expand batch.
 DEPLOYED = 70
@@ -47,6 +49,16 @@ def at_schema(database, tmp_path):
     """`at_schema(version)`: a Store on a disposable database built with the migrations up to `version` only."""
     with ExitStack() as stack:
         yield lambda version: stack.enter_context(old_schema_store(database, tmp_path, version))
+
+
+@pytest.fixture(autouse=True)
+def enricher_role(database):
+    """A release from PREVIOUS also appends 076's enricher and gateway grants (ANYM-851); every real database has
+    both roles."""
+    with psycopg.connect(database.pool.conninfo, autocommit=True) as c:
+        for role in ('messaging_enricher', 'messaging_gateway'):
+            c.execute("DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='" + role + "') THEN "
+                      "CREATE ROLE " + role + " NOLOGIN; END IF; END $$")
 
 
 @pytest.fixture
@@ -67,7 +79,7 @@ def appended_roles(base):
 
 
 def release_plan(base):
-    return plan_for(SOURCE, base, VERSION, appended_roles(base))
+    return plan_for(SOURCE, base, TARGET, appended_roles(base))
 
 
 def gateway_role(dsn):
@@ -147,7 +159,7 @@ def test_the_migration_is_an_unattended_non_critical_check_swap_that_backup_and_
     parsed = rollout.statements(text)
     assert any(('word', 'valid') in s for s in parsed) and not any(('word', 'validate') in s for s in parsed)
     from messaging_service import backup, backup_r2_verifier
-    assert VERSION == RUNTIME_SCHEMA and VERSION in backup.SCHEMAS and VERSION in backup_r2_verifier.SCHEMAS
+    assert TARGET == RUNTIME_SCHEMA and VERSION in backup.SCHEMAS and VERSION in backup_r2_verifier.SCHEMAS
 
 
 # spec: ANYM-868
@@ -157,8 +169,8 @@ def test_the_widened_check_takes_group_aggregates_only_and_rewrites_no_row(at_sc
     assert constraints(dsn) == {'message_receipts_check': True}
     with psycopg.connect(dsn) as c:
         before = c.execute('SELECT md5(string_agg(m::text,\'\' ORDER BY id)) FROM message_receipts m').fetchone()[0]
-    assert store_module.migrate_expand(dsn, release_plan(PREVIOUS)) == {'schema_version': VERSION}
-    assert constraints(dsn) == {'message_receipts_source_check': False} and version(dsn) == (VERSION, 1)
+    assert store_module.migrate_expand(dsn, release_plan(PREVIOUS)) == {'schema_version': TARGET}
+    assert constraints(dsn) == {'message_receipts_source_check': False} and version(dsn) == (TARGET, batch(PREVIOUS))
     with psycopg.connect(dsn) as c:
         assert c.execute('SELECT md5(string_agg(m::text,\'\' ORDER BY id)) FROM message_receipts m').fetchone()[0] == before
         assert c.execute(OLD_INSERT, receipt('synthetic', '-1000000000100', 23, 'provider_aggregate')).fetchone()
@@ -174,10 +186,10 @@ def test_the_widened_check_takes_group_aggregates_only_and_rewrites_no_row(at_sc
 def test_a_rerun_over_a_rewound_ledger_is_idempotent(db):
     store, dsn = db
     with psycopg.connect(dsn) as c:
-        c.execute('DELETE FROM archive_migrations WHERE version=%s', (VERSION,))
+        c.execute('DELETE FROM archive_migrations WHERE version>%s', (PREVIOUS,))
         c.execute("UPDATE probe_metadata SET value=%s WHERE name='schema_version'", (str(PREVIOUS),))
     store.migrate()
-    assert constraints(dsn) == {'message_receipts_source_check': False} and version(dsn) == (VERSION, 1)
+    assert constraints(dsn) == {'message_receipts_source_check': False} and version(dsn) == (TARGET, batch(PREVIOUS))
     store.migrate()
     assert constraints(dsn) == {'message_receipts_source_check': False}
 
@@ -215,7 +227,7 @@ def test_the_swap_on_100k_receipts_commits_or_aborts_inside_the_runner_bounds(at
     gateway_role(dsn); seed(dsn); outgoing_row(store)
     before = batch_state(dsn, base)
     plan = release_plan(base)
-    assert ('gateway_role.sql' in appended_roles(base)) == (base < 71)  # 071's grant rides a release from 70
+    assert 'gateway_role.sql' in appended_roles(base)  # 071's grant rides a release from 70; 076's (ANYM-851) any
     holder = psycopg.connect(dsn)
     holder.execute('SELECT count(*) FROM message_receipts')  # an old-runtime reader holds ACCESS SHARE
     stop, log, inside, result = threading.Event(), [], {}, {}
@@ -244,7 +256,7 @@ def test_the_swap_on_100k_receipts_commits_or_aborts_inside_the_runner_bounds(at
     runner.join(30); time.sleep(0.5); stop.set()
     for s in sessions: s.join(30)
     started, ended = result['span']
-    assert result['out'] == ({'schema_version': VERSION} if code is None else code)
+    assert result['out'] == ({'schema_version': TARGET} if code is None else code)
     assert ended - started <= LOCK_S + TRANSACTION_S + 1
     # Every old-runtime statement finished without an error, and none waited past the runner's bounds: a statement
     # blocked behind the batch waits from its own start until the batch commits or aborts.
@@ -254,7 +266,7 @@ def test_the_swap_on_100k_receipts_commits_or_aborts_inside_the_runner_bounds(at
     assert blocked and all(end <= ended + 0.5 for _, end in blocked)
     assert {kind for kind, _, begin, _, _ in log if begin > ended} == {'reader', 'writer', 'outgoing', 'outgoing-writer'}
     assert before['constraints'] == {'message_receipts_check': True} and before['version'] == (base, 0)
-    applied = {'version': (VERSION, batch(base)), 'constraints': {'message_receipts_source_check': False},
+    applied = {'version': (TARGET, batch(base)), 'constraints': {'message_receipts_source_check': False},
                'menu_choice': 1, 'menu_grant': True if base < 71 else before['menu_grant'],
                'attachment_index': runtime_index}
     if code is None:
@@ -263,7 +275,7 @@ def test_the_swap_on_100k_receipts_commits_or_aborts_inside_the_runner_bounds(at
     else:
         # Nothing applied, from any file or grant of the batch; the next deploy retries the same batch.
         assert batch_state(dsn, base) == before
-        assert store_module.migrate_expand(dsn, plan) == {'schema_version': VERSION}
+        assert store_module.migrate_expand(dsn, plan) == {'schema_version': TARGET}
         assert batch_state(dsn, base) == applied
 
 
