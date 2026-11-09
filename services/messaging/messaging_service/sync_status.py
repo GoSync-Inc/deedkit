@@ -275,6 +275,13 @@ def _files(c, p, *, group_by_chat=False, tallies=None):
         item['extraction_truncated'] += row['extraction_truncated']
         item['enrichment_truncated'] += row['enrichment_truncated']
         coverage.add_row(tallies.setdefault(row['account'], coverage.empty_tally()), row)
+    # ANYM-816: operator recovery states of each permitted account, also one with no current media. Account-wide,
+    # so never for a chat-restricted principal or a per-chat view; None when this database cannot read them.
+    if not group_by_chat and p['chat_ids'] is None:
+        from .media_recovery import counts as recovery_counts
+        recovery=recovery_counts(c,list(p['accounts']))
+        for account in p['accounts']:
+            files.setdefault(account,empty_files())['download_recovery']=None if recovery is None else recovery[account]
     for account in downloads:
         item=files.setdefault(account,empty_files())
         item['current_files']=sum(n for state,n in downloads[account].items() if state!='superseded')

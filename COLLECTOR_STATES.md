@@ -372,6 +372,13 @@ key (MEDIA_STORAGE.md, failed WhatsApp files). It writes nothing and asks no pro
 `invalid_account`, `collector_config_mismatch` or `media_inventory_failed` (exit 1) when it
 cannot answer.
 
+`--media-recover` (ANYM-816; `--code`, `--sent-before`, `--limit` up to 50, `--dry-run`) queues
+at most 50 failed WhatsApp files of the account for one more try through the collector, at the
+lowest claim priority, and prints its counts (MEDIA_STORAGE.md, operator recovery). It sends
+nothing and asks no provider itself; errors: `invalid_account`, `invalid_code`,
+`invalid_sent_before`, `invalid_limit`, `account_not_found`, `not_whatsapp_account`,
+`media_recover_failed` (exit 1).
+
 `last_commit` distinguishes `captured_at` from provider message time and gives
 `committed_by`, an upper bound recorded after the archive transaction returns.
 `capture_to_commit_seconds` includes durable queue delay and replay downtime;

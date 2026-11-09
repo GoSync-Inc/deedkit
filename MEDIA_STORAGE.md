@@ -540,7 +540,7 @@ is `deferred`). The wake is the SQL function `wake_media_job` (migration 066; th
 holds only EXECUTE on it, not UPDATE on `next_due`); before 066 the request is still recorded
 and the job keeps waiting. The same migration raises the cap of `queue_managed_original` to 8. Nothing re-queues a `failed` job,
 and a request does not (above); rows that failed under the old five-attempt budget stay
-`failed` until the operator recovery of DK-05. The code stored on a job is the last failure's.
+`failed` until the operator recovery below (ANYM-816). The code stored on a job is the last failure's.
 `network_error` is the catch-all for a failure that has no typed code: a lost adapter, a reply
 timeout and an unclassified error. A Telegram file reference that expired during the download
 is `media_reference_expired`: every attempt reads the message again, so it is retried twice (30 s, then
@@ -595,6 +595,41 @@ browser-engine account, or when the lookup cannot answer, every job reads `media
 (`media_key_basis: unavailable`); a journal row the lookup could not read in time also counts as
 unknown, never as none. A config of another account is refused (`collector_config_mismatch`). A message captured only by the browser engine has no key in the
 native journal, so neither a native retry nor a phone re-upload can bring it back.
+
+#### Operator recovery of failed WhatsApp files (ANYM-816, schema 69)
+
+An operator can give failed WhatsApp originals of one account one more try through the
+collector, in batches of at most 50:
+
+```sh
+python -m messaging_service.collector_control --dsn-file /run/secrets/owner.dsn \
+  --account example-whatsapp --media-recover [--code media_network_error ...] \
+  [--sent-before 2026-10-01] [--limit 50] [--dry-run]
+```
+
+It picks the account's failed jobs (as the inventory counts them; `--code` repeats,
+`--sent-before` is a UTC date), newest message first, and prints one JSON object: `matching`,
+`bytes` (`bytes_unknown` jobs have no size), `queued`, `refused` by reason and the `run_id`.
+`--dry-run` prints the same counts and writes nothing. A run holds the account's archive lock
+and checks each job in one transaction; two runs serialize. A job that fails a check is
+recorded `refused` with its reason: `message_deleted`, `collection_disabled`,
+`chat_not_collected`, `on_request_chat` (every group or channel chat without an active
+subscription, whatever its request history: nobody asked for it, ANYM-805; these stay failed and
+counted), `storage_paused` (any job waits on storage admission), `lease_running`. A rerun checks
+refused jobs again and never touches a queued, running or final one.
+
+The state lives in its own table `media_recovery` (migration 069): the job's recorded code
+(ANYM-815) and its eight-attempt cap stay as they are, and no agent request is created. The
+collector claims a recovery job only when no other job of the account is claimable, so live,
+windowed and requested downloads go first; the history bound and the prefetch window do not
+apply, the collection policy and the on-request rule are checked again at each claim. Each job
+has 3 attempts on the retry schedule above (a storage pause gives its attempt back) and ends
+with one outcome: `recovered` (stored and recognized like any personal-chat file; the job leaves
+`failed`), `provider_unavailable` (the CDN answered 403, 404 or 410), `still_failing` (budget
+spent, a permanent code, or the last lease expired) or `refused` (`job_changed` when an edit
+replaced the file meanwhile). A collector restart resumes from the table. Account media status
+(`operations.media.recovery`) counts `queued`, `running`, `recovered`, `provider_unavailable`,
+`still_failing` and `refused`. A phone re-upload (ANYM-817) is not part of it.
 
 `outside_history_bounds` is deliberate (ANYM-477), not a failure. Such a job is
 `queued`, is never claimed by the collector alone, does not set `needs_attention`

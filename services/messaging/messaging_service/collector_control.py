@@ -1,4 +1,5 @@
-"""Owner-only resume of a connection block, clear of a history-gap flag and a read-only failed-media inventory.
+"""Owner-only resume of a connection block, clear of a history-gap flag, a read-only failed-media inventory and
+an operator recovery of failed WhatsApp originals (ANYM-816).
 
 No pairing or message sends."""
 import argparse
@@ -74,6 +75,28 @@ def run_media_inventory(dsn_file,account,config):
     print(json.dumps(result,separators=(',',':'),sort_keys=True))
 
 
+RECOVER_ERRORS=('invalid_account','invalid_code','invalid_sent_before','invalid_limit','account_not_found',
+    'not_whatsapp_account')
+
+
+def run_media_recover(dsn_file,account,codes,sent_before,limit,dry_run):
+    """ANYM-816: queue at most `limit` failed jobs of one WhatsApp account for one recovery, or count them (dry run)."""
+    from .media_recovery import parse_date,recover
+    try:
+        before=parse_date(sent_before) if sent_before is not None else None
+        with psycopg.connect(private_text(dsn_file).strip(),row_factory=dict_row,connect_timeout=10) as c:
+            result=recover(c,account,codes=codes,sent_before=before,limit=limit,dry_run=dry_run)
+            if dry_run:c.rollback()
+    except ValueError as e:
+        print(str(e) if str(e) in RECOVER_ERRORS else 'media_recover_failed')
+        raise SystemExit(1) from None
+    except (OSError,psycopg.Error):
+        print('media_recover_failed')
+        raise SystemExit(1) from None
+    # After the connection context: only a committed run reports its queue.
+    print(json.dumps(result,separators=(',',':'),sort_keys=True))
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--dsn-file',type=Path,required=True)
@@ -82,9 +105,18 @@ def main():
     action.add_argument('--resume',action='store_true')
     action.add_argument('--clear-gap',metavar='CHAT')
     action.add_argument('--media-inventory',action='store_true')
+    action.add_argument('--media-recover',action='store_true',
+        help='queue failed WhatsApp originals for one recovery through the collector (ANYM-816)')
     parser.add_argument('--collector-config',type=Path,
         help='the account\'s native WhatsApp collector config: adds media_key held/none from its capture journal')
+    parser.add_argument('--code',action='append',help='--media-recover: only jobs with this recorded code (repeatable)')
+    parser.add_argument('--sent-before',metavar='YYYY-MM-DD',help='--media-recover: only messages sent before this UTC date')
+    parser.add_argument('--limit',type=int,default=50,help='--media-recover: at most this many jobs (1-50)')
+    parser.add_argument('--dry-run',action='store_true',help='--media-recover: count the matching jobs, change nothing')
     args=parser.parse_args()
+    if args.media_recover:
+        run_media_recover(args.dsn_file,args.account,args.code,args.sent_before,args.limit,args.dry_run)
+        return
     if args.media_inventory:
         run_media_inventory(args.dsn_file,args.account,args.collector_config)
         return

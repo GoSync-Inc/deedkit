@@ -120,3 +120,5 @@ GRANT UPDATE(matched_through,acked_through,gap,blocked_reason,rollback_hold) ON 
 GRANT SELECT ON conflict_reevaluations TO messaging_gateway;
 -- Schema 58 (ANYM-575): the module router's open gaps mark a source's coverage incomplete in get_subscription.
 GRANT SELECT ON module_router_gaps TO messaging_gateway;
+-- Schema 69 (ANYM-816): account media status counts recovery states.
+GRANT SELECT ON media_recovery TO messaging_gateway;

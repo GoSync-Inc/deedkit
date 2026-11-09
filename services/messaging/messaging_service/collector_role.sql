@@ -60,3 +60,6 @@ GRANT SELECT,INSERT,UPDATE(cursor,watermark,done_at,last_error) ON conflict_reev
 -- (media_policy.ON_REQUEST_CHATS); these columns only.
 GRANT SELECT(subscription,account,chat) ON subscription_sources TO messaging_collector;
 GRANT SELECT(id,state,expires_at,closed_at) ON subscriptions TO messaging_collector;
+-- Schema 69 (ANYM-816): an operator-queued recovery of a failed original; the collector claims it and records the
+-- outcome. It never inserts a row (the operator command does) and never changes a row's job, account or run.
+GRANT SELECT,UPDATE(state,attempts,next_due,lease_until,refusal_reason,last_code,updated_at) ON media_recovery TO messaging_collector;
