@@ -19,7 +19,7 @@
     "services/messaging/messaging_service/backup_r2_receiver.py": {"lines": 1593, "longest_function": 69},
     "services/messaging/messaging_service/backup_r2_verifier.py": {"lines": 1375, "longest_function": 56},
     "services/messaging/messaging_service/backup_runner.py": {"lines": 1674, "longest_function": 95},
-    "services/messaging/messaging_service/chat_queries.py": {"lines": 992, "longest_function": 526},
+    "services/messaging/messaging_service/chat_queries.py": {"lines": 1019, "longest_function": 411},
     "services/messaging/messaging_service/delivery_endpoints.py": {"lines": 1404, "longest_function": 79},
     "services/messaging/messaging_service/file_index.py": {"lines": 1020, "longest_function": 194},
     "services/messaging/messaging_service/outgoing.py": {"lines": 1018, "longest_function": 100},

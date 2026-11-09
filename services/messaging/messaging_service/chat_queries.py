@@ -455,6 +455,148 @@ def _decorate_peers(c,items,listed,p,private,selected_chat,selves,titles):
             row.update(title=alias['title'],title_basis='alias_chat')
 
 
+def _query_filter(c,query,hidden,roles_ready):
+    """The `query` clause and its arguments: the chat title, a private chat's peer name, a channel's @username."""
+    pattern='%'+query.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
+    match="(c.title ILIKE %s ESCAPE E'\\\\' OR "+raw_title_sql()+" AND "+peer_name_sql()+" ILIKE %s ESCAPE E'\\\\'"
+    matched=[pattern,pattern];name=query.removeprefix('@')
+    if roles_ready and name:
+        # A channel's @username, with or without the @ (ANYM-533).
+        match+=" OR c.username ILIKE %s ESCAPE E'\\\\'"
+        matched.append('%'+name.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%')
+    match+=')'
+    # A listed row also matches by its hidden alias chat's title.
+    found=[hidden[r['id']] for r in c.execute('SELECT c.id FROM chats c WHERE c.id=ANY(%s) AND '+match,
+        [list(hidden),*matched])] if hidden else []
+    return '('+match+(' OR c.id=ANY(%s)' if found else '')+')',[*matched,*([found] if found else [])]
+
+
+def _rank_sql():
+    """(waited, components, score) over the attention, own_last and score_clock joins of the queue statement."""
+    # Waiting points grow with the square root of hours (1h=1, 1d=4, 4d=9) up to
+    # 20 at about 17 days, so recent requests differ before a day has passed.
+    waited="greatest(0,extract(epoch FROM (score_clock.at-attention.sent_at))/3600)"
+    waiting="least(20,floor(sqrt("+waited+"))::integer)"
+    # Each component is a CASE yielding its points or NULL; the score is their sum and the reasons their keys.
+    own_sender="coalesce((score_clock.owners->(a.platform||'|'||attention.sender))-c.account<>'[]'::jsonb,false)"
+    person_mention=f"c.chat_type='group' AND attention.basis='owner_mention' AND NOT coalesce(attention.bot,false) AND NOT coalesce(attention.business,false) AND NOT {own_sender}"
+    def demotion(code,condition):return code,f'CASE WHEN {condition} THEN {DEMOTIONS[code]} END'
+    components=[('private_chat',"CASE WHEN c.chat_type='private' THEN 100 END"),
+        ('group_attention',"CASE WHEN c.chat_type IS DISTINCT FROM 'private' THEN 25 END"),
+        ('question_mark','CASE WHEN attention.question THEN 25 END'),
+        ('provider_contact','CASE WHEN attention.known_contact THEN 10 END'),
+        ('owner_question',f"CASE WHEN {person_mention} AND attention.question THEN {OWNER_QUESTION} END"),
+        # A closing courtesy ("@owner thanks") is not a request (ANYM-427).
+        ('owner_request',f"CASE WHEN {person_mention} AND NOT attention.question AND NOT coalesce(attention.courtesy,false) THEN {OWNER_REQUEST} END"),
+        ('waiting_age_capped',f'CASE WHEN {waiting}>=20 THEN 20 END'),
+        ('waiting_age',f'CASE WHEN {waiting} BETWEEN 1 AND 19 THEN {waiting} END'),
+        demotion('one_way_chat',"c.chat_type='private' AND own_last.sent_at IS NULL"),
+        demotion('provider_business_or_verified','coalesce(attention.business,false)'),
+        demotion('observed_bot',"c.chat_type='group' AND coalesce(attention.bot,false)"),
+        demotion('own_account',own_sender),
+        demotion('closing_courtesy','coalesce(attention.courtesy,false)')]
+    return waited,components,'('+'+'.join(f'coalesce({sql},0)' for _,sql in components)+')'
+
+
+def _promotional_sql():
+    """(broadcast, likely_promotional) conditions over the queue statement's joins."""
+    broadcast="(c.chat_type='private' AND own_last.sent_at IS NULL OR coalesce(attention.business,false))"
+    # ANYM-427: one-way private chat from a non-contact that is a business or verified sender or writes on several UTC days.
+    # Each step seeks the latest meaningful incoming message before the UTC day of the step before it
+    # (message_reply_order), so the day count reads PROMOTIONAL_DAYS index probes, not the mailing history.
+    day_walk="'infinity'::timestamptz"
+    for step in range(PROMOTIONAL_DAYS):
+        before=day_walk if not step else f"date_trunc('day',{day_walk} AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+        day_walk=f'''(SELECT pm{step}.sent_at FROM messages pm{step} LEFT JOIN message_metadata pmd{step}
+          ON pmd{step}.message=pm{step}.id AND pmd{step}.revision=pm{step}.revision
+          WHERE pm{step}.account=c.account AND pm{step}.chat=c.id AND pm{step}.direction='incoming'
+          AND pm{step}.sent_at<{before} AND {meaningful(f'pm{step}',f'pmd{step}')} ORDER BY pm{step}.sent_at DESC LIMIT 1)'''
+    likely_promotional=f'''(c.chat_type='private' AND own_last.sent_at IS NULL AND NOT coalesce(attention.known_contact,false)
+        AND (coalesce(attention.business,false) OR {day_walk} IS NOT NULL))'''
+    return broadcast,likely_promotional
+
+
+def _closing_sql(aliases):
+    """(closing_laterals, courtesy_closed): the courtesy-close lookups and condition of courtesies exclude and only."""
+    alias_chat="m.chat=(score_clock.aliases->>c.id)"
+    def pair(sql):return [sql,*([sql.replace('m.chat=c.id',alias_chat)] if aliases else [])]
+    def tagged(sqls):return ' UNION ALL '.join(f'SELECT {n} AS b,t.* FROM ({sql}) t' for n,sql in enumerate(sqls))
+    stored=f'''SELECT m.id,m.revision,m.deleted,m.body,m.sent_at,CASE WHEN a.platform='telegram' THEN {number('m')} ELSE 0::bigint END
+              AS numeric_id FROM messages m WHERE m.account=c.account AND m.chat=c.id AND c.chat_type='private' AND m.direction='incoming' AND NOT m.deleted
+            ORDER BY m.sent_at DESC,{index_number('m')} DESC NULLS LAST,m.id DESC LIMIT {COURTESY_SCAN}'''
+    meta=metadata_sql('p')
+    # Each tail is one range of message_reply_order in its full key order, whatever the platform's tie rules, so
+    # it reads at most COURTESY_SCAN rows. A tail that filled the scan is known only after its oldest scanned
+    # timestamp (the horizon): rows at it may tie with unread ones, so they are dropped too.
+    closing_from=f'''WITH tails AS MATERIALIZED ({tagged(pair(stored))}),
+          horizon AS (SELECT max(oldest) AS at FROM (SELECT min(sent_at) AS oldest FROM tails GROUP BY b
+            HAVING count(*)>={COURTESY_SCAN}) full_tail),
+          recent AS (SELECT p.id,p.sent_at,p.numeric_id,coalesce({courtesy_sql('p')} OR length(btrim(p.body))=0
+              AND ({meta}->>'media_kind'='sticker' OR {meta}->>'message_kind'='sticker'),false) AS closer
+            FROM tails p LEFT JOIN message_metadata md ON md.message=p.id AND md.revision=p.revision
+            WHERE p.sent_at>coalesce((SELECT at FROM horizon),'-infinity'::timestamptz) AND {meaningful_sql('p','md')}
+            ORDER BY p.sent_at DESC,p.numeric_id DESC,p.id DESC LIMIT {COURTESY_DEPTH})
+          SELECT id,sent_at,numeric_id FROM recent WHERE NOT closer ORDER BY sent_at DESC,numeric_id DESC,id DESC LIMIT 1'''
+    # The owner's stored messages from X on; one row more than the scan in either chat leaves the rest unread.
+    owner_stored=f'''SELECT m.id,m.revision,m.deleted,m.body,m.sent_at,{number('m')} AS numeric_id FROM messages m
+            WHERE m.account=c.account AND m.chat=c.id AND m.direction='outgoing' AND NOT m.deleted
+              AND m.sent_at>=closing_from.sent_at ORDER BY m.sent_at DESC,{index_number('m')} DESC NULLS LAST,m.id DESC
+            LIMIT {COURTESY_SCAN+1}'''
+    # A WhatsApp owner message at X's own second is not proven after X, so it never answers (it may still ask).
+    answered="p.sent_at>closing_from.sent_at OR a.platform='telegram' AND p.sent_at=closing_from.sent_at AND p.numeric_id>closing_from.numeric_id"
+    closing_owner=f'''WITH owned AS MATERIALIZED ({tagged(pair(owner_stored))})
+          SELECT coalesce((SELECT max(k) FROM (SELECT count(*) AS k FROM owned GROUP BY b) per_chat),0) AS scanned,
+            count(*) FILTER(WHERE {answered}) AS answered,coalesce(bool_or({question_sql('p')}),false) AS asked
+          FROM owned p LEFT JOIN message_metadata md ON md.message=p.id AND md.revision=p.revision WHERE {meaningful_sql('p','md')}'''
+    closing_laterals=f'''
+      LEFT JOIN LATERAL ({closing_from}) closing_from ON true
+      LEFT JOIN LATERAL ({closing_owner}) closing_owner ON true'''
+    return closing_laterals,(f"(c.chat_type='private' AND closing_from.id IS NOT NULL AND closing_owner.answered>0"
+        f" AND closing_owner.scanned<={COURTESY_SCAN} AND NOT closing_owner.asked)")
+
+
+def _waits_plan(c,p,aliases,args,clauses,days,include_muted,min_wait_hours,only_questions):
+    """ANYM-537: the awaiting_their_reply candidates, totals and arguments over the request's clauses."""
+    from . import owner_waits
+    # One statement reads the candidates once and takes the totals and the page from that one
+    # snapshot, so a page row left out later (owner_waits.finish) is always one the totals counted.
+    waits_mutes=c.execute('SELECT EXISTS(SELECT 1 FROM reply_mutes WHERE principal=%s) AS x',(p['id'],)).fetchone()['x']
+    rules=owner_waits.conditions(aliases=aliases,min_wait_hours=min_wait_hours,days=days,
+        principal=p['id'],mutes=waits_mutes)
+    shown='w.muted IS NULL' if rules['muted'] and not include_muted else 'true'
+    candidates=('WITH waits_all AS MATERIALIZED (SELECT c.id AS chat_id,ws.sent_at AS since,wh.id AS last_id,'
+        'wh.sent_at AS last_at,wp.sent_at AS peer_at,wp.numeric_id AS peer_numeric,'+(rules['muted'] or 'NULL::text')+
+        ' AS muted,wl.listed,'+('CASE WHEN wl.listed THEN '+rules['question']+' ELSE false END' if only_questions else 'wl.listed')+
+        ' AS asked,'+rules['uncertain']+' AS uncertain FROM chats c JOIN accounts a ON a.id=c.account'
+        ' CROSS JOIN (SELECT %s::jsonb AS owners,%s::jsonb AS aliases) score_clock'
+        ' LEFT JOIN chat_read_observations ro ON ro.account=c.account AND ro.chat=c.id'+owner_waits.laterals(c,aliases)+
+        ' CROSS JOIN LATERAL (SELECT '+rules['listed']+' AS listed) wl WHERE '+' AND '.join([*clauses,rules['chat']])+'),'
+        f''' waits_totals AS (SELECT count(*) FILTER(WHERE w.listed AND w.asked AND {shown}) AS listed,
+              count(*) FILTER(WHERE w.uncertain AND {shown}) AS uncertain,
+              count(*) FILTER(WHERE w.listed AND NOT w.asked AND {shown}) AS without_question,
+              count(*) FILTER(WHERE w.listed AND w.asked AND w.muted IS NOT NULL) AS muted FROM waits_all w)''')
+    return {'rules':rules,'candidates':candidates,'shown':shown,'mutes':waits_mutes,'cursor':None,
+        'args':[owner_senders(c,p),Jsonb(aliases),*args]}
+
+
+def _waits_page(c,waits,base_args,limit):
+    """(prefix, query_args) of the page statement over the picked waits; records waits['totals']."""
+    # The page is chosen over the run lookups alone; the row's head, read and hint evidence is read for it only.
+    # One statement picks the page and counts the totals; the row query then reads only the picked chats.
+    picked=c.execute(waits['candidates']+''', picked AS (SELECT w.chat_id,w.since,w.last_id,w.last_at,w.peer_at,
+            w.peer_numeric,w.muted FROM waits_all w WHERE w.listed AND w.asked AND '''+waits['shown']+
+        (' AND (w.since,w.chat_id)>(%s::timestamptz,%s)' if waits['cursor'] else '')+''' ORDER BY w.since,w.chat_id LIMIT %s)
+            SELECT (SELECT to_jsonb(t) FROM waits_totals t) AS totals,
+              coalesce((SELECT jsonb_agg(to_jsonb(k) ORDER BY k.since,k.chat_id) FROM picked k),'[]'::jsonb) AS page''',
+        [*waits['args'],*(waits['cursor'] or []),limit+1]).fetchone()
+    waits['totals']=dict(picked['totals'])
+    prefix='''WITH chat_page AS MATERIALIZED (SELECT c.*,w.since AS wait_since,w.last_id AS wait_last_id,
+            w.last_at AS wait_last_at,w.peer_at AS wait_peer_at,w.peer_numeric AS wait_peer_numeric,w.muted AS wait_muted
+            FROM jsonb_to_recordset(%s::jsonb) AS w(chat_id text,since timestamptz,last_id text,last_at timestamptz,
+              peer_at timestamptz,peer_numeric bigint,muted text) JOIN chats c ON c.id=w.chat_id) '''
+    return prefix,[Jsonb(picked['page']),*base_args,limit+1]
+
+
 class _PerChatPlan(Exception):
     """ANYM-878: the page-first proof failed in the page statement's snapshot; the call reruns on the per-chat plan."""
 
@@ -528,19 +670,7 @@ def _list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=
     # controls look up their own chat through this query.
     if not selected_chat:clauses.append('c.purged_at IS NULL')
     if query:
-        pattern='%'+query.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
-        match="(c.title ILIKE %s ESCAPE E'\\\\' OR "+raw_title_sql()+" AND "+peer_name_sql()+" ILIKE %s ESCAPE E'\\\\'"
-        matched=[pattern,pattern];name=query.removeprefix('@')
-        if roles_ready and name:
-            # A channel's @username, with or without the @ (ANYM-533).
-            match+=" OR c.username ILIKE %s ESCAPE E'\\\\'"
-            matched.append('%'+name.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%')
-        match+=')'
-        # A listed row also matches by its hidden alias chat's title.
-        found=[hidden[r['id']] for r in c.execute('SELECT c.id FROM chats c WHERE c.id=ANY(%s) AND '+match,
-            [list(hidden),*matched])] if hidden else []
-        clauses.append('('+match+(' OR c.id=ANY(%s)' if found else '')+')')
-        args.extend([*matched,*([found] if found else [])])
+        clause,matched=_query_filter(c,query,hidden,roles_ready);clauses.append(clause);args.extend(matched)
     if chat_types is not None:clauses.append("coalesce(c.chat_type,'unknown')=ANY(%s)");args.append(chat_types)
     # Literals from ROLES, so the unknown-role count below can drop them without touching args.
     role_clauses=[*([role_sql+' IN ('+','.join(sql_literal(r) for r in my_roles)+')'] if my_roles is not None else []),
@@ -631,42 +761,8 @@ def _list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=
     unmuted_pending=pending
     if mutes and not include_dismissed and not include_muted:pending=pending[:-1]+' AND NOT '+chat_muted+')'
     read_sources,fresh,unread=read_state_sql(c)
-    # Waiting points grow with the square root of hours (1h=1, 1d=4, 4d=9) up to
-    # 20 at about 17 days, so recent requests differ before a day has passed.
-    waited="greatest(0,extract(epoch FROM (score_clock.at-attention.sent_at))/3600)"
-    waiting="least(20,floor(sqrt("+waited+"))::integer)"
-    # Each component is a CASE yielding its points or NULL; the score is their sum and the reasons their keys.
-    own_sender="coalesce((score_clock.owners->(a.platform||'|'||attention.sender))-c.account<>'[]'::jsonb,false)"
-    person_mention=f"c.chat_type='group' AND attention.basis='owner_mention' AND NOT coalesce(attention.bot,false) AND NOT coalesce(attention.business,false) AND NOT {own_sender}"
-    def demotion(code,condition):return code,f'CASE WHEN {condition} THEN {DEMOTIONS[code]} END'
-    components=[('private_chat',"CASE WHEN c.chat_type='private' THEN 100 END"),
-        ('group_attention',"CASE WHEN c.chat_type IS DISTINCT FROM 'private' THEN 25 END"),
-        ('question_mark','CASE WHEN attention.question THEN 25 END'),
-        ('provider_contact','CASE WHEN attention.known_contact THEN 10 END'),
-        ('owner_question',f"CASE WHEN {person_mention} AND attention.question THEN {OWNER_QUESTION} END"),
-        # A closing courtesy ("@owner thanks") is not a request (ANYM-427).
-        ('owner_request',f"CASE WHEN {person_mention} AND NOT attention.question AND NOT coalesce(attention.courtesy,false) THEN {OWNER_REQUEST} END"),
-        ('waiting_age_capped',f'CASE WHEN {waiting}>=20 THEN 20 END'),
-        ('waiting_age',f'CASE WHEN {waiting} BETWEEN 1 AND 19 THEN {waiting} END'),
-        demotion('one_way_chat',"c.chat_type='private' AND own_last.sent_at IS NULL"),
-        demotion('provider_business_or_verified','coalesce(attention.business,false)'),
-        demotion('observed_bot',"c.chat_type='group' AND coalesce(attention.bot,false)"),
-        demotion('own_account',own_sender),
-        demotion('closing_courtesy','coalesce(attention.courtesy,false)')]
-    score='('+'+'.join(f'coalesce({sql},0)' for _,sql in components)+')'
-    broadcast="(c.chat_type='private' AND own_last.sent_at IS NULL OR coalesce(attention.business,false))"
-    # ANYM-427: one-way private chat from a non-contact that is a business or verified sender or writes on several UTC days.
-    # Each step seeks the latest meaningful incoming message before the UTC day of the step before it
-    # (message_reply_order), so the day count reads PROMOTIONAL_DAYS index probes, not the mailing history.
-    day_walk="'infinity'::timestamptz"
-    for step in range(PROMOTIONAL_DAYS):
-        before=day_walk if not step else f"date_trunc('day',{day_walk} AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-        day_walk=f'''(SELECT pm{step}.sent_at FROM messages pm{step} LEFT JOIN message_metadata pmd{step}
-          ON pmd{step}.message=pm{step}.id AND pmd{step}.revision=pm{step}.revision
-          WHERE pm{step}.account=c.account AND pm{step}.chat=c.id AND pm{step}.direction='incoming'
-          AND pm{step}.sent_at<{before} AND {meaningful(f'pm{step}',f'pmd{step}')} ORDER BY pm{step}.sent_at DESC LIMIT 1)'''
-    likely_promotional=f'''(c.chat_type='private' AND own_last.sent_at IS NULL AND NOT coalesce(attention.known_contact,false)
-        AND (coalesce(attention.business,false) OR {day_walk} IS NOT NULL))'''
+    waited,components,score=_rank_sql()
+    broadcast,likely_promotional=_promotional_sql()
     promotional_filter={'exclude':'NOT '+likely_promotional,'only':likely_promotional}.get(promotional) if awaiting_reply else None
     if awaiting_reply:clauses.append(pending)
     if only_questions and not awaiting_their_reply:clauses.append('attention.question')
@@ -756,43 +852,7 @@ def _list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=
     # count. Each lookup reads at most COURTESY_SCAN stored rows per chat; whatever it cannot prove keeps the chat.
     # Read only for exclude and only.
     closing=awaiting_reply and courtesies!='include'
-    closing_laterals=courtesy_closed=''
-    if closing:
-        alias_chat="m.chat=(score_clock.aliases->>c.id)"
-        def pair(sql):return [sql,*([sql.replace('m.chat=c.id',alias_chat)] if aliases else [])]
-        def tagged(sqls):return ' UNION ALL '.join(f'SELECT {n} AS b,t.* FROM ({sql}) t' for n,sql in enumerate(sqls))
-        stored=f'''SELECT m.id,m.revision,m.deleted,m.body,m.sent_at,CASE WHEN a.platform='telegram' THEN {number('m')} ELSE 0::bigint END
-              AS numeric_id FROM messages m WHERE m.account=c.account AND m.chat=c.id AND c.chat_type='private' AND m.direction='incoming' AND NOT m.deleted
-            ORDER BY m.sent_at DESC,{index_number('m')} DESC NULLS LAST,m.id DESC LIMIT {COURTESY_SCAN}'''
-        meta=metadata_sql('p')
-        # Each tail is one range of message_reply_order in its full key order, whatever the platform's tie rules, so
-        # it reads at most COURTESY_SCAN rows. A tail that filled the scan is known only after its oldest scanned
-        # timestamp (the horizon): rows at it may tie with unread ones, so they are dropped too.
-        closing_from=f'''WITH tails AS MATERIALIZED ({tagged(pair(stored))}),
-          horizon AS (SELECT max(oldest) AS at FROM (SELECT min(sent_at) AS oldest FROM tails GROUP BY b
-            HAVING count(*)>={COURTESY_SCAN}) full_tail),
-          recent AS (SELECT p.id,p.sent_at,p.numeric_id,coalesce({courtesy_sql('p')} OR length(btrim(p.body))=0
-              AND ({meta}->>'media_kind'='sticker' OR {meta}->>'message_kind'='sticker'),false) AS closer
-            FROM tails p LEFT JOIN message_metadata md ON md.message=p.id AND md.revision=p.revision
-            WHERE p.sent_at>coalesce((SELECT at FROM horizon),'-infinity'::timestamptz) AND {meaningful_sql('p','md')}
-            ORDER BY p.sent_at DESC,p.numeric_id DESC,p.id DESC LIMIT {COURTESY_DEPTH})
-          SELECT id,sent_at,numeric_id FROM recent WHERE NOT closer ORDER BY sent_at DESC,numeric_id DESC,id DESC LIMIT 1'''
-        # The owner's stored messages from X on; one row more than the scan in either chat leaves the rest unread.
-        owner_stored=f'''SELECT m.id,m.revision,m.deleted,m.body,m.sent_at,{number('m')} AS numeric_id FROM messages m
-            WHERE m.account=c.account AND m.chat=c.id AND m.direction='outgoing' AND NOT m.deleted
-              AND m.sent_at>=closing_from.sent_at ORDER BY m.sent_at DESC,{index_number('m')} DESC NULLS LAST,m.id DESC
-            LIMIT {COURTESY_SCAN+1}'''
-        # A WhatsApp owner message at X's own second is not proven after X, so it never answers (it may still ask).
-        answered="p.sent_at>closing_from.sent_at OR a.platform='telegram' AND p.sent_at=closing_from.sent_at AND p.numeric_id>closing_from.numeric_id"
-        closing_owner=f'''WITH owned AS MATERIALIZED ({tagged(pair(owner_stored))})
-          SELECT coalesce((SELECT max(k) FROM (SELECT count(*) AS k FROM owned GROUP BY b) per_chat),0) AS scanned,
-            count(*) FILTER(WHERE {answered}) AS answered,coalesce(bool_or({question_sql('p')}),false) AS asked
-          FROM owned p LEFT JOIN message_metadata md ON md.message=p.id AND md.revision=p.revision WHERE {meaningful_sql('p','md')}'''
-        closing_laterals=f'''
-      LEFT JOIN LATERAL ({closing_from}) closing_from ON true
-      LEFT JOIN LATERAL ({closing_owner}) closing_owner ON true'''
-        courtesy_closed=(f"(c.chat_type='private' AND closing_from.id IS NOT NULL AND closing_owner.answered>0"
-            f" AND closing_owner.scanned<={COURTESY_SCAN} AND NOT closing_owner.asked)")
+    closing_laterals,courtesy_closed=_closing_sql(aliases) if closing else ('','')
     # The broadcast and promotional counts run before the courtesy filter, so they never read its lookups.
     def base_for(attention_lookup,closing=True):return f''' FROM chats c JOIN accounts a ON a.id=c.account
       CROSS JOIN (SELECT %s::timestamptz AS at,%s::jsonb AS owners,%s::jsonb AS aliases) score_clock
@@ -843,27 +903,7 @@ def _list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=
         unknown_roles=c.execute('SELECT count(*) AS n'+base+' AND '.join([*(v for v in clauses if v not in role_clauses),
             role_sql+"='unknown' AND c.chat_type IN ('group','channel') AND a.platform='telegram'"]),
             [*base_args,*args]).fetchone()['n']
-    waits=None
-    if awaiting_their_reply:
-        # ANYM-537: one statement reads the candidates once and takes the totals and the page from that one
-        # snapshot, so a page row left out later (owner_waits.finish) is always one the totals counted.
-        waits_mutes=c.execute('SELECT EXISTS(SELECT 1 FROM reply_mutes WHERE principal=%s) AS x',(p['id'],)).fetchone()['x']
-        rules=owner_waits.conditions(aliases=aliases,min_wait_hours=min_wait_hours,days=awaiting_reply_days,
-            principal=p['id'],mutes=waits_mutes)
-        shown='w.muted IS NULL' if rules['muted'] and not include_muted else 'true'
-        candidates=('WITH waits_all AS MATERIALIZED (SELECT c.id AS chat_id,ws.sent_at AS since,wh.id AS last_id,'
-            'wh.sent_at AS last_at,wp.sent_at AS peer_at,wp.numeric_id AS peer_numeric,'+(rules['muted'] or 'NULL::text')+
-            ' AS muted,wl.listed,'+('CASE WHEN wl.listed THEN '+rules['question']+' ELSE false END' if only_questions else 'wl.listed')+
-            ' AS asked,'+rules['uncertain']+' AS uncertain FROM chats c JOIN accounts a ON a.id=c.account'
-            ' CROSS JOIN (SELECT %s::jsonb AS owners,%s::jsonb AS aliases) score_clock'
-            ' LEFT JOIN chat_read_observations ro ON ro.account=c.account AND ro.chat=c.id'+owner_waits.laterals(c,aliases)+
-            ' CROSS JOIN LATERAL (SELECT '+rules['listed']+' AS listed) wl WHERE '+' AND '.join([*clauses,rules['chat']])+'),'
-            f''' waits_totals AS (SELECT count(*) FILTER(WHERE w.listed AND w.asked AND {shown}) AS listed,
-              count(*) FILTER(WHERE w.uncertain AND {shown}) AS uncertain,
-              count(*) FILTER(WHERE w.listed AND NOT w.asked AND {shown}) AS without_question,
-              count(*) FILTER(WHERE w.listed AND w.asked AND w.muted IS NOT NULL) AS muted FROM waits_all w)''')
-        waits={'rules':rules,'candidates':candidates,'shown':shown,'mutes':waits_mutes,'cursor':None,
-            'args':[owner_senders(c,p),Jsonb(aliases),*args]}
+    waits=_waits_plan(c,p,aliases,args,clauses,awaiting_reply_days,include_muted,min_wait_hours,only_questions) if awaiting_their_reply else None
     if after:
         cid=valid_text(after,empty=False) if order=='id' else position_text(pos.get('id'))
         if not c.execute('SELECT 1 FROM chats c WHERE c.id=%s AND '+scope,[cid,*scope_filter(p,'c',chat_column='id')[1]]).fetchone():raise APIError('not_found',404)
@@ -896,21 +936,8 @@ def _list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=
         base=base.replace(' FROM chats c JOIN accounts a',' FROM chat_page c JOIN accounts a',1)
         where='true'
     if waits:
-        # The page is chosen over the run lookups alone; the row's head, read and hint evidence is read for it only.
-        # One statement picks the page and counts the totals; the row query then reads only the picked chats.
-        picked=c.execute(waits['candidates']+''', picked AS (SELECT w.chat_id,w.since,w.last_id,w.last_at,w.peer_at,
-            w.peer_numeric,w.muted FROM waits_all w WHERE w.listed AND w.asked AND '''+waits['shown']+
-            (' AND (w.since,w.chat_id)>(%s::timestamptz,%s)' if waits['cursor'] else '')+''' ORDER BY w.since,w.chat_id LIMIT %s)
-            SELECT (SELECT to_jsonb(t) FROM waits_totals t) AS totals,
-              coalesce((SELECT jsonb_agg(to_jsonb(k) ORDER BY k.since,k.chat_id) FROM picked k),'[]'::jsonb) AS page''',
-            [*waits['args'],*(waits['cursor'] or []),limit+1]).fetchone()
-        waits['totals']=dict(picked['totals'])
-        prefix='''WITH chat_page AS MATERIALIZED (SELECT c.*,w.since AS wait_since,w.last_id AS wait_last_id,
-            w.last_at AS wait_last_at,w.peer_at AS wait_peer_at,w.peer_numeric AS wait_peer_numeric,w.muted AS wait_muted
-            FROM jsonb_to_recordset(%s::jsonb) AS w(chat_id text,since timestamptz,last_id text,last_at timestamptz,
-              peer_at timestamptz,peer_numeric bigint,muted text) JOIN chats c ON c.id=w.chat_id) '''
+        prefix,query_args=_waits_page(c,waits,base_args,limit);where='true'
         base=base.replace(' FROM chats c JOIN accounts a',' FROM chat_page c JOIN accounts a',1)
-        query_args=[Jsonb(picked['page']),*base_args,limit+1];where='true'
     rows=c.execute(prefix+'''SELECT c.id,c.account,c.title,c.provider_chat AS provider_chat_id,c.chat_type AS type,
         '''+role_sql+''' AS my_role,'''+('c.can_post,c.role_observed_at,' if roles_ready else
           'NULL::boolean AS can_post,NULL::timestamptz AS role_observed_at,')+'''
