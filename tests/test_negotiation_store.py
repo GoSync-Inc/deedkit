@@ -221,6 +221,22 @@ def test_editing_the_only_proposal_to_plain_text_removes_its_negotiation_and_a_r
 
 
 # spec: ANYM-907
+def test_an_acceptance_left_after_its_proposal_is_edited_to_plain_text_keeps_no_agreement(neg):
+    s, c = neg
+    chat, a, b, negotiation = agreed_pair(c)
+    c.execute("UPDATE messages SET body='привет как дела',revision=2 WHERE id=%s", (a,))
+    assert apply(c, ACCOUNT, chat, NOW) == 1
+    assert apply(c, ACCOUNT, chat, NOW) == 0  # the replay
+    (n,) = rows(c, 'negotiations', chat=chat)
+    assert n['state'] == 'removed' and n['agreed_start'] is None
+    assert versions(c, chat) == [(1, 'opened'), (2, 'agreed'), (3, 'removed')]
+    links = rows(c, 'negotiation_sources', negotiation=negotiation)
+    assert {r['message'] for r in links} == {a, b}
+    assert all(r['removed_at'] is not None and r['intent'] is None for r in links)
+    assert visible(c, ACCOUNT, chat) == [] and rows(c, 'negotiation_times', negotiation=negotiation) == []
+
+
+# spec: ANYM-907
 def test_a_source_the_current_negotiation_takes_keeps_its_old_link_so_a_purge_cleans_both(neg):
     s, c = neg
     chat = new_chat(c)
@@ -364,6 +380,29 @@ def test_with_the_worker_stopped_reads_hide_at_once_and_its_first_pass_cleans_be
     checkpoint = Checkpoint()
     assert checkpoint(c, NOW) == 1  # the first call of a started worker always runs
     nothing_derived(c, negotiation, a)
+
+
+# spec: ANYM-907
+def test_a_failed_first_checkpoint_keeps_the_full_startup_lap_for_its_retry(neg, monkeypatch):
+    s, c = neg
+    pairs = [agreed_pair(c) for _ in range(4)]  # eight source rows, more than one checkpoint's SWEEP below
+    monkeypatch.setattr(store_module, 'SWEEP', 3)
+    last = c.execute('SELECT message FROM negotiation_sources ORDER BY message DESC LIMIT 1').fetchone()['message']
+    (target,) = [p for p in pairs if last in p[1:3]]
+    purge_row(c, last)
+    original, calls = store_module.cleanup, []
+
+    def fails_once(*args, **kwargs):
+        calls.append(kwargs.get('budget'))
+        if len(calls) == 1:raise psycopg.OperationalError('injected: the database went away')
+        return original(*args, **kwargs)
+    monkeypatch.setattr(store_module, 'cleanup', fails_once)
+    clock = [100.0]
+    checkpoint = Checkpoint(clock=lambda: clock[0])
+    with pytest.raises(psycopg.OperationalError):checkpoint(c, NOW)
+    clock[0] += 0.1  # the retry is not throttled: the failed call did not count
+    assert checkpoint(c, NOW) == 1 and calls == [None, None]
+    nothing_derived(c, target[3], last)
 
 
 # spec: ANYM-907
