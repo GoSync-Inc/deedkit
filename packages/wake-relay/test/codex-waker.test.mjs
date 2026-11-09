@@ -2,7 +2,6 @@
 import test,{afterEach} from 'node:test';
 import assert from 'node:assert/strict';
 import {execFile} from 'node:child_process';
-import {randomUUID} from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -10,76 +9,14 @@ import {fileURLToPath} from 'node:url';
 import {codexQueue,QUEUE_TIMEOUT_MS,wakeMessage} from '../src/codex.mjs';
 import {deedkitClient,postJson,REQUEST_TIMEOUT_MS,RESPONSE_LIMIT} from '../src/mcp.mjs';
 import {ConfigError,Watcher,loadWatchConfig,readWatchStatus} from '../src/watch.mjs';
+import {SECRET_TEXT,SUB,closeOpened,deedkit,fakeCodex,opened} from './fake-deedkit.mjs';
 import {workspace} from './helpers.mjs';
 
 const BIN=fileURLToPath(new URL('../bin/wake-relay.mjs',import.meta.url));
 const TOKEN='dk_synthetic_waker_token_0123456789';
-const SUB='0b6f5c1e-3a2d-4e8f-9c7b-1a2b3c4d5e6f',THREAD='7d3e2f1a-9b8c-4d6e-a5f4-3c2b1a0e9d8c';
+const THREAD='7d3e2f1a-9b8c-4d6e-a5f4-3c2b1a0e9d8c';
 const SUB2='1c7a6d2f-4b3e-4f9a-8d8c-2b3c4d5e6f70',SUB3='2d8b7e3a-5c4f-4a0b-9e9d-3c4d5e6f7081',THREAD2='Second project chat';
-const SECRET_TEXT='synthetic message body that must never leave the waker';
-// Every server and watcher a test opens is closed after it, also when an assertion fails first.
-const opened=[];
-afterEach(async()=>{for(const close of opened.splice(0).reverse())await Promise.resolve().then(close).catch(()=>{});});
-
-// A DeedKit MCP endpoint with one subscription; its passive page is built like subscriptions.get_subscription_events.
-async function deedkit({tools=['messages_get_subscription_events'],acked=0}={}){
-  const state={items:[],acked,matched:0,requests:0,calls:[],args:[],version:0,transform:null,respond:null,others:{}};
-  const server=http.createServer((req,res)=>{
-    const chunks=[];
-    req.on('data',chunk=>chunks.push(chunk));
-    req.on('end',()=>{
-      state.requests++;
-      state.lastAuthorization=req.headers.authorization;
-      if(state.respond)return state.respond(req,res);
-      const body=JSON.parse(Buffer.concat(chunks).toString('utf8'));
-      const reply=result=>{res.writeHead(200,{'content-type':'application/json','mcp-session-id':'session-1'});
-        res.end(JSON.stringify({jsonrpc:'2.0',id:body.id,result}));};
-      if(body.method==='notifications/initialized'){res.writeHead(202);return res.end();}
-      if(body.method==='initialize')return reply({protocolVersion:'2025-06-18',capabilities:{tools:{}},serverInfo:{name:'fake'}});
-      if(body.method==='tools/list')return reply({tools:tools.map(name=>({name}))});
-      const {name,arguments:args}=body.params;
-      state.calls.push(name);state.args.push(args);
-      const sub=args.subscription_id===SUB?state:(state.others[args.subscription_id]??={items:[],acked:0,matched:0});
-      const visible=sub.items.filter(item=>item.event_id>args.after).slice(0,args.limit+1);
-      const items=visible.slice(0,args.limit);
-      let page={subscription:{subscription_id:args.subscription_id,state:'active',acked_through:sub.acked,matched_through:sub.matched},
-        items,has_more:visible.length>args.limit,next_after:items.length?items.at(-1).event_id:args.after,
-        consumption:'passive_read_no_ack'};
-      if(state.transform)page=state.transform(page);
-      reply({content:[{type:'text',text:JSON.stringify(page)}],...(state.textOnly?{}:{structuredContent:page})});
-    });
-  });
-  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
-  opened.push(()=>{server.closeAllConnections();server.close();});
-  let next=1;
-  const item=(fields={})=>({event_id:next++,kind:'message.created',direction:'incoming',origin:'live',historical:false,
-    wake_reason:['incoming_message'],message:{text:SECRET_TEXT},chat:'chat_synthetic',...fields});
-  return {state,url:`http://127.0.0.1:${server.address().port}/mcp`,
-    push(count=1,fields={},id=SUB){
-      const sub=id===SUB?state:(state.others[id]??={items:[],acked:0,matched:0});
-      for(let i=0;i<count;i++){const value=item(fields);sub.items.push(value);sub.matched=value.event_id;}
-    },
-    sub:id=>id===SUB?state:(state.others[id]??={items:[],acked:0,matched:0}),
-    // Another consumer's fetch issues a receipt bound to the consumption version; its ACK checks that version.
-    fetch(){return {receipt:randomUUID(),version:state.version,through:state.matched};},
-    ack(receipt){if(receipt.version!==state.version)return false;state.version++;state.acked=receipt.through;return true;},
-    close(){server.closeAllConnections();return new Promise(resolve=>server.close(resolve));}};
-}
-
-// A fake `codex` that logs its argv; its behaviour is read from a mode file at each run.
-function fakeCodex(dir,mode='ok'){
-  const file=path.join(dir,'codex'),log=path.join(dir,'codex-calls.jsonl'),modeFile=path.join(dir,'codex-mode');
-  fs.writeFileSync(modeFile,mode);
-  fs.writeFileSync(file,`#!${process.execPath}
-const fs=require('fs');const args=process.argv.slice(2);const mode=fs.readFileSync(${JSON.stringify(modeFile)},'utf8').trim();
-if(args[0]==='queue'&&args[1]==='--help'){process.stdout.write(mode==='nothread'?'Usage: codex queue --message <TEXT>\\n':'Usage: codex queue --thread <THREAD> --message <TEXT> [--resume]\\n');process.exit(0);}
-fs.appendFileSync(${JSON.stringify(log)},JSON.stringify(args)+'\\n');
-if(mode==='warn'){process.stderr.write('Warning: message was queued, but could not resume thread x: start a local daemon or specify a server with --remote\\n');process.exit(0);}
-if(mode==='fail')process.exit(3);
-if(mode==='hang')setInterval(()=>{},1000);else process.exit(0);
-`,{mode:0o755});
-  return {file,setMode:value=>fs.writeFileSync(modeFile,value),calls:()=>fs.existsSync(log)?fs.readFileSync(log,'utf8').trim().split('\n').map(line=>JSON.parse(line)):[]};
-}
+afterEach(closeOpened);
 
 function setup({mode='ok',budget,tools,watch={},watches}={}){
   const space=workspace(),codex=fakeCodex(space.dir,mode),key=space.file('deedkit.key',TOKEN+'\n');
