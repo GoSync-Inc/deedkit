@@ -40,7 +40,9 @@ EXPECTED_GO_SAFE_ONLY = {
     'owner_terminal_required', 'policy_expired', 'provider_already_started', 'provider_response_too_large',
     'session_already_owned', 'unsupported_method',
     # ANYM-837: the operator's read-only --menu-reply-shapes scan reports it on stderr; no collector reads it.
-    'menu_shapes_unavailable'}
+    'menu_shapes_unavailable',
+    # ANYM-914: the native adapter's refusal to open a session without an inherited claim; Python never answers it.
+    'session_claim_required'}
 
 
 def _strings(text, quote):

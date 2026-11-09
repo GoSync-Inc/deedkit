@@ -388,13 +388,21 @@ def get_sync_status(c, p, claims=None):
         sources = c.execute('''SELECT a.id AS account,a.platform,h.status,h.detail_code,h.cooldown_until,
             h.updated_at,h.discovery_started_at,h.discovery_completed_at,h.discovery_count,h.discovery_limited,'''+identity_safe('h.operations')+''' AS operations,
             l.expires_at AS collector_lease_until,
-            s.last_ingest_at,s.detail_code AS archive_detail_code
+            s.last_ingest_at,s.detail_code AS archive_detail_code,
+            k.host_id AS claim_host_id,k.holder_kind AS claim_holder_kind,k.generation AS claim_generation,
+            k.seen_at AS claim_seen_at,k.released_at AS claim_released_at,k.restore_hold AS claim_restore_hold,
+            k.waiting_host_id AS claim_waiting_host_id
             FROM accounts a LEFT JOIN collector_health h ON h.account=a.id
             LEFT JOIN source_status s ON s.account=a.id
             LEFT JOIN collector_leases l ON l.account=a.id
+            LEFT JOIN session_claims k ON k.account=a.id
             WHERE a.id=ANY(%s) ORDER BY a.id''', (p['accounts'],)).fetchall()
         for row in sources:
             row['catalog_chats'] = catalogs.get(row['account'], {}).get('catalog_chats', 0)
+            # ANYM-914: which host owns the provider session (random host IDs, a generation and times only).
+            owner = {key: row.pop('claim_'+key) for key in
+                     ('host_id', 'holder_kind', 'generation', 'seen_at', 'released_at', 'restore_hold', 'waiting_host_id')}
+            row['session_owner'] = owner if owner['generation'] is not None else None
     if sources:
         checkpoints = _checkpoints(c, p, {row['id'] for row in catalog})
         tallies = {}

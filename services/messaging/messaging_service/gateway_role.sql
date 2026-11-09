@@ -137,3 +137,5 @@ GRANT SELECT ON negotiations,negotiation_sources,negotiation_times TO messaging_
 -- Schema 77 (ANYM-851): get_file_text content='structured' reads a document's stored Markdown version and whether
 -- the worker serves the account; read only.
 GRANT SELECT ON attachment_structure,structure_profiles TO messaging_gateway;
+-- Schema 78 (ANYM-914): source status shows which host owns each provider session; read only.
+GRANT SELECT ON session_claims TO messaging_gateway;

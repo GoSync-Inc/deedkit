@@ -135,7 +135,7 @@ def test_the_migration_creates_the_role_and_grants_only_on_its_own_tables(neg):
         remove(s, gateway)
     # The worker's grants on existing tables come with ANYM-908.
     assert not granted_on(c, 'messaging_negotiations', 'messages', 'SELECT')
-    assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '77'
+    assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '78'
 
 
 # spec: ANYM-907
@@ -146,7 +146,7 @@ def test_the_migration_applies_on_the_deployed_schema_and_gives_the_purge_role_n
     old.migrate()
     old.migrate()  # a repeated migrate changes nothing
     with old.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '77'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '78'
         assert store_module.schema_ready(c) is True
         for table in TABLES:
             assert not granted_on(c, 'messaging_purge', table, 'SELECT')

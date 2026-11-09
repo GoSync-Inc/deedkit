@@ -886,7 +886,11 @@ def telegram_session(tmp_path,mode):
 
 def run_telegram(monkeypatch,session,store):
     from messaging_service import telegram_collector as tc
-    monkeypatch.setattr(tc,'configuration',lambda _: ({'session_file':str(session)},{}))
+    locks=session.parent.parent/'session-locks'; locks.mkdir(mode=0o700,exist_ok=True)
+    boot=session.parent.parent/'boot_id'; boot.write_text('synthetic-boot\n')
+    monkeypatch.setattr(tc.session_claim,'BOOT_ID',boot)  # ANYM-914: the claim's host lock, synthetic
+    monkeypatch.setattr(tc,'configuration',lambda _: ({'session_file':str(session),'account':'telegram-test',
+        'session_lock_directory':str(locks)},{}))
     monkeypatch.setattr(tc,'Store',store)
     monkeypatch.setattr(tc,'TelethonProvider',lambda *_: pytest.fail('provider constructed'))
     dsn=session.parent.parent/'synthetic.dsn'; dsn.write_text('synthetic-not-a-connection')
@@ -1100,6 +1104,33 @@ def test_runner_graceful_stop_disconnects_and_releases_lease(worker):
     assert w.archive.acquire(w.account,'replacement')>w.state.lease[1]
 
 
+# spec: ANYM-914
+@pytest.mark.parametrize('disconnect',['verified','failed'])
+def test_runner_stop_releases_the_claim_first_and_only_after_a_verified_disconnect(worker,disconnect):
+    w,s,_=worker
+    w.archive.release(w.account,w.owner,w.state.lease[1])
+    order=[]
+    async def release_claim(): order.append('claim')
+    w.release_claim=release_claim
+    lease=w.archive.release
+    def recorded(*args): order.append('lease'); return lease(*args)
+    w.archive.release=recorded  # the last cleanup step of run's finally, after the status rows
+    if disconnect=='failed':
+        async def broken(): raise OSError('synthetic half-open connection')
+        w.provider.disconnect=broken
+    async def scenario():
+        connected=asyncio.Event(); connect=w.provider.connect
+        async def connecting(): await connect(); connected.set()
+        w.provider.connect=connecting
+        running=asyncio.create_task(w.run())
+        await asyncio.wait_for(connected.wait(),BOUND)
+        order.clear(); w.stopping.set()
+        await asyncio.wait_for(running,BOUND)
+    asyncio.run(scenario())
+    # Released before the status and lease cleanup (the stop grace covers it); an unverified disconnect keeps the row.
+    assert order==(['claim','lease'] if disconnect=='verified' else ['lease']), order
+
+
 @pytest.mark.parametrize('reason',['stop','connect_timeout','lease_lost'])
 def test_runner_tears_down_hung_connect_and_releases_lease(worker,reason):
     w,s,_=worker
@@ -1234,7 +1265,7 @@ def test_backup_covers_collector_positions_and_pending_deletions(worker,tmp_path
     directory=tmp_path/'snapshot'
     create_snapshot(s,directory,[sys.executable,'-c','print("unit-dump-stub")'])
     manifest=json.loads((directory/'manifest.json').read_text())
-    assert manifest['schema_version'] == 77
+    assert manifest['schema_version'] == 78
     assert manifest['tables']['collector_chats']['rows']==1
     assert manifest['tables']['provider_tombstones']['rows']==1
     assert verify_snapshot(s,directory)['status']=='verified'

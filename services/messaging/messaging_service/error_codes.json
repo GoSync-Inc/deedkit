@@ -18,13 +18,15 @@
       "collector_disabled", "session_handover_not_confirmed", "telegram_pairing_required",
       "telegram_identity_mismatch", "private_session_required", "live_account_required",
       "collector_already_owned", "session_already_owned", "collector_lease_lost",
-      "durable_capture_failed", "capture_overload", "collection_disabled", "provider_disconnected"
+      "durable_capture_failed", "capture_overload", "collection_disabled", "provider_disconnected",
+      "session_claim_lost", "host_id_invalid"
     ],
     "whatsapp": [
       "collector_disabled", "session_handover_not_confirmed", "whatsapp_pairing_required",
       "whatsapp_identity_mismatch", "private_session_required", "live_account_required",
       "collector_already_owned", "session_already_owned", "collector_lease_lost",
-      "collection_disabled", "provider_disconnected"
+      "collection_disabled", "provider_disconnected",
+      "session_claim_lost", "host_id_invalid", "session_claim_unsupported"
     ]
   },
   "provider_reply": {

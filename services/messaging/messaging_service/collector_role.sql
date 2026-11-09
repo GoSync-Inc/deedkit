@@ -63,3 +63,6 @@ GRANT SELECT(id,state,expires_at,closed_at) ON subscriptions TO messaging_collec
 -- Schema 69 (ANYM-816): an operator-queued recovery of a failed original; the collector claims it and records the
 -- outcome. It never inserts a row (the operator command does) and never changes a row's job, account or run.
 GRANT SELECT,UPDATE(state,attempts,next_due,lease_until,refusal_reason,last_code,updated_at) ON media_recovery TO messaging_collector;
+-- Schema 78 (ANYM-914): the account's provider-session claim. The collector acquires, refreshes and releases its own
+-- row by compare-and-set (session_claim.py); it never deletes one.
+GRANT SELECT,INSERT,UPDATE ON session_claims TO messaging_collector;

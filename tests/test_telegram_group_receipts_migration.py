@@ -47,8 +47,13 @@ OLD_INSERT = ('INSERT INTO message_receipts(id,account,platform,provider_chat,pr
 @pytest.fixture
 def at_schema(database, tmp_path):
     """`at_schema(version)`: a Store on a disposable database built with the migrations up to `version` only."""
+    def build(version):
+        store = stack.enter_context(old_schema_store(database, tmp_path, version))
+        # A release to the runtime schema also appends 078's collector and gateway grants (ANYM-914).
+        gateway_role(store.pool.conninfo); collector_role(store.pool.conninfo)
+        return store
     with ExitStack() as stack:
-        yield lambda version: stack.enter_context(old_schema_store(database, tmp_path, version))
+        yield build
 
 
 @pytest.fixture(autouse=True)
@@ -87,6 +92,13 @@ def gateway_role(dsn):
     with psycopg.connect(dsn) as c:
         c.execute("DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='messaging_gateway') THEN "
                   "CREATE ROLE messaging_gateway NOLOGIN; END IF; END $$")
+
+
+def collector_role(dsn):
+    # As collector_role.sql's own first statement: the role 078's appended grant names exists before the release.
+    with psycopg.connect(dsn) as c:
+        c.execute("DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='messaging_collector') THEN "
+                  "CREATE ROLE messaging_collector NOLOGIN; END IF; END $$")
 
 
 def seed(dsn, rows=RECEIPTS):

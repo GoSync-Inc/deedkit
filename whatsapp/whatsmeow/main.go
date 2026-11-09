@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -26,6 +27,35 @@ func acquire(root string) (*os.File, error) {
 		return nil, errors.New("session_already_owned")
 	}
 	return f, nil
+}
+
+// ANYM-914: the Python parent holds the canonical host lock, the per-directory lock and the claim row, and is their
+// only releaser. Before any store open this child requires the inherited canonical lock descriptor: the same file
+// as <session_lock_directory>/<account>.lock and a flock that succeeds on it (the same open file description).
+const defaultSessionLockDirectory = "/run/deedkit/session-locks"
+
+func inheritedClaim(c Config) error {
+	refused := errors.New("session_claim_required")
+	value := os.Getenv("ANYMSG_SESSION_CLAIM_FD")
+	fd, e := strconv.Atoi(value)
+	if value == "" || e != nil || fd < 3 {
+		return refused
+	}
+	directory := c.SessionLockDirectory
+	if directory == "" {
+		directory = defaultSessionLockDirectory
+	}
+	var inherited, named syscall.Stat_t
+	if syscall.Fstat(fd, &inherited) != nil || syscall.Lstat(filepath.Join(directory, c.Account+".lock"), &named) != nil {
+		return refused
+	}
+	if inherited.Dev != named.Dev || inherited.Ino != named.Ino || inherited.Mode&syscall.S_IFMT != syscall.S_IFREG {
+		return refused
+	}
+	if syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB) != nil {
+		return refused
+	}
+	return nil
 }
 func main() {
 	syscall.Umask(0077)
@@ -67,6 +97,9 @@ func main() {
 func execute(path string, pair bool) error {
 	c, e := loadConfig(path)
 	if e != nil {
+		return e
+	}
+	if e = inheritedClaim(c); e != nil {
 		return e
 	}
 	lock, e := acquire(c.SessionDirectory)

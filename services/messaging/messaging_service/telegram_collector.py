@@ -26,10 +26,11 @@ from .adapters import telegram_message
 from .archive import MEDIA_CONTENDED,Archive
 from .blobs import BlobWriter
 from .envelope import stable_id
-from .collector_state import LIVE_REJECT_CODES,CaptureSpool,CollectorState,PeerKindConflict,session_lock
+from .collector_state import LIVE_REJECT_CODES,CaptureSpool,CollectorState,PeerKindConflict,private_session_directory,session_lock
 from .spool import DurableSpool,InvalidCapture,KeepItem,PoisonItem
 from .collector_common import DbBackoff,commit_items,validate_common,validate_ranges
 from .store import Store
+from . import session_claim
 from .telegram_governor import BACKGROUND,LIVE_BUDGETS,LIVE_MEDIA,LIVE_STATE,ProviderRateLimited,RequestGovernor
 from .operational import CONNECTION_ERRORS,MEDIA_ERRORS,collector_stop
 from .storage_admission import MEDIA_RESERVE_BYTES
@@ -149,10 +150,14 @@ def configuration(path):
     cfg=private_json(path)
     fields={'enabled','account','credentials_file','session_file','permit_file','spool_directory',
             'batch_size','scan_interval_seconds','max_media_bytes','disk_reserve_bytes',
-            'max_dialogs','history_since','media_backfill','live_search_budget','head_pages_per_pass'}|MEDIA_POLICY_FIELDS
+            'max_dialogs','history_since','media_backfill','live_search_budget','head_pages_per_pass',
+            'session_lock_directory'}|MEDIA_POLICY_FIELDS
     validate_common(cfg,fields)
     for key in ['credentials_file','session_file','permit_file','spool_directory']:
         if not isinstance(cfg.get(key),str) or not Path(cfg[key]).is_absolute(): raise ValueError('invalid_private_path')
+    lock_directory=cfg.get('session_lock_directory')  # ANYM-914; default session_claim.LOCK_DIRECTORY
+    if lock_directory is not None and (not isinstance(lock_directory,str) or not Path(lock_directory).is_absolute()):
+        raise ValueError('invalid_private_path')
     if not cfg['session_file'].endswith('.session'): raise ValueError('invalid_session_filename')
     validate_ranges(cfg,[('batch_size',100,1,100),('scan_interval_seconds',60,10,3600),
                          ('max_media_bytes',512*1024**2,1,4*1024**3),
@@ -741,6 +746,9 @@ class TelegramCollector:
         self.owner=owner or 'telegram-'+secrets.token_hex(12)
         self.lease_ttl,self.heartbeat_interval=lease_ttl,heartbeat_interval
         self.state=None; self.stopping=asyncio.Event(); self.failed=asyncio.Event()
+        # ANYM-914: (pool, Claim) kept by run(); released by run_config only after a verified disconnect.
+        self.session_claim=None; self.disconnect_verified=False
+        self.release_claim=None  # ANYM-914: run_config's bounded release, awaited right after a verified disconnect
         self.capture_count=0; self.failure_code=None; self.policy=None
         self.capture_waiters=deque(); self.capture_wait_seconds=CAPTURE_WAIT_SECONDS
         self._dialog_cache=None; self._next_discovery=0; self._history_spool=None
@@ -1410,6 +1418,9 @@ class TelegramCollector:
             else:self.provider.subscribe(self.capture,self.deleted)
             # Renew ownership and honor shutdown during a slow network connect.
             tasks=[asyncio.create_task(self.heartbeat()),asyncio.create_task(self.stopping.wait())]
+            if self.session_claim is not None:
+                # Refresh is visibility only: it raises solely on a positive session_claim_lost.
+                tasks.append(asyncio.create_task(session_claim.keep(*self.session_claim)))
             connecting=asyncio.create_task(self.connect_provider())
             tasks.append(connecting)
             done,_=await asyncio.wait(tasks,return_when=asyncio.FIRST_COMPLETED)
@@ -1436,7 +1447,12 @@ class TelegramCollector:
             if reevaluation is not None: reevaluation.stop()
             for task in tasks: task.cancel()
             await asyncio.gather(*tasks,return_exceptions=True)
-            with suppress(Exception): await asyncio.wait_for(self.provider.disconnect(),15)
+            try:
+                await asyncio.wait_for(self.provider.disconnect(),15); self.disconnect_verified=True
+            except Exception: pass  # an uncertain disconnect keeps the claim row (ANYM-914)
+            if self.disconnect_verified and self.release_claim is not None:
+                # First, before the status and lease cleanup below, so the stop grace covers it (ANYM-914).
+                with suppress(Exception): await self.release_claim()
             if failure is None:
                 with suppress(Exception):
                     gate=await asyncio.to_thread(self.state.connection_gate)
@@ -1754,15 +1770,21 @@ async def run_config(path):
     try: info=session.lstat()  # A symlink is refused here, never followed.
     except OSError: raise RuntimeError('private_session_required') from None
     if not stat.S_ISREG(info.st_mode) or info.st_mode&0o077: raise RuntimeError('private_session_required')
-    # File ownership spans client construction, which opens the SQLite session.
-    with session_lock(session):
-        store=Store(Path(os.environ['DATABASE_URL_FILE']).read_text().strip(),
-                    Path(os.environ['PROBE_FILES']),'http://collector.invalid')
-        try:
-            archive=Archive(store)
+    os.close(private_session_directory(session))  # a shared directory is refused before any lock or account check
+    # File ownership spans client construction, which opens the SQLite session. ANYM-914: the canonical host lock
+    # first, then the session flock, then the claim, and only then the TelegramClient (it opens the session store).
+    with session_claim.host_lock(cfg.get('account'),cfg.get('session_lock_directory')) as host,session_lock(session):
+        def open_store():
+            return Store(Path(os.environ['DATABASE_URL_FILE']).read_text().strip(),
+                         Path(os.environ['PROBE_FILES']),'http://collector.invalid')
+        def check(store):
             with store.pool.connection() as c:
                 row=c.execute('SELECT platform,synthetic FROM accounts WHERE id=%s',(cfg['account'],)).fetchone()
                 if not row or row['platform']!='telegram' or row['synthetic']: raise RuntimeError('live_account_required')
+        store=await session_claim.open_waiting(open_store,check,cfg['account'])
+        try:
+            archive=Archive(store)
+            claim=await session_claim.acquire_waiting(store.pool,host,'collector')
             spool=CaptureSpool(cfg['spool_directory'],reserve_bytes=cfg['disk_reserve_bytes'])
             live_writer=(BlobWriter(store.files,max_bytes=cfg['media_live_max_bytes'],
                 reserve_bytes=cfg['media_live_disk_reserve_bytes'])
@@ -1773,6 +1795,9 @@ async def run_config(path):
                 live_writer=live_writer,live_window_seconds=cfg['media_live_window_seconds'],
                 media_backfill=cfg['media_backfill'],
                 writer=BlobWriter(store.files,max_bytes=cfg['max_media_bytes'],reserve_bytes=cfg['media_disk_reserve_bytes']))
+            worker.session_claim=(store.pool,claim)
+            # Only a verified disconnect releases (run's finally); a failed or timed-out one keeps the row for this kernel.
+            worker.release_claim=lambda: session_claim.release_bounded(store.pool,claim)
             loop=asyncio.get_running_loop()
             for sig in [signal.SIGTERM,signal.SIGINT]: loop.add_signal_handler(sig,worker.stopping.set)
             await worker.run()

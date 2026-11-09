@@ -16,9 +16,15 @@ import {IdentityCache,cachedIdentityObservations,cachedBidirectionalPair} from '
 import {bindReceiptCapture} from './receipts.mjs';
 
 process.umask(0o077);
+const SESSION_LOCKS='/run/deedkit/session-locks';
 // Libraries must not mix sensitive diagnostics into the bounded private protocol.
 console.log=console.warn=console.error=()=>{};
 const cfg=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
+// ANYM-914: the browser fallback is not claimed; it never starts where the canonical session lock directory (or
+// the configured one) exists, also when run directly rather than through the Python parent's refusal.
+if([SESSION_LOCKS,cfg.session_lock_directory].some(p=>typeof p==='string'&&fs.existsSync(p))){
+  process.stderr.write('session_claim_unsupported\n');process.exit(1);
+}
 cfg.max_media_bytes ??= 512*1024**2;
 let client,policy,spool,sendReceipts,stopping=false,ready=false,verified=false,ownerIds=[];
 let failureRecorded=false;

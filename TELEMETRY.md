@@ -97,11 +97,11 @@ SHA or time; `production.py status` on the host shows those.
 
 Collector stop codes: `capture_overload`, `collection_disabled`,
 `collector_already_owned`, `collector_disabled`, `collector_lease_lost`,
-`disk_reserve`, `durable_capture_failed`, `live_account_required`,
+`disk_reserve`, `durable_capture_failed`, `host_id_invalid`, `live_account_required`,
 `private_session_required`, `provider_auth_failed`, `provider_connect_timeout`,
 `provider_disconnected`, `provider_initialization_failed`, `provider_not_ready`,
 `provider_page_stalled`, `provider_protocol_error`, `session_already_owned`,
-`session_handover_not_confirmed`, `spool_corrupt`, `spool_full`,
+`session_claim_lost`, `session_handover_not_confirmed`, `spool_corrupt`, `spool_full`,
 `telegram_identity_mismatch`, `telegram_pairing_required`,
 `whatsapp_identity_mismatch`, `whatsapp_logged_out`, `whatsapp_pairing_required`.
 
@@ -112,7 +112,7 @@ Telegram only: `durable_capture_failed.capture_error`,
 WhatsApp only: `provider_disconnected.exit_clean`,
 `provider_disconnected.exit_error`, `provider_disconnected.exit_killed`,
 `provider_disconnected.exit_other`, `provider_disconnected.exit_panic`,
-`provider_disconnected.exit_signal`.
+`provider_disconnected.exit_signal`, `session_claim_unsupported`.
 
 The payload contains the release, environment, fixed component/error code,
 allowlisted exception type, public Python filenames/line numbers and, for Telegram

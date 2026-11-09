@@ -64,7 +64,8 @@ def main():
         'principal-info','delivery-endpoints-list','disable-delivery-endpoint','enable-delivery-endpoint',
         'reload-delivery-policy','set-delivery-features','migrate-expand','set-module-cursor','abandon-module-gap',
         'module-router-status','set-dynamic-subscriptions','set-source-filters',
-        'set-source-exclusions','wake-targets-list','disable-wake-target','enable-wake-target','sync-latency'])
+        'set-source-exclusions','wake-targets-list','disable-wake-target','enable-wake-target','sync-latency',
+        'session-claim-list','session-claim-release'])
     parser.add_argument('--principal')
     parser.add_argument('--accounts',nargs='+')
     parser.add_argument('--key-file',type=Path)
@@ -99,6 +100,9 @@ def main():
     parser.add_argument('--dump-command',help='Operator-only JSON argv; never a shell string')
     parser.add_argument('--recovery-config',type=Path,help='Private operator JSON: quiesced sessions/settings/spools')
     parser.add_argument('--account')
+    parser.add_argument('--generation',type=int,help='session-claim-release: the generation the operator read')
+    parser.add_argument('--holder-id',help='session-claim-release: the holder_id the operator read')
+    parser.add_argument('--host-id',help='session-claim-release: the host_id the operator read')
     parser.add_argument('--platform',choices=['telegram','whatsapp'])
     parser.add_argument('--label')
     parser.add_argument('--include-chats',nargs='*',default=[])
@@ -359,6 +363,30 @@ def main():
             if not args.feedback_ids or len(args.feedback_ids)!=1:parser.error(args.command+' requires one --id')
             print(json.dumps(store.set_wake_target_operator_state(args.feedback_ids[0],
                 args.command=='enable-wake-target')))
+        elif args.command=='session-claim-list':
+            # ANYM-914: every claim row (IDs and times only) and the restored accounts that have no row; read-only.
+            from . import session_claim as claims
+            with store.pool.connection() as c:
+                names=[args.account] if args.account else [r['account'] for r in c.execute('SELECT account FROM session_claims ORDER BY account')]
+                view=lambda r:{k:(v.isoformat() if hasattr(v,'isoformat') else v) for k,v in r.items()}
+                items=[view(r) for r in (c.execute(claims.ROW_SQL,(n,)).fetchone() for n in names) if r]
+                held=[r['account'] for r in c.execute("SELECT account FROM source_status WHERE status='restored_disabled' ORDER BY account")]
+                lone=[a for a in held if a not in {i['account'] for i in items} and (not args.account or a==args.account)
+                      and c.execute(claims.ROW_SQL,(a,)).fetchone() is None]
+            print(json.dumps({'items':items,'restored_without_claim':lone}))
+        elif args.command=='session-claim-release':
+            # ANYM-914: compare-and-set on the generation, holder_id and host_id the operator read; no row: a restored account only.
+            from . import session_claim as claims
+            if not args.account:parser.error('session-claim-release requires --account')
+            with store.pool.connection() as c:
+                if args.generation is None and not args.holder_id and not args.host_id:
+                    done=c.execute(claims.RESTORED_SQL,(args.account,)).fetchone() is not None and \
+                        c.execute(claims.ADMIN_RESTORE_SQL,(args.account,)).rowcount==1
+                elif args.generation is None or not args.holder_id or not args.host_id:
+                    parser.error('session-claim-release takes --generation, --holder-id and --host-id together')
+                else:
+                    done=c.execute(claims.ADMIN_RELEASE_SQL,(args.account,args.generation,args.holder_id,args.host_id)).rowcount==1
+            print(json.dumps({'account':args.account,'released':done}))
         elif args.command=='sync-latency':
             # ANYM-865: every account and subscription, read-only; the same rows get_sync_status(include_latency) returns.
             from .stage_latency import read,table

@@ -36,8 +36,8 @@ func testConfig(t *testing.T) Config {
 	t.Helper()
 	root := t.TempDir()
 	_ = os.Chmod(root, 0700)
-	c := Config{Account: "test", ExpectedWID: "123456@c.us", SessionDirectory: filepath.Join(root, "session"), EventsDirectory: filepath.Join(root, "events"), PagesDirectory: filepath.Join(root, "pages"), MaxMediaBytes: 8 << 20}
-	for _, d := range []string{c.SessionDirectory, c.EventsDirectory, c.PagesDirectory} {
+	c := Config{Account: "test", ExpectedWID: "123456@c.us", SessionDirectory: filepath.Join(root, "session"), EventsDirectory: filepath.Join(root, "events"), PagesDirectory: filepath.Join(root, "pages"), MaxMediaBytes: 8 << 20, SessionLockDirectory: filepath.Join(root, "locks")}
+	for _, d := range []string{c.SessionDirectory, c.EventsDirectory, c.PagesDirectory, c.SessionLockDirectory} {
 		if e := os.Mkdir(d, 0700); e != nil {
 			t.Fatal(e)
 		}
@@ -493,6 +493,61 @@ func TestExclusiveNativeSessionLock(t *testing.T) {
 	}
 }
 
+// spec: ANYM-914
+func TestExecuteRefusesWithoutInheritedClaimBeforeOpeningAuth(t *testing.T) {
+	c := testConfig(t)
+	configPath := filepath.Join(filepath.Dir(c.SessionDirectory), "config.json")
+	if err := os.WriteFile(configPath, mustJSON(c), 0600); err != nil {
+		t.Fatal(err)
+	}
+	other, err := os.CreateTemp(c.SessionLockDirectory, "other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	for _, value := range []string{"", "x", "2", strconv.Itoa(int(other.Fd()))} {
+		t.Setenv("ANYMSG_SESSION_CLAIM_FD", value)
+		for _, pair := range []bool{false, true} {
+			if e := execute(configPath, pair); e == nil || e.Error() != "session_claim_required" {
+				t.Fatal(value, pair, e)
+			}
+		}
+	}
+	if _, e := os.Stat(filepath.Join(c.SessionDirectory, "auth.sqlite")); !errors.Is(e, os.ErrNotExist) {
+		t.Fatal("opened auth without the claim", e)
+	}
+	if _, e := os.Stat(filepath.Join(c.SessionDirectory, "native-owner.lock")); !errors.Is(e, os.ErrNotExist) {
+		t.Fatal("took the session lock without the claim", e)
+	}
+}
+
+// spec: ANYM-914
+func TestInheritedClaimAcceptsTheCanonicalLockDescriptor(t *testing.T) {
+	c := testConfig(t)
+	lock, err := os.OpenFile(filepath.Join(c.SessionLockDirectory, c.Account+".lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ANYMSG_SESSION_CLAIM_FD", strconv.Itoa(int(lock.Fd())))
+	if e := inheritedClaim(c); e != nil {
+		t.Fatal(e)
+	}
+	// A second open file description of the same file is held by someone else: refused.
+	second, err := os.OpenFile(filepath.Join(c.SessionLockDirectory, c.Account+".lock"), os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	t.Setenv("ANYMSG_SESSION_CLAIM_FD", strconv.Itoa(int(second.Fd())))
+	if e := inheritedClaim(c); e == nil || e.Error() != "session_claim_required" {
+		t.Fatal(e)
+	}
+}
+
 func TestNativeIPCProcessHelper(t *testing.T) {
 	if os.Getenv("ANYMSG_TEST_IPC_PROCESS") != "1" {
 		return
@@ -538,8 +593,13 @@ func TestNativeProcessExitsWithInheritedBlockingIPC(t *testing.T) {
 			}
 			defer peer.Close()
 			cmd := exec.Command(os.Args[0], "-test.run=^TestNativeIPCProcessHelper$")
-			cmd.Env = append(os.Environ(), "ANYMSG_TEST_IPC_PROCESS=1", "ANYMSG_TEST_IPC_CONFIG="+configPath, "ANYMSG_WHATSAPP_SEND_FD=3")
-			cmd.ExtraFiles = []*os.File{childFile}
+			claimFile, err := os.OpenFile(filepath.Join(config.SessionLockDirectory, config.Account+".lock"), os.O_CREATE|os.O_RDWR, 0600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer claimFile.Close()
+			cmd.Env = append(os.Environ(), "ANYMSG_TEST_IPC_PROCESS=1", "ANYMSG_TEST_IPC_CONFIG="+configPath, "ANYMSG_WHATSAPP_SEND_FD=3", "ANYMSG_SESSION_CLAIM_FD=4")
+			cmd.ExtraFiles = []*os.File{childFile, claimFile}
 			stdin, err := cmd.StdinPipe()
 			if err != nil {
 				t.Fatal(err)

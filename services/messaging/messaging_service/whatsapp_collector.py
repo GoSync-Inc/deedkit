@@ -1,7 +1,7 @@
 """WhatsApp supervisor: fenced ownership, durable capture and bounded private IPC."""
 import asyncio
 import base64
-from contextlib import suppress
+from contextlib import nullcontext,suppress
 import json
 import os
 from pathlib import Path
@@ -17,8 +17,9 @@ from psycopg.types.json import Jsonb
 from .identifiers import SEND_ID_RE
 from .archive import Archive
 from .blobs import BlobWriter
-from .collector_state import CaptureSpool,CollectorState,session_lock,validate_capture as validate_capture
+from .collector_state import CaptureSpool,CollectorState,private_session_directory,session_lock,validate_capture as validate_capture
 from .store import Store
+from . import session_claim
 from .collector_common import DbBackoff,commit_items,validate_common,validate_ranges
 from .telegram_collector import TelegramCollector,ProviderUnavailable,private_json
 from .error_codes import CODES
@@ -72,7 +73,7 @@ def configuration(path):
     fields={'enabled','account','expected_wid','permit_file','session_directory','events_directory',
         'pages_directory','chromium_executable','node_executable','batch_size','scan_interval_seconds',
         'max_media_bytes','disk_reserve_bytes','max_dialogs',
-        'provider','native_executable','whatsapp_gap_repair'}|MEDIA_POLICY_FIELDS
+        'provider','native_executable','whatsapp_gap_repair','session_lock_directory'}|MEDIA_POLICY_FIELDS
     validate_common(cfg,fields)
     if not re.fullmatch(r'[0-9]{5,20}@c.us',cfg.get('expected_wid','')): raise ValueError('invalid_whatsapp_identity')
     # Legacy configs retain their existing session; new setup templates select native.
@@ -81,6 +82,9 @@ def configuration(path):
     executables=['chromium_executable','node_executable'] if provider=='webjs' else ['native_executable']
     for name in ['permit_file','session_directory','events_directory','pages_directory',*executables]:
         if not isinstance(cfg.get(name),str) or not Path(cfg[name]).is_absolute(): raise ValueError('invalid_private_path')
+    lock_directory=cfg.get('session_lock_directory')  # ANYM-914; default session_claim.LOCK_DIRECTORY
+    if lock_directory is not None and (not isinstance(lock_directory,str) or not Path(lock_directory).is_absolute()):
+        raise ValueError('invalid_private_path')
     private=[Path(cfg[name]).resolve() for name in ['session_directory','events_directory','pages_directory']]
     if any(a==b or a in b.parents or b in a.parents for i,a in enumerate(private) for b in private[i+1:]):
         raise ValueError('collector_directories_overlap')
@@ -327,8 +331,9 @@ def whatsapp_asset(name):
 class NodeProvider:
     # ANYM-813: only the native cache can stall a catch-up for good (it never reports exhausted).
     native_history=False
-    def __init__(self,cfg,config_path,lock_fd,*,script=None):
+    def __init__(self,cfg,config_path,lock_fd,*,script=None,claim_fd=None):
         self.cfg,self.config_path,self.lock_fd=cfg,str(config_path),lock_fd
+        self.claim_fd=claim_fd  # ANYM-914: the canonical host lock, inherited by the native child
         self.script=script or whatsapp_asset('provider.mjs')
         self.process=None; self.lock=asyncio.Lock(); self.counter=0; self.policy=None
         self.send_lock=asyncio.Lock();self.disconnect_lock=asyncio.Lock()
@@ -351,9 +356,12 @@ class NodeProvider:
         parent,child=socket.socketpair()
         try:
             env={**os.environ,'ANYMSG_WHATSAPP_SEND_FD':str(child.fileno())}
+            inherited=(self.lock_fd,child.fileno())
+            if self.claim_fd is not None:
+                env[session_claim.CLAIM_FD_ENV]=str(self.claim_fd); inherited=(*inherited,self.claim_fd)
             self.process=await asyncio.create_subprocess_exec(*self.command(),
                 stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL,
-                limit=1024*1024+1,pass_fds=(self.lock_fd,child.fileno()),env=env,start_new_session=True)
+                limit=1024*1024+1,pass_fds=inherited,env=env,start_new_session=True)
             child.close()
             parent.setblocking(False)
             self.send_reader,self.send_writer=await asyncio.open_connection(sock=parent,limit=1024*1024+1)
@@ -616,8 +624,8 @@ class WhatsmeowProvider(NodeProvider):
     profile locks, and an error never switches it to another provider/session.
     """
     native_history=True
-    def __init__(self,cfg,config_path,lock_fd):
-        super().__init__(cfg,config_path,lock_fd,script=Path(cfg['native_executable']))
+    def __init__(self,cfg,config_path,lock_fd,claim_fd=None):
+        super().__init__(cfg,config_path,lock_fd,script=Path(cfg['native_executable']),claim_fd=claim_fd)
     def command(self):
         return [self.cfg['native_executable'],'--config',self.config_path]
     def prepare_session(self):
@@ -632,9 +640,21 @@ class WhatsmeowProvider(NodeProvider):
         except Exception:return None
 
 
-def provider_for_config(cfg,path,lock_fd):
-    cls=WhatsmeowProvider if cfg.get('provider')=='whatsmeow' else NodeProvider
-    return cls(cfg,path,lock_fd)
+def provider_for_config(cfg,path,lock_fd,claim_fd=None):
+    if cfg.get('provider')=='whatsmeow': return WhatsmeowProvider(cfg,path,lock_fd,claim_fd)
+    return NodeProvider(cfg,path,lock_fd)
+
+
+def claims_on(cfg):
+    """ANYM-914: claims are on wherever the canonical lock directory is mounted (every Compose overlay mounts it) or
+    a configured one exists; an override never hides the canonical mount."""
+    return any(Path(p).exists() for p in (session_claim.LOCK_DIRECTORY,cfg.get('session_lock_directory')) if p)
+
+
+def refuse_unclaimed_browser(cfg):
+    # The browser fallback is not claimed: Chromium can outlive Node without any inherited descriptor, so a
+    # re-lock proves nothing about it. It runs only from an overlay without the lock mount (COLLECTORS.md).
+    if cfg.get('provider')!='whatsmeow' and claims_on(cfg): raise RuntimeError('session_claim_unsupported')
 
 
 def require_paired_session(cfg):
@@ -854,17 +874,27 @@ async def run_config(path):
     if not session.is_dir() or session.is_symlink() or session.stat().st_mode&0o077:
         raise RuntimeError('private_session_required')
     require_paired_session(cfg)
-    with session_lock(session) as lock_fd:
-        if cfg.get('provider')!='whatsmeow':clear_browser_runtime_locks(session)
-        store=Store(Path(os.environ['DATABASE_URL_FILE']).read_text().strip(),Path(os.environ['PROBE_FILES']),'http://collector.invalid')
-        try:
+    refuse_unclaimed_browser(cfg)  # before any lock, Node spawn or session open
+    native=cfg.get('provider')=='whatsmeow'
+    os.close(private_session_directory(session))  # a shared directory is refused before any lock or account check
+    # ANYM-914: canonical host lock, session flock, claim, then the child that opens auth.sqlite.
+    with (session_claim.host_lock(cfg['account'],cfg.get('session_lock_directory')) if native else nullcontext()) as host,\
+            session_lock(session) as lock_fd:
+        if not native:clear_browser_runtime_locks(session)
+        def open_store():
+            return Store(Path(os.environ['DATABASE_URL_FILE']).read_text().strip(),Path(os.environ['PROBE_FILES']),'http://collector.invalid')
+        def check(store):
             with store.pool.connection() as c:
                 row=c.execute('SELECT platform,synthetic FROM accounts WHERE id=%s',(cfg['account'],)).fetchone()
                 if not row or row['platform']!='whatsapp' or row['synthetic']:raise RuntimeError('live_account_required')
+        store=await session_claim.open_waiting(open_store,check,cfg['account'])  # a database outage at start waits
+        try:
+            claim=await session_claim.acquire_waiting(store.pool,host,'collector') if native else None
             live_writer=(BlobWriter(store.files,max_bytes=cfg['media_live_max_bytes'],
                 reserve_bytes=cfg['media_live_disk_reserve_bytes'])
                 if cfg['media_live_disk_reserve_bytes'] is not None else None)
-            worker=WhatsAppCollector(Archive(store),cfg['account'],provider_for_config(cfg,path,lock_fd),
+            worker=WhatsAppCollector(Archive(store),cfg['account'],
+                provider_for_config(cfg,path,lock_fd,host.fd if native else None),
                 CaptureSpool(cfg['pages_directory'],reserve_bytes=cfg['disk_reserve_bytes']),
                 events_spool=CaptureSpool(cfg['events_directory'],reserve_bytes=cfg['disk_reserve_bytes']),
                 batch_size=cfg['batch_size'],interval=cfg['scan_interval_seconds'],max_dialogs=cfg['max_dialogs'],
@@ -873,6 +903,12 @@ async def run_config(path):
                 live_window_seconds=cfg['media_live_window_seconds'],
                 gap_repair=cfg['whatsapp_gap_repair'],
                 writer=BlobWriter(store.files,max_bytes=cfg['max_media_bytes'],reserve_bytes=cfg['media_disk_reserve_bytes']))
+            if claim is not None:
+                worker.session_claim=(store.pool,claim)
+                async def release_claim():
+                    # Only after the child was reaped and a fresh descriptor proves no descendant holds the lock.
+                    if session_claim.descendants_gone(host): await session_claim.release_bounded(store.pool,claim)
+                worker.release_claim=release_claim
             loop=asyncio.get_running_loop()
             for sig in [signal.SIGTERM,signal.SIGINT]: loop.add_signal_handler(sig,worker.stopping.set)
             await worker.run()

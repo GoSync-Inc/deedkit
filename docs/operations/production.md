@@ -1146,6 +1146,52 @@ image/config ([platform-cutover.md](platform-cutover.md)). Do not use `down -v`,
 prune unrelated objects or restart a stale calendar writer. Keep the previous
 images until acceptance.
 
+### Session claim guards (ANYM-914)
+
+A release that runs the session services (the collectors and pairing commands, schema 78) gets four refusals from
+`production.py`; each surfaces as the existing `plan_a_refused` halt with its code in the reason:
+
+- `session_locks_unmounted`: the release carries `session_claim.py` and a session service (a `-session` bind) in the
+  host's Compose files does not bind `/run/deedkit/session-locks` or stops with a `stop_grace_period` under 20 s.
+  Refused in `prepare` and again in `apply`, before anything stops. A release never edits the host's Compose files;
+  install the change first (First claim release below).
+- `session_locks_unsafe`: the host directory mounted at `/run/deedkit/session-locks` (`deploy/private/session-locks`)
+  is created once, 0700 for uid 10001, by `prepare` and checked again by `apply`; an existing one that is a symlink, not
+  a directory, group- or other-accessible or of another owner is refused, never repaired. Fix it by hand
+  (`chown 10001:10001`, `chmod 700`); never copy it from another host.
+- `foreign_session_opener`: before a release restarts a service with a `-session` bind, no running, paused or
+  restarting container other than that directory's own Compose service may mount the session directory or a mount
+  source (bind or named volume) holding a session store (`*.session`, `auth.sqlite`, a browser profile). The configured
+  services' own mounts are searched two levels down; every other container's mounts four levels down, outside the
+  configured services' data paths. A foreign mount with more than 20000 entries in those levels refuses too (its
+  ownership cannot be established): read it, and when it holds no session store list its host path in
+  `session_scan_exempt` (production settings, a list of absolute paths). Stop the one-off or foreign container first.
+- `pre_claim_rollback_refused`: once a release ran claims healthy (`state/session-claims.json`), `rollback`, `deploy`
+  and a by-hand `apply` to a tree without `session_claim.py` need `--pre-claim-rollback "<reason>"`, and only while one
+  host runs sessions (an older tree takes no claim, so a second host could open the same session).
+
+An unreadable container listing or claims record refuses too, so it halts deploys until the agent clears the cause.
+
+First claim release (hand route). The first release carrying `session_claim.py` cannot run unattended: its range
+changes the tool pair and adds migration 078 (`migration_by_hand`), and the host's Compose files need the lock mount.
+The agent who releases it, in this order:
+
+1. Read-only transition inventory on the production host and the Mac mini, receipt in the release record: every
+   container and host process that holds or mounts a session store, and every autostart (restart policies, systemd
+   units, cron, launchd) that could start one, is exactly the configured session services. PR #806 holds the first
+   receipt; repeat it right before the release.
+2. Install the host Compose change, with a copy of each file for undo: the bind
+   `./private/session-locks:/run/deedkit/session-locks` on `telegram`, `whatsapp1` and `whatsapp2` (as
+   `deploy/compose.collectors.yaml` and `deploy/compose.whatsapp.yaml`), and `stop_grace_period: 25s` on `telegram`.
+   The directory itself is created by `prepare`.
+3. Install the tool pair of the release SHA ("Deploy tool updates"), then release the migration by the hand route of
+   "Migration releases and the backup gate", item 4. The backup receiver reads schema 78 only after its own update; that
+   is a backup follow-up, never a release hold.
+4. After `applied`: `session_owner` on the full sync status shows generation 1 or more for every session service.
+
+Undo: before step 3, restore the copied Compose files. After it, a rollback to a pre-claim tree needs
+`--pre-claim-rollback "<reason>"` (above); migration 078 stays (expand only).
+
 ### Waiting for a running backup (ANYM-744)
 
 `apply`, the standalone `seamless_release.py promote` and a manual `deploy` (not `--auto`, not `--dry-run`) wait up to

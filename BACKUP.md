@@ -283,7 +283,9 @@ the live DB is updated. When proxy configuration is added, include it in the exp
 list of settings sources; this does not replace a backup of the previous application and its DB.
 
 Restore first checks all hashes, then revokes the stored keys and disables
-the collectors. The old gateway 0.4 must not be run over a restored schema 5: it
+the collectors. It also holds every provider-session claim (`session_claims.restore_hold`, schema 78; a pre-claim backup is
+held by its `restored_disabled` status): before re-enabling collectors on a restored database, stop the original
+environment's session services, then run `deedkit admin session-claim release` per account (COLLECTORS.md, ANYM-914). The old gateway 0.4 must not be run over a restored schema 5: it
 ignores the new chat/operation restrictions. Code, schema and role grants versions
 are restored consistently. Policy details: [ACCESS.md](ACCESS.md).
 
