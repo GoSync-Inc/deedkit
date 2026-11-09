@@ -231,6 +231,21 @@ def test_registered_original_is_streamed_without_path_in_result(tmp_path):
     assert isinstance(call.media.file, types.InputFile)
 
 
+# spec: ANYM-927
+def test_a_silent_telegram_send_file_sends_the_media_without_sound(tmp_path):
+    original = tmp_path / 'original.bin'
+    original.write_bytes(b'synthetic original')
+    import hashlib
+    digest = hashlib.sha256(original.read_bytes()).hexdigest()
+    sent = []
+    for parameters in ({'mode': 'document', 'silent': True}, {'mode': 'document'}):
+        client = Client()
+        result = run(client, 'send_file', parameters, registered_file_path=str(original), file_digest=digest)
+        assert result['outcome'] == 'confirmed'
+        sent.append(next(c for c in client.calls if isinstance(c, functions.messages.SendMediaRequest)))
+    assert sent[0].silent is True and sent[1].silent is None
+
+
 def test_registered_original_symlink_or_oversize_rejected_before_provider(tmp_path):
     original = tmp_path / 'original.bin'
     original.write_bytes(b'file')

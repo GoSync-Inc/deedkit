@@ -25,7 +25,7 @@ from starlette.routing import Route
 
 from .store import APIError, Store, digest
 from .security_logging import redact_library_logs
-from . import __version__
+from . import __version__, silent_send
 from .error_details import payload,classified as classified
 from .field_errors import field_error,pydantic_field_errors
 from .presentation import options, render
@@ -99,9 +99,9 @@ OMITTED_WHEN_NONE = {'create_subscription':('chat_ids','sources','wake_rules','r
     'update_subscription':('exclude_chats','exclusions_revision'),
     # ANYM-736: an omitted guard keeps every request, hash and stored row as before.
     # ANYM-748: so does an omitted allow_duplicate.
-    # ANYM-837: so does an omitted menu_choice.
-    'send_message':('expected_last_message_id','guard','allow_duplicate','menu_choice'),
-    'preview_message':('menu_choice',),'get_send_status':('send_id','request_id')}
+    # ANYM-837: so does an omitted menu_choice. ANYM-927: and an omitted silent.
+    'send_message':('expected_last_message_id','guard','allow_duplicate','menu_choice','silent'),
+    'preview_message':('menu_choice','silent'),'get_send_status':('send_id','request_id')}
 # ANYM-837: answering a WhatsApp bot menu, in the argument's schema (the send_message description is at its cap).
 MENU_CHOICE=('WhatsApp bot menu answer (native adapter only): {message_id, option_id}, message_id the archived menu in '
     'this chat_id, option_id exactly as shown after "[id: " in its option line. Sends the structured reply a phone '
@@ -474,7 +474,8 @@ def register_send_tools(mcp, call, async_call, read):
                         phone: StrictStr='',username: StrictStr='',reply_to: StrictStr='',format: MessageFormat='plain',
                         link_preview: StrictBool=False,allow_lossy: StrictBool=False,
                         menu_choice: Annotated[dict[str,StrictStr] | None,Field(description=MENU_CHOICE,
-                                                                                json_schema_extra=no_schema_default)]=None
+                                                                                json_schema_extra=no_schema_default)]=None,
+                        silent: Annotated[StrictBool | None,Field(description=silent_send.DESCRIPTION,json_schema_extra=no_schema_default)]=None
                         ) -> dict[str,Any]:
         """Render an authorized draft without sending or queuing.
 
@@ -499,7 +500,8 @@ def register_send_tools(mcp, call, async_call, read):
         return await async_call(ctx,'preview_message',account=account,chat_id=chat_id,phone=phone,username=username,
             text=text,
             reply_to=reply_to,format=format,link_preview=link_preview,allow_lossy=allow_lossy,
-            **({'menu_choice':menu_choice} if menu_choice is not None else {}))
+            **({'menu_choice':menu_choice} if menu_choice is not None else {}),
+            **({'silent':silent} if silent is not None else {}))
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(readOnlyHint=False,
         destructiveHint=True,idempotentHint=True,openWorldHint=True))
@@ -513,7 +515,8 @@ def register_send_tools(mcp, call, async_call, read):
                      allow_duplicate: Annotated[StrictBool | None,Field(description=ALLOW_DUPLICATE,
                                                                           json_schema_extra=no_schema_default)]=None,
                      menu_choice: Annotated[dict[str,StrictStr] | None,Field(description=MENU_CHOICE,
-                                                                             json_schema_extra=no_schema_default)]=None
+                                                                             json_schema_extra=no_schema_default)]=None,
+                     silent: Annotated[StrictBool | None,Field(description=silent_send.DESCRIPTION,json_schema_extra=no_schema_default)]=None
                      ) -> dict[str,Any]:
         """Send exact confirmed content using this account's existing collector.
 
@@ -554,7 +557,7 @@ def register_send_tools(mcp, call, async_call, read):
         duplicate_send_unresolved (409); see allow_duplicate.
         """
         guarded={k:v for k,v in (('expected_last_message_id',expected_last_message_id),('guard',guard),
-                                 ('allow_duplicate',allow_duplicate),('menu_choice',menu_choice)) if v is not None}
+                                 ('allow_duplicate',allow_duplicate),('menu_choice',menu_choice),('silent',silent)) if v is not None}
         return await async_call(ctx,'send_message',account=account,chat_id=chat_id,phone=phone,username=username,
             text=text,
             request_id=request_id,reply_to=reply_to,format=format,preview_digest=preview_digest,
@@ -1563,6 +1566,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
             else:
                 phone=phone_send.recipient(arguments.get('chat_id',''),arguments.pop('phone',''))
                 if phone is not None:arguments.pop('chat_id',None);arguments['phone']=phone
+            silent_send.chat_id_only(arguments,phone,username)  # ANYM-927: silent rides only a chat_id send.
         if method in ('preview_message','send_message') and (phone is not None or username is not None) and (
                 arguments.get('menu_choice') is not None):
             # ANYM-837: a menu is answered in the chat that sent it, by its archive chat_id.

@@ -15,6 +15,7 @@ from .identifiers import ACCOUNT_RE, SEND_ID_RE, WA_CHAT_RE
 from .envelope import canonical, stable_id
 from .policy import audit, effective_permissions, lock_principal, targets
 from .store import APIError, serial
+from .silent_send import check as silent_check, render_policy, unsupported as silent_unsupported
 from .subscriptions import journal_send_failures
 
 
@@ -97,10 +98,10 @@ def permitted(p, account, chat):
     return account in p['accounts'] and (p['chat_ids'] is None or chat in p['chat_ids'])
 
 
-def format_options(format,link_preview,allow_lossy,preview_digest=''):
+def format_options(format,link_preview,allow_lossy,preview_digest='',silent=False):
     if not isinstance(format,str) or format not in ('plain','markdown','html'):
         raise APIError('invalid_message_format')
-    if type(link_preview) is not bool or type(allow_lossy) is not bool:
+    if type(link_preview) is not bool or type(allow_lossy) is not bool or type(silent) is not bool:
         raise APIError('invalid_parameters')
     if not isinstance(preview_digest,str) or (preview_digest and not re.fullmatch(r'[a-f0-9]{64}',preview_digest)):
         raise APIError('preview_mismatch',409)
@@ -143,16 +144,18 @@ def target(c,p,account,chat_id,reply_to):
     return chat,reply_id
 
 
-def reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id,menu=None):
-    """menu (ANYM-837): a resolved menu_choice; its menu, revision, type, option and label join the digest."""
+def reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id,menu=None,silent=False):
+    """menu (ANYM-837): a resolved menu_choice; its menu, revision, type, option and label join the digest.
+    silent (ANYM-927): Telegram only; it joins the digest through the render policy (silent_send.py)."""
     from .formatting import render_message
     from .whatsapp_capabilities import account_provider
+    silent_check(silent,chat['platform'])
     if (link_preview and chat['platform']=='whatsapp' and
         account_provider(c,account,'whatsapp')=='whatsmeow'):
         raise APIError('link_preview_unsupported',409)
     artifact=render_message(chat['platform'],text,format=format,
         link_preview=link_preview,allow_lossy=allow_lossy)
-    policy={'link_preview':link_preview,'allow_lossy':allow_lossy}
+    policy=render_policy(link_preview,allow_lossy,silent)
     # This binds a scoped draft, never the owner's identity or approval.
     bound={'principal':p['id'],'scope_version':p['scope_version'],
         'account':account,'chat_id':chat_id,'provider_chat':chat['provider_chat'],
@@ -165,21 +168,25 @@ def reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,c
     draft={**artifact,'account':account,'chat_id':chat_id,'provider_chat_id':chat['provider_chat'],
         'reply_to':reply_to,'reply_provider_id':reply_id,'render_policy':policy,
         'preview_digest':digest,'owner_approval_verified_by_server':False}
+    if silent:draft['silent']=True
     if menu is not None:
         from . import menu_choice
         draft['menu_choice']=menu_choice.preview_block(menu,chat)
     return draft
 
 
-def preview(c,p,account,chat_id,text,reply_to='',format='plain',link_preview=False,allow_lossy=False,menu_choice=None):
+def preview(c,p,account,chat_id,text,reply_to='',format='plain',link_preview=False,allow_lossy=False,menu_choice=None,
+            silent=False):
     """Render a scoped draft without provider calls, readiness or enqueueing."""
-    format_options(format,link_preview,allow_lossy)
+    format_options(format,link_preview,allow_lossy,silent=silent)
     if menu_choice is not None:
+        # A menu is answered only on WhatsApp, which has no silent send (ANYM-927).
+        if silent:raise silent_unsupported()
         chat,menu=menu_target(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,menu_choice)
         return reviewed(c,p,account,chat_id,menu['label'],menu['message_id'],'plain',False,False,chat,
             menu['provider_message_id'],menu)
     chat,reply_id=target(c,p,account,chat_id,reply_to)
-    return reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id)
+    return reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id,silent=silent)
 
 
 def menu_arguments(text,reply_to,format,link_preview,allow_lossy,menu_choice):
@@ -235,8 +242,8 @@ def dispatch_payload(job,platform):
             if (not isinstance(artifact,dict) or not isinstance(policy,dict) or
                 set(artifact)!={'format','source_text','rendered_text','provider_text','entities',
                     'provider_payload','warnings','links','utf16_units','renderer_version'} or
-                set(policy)!={'link_preview','allow_lossy'} or
-                any(type(v) is not bool for v in policy.values()) or
+                set(policy)-{'silent'}!={'link_preview','allow_lossy'} or
+                any(type(v) is not bool for v in policy.values()) or policy.get('silent',True) is not True or
                 artifact.get('format') not in ('plain','markdown','html') or
                 artifact.get('format')!=job.get('source_format') or
                 not isinstance(artifact.get('source_text'),str) or
@@ -266,6 +273,10 @@ def dispatch_payload(job,platform):
                 not re.fullmatch(r'[a-f0-9]{64}',job['preview_digest'])):
                 raise ValueError('invalid_persisted_digest')
         payload=validate_provider_payload(platform,payload)
+        if isinstance(job.get('render_policy'),dict) and job['render_policy'].get('silent') is True:
+            # ANYM-927: a silent row was previewed for a Telegram chat; no other platform sends it, loud or not.
+            if platform!='telegram':raise ValueError('silent_unsupported')
+            payload={**payload,'silent':True}
         if choice is not None:
             if payload.get('text')!=choice['label'] or payload.get('link_preview') is not False:
                 raise ValueError('invalid_persisted_menu_choice')
@@ -555,13 +566,14 @@ def outbound_status(c,accounts):
 
 def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
             preview_digest='',link_preview=False,allow_lossy=False,phone_hash=None,child=False,
-            expected_last_message_id=None,guard=None,duplicate_guard=False,allow_duplicate=None,menu_choice=None):
+            expected_last_message_id=None,guard=None,duplicate_guard=False,allow_duplicate=None,menu_choice=None,silent=False):
     """menu_choice (ANYM-837): {message_id, option_id} of an archived WhatsApp menu, answered with its structured
     reply; it needs its own preview_digest and stores the archived label as the text.
     expected_last_message_id, guard (ANYM-736): the optional chat-head precondition, send_guard.py.
     duplicate_guard (ANYM-748): only the send_message tool passes True; allow_duplicate=True skips it for one call.
     phone_hash: a phone send (ANYM-532) whose digest the caller checked; it is the request hash.
-    child: a messages_send step (ANYM-546) under its child key; only such a call may use the child prefix."""
+    child: a messages_send step (ANYM-546) under its child key; only such a call may use the child prefix.
+    silent (ANYM-927): Telegram without a notification sound, with its own preview_digest (silent_send.py)."""
     def refused(error,resolved=False):
         # ANYM-646: a caller's own send names the preview call; a phone step or a messages_send child keeps its body.
         # The chat is echoed only once it resolves for this key; a malformed digest is refused before that.
@@ -571,16 +583,17 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
             except Exception:return error
         from . import preview_refusal
         return preview_refusal.send(error,p,account,chat_id,reply_to=reply_to if isinstance(reply_to,str) else '',
-            format=format,link_preview=link_preview,allow_lossy=allow_lossy)
+            format=format,link_preview=link_preview,allow_lossy=allow_lossy,silent=silent)
     if menu_choice is not None:
         if phone_hash is not None or child:
             from .field_errors import refusal as field_refusal
             raise field_refusal('invalid_parameters',[('menu_choice','format','a chat_id send_message')])
-        format_options(format,link_preview,allow_lossy,preview_digest)
+        format_options(format,link_preview,allow_lossy,preview_digest,silent)
+        if silent:raise silent_unsupported()
         menu_arguments(text,reply_to,format,link_preview,allow_lossy,menu_choice)
         return enqueue_menu_choice(c,p,account,chat_id,text,request_id,preview_digest,expected_last_message_id,guard,
             duplicate_guard,allow_duplicate,menu_choice)
-    try:format_options(format,link_preview,allow_lossy,preview_digest)
+    try:format_options(format,link_preview,allow_lossy,preview_digest,silent)
     except APIError as error:raise refused(error) from None
     # Source length is bounded by the renderer; the actual provider wire payload
     # must satisfy the conservative 4000 UTF-16-unit limit.
@@ -598,7 +611,7 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
     if guarded:
         from . import send_guard
         send_guard.validate(expected_last_message_id,guard)
-    chat,reply_id=target(c,p,account,chat_id,reply_to)
+    chat,reply_id=target(c,p,account,chat_id,reply_to);silent_check(silent,chat['platform'])
     guard_refusal=None
     if guarded and not c.execute('SELECT 1 FROM outgoing_messages WHERE principal=%s AND request_id=%s',
             (p['id'],request_id)).fetchone():
@@ -608,7 +621,7 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
         # between this read and the insert is the guard's documented limit.
         try:send_guard.check(c,p,account,chat_id,chat['platform'],expected_last_message_id,guard)
         except APIError as failure:guard_refusal=failure
-    default_policy=format=='plain' and not link_preview and not allow_lossy
+    default_policy=format=='plain' and not link_preview and not allow_lossy and not silent
     legacy_hash=hashlib.sha256(canonical([account,chat_id,text,reply_id])).hexdigest()
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('outgoing:'+p['id'],))
     existing=c.execute('SELECT * FROM outgoing_messages WHERE principal=%s AND request_id=%s',
@@ -628,15 +641,15 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
                 existing['account']==account and existing['chat']==chat_id and
                 existing['provider_chat']==chat['provider_chat'] and existing['reply_provider_id']==reply_id and
                 existing.get('source_text')==text and existing.get('source_format')==format and
-                existing.get('render_policy')=={'link_preview':link_preview,'allow_lossy':allow_lossy} and
+                existing.get('render_policy')==render_policy(link_preview,allow_lossy,silent) and
                 (existing.get('preview_digest') or '')==preview_digest)
         if not matches:raise APIError('idempotency_conflict',409)
         return result(existing,c,p)
     if guard_refusal is not None:raise guard_refusal
     if duplicate_guard and allow_duplicate is not True:
-        refuse_unresolved_duplicate(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id)
+        refuse_unresolved_duplicate(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id,silent=silent)
     if not default_policy and not preview_digest:raise refused(APIError('preview_required',409),True)
-    draft=reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id)
+    draft=reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id,silent=silent)
     if phone_hash is None and preview_digest and preview_digest!=draft['preview_digest']:
         raise refused(APIError('preview_mismatch',409),True)
     artifact={name:draft[name] for name in ('format','source_text','rendered_text','provider_text','entities',
@@ -769,9 +782,10 @@ MENU_DUPLICATE_SQL=f"""SELECT request_id,status FROM outgoing_messages
     ORDER BY created_at DESC LIMIT 1"""
 
 
-def unresolved_send(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id,option_id=None):
+def unresolved_send(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id,option_id=None,
+                    silent=False):
     """The newest unresolved earlier send of this principal with the same intent, or None."""
-    policy=Jsonb({'link_preview':link_preview,'allow_lossy':allow_lossy})
+    policy=Jsonb(render_policy(link_preview,allow_lossy,silent))
     if option_id is not None:
         return c.execute(MENU_DUPLICATE_SQL,(p['id'],account,chat_id,reply_id,option_id,request_id,
             CHILD_KEY_PREFIX)).fetchone()
@@ -780,7 +794,7 @@ def unresolved_send(c,p,account,chat_id,request_id,text,format,link_preview,allo
 
 
 def refuse_unresolved_duplicate(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id,
-                                option_id=None):
+                                option_id=None,silent=False):
     """ANYM-748: refuse a send whose same content to the same chat is still queued, dispatching or unknown.
 
     Runs under the principal lock, so of two concurrent identical calls one queues and the other sees it. Its own
@@ -790,7 +804,8 @@ def refuse_unresolved_duplicate(c,p,account,chat_id,request_id,text,format,link_
         with c.transaction():
             previous=c.execute("SELECT current_setting('statement_timeout') AS v").fetchone()['v']
             c.execute("SELECT set_config('statement_timeout',%s,true)",(str(DUPLICATE_TIMEOUT_MS),))
-            earlier=unresolved_send(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id,option_id)
+            earlier=unresolved_send(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id,option_id,
+                silent)
             c.execute("SELECT set_config('statement_timeout',%s,true)",(previous,))
     except Exception:
         raise APIError('chat_guard_unavailable',503) from None

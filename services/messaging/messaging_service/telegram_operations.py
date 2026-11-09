@@ -569,8 +569,9 @@ async def write_file(op):
                 round_message=mode == 'video_note', supports_streaming=mode == 'video'))
         media = types.InputMediaUploadedDocument(uploaded, mime, attributes, force_file=mode == 'document')
     random_id = secrets.randbits(63)
-    response = await invoke(functions.messages.SendMediaRequest(peer, media,
-        parameters.get('caption', ''), random_id=random_id, clear_draft=False, entities=[]), mutation=True)
+    response = await invoke(functions.messages.SendMediaRequest(peer, media, parameters.get('caption', ''),
+        silent=parameters.get('silent') is True or None, random_id=random_id, clear_draft=False, entities=[]),
+        mutation=True)  # ANYM-927: silent is a validated true or absent; None keeps the usual notification.
     return accepted_updates(response, chat, random_id)
 
 

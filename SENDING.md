@@ -410,6 +410,31 @@ Honest scope: this is not exactly-once delivery. Changed text, another chat or r
 child steps are not covered. Against a messaging service from before this change a call with
 `allow_duplicate` fails closed (`invalid_parameters`, `unknown_field`); one without it works as before.
 
+### Sending without a notification sound (`silent`, ANYM-927)
+
+On Telegram an agent can send to an archive `chat_id` without a notification sound, for example late in the
+evening: the recipient gets the message as usual, but their phone stays quiet. `preview_message` and
+`send_message` take the optional `silent` (boolean, no schema default; omitted or `false` is the usual send).
+`silent: true` counts as a nondefault policy, so it needs a preview: the preview shows `silent: true` (also in
+its `render_policy`), and its `preview_digest` binds it. A loud preview cannot be sent silent, or the reverse
+(`preview_mismatch`); a silent send without a digest is `preview_required`, and the refusal's `caller_supplies`
+names `silent`. The queued row keeps `silent: true` in its `render_policy`, so a retry with the same
+`request_id` must repeat it (else `idempotency_conflict`), and the duplicate check above treats a silent and a
+loud copy as different sends. The collector passes it to Telegram as `silent=True`.
+
+WhatsApp has no silent send. On a WhatsApp chat (and with `menu_choice`) `silent: true` is refused
+`silent_unsupported` with `field_errors: [{field: "silent", reason: "enum", allowed: [false]}]`, and nothing
+is queued. A phone recipient opens a WhatsApp chat, so it is refused `silent_unsupported` too. A Telegram
+`username` recipient is refused `invalid_parameters` (`silent`, `format`: a chat_id recipient): preview and
+send it again to its archive `chat_id` once the chat exists. `messages_send` does not take `silent`.
+
+`execute_messenger_operation` `send_file` on Telegram takes `silent` in `parameters` too. Its preview digest
+binds it, an explicit `false` is stored as the usual send, and on WhatsApp it is `silent_unsupported`.
+
+A messaging service from before this change refuses a call with `silent` (`unknown_field`); a call without it
+works as before. A silent row is refused before the provider by an older collector (`send_target_invalid`),
+so it is never sent with sound.
+
 ### Menu choices: answering a WhatsApp bot menu (`menu_choice`, ANYM-837, schema 71)
 
 Many WhatsApp bots act only on the structured reply a phone sends when the user taps a menu option; a

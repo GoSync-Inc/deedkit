@@ -299,6 +299,8 @@ def _fields(platform, name, spec):
              'last_name': _field('string', default='', maximum=64)})
     if platform == 'telegram' and name == 'list_contacts':
         return {**spec['fields'], 'query': _field('string', maximum=64, nonempty=True)}
+    if platform == 'telegram' and name == 'send_file':
+        return {**spec['fields'], 'silent': _field('boolean')}  # ANYM-927: true sends without a notification sound.
     if name == 'update_profile':
         names = ('name', 'status') if platform == 'whatsapp' else ('first_name', 'last_name', 'bio')
         return {n: _field('string', maximum=64 if n in ('name', 'first_name', 'last_name') else 139,
@@ -561,6 +563,10 @@ def validate_operation(platform, operation, parameters, *, provider=None):
     if parameters is None: parameters = {}
     if not isinstance(parameters, dict): raise ParameterError(field_error('parameters', 'type', 'object'))
     fields = _fields(platform, operation, spec)
+    if operation == 'send_file' and 'silent' not in fields and parameters.get('silent', False) is not False:
+        # ANYM-927: WhatsApp has no send without a notification sound; named, never an unknown field.
+        raise ParameterError(field_error('silent', 'enum', 'false: WhatsApp has no silent send', [False]),
+                             code='silent_unsupported')
     output, errors = {}, []
     try:
         for name, descriptor in fields.items():
@@ -598,6 +604,8 @@ def validate_operation(platform, operation, parameters, *, provider=None):
         for name, default in EDIT_DEFAULTS.items():
             if output.get(name, default) == default and type(output.get(name, default)) is type(default):
                 output.pop(name, None)
+    if operation == 'send_file' and output.get('silent') is False:
+        output.pop('silent')  # ANYM-927: an explicit false is the loud send of before, same parameters and digest.
     if operation == 'update_profile' and not output:
         raise ParameterError(field_error('parameters', 'required', 'at least one of ' + ', '.join(fields)))
     if operation == 'send_file' and (('attachment_id' in output)+('upload_id' in output)!=1):

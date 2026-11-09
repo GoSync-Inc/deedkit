@@ -31,7 +31,7 @@ def _named(error, tool, arguments, supplies, hint):
 
 
 def send(error, principal, account, chat_id='', *, phone='', username='', reply_to='', format='plain',
-         link_preview=False, allow_lossy=False):
+         link_preview=False, allow_lossy=False, silent=False):
     """`error` with the preview_message continuation when it is a missing or changed preview; else unchanged.
     caller_supplies names every argument the refused call set that the digest binds."""
     if getattr(error, 'code', None) not in REFUSALS or not _own(principal, account):
@@ -40,7 +40,8 @@ def send(error, principal, account, chat_id='', *, phone='', username='', reply_
     if isinstance(chat_id, str) and chat_id:
         arguments['chat_id'] = chat_id
     given = (('text', True), ('phone', bool(phone)), ('username', bool(username)), ('reply_to', bool(reply_to)),
-             ('format', format != 'plain'), ('link_preview', link_preview is True), ('allow_lossy', allow_lossy is True))
+             ('format', format != 'plain'), ('link_preview', link_preview is True), ('allow_lossy', allow_lossy is True),
+             ('silent', silent is True))
     supplies = [name for name, is_set in given if is_set]
     return _named(error, 'preview_message', arguments, supplies, SEND_HINT)
 
