@@ -74,6 +74,8 @@ BUILDS = {
     "indexer": (".", "services/messaging/Dockerfile", "indexer", "import messaging_service.file_index"),
     "enricher-local": (".", "services/messaging/Dockerfile", "enricher-local", "import messaging_service.enrichment"),
     "whatsapp-native": (".", "services/messaging/Dockerfile", "whatsapp-native", "import messaging_service.whatsapp_collector"),
+    # ANYM-937: the session holder; its own context (whatsapp/whatsmeow only) and no Python, so the smoke is --version.
+    "whatsapp-holder": ("whatsapp/whatsmeow", "whatsapp/whatsmeow/Dockerfile", "whatsapp-holder", "--version"),
     "gateway": (".", "services/gateway/Dockerfile", "", "import agent_gateway, platform_contracts.release"),
     "calendar": ("services/calendar", "services/calendar/Dockerfile", "", "import family_calendar"),
     "recordings": ("services/recordings", "services/recordings/Dockerfile", "", "import deedkit_recordings.app"),
@@ -1459,6 +1461,8 @@ def build_image(source, sha, target, *, check=False, verified=None):
                     "--security-opt", "no-new-privileges", "--entrypoint"]
         if target == "http-router":
             run(isolated + ["/deedkit-release-router", image, "--version"])
+        elif target == "whatsapp-holder":
+            run(isolated + ["/usr/local/bin/anymsg-whatsmeow", image, smoke])
         else:
             run(isolated + ["python", image, "-c", smoke])
     except Exception:

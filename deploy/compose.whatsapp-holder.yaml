@@ -1,0 +1,63 @@
+# ANYM-937: the WhatsApp session holders. Use after compose.yaml + compose.whatsapp.yaml + compose.whatsapp-native.yaml,
+# and only from the cutover on (docs/whatsapp-native.md, Session holder cutover): without this overlay the collectors
+# run child mode unchanged, which is also the rollback. Each holder owns its account's session directory, the canonical
+# host lock bind, its `session_holder` login and the provider connection; its collector attaches over the private
+# socket directory (0700, UID 10001) and mounts neither the session nor the lock directory. Both read the same
+# whatsapp<n>.json, which names `holder_socket_directory` and `holder_dsn_file`.
+x-whatsapp-holder: &holder
+  profiles: [whatsapp]
+  restart: unless-stopped
+  depends_on:
+    db: {condition: service_healthy}
+  networks: [backend, collector_egress]
+  read_only: true
+  user: "10001:10001"
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  mem_limit: ${PROBE_WHATSAPP_HOLDER_MEMORY:-512m}
+  pids_limit: 64
+  # ANYM-914: above the 15 s disconnect bound; the holder releases its claim after the provider disconnect.
+  stop_grace_period: 25s
+  logging:
+    driver: json-file
+    options: {max-size: 5m, max-file: "2"}
+services:
+  whatsapp1-holder:
+    <<: *holder
+    image: anymsg-whatsapp-holder:${MESSAGING_VERSION:-0.9.19}
+    volumes:
+      - ./private/whatsapp1.json:/run/secrets/whatsapp_config:ro
+      - ./private/whatsapp1-holder.dsn:/run/secrets/holder_dsn:ro
+      - ./private/whatsapp1-session:/sessions
+      - ./private/session-locks:/run/deedkit/session-locks
+      - ./private/whatsapp1-holder:/run/deedkit/holder
+      - whatsapp1_spool:/spool
+  whatsapp2-holder:
+    <<: *holder
+    image: anymsg-whatsapp-holder:${MESSAGING_VERSION:-0.9.19}
+    volumes:
+      - ./private/whatsapp2.json:/run/secrets/whatsapp_config:ro
+      - ./private/whatsapp2-holder.dsn:/run/secrets/holder_dsn:ro
+      - ./private/whatsapp2-session:/sessions
+      - ./private/session-locks:/run/deedkit/session-locks
+      - ./private/whatsapp2-holder:/run/deedkit/holder
+      - whatsapp2_spool:/spool
+  # The collectors attach: the events spool and the socket directory, no session and no session-locks bind.
+  whatsapp1:
+    volumes: !override
+      - ./private/collector.dsn:/run/secrets/database_url:ro
+      - ./private/whatsapp1.json:/run/secrets/whatsapp_config:ro
+      - ./private/whatsapp1.permit.json:/run/secrets/whatsapp_permit:ro
+      - ./private/whatsapp1-holder:/run/deedkit/holder
+      - whatsapp1_spool:/spool
+      - files:/data
+      - file_uploads:/data/files/.uploads:ro
+  whatsapp2:
+    volumes: !override
+      - ./private/collector.dsn:/run/secrets/database_url:ro
+      - ./private/whatsapp2.json:/run/secrets/whatsapp_config:ro
+      - ./private/whatsapp2.permit.json:/run/secrets/whatsapp_permit:ro
+      - ./private/whatsapp2-holder:/run/deedkit/holder
+      - whatsapp2_spool:/spool
+      - files:/data
+      - file_uploads:/data/files/.uploads:ro

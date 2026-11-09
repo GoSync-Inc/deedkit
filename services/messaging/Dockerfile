@@ -150,6 +150,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=whatsmeow-build /out/anymsg-whatsmeow /usr/local/bin/anymsg-whatsmeow
 COPY --from=whatsmeow-build /out/licenses /app/whatsmeow-licenses
 COPY services/messaging/messaging_service ./messaging_service
+# The collector's session holder protocol range (whatsapp_holder.py COLLECTOR_SUPPORTED); ANYM-896's pair rule reads it.
+LABEL io.deedkit.collector.protocol.min="1" io.deedkit.collector.protocol.max="1"
 # This user is defined by the pinned base or explicitly created above.
 # hadolint ignore=DL3066
 USER probe

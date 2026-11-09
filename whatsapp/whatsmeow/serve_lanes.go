@@ -5,6 +5,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -160,14 +161,18 @@ func (h *holder) attach(lane string, fc *frameConn, lease leaseRef) (*attachment
 			return nil, "holder_busy" // a second live attachment of one lease
 		}
 		// The database names the new lease the account's live one: the old one is positively invalid. Its admitted
-		// calls finish before the successor is attached, so two collectors never act at once.
+		// calls finish before the successor is attached, so two collectors never act at once; the wait is bounded:
+		// detach cancels its reads, and its mutations end by their own deadlines.
 		h.detach(current, "collector_lease_invalid")
 		current.inflight.Wait()
 	}
-	att := &attachment{lease: lease, control: fc, verifiedUntil: deadline, attachedAt: h.now(), closed: make(chan struct{})}
+	ctx, cancel := context.WithCancel(h.ctx)
+	att := &attachment{lease: lease, control: fc, verifiedUntil: deadline, attachedAt: h.now(), closed: make(chan struct{}),
+		ctx: ctx, cancel: cancel}
 	h.mu.Lock()
 	if h.att != nil {
 		h.mu.Unlock()
+		cancel()
 		return nil, "holder_busy"
 	}
 	h.att = att
@@ -188,6 +193,9 @@ func (h *holder) detach(att *attachment, reason string) {
 		}
 		send := att.send
 		h.mu.Unlock()
+		if att.cancel != nil {
+			att.cancel()
+		}
 		att.control.conn.Close()
 		if send != nil {
 			send.conn.Close()

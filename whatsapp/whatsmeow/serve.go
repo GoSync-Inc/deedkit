@@ -89,6 +89,11 @@ type attachment struct {
 	// A successor attaches only after every admitted call of its predecessor returned (finding 2).
 	dead     bool
 	inflight sync.WaitGroup
+	// ctx carries the control lane's reads and ends with the attachment: a successor never waits out a predecessor's
+	// long read (a media download's deadline is up to 50 min). Send-lane mutations run on the holder's context and
+	// end by their own deadlines (send, runBounded), so attach's wait for inflight is bounded.
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 type frameConn struct {
@@ -321,7 +326,11 @@ func (h *holder) dispatch(att *attachment, lane string, r request, emit func(any
 	if r.Method == "messenger_operation" {
 		return h.journaledOperation(p, r)
 	}
-	return p.handle(h.ctx, r, emit)
+	ctx := h.ctx
+	if lane == "control" && att.ctx != nil {
+		ctx = att.ctx // a read ends with its attachment
+	}
+	return p.handle(ctx, r, emit)
 }
 
 // start connects once: an attached collector's `start` returns the running connection when there is one (a collector
