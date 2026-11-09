@@ -649,7 +649,9 @@ def test_catalog_covers_explicit_families_and_provider_differences():
         assert 'exact archive revision' in catalog['edit_message']['limitation']
         assert 'plain text only' not in catalog['edit_message']['limitation']
         assert set(catalog['forward_message']['parameters_schema']) == {'source_message_id', 'source_revision'}
-        assert set(catalog['send_file']['parameters_schema']) == {'attachment_id', 'upload_id', 'sha256', 'mode', 'caption'}
+        # ANYM-927: silent (no notification sound) on Telegram only.
+        assert set(catalog['send_file']['parameters_schema']) == {'attachment_id', 'upload_id', 'sha256', 'mode', 'caption',
+                                                                  *(('silent',) if catalog is telegram else ())}
         assert catalog['send_file']['parameters_schema']['sha256']['required'] is True
         assert '32 MiB' in catalog['send_file']['limitation']
     for platform in ('telegram','whatsapp'):
