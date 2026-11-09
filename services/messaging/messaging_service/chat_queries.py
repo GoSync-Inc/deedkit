@@ -254,6 +254,7 @@ def _alias_pairs(accounts,c,p,chats=None):
 PAGE_WINDOW=4
 PAGE_WINDOW_CAP=4096
 PAGE_CANDIDATE_CAP=4
+PAGE_HEAD_BUDGET=7
 
 
 def _page_first(c,p,clauses,args,*,accounts,limit,last_sql,last_filter,pos,lower,upper,exclude_chats):
@@ -308,7 +309,7 @@ def _page_first(c,p,clauses,args,*,accounts,limit,last_sql,last_filter,pos,lower
     # need: distinct window chats the floor must cover. It starts at limit+1 and at least doubles while a candidate list
     # falls short (chats the cursor or a bound excludes, hidden pair chats): a deeper floor before a wider window, and at
     # most three tries before the fallback, so a deep cursor costs today's plan plus at most 7x(limit+1) head reads.
-    size,need,examined,first=PAGE_WINDOW*(limit+1),limit+1,None,{}
+    size,need,examined,first,spent=PAGE_WINDOW*(limit+1),limit+1,None,{},0
     while need<=PAGE_CANDIDATE_CAP*(limit+1):
         if len(first)<need:
             if examined is not None and examined['n']<size:return None
@@ -326,7 +327,9 @@ def _page_first(c,p,clauses,args,*,accounts,limit,last_sql,last_filter,pos,lower
             tied=c.execute(tie_sql,[*msg_args,*bound_args,floor,PAGE_WINDOW_CAP+1,*args]).fetchall()
             if tied[0]['n']>PAGE_WINDOW_CAP:return None
             found+=[r['chat'] for r in tied if r['chat'] is not None and r['chat'] not in first]
-        if len(found)>PAGE_CANDIDATE_CAP*(limit+1):return None
+        # Every try's candidates are head reads: together at most 7x(limit+1) (1+2+4 floors) before the fallback.
+        spent+=len(found)
+        if len(found)>PAGE_CANDIDATE_CAP*(limit+1) or spent>PAGE_HEAD_BUDGET*(limit+1):return None
         aliases,listed=_alias_pairs(accounts,c,p,chats=[*found,*(exclude_chats or [])])
         # The listed chat of a pair hides the other one; an excluded hidden chat excludes its listed chat too.
         hidden={v['chat']['id']:shown for shown,v in listed.items()}
@@ -451,7 +454,7 @@ class _PerChatPlan(Exception):
 
 def list_chats(*args,**kw):
     try:return _list_chats(*args,**kw)
-    except _PerChatPlan:return _list_chats(*args,**kw,plan='per_chat')
+    except _PerChatPlan:return _list_chats(*args,**{**kw,'plan':'per_chat'})
 
 
 def _list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=None,
@@ -880,7 +883,7 @@ def _list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=
         if found:
             # ANYM-878: the page is chosen over the candidates and proven in this one statement's snapshot.
             prefix=('WITH chat_page AS MATERIALIZED (SELECT c.*,last.sent_at AS page_head'+page_from+' WHERE '+where+
-                ' AND c.id=ANY(%s) AND NOT c.id=ANY(%s) ORDER BY '+sort+' LIMIT %s), page_proof AS MATERIALIZED (SELECT count(*)>%s AND '+
+                ' AND c.id=ANY(%s) AND NOT c.id=ANY(%s) ORDER BY '+sort+' LIMIT %s), page_proof AS MATERIALIZED (SELECT count(page_head)>%s AND '+
                 found['proof']+' AS proven FROM chat_page) ')
             query_args=[*args,found['found'],found['excluded'],limit+1,limit,*found['proof_args'],*base_args,limit+1]
         base=base.replace(' FROM chats c JOIN accounts a',' FROM chat_page c JOIN accounts a',1)

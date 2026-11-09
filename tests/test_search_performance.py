@@ -181,7 +181,9 @@ class Plans:
 
 def head_loops(plans):
     """The most times any one messages scan ran in the page's own statements (a per-chat head read runs once per chat)."""
-    own=[plan for chain,plan in plans if chain and chain[-1] in ('list_chats','_page_first','_alias_pairs')]
+    own=[plan for chain,plan in plans if chain and chain[-1] in ('list_chats','_list_chats','_page_first','_alias_pairs')]
+    # The page statement itself must be among them, or a bound would pass on nothing.
+    assert any(chain and chain[-1] in ('list_chats','_list_chats') and 'chat_page' in str(plan) for chain,plan in plans),[c[-1:] for c,_ in plans]
     return max((node.get('Actual Loops',1) for plan in own for node in nodes(plan) if node.get('Relation Name')=='messages'),default=0)
 
 

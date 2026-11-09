@@ -55,19 +55,27 @@ def build(s, chats, pairs):
 
 def walk(s, c, p, *, limit, view, accounts, page_first, pages=6, **filters):
     """Every page of the catalog walk (rows and cursors), page-first or forced onto today's per-chat plan (the oracle)."""
-    real = chat_queries._page_first
+    real, pairs = chat_queries._page_first, chat_queries._alias_pairs
+    heads = []
+    def counted(accounts, c, p, chats=None):
+        if chats is not None:heads.append(len(chats))
+        return pairs(accounts, c, p, chats=chats)
     if not page_first:chat_queries._page_first = lambda *a, **k: None
+    chat_queries._alias_pairs = counted
     try:
         out, after = [], ''
         for _ in range(pages):
+            heads.clear()
             result = chat_queries.list_chats(s, c, p, after, limit, order='activity', view=view, accounts=accounts,
                 include_coverage=False, **filters)
+            # Each page-first try reads the heads of its candidates (one pair read per try): 7x(limit+1) in all.
+            assert sum(heads) <= 7*(limit+1), heads
             out.append(result)
             after = result['next_cursor']
             if not after:break
         return out
     finally:
-        chat_queries._page_first = real
+        chat_queries._page_first, chat_queries._alias_pairs = real, pairs
 
 
 def both(s, token, **kw):
@@ -175,3 +183,32 @@ def test_page_first_reruns_on_the_per_chat_plan_when_a_chat_gets_newer_inside_th
     # The proof failed in the page statement's snapshot, so the call answered from the per-chat plan: the racing chat leads.
     assert found and found[0] is not None
     assert got == oracle and got['items'][0]['last_message_id'] == 'h-m-race'
+
+
+# spec: ANYM-878
+def test_page_first_reruns_on_the_per_chat_plan_when_candidate_heads_vanish_inside_the_call(seeded):
+    s, _, _ = seeded
+    # Two chats with messages and, after them in id order, chats without any: the per-chat plan lists those by id.
+    ids = build(s, [('tg-private', [(5, 'text', False)]), ('tg-private', [(4, 'text', False)])]+[('tg-private', [])]*8, [])
+    # A key for just these 10 chats (more than the first window's 8), so no other chat has a message to fail the proof.
+    token = s.issue_key('page-first-vanish', ['telegram-demo'], chats=ids)
+    found, real = [], chat_queries._page_first
+    def deleting(*args, **kw):
+        result = real(*args, **kw);found.append(result)
+        if result and len(found) == 1:
+            with s.pool.connection() as w:
+                w.execute("UPDATE messages SET deleted=true WHERE chat=ANY(%s)", (result['found'],))
+        return result
+    chat_queries._page_first = deleting
+    try:
+        with s.authorized(token, 'list_chats') as (c, p):
+            got = chat_queries.list_chats(s, c, p, '', 1, order='activity', view='conversation', include_coverage=False)
+            chat_queries._page_first = lambda *a, **k: None
+            oracle = chat_queries.list_chats(s, c, p, '', 1, order='activity', view='conversation', include_coverage=False)
+    finally:
+        chat_queries._page_first = real
+    assert oracle['items'][0]['id'] == 'h-9'
+    # The candidates' heads became NULL; ordering among headless chats is by id, which no message proof covers.
+    assert found and found[0] is not None
+    assert got == oracle
+
