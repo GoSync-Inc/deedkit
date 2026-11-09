@@ -218,6 +218,38 @@ def test_default_activity_page_reads_heads_for_the_page_not_the_catalog(seeded):
     assert empty['items']==[] and 0<examined<=PAGE_WINDOW_CAP,examined
 
 
+class ViewStatements:
+    """Counts the statements the conversation view issues (the per-chat function or the page's batch)."""
+    def __init__(self,connection):self.connection=connection;self.view=0
+    def execute(self,sql,args=None):
+        import traceback
+        if any(f.name in ('conversation_state','conversation_states') for f in traceback.extract_stack()[:-1]
+                if '/messaging_service/' in f.filename):self.view+=1
+        return self.connection.execute(sql,args)
+    def __getattr__(self,name):return getattr(self.connection,name)
+
+
+# ANYM-889: the per-chat reads ran 321 statements for 25 rows and 1,285 for 100; the page batch runs 18 for both
+# (worst case: fallbacks on both platforms, reply targets, conflict classes add a few, never per row).
+CONVERSATION_VIEW_STATEMENTS = 24
+
+
+# spec: ANYM-889
+def test_conversation_view_runs_a_fixed_number_of_statements_for_25_and_100_rows(seeded):
+    from messaging_service.chat_queries import list_chats
+    s,a,_=seeded
+    seed_catalog(s)
+    counts={}
+    for limit in (25,100):
+        with s.authorized(a,'list_chats') as (c,p):
+            counted=ViewStatements(c)
+            result=list_chats(s,counted,p,'',limit,order='activity',view='conversation',include_coverage=False)
+        assert len(result['items'])==limit and all(row['conversation'] for row in result['items'])
+        assert {row['type'] for row in result['items']}>={'private','group'}
+        counts[limit]=counted.view
+    assert 0<counts[25]<=CONVERSATION_VIEW_STATEMENTS and 0<counts[100]<=CONVERSATION_VIEW_STATEMENTS,counts
+
+
 def page_first_heads(plans):
     """Head reads the page-first plan added: per statement the most-run messages scan, summed over its statements."""
     return sum(max((node.get('Actual Loops',1) for node in nodes(plan) if node.get('Relation Name')=='messages'),default=0)

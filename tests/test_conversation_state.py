@@ -1,7 +1,9 @@
 """Conversation head assertions; all messages and provider observations are synthetic."""
+import itertools
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from hypothesis import HealthCheck, given, settings, strategies as st
 
 
 NOW = datetime(2026, 10, 15, 0, 0, 0, tzinfo=timezone.utc)
@@ -364,6 +366,92 @@ def test_exact_chat_state_obeys_restricted_and_revoked_acl(dialogue_archive):
     with s.authorized(scoped,'list_chats') as (c,p):
         with pytest.raises(APIError,match='not_found'):
             conversation_state(c,p,'dialogue-wa',allowed)
+
+
+VIEW_KEYS = itertools.count()
+VIEW_KINDS = ('text', 'service', 'empty', 'media', 'queued', 'mention', 'deleted')
+VIEW_MESSAGE = st.tuples(st.integers(0, 4), st.sampled_from(VIEW_KINDS), st.booleans())
+VIEW_CHAT = st.tuples(st.sampled_from(('tg-private', 'tg-group', 'tg-channel', 'tg-self', 'wa-private', 'wa-group')),
+    st.lists(VIEW_MESSAGE, max_size=4), st.booleans())
+
+
+def view_catalog(s, chats):
+    """Synthetic chats for the page oracle: ties in a 5-minute span, files, media jobs, owner mentions, self chats.
+
+    A crowded chat gets 65 service messages in a newer second, so its head is truncated and has no meaningful message."""
+    base = datetime.now(timezone.utc).replace(microsecond=0)-timedelta(hours=1)
+    ids = []
+    with s.pool.connection() as c:
+        for table, column in (('attachments', 'id'), ('media_jobs', 'id'), ('messages', 'chat'),
+                ('chat_read_observations', 'chat'), ('chats', 'id')):
+            c.execute('DELETE FROM '+table+' WHERE '+column+" LIKE 'cv-%%'")
+        c.execute("""INSERT INTO collector_health(account,status,detail_code,cooldown_until)
+            VALUES('telegram-demo','degraded','rate_limited',clock_timestamp()+interval '90 seconds')
+            ON CONFLICT(account) DO UPDATE SET status='degraded',detail_code='rate_limited',cooldown_until=EXCLUDED.cooldown_until""")
+        n = 0
+        for i, (kind, specs, crowd) in enumerate(chats):
+            platform, chat_type = kind.split('-')
+            account = 'telegram-demo' if platform == 'tg' else 'whatsapp-demo-1'
+            chat = 'cv-'+str(i)
+            provider = chat+('@g.us' if kind == 'wa-group' else '')
+            c.execute('INSERT INTO chats(id,account,provider_chat,title,chat_type) VALUES(%s,%s,%s,%s,%s)',
+                (chat, account, provider, 'Synthetic '+str(i), 'private' if chat_type == 'self' else chat_type))
+            if chat_type == 'self':
+                c.execute('''INSERT INTO chat_read_observations(chat,account,observed_at,basis,is_self_chat)
+                    VALUES(%s,%s,clock_timestamp(),'telegram_dialog',true)''', (chat, account))
+            ids.append(chat)
+            for minute, message_kind, outgoing in specs:
+                n += 1
+                mid = 'cv-m-'+str(n)
+                body = '' if message_kind in ('media', 'queued', 'empty', 'service') else 'synthetic text '+str(n)
+                c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction,deleted)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)''', (mid, account, chat, str(n) if platform == 'tg' else 'wamid-'+str(n),
+                    'owner' if outgoing else 'peer', body, base+timedelta(minutes=minute),
+                    'outgoing' if outgoing else 'incoming', message_kind == 'deleted'))
+                metadata = {'service': '{"is_service":true}', 'media': '{"media_kind":"photo"}', 'queued': '{"media_kind":"photo"}',
+                    'mention': '{"mentions_owner":true}'}.get(message_kind)
+                if metadata:
+                    c.execute('INSERT INTO message_metadata(message,revision,metadata) SELECT id,revision,%s::jsonb FROM messages WHERE id=%s',
+                        (metadata, mid))
+                if message_kind in ('media', 'queued'):
+                    c.execute('''INSERT INTO media_jobs(id,account,message,descriptor,state) VALUES(%s,%s,%s,'{"filename":"photo.jpg"}'::jsonb,%s)''',
+                        ('cv-j-'+str(n), account, mid, 'ready' if message_kind == 'media' else 'queued'))
+                if message_kind == 'media':
+                    c.execute('''INSERT INTO attachments(id,message,digest,filename,mime,bytes)
+                        VALUES(%s,%s,repeat('a',64),'photo.jpg','image/jpeg',4)''', ('cv-j-'+str(n), mid))
+            if crowd:
+                c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
+                    SELECT %s||k,%s,%s,%s||k,'peer','',%s,'incoming' FROM generate_series(1,65) k''',
+                    (chat+'-crowd-', account, chat, ('9000' if platform == 'tg' else 'wamid-crowd-')+str(i), base+timedelta(minutes=5)))
+                c.execute('''INSERT INTO message_metadata(message,revision,metadata)
+                    SELECT id,revision,'{"is_service":true}'::jsonb FROM messages WHERE chat=%s AND id LIKE %s''', (chat, chat+'-crowd-%'))
+    return ids
+
+
+# spec: ANYM-889
+@settings(max_examples=30, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow])
+@given(st.lists(VIEW_CHAT, min_size=1, max_size=8), st.booleans())
+def test_page_conversation_view_equals_the_per_chat_function_for_every_row(seeded, monkeypatch, chats, restricted):
+    """The page's batched conversation view returns, row by row, what today's per-chat function returns."""
+    from messaging_service import chat_queries
+    from messaging_service.conversation_state import conversation_state
+    s,key,_=seeded
+    ids=view_catalog(s,chats)
+    if restricted:
+        # A chat-restricted key reads no account-wide collector health (conversation_state.py collector_facts).
+        key=s.issue_key('view-oracle-'+str(next(VIEW_KEYS)),['telegram-demo','whatsapp-demo-1'],chats=ids[::2])
+    def per_chat(c,p,pairs,*,titles=None):
+        return [conversation_state(c,p,account,chat,titles=titles) for account,chat in pairs]
+    with s.authorized(key,'list_chats') as (c,p):
+        batched=chat_queries.list_chats(s,c,p,'',25,view='conversation',include_coverage=False)
+        with monkeypatch.context() as patched:
+            patched.setattr(chat_queries,'conversation_states',per_chat)
+            oracle=chat_queries.list_chats(s,c,p,'',25,view='conversation',include_coverage=False)
+    assert [row['id'] for row in batched['items']]==[row['id'] for row in oracle['items']]
+    assert any(row['id'].startswith('cv-') for row in batched['items']) or not any(specs for _,specs,_ in chats)
+    for got,want in zip(batched['items'],oracle['items']):
+        assert got==want,(got['id'],[k for k in want if got.get(k)!=want.get(k)])
+    assert batched==oracle
 
 
 def contradicted_head(s, add, *changes):
