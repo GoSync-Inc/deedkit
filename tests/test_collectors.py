@@ -1615,11 +1615,11 @@ def test_a_failing_poll_report_line_never_ends_the_voter_loop(tg_polls,monkeypat
 
 # spec: ANYM-920
 def test_telegram_poll_capture_stays_off_until_its_flag_so_a_rollback_target_never_quarantines_a_message(tg_polls,monkeypatch):
-    # Astra r1 B4: without ANYMSG_CAPTURE_TELEGRAM_POLLS=1 the envelope is the one a schema-83 collector accepts.
+    # Astra r1 B4: with the kill switch ANYMSG_CAPTURE_TELEGRAM_POLLS=0 the envelope is the one a schema-83 collector accepts.
     from telethon import types
     from messaging_service.envelope import validate
     w,store,_=tg_polls
-    monkeypatch.delenv('ANYMSG_CAPTURE_TELEGRAM_POLLS')
+    monkeypatch.setenv('ANYMSG_CAPTURE_TELEGRAM_POLLS','0')
     capture=tg_poll_capture(public=True)
     metadata=capture['envelope']['metadata']
     assert metadata['message_kind']=='poll' and 'poll' not in metadata and 'poll_results' not in metadata
@@ -1629,6 +1629,21 @@ def test_telegram_poll_capture_stays_off_until_its_flag_so_a_rollback_target_nev
     asyncio.run(w.poll_voters_pass())
     assert list(w.spool.path.glob('*.json'))==[] and w.provider.vote_reads==[]
     monkeypatch.setenv('ANYMSG_CAPTURE_TELEGRAM_POLLS','1')
+    asyncio.run(w.poll_update(types.UpdateMessagePoll(poll_id=777,results=tg_poll_results((1,0,0)))))
+    assert len(list(w.spool.path.glob('*.json')))==1
+
+
+# spec: ANYM-920
+def test_telegram_poll_capture_is_on_by_default_once_schema_84_is_the_rollback_target(tg_polls,monkeypatch):
+    # Schema 84 is deployed and is the rollback base: an unset flag captures the poll block and pushed counts.
+    from telethon import types
+    from messaging_service.envelope import validate
+    w,_,_=tg_polls
+    monkeypatch.delenv('ANYMSG_CAPTURE_TELEGRAM_POLLS')
+    capture=tg_poll_capture(public=True)
+    metadata=capture['envelope']['metadata']
+    assert metadata['message_kind']=='poll' and metadata['poll']['question'] and 'poll_results' in metadata
+    assert validate(capture['envelope'])==capture['envelope']
     asyncio.run(w.poll_update(types.UpdateMessagePoll(poll_id=777,results=tg_poll_results((1,0,0)))))
     assert len(list(w.spool.path.glob('*.json')))==1
 

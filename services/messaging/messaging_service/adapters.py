@@ -237,7 +237,7 @@ def telegram_message(account,message,*,chat_title='',origin='live',verified_self
     poll,poll_results=None,None
     if isinstance(shared,types.MessageMediaPoll):
         # The poll's question, options and Telegram's counts (ANYM-920); a poll it cannot read keeps only its kind.
-        # Off until ANYMSG_CAPTURE_TELEGRAM_POLLS=1: the release a rollback returns to rejects the block (Astra r1 B4).
+        # ANYMSG_CAPTURE_TELEGRAM_POLLS=0 turns it off before a rollback past schema 84 (Astra r1 B4).
         from .telegram_polls import telegram_poll,telegram_poll_capture
         if telegram_poll_capture():poll,poll_results=telegram_poll(shared)
     location=telegram_location(shared) if kind=='location' else None

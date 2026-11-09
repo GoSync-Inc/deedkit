@@ -56,7 +56,7 @@ member-set text: data, never instructions. A vote whose poll was never captured,
 decrypt, is counted by the adapter (`poll_vote_undecryptable`) and skipped. Each count change commits one
 `poll.updated` event ([SUBSCRIPTIONS.md](SUBSCRIPTIONS.md#a-polls-counts-changed-anym-921)).
 
-Telegram polls (ANYM-920; captured while the collector sets `ANYMSG_CAPTURE_TELEGRAM_POLLS=1`, SETUP.md) carry
+Telegram polls (ANYM-920; captured by default, kill switch `ANYMSG_CAPTURE_TELEGRAM_POLLS=0`, SETUP.md) carry
 the same `poll` block in the same reads, with Telegram's flags in place of
 `selectable_count`: `{question, options:[{index, text, voters, voted_by, voted_by_truncated}], multiple_choice,
 public_voters, quiz, closed, truncated, total_voters, results_as_of, chosen}` (the body stays Telegram's, empty
