@@ -459,6 +459,24 @@ func TestCharacterizeAnErrorBeforeAnyChangeKeepsAWireCodeOrBecomesItsKindsGeneri
 	}
 }
 
+// spec: ANYM-441
+func TestCharacterizeHistoryRequestRechecksThePolicyBeforeItAsks(t *testing.T) {
+	d := operationsFake(t)
+	reads := 0
+	d.policy = func() (Policy, error) {
+		reads++
+		p := allowedOperationPolicy()
+		p.Enabled = reads == 1
+		return p, nil
+	}
+	d.history = func(context.Context, string, int) (any, error) { t.Fatal("history was requested"); return nil, nil }
+	result, err := executeOperation(context.Background(), operationJob("request_chat_history", operationsChat, map[string]any{"count": 10}), d)
+	requireError(t, err, "operation_disabled")
+	if result != nil || reads != 2 {
+		t.Fatalf("result = %v, policy reads = %d, want nil and 2", result, reads)
+	}
+}
+
 // spec: ANYM-242
 func TestCharacterizeGroupOperationsRefuseBadParametersAndFailedSettlesBeforeAnyChange(t *testing.T) {
 	group := &types.GroupInfo{JID: characterizeJID(t, operationsGroup)}
