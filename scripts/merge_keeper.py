@@ -7,15 +7,18 @@ Merge keeper). Every GitHub call goes through `gh`, which takes `GH_TOKEN` from 
 so the token source is the caller's choice.
 
 For each open, non-draft, same-repository pull request into `main` that carries the label `ship`:
-  1. An approval must be recorded for the head SHA: an APPROVE review by an owner, member or collaborator on that
-     commit, or a description line `Review: orchestrator diff read <sha>`. An approval of an older SHA: no enqueue,
-     one comment.
-  2. Every required check of the live `main` rules has its latest run on the head completed after the last
-     ready-for-review event: `CI gate` success, the others success or skipped (`CI gate` validates their skip).
+  1. An approval must be recorded for the full head SHA by an account with write access (author association owner,
+     member or collaborator): an APPROVE review on that commit, or an unedited comment, posted after the head
+     arrived, with the line `Review: orchestrator diff read <40-hex sha>`. The description is never read for it.
+     An approval of an older SHA: no enqueue, one comment.
+  2. Every required check of the live `main` rules (name and app) has its newest run on the head completed: `CI
+     gate` success, the others success or skipped (`CI gate` validates their skip; never all skipped).
   3. The new migrations must take the next free numbers on `main`; otherwise one comment with the exact rename.
-  4. A merge-queue removal for failed checks is retried once (re-enqueue, which reruns the group); a second one on
-     the same head gets one comment with the failing jobs and the keeper leaves the pull request alone. A removal by
-     hand holds the pull request until a new head or the `ship` label is added again.
+  4. A merge-queue removal for failed checks is retried once (re-enqueue, which reruns the group), RETRY_AFTER
+     minutes after it so a worker's `wait-merge.sh` re-enqueues first; a second one on the same head gets one
+     comment with the failing jobs and the keeper leaves the pull request alone. A queue conflict waits until main
+     moves and is retried once; a removal by hand holds the pull request until a new head or the `ship` label is
+     added again. The counts come from the pull request's timeline, so they are shared with every other actor.
 Comments carry an HTML marker and are posted once per head. `--dry-run` writes nothing and prints every decision.
 """
 from __future__ import annotations
@@ -39,6 +42,8 @@ GATE = 'CI gate'
 MIGRATIONS = 'services/messaging/messaging_service/migrations'
 MIGRATION = re.compile(r'^(\d{3})_[A-Za-z0-9_]+\.sql$')
 APPROVAL_LINE = re.compile(r'^\s*Review:\s*orchestrator diff read\s+([0-9a-f]{7,40})\b', re.I | re.M)
+KEEPER_BOT = 'github-actions[bot]'
+RETRY_AFTER = 3  # minutes a failed-checks removal waits before the keeper re-enqueues
 TRUSTED = {'OWNER', 'MEMBER', 'COLLABORATOR'}
 MARK_PREFIX = '<!-- merge-keeper:'
 MARK = MARK_PREFIX + '{} -->'
@@ -59,14 +64,14 @@ class Facts:
     same_repository: bool = True
     base: str = BASE
     labels: tuple = (LABEL,)
-    body: str = ''
     reviews: list = field(default_factory=list)  # {'state','commit_id','author_association'}
-    comments: list = field(default_factory=list)  # issue comment bodies
+    comments: list = field(default_factory=list)  # {'body','author_association','user','created_at','updated_at'}
     queued: bool = False
     auto_merge: bool = False
     mergeable: bool | None = True
-    ready_at: str = ''  # last READY_FOR_REVIEW_EVENT, ISO time or ''
     head_at: str = ''  # first check suite on the head: when this head arrived
+    main_at: str = ''  # when main's tip was committed: a queue conflict is retried only after main moved
+    now: str = '9999-12-31T00:00:00Z'  # this tick's time
     removals: list = field(default_factory=list)  # {'at','reason','group'} oldest first
     labeled_at: str = ''  # last time `ship` was added
     required: tuple = ('checks / verify', GATE)
@@ -84,19 +89,29 @@ class Decision:
     comment: str = ''
 
 
+def trusted(comment):
+    return comment.get('author_association') in TRUSTED or comment.get('user') == KEEPER_BOT
+
+
 def marked(facts, key):
-    return any(MARK.format(key) in body for body in facts.comments)
+    """A dedup marker counts only from a write-access account or the Actions bot, so an outsider cannot mute one."""
+    return any(MARK.format(key) in (c.get('body') or '') for c in facts.comments if trusted(c))
 
 
 def approved_shas(facts):
-    """SHAs with a recorded approval: trusted APPROVE reviews and the orchestrator's diff-read line."""
+    """SHAs with a recorded approval by a write-access account: APPROVE reviews and unedited diff-read comments."""
     shas = [r['commit_id'] for r in facts.reviews
             if r.get('state') == 'APPROVED' and r.get('author_association') in TRUSTED and r.get('commit_id')]
-    return shas + APPROVAL_LINE.findall(facts.body or '')
+    for c in facts.comments:
+        if c.get('author_association') in TRUSTED and c.get('updated_at') == c.get('created_at'):
+            shas += [sha.lower() for sha in APPROVAL_LINE.findall(c.get('body') or '')
+                     if (c.get('created_at') or '') >= (facts.head_at or '')]
+    return shas
 
 
 def head_approved(facts):
-    return any(sha and facts.head.startswith(sha.lower()) for sha in approved_shas(facts))
+    """Only the full head SHA approves: an abbreviation or an approval posted before this head arrived does not."""
+    return facts.head.lower() in approved_shas(facts)
 
 
 def migration_plan(added, on_main):
@@ -108,8 +123,18 @@ def migration_plan(added, on_main):
     return None if wanted == mine else list(zip(mine, wanted))
 
 
+def migration_moves(plan):
+    """`git mv` lines that never move onto another file of the plan: through a temporary name when they would."""
+    moves = [(old, new) for old, new in plan if old != new]
+    path = f'{MIGRATIONS}/{{}}'.format
+    if not {new for _, new in moves} & {old for old, _ in moves}:
+        return [f'git mv {path(old)} {path(new)}' for old, new in moves]
+    return ([f'git mv {path(old)} {path(old + ".renumber")}' for old, _ in moves]
+            + [f'git mv {path(old + ".renumber")} {path(new)}' for old, new in moves])
+
+
 def migration_comment(facts, plan):
-    lines = [f'git mv {MIGRATIONS}/{old} {MIGRATIONS}/{new}' for old, new in plan if old != new]
+    lines = migration_moves(plan)
     pins = []
     for old, new in plan:
         o, n = int(old[:3]), int(new[:3])
@@ -129,7 +154,8 @@ def migration_comment(facts, plan):
 
 
 def required_state(facts):
-    """'' when every required check passed on the head after ready-for-review, else why not."""
+    """'' when every required check's newest run on the head passed, else why not. A draft's run counts: this
+    repository's drafts run full CI, and `CI gate` fails any skip it cannot validate."""
     if not facts.required:
         return 'no required checks read from the rules'
     states = []
@@ -139,8 +165,6 @@ def required_state(facts):
             return f'{name}: no run on the head'
         if run.get('status') != 'completed':
             return f'{name}: {run.get("status")}'
-        if facts.ready_at and (run.get('started_at') or '') < facts.ready_at:
-            return f'{name}: latest run started before ready-for-review'
         states.append((name, run.get('conclusion')))
     for name, conclusion in states:
         if name == GATE and conclusion != 'success':
@@ -152,6 +176,11 @@ def required_state(facts):
     if GATE not in facts.required and any(c == 'skipped' for _, c in states):
         return 'a skipped required check and no gate check to validate it'
     return ''
+
+
+def minutes_between(earlier, later):
+    parse = lambda t: dt.datetime.fromisoformat(t.replace('Z', '+00:00'))  # noqa: E731
+    return (parse(later) - parse(earlier)).total_seconds() / 60
 
 
 def decide(facts):
@@ -173,6 +202,7 @@ def decide(facts):
     if manual and (facts.labeled_at or '') <= manual[-1]['at']:
         return Decision('hold', 'removed from the queue by hand on this head; push or add the ship label again')
     failures = [r for r in since if r.get('reason') not in QUEUE_DONE | QUEUE_RETRYLESS]
+    conflicts = [r for r in since if r.get('reason') == 'merge_conflict']
     jobs = '\n'.join(f'- {job}' for job in facts.failing_jobs) or '- (no failed job found in the group run)'
     if len(failures) >= 2:
         return Decision('hold', f'{len(failures)} merge-queue failures on this head', f'stop:{facts.head}', '\n'.join([
@@ -181,14 +211,21 @@ def decide(facts):
             f'(last: `{failures[-1].get("reason")}`), so it stops retrying. Failing jobs of the last group run:',
             jobs, '', 'Fix the cause (a flake: harness orchestration.md, Merging) and push; a new head resets the '
             'retry.']))
+    if len(conflicts) >= 2:
+        return Decision('hold', 'two queue conflicts on this head', f'queue-conflict:{facts.head}', '\n'.join([
+            MARK.format(f'queue-conflict:{facts.head}'),
+            f'Merge keeper: removed from the queue twice for a conflict on head `{facts.head[:12]}`, so it stops. '
+            'Rebase onto main, rerun the local checks, push.']))
+    if conflicts and (facts.main_at or '') < conflicts[-1]['at']:
+        return Decision('hold', 'queue conflict: waits for main to move past the entry ahead')
     if not head_approved(facts):
         if approved_shas(facts):
             old = ', '.join(sorted({s[:12] for s in approved_shas(facts)}))
             return Decision('hold', 'approval is for an older head', f'stale:{facts.head}', '\n'.join([
                 MARK.format(f'stale:{facts.head}'),
                 f'Merge keeper: not enqueued. The recorded approval names `{old}`, but the head is '
-                f'`{facts.head[:12]}`. The new commits need their review (an APPROVE on the head or '
-                f'`Review: orchestrator diff read {facts.head[:12]}` in the description).']))
+                f'`{facts.head[:12]}`. The new commits need their review (an APPROVE on the head, or a new comment '
+                f'`Review: orchestrator diff read {facts.head}`).']))
         return Decision('hold', 'no approval recorded for the head')
     pending = required_state(facts)
     if pending:
@@ -203,6 +240,8 @@ def decide(facts):
     if plan:
         return Decision('hold', 'migration numbers do not follow main', f'migration:{facts.head}',
                         migration_comment(facts, plan))
+    if failures and minutes_between(failures[-1]['at'], facts.now) < RETRY_AFTER:
+        return Decision('hold', f'dequeued for failed checks; re-enqueue after {RETRY_AFTER} min unless a worker does')
     if failures:
         return Decision('enqueue', 'retry after one merge-queue failure', f'retry:{facts.head}', '\n'.join([
             MARK.format(f'retry:{facts.head}'),
@@ -242,28 +281,28 @@ class GitHub:
 
 PR_QUERY = '''query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){
 pullRequest(number:$number){id isInMergeQueue autoMergeRequest{enabledAt}
-timelineItems(last:100,itemTypes:[READY_FOR_REVIEW_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT,LABELED_EVENT]){nodes{
-__typename ... on ReadyForReviewEvent{createdAt} ... on LabeledEvent{createdAt label{name}}
+timelineItems(last:100,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT,LABELED_EVENT]){nodes{
+__typename ... on LabeledEvent{createdAt label{name}}
 ... on RemovedFromMergeQueueEvent{createdAt reason beforeCommit{oid}}}}}}}'''
 
 
-def collect(gh, pr, required):
+def collect(gh, pr, required, main_at=''):
     """Facts for one REST pull request object."""
     number, head = pr['number'], pr['head']['sha']
     detail = gh.api(gh.repo(f'pulls/{number}'))
     graph = gh.graphql(PR_QUERY, owner=gh.owner, name=gh.name, number=number)['repository']['pullRequest']
     events = graph['timelineItems']['nodes']
-    ready = [e['createdAt'] for e in events if e['__typename'] == 'ReadyForReviewEvent']
     labeled = [e['createdAt'] for e in events if e['__typename'] == 'LabeledEvent' and e['label']['name'] == LABEL]
     removals = [{'at': e['createdAt'], 'reason': (e.get('reason') or '').lower(),
                  'group': (e.get('beforeCommit') or {}).get('oid')}
                 for e in events if e['__typename'] == 'RemovedFromMergeQueueEvent']
     suites = gh.api(gh.repo(f'commits/{head}/check-suites?per_page=100'))['check_suites']
     checks = {}
-    for name in required:
-        runs = gh.api(gh.repo(f'commits/{head}/check-runs?per_page=100&filter=all&check_name={quote(name)}'))['check_runs']
-        if runs:
-            latest = max(runs, key=lambda r: (r.get('started_at') or '', r['id']))
+    for name, app in required:
+        runs = gh.api(gh.repo(f'commits/{head}/check-runs?per_page=100&filter=all&check_name={quote(name)}'))
+        runs = [r for r in runs['check_runs'] if app is None or (r.get('app') or {}).get('id') == app]
+        if runs:  # check run ids grow with creation, so the newest attempt wins even before it starts
+            latest = max(runs, key=lambda r: r['id'])
             checks[name] = {k: latest.get(k) for k in ('status', 'conclusion', 'started_at')}
     files = gh.api(gh.repo(f'pulls/{number}/files?per_page=100'), paginate=True)
     added = tuple(Path(f['filename']).name for f in files if f['status'] in ('added', 'renamed', 'copied')
@@ -272,14 +311,17 @@ def collect(gh, pr, required):
     facts = Facts(
         number=number, head=head, open=pr['state'] == 'open', draft=pr['draft'], same_repository=pr['head']['repo'] is not None
         and pr['head']['repo']['full_name'] == gh.repository, base=pr['base']['ref'],
-        labels=tuple(label['name'] for label in pr['labels']), body=pr.get('body') or '',
+        labels=tuple(label['name'] for label in pr['labels']),
         reviews=gh.api(gh.repo(f'pulls/{number}/reviews?per_page=100'), paginate=True),
-        comments=[c['body'] for c in gh.api(gh.repo(f'issues/{number}/comments?per_page=100'), paginate=True)
-                  if MARK_PREFIX in (c.get('body') or '')],
+        comments=[{'body': c.get('body') or '', 'author_association': c.get('author_association'),
+                   'user': (c.get('user') or {}).get('login'), 'created_at': c.get('created_at'),
+                   'updated_at': c.get('updated_at')}
+                  for c in gh.api(gh.repo(f'issues/{number}/comments?per_page=100'), paginate=True)
+                  if MARK_PREFIX in (c.get('body') or '') or APPROVAL_LINE.search(c.get('body') or '')],
         queued=graph['isInMergeQueue'], auto_merge=graph['autoMergeRequest'] is not None,
-        mergeable=detail.get('mergeable'), ready_at=max(ready, default=''),
+        mergeable=detail.get('mergeable'), main_at=main_at, now=github_time(now()),
         head_at=min((s['created_at'] for s in suites), default=github_time(now())), removals=removals,
-        labeled_at=max(labeled, default=''), required=tuple(required), checks=checks, added_migrations=added,
+        labeled_at=max(labeled, default=''), required=tuple(name for name, _ in required), checks=checks, added_migrations=added,
         main_migrations=on_main)
     failures = [r for r in removals if r['at'] >= facts.head_at and r['reason'] not in QUEUE_DONE | QUEUE_RETRYLESS]
     if failures and failures[-1]['group']:
@@ -300,8 +342,12 @@ def failing_jobs(gh, group_sha):
 
 def required_checks(gh):
     rules = gh.api(gh.repo(f'rules/branches/{BASE}'))
-    return [c['context'] for r in rules if r['type'] == 'required_status_checks'
+    return [(c['context'], c.get('integration_id')) for r in rules if r['type'] == 'required_status_checks'
             for c in r['parameters']['required_status_checks']]
+
+
+def main_time(gh):
+    return gh.api(gh.repo(f'commits/{BASE}'))['commit']['committer']['date']
 
 
 ENQUEUE = '''mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head}){
@@ -336,7 +382,7 @@ def github_time(moment):
 def run(arguments):
     gh = GitHub(arguments.repository, dry_run=arguments.dry_run)
     started, results, errors = now(), [], []
-    required = required_checks(gh)
+    required, main_at = required_checks(gh), main_time(gh)
     if arguments.pr:
         pulls = [gh.api(gh.repo(f'pulls/{n}')) for n in arguments.pr]
     else:
@@ -344,7 +390,7 @@ def run(arguments):
                  if any(label['name'] == LABEL for label in p['labels'])]
     for pr in pulls:
         try:
-            facts, node_id = collect(gh, pr, required)
+            facts, node_id = collect(gh, pr, required, main_at)
             if arguments.ignore_label and LABEL not in facts.labels:
                 facts.labels = (*facts.labels, LABEL)
             decision = decide(facts)

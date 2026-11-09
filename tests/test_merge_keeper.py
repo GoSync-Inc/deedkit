@@ -7,11 +7,22 @@ HEAD = 'a' * 40
 OLD = 'b' * 40
 GREEN = {'checks / verify': {'status': 'completed', 'conclusion': 'success', 'started_at': '2026-11-09T01:00:00Z'},
          'CI gate': {'status': 'completed', 'conclusion': 'success', 'started_at': '2026-11-09T01:00:00Z'}}
+AT = '2026-11-09T00:10:00Z'
+
+
+def comment(body, association='OWNER', created=AT, updated=None, user='egerev'):
+    return {'body': body, 'author_association': association, 'user': user, 'created_at': created,
+            'updated_at': updated or created}
+
+
+def approval(sha=HEAD, **changes):
+    return comment(f'Review: orchestrator diff read {sha}', **changes)
 
 
 def facts(**changes):
-    base: dict[str, object] = dict(number=7, head=HEAD, body=f'Review: orchestrator diff read {HEAD[:12]}', checks=dict(GREEN),
-                head_at='2026-11-09T00:00:00Z', main_migrations=('072_a.sql', '073_b.sql'))
+    base: dict[str, object] = dict(number=7, head=HEAD, comments=[approval()], checks=dict(GREEN),
+                                   head_at='2026-11-09T00:00:00Z', main_at='2026-11-09T00:00:00Z',
+                                   now='2026-11-09T05:00:00Z', main_migrations=('072_a.sql', '073_b.sql'))
     base.update(changes)
     return mk.Facts(**base)  # type: ignore[arg-type]  # test overrides by keyword
 
@@ -24,34 +35,54 @@ def test_approved_green_pull_request_is_enqueued():
 # spec: ANYM-625
 def test_trusted_approve_review_on_the_head_counts_and_an_outsider_does_not():
     review = {'state': 'APPROVED', 'commit_id': HEAD, 'author_association': 'COLLABORATOR'}
-    assert mk.decide(facts(body='', reviews=[review])).action == 'enqueue'
+    assert mk.decide(facts(comments=[], reviews=[review])).action == 'enqueue'
     outsider = dict(review, author_association='NONE')
-    assert mk.decide(facts(body='', reviews=[outsider])).reason == 'no approval recorded for the head'
+    assert mk.decide(facts(comments=[], reviews=[outsider])).reason == 'no approval recorded for the head'
+
+
+# spec: ANYM-625
+def test_forged_edited_abbreviated_or_pre_head_approval_comments_do_not_approve():
+    for forged in (approval(association='NONE'), approval(association='CONTRIBUTOR'),
+                   approval(updated='2026-11-09T00:20:00Z'), approval(sha=HEAD[:12]),
+                   approval(created='2026-11-08T23:00:00Z')):
+        assert not mk.head_approved(facts(comments=[forged])), forged
 
 
 # spec: ANYM-625
 def test_approval_of_an_older_head_holds_and_comments_once():
-    stale = facts(body=f'Review: orchestrator diff read {OLD[:12]}')
+    stale = facts(comments=[approval(OLD)])
     decision = mk.decide(stale)
     assert (decision.action, decision.comment_key) == ('hold', f'stale:{HEAD}')
-    assert OLD[:12] in decision.comment and HEAD[:12] in decision.comment
-    stale.comments = [decision.comment]
+    assert OLD[:12] in decision.comment and HEAD in decision.comment
+    stale.comments.append(comment(decision.comment))
     assert mk.act(mk.GitHub(dry_run=True), stale, 'id', decision) == []
 
 
 # spec: ANYM-625
-def test_skipped_gate_or_all_skipped_or_pre_ready_run_never_enqueues():
+def test_an_outsider_marker_does_not_mute_the_keeper_comment():
+    decision = mk.decide(facts(comments=[approval(OLD)]))
+    muted = facts(comments=[approval(OLD), comment(decision.comment, association='NONE')])
+    assert mk.act(mk.GitHub(dry_run=True), muted, 'id', decision) == [f'comment stale:{HEAD}']
+    by_bot = facts(comments=[approval(OLD), comment(decision.comment, association='NONE', user=mk.KEEPER_BOT)])
+    assert mk.act(mk.GitHub(dry_run=True), by_bot, 'id', decision) == []
+
+
+# spec: ANYM-625
+def test_skipped_gate_or_all_skipped_or_pending_never_enqueues():
     skipped = {**GREEN['CI gate'], 'conclusion': 'skipped'}
     assert mk.decide(facts(checks={**GREEN, 'CI gate': skipped})).action == 'hold'
     docs_only = {**GREEN, 'checks / verify': {**GREEN['checks / verify'], 'conclusion': 'skipped'}}
     assert mk.decide(facts(checks=docs_only)).action == 'enqueue'
-    assert mk.decide(facts(ready_at='2026-11-09T02:00:00Z')).reason.endswith('started before ready-for-review')
+    queued = {**GREEN, 'CI gate': {'status': 'queued', 'conclusion': None, 'started_at': None}}
+    assert mk.decide(facts(checks=queued)).reason == 'required checks: CI gate: queued'
     assert mk.decide(facts(checks={'CI gate': GREEN['CI gate']})).reason == 'required checks: checks / verify: no run on the head'
 
 
 # spec: ANYM-625
-def test_one_queue_failure_retries_once_and_a_second_stops():
+def test_one_queue_failure_retries_once_after_the_worker_window_and_a_second_stops():
     one = [{'at': '2026-11-09T01:30:00Z', 'reason': 'failed_checks', 'group': 'c' * 40}]
+    early = mk.decide(facts(removals=one, now='2026-11-09T01:31:00Z'))
+    assert early.action == 'hold' and 'unless a worker does' in early.reason
     decision = mk.decide(facts(removals=one, failing_jobs=['CI / checks / verify: failure https://x']))
     assert (decision.action, decision.comment_key) == ('enqueue', f'retry:{HEAD}')
     assert 'checks / verify' in decision.comment
@@ -60,6 +91,16 @@ def test_one_queue_failure_retries_once_and_a_second_stops():
     assert (decision.action, decision.comment_key) == ('hold', f'stop:{HEAD}')
     older_head = [dict(r, at='2026-11-08T00:00:00Z') for r in two]
     assert mk.decide(facts(removals=older_head)).action == 'enqueue'
+
+
+# spec: ANYM-625
+def test_queue_conflict_waits_for_main_to_move_and_a_second_stops():
+    one = [{'at': '2026-11-09T01:30:00Z', 'reason': 'merge_conflict', 'group': None}]
+    assert mk.decide(facts(removals=one, main_at='2026-11-09T01:00:00Z')).action == 'hold'
+    assert mk.decide(facts(removals=one, main_at='2026-11-09T01:40:00Z')).action == 'enqueue'
+    two = one + [{'at': '2026-11-09T02:30:00Z', 'reason': 'merge_conflict', 'group': None}]
+    decision = mk.decide(facts(removals=two, main_at='2026-11-09T03:00:00Z'))
+    assert (decision.action, decision.comment_key) == ('hold', f'queue-conflict:{HEAD}')
 
 
 # spec: ANYM-625
@@ -105,33 +146,55 @@ def test_migration_plan_renames_to_the_next_free_numbers(on_main, added):
     assert (plan is None) == ([int(n[:3]) for n in sorted(mine)] == list(range(top + 1, top + 1 + len(mine))))
 
 
-check = st.fixed_dictionaries({'status': st.sampled_from(['completed', 'in_progress']),
+# spec: ANYM-625
+@settings(max_examples=300)
+@given(st.sets(st.integers(1, 200), max_size=8), st.sets(st.integers(1, 210), min_size=1, max_size=5))
+def test_migration_moves_never_target_an_existing_file(on_main, numbers):
+    """Replaying the `git mv` lines on the added files never moves onto a present file and ends at the plan."""
+    mine = sorted(f'{n:03d}_x.sql' for n in numbers)
+    plan = mk.migration_plan(mine, tuple(f'{n:03d}_m.sql' for n in on_main))
+    if not plan:
+        return
+    files = {f'{mk.MIGRATIONS}/{name}' for name in mine}
+    for line in mk.migration_moves(plan):
+        _, _, source, target = line.split()
+        assert source in files and target not in files, line
+        files = (files - {source}) | {target}
+    assert files == {f'{mk.MIGRATIONS}/{new}' for _, new in plan}
+
+
+check = st.fixed_dictionaries({'status': st.sampled_from(['completed', 'in_progress', 'queued']),
                                'conclusion': st.sampled_from(['success', 'skipped', 'failure', None]),
-                               'started_at': st.sampled_from(['2026-11-09T01:00:00Z', '2026-11-09T03:00:00Z'])})
-removal = st.fixed_dictionaries({'at': st.sampled_from(['2026-11-08T00:00:00Z', '2026-11-09T01:30:00Z']),
+                               'started_at': st.sampled_from(['2026-11-09T01:00:00Z', None])})
+removal = st.fixed_dictionaries({'at': st.sampled_from(['2026-11-08T00:00:00Z', '2026-11-09T01:30:00Z',
+                                                        '2026-11-09T04:59:00Z']),
                                  'reason': st.sampled_from(['failed_checks', 'manual', 'merge_conflict', 'merged']),
                                  'group': st.none()})
+approvals = st.sampled_from([approval(), approval(HEAD[:9]), approval(OLD), approval(association='NONE'),
+                             approval(updated='2026-11-09T00:30:00Z'), approval(created='2026-11-08T00:00:00Z')])
 
 
 # spec: ANYM-625
 @settings(max_examples=500)
-@given(body=st.sampled_from(['', f'Review: orchestrator diff read {HEAD[:9]}', f'Review: orchestrator diff read {OLD}']),
+@given(comments=st.lists(approvals, max_size=2),
        checks=st.dictionaries(st.sampled_from(['checks / verify', 'CI gate']), check),
        removals=st.lists(removal, max_size=3), mergeable=st.sampled_from([True, False, None]),
-       queued=st.booleans(), draft=st.booleans(), ready_at=st.sampled_from(['', '2026-11-09T02:00:00Z']),
+       queued=st.booleans(), draft=st.booleans(), main_at=st.sampled_from(['2026-11-09T00:00:00Z', '2026-11-09T02:00:00Z']),
        added=st.sampled_from([(), ('073_x.sql',), ('074_x.sql',), ('075_x.sql',)]))
-def test_enqueue_only_when_every_gate_holds(body, checks, removals, mergeable, queued, draft, ready_at, added):
-    f = facts(body=body, checks=checks, removals=removals, mergeable=mergeable, queued=queued, draft=draft,
-              ready_at=ready_at, added_migrations=added)
+def test_enqueue_only_when_every_gate_holds(comments, checks, removals, mergeable, queued, draft, main_at, added):
+    f = facts(comments=comments, checks=checks, removals=removals, mergeable=mergeable, queued=queued, draft=draft,
+              main_at=main_at, added_migrations=added)
     if mk.decide(f).action != 'enqueue':
         return
     since = [r for r in removals if r['at'] >= f.head_at]
-    assert mk.head_approved(f) and not queued and not draft and mergeable is True
+    assert approval() in comments and not queued and not draft and mergeable is True
     assert checks.get('CI gate', {}).get('conclusion') == 'success'
-    assert all(c['status'] == 'completed' and c['conclusion'] in ('success', 'skipped') and c['started_at'] >= ready_at
-               for c in checks.values()) and set(checks) == set(f.required)
-    assert added in ((), ('074_x.sql',))
-    assert sum(r['reason'] == 'failed_checks' for r in since) <= 1
+    assert all(c['status'] == 'completed' and c['conclusion'] in ('success', 'skipped') for c in checks.values())
+    assert set(checks) == set(f.required) and added in ((), ('074_x.sql',))
+    failures = [r for r in since if r['reason'] == 'failed_checks']
+    assert len(failures) <= 1 and all(r['at'] <= '2026-11-09T04:57:00Z' for r in failures)
+    conflicts = [r for r in since if r['reason'] == 'merge_conflict']
+    assert len(conflicts) <= 1 and all(r['at'] <= main_at for r in conflicts)
     assert not any(r['reason'] == 'manual' for r in since)
 
 
@@ -142,3 +205,10 @@ def test_heartbeat_is_stale_after_the_limit_or_when_missing():
     assert 'min ago on mini' in mk.stale('{"ok_at":"2026-11-09T00:30:00Z","host":"mini"}', at)
     assert mk.stale('', at) == 'no heartbeat recorded'
     assert mk.stale('nope', at).startswith('unreadable')
+
+
+# spec: ANYM-625
+def test_watchdog_has_its_own_concurrency_group():
+    text = (mk.Path(__file__).resolve().parents[1] / '.github/workflows/merge-keeper.yml').read_text()
+    assert "group: merge-keeper-${{ github.event.schedule == '17 * * * *' && 'watchdog' || 'report' }}" in text
+    assert "github.event.schedule == '17 * * * *'" in text.split('heartbeat-check')[0].rsplit('- name:', 1)[1]
