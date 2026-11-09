@@ -156,6 +156,12 @@ func (s *CaptureStore) PutGroupChanges(group types.JID, at time.Time, stamp stri
 		if err != nil {
 			return err
 		}
+		// Bounded fields can still add up past the journal limit (2048 long IDs): such a
+		// notification is unrepresentable, so it is skipped, never a capture failure.
+		// The margin covers a collision suffix on the provider ID.
+		if data, err := json.Marshal(envelope); err != nil || len(data) > maxCaptureEnvelopeBytes-1024 {
+			return errGroupChange
+		}
 		var title *string
 		if (c.change == "rename" || c.change == "joined_group") && origin == "live" && c.value != nil && *c.value != "" {
 			v := envelopeText(*c.value, maxEnvelopeSenderName)
@@ -165,7 +171,7 @@ func (s *CaptureStore) PutGroupChanges(group types.JID, at time.Time, stamp stri
 	}
 	chat := LegacyChatID(group)
 	for _, e := range entries {
-		id, err := s.groupEntryID(chat, e.id, e.envelope, origin)
+		id, err := s.groupEntryID(chat, e.id, e.envelope)
 		if err != nil {
 			return err
 		}
@@ -175,9 +181,12 @@ func (s *CaptureStore) PutGroupChanges(group types.JID, at time.Time, stamp stri
 		if err := s.append(chat, id, at.Unix(), nil, e.envelope, origin == "history"); err != nil {
 			return err
 		}
-		// The dialog list feeds backfill and reconcile titles: it follows a live rename.
+		// The dialog list feeds backfill and reconcile titles: it follows the newest live
+		// rename or join, never an older one delivered late.
 		if e.title != nil {
-			if _, err := s.db.Exec("UPDATE chats SET title=? WHERE chat=?", *e.title, chat); err != nil {
+			if _, err := s.db.Exec(`UPDATE chats SET title=? WHERE chat=? AND NOT EXISTS(SELECT 1 FROM capture
+				WHERE chat=? AND message_id<>? AND source_ts>? AND message_id LIKE 'group\_%' ESCAPE '\'
+				AND (message_id LIKE '%\_rename%' ESCAPE '\' OR message_id LIKE '%\_joined\_group%' ESCAPE '\'))`, *e.title, chat, chat, id, at.Unix()); err != nil {
 				return err
 			}
 		}
@@ -186,11 +195,12 @@ func (s *CaptureStore) PutGroupChanges(group types.JID, at time.Time, stamp stri
 }
 
 // groupEntryID returns the provider ID to journal a group change under, or ""
-// when it is already journaled. A live change whose derived ID names another
-// change of the same group, second and kind (two separate adds in one second)
-// gets a suffix from its own content instead of being lost. A synced stub only
-// ever maps to the derived ID: its member IDs may be in another form.
-func (s *CaptureStore) groupEntryID(chat, id string, envelope map[string]any, origin string) (string, error) {
+// when the same change is already journaled. The same change is the same
+// derived ID with the same participants and value (the actor may be in its
+// phone-number or LID form). A different change under the derived ID of the
+// same group, second and kind (two separate adds in one second, live or synced)
+// gets a suffix from its own content instead of being lost.
+func (s *CaptureStore) groupEntryID(chat, id string, envelope map[string]any) (string, error) {
 	stored := func(id string) ([]byte, error) {
 		var data []byte
 		err := s.db.QueryRow("SELECT envelope FROM capture WHERE chat=? AND message_id=? ORDER BY seq DESC LIMIT 1", chat, id).Scan(&data)
@@ -199,24 +209,33 @@ func (s *CaptureStore) groupEntryID(chat, id string, envelope map[string]any, or
 		}
 		return data, err
 	}
+	type content struct {
+		Participants []string `json:"participants"`
+		Value        *string  `json:"value"`
+	}
+	key := func(raw []byte) string {
+		var v struct {
+			Event struct {
+				GroupChange content `json:"groupChange"`
+			} `json:"event"`
+		}
+		if json.Unmarshal(raw, &v) != nil {
+			return ""
+		}
+		b, _ := json.Marshal(v.Event.GroupChange)
+		return string(b)
+	}
 	data, err := stored(id)
 	if err != nil || data == nil {
 		return id, err
 	}
-	if origin != "live" {
+	own, _ := json.Marshal(envelope)
+	change := key(own)
+	if key(data) == change {
 		return "", nil
 	}
 	event := envelope["event"].(map[string]any)
-	change, _ := json.Marshal(event["groupChange"])
-	var old struct {
-		Event struct {
-			GroupChange json.RawMessage `json:"groupChange"`
-		} `json:"event"`
-	}
-	if json.Unmarshal(data, &old) == nil && string(old.Event.GroupChange) == string(change) {
-		return "", nil
-	}
-	h := sha256.Sum256(change)
+	h := sha256.Sum256([]byte(change))
 	suffixed := id + "_" + hex.EncodeToString(h[:4])
 	if data, err = stored(suffixed); err != nil || data != nil {
 		return "", err

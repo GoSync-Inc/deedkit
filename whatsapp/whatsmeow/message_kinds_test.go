@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -324,13 +325,65 @@ func TestNativeHistoryGroupStubMapsToTheLiveEntry(t *testing.T) {
 	if rows != 2 {
 		t.Fatal("history stub also journaled as a bare notification", rows)
 	}
+	// Two history-only adds of different members in one second keep both (Astra r1 B2); a synced
+	// rename that arrives before its live notification is still one entry.
+	more := &waHistorySync.HistorySync{Conversations: []*waHistorySync.Conversation{{ID: proto.String(groupJID.String()), Messages: []*waHistorySync.HistorySyncMsg{
+		stub("STUB3", 1700000300, waWeb.WebMessageInfo_GROUP_PARTICIPANT_ADD, "666666@s.whatsapp.net"),
+		stub("STUB4", 1700000300, waWeb.WebMessageInfo_GROUP_PARTICIPANT_ADD, "777777@s.whatsapp.net"),
+		stub("STUB5", 1700000700, waWeb.WebMessageInfo_GROUP_CHANGE_SUBJECT, "Огород"),
+	}}}}
+	for range 2 {
+		if err := p.captureHistory(more); err != nil {
+			t.Fatal(err)
+		}
+	}
+	later := events.GroupInfo{JID: groupJID, Timestamp: time.Unix(1700000700, 0), Sender: &admin, Name: &types.GroupName{Name: "Огород"}}
+	if !p.handleGroupEvent(&later) {
+		t.Fatal("handler refused")
+	}
+	entries = groupEntries(t, p.Capture)[2:]
+	var kept []string
+	for _, entry := range entries {
+		kept = append(kept, participantsOf(groupChangeOf(t, entry))+"/"+entry["origin"].(string))
+	}
+	if strings.Join(kept, " ") != "666666@c.us/backfill 777777@c.us/backfill /backfill" {
+		t.Fatal("synced same-second changes", kept)
+	}
+}
+
+// spec: ANYM-869
+func TestNativeLateOlderRenameNeverRewindsTheDialogTitle(t *testing.T) {
+	p := skipProvider(t)
+	admin := member("333333")
+	title := func() string {
+		var v string
+		p.Capture.db.QueryRow("SELECT title FROM chats WHERE chat=?", "120363000000000009@g.us").Scan(&v)
+		return v
+	}
+	for _, r := range []struct {
+		at   int64
+		name string
+		want string
+	}{{1700000900, "Новое", "Новое"}, {1700000800, "Старое", "Новое"}, {1700001000, "Новейшее", "Новейшее"}} {
+		e := events.GroupInfo{JID: groupJID, Timestamp: time.Unix(r.at, 0), Sender: &admin, Name: &types.GroupName{Name: r.name}}
+		if !p.handleGroupEvent(&e) || title() != r.want {
+			t.Fatalf("after %q the dialog title is %q, want %q", r.name, title(), r.want)
+		}
+	}
 }
 
 // spec: ANYM-869
 func TestNativeMalformedGroupChangeIsCountedAndTheNextMessageIsCaptured(t *testing.T) {
 	p := skipProvider(t)
 	admin := member("333333")
+	// 2048 IDs within every per-field bound still exceed the journal limit together (Astra r1 B1).
+	var huge []types.JID
+	for i := range maxGroupChangeParticipants {
+		huge = append(huge, member(strings.Repeat("€", 140)+strconv.Itoa(i)))
+	}
 	for _, bad := range []any{
+		(*events.GroupInfo)(nil), (*events.JoinedGroup)(nil), // typed nil (Astra r1 m1)
+		&events.GroupInfo{JID: groupJID, Timestamp: time.Unix(1700000600, 0), Sender: &admin, Join: huge},
 		&events.GroupInfo{JID: groupJID, Sender: &admin, Name: &types.GroupName{Name: "x"}},                                                    // no time
 		&events.GroupInfo{JID: member("777777"), Timestamp: time.Unix(1700000600, 0), Sender: &admin, Name: &types.GroupName{Name: "x"}},       // not a group
 		&events.GroupInfo{JID: groupJID, Timestamp: time.Unix(1700000600, 0), Sender: &admin, Join: []types.JID{types.NewJID("bad\x00", "x")}}, // unusable member ID
@@ -341,7 +394,7 @@ func TestNativeMalformedGroupChangeIsCountedAndTheNextMessageIsCaptured(t *testi
 			t.Fatalf("malformed group change refused: %#v", bad)
 		}
 	}
-	if got := skipCounts(t, p.Capture); got["skipped_group_change"] != 4 || len(got) != 1 {
+	if got := skipCounts(t, p.Capture); got["skipped_group_change"] != 7 || len(got) != 1 {
 		t.Fatal(got)
 	}
 	if n := spoolFiles(t, p.Config.EventsDirectory); n != 0 || !p.ready.Load() {

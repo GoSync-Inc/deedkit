@@ -596,8 +596,14 @@ func (p *Provider) captureGroupEvent(value any) error {
 	var changes []groupChange
 	switch e := value.(type) {
 	case *events.GroupInfo:
+		if e == nil {
+			return errGroupChange
+		}
 		group, at, changes = e.JID, e.Timestamp, groupInfoChanges(e)
 	case *events.JoinedGroup:
+		if e == nil {
+			return errGroupChange
+		}
 		var c groupChange
 		c, stamp = joinedGroupChange(e)
 		if stamp == "" {

@@ -442,6 +442,8 @@ class CollectorState:
                         peer_kind=CASE WHEN %s AND collector_chats.peer_kind='chat' AND excluded.peer_kind='channel'
                             THEN 'channel' ELSE collector_chats.peer_kind END''',
                         (self.account,chat,kind,history_since,discovery))
+                    from .archive import group_title_kept
+                    if group_title_kept(c,self.account,stable_id('chat',self.account,chat),chat,title or chat):title=chat
                     c.execute('''INSERT INTO chats(id,account,title,chat_type,provider_chat) VALUES(%s,%s,%s,%s,%s)
                         ON CONFLICT(id) DO UPDATE SET
                         title=CASE WHEN excluded.title<>%s AND excluded.title<>'' THEN excluded.title ELSE chats.title END,

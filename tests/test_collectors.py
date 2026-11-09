@@ -1043,10 +1043,10 @@ def test_session_whose_parent_is_a_file_fails_with_the_privacy_code(tmp_path,mon
 WA_GROUP='120363000000000009@g.us'
 
 
-def wa_capture(mid,at,*,body='',kind='chat',group=None,actor='333333@c.us',origin='live'):
+def wa_capture(mid,at,*,body='',kind='chat',group=None,actor='333333@c.us',origin='live',chat=WA_GROUP,title=None):
     """The whatsmeow adapter's envelope (capture.go groupChangeEnvelope / NormalizeMessage), synthetic only."""
     import hashlib
-    event={'chatId':WA_GROUP,'chatName':WA_GROUP,'messageId':mid,'messageType':kind,'timestampResolution':'second',
+    event={'chatId':chat,'chatName':title or chat,'messageId':mid,'messageType':kind,'timestampResolution':'second',
         'durationSeconds':None,'isService':kind!='chat','isSelfChat':False,'senderId':actor or '','senderName':'','body':body,
         'timestamp':at,'fromMe':False,'hasMedia':False,'filename':None,'mimetype':None,'filesize':None,'replyToId':None,
         'mentionsOwner':None,'replyToOwner':None,'forwarded':None,'mediaKind':None,'editedTimestampMs':None,
@@ -1073,9 +1073,9 @@ def wa_groups(seeded):
     return state,store,key
 
 
-def wa_chat(store):
+def wa_chat(store,chat=WA_GROUP):
     with store.pool.connection() as c:
-        return c.execute('SELECT title,chat_type FROM chats WHERE id=%s',(stable_id('chat','wa-groups',WA_GROUP),)).fetchone()
+        return c.execute('SELECT title,chat_type FROM chats WHERE id=%s',(stable_id('chat','wa-groups',chat),)).fetchone()
 
 
 def wa_rows(store,provider_id):
@@ -1123,6 +1123,17 @@ def test_an_older_synced_rename_never_overwrites_the_newer_group_title(wa_groups
     assert wa_chat(store)['title']=='Новое имя'
     assert state.apply(group_capture('rename',1700000300,value='Ещё новее'))['outcome']=='created'
     assert wa_chat(store)['title']=='Ещё новее'
+    # A scan page or a dialog list read before the rename carries the old title: neither rewinds it (Astra r1 M1).
+    assert state.apply(wa_capture('false_'+WA_GROUP+'_PAGE',1700000050,body='старое сообщение',origin='reconcile',
+        title='Новое имя'))['outcome']=='created'
+    state.inventory([(WA_GROUP,'chat','Старое имя','group')],None)
+    assert wa_chat(store)['title']=='Ещё новее'
+    # A group with no rename or join row keeps today's behaviour: the page and the dialog list name it.
+    other='120363000000000010@g.us'
+    state.apply(wa_capture('false_'+other+'_A',1700000050,body='привет',chat=other,title='Из списка чатов'))
+    assert wa_chat(store,other)['title']=='Из списка чатов'
+    state.inventory([(other,'chat','Новое из списка','group')],None)
+    assert wa_chat(store,other)['title']=='Новое из списка'
 
 
 # spec: ANYM-869
