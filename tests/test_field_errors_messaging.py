@@ -197,7 +197,7 @@ def test_every_hint_literal_of_the_feedback_and_argument_checks_is_in_the_shared
     from platform_contracts import field_errors as shared
     root = pathlib.Path(messaging_service.__file__).parent
     found = set()
-    for name in ('feedback.py', 'app.py'):
+    for name in ('feedback.py', 'app.py', *sorted(p.relative_to(root).as_posix() for p in (root / 'app_tools').glob('*.py'))):
         for node in ast.walk(ast.parse((root / name).read_text())):
             # `(field, reason, hint, ...)` error tuples; a hint may be a conditional between two literals.
             if isinstance(node, ast.Tuple) and len(node.elts) >= 3 and isinstance(node.elts[0], ast.Constant) and (

@@ -240,7 +240,8 @@ def test_changed_since_finds_a_status_change_on_an_old_item(seeded):
 # spec: ANYM-265
 def test_no_agent_key_reaches_the_export():
     assert 'export_feedback' not in OPERATION_PERMISSIONS and 'export_feedback' not in AUDIT_OPERATIONS
-    assert 'export_feedback' not in SOURCE.joinpath('app.py').read_text()
+    for path in (SOURCE / 'app.py', *sorted((SOURCE / 'app_tools').glob('*.py'))):
+        assert 'export_feedback' not in path.read_text(), path.name
     catalog = json.loads((ROOT / 'services/gateway/src/agent_gateway/catalog.json').read_text())
     contracts = json.loads((ROOT / 'tests/platform/fixtures/messaging-contracts.json').read_text())
     assert not any('export' in tool['name'] and 'feedback' in tool['name'] for tool in catalog)
