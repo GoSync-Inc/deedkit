@@ -4,10 +4,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import math
 import re
 from uuid import UUID, uuid5
 
+log = logging.getLogger(__name__)
 NAMESPACE = UUID('5d833db7-c8ae-4c82-bfe3-e0e4d498d4da')
 MAX_ENVELOPE = 512 * 1024
 
@@ -99,6 +101,28 @@ def contact_block(value):
     return result
 
 
+LOCATION_KEYS=frozenset(('latitude','longitude','accuracy_m','title','address','live'))
+
+
+def location_block(value):
+    """A shared point or venue (ANYM-922): coordinates, accuracy, title and address as the sender stated them.
+    A live location is only the fact that it was shared, {live: true}: never a point of its track."""
+    def coordinate(item,limit):
+        if type(item) not in (int,float) or not math.isfinite(item) or not -limit<=item<=limit:raise ValueError('invalid_location')
+        return round(float(item),6)
+    def label(item):
+        if item is not None and (not isinstance(item,str) or '\x00' in item or len(item)>256):raise ValueError('invalid_location')
+        return item or None
+    if not isinstance(value,dict) or set(value)-LOCATION_KEYS or type(value.get('live')) is not bool:raise ValueError('invalid_location')
+    if value['live']:
+        if set(value)!={'live'}:raise ValueError('invalid_location')
+        return {'live':True}
+    accuracy=value.get('accuracy_m')
+    if accuracy is not None and (type(accuracy) is not int or not 0<=accuracy<2**32):raise ValueError('invalid_location')
+    return {'latitude':coordinate(value.get('latitude'),90),'longitude':coordinate(value.get('longitude'),180),
+        'accuracy_m':accuracy,'title':label(value.get('title')),'address':label(value.get('address')),'live':False}
+
+
 GROUP_CHANGES=('rename','topic','join','leave','add','remove','promote','demote','joined_group')
 MAX_GROUP_CHANGE_PARTICIPANTS=2048
 
@@ -124,8 +148,20 @@ def text(value, maximum, name, empty=False):
     return value
 
 
+def without_unencodable_location(data):
+    """A location JSON cannot carry (NaN, infinity) is dropped before the envelope is encoded, never the message (ANYM-922)."""
+    metadata=data.get('metadata')
+    if not isinstance(metadata,dict) or 'location' not in metadata:return data
+    try:canonical(metadata['location'])
+    except (TypeError,ValueError):
+        log.warning('location_dropped reason=invalid_location')
+        return {**data,'metadata':{k:v for k,v in metadata.items() if k!='location'}}
+    return data
+
+
 def validate(data):
     if not isinstance(data, dict): raise ValueError('invalid_envelope')
+    data=without_unencodable_location(data)
     if len(canonical(data))>MAX_ENVELOPE: raise ValueError('envelope_too_large')
     allowed={'account','platform','chat','chat_title','provider_id','sender','body','sent_at',
              'updated_at','deleted','direction','origin','media','sender_profile','metadata','formatting'}
@@ -155,7 +191,7 @@ def validate(data):
         metadata=data['metadata']
         if not isinstance(metadata,dict) or set(metadata)-{'reply_to_provider_id','forwarded','media_kind','mentions_owner','reply_to_owner','sender_is_bot','chat_type','sender_identity_basis','is_service','is_self_chat','sender_is_contact','sender_is_business_or_verified',
                 'message_kind','provider_message_type','timestamp_resolution','media_duration_seconds','forward_origin','contact',
-                'web_preview_id','buttons','group_change','poll'}:
+                'web_preview_id','buttons','group_change','poll','location'}:
             raise ValueError('invalid_metadata')
         result['metadata']={}
         for key,value in metadata.items():
@@ -187,6 +223,16 @@ def validate(data):
                 if metadata.get('message_kind')!='poll':raise ValueError('invalid_metadata')
                 from .polls import poll_block
                 value=poll_block(value)
+            elif key=='location':
+                # A place someone shared (ANYM-922). A block the archive cannot accept never costs the message:
+                # it is dropped and only the reason code is logged, never the coordinates.
+                if value is None:continue
+                try:
+                    if metadata.get('message_kind')!='location':raise ValueError('invalid_location')
+                    value=location_block(value)
+                except ValueError:
+                    log.warning('location_dropped reason=invalid_location')
+                    continue
             elif key=='web_preview_id':
                 # Telegram's link preview page ID in its unsigned 64-bit decimal form (ANYM-611).
                 if value is not None and (type(value) is not str or not re.fullmatch(r'[0-9]{1,20}',value)):
@@ -238,6 +284,8 @@ def validate(data):
         result.get('metadata',{}).pop('contact',None)
         # Nor a keyboard: its labels and links are message content (ANYM-658).
         result.get('metadata',{}).pop('buttons',None)
+        # Nor a shared place (ANYM-922).
+        result.get('metadata',{}).pop('location',None)
     return result
 
 

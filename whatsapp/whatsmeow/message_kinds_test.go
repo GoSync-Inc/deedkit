@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -520,6 +521,13 @@ func TestNativeLocationKeepsItsPointTitleAndAddressAndALiveOneOnlyTheFact(t *tes
 	if data, _ := json.Marshal(v["location"]); string(data) != `{"accuracy_m":null,"address":null,"latitude":-33.9,"live":false,"longitude":151.2,"title":null}` {
 		t.Fatal(string(data))
 	}
+	// JSON cannot carry NaN: the coordinate is null (the archive drops the block) and the message is still journaled.
+	v, err = NormalizeMessage(groupFixture("LOCNAN", &waE2E.Message{LocationMessage: &waE2E.LocationMessage{
+		DegreesLatitude: proto.Float64(math.NaN()), DegreesLongitude: proto.Float64(math.Inf(1)), Name: proto.String("Парк")}}), owner)
+	if err != nil || v["location"].(map[string]any)["latitude"] != nil || v["location"].(map[string]any)["longitude"] != nil {
+		t.Fatal(err, v["location"])
+	}
+	requireFields(t, v, map[string]any{"messageType": "location", "body": "Парк"})
 	// A live location, in either form, is only the fact that it was shared: no point of the track.
 	for name, m := range map[string]*waE2E.Message{
 		"live": {LiveLocationMessage: &waE2E.LiveLocationMessage{DegreesLatitude: proto.Float64(55.7), DegreesLongitude: proto.Float64(37.6),

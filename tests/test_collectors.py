@@ -1326,11 +1326,12 @@ def test_message_reads_return_a_shared_whatsapp_location_and_never_its_live_trac
     state,store,key=wa_groups
     point={'latitude':55.755826,'longitude':37.6173,'accuracy_m':None,'title':'Парк Синтетик','address':'ул. Тестовая 1','live':False}
     shared=wa_capture('false_'+WA_GROUP+'_LOC1_444444@c.us',1700000000,body='Парк Синтетик',kind='location',actor='444444@c.us')
-    shared['event']['location']=point
+    shared['event'].update(location=point,isService=False)
     live=wa_capture('false_'+WA_GROUP+'_LOC2_444444@c.us',1700000010,body='иду',kind='location',actor='444444@c.us')
-    live['event']['location']={'live':True}
-    state.apply(shared);state.apply(live)
+    live['event'].update(location={'live':True},isService=False)
     state.apply(wa_capture('false_'+WA_GROUP+'_HI_555555@c.us',1700000020,body='Парк Синтетик рядом',actor='555555@c.us'))
+    subscription=store.create_subscription(key,[stable_id('chat','wa-groups',WA_GROUP)])['subscription_id']
+    state.apply(shared);state.apply(live)
     chat_id=stable_id('chat','wa-groups',WA_GROUP)
     mid,lid=(stable_id('msg','wa-groups',WA_GROUP,'false_'+WA_GROUP+f'_LOC{n}_444444@c.us') for n in (1,2))
     reads={'archive':store.get_messages(key,chat_id)['items'],'conversation':store.get_messages(key,chat_id,view='conversation')['items'],
@@ -1339,9 +1340,14 @@ def test_message_reads_return_a_shared_whatsapp_location_and_never_its_live_trac
         assert next(i for i in items if i['id']==mid)['location']==point,name
         assert all('location' not in i for i in items if i['id'] not in (mid,lid)),name
     assert next(i for i in reads['archive'] if i['id']==lid)['location']=={'live':True}
+    # Subscription references carry IDs and kinds, never the place.
+    from messaging_service.subscriptions import match_subscriptions
+    match_subscriptions(store)
+    references=store.get_subscription_events(key,subscription,limit=100)['items']
+    assert len(references)>=2 and '55.75' not in json.dumps(references,default=str,ensure_ascii=False) and 'Тестовая' not in json.dumps(references,default=str,ensure_ascii=False)
     # A deleted message keeps no place.
     gone=wa_capture('false_'+WA_GROUP+'_LOC1_444444@c.us',1700000000,kind='location',actor='444444@c.us')
-    gone.update(change='delete');state.apply(gone)
+    gone['event']['isService']=False;gone.update(change='delete');state.apply(gone)
     assert 'location' not in store.get_context(key,mid)['message']
     # A key without read on the chat gets nothing.
     Archive(store).register('wa-other','whatsapp','Synthetic other',discover=True)

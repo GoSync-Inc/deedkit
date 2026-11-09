@@ -244,6 +244,13 @@ def shape_messages(rows, *, compact=False, body_chars=None):
             elif compact and isinstance(row['buttons'],dict):
                 from .message_buttons import compact as compact_buttons
                 row.update(compact_buttons(row['buttons']))
+        if 'location' in row:
+            # ANYM-922: no place is no key. A point always reads in its full shape: a same-revision re-observation
+            # stores it with its null fields stripped.
+            location=row['location']
+            if not isinstance(location,dict):row.pop('location')
+            elif location.get('live') is not True:
+                row['location']={k:location.get(k) for k in ('latitude','longitude','accuracy_m','title','address')}|{'live':False}
         if compact:
             if body is not None:row.setdefault('snippet',body[:320])
             row.pop('body',None)
