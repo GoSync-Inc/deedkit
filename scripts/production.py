@@ -25,7 +25,7 @@ if GUARDED:
 import argparse
 import copy
 from contextlib import ExitStack, contextmanager, suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import io
@@ -3349,10 +3349,16 @@ def halt_summary(text):
         summary.update(actor=pause["actor"], waiting=f"waiting for {waited // 3600}h{waited % 3600 // 60}m")
     return summary
 CONFIG, HTTP_CONFIG = "/etc/deedkit/production.json", "/etc/deedkit/http-production.json"
-DEPLOY_INTERVAL = 20 * 60
-# Consecutive runs whose `git ls-remote` or mirror fetch failed before the deployer pauses (about 15 minutes on the
-# timer): a network blip heals by itself, a broken mirror or a refused access does not.
+# The least time between two `--auto` deploy starts: about one deploy's duration. Deploys never overlap (the host
+# locks and the oneshot unit); the interval only stops a run that ended fast from starting the next at once. It was
+# 20 minutes for the GitHub API quota, which promotion no longer reads (ANYM-406; ci-deploy-speed 11-09).
+DEPLOY_INTERVAL = 5 * 60
+# Consecutive runs whose `git ls-remote` or mirror fetch failed before the deployer pauses: a network blip heals by
+# itself, a broken mirror or a refused access does not. The timer runs every minute, so an `--auto` run retries a
+# failed git or GHCR read only RETRY_SPACING after the last counted failure: the pause still comes after about 10-15
+# minutes of failures, never after three minutes.
 FETCH_FAILURES = 3
+RETRY_SPACING = 4 * 60
 # Changes a human applies or installs by hand, so the deployer pauses for them; but `deploy` installs the pair of
 # TOOL_FILES itself on a host with the self-updating layout ("Deploy tool updates" below).
 SQL_INVENTORY = re.compile(r"\.sql$|^services/.+/migrations/")
@@ -5493,6 +5499,21 @@ def newest_attested_candidate(mirror, state, http_state, base, head, attested):
     return None
 
 
+def retry_after(last, moment=None):
+    """When an `--auto` run may read git or GHCR again after a counted failure (`fetch_failures`, `unreachable`), or
+    None. A record without a readable time never holds a run back: the read is retried and counted as before."""
+    times = []
+    for key in ("fetch_failures", "unreachable"):
+        try:
+            times.append(datetime.strptime(last[key]["at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not times:
+        return None
+    retry = max(times) + timedelta(seconds=RETRY_SPACING)
+    return retry if retry > (moment or datetime.now(timezone.utc)) else None
+
+
 def deploy_receipt(state, halt):
     """The previous deploy receipt and its counters: `(halted, None)` when it is malformed, else `(None, counters)`."""
     try:
@@ -5714,7 +5735,9 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
         return halted
     last, started, failures, misses, waits, gated = counts
     if auto and started and (datetime.now(timezone.utc) - started).total_seconds() < DEPLOY_INTERVAL:
-        return {"status": "waiting", "reason": "less than 20 minutes since the last deploy started"}
+        return {"status": "waiting", "reason": f"less than {DEPLOY_INTERVAL // 60} minutes since the last deploy started"}
+    if auto and (retry := retry_after(last)):
+        return {"status": "waiting", "reason": f"a git or GHCR read failed; the next try is at {retry:%H:%M:%SZ}"}
     if "call_waits" in last or "migration_waits" in last:
         # Waits for calls or a migration gate count only in a row: this run carries the count on only when it waits
         # again.
@@ -7259,7 +7282,7 @@ def argument_parser():
     parser.add_argument("--target", choices=sorted(BUILDS))
     parser.add_argument("--config", help="default " + CONFIG + "; status: the autodeploy unit's (active_config)")
     parser.add_argument("--http-config", default=HTTP_CONFIG, help="deploy, rollback, status: seamless_release.py's")
-    parser.add_argument("--auto", action="store_true", help="deploy: at most one deploy start per 20 minutes (timer)")
+    parser.add_argument("--auto", action="store_true", help="deploy: at most one deploy start per 5 minutes, and a failed read retried 4 minutes later (timer)")
     parser.add_argument("--dry-run", action="store_true", help="deploy: print the plan or pause reason, change nothing")
     parser.add_argument("--remove", action="store_true", help="images: remove the listed candidates")
     parser.add_argument("--database", help="copy-database: a name under the configuration's migration.databases")
