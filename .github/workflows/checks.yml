@@ -632,11 +632,24 @@ jobs:
           uv sync --locked --group dev
           uv run ruff check src
           uv run pytest -q -p no:cacheprovider -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/inference.xml"
+      - name: Agent runner tests
+        # ANYM-819: the agent runner for the Mac mini's agent VM, with fake engines, a fake VM and a fake host gate,
+        # plus real containers from a locally built fake image on this runner's Docker (never a real engine). Its own
+        # lock and environment; its report is the Tiden module `agent_runner` (services/agent-runner/tests).
+        id: agent_runner
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
+        working-directory: services/agent-runner
+        env:
+          AGENT_RUNNER_DOCKER_TESTS: required
+        run: |
+          uv sync --locked --group dev
+          uv run ruff check src tests
+          uv run pytest -q -p no:cacheprovider -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/agent-runner.xml"
       - name: Record the service outcomes
         if: ${{ always() }}
         env:
           MODULE_OUTCOMES: >-
-            {"gateway":"${{ steps.gateway.outcome }}","platform_contracts":"${{ steps.platform_contracts.outcome }}","calls":"${{ steps.calls.outcome }}","calls_frontend":"${{ steps.calls_frontend.outcome }}","inference":"${{ steps.inference.outcome }}"}
+            {"gateway":"${{ steps.gateway.outcome }}","platform_contracts":"${{ steps.platform_contracts.outcome }}","calls":"${{ steps.calls.outcome }}","calls_frontend":"${{ steps.calls_frontend.outcome }}","inference":"${{ steps.inference.outcome }}","agent_runner":"${{ steps.agent_runner.outcome }}"}
         run: |
           python3 -c 'import json, os, pathlib; pathlib.Path(os.environ["RUNNER_TEMP"], "ci-evidence", "outcomes.json").write_text(json.dumps({"module_checks": json.loads(os.environ["MODULE_OUTCOMES"])}))'
       - name: Retain service evidence even when a test fails

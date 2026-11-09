@@ -53,7 +53,7 @@ NO_SPEC_LIST = "config/tiden-unlinked-tests.json"
 CATEGORIES = ("missing-spec", "helper", "trivial", "duplicate", "dead-code")
 ENTRY_FIELDS = {"caseId", "externalId", "category", "reason"}
 # Fixed suites, one path rule each, in this order; anything else is unassigned and fails by itself.
-SUITES = ("root-python", "calendar", "calls-frontend", "calls", "gateway", "inference", "platform-contracts",
+SUITES = ("root-python", "calendar", "calls-frontend", "calls", "gateway", "inference", "agent-runner", "platform-contracts",
           "release-router-go", "whatsmeow-go", "whatsapp-node", "npm", "ci")
 CALLS_WITHOUT_PATH = ("s:tests.test_voice", "s:tests.test_webrtc")
 BARE_GO_TEST = re.compile(r"[^/]*_test\.go")
@@ -95,6 +95,8 @@ def suite(case: dict) -> str:
         return "gateway"
     if path.startswith("services/inference/"):
         return "inference"
+    if path.startswith("services/agent-runner/"):
+        return "agent-runner"
     if path.startswith("packages/platform-contracts/"):
         return "platform-contracts"
     if path.startswith("whatsapp/whatsmeow/") or BARE_GO_TEST.fullmatch(path):

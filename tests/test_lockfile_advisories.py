@@ -18,6 +18,7 @@ UV_LOCKS = ('uv.lock', 'services/messaging/uv.lock', 'services/gateway/uv.lock',
     'services/calls/uv.lock', 'services/calendar/uv.lock', 'tools/dev/uv.lock')
 RECORDINGS_LOCK = 'services/recordings/uv.lock'
 INFERENCE_LOCK = 'services/inference/uv.lock'
+AGENT_RUNNER_LOCK = 'services/agent-runner/uv.lock'
 REQUIREMENTS_LOCKS = ('services/messaging/requirements.lock', 'services/messaging/requirements-test.lock',
     'services/messaging/requirements-enrichment.lock', 'services/messaging/requirements-telemetry.lock',
     'services/messaging/requirements-backup-r2.lock')
@@ -111,12 +112,19 @@ def test_lockfile_advisory_check_lists_every_committed_lockfile():
     tracked = subprocess.run(['git', '-C', str(ROOT), 'ls-files', '-z'], check=True, capture_output=True, text=True).stdout
     found = {path for path in tracked.split('\0')
         if PurePosixPath(path).name == 'uv.lock' or re.fullmatch(r'requirements[^/]*\.lock', PurePosixPath(path).name)}
-    assert found == set(UV_LOCKS + REQUIREMENTS_LOCKS) | {RECORDINGS_LOCK, INFERENCE_LOCK}
+    assert found == set(UV_LOCKS + REQUIREMENTS_LOCKS) | {RECORDINGS_LOCK, INFERENCE_LOCK, AGENT_RUNNER_LOCK}
 
 
 # spec: ANYM-682
 def test_inference_lockfile_pins_no_version_below_a_known_advisory_fix():
     pins = _pins((ROOT / INFERENCE_LOCK).read_text(encoding='utf-8'), True)
+    assert pins
+    assert not _below_fix(pins)
+
+
+# spec: ANYM-819
+def test_agent_runner_lockfile_pins_no_version_below_a_known_advisory_fix():
+    pins = _pins((ROOT / AGENT_RUNNER_LOCK).read_text(encoding='utf-8'), True)
     assert pins
     assert not _below_fix(pins)
 

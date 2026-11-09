@@ -1,0 +1,8 @@
+{"type":"system","subtype":"init","session_id":"00000000-0000-4000-8000-000000000001","tools":["Bash","Edit"],"model":"synthetic"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"I will fix the typo in README.md."}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/workspace/README.md","old_string":"teh","new_string":"the"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"git add README.md && git commit -m 'docs: fix a typo'"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"[agent 1a2b3c] docs: fix a typo"}]}}
+not json: a stray stderr line from a tool
+{"type":"result","subtype":"success","is_error":false,"num_turns":3,"result":"Fixed the typo in README.md and committed it.\nRESULT: done — the typo is fixed"}
