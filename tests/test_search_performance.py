@@ -342,6 +342,17 @@ def seed_attention_groups(s):
         c.execute('ANALYZE messages');c.execute('ANALYZE message_metadata');c.execute('ANALYZE chats')
 
 
+def forget_attention_groups(s):
+    """Leave the shared database's statistics as the fixture's baseline: the 100k seeded rows were ANALYZEd, and a
+    later plan test in the same shard must not plan its small tables from those numbers (#748)."""
+    with s.pool.connection() as c:
+        c.execute('TRUNCATE accounts,principals,api_key_operations,feed_counter,audit_log CASCADE')
+        c.execute('INSERT INTO feed_counter(id) VALUES(1)')
+    s.seed()
+    with s.pool.connection() as c:
+        c.execute('ANALYZE messages');c.execute('ANALYZE message_metadata');c.execute('ANALYZE chats')
+
+
 def attention_ids(c,account,chat,provider_chat,platform,query):
     return [r['id'] for r in c.execute('''WITH group_scope AS (SELECT %s::text AS account,%s::text AS chat,
         %s::text AS provider_chat,%s::text AS platform) SELECT threads.id FROM group_scope gs CROSS JOIN LATERAL ('''+query(
@@ -377,10 +388,15 @@ def timeless(value):
 
 # spec: ANYM-915
 def test_group_attention_reads_its_candidates_not_the_group_history(seeded,monkeypatch):
-    from group_attention_legacy import legacy_group_thread_query
-    from messaging_service.conversation_state import group_thread_query
     s,_,_=seeded
     seed_attention_groups(s)
+    try:check_attention_groups(s,monkeypatch)
+    finally:forget_attention_groups(s)
+
+
+def check_attention_groups(s,monkeypatch):
+    from group_attention_legacy import legacy_group_thread_query
+    from messaging_service.conversation_state import group_thread_query
     wa='120363000000000001@g.us'
     expected={chat:[chat+'-'+str(n) for n in (49999,49990,40009,25003,20000,3001,100,7)] for chat in ('ga-tg','ga-wa')}
     with s.pool.connection() as c:
