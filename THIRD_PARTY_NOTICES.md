@@ -33,7 +33,8 @@ that every transitive dependency or model has completed a license audit.
 
 The optional native WhatsApp adapter uses [whatsmeow](https://github.com/tulir/whatsmeow)
 (MPL-2.0), pinned with its transitive dependencies in `whatsapp/whatsmeow/go.mod`
-and `go.sum`. Our adapter is separate MIT source. The build replaces whatsmeow with
+and `go.sum`. Serve mode (the session holder) adds the PostgreSQL client
+[pgx](https://github.com/jackc/pgx) (MIT) to the same locks. Our adapter is separate MIT source. The build replaces whatsmeow with
 a modified version: the fork https://github.com/GoSync-Inc/whatsmeow at revision
 fa2ca87d4bd8 (branch `deedkit/f16f9ca30d6a`), which is upstream commit f16f9ca30d6a
 (https://github.com/tulir/whatsmeow/tree/f16f9ca30d6a) plus one commit: two hunks in

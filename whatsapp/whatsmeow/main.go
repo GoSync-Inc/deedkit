@@ -71,7 +71,15 @@ func main() {
 	flag.BoolVar(&mediaKeys, "media-keys", false, "read-only capture journal lookup for the operator media inventory; no provider/session access")
 	var menuShapes bool
 	flag.BoolVar(&menuShapes, "menu-reply-shapes", false, "read-only capture journal scan: field relations of the owner's menu replies, no values (ANYM-837); no provider/session access")
+	var socketDir string
+	flag.StringVar(&socketDir, "serve", "", "session holder (ANYM-937): own the session and serve the collector on unix sockets in this 0700 directory")
+	var version bool
+	flag.BoolVar(&version, "version", false, "print the build's source SHA and holder protocol range; no provider/session access")
 	flag.Parse()
+	if version {
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"holder_source_sha": sourceSHA, "protocol": holderProtocol, "supported": holderSupported})
+		return
+	}
 	code := 0
 	var err error
 	if fixture != "" {
@@ -82,6 +90,8 @@ func main() {
 		err = serveMediaKeys(path, os.Stdin, os.Stdout)
 	} else if menuShapes {
 		err = serveMenuReplyShapes(path, os.Stdout)
+	} else if socketDir != "" {
+		err = serve(path, socketDir)
 	} else {
 		err = execute(path, pair)
 	}

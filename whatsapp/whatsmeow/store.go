@@ -40,6 +40,7 @@ type CaptureStore struct {
 	MaxEntries      int
 	MaxSpoolBytes   int64
 	MaxSpoolEntries int
+	Fence           func(chat string) (release func(), err error) // ANYM-937 serve mode, capture_fence.go; nil in child mode
 }
 type savedMessage struct {
 	Info   types.MessageInfo
@@ -418,30 +419,14 @@ func (s *CaptureStore) append(chat, id string, stamp int64, raw []byte, envelope
 		// still exported, but cannot later serve pages, media or edit lookups.
 		raw = []byte{}
 	}
-	// Observation time/origin do not turn a history replay into a new revision.
-	canonical := map[string]any{}
-	for k, v := range envelope {
-		if k != "observed_at" && k != "origin" {
-			canonical[k] = v
-		}
-	}
-	if v, ok := canonical["event"].(map[string]any); ok {
-		copy := map[string]any{}
-		for k, x := range v {
-			if k != "identityObservations" {
-				copy[k] = x
-			}
-		}
-		canonical["event"] = copy
-	}
-	stable, _ := json.Marshal(canonical)
-	h := sha256.New()
-	h.Write(stable)
-	h.Write([]byte{0})
-	h.Write(raw)
-	digest := hex.EncodeToString(h.Sum(nil))
+	digest := captureDigest(envelope, raw)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	release, err := s.fence(chat)
+	if err != nil {
+		return fenceRefusal(err)
+	}
+	defer release()
 	var published int
 	var storedData []byte
 	err = s.db.QueryRow("SELECT published,envelope FROM capture WHERE digest=?", digest).Scan(&published, &storedData)
@@ -620,19 +605,15 @@ func (s *CaptureStore) Replay() error {
 	defer s.mu.Unlock()
 	// Bound both RAM and mutex hold time. The lifecycle worker drains subsequent
 	// oldest-first batches; startup never materializes the entire capture cache.
-	rows, e := s.db.Query("SELECT digest,envelope FROM capture WHERE published=0 ORDER BY seq LIMIT ?", replayBatchEntries)
+	rows, e := s.db.Query("SELECT digest,envelope,chat FROM capture WHERE published=0 ORDER BY seq LIMIT ?", replayBatchEntries)
 	if e != nil {
 		return e
 	}
-	type item struct {
-		d string
-		b []byte
-	}
-	var pending []item
+	var pending []pendingCapture
 	var size int
 	for rows.Next() {
-		var i item
-		if e = rows.Scan(&i.d, &i.b); e != nil {
+		var i pendingCapture
+		if e = rows.Scan(&i.d, &i.b, &i.chat); e != nil {
 			rows.Close()
 			return e
 		}
@@ -658,12 +639,7 @@ func (s *CaptureStore) Replay() error {
 	if e != nil {
 		return e
 	}
-	for _, i := range pending {
-		if e = s.publishWithUsage(i.d, i.b, &usage); e != nil {
-			return e
-		}
-	}
-	return nil
+	return s.publishPending(pending, &usage)
 }
 func atomicPrivate(dir, name string, data []byte) error {
 	var entropy [12]byte
