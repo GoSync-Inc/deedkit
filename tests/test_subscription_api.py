@@ -178,7 +178,7 @@ def test_subscription_manifest_has_strict_schemas_and_passive_event_read():
             'Accept':'application/json, text/event-stream'},json={'jsonrpc':'2.0','id':1,
             'method':'tools/list','params':{}}).json()['result']['tools']
     tools={tool['name']:tool for tool in listed}
-    assert len(tools)==54
+    assert len(tools)==59
     for method in METHODS:
         tool=tools[method]
         assert tool['inputSchema']['additionalProperties'] is False
@@ -1144,6 +1144,30 @@ def test_endpoint_calls_drop_omitted_options_and_wait_for_the_inline_test(transp
     assert waited==['synthetic-token']*2
     assert [r['test']['test_status'] for r in results]==['delivered','pending','delivered','pending','pending']
     assert all(secret not in json.dumps(r) for r in results)
+
+
+# spec: ANYM-848
+def test_wake_target_tools_match_the_gateway_catalog_and_client_lists():
+    root=Path(__file__).resolve().parents[1]
+    catalog={row['name']:row for row in json.loads(
+        (root/'services/gateway/src/agent_gateway/catalog.json').read_text())}
+    client={row['name']:row['read_only'] for row in json.loads((root/'packages/deedkit/lib/tools.json').read_text())}
+    with TestClient(create_app(RecordingStore(),['testserver'])) as http:
+        listed=http.post('/mcp',headers={'Authorization':'Bearer synthetic-token',
+            'Accept':'application/json, text/event-stream'},json={'jsonrpc':'2.0','id':1,
+            'method':'tools/list','params':{}}).json()['result']['tools']
+    backend={tool['name']:tool for tool in listed}
+    tools=('register_wake_target','list_wake_targets','update_wake_target','delete_wake_target','confirm_wake_target')
+    for name in tools:
+        for field in ('description','inputSchema','annotations'):
+            assert catalog['messages_'+name][field]==backend[name][field],(name,field)
+        read=name=='list_wake_targets'
+        assert backend[name]['annotations']['readOnlyHint'] is read and client['messages_'+name] is read
+        assert catalog['messages_'+name]['scopes']==['read','delivery-write']
+    assert 'CODEX_THREAD_ID' in backend['register_wake_target']['description']
+    schema=backend['register_wake_target']['inputSchema']
+    assert schema['required']==['request_id','kind','thread','subscription_ids']
+    assert schema['properties']['subscription_ids']['maxItems']==16
 
 
 # spec: ANYM-520

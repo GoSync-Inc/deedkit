@@ -77,6 +77,8 @@ V61_TABLES={'delivery_attempts':'id'}
 V69_TABLES={'media_recovery':'job'}
 # ANYM-824: per-day matcher counts of each subscription (numbers, platform names, UTC days; no IDs or text).
 V70_TABLES={'subscription_activity':'subscription,day,platform,scope_version,metric'}
+# ANYM-848: an agent's own wake targets and their bindings (thread IDs, labels, states; no secret).
+V72_TABLES={'wake_targets':'id','wake_target_subscriptions':'wake_target,subscription'}
 SCHEMAS=range(2,73)
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
@@ -101,7 +103,7 @@ def database_manifest(c):
                        **(V35_TABLES if version>=35 else {}),
                        **(V37_TABLES if version>=37 else {}),
                        **(V38_TABLES if version>=38 else {}),**(V41_TABLES if version>=41 else {}),**(V42_TABLES if version>=42 else {}),**(V43_TABLES if version>=43 else {}),
-                       **(V44_TABLES if version>=44 else {}),**(V45_TABLES if version>=45 else {}),**(V48_TABLES if version>=48 else {}),**(V49_TABLES if version>=49 else {}),**(V50_TABLES if version>=50 else {}),**(V51_TABLES if version>=51 else {}),**(V53_TABLES if version>=53 else {}),**(V56_TABLES if version>=56 else {}),**(V57_TABLES if version>=57 else {}),**(V58_TABLES if version>=58 else {}),**(V61_TABLES if version>=61 else {}),**(V69_TABLES if version>=69 else {}),**(V70_TABLES if version>=70 else {})}.items():
+                       **(V44_TABLES if version>=44 else {}),**(V45_TABLES if version>=45 else {}),**(V48_TABLES if version>=48 else {}),**(V49_TABLES if version>=49 else {}),**(V50_TABLES if version>=50 else {}),**(V51_TABLES if version>=51 else {}),**(V53_TABLES if version>=53 else {}),**(V56_TABLES if version>=56 else {}),**(V57_TABLES if version>=57 else {}),**(V58_TABLES if version>=58 else {}),**(V61_TABLES if version>=61 else {}),**(V69_TABLES if version>=69 else {}),**(V70_TABLES if version>=70 else {}),**(V72_TABLES if version>=72 else {})}.items():
         query=sql.SQL('SELECT row_to_json(t) AS record FROM {} t ORDER BY {}').format(
             sql.Identifier(name),sql.SQL(',').join(sql.Identifier(part) for part in order.split(',')))
         sha=hashlib.sha256(); count=0
@@ -364,6 +366,9 @@ def quarantine_restore(store):
             # Self-service endpoints stay off until the operator enables each one (ANYM-519).
             c.execute("UPDATE delivery_endpoints SET state='operator_disabled',version=version+1,updated_at=clock_timestamp() WHERE state<>'deleted'")
             c.execute("UPDATE delivery_endpoint_tests SET state='cancelled',lease_token=NULL,lease_until=NULL,finished_at=clock_timestamp(),error_code='restored_disabled' WHERE state IN ('pending','leased')")
+        if version>=72:
+            # ANYM-848: a restored snapshot wakes no chat until the operator enables its targets again.
+            c.execute("UPDATE wake_targets SET state='operator_disabled',disabled_reason='restore',version=version+1,updated_at=clock_timestamp() WHERE state<>'deleted'")
         if version>=38:
             # Held hints and silence timers never fire from a restored snapshot.
             c.execute("""UPDATE subscription_hint_windows SET first_match_at=NULL,last_match_at=NULL,match_count=0,

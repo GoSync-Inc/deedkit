@@ -4525,6 +4525,268 @@
         "openWorldHint": false,
         "readOnlyHint": false
       },
+      "description": "Register one of your own chats to be woken when any of your own listed active subscriptions has new events.\n\nRequires read + explicit delivery-write and the operator's delivery switch (else delivery_disabled). A Codex\nagent passes its own CODEX_THREAD_ID as thread. The host waker on the owner's machine reads your targets, sends\nthe chat one challenge with a code, and wakes it for events only after that chat calls confirm_wake_target\nwith the code. A subscription wakes at most one chat: subscription_already_bound names your target that holds\nit; rebind true moves it here. hourly_budget (default 12) caps wakes per hour on the waker. Repeat the same\nrequest_id and arguments to recover a lost response; DeedKit never sends anything to the chat.\n",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "hourly_budget": {
+            "anyOf": [
+              {
+                "maximum": 60,
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Hourly Budget"
+          },
+          "kind": {
+            "const": "codex_thread",
+            "title": "Kind",
+            "type": "string"
+          },
+          "label": {
+            "default": "",
+            "maxLength": 80,
+            "pattern": "^[^\\x00-\\x1f\\x7f]*$",
+            "title": "Label",
+            "type": "string"
+          },
+          "rebind": {
+            "default": false,
+            "title": "Rebind",
+            "type": "boolean"
+          },
+          "request_id": {
+            "maxLength": 128,
+            "minLength": 8,
+            "pattern": "^[A-Za-z0-9_.:-]+$",
+            "title": "Request Id",
+            "type": "string"
+          },
+          "subscription_ids": {
+            "items": {
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+              "type": "string"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "title": "Subscription Ids",
+            "type": "array"
+          },
+          "thread": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[A-Za-z0-9][A-Za-z0-9 ._-]{0,63})$",
+            "title": "Thread",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "kind",
+          "thread",
+          "subscription_ids"
+        ],
+        "title": "register_wake_targetArguments",
+        "type": "object"
+      },
+      "name": "register_wake_target",
+      "outputSchema": {
+        "additionalProperties": true,
+        "title": "register_wake_targetDictOutput",
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "List this exact key's wake targets, newest first: thread, label, state, hourly_budget, confirmation and the IDs of their still-active subscriptions (bound counts them). Requires read + explicit delivery-write.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "title": "list_wake_targetsArguments",
+        "type": "object"
+      },
+      "name": "list_wake_targets",
+      "outputSchema": {
+        "additionalProperties": true,
+        "title": "list_wake_targetsDictOutput",
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Version-checked change of your own wake target: pause, resume, set_thread (thread; needs a new confirmation) or set_subscriptions (subscription_ids, rebind).\n\nRequires read + explicit delivery-write. A stale version gives wake_target_conflict with the current version.\nOnly the owner lifts operator_disabled: then every action except delete gives invalid_wake_target_state with\ndisabled_reason and the command to ask for.\n",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "pause",
+              "resume",
+              "set_thread",
+              "set_subscriptions"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "rebind": {
+            "default": false,
+            "title": "Rebind",
+            "type": "boolean"
+          },
+          "subscription_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                  "type": "string"
+                },
+                "maxItems": 16,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Subscription Ids"
+          },
+          "thread": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "pattern": "^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[A-Za-z0-9][A-Za-z0-9 ._-]{0,63})$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Thread"
+          },
+          "version": {
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "title": "Version",
+            "type": "integer"
+          },
+          "wake_target_id": {
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+            "title": "Wake Target Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "wake_target_id",
+          "version",
+          "action"
+        ],
+        "title": "update_wake_targetArguments",
+        "type": "object"
+      },
+      "name": "update_wake_target",
+      "outputSchema": {
+        "additionalProperties": true,
+        "title": "update_wake_targetDictOutput",
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Delete your own wake target; its subscriptions are unbound and the chat is no longer woken. Requires read + explicit delivery-write.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "version": {
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "title": "Version",
+            "type": "integer"
+          },
+          "wake_target_id": {
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+            "title": "Wake Target Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "wake_target_id",
+          "version"
+        ],
+        "title": "delete_wake_targetArguments",
+        "type": "object"
+      },
+      "name": "delete_wake_target",
+      "outputSchema": {
+        "additionalProperties": true,
+        "title": "delete_wake_targetDictOutput",
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Return the code of the host waker's challenge that this chat received, so the waker starts waking it.\n\nCall it only from the chat that got the challenge and only for a target this chat registered. The latest code\nreplaces an earlier one. Requires read + explicit delivery-write.\n",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Code",
+            "type": "string"
+          },
+          "wake_target_id": {
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+            "title": "Wake Target Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "wake_target_id",
+          "code"
+        ],
+        "title": "confirm_wake_targetArguments",
+        "type": "object"
+      },
+      "name": "confirm_wake_target",
+      "outputSchema": {
+        "additionalProperties": true,
+        "title": "confirm_wake_targetDictOutput",
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
       "description": "Record bounded private feedback for this credential. `operation` is the tool name as listed, with or without the messages_ prefix. Reference only visible sources; no raw secrets, external messages or automatic issue publishing.",
       "inputSchema": {
         "additionalProperties": false,

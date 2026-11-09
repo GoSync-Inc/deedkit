@@ -1274,6 +1274,63 @@ class Store:
         with self.authorized(token) as (c, p):
             return endpoint_signal(c, p, endpoint_id)
 
+    # ANYM-848: an agent's own wake targets, read by a host waker (packages/wake-relay); DeedKit never contacts them.
+    def wake_authorized(self, token, operation):
+        # Before schema 72 (rolling upgrade) the audit CHECK has no wake operation: the denial is audited as
+        # http_boundary for the caller, as endpoint_authorized does before schema 49, and answers delivery_disabled.
+        from .wake_targets import schema_ready
+        with self.pool.connection() as c:
+            ready = schema_ready(c)
+        if not ready:
+            with self.authorized(token) as (c, p):
+                audit(c, p, 'http_boundary', 'denied', 'delivery_disabled')
+            error = APIError('delivery_disabled', 409)
+            error.operation, error.audited = operation, True
+            raise error
+        return self.authorized(token, operation)
+
+    def register_wake_target(self, token, request_id, kind, thread, subscription_ids, label='', hourly_budget=None,
+                             rebind=False):
+        from .wake_targets import register_wake_target
+        with self.wake_authorized(token, 'register_wake_target') as (c, p):
+            return register_wake_target(self, c, p, request_id, kind, thread, subscription_ids, label, hourly_budget,
+                                        rebind)
+
+    def list_wake_targets(self, token):
+        from .wake_targets import list_wake_targets
+        with self.wake_authorized(token, 'list_wake_targets') as (c, p):
+            return list_wake_targets(self, c, p)
+
+    def update_wake_target(self, token, wake_target_id, version, action, thread=None, subscription_ids=None,
+                           rebind=False):
+        from .wake_targets import update_wake_target
+        with self.wake_authorized(token, 'update_wake_target') as (c, p):
+            return update_wake_target(self, c, p, wake_target_id, version, action, thread, subscription_ids, rebind)
+
+    def delete_wake_target(self, token, wake_target_id, version):
+        from .wake_targets import delete_wake_target
+        with self.wake_authorized(token, 'delete_wake_target') as (c, p):
+            return delete_wake_target(self, c, p, wake_target_id, version)
+
+    def confirm_wake_target(self, token, wake_target_id, code):
+        from .wake_targets import confirm_wake_target
+        with self.wake_authorized(token, 'confirm_wake_target') as (c, p):
+            return confirm_wake_target(self, c, p, wake_target_id, code)
+
+    def list_wake_targets_admin(self, principal=None):
+        from .wake_targets import list_admin
+        if principal is not None:principal_id(principal)
+        return list_admin(self, principal)
+
+    def set_wake_target_operator_state(self, wake_target_id, enabled):
+        from .wake_targets import set_operator_state
+        return set_operator_state(self, wake_target_id, enabled)
+
+    def enable_all_wake_targets(self, principal=None):
+        from .wake_targets import enable_all
+        if principal is not None:principal_id(principal)
+        return enable_all(self, principal)
+
     def set_dynamic_subscriptions(self, enabled, *, verify_components=False):
         # Operator only (`set-dynamic-subscriptions`, ANYM-522); disabling is the rollback before older code runs.
         from .subscriptions import set_dynamic_subscriptions
@@ -1444,7 +1501,7 @@ class Store:
             c.execute(Path(__file__).with_name('schema.sql').read_text())
             version=int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
             if version>RUNTIME_SCHEMA: raise RuntimeError('database_newer_than_runtime')
-            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql'),(43,'043_person_links.sql'),(44,'044_key_operation_id.sql'),(45,'045_message_purge.sql'),(46,'046_chat_roles.sql'),(47,'047_contact_search.sql'),(48,'048_dispatcher_heartbeat.sql'),(49,'049_delivery_endpoints.sql'),(50,'050_component_heartbeats.sql'),(51,'051_send_intents.sql'),(52,'052_host_admission_index.sql'),(53,'053_person_preferences.sql'),(54,'054_conflict_classes.sql'),(55,'055_failure_events.sql'),(56,'056_module_events.sql'),(57,'057_conflict_reevaluation.sql'),(58,'058_module_router.sql'),(59,'059_endpoint_refusal_indexes.sql'),(60,'060_dynamic_subscription_sources.sql'),(61,'061_delivery_attempts.sql'),(62,'062_subscription_tombstones.sql'),(63,'063_send_terminal_events.sql'),(64,'064_bot_press_permission.sql'),(65,'065_call_failed_provider_error.sql'),(66,'066_media_attempt_budget.sql'),(67,'067_recording_module_source.sql'),(68,'068_attachment_digest_index.sql'),(69,'069_media_recovery.sql'),(70,'070_subscription_activity.sql'),(71,'071_menu_choice.sql'),(72,'072_attachment_message_index.sql')]:
+            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql'),(43,'043_person_links.sql'),(44,'044_key_operation_id.sql'),(45,'045_message_purge.sql'),(46,'046_chat_roles.sql'),(47,'047_contact_search.sql'),(48,'048_dispatcher_heartbeat.sql'),(49,'049_delivery_endpoints.sql'),(50,'050_component_heartbeats.sql'),(51,'051_send_intents.sql'),(52,'052_host_admission_index.sql'),(53,'053_person_preferences.sql'),(54,'054_conflict_classes.sql'),(55,'055_failure_events.sql'),(56,'056_module_events.sql'),(57,'057_conflict_reevaluation.sql'),(58,'058_module_router.sql'),(59,'059_endpoint_refusal_indexes.sql'),(60,'060_dynamic_subscription_sources.sql'),(61,'061_delivery_attempts.sql'),(62,'062_subscription_tombstones.sql'),(63,'063_send_terminal_events.sql'),(64,'064_bot_press_permission.sql'),(65,'065_call_failed_provider_error.sql'),(66,'066_media_attempt_budget.sql'),(67,'067_recording_module_source.sql'),(68,'068_attachment_digest_index.sql'),(69,'069_media_recovery.sql'),(70,'070_subscription_activity.sql'),(71,'071_menu_choice.sql'),(72,'072_attachment_message_index.sql'),(73,'073_wake_targets.sql')]:
                 migration=Path(__file__).with_name('migrations')/name
                 sha=hashlib.sha256(migration.read_bytes()).hexdigest()
                 if version<target:

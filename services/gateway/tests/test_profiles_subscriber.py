@@ -18,6 +18,9 @@ SUBSCRIBER = READER + ["messages_create_subscription", "messages_update_subscrip
 ENDPOINT_TOOLS = ["messages_register_delivery_endpoint", "messages_list_delivery_endpoints",
                   "messages_update_delivery_endpoint", "messages_delete_delivery_endpoint",
                   "messages_test_delivery_endpoint", "messages_list_delivery_attempts"]
+# ANYM-848: an agent's own wake targets need the same pair; no repository profile exposes them (enablement adds them).
+WAKE_TOOLS = ["messages_register_wake_target", "messages_list_wake_targets", "messages_update_wake_target",
+              "messages_delete_wake_target", "messages_confirm_wake_target"]
 
 
 def tools(name):
@@ -36,14 +39,23 @@ def test_subscriber_and_reader_profiles_have_exact_tool_sets():
     assert result.returncode == 0, result.stderr
 
 
+# spec: ANYM-848
+def test_no_repository_profile_exposes_the_wake_target_tools():
+    for profile in sorted((ROOT / "config/profiles").glob("*.toml")):
+        exposed = tomllib.loads(profile.read_text()).get("exposure", {}).get("tools", [])
+        assert not set(WAKE_TOOLS) & set(exposed), profile.name
+    assert all(CATALOG[name]["scopes"] == ["read", "delivery-write"] for name in WAKE_TOOLS)
+    assert [name for name in WAKE_TOOLS if CATALOG[name]["annotations"]["readOnlyHint"]] == ["messages_list_wake_targets"]
+
+
 # spec: ANYM-519
 def test_subscriber_profile_gains_delivery_write_tools_and_reader_stays_without_them():
     subscriber, reader = tools("messaging-subscriber"), tools("messaging-reader")
     assert subscriber[-len(ENDPOINT_TOOLS):] == ENDPOINT_TOOLS and len(set(subscriber)) == len(subscriber)
     assert not set(ENDPOINT_TOOLS) & set(reader)
-    # delivery-write is a new permission: only these six tools need it, and no reader tool does.
+    # delivery-write is a new permission: only these six tools and the wake target tools need it, no reader tool does.
     needs = {name for name, tool in CATALOG.items() if "delivery-write" in tool["scopes"]}
-    assert needs == set(ENDPOINT_TOOLS)
+    assert needs == set(ENDPOINT_TOOLS) | set(WAKE_TOOLS)
     assert all(CATALOG[name]["scopes"] == ["read", "delivery-write"] for name in ENDPOINT_TOOLS)
     assert not any("delivery-write" in CATALOG[name]["scopes"] for name in reader)
     # Only the two lists are reads; the other four change state.

@@ -105,6 +105,14 @@ ExclusionsRevision = Annotated[StrictInt | None, Field(ge=0,le=9007199254740991,
 ExcludedChats = Annotated[list[ExcludedChat] | None, Field(
     json_schema_extra=lambda schema: schema.pop('default',None),
     description='set_exclusions only: the whole new list of {account, chat} pairs; an empty list clears it.')]
+# ANYM-848: an agent's own wake target. wake_targets.py checks every field again.
+WakeTargetReference = ReceiverReference
+WakeThread = Annotated[StrictStr, Field(min_length=1,max_length=64,
+    pattern=r'^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[A-Za-z0-9][A-Za-z0-9 ._-]{0,63})$')]
+WakeTargetSubscriptions = Annotated[list[ReceiverReference], Field(min_length=1,max_length=16)]
+WakeTargetLabel = Annotated[StrictStr, Field(max_length=80,pattern=r'^[^\x00-\x1f\x7f]*$')]
+WakeTargetBudget = Annotated[StrictInt, Field(ge=1,le=60)]
+WakeConfirmationCode = Annotated[StrictStr, Field(pattern=r'^[0-9a-f]{32}$')]
 class SubscriptionSources(TypedDict, total=False):
     # ANYM-522: every chat the key can see now, optionally per account; channels and bots only when asked for.
     __pydantic_config__ = ConfigDict(extra='forbid')

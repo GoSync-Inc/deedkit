@@ -806,3 +806,41 @@ def test_delivery_endpoints_list_disable_enable_run_the_messaging_operator_comma
         ("messaging", ["enable-delivery-endpoint", "--id", endpoint])]
     # A malformed ID never reaches the operator command.
     assert admin.main(base + ["disable", "not-a-uuid"], run=run) == 2 and len(calls) == 3
+
+
+# spec: ANYM-848
+def test_wake_targets_list_disable_enable_run_the_messaging_operator_commands(tmp_path, capsys):
+    labels = tmp_path / "labels.json"
+    labels.write_text(json.dumps({"version": 1, "labels": {"wake-agent": "Synthetic Codex"}}))
+    labels.chmod(0o600)
+    config = tmp_path / "admin.json"
+    config.write_text(json.dumps({"labels": str(labels)}))
+    config.chmod(0o600)
+    calls = []
+    def run(service, args, data=None):
+        calls.append((service, args))
+        if args[0] == "wake-targets-list":
+            return {"items": [{"wake_target_id": "synthetic", "principal": "wake-agent", "state": "enabled",
+                               "confirmed": True}], "targets_by_state": {"enabled": 1}, "unbound": 0}
+        if args[-1] == "--all" or "--all" in args:
+            return {"enabled": 2}
+        return {"wake_target_id": args[-1], "state": "operator_disabled" if args[0].startswith("disable") else "enabled"}
+    target = "6a1d3b9f-3c9a-4d2e-8e47-1f7c2d2a0b12"
+    base = ["--config", str(config), "wake-targets"]
+    assert admin.main(base + ["list", "--principal", "wake-agent"], run=run) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert listed["items"][0]["key_label"] == "Synthetic Codex" and listed["targets_by_state"] == {"enabled": 1}
+    assert admin.main(base + ["disable", target], run=run) == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "operator_disabled"
+    assert admin.main(base + ["enable", target.upper()], run=run) == 0
+    capsys.readouterr()
+    assert admin.main(base + ["enable", "--all", "--principal", "wake-agent"], run=run) == 0
+    assert json.loads(capsys.readouterr().out) == {"enabled": 2}
+    assert calls == [("messaging", ["wake-targets-list", "--principal", "wake-agent"]),
+        ("messaging", ["disable-wake-target", "--id", target]),
+        ("messaging", ["enable-wake-target", "--id", target]),
+        ("messaging", ["enable-wake-target", "--all", "--principal", "wake-agent"])]
+    # A malformed ID, a missing one and an ID with --all never reach the operator command.
+    assert admin.main(base + ["disable", "not-a-uuid"], run=run) == 2
+    assert admin.main(base + ["enable"], run=run) == 2
+    assert admin.main(base + ["enable", target, "--all"], run=run) == 2 and len(calls) == 4

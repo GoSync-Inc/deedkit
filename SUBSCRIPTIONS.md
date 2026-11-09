@@ -935,6 +935,51 @@ endpoint's `delivery_health` and `last_error`, the owning `principal`, `key_id` 
 principal's `key_label` from the private admin labels file, and `endpoints_by_state` counts
 the listed endpoints by health state.
 
+## Wake targets (pull waker rules, schema 72)
+
+ANYM-848. A wake target is an agent's own rule: "when any of these subscriptions of mine has new events, wake this
+chat of mine". It is the pull-side sibling of a self-service endpoint: DeedKit stores the rule and returns it to the
+key that registered it; a host waker on the owner's machine (packages/wake-relay, "Codex chat (pull waker)") reads the
+rules with the agent's own key and wakes the chat. DeedKit never contacts the chat, stages no hint for it and leaves
+the subscription's push delivery alone. Which events wake the chat stays the subscription's job (its sources and
+`wake_rules`).
+
+Tools (each needs `read` + explicit `delivery-write`, the exact key, and the operator's delivery switch, else
+`delivery_disabled`):
+
+- `register_wake_target(request_id, kind, thread, subscription_ids, label?, hourly_budget?, rebind?)`: `kind` is
+  `codex_thread`; a Codex agent passes its own `CODEX_THREAD_ID` as `thread` (a session UUID or a 1-64 character
+  session name, never an option). `subscription_ids` are 1-16 of the key's own active subscriptions; another key's or
+  a closed one is `not_found`. A subscription wakes at most one chat: `subscription_already_bound` names the key's own
+  target that holds it (`wake_target_id`, `version`), and `rebind: true` moves it. `hourly_budget` (1-60, default 12)
+  is read by the waker; DeedKit only stores it. The same request again returns the row as it is now (also deleted);
+  the same `request_id` with other fields is `idempotency_conflict`.
+- `list_wake_targets()`: the key's targets, newest first, with `max_wake_targets` (`WAKE_MAX_TARGETS_PER_KEY`, default
+  8, 1-32). Each lists only its still-active subscriptions (`bound` counts them; 0 is shown). `wake_target_limit`
+  (429) lists the key's targets so the agent can delete one.
+- `update_wake_target(wake_target_id, version, action)`: `pause` (from `enabled`), `resume` (from `agent_paused`),
+  `set_thread` (clears the confirmation) or `set_subscriptions` (with `rebind`). A stale version is
+  `wake_target_conflict` (409) with the current version.
+- `delete_wake_target(wake_target_id, version)`: a soft delete; its bindings go.
+- `confirm_wake_target(wake_target_id, code)`: the chat returns the 32-hex code of the waker's challenge. The latest
+  code replaces an earlier one; DeedKit stores and returns it, and the waker compares it with the code it sent.
+
+The challenge is why a thread ID alone wakes nothing: the waker sends the chat one fixed challenge and wakes it for
+events only once that chat confirmed. This keeps a key holder that is not the owner's OS user on the agent Mac (a cloud
+agent with the key, a leaked key) from waking a local chat. It does not separate chats of that one user: any local
+process of that user can already run `codex queue` on any thread.
+
+`enabled` means stored, not proven woken: the waker's `watch-status` shows whether a rule ran. The owner's view and
+switch: `deedkit admin wake-targets list [--principal P]` (every target with counts by state and `unbound`; whether a
+code came back, never the code), `deedkit admin wake-targets disable|enable ID` (`operator_disabled`, reason
+`operator`; an agent cannot lift it, every agent action but delete answers `invalid_wake_target_state` with the reason)
+and `deedkit admin wake-targets enable --all [--principal P]`, the step after a backup restore, which disables every
+target with reason `restore`. `set-delivery-features --disable` also stops these tools, so a registry-mode waker stops
+waking; an ANYM-844 waker with a static file never reads the registry. A new agent needs the five
+`messages_*_wake_target(s)` tools in its gateway profile once per principal, not per chat. Stored data: the thread ID,
+label, bindings and the confirmation code, visible to the registering key, the operator's admin CLI and the encrypted
+backups; no secret.
+
 ## Host receivers (wake relay)
 
 `packages/wake-relay/` (Node 24, `node:crypto` and `node:sqlite` only) is a host
