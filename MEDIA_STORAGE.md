@@ -327,9 +327,15 @@ phase still counts it as a lease until the sweep. Expired storage reservations
 are still reclaimed on every claim. `tests/test_media_claim_performance.py`
 checks the plans with 30,000 and 60,000 dormant jobs.
 
-Claims run in this order: explicit requests, then live originals (newest first), then
+Claims run in this order: explicit requests, then live originals, then
 voice notes (`audio/ogg`, `audio/opus`, at most 32 MiB), then other files of at most
-1 MiB, then everything else. Within each group the newest message comes first. The
+1 MiB, then everything else. Within each group the newest message comes first, except
+live originals (ANYM-877): private chats before groups and channels, then files of at most
+2 MiB before larger ones, then messages of the last 15 minutes oldest first (a burst arrives
+in the order it was sent), then older live originals newest first. When the Telegram collector
+fetches a live job's message, the same request also takes the messages of up to 20 other
+queued live jobs of that chat, and each of them uses its copy once if it is at most
+10 minutes old. A download makes one request per 512 KiB part and none after the last. The
 Telegram collector also backfills dormant out-of-window jobs on its own
 (`media_backfill`, default `true`). This covers voice notes and files of at most 1 MiB
 from a bounded window (`media_prefetch_days` from 1 to 36500), inside `history_since`.

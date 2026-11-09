@@ -30,7 +30,7 @@ from .collector_state import LIVE_REJECT_CODES,CaptureSpool,CollectorState,PeerK
 from .spool import DurableSpool,InvalidCapture,PoisonItem
 from .collector_common import DbBackoff,commit_items,validate_common,validate_ranges
 from .store import Store
-from .telegram_governor import LIVE_BUDGETS,LIVE_STATE,ProviderRateLimited,RequestGovernor
+from .telegram_governor import BACKGROUND,LIVE_BUDGETS,LIVE_MEDIA,LIVE_STATE,ProviderRateLimited,RequestGovernor
 from .operational import CONNECTION_ERRORS,MEDIA_ERRORS,collector_stop
 from .storage_admission import MEDIA_RESERVE_BYTES
 from .media_policy import MEDIA_POLICY_FIELDS,configure_media_policy,validate_prefetch_days
@@ -217,6 +217,7 @@ def peer_kind(message):
 class TelethonProvider:
     supports_receipts=True
     supports_owner_reads=True
+    fetches_bursts=True  # chunks() reads source['_tier'] and source['_burst'] (ANYM-877)
     def __init__(self,cfg,auth,*,receive_updates=True):
         from telethon import TelegramClient
         # Do not let library diagnostics log payloads or credentials.
@@ -393,10 +394,11 @@ class TelethonProvider:
                 self.read_gap_pending=True
                 logging.getLogger(__name__).warning('read_state_gap_failed: %s',type(exc).__name__)
 
-    async def rpc(self,operation,phase,*,before=None):
+    async def rpc(self,operation,phase,*,before=None,tier=None):
         governor=getattr(self,'governor',None)
         if governor:
-            return await governor.call(operation,phase,**({'before':before} if before is not None else {}))
+            return await governor.call(operation,phase,**({'before':before} if before is not None else {}),
+                **({'tier':tier} if tier is not None else {}))
         if before is not None:await before()
         return await operation()
 
@@ -566,12 +568,44 @@ class TelethonProvider:
                 raise ProviderPageError(type(exc).__name__) from exc
         return await self.rpc(read,'telegram_history')
 
+    def fetched_message(self,chat,message_id):
+        """A message a burst fetch took for a later job (ANYM-877): used once, at most FETCHED_SECONDS old."""
+        fetched=self.__dict__.setdefault('_fetched',{})
+        now=time.monotonic()
+        for key in [k for k,(at,_) in fetched.items() if now-at>FETCHED_SECONDS]:del fetched[key]
+        entry=fetched.pop((chat,message_id),None)
+        return entry[1] if entry else None
+
+    def keep_fetched(self,chat,messages):
+        fetched=self.__dict__.setdefault('_fetched',{})
+        now=time.monotonic()
+        for message in messages:
+            if message is None or type(getattr(message,'id',None)) is not int:continue
+            if len(fetched)>=FETCHED_MAX:del fetched[next(iter(fetched))]
+            fetched[(chat,message.id)]=(now,message)
+
+    async def media_message(self,source,tier):
+        """The job's message: a burst's earlier fetch if it still matches, else one request that also
+        takes the messages of the chat's other queued live jobs (source['_burst'], ANYM-877)."""
+        chat,message_id=int(source['provider_chat']),int(source['provider_id'])
+        burst=[i for i in dict.fromkeys(source.get('_burst') or ()) if type(i) is int and i!=message_id][:BURST_FETCH]
+        if burst:
+            messages=await self.rpc(lambda:self.client.get_messages(chat,ids=[message_id,*burst]),'telegram_media',
+                tier=tier)
+            messages=list(messages or ())
+            self.keep_fetched(chat,messages[1:])
+            return messages[0] if messages else None
+        return await self.rpc(lambda:self.client.get_messages(chat,ids=message_id),'telegram_media',tier=tier)
+
     async def chunks(self,source,descriptor):
         from telethon import types,utils
         from telethon.errors import FileReferenceExpiredError,FilerefUpgradeNeededError,FloodWaitError
+        tier=source.get('_tier')
         try:
-            message=await self.rpc(lambda:self.client.get_messages(int(source['provider_chat']),
-                ids=int(source['provider_id'])),'telegram_media')
+            # A burst's earlier fetch serves this job once; one that no longer matches is fetched again.
+            message=self.fetched_message(int(source['provider_chat']),int(source['provider_id']))
+            if message is None or descriptor not in telegram_message(source['account'],message)['media']:
+                message=await self.media_message(source,tier)
             if not message: raise ProviderUnavailable('media_unavailable')
             current=telegram_message(source['account'],message)
             if descriptor not in current['media']: raise ProviderUnavailable('media_reference_changed')
@@ -580,7 +614,7 @@ class TelethonProvider:
             # Download the same concrete object that the adapter described.
             media=getattr(message,'document',None) or getattr(message,'photo',None)
             if media is None: raise ProviderUnavailable('media_unavailable')
-            download_options={'request_size':512*1024}
+            download_options={'request_size':MEDIA_REQUEST_BYTES}
             if isinstance(media,types.Photo):
                 # File(Photo).size describes the heaviest representation, but
                 # iter_download(Photo) blindly chooses sizes[-1]. Ordering is
@@ -595,12 +629,18 @@ class TelethonProvider:
                 download_options.update(file_size=descriptor['bytes'],dc_id=media.dc_id)
             else: location=media
             stream=self.client.iter_download(location,**download_options)
+            expected=descriptor.get('bytes') if type(descriptor.get('bytes')) is int else None
             try:
-                iterator=stream.__aiter__()
+                iterator=stream.__aiter__();received=0
                 while True:
-                    try:chunk=await self.rpc(iterator.__anext__,'telegram_media')
+                    try:chunk=await self.rpc(iterator.__anext__,'telegram_media',tier=tier)
                     except StopAsyncIteration:break
+                    received+=len(chunk)
                     yield chunk
+                    # ANYM-877: the call after the last part makes no request (Telethon ends after a short part),
+                    # so it takes no admission: the stream ends at the descriptor's size or, size unknown, after a
+                    # short part. A short or long total still fails in the writer.
+                    if received>=expected if expected is not None else len(chunk)<MEDIA_REQUEST_BYTES:break
             finally: await stream.close()
         except FloodWaitError as exc: raise ProviderRateLimited(exc.seconds) from None
         except (FileReferenceExpiredError,FilerefUpgradeNeededError):
@@ -618,6 +658,10 @@ def media_deadline(size):
     return max(3600,min(6*3600,int(expected*1.5)+600))
 
 
+# ANYM-877: one file part per request (Telethon's maximum). A job's message fetch also takes the messages of up to
+# BURST_FETCH other queued live jobs of its chat; a later job uses its copy once, if at most FETCHED_SECONDS old.
+MEDIA_REQUEST_BYTES=512*1024
+BURST_FETCH=20; FETCHED_SECONDS=600; FETCHED_MAX=200
 # Deterministic failures of a pure parser on malformed provider input. Resource,
 # I/O and unexpected errors are not among them and still fail capture closed.
 PARSE_ERRORS=(ValueError,TypeError,KeyError,AttributeError,IndexError,RecursionError)
@@ -1166,6 +1210,16 @@ class TelegramCollector:
                 await asyncio.to_thread(self.archive.renew_media,job,collector_lease=self.state.lease)
         async def transfer():
             source=await asyncio.to_thread(self.archive.media_source,job,collector_lease=self.state.lease)
+            if getattr(self.provider,'fetches_bursts',False):
+                # ANYM-877: someone waits for a live or requested original; one fetch serves the chat's burst.
+                requested=job.get('requested_until') is not None and job['requested_until']>datetime.now(timezone.utc)
+                source={**source,'_tier':LIVE_MEDIA if job.get('_live_media') or requested else BACKGROUND}
+                if job.get('_live_media'):
+                    # Only an optimisation: a failed lookup fetches this one message, as before.
+                    try:source['_burst']=await asyncio.to_thread(self.archive.media_burst,job,
+                        window_seconds=self.live_window_seconds,limit=BURST_FETCH)
+                    except Exception as exc:
+                        log.warning('media_burst_failed error=%s',type(exc).__name__)
             stream=self.provider.chunks(source,job['descriptor'])
             try:
                 return await writer.write_async(stream,expected_bytes=job['descriptor']['bytes'],

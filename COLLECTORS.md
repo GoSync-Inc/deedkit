@@ -38,7 +38,14 @@ fsync, the DB queue and the agent's own request time are added to it. After a st
 catch-up events are possible; `origin=live` does not prove there was no such delay.
 A message the live stream lost is stored later by the periodic reconcile pass (every
 `scan_interval_seconds`, 60 s by default, but paced by the request governor, so
-a long pass can be much later). The journal records it as `reconcile`; if it was sent
+a long pass can be much later). The governor admits one request per second per account and
+gives the next slot to the most urgent tier (ANYM-877): agents' live reads and commands,
+then live and requested originals, then history reconcile, discovery and backfill. A waiting
+lower tier still gets at least one of every five admissions, so under continuous live work
+a reconcile pass can take up to about five times longer. A FloodWait or account cooldown
+stops every tier; each one is also kept as `{started_at, seconds, phase}` in
+`collector_health.operations.cooldowns.recent` (the last 20), which the full `get_sync_status`
+shows under `operations.cooldowns`. The journal records it as `reconcile`; if it was sent
 at most 6 hours before, live subscriptions read it as `live_recovered` and match it
 (SUBSCRIPTIONS.md, ANYM-733).
 Stateless MCP does not wake an idle agent: the client must call read/updates.
