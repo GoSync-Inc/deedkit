@@ -49,6 +49,7 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 REPOSITORY = "GoSync-Inc/deedkit"
 # `publish` pushed and attested this commit's images; preparation pulls nothing from a run without it (ANYM-301).
@@ -476,6 +477,14 @@ def config(path):
         if name in seen or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name):
             raise Refused("invalid or duplicate Compose project")
         seen.add(name)
+        if "sessions" in project:
+            raise Refused("session_mark_invalid: session marks go on the services entries (ANYM-896)")
+        project["services"], sessions = holder_marks(project)  # ANYM-896: `{service: target}` from here on
+        if sessions:
+            project["sessions"] = sessions
+    if any("sessions" in project for project in value["projects"]) or {"session_window", "session_timezone"} & value.keys():
+        holder_window(value)
+    for project in value["projects"]:
         if not project.get("services") or set(project["services"].values()) - BUILDS.keys():
             raise Refused("select explicit services with known build targets")
         if any(not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", service)
@@ -512,14 +521,17 @@ def compose(project):
     return result
 
 
-def snapshot(project, *, stopped=False, labels=None):
+def snapshot(project, *, stopped=False, labels=None, conditions=None, exited=()):
     """The project's Compose document and the identity of each selected service's container. Only rollback and a
-    failed health wait (`stopped`) accept a container that exited or keeps restarting: that is when they run.
-    `labels`, a dict, receives each service's input label (ANYM-895), None unless the container runs steadily."""
+    failed health wait (`stopped`) accept a container that exited or keeps restarting: that is when they run, and so
+    do the session services named in `exited` (ANYM-896: a stopped holder is recreated at once).
+    `labels`, a dict, receives each service's input label (ANYM-895), None unless the container runs steadily;
+    `conditions` why it does not: stopped, restarting, paused or unhealthy (None when it runs steadily)."""
     document = json.loads(run(compose(project) + ["config", "--format", "json"]))
     running = {}
     for service in project["services"]:
-        ids = run(["docker", "ps", *(["--all", "--filter", "label=com.docker.compose.oneoff=False"] if stopped else []),
+        loose = stopped or service in exited
+        ids = run(["docker", "ps", *(["--all", "--filter", "label=com.docker.compose.oneoff=False"] if loose else []),
                    "--filter", "label=com.docker.compose.project=" + project["name"],
                    "--filter", "label=com.docker.compose.service=" + service, "--format", "{{.ID}}"]).split()
         if len(ids) != 1 or service not in document["services"]:
@@ -527,8 +539,8 @@ def snapshot(project, *, stopped=False, labels=None):
         validate_runtime(document["services"][service])
         actual = json.loads(run(["docker", "inspect", ids[0]]))[0]
         condition = actual.get("State", {})
-        if stopped and not (condition.get("Running") and not condition.get("Paused")
-                            or condition.get("Status") in ("restarting", "exited")):
+        if loose and not (condition.get("Running") and not condition.get("Paused")
+                          or condition.get("Status") in ("restarting", "exited")):
             raise Refused("a selected container is neither running, restarting nor exited")
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", actual["Image"]):
             raise Refused("running container has no immutable image identity")
@@ -536,6 +548,10 @@ def snapshot(project, *, stopped=False, labels=None):
         if labels is not None:
             steady = condition.get("Running") and not condition.get("Restarting") and not condition.get("Paused")
             labels[service] = ((actual.get("Config") or {}).get("Labels") or {}).get(INPUT_LABEL) if steady else None
+        if conditions is not None:
+            health = (condition.get("Health") or {}).get("Status", "healthy") if "Health" in condition else "healthy"
+            conditions[service] = ("stopped" if not condition.get("Running") else "restarting" if condition.get("Restarting")
+                                   else "paused" if condition.get("Paused") else "unhealthy" if health != "healthy" else None)
     return document, running
 
 
@@ -1537,12 +1553,12 @@ def prepare(settings, sha):
     run(["git", "-C", str(source), "checkout", "--quiet", "--detach", sha], umask=0o022)
     snapshots, env_files = [], {}
     for project in settings["projects"]:
-        labels = {}
-        document, running = snapshot(project, labels=labels)
+        labels, conditions = {}, {}
+        document, running = snapshot(project, labels=labels, conditions=conditions, exited=set(project.get("sessions") or ()))
         reference, named = evidence_document(project, document)
         env_files.update({path: env_file_digest(path) for path in named})
         snapshots.append({"project": project, "before": document, "reference": reference, "running": running,
-                          "labels": labels})
+                          "labels": labels, "conditions": conditions})
     # ANYM-914: the lock directory exists before the inputs below are hashed and before apply stops anything.
     provide_session_locks(((service, item["before"]["services"][service]) for item in snapshots
                            for service in item["project"]["services"]),
@@ -1625,7 +1641,8 @@ def prepare(settings, sha):
         projects.append({"name": project["name"], "file": str(path), "digest": digest(read(path)),
                          "before_digest": digest(before), "running": item["running"],
                          "before_file_digest": digest(read(previous)), "inputs": inputs, "kept": kept,
-                         "recreated": reasons})
+                         "recreated": reasons, **({"session": session} if (session := holder_prepared(
+                             project, item, reasons, recorded)) else {})})
     # What current.json said at preparation: rollback of a release that failed its health wait requires it unchanged.
     receipt = {"version": 1, "render": RENDER_VERSION, "env_files": [{"path": path, "sha256": env_files[path]} for path in sorted(env_files)],
                "sha": sha, "ci": evidence, "images": images,
@@ -1924,17 +1941,21 @@ def boot_id():
 
 
 def service_outcomes(receipt):
-    """`{project: {service: {"kept": {container, revision}} | {"recreated": [changed parts]}}}`: digests only."""
+    """`{project: {service: {"kept": {container, revision}} | {"recreated": [changed parts]} | {"deferred": {parts,
+    next_window, line, container, revision}}}}` (ANYM-896: a deferred session service): digests only."""
     return {item["name"]: {**{service: {"recreated": why} for service, why in (item.get("recreated") or {}).items()},
                            **{service: {"kept": {"container": value["container"], "revision": value["revision"]}}
-                              for service, value in (item.get("kept") or {}).items()}}
+                              for service, value in (item.get("kept") or {}).items()},
+                           **{service: {"deferred": {**value, "container": item["kept"][service]["container"],
+                                                     "revision": item["kept"][service]["revision"]}}
+                              for service, value in (item.get("deferred") or {}).items()}}
             for item in receipt["projects"] if "inputs" in item}
 
 
 def check_inputs(project, item, document):
     """Refuse with `inputs_changed_since_prepare` when a host file a service reads hashes otherwise than at prepare."""
     for service, wanted in (item.get("inputs") or {}).items():
-        if wanted["digest"] is None:
+        if wanted["digest"] is None or service in (item.get("deferred") or {}):  # ANYM-896: the running inputs
             continue
         try:
             host = host_inputs(document, service)
@@ -2184,7 +2205,7 @@ def apply(settings, sha, *, backup_waited=0, pre_claim=None):
         if legacy_identities(item["running"]):
             raise Refused("prepared by an older production.py with order-dependent container settings; prepare again")
         labels = {}
-        document, running = snapshot(project, labels=labels)
+        document, running = snapshot(project, labels=labels, exited=set(project.get("sessions") or ()))
         if (item["name"] != project["name"] or digest(document) != item["before_digest"]
                 or running != item["running"] or digest(read(item["file"])) != item["digest"]):
             raise Refused("production or prepared configuration changed since preparation")
@@ -2212,11 +2233,15 @@ def apply(settings, sha, *, backup_waited=0, pre_claim=None):
     wait_for_calls(settings, deadline)
     for project, item in zip(settings["projects"], receipt["projects"], strict=True):
         check_inputs(project, item, documents[project["name"]])
+    # ANYM-896: which changed session services go now and which stay until the window, decided after the call waits.
+    held, deferrals = holder_decide(settings, state, receipt)
     # ANYM-914: no other opener holds a session this release starts, and the lock directory exists before any stop.
     started = started_units(settings, receipt, documents)
     check_session_openers(settings, documents, started)
     provide_session_locks(((service, unit) for _, service, unit in started), required=(release / "source" / SESSION_CLAIM).is_file())
     write(release / "attempted.json", {"sha": sha, "ci": evidence, "status": "applying"})
+    if held or deferrals:  # counted before the first stop: a crash still counts the window's planned recreate
+        holder_record(state, events=held, pending=deferrals)
     started, touched = {}, []
     for project, item in zip(settings["projects"], receipt["projects"], strict=True):
         command = ["docker", "compose", "--profile", "*", "--project-name", project["name"], "-f", item["file"]]
@@ -2230,13 +2255,8 @@ def apply(settings, sha, *, backup_waited=0, pre_claim=None):
             check_inputs(project, item, documents[project["name"]])
         touched.append((project, item))
         if services:
-            # Stop the existing owners before replacements can connect to their sessions.
-            run(command + ["stop", *services])
-            try:
-                run(command + ["up", "-d", "--no-build", "--pull", "never", "--no-deps",
-                               "--wait", "--wait-timeout", "180", *services])
-            except Refused as exc:
-                unhealthy(release, sha, receipt, evidence, touched, exc)
+            holder_apply(project, item, receipt, services, command, lambda exc, waiting=(): unhealthy(
+                release, sha, receipt, evidence, touched, exc, {(project["name"], service) for service in waiting}))
         unproven = []
         for service, target in project["services"].items():
             if service in kept:
@@ -2320,16 +2340,18 @@ def restart_loop(project, item, unproven):
     return None
 
 
-def unhealthy(release, sha, receipt, evidence, touched, failure):
+def unhealthy(release, sha, receipt, evidence, touched, failure, waiting=()):
     """After `up --wait` or the settle (ANYM-758) failed: when every replacement started so far runs the prepared image, in any state, record
     the release as `unhealthy` with rollback data for the projects it touched; otherwise the attempt stays unresolved.
-    Either way current.json keeps naming the previous release, and the apply is refused."""
+    Either way current.json keeps naming the previous release, and the apply is refused. `waiting` names (project,
+    service) of collectors that were stopped but not started yet (ANYM-896): they still run their previous image."""
     restore = []
     try:
         for project, item in touched:
             document, running = snapshot(project, stopped=True)
             if digest(document) != item["before_digest"] or any(
-                    running[service]["image"] != expected_image(receipt, item, service, target)
+                    running[service]["image"] != (item["running"][service]["image"] if (project["name"], service) in waiting
+                                                  else expected_image(receipt, item, service, target))
                     for service, target in project["services"].items()):
                 raise Refused("a replacement does not run the prepared image")
             restore.append(restore_entry(item, document, running))
@@ -2343,10 +2365,13 @@ def unhealthy(release, sha, receipt, evidence, touched, failure):
 
 
 def unfinished(state):
-    """Releases whose apply or rollback started but never recorded its result."""
-    return sorted(path.parent.name for marker, outcome in (("attempted.json", "result.json"),
-                                                           ("rollback-attempted.json", "rollback.json"))
-                  for path in state.glob("*/" + marker) if not (path.parent / outcome).exists())
+    """Releases whose apply or rollback, or a session pass (ANYM-896: `<sha>/session-<time>`), started but never recorded
+    its result."""
+    return sorted([path.parent.name for marker, outcome in (("attempted.json", "result.json"),
+                                                            ("rollback-attempted.json", "rollback.json"))
+                   for path in state.glob("*/" + marker) if not (path.parent / outcome).exists()]
+                  + [path.parent.parent.name + "/" + path.parent.name for path in state.glob("*/session-*/attempted.json")
+                     if not (path.parent / "result.json").exists()])
 
 
 # A plan A stop never cuts a call (production.md "Apply and verify"): restarting the calls service ends every unfinished
@@ -2784,10 +2809,16 @@ def rollback_restore(settings, release, sha, serving, plan):
             continue
         if index:
             wait_for_calls(settings, time.monotonic() + CALL_WAIT)
-        # Stop the release's owners before the previous ones can connect to their sessions.
-        run(command + ["stop", *services])
-        run(command + ["up", "-d", "--no-build", "--pull", "never", "--no-deps",
-                       "--wait", "--wait-timeout", "180", *services])
+        # Stop the release's owners before the previous ones can connect to their sessions; a holder's collector stops
+        # before it and starts after it (ANYM-896).
+        later = holder_collectors(project, services)
+        if later:
+            run(command + ["stop", *later])
+        run(command + ["stop", *[service for service in services if service not in later]])
+        for group in ([service for service in services if service not in later], later):
+            if group:
+                run(command + ["up", "-d", "--no-build", "--pull", "never", "--no-deps",
+                               "--wait", "--wait-timeout", "180", *group])
         for service, image in previous.items():
             ids = run(command + ["ps", "-q", service]).split()
             if len(ids) != 1:
@@ -2839,6 +2870,652 @@ def rollback(settings, sha, http=None, *, pre_claim=None):
     if not failed:  # current.json already names the release that runs again
         write(state / "current.json", {**outcome, "images": result["images"]})
     return outcome
+
+
+# ANYM-896 (production.md "Session holders"): a session service (`"session": true`, a holder) is recreated for a change
+# only inside the nightly window, at most once a window, unless a precedence reason or the urgent flag says otherwise.
+# A holder copies no messaging_service code and speaks only its versioned socket protocol, so a holder kept back beside
+# a newer release is checked by that protocol alone; its collector is never kept back (the pair rule below).
+HOLDER_TARGETS = frozenset({"whatsapp-holder", "telegram-holder"})
+HOLDER_WINDOW, HOLDER_TIMEZONE = "03:00-05:00", "Asia/Makassar"  # owner 2026-10-17 (ANYM-330): «Да, ночью по Бали»
+HOLDER_LEDGER, HOLDER_LEDGER_EVENTS, HOLDER_LEDGER_PASSES = "session-ledger.json", 500, 60
+HOLDER_SOCKETS = "/run/deedkit/holder"  # the holder's socket directory (deploy/compose.whatsapp<n>-holder.yaml)
+PLANNED_STOP = ".planned-stop"  # whatsapp_holder.py PLANNED_STOP_FILE
+HOLDER_PASS_MARGIN = 30 * 60  # the night's pass starts within the window shortened by this much at both ends
+HOLDER_STALE_WINDOWS = 2
+HOLDER_ATTACH_S, HOLDER_ATTACH_POLL = 120, 5  # above the collector's 60 s attach backoff
+PROTOCOL_LABEL = "io.deedkit.{role}.protocol.{end}"  # whatsapp/whatsmeow/Dockerfile, services/messaging/Dockerfile
+FLAG_AUTHORITIES = ("incident", "owner")
+HOLDER_KINDS = ("planned", "recovery", "flagged", "rollback")
+PRECEDENCE = ("unreadable", "unlabeled")
+
+
+def holder_marks(project):
+    """Criterion 1: the project's `services` as `{service: target}` and its session services as `{holder: {"collector":
+    service}}`. An object entry takes only `target`, `"session": true` and `collector`, on a holder target."""
+    services, sessions = {}, {}
+    for service, entry in (project.get("services") or {}).items():
+        if not isinstance(entry, dict):
+            services[service] = entry
+            continue
+        where = f"{project.get('name')}/{service}"
+        if set(entry) - {"target", "session", "collector"} or entry.get("session") is not True or not isinstance(
+                entry.get("target"), str):
+            raise Refused(f"session_mark_invalid: {where} takes only target, \"session\": true and collector")
+        if entry["target"] not in HOLDER_TARGETS:
+            raise Refused(f"session_target_unsupported: {where}: only a target that copies no messaging_service code "
+                          f"({', '.join(sorted(HOLDER_TARGETS))}) may be a session service")
+        services[service], sessions[service] = entry["target"], {"collector": entry.get("collector")}
+    collectors = [mark["collector"] for mark in sessions.values()]
+    for holder, mark in sessions.items():
+        if (not isinstance(mark["collector"], str) or mark["collector"] not in services or mark["collector"] in sessions
+                or collectors.count(mark["collector"]) > 1):
+            raise Refused(f"session_mark_invalid: {project.get('name')}/{holder} needs \"collector\": another selected "
+                          "service of its own")
+    return services, sessions
+
+
+def holder_window(settings):
+    """`(zone, start, end)` of the nightly window: local minutes after midnight, the start before the end."""
+    text, name = settings.get("session_window", HOLDER_WINDOW), settings.get("session_timezone", HOLDER_TIMEZONE)
+    found = re.fullmatch(r"([01][0-9]|2[0-3]):([0-5][0-9])-([01][0-9]|2[0-3]):([0-5][0-9])", text) if isinstance(
+        text, str) else None
+    start, end = (int(found[1]) * 60 + int(found[2]), int(found[3]) * 60 + int(found[4])) if found else (0, 0)
+    if start >= end:
+        raise Refused("session_window_invalid: session_window is HH:MM-HH:MM, its start before its end on one day")
+    try:
+        zone = ZoneInfo(name)
+    except (ValueError, TypeError, ZoneInfoNotFoundError) as exc:
+        if name != HOLDER_TIMEZONE:
+            raise Refused("session_timezone_invalid: session_timezone is an IANA time zone name") from exc
+        zone = timezone(timedelta(hours=8), "WITA")  # a host without tzdata: Makassar's offset, unchanged since 1963
+    return zone, start, end
+
+
+def holder_clock():
+    return datetime.now(timezone.utc)
+
+
+def holder_window_at(settings, moment):
+    """`(begin, end)` in UTC of the window that contains `moment`, else of the next one."""
+    zone, start, end = holder_window(settings)
+    day = moment.astimezone(zone).date()
+    for offset in (-1, 0, 1, 2):
+        date = day + timedelta(days=offset)
+        begin, finish = (datetime(date.year, date.month, date.day, minutes // 60, minutes % 60, tzinfo=zone).astimezone(
+            timezone.utc) for minutes in (start, end))
+        if moment < finish:
+            return begin, finish
+    raise Refused("session_window_invalid: no window follows " + moment.isoformat())
+
+
+def holder_next_window(settings, moment):
+    """The window a change deferred at `moment` waits for: the one ahead, or the one after the window it is in."""
+    begin, end = holder_window_at(settings, moment)
+    return holder_window_at(settings, end) if begin <= moment else (begin, end)
+
+
+def holder_window_key(settings, begin):
+    return begin.astimezone(holder_window(settings)[0]).date().isoformat()
+
+
+def holder_window_text(settings, begin, end):
+    zone = holder_window(settings)[0]
+    local, until = begin.astimezone(zone), end.astimezone(zone)
+    return f"{begin:%Y-%m-%dT%H:%M}Z-{end:%H:%M}Z UTC, {local:%Y-%m-%d %H:%M}-{until:%H:%M} {local.tzname()}"
+
+
+def holder_pass_time(settings, begin, end):
+    """Criterion 3: the night's pass start, derived from the window's date (03:30-04:30 for 03:00-05:00), so the
+    reconnect minute varies from night to night and every run of a night agrees on it."""
+    margin = min(HOLDER_PASS_MARGIN, (end - begin).total_seconds() / 4)
+    span = max(1, int((end - begin).total_seconds() - 2 * margin))
+    seed = int(hashlib.sha256(("session pass " + holder_window_key(settings, begin)).encode()).hexdigest(), 16)
+    return begin + timedelta(seconds=margin + seed % span)
+
+
+def holder_ledger(state):
+    """state/session-ledger.json: the recreates of session services by kind and window, the deferred changes, and each
+    window's pass outcome."""
+    path = state / HOLDER_LEDGER
+    value = read(path) if path.exists() else {}
+    return {"version": 1, "events": list(value.get("events") or []), "pending": dict(value.get("pending") or {}),
+            "passes": dict(value.get("passes") or {})}
+
+
+def holder_record(state, events=(), pending=None, passes=None):
+    """Append events, set or clear (None) pending changes, keeping each one's first deferral, and record passes."""
+    ledger = holder_ledger(state)
+    ledger["events"] = (ledger["events"] + list(events))[-HOLDER_LEDGER_EVENTS:]
+    for name, entry in (pending or {}).items():
+        if entry is None:
+            ledger["pending"].pop(name, None)
+        else:
+            ledger["pending"][name] = {**entry, "since": ledger["pending"].get(name, entry).get("since", entry["since"])}
+    ledger["passes"] = dict(list({**ledger["passes"], **(passes or {})}.items())[-HOLDER_LEDGER_PASSES:])
+    write(state / HOLDER_LEDGER, ledger)
+
+
+def holder_event(name, kind, key, sha, **fields):
+    return {"service": name, "kind": kind, "window": key, "at": now(), "release": sha, **fields}
+
+
+def holder_planned(ledger, name, key):
+    return any(event.get("service") == name and event.get("kind") == "planned" and event.get("window") == key
+               for event in ledger["events"])
+
+
+def holder_counts(events):
+    return {kind: sum(event["kind"] == kind for event in events) for kind in HOLDER_KINDS}
+
+
+def protocol_range(image, role):
+    """`(min, max)` of an image's socket protocol labels; None when they are absent or malformed."""
+    try:
+        labels = (json.loads(run(["docker", "image", "inspect", image]))[0].get("Config") or {}).get("Labels") or {}
+    except (Refused, ValueError, LookupError, AttributeError):
+        return None
+    found = [labels.get(PROTOCOL_LABEL.format(role=role, end=end)) for end in ("min", "max")]
+    numbers = [int(value) for value in found if isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,5}", value)]
+    return (numbers[0], numbers[1]) if len(numbers) == 2 and numbers[0] <= numbers[1] else None
+
+
+def holder_speaks(project, running, images, holder, collector, group):
+    """Criterion 7: whether `group` (what is recreated of the holder and its collector) leaves a pair that shares a
+    socket protocol (a service speaks its range's maximum): a collector alone needs its candidate range to include the
+    running holder's protocol, a holder alone the running collector's; a pair, each candidate the other candidate's."""
+    def protocols(service, role):
+        image = images[project["services"][service]] if service in group else running[service]["image"]
+        return protocol_range(image, role)
+    def includes(outer, inner):
+        return outer is not None and inner is not None and outer[0] <= inner[1] <= outer[1]
+    new_holder, new_collector = protocols(holder, "holder"), protocols(collector, "collector")
+    return includes(new_holder, new_collector) and includes(new_collector, new_holder) if len(group) == 2 else (
+        includes(new_collector, new_holder) if group == [collector] else includes(new_holder, new_collector))
+
+
+def incompatible(project, holder, collector, group):
+    what = " and ".join(group)
+    return Refused(f"session_pair_incompatible: recreating {project['name']}/{what} would leave {holder} and {collector} "
+                   "without a shared socket protocol; nothing was stopped")
+
+
+def holder_prepared(project, item, reasons, recorded):
+    """At prepare: for each changed session service and paired collector, its precedence reason (criterion 2: stopped,
+    restarting, unhealthy, paused, unlabeled or unreadable) or None and the inputs its running container carries."""
+    found = {}
+    for holder, mark in (project.get("sessions") or {}).items():
+        for service in (holder, mark["collector"]):
+            if service not in reasons:
+                continue
+            why, record, identity = reasons[service], recorded.get(service) or {}, item["running"][service]
+            precedence = item["conditions"].get(service) or (why[0] if why[0] in PRECEDENCE else None)
+            if precedence is None and (item["labels"].get(service) != record.get("digest") or any(
+                    record.get(key) != identity[key] for key in ("container", "image", "settings"))):
+                precedence = "unlabeled"
+            found[service] = {"precedence": precedence} if precedence else {"precedence": None, "recorded": {
+                "digest": record["digest"], "parts": record.get("parts"), "revision": record["revision"]}}
+    return found
+
+
+def holder_defer(item, service, recorded, text):
+    """Keep `service` as a kept service on the inputs its container carries; the receipt says what waits and until."""
+    parts, identity = item["recreated"].pop(service), item["running"][service]
+    item.setdefault("kept", {})[service] = {"container": identity["container"], "image": identity["image"],
+                                            "revision": recorded["revision"]}
+    item["inputs"][service] = {"digest": recorded["digest"], "parts": recorded["parts"]}
+    item.setdefault("deferred", {})[service] = {"parts": parts, "next_window": text,
+                                                "line": f"deferred ({', '.join(parts)}, next window {text})"}
+
+
+def holder_decide(settings, state, receipt):
+    """Criteria 2 and 7 in apply, after its call waits and before its first stop: a changed holder goes now when it
+    has a precedence reason, when its new collector cannot speak to the running holder (the collector is never kept
+    back), or inside the window as its first planned recreate there; otherwise it stays as a kept service until the
+    next window. Refuses a recreate that leaves no shared protocol. Changes `receipt` in memory; returns the events and
+    pending changes for the ledger."""
+    if not any(project.get("sessions") for project in settings["projects"]):
+        return [], {}
+    moment, ledger, events, pending = holder_clock(), holder_ledger(state), [], {}
+    begin, end = holder_window_at(settings, moment)
+    key = holder_window_key(settings, begin)
+    for project, item in zip(settings["projects"], receipt["projects"], strict=True):
+        recreated, info = item.get("recreated") or {}, item.get("session") or {}
+        for holder, mark in (project.get("sessions") or {}).items():
+            collector, name = mark["collector"], project["name"] + "/" + holder
+            group = [service for service in (holder, collector) if service in recreated]
+            speaks = lambda members: holder_speaks(project, item["running"], receipt["images"], holder, collector, members)
+            if holder not in group:  # a collector-only recreate never recreates its holder
+                if group and not speaks(group):
+                    raise incompatible(project, holder, collector, group)
+                continue
+            precedence = (info.get(holder) or {}).get("precedence", "unlabeled")
+            if not precedence and collector in group and not speaks([collector]):
+                precedence = "collector_requires_holder"
+            if precedence or begin <= moment < end and not holder_planned(ledger, name, key):
+                if not speaks(group):
+                    raise incompatible(project, holder, collector, group)
+                events.append(holder_event(name, "recovery" if precedence else "planned", key, receipt["sha"],
+                                           **({"reason": precedence} if precedence else {})))
+                pending[name] = None
+                continue
+            # Deferred; a changed collector goes alone now (it speaks to the running holder, checked above).
+            text = holder_window_text(settings, *holder_next_window(settings, moment))
+            parts = recreated[holder]
+            holder_defer(item, holder, info[holder]["recorded"], text)
+            pending[name] = {"parts": parts, "release": receipt["sha"], "since": now(), "next_window": text}
+    return events, pending
+
+
+def holder_collectors(project, services):
+    """The collectors in `services` whose holders are there too: they start after their holders and stop first."""
+    return [mark["collector"] for holder, mark in (project.get("sessions") or {}).items()
+            if holder in services and mark["collector"] in services]
+
+
+def holder_apply(project, item, receipt, services, command, failed):
+    """apply's stop and `up` of one project's replacements. Without a session service among them: one stop and one
+    `up`, as before ANYM-896. With one: a paired collector stops first and starts only after its holder passed its
+    post-up check, and each recreated holder sees its collector attach (criterion 7). `failed(exc, waiting=())` records
+    the release unhealthy and raises."""
+    holders = [holder for holder in (project.get("sessions") or {}) if holder in services]
+    later = holder_collectors(project, services)
+    first = [service for service in services if service not in later]
+    up = command + ["up", "-d", "--no-build", "--pull", "never", "--no-deps", "--wait", "--wait-timeout", "180"]
+    # Stop the existing owners before replacements can connect to their sessions.
+    if later:
+        run(command + ["stop", *later])
+    run(command + ["stop", *first])
+    since = holder_since()
+    try:
+        run(up + first)
+        if holders:
+            holder_steady(command, project, item["running"], {holder: receipt["images"][project["services"][holder]]
+                                                              for holder in holders})
+    except Refused as exc:
+        failed(exc, later)
+    paired = [holder for holder in holders if project["sessions"][holder]["collector"] in later]
+    if failure := holder_attached(command, project, [holder for holder in holders if holder not in paired], since):
+        failed(Refused(failure))
+    if later:
+        since = holder_since()
+        try:
+            run(up + later)
+        except Refused as exc:
+            failed(exc)
+        if failure := holder_attached(command, project, paired, since):
+            failed(Refused(failure))
+
+
+def holder_steady(command, project, running, images):
+    """The post-up check of recreated services (`images`: service -> expected image): each runs steadily on its image
+    and, after APPLY_SETTLE_SECONDS, has not restarted. Refused with the failed check."""
+    unproven = []
+    for service, image in images.items():
+        ids = run(command + ["ps", "-q", service]).split()
+        if len(ids) != 1:
+            raise Refused(f"{project['name']}/{service} is missing after its recreate")
+        actual = json.loads(run(["docker", "inspect", ids[0]]))[0]
+        if actual["Image"] != image or not steady(actual):
+            raise Refused(f"{project['name']}/{service} is not running steadily on its image after its recreate")
+        unproven.append((service, ids[0], actual))
+    if failure := restart_loop(project, {"running": running}, unproven):
+        raise Refused(failure)
+
+
+def holder_since():
+    return (holder_clock() - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def holder_log(container, since):
+    """The holder's log lines since `since` (its JSON events go to stderr). Only event names are read; nothing of it is
+    printed or kept."""
+    result = subprocess.run(["docker", "logs", "--since", since, container], capture_output=True, text=True, timeout=30)
+    return (result.stdout + result.stderr).splitlines() if result.returncode == 0 else []
+
+
+def holder_attached(command, project, holders, since):
+    """Why a recreated holder saw no collector attach (its `holder.attached` event since `since`) within
+    HOLDER_ATTACH_S, or None."""
+    def seen(container):
+        for line in holder_log(container, since):
+            with suppress(ValueError, RecursionError):
+                if isinstance(event := json.loads(line), dict) and event.get("event") == "holder.attached":
+                    return True
+        return False
+    deadline = time.monotonic() + HOLDER_ATTACH_S
+    for holder in holders:
+        ids = run(command + ["ps", "-q", holder]).split()
+        while not (len(ids) == 1 and seen(ids[0])):
+            if len(ids) != 1 or time.monotonic() >= deadline:
+                return f"no collector attached to the recreated {project['name']}/{holder} within {HOLDER_ATTACH_S} s"
+            time.sleep(HOLDER_ATTACH_POLL)
+    return None
+
+
+def holder_marker(document, holder, planned_end):
+    """Criterion 6: `{reason: session_window, planned_end}` in the holder's socket directory (0600, the collectors'
+    owner, a temporary file renamed), so its collector reports the stop as planned. None when it cannot be written:
+    the collector then reports `holder_restart`, and the pass goes on."""
+    sources = [volume.get("source") for volume in document["services"][holder].get("volumes") or []
+               if isinstance(volume, dict) and volume.get("type") == "bind" and volume.get("target") == HOLDER_SOCKETS]
+    if len(sources) != 1 or not isinstance(sources[0], str):
+        return None
+    directory = Path(sources[0])
+    temporary = directory / f"{PLANNED_STOP}.{uuid.uuid4().hex}"
+    try:
+        if not stat.S_ISDIR(directory.lstat().st_mode):
+            return None
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.fchown(descriptor, *SESSION_OWNER)
+            os.write(descriptor, json.dumps({"reason": "session_window", "planned_end": planned_end.isoformat()}).encode())
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, directory / PLANNED_STOP)
+    except OSError:
+        with suppress(OSError):
+            temporary.unlink()
+        return None
+    return directory / PLANNED_STOP
+
+
+def holder_document(base, units):
+    """`base` without builds, each service of `units` on `(image, revision, input digest or None)`."""
+    result = json.loads(json.dumps(base))
+    for unit in result["services"].values():
+        unit.pop("build", None)
+    for service, (image, revision, value) in units.items():
+        unit = result["services"][service]
+        labels = unit.setdefault("labels", {})
+        unit["image"], labels[REVISION_LABEL] = image, revision
+        if value is None:
+            labels.pop(INPUT_LABEL, None)
+        else:
+            labels[INPUT_LABEL] = value
+    return result
+
+
+def holder_files(directory, plan, sha, images):
+    """The pass's Compose files of one project: the candidate (the recreated services on the release's images and their
+    recomputed digests) and the restore file (every service as it runs, with the labels its receipt names)."""
+    project, document, running, recorded = plan["project"], plan["document"], plan["running"], plan["recorded"]
+    def as_running(service):
+        record = recorded.get(service) or {}
+        return running[service]["image"], record.get("revision", sha), record.get("digest")
+    old = {service: as_running(service) for service in project["services"]}
+    new = {**old, **{service: (images[project["services"][service]], sha, plan["wanted"][service]["digest"])
+                     for service in plan["units"]}}
+    reference, _ = evidence_document(project, document)
+    files = {}
+    for suffix, units in (("", new), (".before", old)):
+        path = directory / f"{project['name']}{suffix}.json"
+        write(path, escaped_rendered(holder_document(reference, units)))
+        reread = json.loads(run(["docker", "compose", "--profile", "*", "-f", str(path), "config", "--format", "json"]))
+        if reread != holder_document(document, units):
+            raise Refused("a session pass Compose file did not round-trip exactly")
+        files[suffix] = path
+    return files
+
+
+def holder_plans(settings, state, current, receipt, release, ledger, key, flagged):
+    """What a pass recreates in each project with session services, from digests recomputed against the release's
+    checkout and the host as it is now (a change a rollback undid is no longer pending): `units` (service -> kind),
+    `groups` (holder, collector, members) and `waiting` (pending, but this window already had its planned recreate)."""
+    try:
+        entries = tree_entries(release / "source")
+    except Exception:
+        entries = None
+    built, plans = {}, []
+    for project in (project for project in settings["projects"] if project.get("sessions")):
+        labels, conditions = {}, {}
+        document, running = snapshot(project, labels=labels, conditions=conditions, exited=set(project["sessions"]))
+        recorded, wanted, why = recorded_inputs(state, project["name"], current), {}, {}
+        for service, target in project["services"].items():
+            if target not in built:
+                try:
+                    built[target] = build_inputs(release / "source", target, entries) if entries is not None else None
+                except Exception:
+                    built[target] = None
+            wanted[service] = service_inputs(document, service, built[target])
+            why[service] = keep_decision(service, wanted[service], running[service], labels.get(service),
+                                         recorded.get(service))
+        plan = {"project": project, "document": document, "running": running, "recorded": recorded, "wanted": wanted,
+                "units": {}, "groups": [], "waiting": [], "reasons": {}}
+        for holder, mark in project["sessions"].items():
+            collector, name = mark["collector"], project["name"] + "/" + holder
+            if flagged is not None:
+                if name not in flagged:
+                    continue
+                kind = "flagged"
+            elif why[holder] is None:
+                continue
+            elif conditions.get(holder) or why[holder][0] in PRECEDENCE:
+                kind, plan["reasons"][holder] = "recovery", conditions.get(holder) or why[holder][0]
+            elif holder_planned(ledger, name, key):
+                plan["waiting"].append(name)
+                continue
+            else:
+                kind = "planned"
+            members = [holder] + ([collector] if why[collector] is not None else [])
+            if not holder_speaks(project, running, receipt["images"], holder, collector, members):
+                raise incompatible(project, holder, collector, members)
+            for service in members:
+                image = receipt["images"][project["services"][service]]
+                if json.loads(run(["docker", "image", "inspect", image]))[0].get("Id") != image:
+                    raise Refused(f"the release image of {project['name']}/{service} is not on this host")
+            plan["units"].update(dict.fromkeys(members, kind))
+            plan["groups"].append((holder, collector, members))
+        plans.append(plan)
+    return plans
+
+
+def holder_group(settings, http, plan, group, files, planned_end):
+    """One holder of a pass, with its collector when both are recreated: the planned-stop marker, the collector stopped
+    first, the holder up and checked, the collector up, the attach. Any failure restores the previous pair inside this
+    pass, holder first, without guard_rollback for the holder (it carries no migrations) and with it for a collector
+    (criterion 4). Returns `(status, failed check or None)`; a failed restore raises (the pass stays `started`)."""
+    project, (holder, later) = plan["project"], (group[0], group[2][1:])
+    new, old = (["docker", "compose", "--profile", "*", "--project-name", project["name"], "-f", str(files[suffix])]
+                for suffix in ("", ".before"))
+    up = ["up", "-d", "--no-build", "--pull", "never", "--no-deps", "--force-recreate", "--wait", "--wait-timeout", "180"]
+    images = {service: plan["images"][project["services"][service]] for service in group[2]}
+    marker = holder_marker(plan["document"], holder, planned_end)
+    try:
+        try:
+            if later:
+                run(new + ["stop", *later])
+            run(new + ["stop", holder])
+            since = holder_since()
+            run(new + up + [holder])
+            holder_steady(new, project, plan["running"], {holder: images[holder]})
+            if later:
+                since = holder_since()
+                run(new + up + later)
+                holder_steady(new, project, plan["running"], {service: images[service] for service in later})
+            if failure := holder_attached(new, project, [holder], since):
+                raise Refused(failure)
+            return "recreated", None
+        except Refused as exc:
+            failed = str(exc)
+        if later:
+            guard_rollback(serving_generation(settings, http),
+                           [(project, files[".before"], {service: plan["running"][service]["image"] for service in later})])
+        run(old + ["stop", *later, holder])
+        for members in ([holder], later):
+            if members:
+                run(old + up + members)
+                holder_steady(old, project, plan["running"], {service: plan["running"][service]["image"]
+                                                              for service in members})
+        return "rolled_back", failed
+    finally:
+        if marker is not None:
+            with suppress(OSError):
+                marker.unlink()
+
+
+def holder_receipts(state, sha, changes):
+    """After a pass, current.json and the release's result.json name each recreated or restored service's container,
+    and a recreated one's inputs on this release (no longer kept), so the next release and a rollback read what runs."""
+    for path in (state / "current.json", state / sha / "result.json"):
+        value = read(path)
+        for item in value["rollback"]["projects"]:
+            for service, change in changes.get(item["name"], {}).items():
+                item["running"][service] = change["running"]
+                if "inputs" in change:
+                    item["inputs"][service] = change["inputs"]
+                    (item.get("kept") or {}).pop(service, None)
+        write(path, value)
+
+
+def holder_pass(settings, http, *, moment=None, flagged=None, reference=None):
+    """Criteria 3-7: a session-only pass over the current applied release; no new release, every digest recomputed.
+    Refused before its `started` receipt: nothing stopped. After it: a call wait bounded by the window's end (or
+    CALL_WAIT for a flag), then each group; the pass's receipt is release/session-<time>/result.json."""
+    state = Path(settings["state_directory"])
+    current, moment = read(state / "current.json"), moment or holder_clock()
+    sha, kind_of_pass = current["sha"], "flagged" if flagged is not None else "night"
+    release = state / sha
+    receipt, ledger = read(release / "prepared.json"), holder_ledger(state)
+    begin, end = holder_window_at(settings, moment)
+    key, passes = holder_window_key(settings, begin), (lambda value: {} if flagged is not None else {key: value})
+    try:
+        plans = holder_plans(settings, state, current, receipt, release, ledger, key, flagged)
+    except Refused as exc:
+        holder_record(state, passes=passes({"status": "refused", "reason": str(exc)}))
+        return {"status": "refused", "reason": str(exc)}
+    waiting = {name for plan in plans for name in plan["waiting"]}
+    if not any(plan["units"] for plan in plans):
+        holder_record(state, pending={name: None for name in ledger["pending"] if name not in waiting},
+                      passes=passes({"status": "nothing pending"}))
+        return {"status": "nothing pending", "waiting": sorted(waiting)}
+    directory = release / ("session-" + moment.strftime("%Y%m%dT%H%M%SZ"))
+    directory.mkdir(mode=0o700)
+    files = []
+    for plan in plans:
+        plan["images"] = receipt["images"]
+        files.append(holder_files(directory, plan, sha, receipt["images"]) if plan["units"] else None)
+    services = {plan["project"]["name"] + "/" + service: kind for plan in plans for service, kind in plan["units"].items()}
+    started = {"sha": sha, "pass": kind_of_pass, "window": key, "status": "started", "started_at": now(),
+               "services": services, **({"reference": reference} if reference else {})}
+    write(directory / "attempted.json", started)
+    holder_record(state, passes=passes({"status": "started", "pass": directory.name}))
+    try:
+        wait_for_calls(settings, time.monotonic() + max(0, (CALL_WAIT if flagged is not None else
+                                                            (end - holder_clock()).total_seconds())))
+    except (CallActive, CallsUnknown) as exc:
+        reason = str(exc) if flagged is not None else "deferred (window closed during call wait)"
+        result = {**started, "status": "waiting" if flagged is not None else "deferred", "reason": reason,
+                  "finished_at": now(), "counts": holder_counts([])}
+        write(directory / "result.json", result)
+        holder_record(state, passes=passes({"status": result["status"], "pass": directory.name}))
+        return result
+    planned_end = end if flagged is None else holder_clock() + timedelta(seconds=HOLDER_ATTACH_S + 180)
+    events, outcomes, changes, cleared = [], {}, {}, {}
+    for plan, paths in zip(plans, files):
+        project = plan["project"]
+        for group in plan["groups"]:
+            name, members = project["name"] + "/" + group[0], group[2]
+            kind = plan["units"][group[0]]
+            events += [holder_event(project["name"] + "/" + service, kind, key, sha, **(
+                {"reason": plan["reasons"][service]} if service in plan["reasons"] else {}),
+                **({"reference": reference} if reference else {})) for service in members]
+            holder_record(state, events=events[-len(members):])  # counted before the first stop: a crash still counts
+            status, failed = holder_group(settings, http, plan, group, paths, planned_end)
+            _, running = snapshot(project)
+            for service in members:
+                changes.setdefault(project["name"], {})[service] = {"running": running[service], **(
+                    {"inputs": plan["wanted"][service]} if status == "recreated" else {})}
+            outcomes[name] = {"status": status, "services": members, **({"check": failed} if failed else {})}
+            if status == "recreated":
+                cleared[name] = None
+            else:
+                events += [holder_event(project["name"] + "/" + service, "rollback", key, sha, check=failed)
+                           for service in members]
+                holder_record(state, events=events[-len(members):])
+    holder_receipts(state, sha, changes)
+    status = "rolled_back" if any(value["status"] == "rolled_back" for value in outcomes.values()) else "applied"
+    result = {**started, "status": status, "finished_at": now(), "outcomes": outcomes, "counts": holder_counts(events)}
+    write(directory / "result.json", result)
+    if flagged is None:
+        cleared.update({name: None for name in ledger["pending"] if name not in waiting and name not in outcomes})
+    holder_record(state, pending=cleared, passes=passes({"status": status, "pass": directory.name}))
+    return result
+
+
+def holder_nightly(settings, http, state, current, serving, outcome, *, auto, dry_run, halt):
+    """Criterion 3: an `--auto` run that found nothing new to deploy runs the night's session-only pass once, from its
+    per-night start until the window ends, when a deferred change is recorded."""
+    if not auto or dry_run or not any(project.get("sessions") for project in settings["projects"]):
+        return outcome
+    moment, ledger = holder_clock(), holder_ledger(state)
+    begin, end = holder_window_at(settings, moment)
+    key = holder_window_key(settings, begin)
+    if not ledger["pending"] or key in ledger["passes"] or not holder_pass_time(settings, begin, end) <= moment < end:
+        return outcome
+    if drift := configuration_drift(settings, http, current, serving):
+        holder_record(state, passes={key: {"status": "skipped", "reason": drift}})
+        return {**outcome, "session_pass": {"status": "skipped", "reason": drift}}
+    try:
+        passed = holder_pass(settings, http, moment=moment)
+    except Exception as exc:
+        message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+        return halt(f"the session pass of {current['sha']} stopped: {message}; inspect its receipt",
+                    code="session_pass_failed")
+    return {**outcome, "session_pass": passed}
+
+
+def holder_flag(settings, services, reason):
+    """Criterion 5: the `project/holder` names of `--session-restart-now` and its `--reason`, `incident:<runbook
+    record>` or `owner:<the owner's line>`; anything else is refused with `session_flag_invalid` before any stop."""
+    configured = [(project["name"] + "/" + holder, holder) for project in settings["projects"]
+                  for holder in project.get("sessions") or {}]
+    found = []
+    for name in (part.strip() for part in (services or "").split(",")):
+        matches = [full for full, holder in configured if name in (full, holder)]
+        if len(matches) != 1:
+            raise Refused(f"session_flag_invalid: {name[:80] or 'an empty name'} is not one configured session service")
+        found.append(matches[0])
+    authority, _, cited = (reason or "").partition(":")
+    if authority not in FLAG_AUTHORITIES or not cited.strip() or len(reason) > 1000 or len(set(found)) != len(found):
+        raise Refused("session_flag_invalid: --reason is \"incident:<runbook record>\" or \"owner:<the owner's line, "
+                      "quoted>\", each service named once")
+    return found, reason
+
+
+def holder_flagged(settings, http, flag):
+    """`deploy --session-restart-now`: a session-only pass over the named services, at once, under the deploy locks."""
+    state, http_state = Path(settings["state_directory"]), Path(http["state_directory"])
+    if reason := unresolved(state, http_state):
+        return {"status": "refused", "reason": reason}
+    current = read(state / "current.json") if (state / "current.json").exists() else {}
+    if current.get("status") != "applied":
+        return {"status": "refused", "reason": "the current release is not applied"}
+    names, reference = holder_flag(settings, *flag)
+    return holder_pass(settings, http, flagged=set(names), reference=reference)
+
+
+def holder_pending(settings, moment=None):
+    """Criterion 6: each deferred session change with its parts, release and next window (UTC and local); one still
+    deferred after two windows carries `session_deferral_stale`."""
+    if not any(project.get("sessions") for project in settings.get("projects") or []):
+        return []
+    moment, found = moment or holder_clock(), []
+    for name, entry in sorted(holder_ledger(Path(settings["state_directory"]))["pending"].items()):
+        line = {"service": name, "parts": entry.get("parts"), "release": entry.get("release"), "since": entry.get("since"),
+                "next_window": holder_window_text(settings, *holder_window_at(settings, moment))}
+        try:
+            since = datetime.strptime(entry["since"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except (KeyError, TypeError, ValueError):
+            since = None
+        passed, end = 0, holder_next_window(settings, since or moment)[1]
+        while since and end <= moment and passed < HOLDER_STALE_WINDOWS:
+            passed, end = passed + 1, holder_window_at(settings, end)[1]
+        if passed >= HOLDER_STALE_WINDOWS:
+            line["code"] = "session_deferral_stale"
+        found.append(line)
+    return found
 
 
 # Image retention (production.md "Image retention"). Besides this configuration's state, other states on the host keep
@@ -3420,7 +4097,8 @@ class CopyStuck(Refused):
 def settings_digest(settings):
     """The plan A configuration digest receipts record. The `migration` section (ANYM-588 C7) and the `backup` section
     (ANYM-744) are not in it: adding either changes no prepared release."""
-    return digest({key: value for key, value in settings.items() if key not in ("migration", "backup")})
+    return digest({key: value for key, value in settings.items()
+                   if key not in ("migration", "backup", "session_window", "session_timezone")})
 
 
 def copy_source(settings, name):
@@ -4212,6 +4890,7 @@ HALTS = {
     "release_not_applied": ("agent", _DOC + "apply-and-verify"),
     "release_not_on_main": ("agent", _DEPLOY),
     "rollback_failed": ("agent", _ROLLBACK),
+    "session_pass_failed": ("agent", _DOC + "session-holders-anym-896"),
     "tool_blob_mismatch": ("agent", _TOOLS),
     "tool_by_hand": ("agent", _TOOLS),
     "tool_not_descended": ("agent", _TOOLS),
@@ -6348,8 +7027,12 @@ def host_locks(settings, http, s):
         yield
 
 
-def deploy(settings, http, *, auto=False, dry_run=False, attested=None, configs=(CONFIG, HTTP_CONFIG), pre_claim=None):
-    """Deploy the newest green main commit with plan A and then plan B, or pause with a reason (production.md)."""
+def deploy(settings, http, *, auto=False, dry_run=False, attested=None, configs=(CONFIG, HTTP_CONFIG), pre_claim=None,
+           flag=None):
+    """Deploy the newest green main commit with plan A and then plan B, or pause with a reason (production.md).
+    `flag` (`--session-restart-now` services and `--reason`, ANYM-896) runs only a session-only pass over those."""
+    if flag is not None:
+        holder_flag(settings, *flag)  # refused before any lock or stop
     if PAUSE.exists():
         paused = {"status": "paused", "reason": PAUSE.read_text()[:1000].strip()}
         if not dry_run:
@@ -6390,6 +7073,9 @@ def deploy(settings, http, *, auto=False, dry_run=False, attested=None, configs=
             return {"status": "busy", "code": "rotation_running", "reason": rotating}
         if stale := stale_tool(s):
             return {"status": "error", "reason": stale + "; nothing changed, the next run uses it"}
+        if flag is not None:
+            return {"status": "plan", "would_restart": holder_flag(settings, *flag)[0]} if dry_run else holder_flagged(
+                settings, http, flag)
         if not dry_run:
             try:
                 tend_copies(settings, locked=True)
@@ -6772,8 +7458,9 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
     halted, mirror = deploy_fetch_main(state, base, serving, last, failures, dry_run, halt)
     if halted is not None:
         return halted
-    if mirror is None:
-        return {"status": "current", "sha": base}
+    if mirror is None:  # ANYM-896: the night's session-only pass runs when nothing new is to be deployed
+        return holder_nightly(settings, http, state, current, serving, {"status": "current", "sha": base}, auto=auto,
+                              dry_run=dry_run, halt=halt)
     head = run(["git", "-C", str(mirror), "rev-parse", "refs/heads/main"]).strip()
     if not on_main(mirror, base, head) or not on_main(mirror, serving["sha"], base):
         return halt("the current release is not on main, or the serving HTTP release is not an ancestor of it",
@@ -8311,6 +8998,10 @@ def argument_parser():
     parser.add_argument("--undo", action="store_true", help="enroll: reverse an applied enrollment")
     parser.add_argument("--pre-claim-rollback", metavar="REASON",
                         help="deploy, apply, rollback: return to a tree without session_claim.py after claims ran (ANYM-914)")
+    parser.add_argument("--session-restart-now", metavar="SERVICES",
+                        help="deploy: recreate these session services at once (ANYM-896), with --reason")
+    parser.add_argument("--reason", help='deploy --session-restart-now: "incident:<runbook record>" or '
+                                         '"owner:<the owner\'s line, quoted>"')
     parser.add_argument("--verifier", help="self-test: check this staged verifier build against the pin instead of "
                                            "the installed one (attest-verify install, production.md)")
     return parser
@@ -8354,6 +9045,8 @@ def locked_action(args):
                 result["project_services"] = services
             if warnings := disk_warnings():
                 result["disk_warnings"] = warnings
+            if pending := holder_pending(settings):  # ANYM-896 criterion 6
+                result["session_pending"] = pending
         elif args.action == "images":
             result = remove_images(settings) if args.remove else images_report(settings)
         elif args.action == "copy-database":
@@ -8401,9 +9094,15 @@ def execute_action(args):
     if args.action == "deploy":
         if os.geteuid() != 0:
             raise Refused("deploy requires the production host operator")
-        return deploy(config(args.config), http_release_tool().validate_settings(config(args.http_config)),
-                      auto=args.auto, dry_run=args.dry_run, configs=(args.config, args.http_config),
-                      pre_claim=args.pre_claim_rollback)
+        if (args.session_restart_now is None) != (args.reason is None) or args.auto and args.session_restart_now:
+            raise Refused("session_flag_invalid: --session-restart-now and --reason go together, never with --auto")
+        settings = config(args.config)
+        flag = None if args.session_restart_now is None else (args.session_restart_now, args.reason)
+        result = deploy(settings, http_release_tool().validate_settings(config(args.http_config)), auto=args.auto,
+                        dry_run=args.dry_run, configs=(args.config, args.http_config), pre_claim=args.pre_claim_rollback,
+                        flag=flag)
+        # ANYM-896 criterion 6: the pending session changes, on stdout only (deploy.json keeps the run's receipt).
+        return {**result, "session_pending": pending} if (pending := holder_pending(settings)) else result
     return locked_action(args)
 
 

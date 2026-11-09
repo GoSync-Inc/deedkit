@@ -89,8 +89,8 @@ Then per account, `whatsapp1` first and `whatsapp2` only after `whatsapp1` verif
 3. Back up `whatsapp<n>.json` and `/etc/deedkit/production.json` (a per-account copy, `.before-holder<n>`). Add
    `"holder_socket_directory": "/run/deedkit/holder"` and `"holder_dsn_file": "/run/secrets/holder_dsn"` to
    `whatsapp<n>.json`; append `/srv/deedkit/deploy/compose.whatsapp<n>-holder.yaml` after the native overlay in the
-   project's `files` and add `"whatsapp<n>-holder": "whatsapp-holder"` (with ANYM-896's marks) to `services`. Read
-   back with `jq`.
+   project's `files` and add `"whatsapp<n>-holder": {"target": "whatsapp-holder", "session": true, "collector":
+   "whatsapp<n>"}` (ANYM-896's marks, production.md "Session holders") to `services`. Read back with `jq`.
 4. Read-only: no active call (production.md, the active-call check).
 5. `production.py prepare --sha S`: it builds and smoke-checks `deedkit-production-whatsapp-holder:S` from the
    release checkout and resolves the candidate. Review it: only `whatsapp<n>` (new mounts) and `whatsapp<n>-holder`

@@ -1233,6 +1233,52 @@ tables gets `permission denied for table session_holder_accounts`. The logins ar
 bindings are (backup inventory): such a binding names a login the fresh cluster does not have and passes no row,
 and step 4's binding statement moves it to the restored host's new login.
 
+### Session holders (ANYM-896)
+
+A session holder (`whatsapp-holder`, later `telegram-holder`: a target that copies no messaging_service code) holds a
+provider connection, so recreating it is a provider reconnect. It is marked in the configuration's `services` as an
+object, `"whatsapp1-holder": {"target": "whatsapp-holder", "session": true, "collector": "whatsapp1"}`; `config()`
+refuses the mark on any other target (`session_target_unsupported`), unknown keys and a missing or shared collector
+(`session_mark_invalid`). Global keys: `session_window` (default `03:00-05:00`) and `session_timezone` (default
+`Asia/Makassar`, WITA: the owner's 2026-10-17 «Да, ночью по Бали»); neither is part of the prepared configuration
+digest.
+
+- Deferral. When a holder's ANYM-895 decision is a changed digest, `apply` (also inside `deploy`) recreates it only
+  when the recreate begins inside the window and the holder had no planned recreate earlier in that window. Otherwise
+  the running container stays as a kept service on the inputs it carries, and the receipt's `services` entry says
+  `deferred (<parts>, next window <UTC>, <local> WITA)`. The decision is taken after the call waits, right before
+  the first stop. Precedence: a holder that is stopped, restarting, paused, unhealthy, `unlabeled` or `unreadable` is
+  recreated at once (kind `recovery` with that reason). A migration changes no holder: a holder copies none.
+- Collectors are never kept back: a collector that changed goes in its release. A holder and its collector that both
+  go form a pair: the collector stops first, the holder comes up and passes its check, then the collector comes up and
+  must attach (the holder's `holder.attached` log event within 120 s). A collector alone needs its new image's
+  protocol range (`io.deedkit.collector.protocol.{min,max}`) to include the running holder's protocol (the maximum of
+  `io.deedkit.holder.protocol.{min,max}`), a holder alone the reverse; a pair, each the other's. A recreate that leaves
+  no shared protocol is refused before any stop (`session_pair_incompatible`). A changed collector that cannot speak to
+  the running holder takes the holder with it at once (`recovery`, `collector_requires_holder`). A failure in the pair
+  records the release `unhealthy`; its rollback restores both, holder first (`deploy` does it at once).
+- Night pass. A `deploy --auto` run that finds nothing new to deploy, when a deferred change is recorded, runs one
+  session-only pass a night from its per-night start (inside 03:30-04:30, derived from the date) until the window
+  ends. It uses the current applied release, recomputes every digest (a change a rollback undid is `nothing
+  pending`) and writes `<state>/<sha>/session-<time>/attempted.json` as `started` before its call wait; a crash
+  leaves that receipt without `result.json`, which every later deploy refuses as unfinished. A call wait that reaches
+  the window's end stops nothing: `deferred (window closed during call wait)`. Before it stops a holder it writes
+  `.planned-stop` (`{reason: session_window, planned_end}`, 0600, the collectors' owner) in the holder's socket
+  directory and removes it after the holder is back, so the collector reports `provider_disconnected` with reason
+  `session_window`. A holder (or pair) failing its check is restored inside the pass, holder first (no
+  `guard_rollback` for the holder, which carries no migrations; the collector keeps it): `rolled_back` with the
+  failed check, the change stays pending. An exception after `started` halts autodeploy with `session_pass_failed`.
+- Urgent flag. `production.py deploy --session-restart-now <holder>[,<holder>...] --reason "incident:<runbook
+  record>"` (the incident recovery override, AGENTS.md section 2, docs/operations/incident-recovery.md) or `--reason
+  "owner:<the owner's line, quoted>"` recreates the named holders at once in a session-only pass (`--dry-run` lists
+  them). Anything else, or a name that is no configured session service, is refused before any stop
+  (`session_flag_invalid`). Each one is a `flagged` recreate with its reference.
+- Visibility. `status` and the deploy's stdout list `session_pending`: the holder, the changed parts, the release, the
+  next window in UTC and WITA, and `session_deferral_stale` once two windows passed without it. The ledger
+  `<state>/session-ledger.json` keeps the recreates by kind (`planned`, `recovery`, `flagged`, `rollback`) and window,
+  the pending changes and each window's pass; each pass's `result.json` has its `counts`. After a pass, `current.json`
+  and the release's `result.json` name the new container, so the next release and `rollback` read what runs.
+
 ### Waiting for a running backup (ANYM-744)
 
 `apply`, the standalone `seamless_release.py promote` and a manual `deploy` (not `--auto`, not `--dry-run`) wait up to
@@ -3299,6 +3345,7 @@ own pause, in that older shape. A dry run reports `would_pause` and writes nothi
 | `release_not_applied` | agent | `docs/operations/production.md#apply-and-verify` |
 | `release_not_on_main` | agent | `docs/operations/production.md#continuous-deployment` |
 | `rollback_failed` | agent | `docs/operations/production.md#roll-back-the-current-release` |
+| `session_pass_failed` | agent | `docs/operations/production.md#session-holders-anym-896` |
 | `tool_blob_mismatch` | agent | `docs/operations/production.md#deploy-tool-updates` |
 | `tool_by_hand` | agent | `docs/operations/production.md#deploy-tool-updates` |
 | `tool_not_descended` | agent | `docs/operations/production.md#deploy-tool-updates` |
