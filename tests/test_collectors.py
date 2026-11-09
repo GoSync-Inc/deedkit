@@ -252,6 +252,74 @@ def test_session_terminal_telegram_media_error_still_stops_collector(worker,erro
     assert not list(s.files.glob('.pending-*'))
 
 
+# spec: ANYM-840
+def test_telegram_channel_difference_fetch_logs_chat_count_and_timing_only(caplog):
+    from telethon import TelegramClient,types,utils
+    from telethon.sessions import StringSession
+    from telethon._updates.messagebox import State as BoxState,PossibleGap,PrematureEndReason
+    from messaging_service.telegram_collector import TelethonProvider
+    # A real, never-connected client: the hooks are the ones Telethon's update loop calls.
+    client=TelegramClient(StringSession(),1,'synthetic',receive_updates=False)
+    provider=object.__new__(TelethonProvider);provider.client=client
+    provider.bind_state(NS(account='tg-gate',update_gap=lambda:None))
+    class Hashes:
+        self_bot=False
+        def get(self,entry):return NS(id=entry,hash=99) if entry!=777 else None
+        def extend(self,users,chats):pass
+    hashes=Hashes();sent=datetime(2026,11,9,10,0,tzinfo=timezone.utc)
+    def channel_message(i):
+        return types.Message(id=i,peer_id=types.PeerChannel(4242),date=sent,message='synthetic private text')
+    def difference(final,*ids):
+        return types.updates.ChannelDifference(final=final,pts=8,new_messages=[channel_message(i) for i in ids],
+            other_updates=[],chats=[],users=[])
+    def new_messages(updates):return sum(isinstance(u,types.UpdateNewChannelMessage) for u in updates)
+    async def scenario():
+        box=client._message_box;loop=asyncio.get_running_loop()
+        # The no-updates deadline expired: a timeout fetch of two pages keeps its trigger on page 2.
+        box.map[4242]=BoxState(pts=5,deadline=loop.time()-1);box.next_deadline=4242;box.check_deadlines()
+        assert new_messages(box.apply_channel_difference(box.get_channel_difference(hashes),difference(False,1,2),hashes)[0])==2
+        assert new_messages(box.apply_channel_difference(box.get_channel_difference(hashes),difference(True,3),hashes)[0])==1
+        # An expired pts gap; the first request gets no response (Telethon sleeps on OSError and asks again).
+        box.map[4242].deadline=loop.time()+600;box.possible_gaps[4242]=PossibleGap(deadline=loop.time()-1,updates=[])
+        box.check_deadlines();box.get_channel_difference(hashes)
+        box.apply_channel_difference(box.get_channel_difference(hashes),types.updates.ChannelDifferenceEmpty(final=True,pts=8),hashes)
+        # Telegram says the channel is too long: the latest messages come in `messages`; then the fetch ends early.
+        box.try_begin_get_diff(4242,'received updateChannelTooLong')
+        dialog=types.Dialog(peer=types.PeerChannel(4242),top_message=4,read_inbox_max_id=0,read_outbox_max_id=0,
+            unread_count=0,unread_mentions_count=0,unread_reactions_count=0,unread_poll_votes_count=0,
+            notify_settings=types.PeerNotifySettings(),pts=12)
+        too_long=types.updates.ChannelDifferenceTooLong(dialog=dialog,messages=[channel_message(4)],chats=[],users=[],final=True)
+        assert box.apply_channel_difference(box.get_channel_difference(hashes),too_long,hashes)==([],[],[])
+        box.end_channel_difference(box.get_channel_difference(hashes),PrematureEndReason.TEMPORARY_SERVER_ISSUES,hashes)
+        # A channel without an access hash is dropped by Telethon with no request.
+        box.map[777]=BoxState(pts=1,deadline=loop.time()-1);box.next_deadline=777;box.check_deadlines()
+        assert box.get_channel_difference(hashes) is None
+        # A diff the hook cannot read never breaks Telethon's own apply.
+        box.map[4242].deadline=loop.time()-1;box.next_deadline=4242;box.check_deadlines();request=box.get_channel_difference(hashes)
+        broken=types.updates.ChannelDifference(final=True,pts=9,new_messages=[NS(id=5)],other_updates=[],chats=[],users=[])
+        assert new_messages(box.apply_channel_difference(request,broken,hashes)[0])==1
+        # Every finished fetch left the tracker: it stays bounded.
+        assert provider.channel_fetches=={}
+    with caplog.at_level('INFO',logger='messaging_service.telegram_collector'):asyncio.run(scenario())
+    lines=[r.getMessage() for r in caplog.records if r.getMessage().startswith('telegram_channel_difference')]
+    chat=stable_id('chat','tg-gate',str(utils.get_peer_id(types.PeerChannel(4242))))
+    assert len(lines)==8 and all(f'chat={chat} ' in line for line in lines[:6]+lines[7:])
+    expected=['trigger=timeout result=difference page=1 messages=2 final=False ',
+              'trigger=timeout result=difference page=2 messages=1 final=True ',
+              'trigger=gap result=no_response page=1 messages=0 final=None elapsed_ms=',
+              'trigger=gap result=empty page=2 messages=0 final=True ',
+              'trigger=channel_too_long result=too_long page=1 messages=1 final=True ',
+              'trigger=channel_too_long result=ended_early page=2 messages=0 ',
+              'trigger=timeout result=no_access_hash page=0 messages=0 final=None elapsed_ms=none ',
+              'trigger=timeout result=difference page=1 messages=1 ']
+    assert all(part in line for part,line in zip(expected,lines,strict=True))
+    assert stable_id('chat','tg-gate',str(utils.get_peer_id(types.PeerChannel(777)))) in lines[6]
+    assert 'oldest_age_s=none' not in lines[0] and 'oldest_age_s=none' not in lines[4] and 'oldest_age_s=none' in lines[3]
+    assert all('elapsed_ms=' in line and 'fetch_ms=' in line for line in lines)
+    text=' '.join(lines)
+    assert 'synthetic private text' not in text and '4242' not in text and '777' not in text
+
+
 @pytest.fixture
 def worker(seeded,tmp_path):
     store,_,_=seeded; archive=Archive(store)
