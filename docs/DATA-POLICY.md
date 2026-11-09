@@ -53,8 +53,9 @@ volume) (owner 11-03, see Data egress).
   and references (message, chat and account IDs) derived from its messages by fixed rules, with no
   copied text and no model. Visibility is that of messages (`read`, ANYM-909). Deletion: a message
   purge hides every negotiation it fed from reads when the purge commits; the negotiation worker
-  (ANYM-908) deletes its sources, times and mark, or blanks them to ids, within seconds while it
-  runs (before its next `apply` transaction) and before any other work when it starts; what stays
+  (ANYM-908) deletes its sources, times and mark, or blanks them to ids, before its next `apply`
+  or publish touches that negotiation, otherwise within one lap of its cleanup while it runs (up to
+  2,000 source rows a second), and before any other work when it starts; what stays
   is a content-free `removed` tombstone and transition rows with ids, kinds and timestamps. A
   negotiation event fetched in that window still shows its ids, state and whose turn it was.
   Backups and cold copies follow today's rule, with the gap the Deletion line records unchanged

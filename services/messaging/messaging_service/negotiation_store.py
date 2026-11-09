@@ -4,8 +4,9 @@ Only two kinds of process write these tables: the one negotiation worker (ANYM-9
 marks tools (ANYM-910). Every writing transaction first takes the chat's advisory lock, before any row lock;
 collectors and the message purge never take it, so they never wait on this code. Several chats: ascending key order.
 
-A message purge (ANYM-510) is unchanged: reads hide a negotiation with a purged source at once (VISIBLE), and the
-worker's cleanup deletes or blanks to ids everything derived from it, before its next apply.
+A message purge (ANYM-510) is unchanged: reads hide a negotiation with a purged source at once (VISIBLE). `apply` and
+`clean_if_purged` (before a publish) clean their own chat or negotiation first; the worker's cleanup reaches the rest
+from a durable cursor in bounded slices. Cleaning deletes or blanks to ids everything derived from the message.
 Stored: states, times, zones and message IDs. No message text is ever written here.
 """
 import hashlib
@@ -27,6 +28,8 @@ PRIVILEGES = ('SELECT', 'INSERT', 'UPDATE', 'DELETE')
 WINDOW = timedelta(days=14)
 MAX_SOURCES = 200
 BATCH = 200
+# Source rows one checkpoint reads at most; the next one goes on from the cursor. A worker's first call reads a lap.
+SWEEP = 2000
 TIMEOUT = '10s'
 # A test hook, called inside the apply transaction with a stage name ('evaluated', 'written'); None in production.
 hook = None
@@ -42,9 +45,17 @@ SOURCES_SQL = f'''SELECT m.id, m.revision, m.sender, m.direction, m.body, m.sent
   WHERE m.account=%s AND m.chat=%s AND NOT m.deleted AND NOT m.purged AND m.sent_at>=%s
   ORDER BY m.sent_at DESC, m.id DESC LIMIT %s'''
 
-PURGED_SQL = '''SELECT DISTINCT s.negotiation, n.account, n.chat FROM negotiation_sources s
-  JOIN messages m ON m.id=s.message JOIN negotiations n ON n.id=s.negotiation
-  WHERE m.purged ORDER BY s.negotiation LIMIT %s'''
+# Purge discovery reads source rows by primary key from the durable cursor (negotiation_cursor), one bounded
+# transaction of `batch` rows each; a message that is gone counts as not purged, as VISIBLE reads it.
+SWEEP_SQL = '''SELECT s.message, s.negotiation, n.account, n.chat, coalesce(m.purged, false) AS purged
+  FROM negotiation_sources s JOIN negotiations n ON n.id=s.negotiation LEFT JOIN messages m ON m.id=s.message
+  WHERE (s.message, s.negotiation) > (%s, %s) ORDER BY s.message, s.negotiation LIMIT %s'''
+# A chat's or one negotiation's purged sources, removed ones included: index paths only (negotiation_chat,
+# negotiation_source_owner, the messages key).
+CHAT_PURGED_SQL = '''SELECT DISTINCT s.negotiation FROM negotiations n JOIN negotiation_sources s ON s.negotiation=n.id
+  JOIN messages m ON m.id=s.message WHERE n.account=%s AND n.chat=%s AND m.purged ORDER BY s.negotiation'''
+NEGOTIATION_PURGED_SQL = '''SELECT EXISTS (SELECT 1 FROM negotiation_sources s JOIN messages m ON m.id=s.message
+  WHERE s.negotiation=%s AND m.purged) AS hit'''
 
 
 def negotiation_lock_key(account, chat):
@@ -124,11 +135,12 @@ def _times(c, negotiation, result):
              t['zone_source'], list(t.get('assumed') or [])))
 
 
-def _blank_sources(c, messages, now):
-    """A source that no longer feeds keeps only ids: negotiation, message, revision and removed_at."""
+def _blank_sources(c, negotiation, messages, now):
+    """A negotiation's sources that no longer feed it keep only ids: negotiation, message, revision and removed_at.
+    The link itself stays, so a purge of the message still finds this negotiation."""
     if messages:
         c.execute('''UPDATE negotiation_sources SET removed_at=%s,intent=NULL,confidence=NULL,medium=NULL,cue_start=NULL,
-            cue_end=NULL WHERE message=ANY(%s) AND removed_at IS NULL''', (now, list(messages)))
+            cue_end=NULL WHERE negotiation=%s AND message=ANY(%s) AND removed_at IS NULL''', (now, negotiation, list(messages)))
 
 
 def _tombstone(c, negotiation, now, trigger=None):
@@ -143,7 +155,10 @@ def _tombstone(c, negotiation, now, trigger=None):
 
 
 def _write(c, account, chat, now, result, sources):
-    fetched = {s['message_id'] for s in sources}
+    signals = {s['message_id']: s for s in sources}
+    fetched = set(signals)
+    # A message read in the window that carries no scheduling signal any more (edited to plain text) feeds nothing.
+    silent = {m for m, s in signals.items() if (s['signal'] or {}).get('intent', 'none') == 'none'}
     stored = c.execute('''SELECT * FROM negotiations WHERE account=%s AND chat=%s AND state<>'removed'
         ORDER BY opened_at DESC, id DESC''', (account, chat)).fetchall()
     rows = c.execute('''SELECT message, negotiation FROM negotiation_sources WHERE negotiation=ANY(%s)
@@ -153,8 +168,7 @@ def _write(c, account, chat, now, result, sources):
     unseen = sorted({r['message'] for r in rows} - fetched)
     alive = fetched | ({r['id'] for r in c.execute('''SELECT id FROM messages WHERE id=ANY(%s) AND NOT deleted
         AND NOT purged''', (unseen,)).fetchall()} if unseen else set())
-    changed = 0
-    target = None
+    changed, target, feeding = 0, None, set()
     if result is not None:
         feeding = set(result['sources'])
         target = next((n for n in stored if active.get(n['id'], set()) & feeding), None)
@@ -176,24 +190,27 @@ def _write(c, account, chat, now, result, sources):
                             result['state'], result['awaiting'], now)
                 _times(c, negotiation, result)
                 changed += 1
-        signals = {s['message_id']: s for s in sources}
         for message in result['sources']:
             s = signals[message]
             cue = s['signal'].get('cue_span') or (None, None)
             c.execute('''INSERT INTO negotiation_sources(message,negotiation,revision,removed_at,intent,confidence,medium,
-                cue_start,cue_end) VALUES(%s,%s,%s,NULL,%s,%s,%s,%s,%s) ON CONFLICT (message) DO UPDATE SET
-                negotiation=EXCLUDED.negotiation,revision=EXCLUDED.revision,removed_at=NULL,intent=EXCLUDED.intent,
+                cue_start,cue_end) VALUES(%s,%s,%s,NULL,%s,%s,%s,%s,%s) ON CONFLICT (message,negotiation) DO UPDATE SET
+                revision=EXCLUDED.revision,removed_at=NULL,intent=EXCLUDED.intent,
                 confidence=EXCLUDED.confidence,medium=EXCLUDED.medium,cue_start=EXCLUDED.cue_start,cue_end=EXCLUDED.cue_end''',
                 (message, negotiation, s['revision'], s['signal'].get('intent'), s['signal'].get('confidence'),
                  s['signal'].get('medium'), cue[0], cue[1]))
         # The target's sources that no longer feed it: gone from the archive, or read in the window and left out.
-        _blank_sources(c, {m for m in active.get(negotiation, set()) - feeding if m not in alive or m in fetched}, now)
-    # Every source whose message is deleted keeps only ids; a negotiation with no live source left becomes removed.
+        _blank_sources(c, negotiation, {m for m in active.get(negotiation, set()) - feeding
+                                        if m not in alive or m in fetched}, now)
+    # Every other negotiation: a source whose message is deleted, carries no signal any more, or now feeds the current
+    # negotiation keeps only ids, its link kept (a link never moves to another negotiation, so a purge finds both).
+    # One with no source left, or one the current negotiation took a source from, becomes removed.
     for n in stored:
         if target is not None and n['id'] == target['id']:continue
         messages = active.get(n['id'], set())
-        _blank_sources(c, messages - alive, now)
-        if not messages & alive:
+        dropped = (messages - alive) | (messages & silent) | (messages & feeding)
+        _blank_sources(c, n['id'], dropped, now)
+        if messages & feeding or not messages - dropped:
             _tombstone(c, n['id'], now)
             changed += 1
     return changed
@@ -206,10 +223,12 @@ def apply(c, account, chat, now, zone=None):
     with c.transaction():
         _bounded(c)
         lock_chats(c, [(account, chat)])
+        # A purge of this chat's sources that no cleanup has reached yet is cleaned first, under the same lock.
+        purged = sum(_purge_one(c, r['negotiation'], now) for r in c.execute(CHAT_PURGED_SQL, (account, chat)).fetchall())
         sources = _sources(c, account, chat, now, zone)
         result = negotiation_state.evaluate(sources, now)
         _stage('evaluated')
-        changed = _write(c, account, chat, now, result, sources)
+        changed = purged + _write(c, account, chat, now, result, sources)
         _stage('written')
     return changed
 
@@ -235,26 +254,57 @@ def _purge_one(c, negotiation, now):
     return True
 
 
-def cleanup(c, now, batch=BATCH):
-    """Drain every source row whose message is purged, removed sources included, in batches, one transaction per
-    negotiation under its chat's lock. Returns the count; logs only the count."""
-    total = 0
-    while True:
+def cleanup(c, now, batch=BATCH, budget=SWEEP):
+    """Find every source row whose message is purged, removed sources included, and clean its negotiation.
+
+    Discovery reads source rows by primary key from the durable cursor, `batch` rows per bounded transaction and at most
+    `budget` rows a call (None: one lap over every row present at the start); at the end it wraps to the start. Each
+    negotiation hit is cleaned in its own bounded transaction under its chat's lock, and only then does the cursor move
+    on, so a stop resumes where it left off. `apply` and `clean_if_purged` clean their own chat or negotiation exactly,
+    whatever the cursor. Returns the count; logs only the count."""
+    total, scanned = 0, 0
+    if budget is None:
         with c.transaction():
-            rows = c.execute(PURGED_SQL, (batch,)).fetchall()
-        if not rows:break
-        for r in sorted(rows, key=lambda r: (negotiation_lock_key(r['account'], r['chat']), r['negotiation'])):
+            _bounded(c)
+            budget = c.execute('SELECT count(*) AS n FROM negotiation_sources').fetchone()['n']
+    while scanned < budget:
+        with c.transaction():
+            _bounded(c)
+            row = c.execute('SELECT purge_message, purge_negotiation FROM negotiation_cursor WHERE id=1').fetchone()
+            after = (row['purge_message'], row['purge_negotiation']) if row else ('', '')
+            chunk = c.execute(SWEEP_SQL, (*after, batch)).fetchall()
+        hits = {(r['account'], r['chat'], r['negotiation']) for r in chunk if r['purged']}
+        for account, chat, negotiation in sorted(hits, key=lambda h: (negotiation_lock_key(h[0], h[1]), h[2])):
             with c.transaction():
                 _bounded(c)
-                lock_chats(c, [(r['account'], r['chat'])])
-                total += _purge_one(c, r['negotiation'], now)
+                lock_chats(c, [(account, chat)])
+                total += _purge_one(c, negotiation, now)
+        last = (chunk[-1]['message'], chunk[-1]['negotiation']) if len(chunk) == batch else ('', '')
+        with c.transaction():
+            _bounded(c)
+            c.execute('''INSERT INTO negotiation_cursor(id,updated_at,purge_message,purge_negotiation) VALUES(1,%s,%s,%s)
+                ON CONFLICT (id) DO UPDATE SET purge_message=EXCLUDED.purge_message,
+                purge_negotiation=EXCLUDED.purge_negotiation''', (now, *last))
+        scanned += len(chunk)
+        if not chunk and after == ('', ''):break  # nothing stored
     if total:log.info('negotiations_purged count=%d', total)
     return total
 
 
+def clean_if_purged(c, negotiation, now):
+    """Before a publish (ANYM-908), inside the caller's transaction: when a source of the negotiation is purged, clean
+    it under its chat's lock and return True (nothing of it may publish); else False."""
+    row = c.execute('SELECT account, chat FROM negotiations WHERE id=%s', (negotiation,)).fetchone()
+    if row is None:return False
+    lock_chats(c, [(row['account'], row['chat'])])
+    if not c.execute(NEGOTIATION_PURGED_SQL, (negotiation,)).fetchone()['hit']:return False
+    return _purge_one(c, negotiation, now)
+
+
 class Checkpoint:
     """The worker's cleanup checkpoint: run before each apply and publish transaction and between backoffs, at most
-    once per interval (one 10 s apply plus 1 s bounds the time between checks while the worker runs)."""
+    once per interval (one 10 s apply plus 1 s bounds the time between checks while the worker runs). The first call
+    of a started worker reads a whole lap; later calls go on from the cursor, at most SWEEP rows each."""
 
     def __init__(self, interval=1.0, clock=time.monotonic):
         self.interval, self.clock, self.last = interval, clock, None
@@ -262,8 +312,8 @@ class Checkpoint:
     def __call__(self, c, now):
         at = self.clock()
         if self.last is not None and at - self.last < self.interval:return 0
-        self.last = at
-        return cleanup(c, now)
+        first, self.last = self.last is None, at
+        return cleanup(c, now, budget=None if first else SWEEP)
 
 
 def take_rebuild(c, limit=BATCH):

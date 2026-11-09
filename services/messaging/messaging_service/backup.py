@@ -81,7 +81,7 @@ V70_TABLES={'subscription_activity':'subscription,day,platform,scope_version,met
 V73_TABLES={'wake_targets':'id','wake_target_subscriptions':'wake_target,subscription'}
 # ANYM-907: each chat's negotiation, its source references, times, transitions, the rebuild queue and the worker's
 # cursor (states, times, zones and message IDs derived from messages; no message text).
-V76_TABLES={'negotiations':'id','negotiation_sources':'message','negotiation_times':'negotiation,ord',
+V76_TABLES={'negotiations':'id','negotiation_sources':'message,negotiation','negotiation_times':'negotiation,ord',
     'negotiation_transitions':'negotiation,version','negotiation_rebuild':'account,chat','negotiation_cursor':'id'}
 SCHEMAS=range(2,77)
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',

@@ -85,6 +85,7 @@ def test_schema73_snapshot_round_trips_the_wake_targets(database,tmp_path):
 def test_schema76_snapshot_round_trips_the_negotiations_and_restores_their_grants(database,tmp_path):
     from datetime import datetime,timedelta,timezone
     from messaging_service.backup import V76_TABLES,database_manifest
+    from messaging_service.backup_restore_worker import restore_roles_sql
     from messaging_service.negotiation_store import apply
     from test_subscription_retention import restore_database,snapshot_restored
     now=datetime.now(timezone.utc)
@@ -103,20 +104,21 @@ def test_schema76_snapshot_round_trips_the_negotiations_and_restores_their_grant
         assert before['negotiations']['rows']==1 and before['negotiation_transitions']['rows']==1
         # snapshot_restored verifies the bundle before and the restored database after pg_restore.
         with snapshot_restored(source,tmp_path) as restored:
-            restored.migrate()  # a restore runs without ACLs; migrate re-applies 076's grants
+            # As the restore worker: every RESTORE_ROLES role first, then migrate re-applies 076's grants (a restore
+            # runs without ACLs).
+            with restored.pool.connection() as c:c.execute(restore_roles_sql())
+            restored.migrate()
             with restored.pool.connection() as c:
                 manifest=database_manifest(c)
                 assert {name:manifest[name] for name in before}==before
-                # The restore cluster holds every RESTORE_ROLES role (backup_restore_worker.restore_roles_sql).
                 has=lambda role,table,privilege: c.execute('''SELECT CASE WHEN EXISTS (SELECT FROM pg_roles
                     WHERE rolname=%s) THEN has_table_privilege(%s,%s,%s) ELSE NULL END AS ok''',
                     (role,role,table,privilege)).fetchone()['ok']
                 for table in V76_TABLES:
                     assert has('messaging_negotiations',table,'DELETE') is True
-                    assert has('messaging_purge',table,'SELECT') is not True
-                # The API role, where the test cluster has it (store.migrate grants only to existing roles).
+                    assert has('messaging_purge',table,'SELECT') is False
                 for table in ('negotiations','negotiation_sources','negotiation_times'):
-                    assert has('messaging_gateway',table,'SELECT') is not False
+                    assert has('messaging_gateway',table,'SELECT') is True and has('messaging_gateway',table,'INSERT') is False
 
 
 # spec: ANYM-824

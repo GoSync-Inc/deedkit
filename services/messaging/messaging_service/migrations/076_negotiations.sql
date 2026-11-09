@@ -2,8 +2,9 @@
 -- ANYM-907: each chat's scheduling negotiation (ANYM-893 evaluate), stored with versions that are never reused, its
 -- source messages, its times and one transition row per committed change; a rebuild queue and the worker's cursor.
 -- Derived from message text, never a copy of it: states, times, zones and message references only.
--- Manual: it creates the role messaging_negotiations (NOLOGIN, as the role files do) and grants on these new tables
--- only. The worker's grants on existing tables (messages, chats, events, ...) come with ANYM-908. messaging_purge
+-- It creates the role messaging_negotiations (NOLOGIN, as the role files do) and grants on these new tables only.
+-- Release: declared manual for the deploy pause, and production.py migrate-expand still applies it unattended
+-- (migration_rollout.unattended_class is expand: non-critical, one transaction, no long name), as any expand. The worker's grants on existing tables (messages, chats, events, ...) come with ANYM-908. messaging_purge
 -- gets nothing: the purge job (ANYM-510) is unchanged, and the negotiation worker removes what a purge leaves.
 -- Risk tier: non-critical (docs/operations/production.md "Migration risk tiers": new tables, a new role and grants on
 -- the new tables only; no existing row, column or grant changes). No foreign key names an existing table, so no
@@ -45,7 +46,8 @@ CREATE TABLE IF NOT EXISTS negotiations (
 );
 CREATE INDEX IF NOT EXISTS negotiation_chat ON negotiations(account,chat,opened_at DESC,id);
 CREATE TABLE IF NOT EXISTS negotiation_sources (
- message text PRIMARY KEY,
+ -- One link per message and negotiation, never moved: a purge finds every negotiation a message ever fed.
+ message text NOT NULL,
  negotiation text NOT NULL REFERENCES negotiations(id),
  revision integer,
  removed_at timestamptz,
@@ -56,7 +58,8 @@ CREATE TABLE IF NOT EXISTS negotiation_sources (
  cue_end integer,
  -- A removed source keeps only ids: negotiation, message, revision and removed_at.
  CHECK(removed_at IS NULL OR (intent IS NULL AND confidence IS NULL AND medium IS NULL AND cue_start IS NULL
-  AND cue_end IS NULL))
+  AND cue_end IS NULL)),
+ PRIMARY KEY(message,negotiation)
 );
 CREATE INDEX IF NOT EXISTS negotiation_source_owner ON negotiation_sources(negotiation);
 CREATE TABLE IF NOT EXISTS negotiation_times (
@@ -96,7 +99,10 @@ CREATE TABLE IF NOT EXISTS negotiation_rebuild (
 CREATE TABLE IF NOT EXISTS negotiation_cursor (
  id integer PRIMARY KEY CHECK(id=1),
  event_id bigint NOT NULL DEFAULT 0 CHECK(event_id>=0),
- updated_at timestamptz NOT NULL
+ updated_at timestamptz NOT NULL,
+ -- The purge discovery's place in negotiation_sources (its primary key); empty: the start.
+ purge_message text NOT NULL DEFAULT '',
+ purge_negotiation text NOT NULL DEFAULT ''
 );
 GRANT SELECT,INSERT,UPDATE,DELETE ON negotiations,negotiation_sources,negotiation_times,negotiation_transitions,
  negotiation_rebuild,negotiation_cursor TO messaging_negotiations;
