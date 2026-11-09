@@ -1241,7 +1241,8 @@ object, `"whatsapp1-holder": {"target": "whatsapp-holder", "session": true, "col
 refuses the mark on any other target (`session_target_unsupported`), unknown keys and a missing or shared collector
 (`session_mark_invalid`). Global keys: `session_window` (default `03:00-05:00`) and `session_timezone` (default
 `Asia/Makassar`, WITA: the owner's 2026-10-17 «Да, ночью по Бали»); neither is part of the prepared configuration
-digest.
+digest. Order: add a mark only once the installed tool carries this support (an older tool refuses the object
+entry, `TypeError`, on every command); before a `tool-rollback` to such a tool, remove the marks first.
 
 - Deferral. When a holder's ANYM-895 decision is a changed digest, `apply` (also inside `deploy`) recreates it only
   when the recreate begins inside the window and the holder had no planned recreate earlier in that window. Otherwise
