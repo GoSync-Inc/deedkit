@@ -750,6 +750,18 @@ pause was copied to `/etc/deedkit/autodeploy.pause.before-074` and removed. The 
 and rehearsed in 16 ms, migrated 73 to 74 at 09:09:12Z and deployed c68c9081 at 09:12:26Z, with no
 pause left.
 
+Release record, 2026-11-09 (075 `message_receipts_source_check`, a CHECK widened NOT VALID): the 09:23Z run
+halted `migration_refused`, "the pre-migration copy of messaging failed: disk_reserve": `/` had about 18 GiB
+free, below twice the 4 GiB database plus the 10 GiB reserve. The tool went from 4085de9f to d95cbcb2 by hand
+first ("Deploy tool updates" steps 1-3). The backup timers were stopped at 09:33:32Z (three, recorded). Then,
+under the runner lock, `python -m messaging_service migrate` ran at 09:35:06-09Z through `docker compose run
+operator migrate`, with `PGAPPNAME=deedkit-hand075-migrate`: rc 0, schema 74 to 75, the constraint left NOT
+VALID. `production.py apply --sha d95cbcb2` ran 09:37:05-09:39:26Z (no active call), then `seamless_release.py
+prepare` and `promote --sha d95cbcb2` 09:39:50-09:40:50Z. The timers started again at 09:40:58Z and the pause
+was removed at 09:41:08Z. Undo: `production.py rollback` to c68c9081 (the CHECK only widens, so c68c9081 runs on
+75). Follow-ups: a range migrated by hand now releases with no second copy ("Unattended migrations",
+Admission, PR #803), and `copy_root` moves the copies off `/` ("Database copies").
+
 ### Database copies
 
 ANYM-588. A release needs a copy only for a database with no daily backup running (owner 11-04, "Migration
@@ -760,21 +772,33 @@ call the command. It runs under the plan A lock, like `prepare`.
 
 Configuration: the plan A file's `migration` section (`deploy/production.example.json`):
 `databases.<name>` = `{container, owner, database}` (the name: up to 12 lowercase letters and digits) and
-`copy_timeout_s` (default 1800, the deadline of each dump and of the restore). Without the section
+`copy_timeout_s` (default 1800, the deadline of each dump and of the restore) and `copy_root` (optional: an
+absolute, normalized directory, for example `/mnt/HC_Volume_107150701/deedkit-migration-copies` on the image volume;
+default `<state>/migration-copies`). The configured root is created `0700` only when every parent exists, is a real
+directory (no symlink) owned by root or the operator and writable by no one else (unless sticky, like `/tmp`), and the
+last parent is on another filesystem than the state, so an unmounted volume whose mount point is still there refuses
+instead of taking the copy onto `/`. Before its first copy the root is recorded in `<state>/copy-roots.json`; every run
+tends (releases and expires) the configured root, every recorded one and `<state>/migration-copies`, refuses while a
+recorded root is missing (`copies_unreconciled`: mount it), forgets a recorded root that holds no copy and is no longer
+configured, and treats a copy ID found in two roots as stuck.
+Production, from the plan A edit after this change (2026-11-09): `copy_root` on the image volume, because `/` was too small for messaging's dump and
+restore (the 075 copy refused `disk_reserve`). Without the section
 `copy-database` refuses and `deploy` behaves as before. The section is not part of the configuration
 digest, so adding it changes no prepared release (`settings_digest`).
 
 Steps, all through `docker exec -i -e PGAPPNAME=deedkit-copy-<id>-<step> <container>`, where `<id>` is
 `<sha12>-<name>-<UTC stamp>`:
 
-1. `<state>/migration-copies/<id>/owner.json` (0600, fsynced, directory 0700) names the scratch container
+1. `<copy root>/<id>/owner.json` (0600, fsynced, directory 0700) names the scratch container
    and the session prefix before anything starts.
 2. A keeper `psql` session (`idle_in_transaction_session_timeout` and `statement_timeout` = the deadline)
    opens `REPEATABLE READ READ ONLY`, exports its snapshot, reads the database size and an exact
    `count(*)` of every table (ordinary and partitioned) outside the system schemas.
-3. Free space: the copy filesystem and the live database's data filesystem (the Source of the mount that
-   holds the container's `PGDATA`) each need 2 × the database size + the reserve, max(10 GiB, 10 % of that
-   filesystem). While a dump or the restore runs both are read every 2 s; below the reserve the step is
+3. Free space: the copy filesystem needs 2 × the database size + the reserve, max(10 GiB, 10 % of that
+   filesystem); the live database's data filesystem (the Source of the mount that holds the container's
+   `PGDATA`) needs the same when it is the copy's, else the reserve alone: the copy writes no file there, but its
+   snapshot keeps WAL and row versions vacuum cannot reuse yet, so both filesystems are read every 2 s for as long as
+   the snapshot is held, its queries included (a path that cannot be read counts as the copy's). While a dump or the restore runs both are read every 2 s; below the reserve the step is
    cancelled.
 4. At the snapshot: `pg_dump --schema-only` (the reference schema), `pg_dump -Fc` to `<database>.dump`,
    `pg_dumpall --roles-only --no-role-passwords` to `roles.sql` (files 0600, created with `O_NOFOLLOW`);
@@ -821,8 +845,10 @@ state, also when another copy is stuck. Of a copy whose resources are not confir
 `owner.json` stays, so a later run can still stop them. The copies are plaintext on this host's disk and
 never leave it.
 
-Undo: none needed; a copy changes no database. To remove a copy at once: `rm -r
-/var/lib/deedkit-production/migration-copies/<id>` after its `released.json` exists.
+Undo: none needed; a copy changes no database. To remove a copy at once: `rm -r <copy root>/<id>` after its
+`released.json` exists. Undo of `copy_root`: remove the key from the plan A file (its backup beside it); the next
+copy goes to `<state>/migration-copies` again, and `copy-roots.json` keeps the volume's root tended until its last
+copy expires (48 h), then forgets it. Keep the volume mounted until then.
 
 ### Unattended migrations
 
