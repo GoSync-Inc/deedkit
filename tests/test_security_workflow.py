@@ -58,8 +58,11 @@ def test_a_go_allowlist_entry_names_every_go_mod_that_requires_its_module():
         module = entry["reason"].split()[0]
         assert module.count("/") >= 2, entry
         for go_mod in go_mods:
-            required = any(line.split()[:1] == [module] or line.split()[1:2] == [module]
-                           for line in (ROOT / go_mod).read_text().splitlines())
+            # reads: services/release-router/go.mod
+            # reads: tools/attest-verify/go.mod
+            # reads: whatsapp/whatsmeow/go.mod
+            lines = (ROOT / go_mod).read_text().splitlines()
+            required = any(line.split()[:1] == [module] or line.split()[1:2] == [module] for line in lines)
             assert not required or go_mod in entry["reason"], (entry["id"], go_mod)
 
 
