@@ -574,6 +574,7 @@ def test_backlog_share_one_keeps_the_whole_cap_for_old_work(configured,tmp_path)
     assert w.claim() is None
 
 
+# spec: ANYM-69
 def test_configuration_backlog_share_is_a_fraction(tmp_path):
     path=tmp_path/'config.json'
     base={'enabled':True,'accounts':['fixture'],'profiles':{'audio':{'provider':'faster_whisper','model':str(tmp_path)}}}
