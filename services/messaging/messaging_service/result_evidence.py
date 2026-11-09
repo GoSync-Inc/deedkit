@@ -121,7 +121,12 @@ def _readable(c,file):
     root=FILES_ROOT.get()
     if root is None or not file.get('digest'):return False
     row={'sha256':file['digest'],'bytes':file['bytes']}
-    return _available(root,row) or (_absent(root,row) and is_managed_evicted(c,file['digest'],file['bytes']))
+    if _available(root,row):return True
+    if not _absent(root,row):return False
+    # A decorate row carries is_managed_evicted's answer from its own read (EXCERPT_COLUMNS, original_residency),
+    # so an absent original costs no statement per file (ANYM-889).
+    if 'original_residency' in file:return file['original_residency']=='evicted'
+    return is_managed_evicted(c,file['digest'],file['bytes'])
 
 
 def text_excerpt(c,file,budget):

@@ -3,7 +3,7 @@ import itertools
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from hypothesis import HealthCheck, given, settings, strategies as st
+from hypothesis import HealthCheck, example, given, settings, strategies as st
 
 
 NOW = datetime(2026, 10, 15, 0, 0, 0, tzinfo=timezone.utc)
@@ -423,14 +423,16 @@ def view_catalog(s, chats):
                 c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
                     SELECT %s||k,%s,%s,%s||k,'peer','',%s,'incoming' FROM generate_series(1,65) k''',
                     (chat+'-crowd-', account, chat, ('9000' if platform == 'tg' else 'wamid-crowd-')+str(i), base+timedelta(minutes=5)))
-                c.execute('''INSERT INTO message_metadata(message,revision,metadata)
-                    SELECT id,revision,'{"is_service":true}'::jsonb FROM messages WHERE chat=%s AND id LIKE %s''', (chat, chat+'-crowd-%'))
     return ids
 
 
 # spec: ANYM-889
 @settings(max_examples=30, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow])
 @given(st.lists(VIEW_CHAT, min_size=1, max_size=8), st.booleans())
+@example([('tg-private', [(0, 'text', False)], True), ('wa-private', [(1, 'empty', True)], True),
+    ('wa-group', [(2, 'mention', False)], True)], False)
+@example([('tg-private', [(0, 'text', False)], True), ('wa-private', [(1, 'empty', True)], True),
+    ('wa-group', [(2, 'mention', False)], True)], True)
 def test_page_conversation_view_equals_the_per_chat_function_for_every_row(seeded, monkeypatch, chats, restricted):
     """The page's batched conversation view returns, row by row, what today's per-chat function returns."""
     from messaging_service import chat_queries
@@ -452,6 +454,14 @@ def test_page_conversation_view_equals_the_per_chat_function_for_every_row(seede
     for got,want in zip(batched['items'],oracle['items']):
         assert got==want,(got['id'],[k for k in want if got.get(k)!=want.get(k)])
     assert batched==oracle
+    # A crowded private head (65 visible, empty messages in its newest second) is truncated in both answers; on
+    # Telegram (provider order known) its older meaningful message is the fallback, on WhatsApp the tie stays ambiguous.
+    shown={row['id']:row['conversation'] for row in batched['items']}
+    for chat,(kind,specs,crowd) in zip(ids,chats):
+        if crowd and chat in shown and kind in ('tg-private','wa-private'):
+            assert shown[chat]['basis']['code']=='head_candidates_truncated',(chat,shown[chat]['basis'])
+            older=kind=='tg-private' and any(k in ('text','media','queued','mention') for _,k,_ in specs)
+            assert (shown[chat]['latest_known_meaningful_message'] is not None)==older,(chat,specs)
 
 
 def contradicted_head(s, add, *changes):

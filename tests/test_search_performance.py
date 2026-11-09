@@ -237,8 +237,20 @@ CONVERSATION_VIEW_STATEMENTS = 24
 # spec: ANYM-889
 def test_conversation_view_runs_a_fixed_number_of_statements_for_25_and_100_rows(seeded):
     from messaging_service.chat_queries import list_chats
+    from test_file_index import add_file, worker_for
+    from test_file_retention_api import managed_absence
     s,a,_=seeded
     seed_catalog(s)
+    # A text file on each of the 60 newest Telegram heads (all on both pages' rows or the 100-row page), each original
+    # gone: lost on disk (no excerpt) or by a completed managed eviction (excerpt shown). The presence rule reads no
+    # statement per file.
+    digests=[add_file(s,'pf-file-'+str(n),'pf-m-'+str(n)+'-0',('Synthetic note '+str(n)).encode(),'note.txt') for n in range(60)]
+    worker=worker_for(s)
+    for _ in range(200):
+        if not worker.run_once()['claimed']:break
+    for n,digest in enumerate(digests):
+        if n%2:(s.files/digest).unlink()
+        else:managed_absence(s,digest,len(('Synthetic note '+str(n)).encode()))
     counts={}
     for limit in (25,100):
         with s.authorized(a,'list_chats') as (c,p):
@@ -246,6 +258,10 @@ def test_conversation_view_runs_a_fixed_number_of_statements_for_25_and_100_rows
             result=list_chats(s,counted,p,'',limit,order='activity',view='conversation',include_coverage=False)
         assert len(result['items'])==limit and all(row['conversation'] for row in result['items'])
         assert {row['type'] for row in result['items']}>={'private','group'}
+        quoted={row['id']:(row['conversation']['latest_known_meaningful_message'] or {}).get('display_text_media')
+            for row in result['items']}
+        # The managed-evicted original's text is quoted in its head; the lost one's is not.
+        assert quoted['pf-0'][0]['attachment_id']=='pf-file-0' and quoted['pf-1'] is None,(quoted['pf-0'],quoted['pf-1'])
         counts[limit]=counted.view
     assert 0<counts[25]<=CONVERSATION_VIEW_STATEMENTS and 0<counts[100]<=CONVERSATION_VIEW_STATEMENTS,counts
 
