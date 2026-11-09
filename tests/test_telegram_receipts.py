@@ -305,7 +305,7 @@ def test_provider_registers_the_group_callback_for_both_outbox_update_types():
     provider.client = NS(add_event_handler=lambda callback, event: registered.append((callback, event)))
     groups = object()
     provider.subscribe(object(), object(), object(), owner_reads=object(), group_receipts=groups)
-    assert provider.supports_group_receipts is True and len(registered) == 6
+    assert provider.supports_group_receipts is True and len(registered) == 7  # with the ANYM-847 service handler
     assert registered[-1][0] is groups
     assert registered[-1][1].types == (types.UpdateReadHistoryOutbox, types.UpdateReadChannelOutbox)
 
