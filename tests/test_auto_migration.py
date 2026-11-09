@@ -862,15 +862,15 @@ def labelled(copy_id, kind):
                           check=True).stdout.split()
 
 
-def fake_migrate(migration, *, slow=False):
+def fake_migrate(migration, *, slow=False, linger=False):
     """migrate-expand as a psql session on the copy over the rehearsal network: the migration, its ledger row, the
-    schema version, in one transaction."""
+    schema version, in one transaction; `linger` keeps the session and its container 1.2 s past the commit."""
     calls = []
     def expand_run(name, image, network, dsn_file, plan_file, *, label=None, status=False):
         calls.append((name, network, label, json.loads(Path(plan_file).read_text())["identity"]))
         host = Path(dsn_file).read_text().split("@")[1].split(":")[0]
         text = "BEGIN; " + migration + LEDGER_ROW.format(digest="a" * 64) + (" SELECT pg_sleep(1.2);" if slow else "") \
-            + " COMMIT;"
+            + " COMMIT;" + (" SELECT pg_sleep(1.2);" if linger else "")
         subprocess.run(["docker", "run", "--rm", "--network", network, "--label", label, "-i", image, "psql", "-X", "-q",
                         "-v", "ON_ERROR_STOP=1", "-h", host, "-U", OWNER, "-d", Path(dsn_file).read_text().strip()
                         .rsplit("/", 1)[1]], input=text, capture_output=True, text=True, check=True)
@@ -917,6 +917,21 @@ def test_the_rehearsal_runs_on_the_copy_over_an_internal_network_and_leaves_noth
     # The live database itself never changed.
     assert psql(copy_settings["migration"]["databases"]["messaging"]["database"],
                 "SELECT value FROM probe_metadata WHERE name = 'schema_version';").strip() == "50"
+
+
+# spec: ANYM-449
+def test_the_rehearsal_times_the_migration_transaction_not_the_container_exit_after_its_commit(copy_settings,
+                                                                                               monkeypatch):
+    # 068 on 11-09: a 40 ms index read 1100, 2274 and 4681 ms (over migrate-expand's 4 s transaction_timeout) because
+    # the window ran to a later docker exec. Here the session stays 1.2 s past its commit; the limit is the default.
+    expand_run, _ = fake_migrate(ADDITIVE, linger=True)
+    monkeypatch.setattr(p, "expand_run", expand_run)
+    with p.database_copy(copy_settings, "messaging", NEWEST, keep=True, catalog=p.CATALOG) as copied:
+        record = p.rehearse(copied, {**PLAN, "roles": {}}, scratch_image(), p.REHEARSAL_LIMIT_MS)
+        track = p.scratch_lines(copied["copy"], copied, "track", "SHOW track_commit_timestamp;")
+    assert track == ["on"]
+    assert 0 <= record["took_ms"] < 1000
+    assert ["relation", "public.synthetic_items"] in [key for key, _ in record["difference"]["added"]]
 
 
 # spec: ANYM-449

@@ -2928,11 +2928,13 @@ def copy_scratch(copy, image, directory, timeout, paths, superuser):
     # A root operator lets the image's entrypoint own the data directory; anyone else runs PostgreSQL as itself, so
     # the cleanup can remove what it wrote.
     user = ["--user", f"{os.geteuid()}:{os.getegid()}"] if os.geteuid() else []
+    # track_commit_timestamp: the rehearsal times the migration's own transaction by its commit (REHEARSAL_TOOK).
     run(["docker", "run", "-d", "--rm", "--name", scratch_container, "--label", "deedkit-copy=" + copy["id"],
          "--network", "none", "--log-driver", "none", "--memory", "1g", "--cpus", "1", "--pids-limit", "256",
          "--shm-size", "256m", *user, "-e", "POSTGRES_HOST_AUTH_METHOD=trust", "-e", "POSTGRES_USER=" + superuser,
          "-e", "POSTGRES_DB=postgres",
-         "-e", "PGDATA=" + COPY_DATA, "-v", f"{scratch}:{COPY_DATA}", image], timeout=120)
+         "-e", "PGDATA=" + COPY_DATA, "-v", f"{scratch}:{COPY_DATA}", image, "-c", "track_commit_timestamp=on"],
+        timeout=120)
     scratch_sql = ("-h", "127.0.0.1", "-U", superuser)
     deadline = copy_clock() + timeout
     # The entrypoint's initialisation server listens on no TCP address: 127.0.0.1 answers only the final server.
@@ -3755,6 +3757,12 @@ CALENDAR_DATA = r"""SELECT line FROM (
 # milliseconds its session added (counted at its exit), plus the few reads between (an overestimate).
 BUSY = ("SELECT round(active_time + idle_in_transaction_time) FROM pg_stat_database "
         "WHERE datname = current_database();")
+# The messaging rehearsal's time: its migrate-expand transaction alone, from its start (`applied_at` is now()) to its
+# commit (the scratch server tracks commit timestamps). Not a later read's clock: that adds the container's exit, its
+# removal and a new docker exec, which on the loaded host were most of 068's 1100 ms (fix-migration-rehearsal-11-09).
+# -1 when the commit time is unknown.
+REHEARSAL_TOOK = ("SELECT coalesce(round(extract(epoch FROM max(pg_xact_commit_timestamp(xmin)) - min(applied_at))"
+                  " * 1000), -1) FROM archive_migrations WHERE version > {base};")
 
 
 def calendar_settings(settings):
@@ -4226,8 +4234,9 @@ def rehearse(copied, plan, image, limit):
                                + (answer or {}).get("error", "no answer" if answer is None else "wrong version"))
     took = None
     if plan["pending"] and not calendar:
-        took = int(scratch_lines(copy, copied, "took", "SELECT coalesce(round(extract(epoch FROM clock_timestamp()"
-                                 f" - max(applied_at)) * 1000), -1) FROM archive_migrations WHERE version > {int(plan['base'])};")[0])
+        took = int(scratch_lines(copy, copied, "took", REHEARSAL_TOOK.format(base=int(plan["base"])))[0])
+        if took < 0:
+            raise MigrationRefused("the rehearsal's transaction has no commit time on the copy")
     after_data = stable_data(copy, copied, CALENDAR_DATA if calendar else MIGRATION_DATA)
     if plan["pending"] and calendar:
         took = int(float(scratch_lines(copy, copied, "busy", BUSY)[0])) - spent

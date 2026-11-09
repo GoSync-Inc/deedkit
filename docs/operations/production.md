@@ -868,8 +868,10 @@ Phases, each a pause or a wait before any production write:
    other change (indexes, constraints, functions, triggers, views, policies, grants, defaults, roles)
    passes; `probe_metadata` only by `schema_version`;
    `archive_migrations` only by the pending versions; and no other existing table may show a write in
-   `pg_stat_user_tables` or a changed exact row count (a TRUNCATE moves no write counter; ANYM-743) or column number (a column dropped and added again). Its transaction (from `applied_at` to the first read after the container ended)
-   takes at most `rehearsal_limit_ms`. Else the run pauses "not unattended: <first difference>" or "too slow
+   `pg_stat_user_tables` or a changed exact row count (a TRUNCATE moves no write counter; ANYM-743) or column number (a column dropped and added again). Its transaction (from `applied_at`, its start, to its
+   commit timestamp: the scratch server runs with `track_commit_timestamp=on`; an unknown commit time pauses)
+   takes at most `rehearsal_limit_ms`. The container's exit and the reads after it do not count: until 11-09 they
+   did and were most of the time (068's 40 ms index read 1100 to 4681 ms on the loaded host). Else the run pauses "not unattended: <first difference>" or "too slow
    for an unattended lock". The copy's release removes and confirms every resource; a killed run leaves
    them to the next run's reconciliation.
 5. Final gate: admission and the producer check again, the live catalog still the copy's (else "the
