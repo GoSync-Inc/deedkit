@@ -414,3 +414,120 @@ def conversation_state(c,p,account,chat,*,titles=None):
         attention=attention,truncated=truncated,meaningful_fallback=fallback,collector=collector)
     result.update(account=account,chat_id=chat)
     return result
+
+
+def _ranked(found):
+    """A page read's rows as lists keyed by pair ordinal, in statement order; the batch columns removed."""
+    listed={}
+    for row in found:
+        listed.setdefault(row.pop('_batch_n'),[]).append(row);row.pop('_batch_position',None)
+    return listed
+
+
+def conversation_states(c,p,pairs,*,titles=None):
+    """ANYM-889: conversation_state for a page of (account, chat) pairs in a fixed number of statements.
+
+    Each read runs once for the page; the head and fallback reads once per platform, whose SQL the platform
+    shapes. enrich and decorate_messages run once for the heads and once for the fallbacks and group attention,
+    each list decorated as its own call would be (its excerpt budget, positions and attachment items). Every row
+    equals conversation_state's answer for its chat in the same transaction (the oracle in
+    tests/test_conversation_state.py). A failed read fails the page, as a failed per-chat call failed it.
+    """
+    from .store import APIError
+    from .conversation import decorate_messages, meaningful_sql, visible_sql
+    from .chat_queries import latest_sql,number
+    from .message_queries import BASE, enrich
+    from .chat_evidence import rows, history as coverage_history
+    requested=[(account,chat) for account,chat in pairs]
+    pairs=list(dict.fromkeys(requested))
+    if not pairs:return []
+    accounts=[account for account,_ in pairs];chats=[chat for _,chat in pairs]
+    scope,args=scope_filter(p,'c',chat_column='id')
+    infos={(r['account'],r['id']):r for r in c.execute('''SELECT c.id,c.account,c.chat_type,c.provider_chat,a.platform,
+        coalesce(ro.is_self_chat,false) AS self_chat,CURRENT_TIMESTAMP AS as_of
+        FROM unnest(%s::text[],%s::text[]) AS k(account,chat) JOIN chats c ON c.account=k.account AND c.id=k.chat
+        JOIN accounts a ON a.id=c.account LEFT JOIN chat_read_observations ro
+        ON ro.account=c.account AND ro.chat=c.id WHERE '''+scope,[accounts,chats,*args]).fetchall()}
+    if any(pair not in infos for pair in pairs):
+        raise APIError('not_found',404)
+    ordinal={pair:n for n,pair in enumerate(pairs,1)}
+    page='''SELECT k.n AS _batch_n,found.* FROM unnest(%s::integer[],%s::text[],%s::text[]) AS k(n,account,chat)
+        CROSS JOIN LATERAL ('''
+    def per_platform(chosen,query):
+        """One statement per platform over the chosen pairs, each pair's rows in its own statement's order."""
+        found={}
+        for telegram in (True,False):
+            part=[pair for pair in chosen if (infos[pair]['platform']=='telegram')==telegram]
+            if part:
+                platform="'telegram'" if telegram else "'whatsapp'"
+                listed=_ranked(c.execute(query(platform,number('m') if telegram else '0::bigint'),
+                    [[ordinal[pair] for pair in part],[a for a,_ in part],[x for _,x in part]]).fetchall())
+                found.update({pair:listed.get(ordinal[pair],[]) for pair in part})
+        return found
+    head_query=''' FROM messages m LEFT JOIN message_metadata md ON md.message=m.id
+        AND md.revision=m.revision WHERE m.account=k.account AND m.chat=k.chat AND NOT m.deleted AND '''+visible_sql()
+    def heads(platform,numeric):
+        # conversation_state's head read for each pair: the newest second, then its bounded per-direction tails.
+        head_sql='SELECT '+BASE+','+numeric+' AS numeric_id'+head_query+' AND m.sent_at=(SELECT sent_at FROM newest)'
+        return (page+'''SELECT h.*,row_number() OVER (ORDER BY h.sent_at DESC,coalesce(h.numeric_id,0) DESC,h.id DESC)
+            AS _batch_position FROM (WITH newest AS (SELECT m.sent_at'''+head_query+''' ORDER BY m.sent_at DESC,m.id DESC LIMIT 1) '''+
+            latest_sql(head_sql,both_directions=True,platform=platform,limit=HEAD_LIMIT+1)+''') h) found
+            ORDER BY k.n,found._batch_position''')
+    observed={};truncated={}
+    for pair,listed in per_platform(pairs,heads).items():
+        truncated[pair]=len(listed)>HEAD_LIMIT and listed[0]['sent_at']==listed[-1]['sent_at']
+        observed[pair]=listed[:HEAD_LIMIT]
+    groups=[observed[pair] for pair in pairs]
+    flat=[m for group in groups for m in group]
+    enrich(c,flat,p,titles=titles,groups=groups);decorate_messages(c,p,flat,groups=groups)
+    def fallbacks(platform,numeric):
+        fallback_sql='SELECT '+BASE+','+numeric+''' AS numeric_id FROM messages m LEFT JOIN message_metadata md
+            ON md.message=m.id AND md.revision=m.revision WHERE m.account=k.account AND m.chat=k.chat
+            AND '''+meaningful_sql()
+        return page+latest_sql(fallback_sql,both_directions=True,platform=platform)+') found ORDER BY k.n'
+    fallback={pair:listed[0] for pair,listed in per_platform(
+        [pair for pair in pairs if not any(_meaningful(m) for m in observed[pair])],fallbacks).items() if listed}
+    attention={pair:[] for pair in pairs}
+    grouped=[pair for pair in pairs if infos[pair]['chat_type']=='group']
+    if grouped:
+        # The per-chat statement's ORDER BY, as a rank: the outer sort keeps each chat's thread order.
+        projection=(BASE+", CASE WHEN gs.platform='whatsapp' AND "+group_after_owner_sql('gs.platform',same_time=True)+
+            " THEN 'ambiguous' ELSE 'open' END AS attention_status,row_number() OVER (ORDER BY m.sent_at DESC,"
+            "CASE WHEN gs.platform='telegram' THEN "+number('m')+" ELSE 0::bigint END DESC,m.id DESC) AS _batch_position")
+        listed=_ranked(c.execute('''SELECT gs.n AS _batch_n,threads.* FROM unnest(%s::integer[],%s::text[],%s::text[],
+            %s::text[],%s::text[]) AS gs(n,account,chat,provider_chat,platform) CROSS JOIN LATERAL ('''+group_thread_query(
+                projection,account='gs.account',chat='gs.chat',provider_chat='gs.provider_chat',platform='gs.platform',limit=17)+
+            ''') threads ORDER BY gs.n,threads._batch_position''',[[ordinal[pair] for pair in grouped],[a for a,_ in grouped],
+                [x for _,x in grouped],[infos[pair]['provider_chat'] for pair in grouped],
+                [infos[pair]['platform'] for pair in grouped]]).fetchall())
+        attention.update({pair:listed.get(ordinal[pair],[]) for pair in grouped})
+    groups=[[fallback[pair]] for pair in pairs if pair in fallback]+[attention[pair] for pair in pairs]
+    flat=[m for group in groups for m in group]
+    enrich(c,flat,p,titles=titles,groups=groups);decorate_messages(c,p,flat,groups=groups)
+    coverage={(r['account'],r['chat_id']):r for r in rows(c,p,chats,sorted(set(accounts)))}
+    restricted=p.get('chat_ids') is not None
+    health,failed={},False
+    if not restricted:
+        try:
+            # A savepoint, as in collector_facts: a failed SELECT must not leave the queue's transaction aborted.
+            with c.transaction():
+                health={r.pop('account'):r for r in c.execute(
+                    'SELECT account,status,detail_code,cooldown_until FROM collector_health WHERE account=ANY(%s)',
+                    (sorted(set(accounts)),)).fetchall()}
+        except Exception:
+            health,failed={},True
+    results={}
+    for pair in pairs:
+        account,chat=pair;info=infos[pair];head=observed[pair];row=coverage.get(pair)
+        # collector_facts' answer for this chat from the page's one health read.
+        progress=(row or {}).get('wa_progress')
+        facts={'catchup_progress_at':progress.get('catchup_progress_at') if isinstance(progress,dict) else None}
+        collector=facts if restricted or failed else {**(health.get(account) or {}),**facts}
+        result=derive_state(head, platform=info['platform'], chat_type=info['chat_type'],
+            as_of=info['as_of'],history=coverage_history(row) if row else {},self_chat=info['self_chat'] or
+                any(m.get('is_self_chat') is True for m in head) or
+                info['platform']=='telegram' and info['provider_chat']=='777000',
+            attention=attention[pair],truncated=truncated[pair],meaningful_fallback=fallback.get(pair),collector=collector)
+        result.update(account=account,chat_id=chat)
+        results[pair]=result
+    return [results[pair] for pair in requested]

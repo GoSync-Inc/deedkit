@@ -218,6 +218,54 @@ def test_default_activity_page_reads_heads_for_the_page_not_the_catalog(seeded):
     assert empty['items']==[] and 0<examined<=PAGE_WINDOW_CAP,examined
 
 
+class ViewStatements:
+    """Counts the statements the conversation view issues (the per-chat function or the page's batch)."""
+    def __init__(self,connection):self.connection=connection;self.view=0
+    def execute(self,sql,args=None):
+        import traceback
+        if any(f.name in ('conversation_state','conversation_states') for f in traceback.extract_stack()[:-1]
+                if '/messaging_service/' in f.filename):self.view+=1
+        return self.connection.execute(sql,args)
+    def __getattr__(self,name):return getattr(self.connection,name)
+
+
+# ANYM-889: the per-chat reads ran 321 statements for 25 rows and 1,285 for 100; the page batch runs 18 for both
+# (worst case: fallbacks on both platforms, reply targets, conflict classes add a few, never per row).
+CONVERSATION_VIEW_STATEMENTS = 24
+
+
+# spec: ANYM-889
+def test_conversation_view_runs_a_fixed_number_of_statements_for_25_and_100_rows(seeded):
+    from messaging_service.chat_queries import list_chats
+    from test_file_index import add_file, worker_for
+    from test_file_retention_api import managed_absence
+    s,a,_=seeded
+    seed_catalog(s)
+    # A text file on each of the 60 newest Telegram heads (all on both pages' rows or the 100-row page), each original
+    # gone: lost on disk (no excerpt) or by a completed managed eviction (excerpt shown). The presence rule reads no
+    # statement per file.
+    digests=[add_file(s,'pf-file-'+str(n),'pf-m-'+str(n)+'-0',('Synthetic note '+str(n)).encode(),'note.txt') for n in range(60)]
+    worker=worker_for(s)
+    for _ in range(200):
+        if not worker.run_once()['claimed']:break
+    for n,digest in enumerate(digests):
+        if n%2:(s.files/digest).unlink()
+        else:managed_absence(s,digest,len(('Synthetic note '+str(n)).encode()))
+    counts={}
+    for limit in (25,100):
+        with s.authorized(a,'list_chats') as (c,p):
+            counted=ViewStatements(c)
+            result=list_chats(s,counted,p,'',limit,order='activity',view='conversation',include_coverage=False)
+        assert len(result['items'])==limit and all(row['conversation'] for row in result['items'])
+        assert {row['type'] for row in result['items']}>={'private','group'}
+        quoted={row['id']:(row['conversation']['latest_known_meaningful_message'] or {}).get('display_text_media')
+            for row in result['items']}
+        # The managed-evicted original's text is quoted in its head; the lost one's is not.
+        assert quoted['pf-0'][0]['attachment_id']=='pf-file-0' and quoted['pf-1'] is None,(quoted['pf-0'],quoted['pf-1'])
+        counts[limit]=counted.view
+    assert 0<counts[25]<=CONVERSATION_VIEW_STATEMENTS and 0<counts[100]<=CONVERSATION_VIEW_STATEMENTS,counts
+
+
 def page_first_heads(plans):
     """Head reads the page-first plan added: per statement the most-run messages scan, summed over its statements."""
     return sum(max((node.get('Actual Loops',1) for node in nodes(plan) if node.get('Relation Name')=='messages'),default=0)
