@@ -199,6 +199,31 @@ def test_an_edited_source_equals_evaluating_with_only_its_new_revision(rows, now
 
 # spec: ANYM-893
 @settings(max_examples=300, deadline=None)
+@given(rows=chats(), now=NOW, data=st.data())
+def test_two_copies_of_one_revision_give_the_same_result_in_either_order(rows, now, data):
+    # Astra r1 M6: conflicting copies of one message at one revision never let input order decide.
+    if not rows:return
+    i = data.draw(st.integers(0, len(rows) - 1))
+    twin = dict(rows[i], signal=data.draw(SIGNALS))
+    assert evaluate(rows + [twin], now) == evaluate([twin] + rows, now)
+
+
+# spec: ANYM-893
+@settings(max_examples=300, deadline=None)
+@given(rows=chats(), now=NOW, signal=SIGNALS, opener=st.sampled_from(('propose', 'ask_availability')),
+       confidence=st.sampled_from(('medium', 'high')))
+def test_an_opening_source_before_all_others_always_gives_a_negotiation(rows, now, signal, opener, confidence):
+    # Not vacuous: the properties above would pass an evaluator that always returned None.
+    first = {'message_id': 'opener', 'revision': 1, 'sender': 'anna', 'is_owner': False,
+             'sent_at': BASE - timedelta(minutes=1), 'chat_type': 'private', 'addressed': False,
+             'signal': dict(signal, intent=opener, confidence=confidence)}
+    result = evaluate([first] + rows, now)
+    # A later negotiation may replace it after a close, but some negotiation always remains.
+    assert result is not None and result['state'] in STATES
+
+
+# spec: ANYM-893
+@settings(max_examples=300, deadline=None)
 @given(rows=chats(senders=('anna',)) | chats(senders=('owner',)), now=NOW)
 def test_agreed_never_results_from_a_single_sender(rows, now):
     result = evaluate(rows, now)

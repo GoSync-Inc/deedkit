@@ -1496,6 +1496,528 @@
   }
  },
  {
+  "id": "ru-broad-accept-of-two-options-is-ambiguous",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-broad-accept-of-two-options-is-ambiguous-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "можно в пятницу в 12 или в 14",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ],
+      [
+       "2026-11-13T14:00:00+00:00",
+       "2026-11-13T15:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-broad-accept-of-two-options-is-ambiguous-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ок, в пятницу",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ],
+      [
+       "2026-11-13T14:00:00+00:00",
+       "2026-11-13T15:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-broad-accept-keeps-the-offered-slot",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-broad-accept-keeps-the-offered-slot-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай в пятницу в 12",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-broad-accept-keeps-the-offered-slot-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ок, в пятницу",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-13T12:00:00+00:00",
+      "2026-11-13T13:00:00+00:00"
+     ],
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-reschedule-of-an-ambiguous-agreement",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-reschedule-of-an-ambiguous-agreement-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "можно в пятницу в 12 или в 14",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ],
+      [
+       "2026-11-13T14:00:00+00:00",
+       "2026-11-13T15:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-reschedule-of-an-ambiguous-agreement-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ок",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ],
+      [
+       "2026-11-13T14:00:00+00:00",
+       "2026-11-13T15:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-reschedule-of-an-ambiguous-agreement-3",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "давай перенесём на четверг в 11",
+    "expect": {
+     "state": "counter",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-12T11:00:00+00:00",
+       "2026-11-12T12:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-decline-of-an-ambiguous-agreement",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-decline-of-an-ambiguous-agreement-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "можно в пятницу в 12 или в 14",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ],
+      [
+       "2026-11-13T14:00:00+00:00",
+       "2026-11-13T15:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-decline-of-an-ambiguous-agreement-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ок",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ],
+      [
+       "2026-11-13T14:00:00+00:00",
+       "2026-11-13T15:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-decline-of-an-ambiguous-agreement-3",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "не могу",
+    "expect": {
+     "state": "counter",
+     "awaiting": "peer",
+     "current": [],
+     "agreed": null,
+     "declined": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ],
+      [
+       "2026-11-13T14:00:00+00:00",
+       "2026-11-13T15:00:00+00:00"
+      ]
+     ]
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-a-later-accept-settles-an-ambiguous-agreement",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-a-later-accept-settles-an-ambiguous-agreement-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "можно в пятницу в 12 или в 14",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ],
+      [
+       "2026-11-13T14:00:00+00:00",
+       "2026-11-13T15:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-a-later-accept-settles-an-ambiguous-agreement-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ок",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ],
+      [
+       "2026-11-13T14:00:00+00:00",
+       "2026-11-13T15:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-a-later-accept-settles-an-ambiguous-agreement-3",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "ок, в пятницу в 14",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-13T14:00:00+00:00",
+      "2026-11-13T15:00:00+00:00"
+     ],
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-an-ambiguous-agreement-stays-until-its-options-pass",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-an-ambiguous-agreement-stays-until-its-options-pass-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "можно в пятницу в 12 или в 14",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ],
+      [
+       "2026-11-13T14:00:00+00:00",
+       "2026-11-13T15:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-an-ambiguous-agreement-stays-until-its-options-pass-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ок",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ],
+      [
+       "2026-11-13T14:00:00+00:00",
+       "2026-11-13T15:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-an-ambiguous-agreement-stays-until-its-options-pass-3",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-10T11:00:00+00:00",
+    "text": "давай созвонимся в четверг в 16",
+    "expect": {
+     "state": "counter",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-12T16:00:00+00:00",
+       "2026-11-12T16:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-availability-question-after-agreement-awaits-the-owner",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-availability-question-after-agreement-awaits-the-owner-1",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай завтра созвонимся в 10",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-10T10:00:00+00:00",
+       "2026-11-10T10:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-availability-question-after-agreement-awaits-the-owner-2",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ок",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-10T10:00:00+00:00",
+      "2026-11-10T10:30:00+00:00"
+     ],
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-availability-question-after-agreement-awaits-the-owner-3",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "когда тебе удобно созвониться?",
+    "expect": {
+     "state": "counter",
+     "awaiting": "owner",
+     "current": [],
+     "agreed": null,
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-bare-reschedule-request-after-agreement-awaits-the-owner",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-bare-reschedule-request-after-agreement-awaits-the-owner-1",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай завтра созвонимся в 10",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-10T10:00:00+00:00",
+       "2026-11-10T10:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-bare-reschedule-request-after-agreement-awaits-the-owner-2",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ок",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-10T10:00:00+00:00",
+      "2026-11-10T10:30:00+00:00"
+     ],
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-bare-reschedule-request-after-agreement-awaits-the-owner-3",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "перенесём?",
+    "expect": {
+     "state": "counter",
+     "awaiting": "owner",
+     "current": [],
+     "agreed": null,
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
   "id": "en-call-counter-agreed",
   "chat_type": "private",
   "owner_zone": "Europe/Lisbon",

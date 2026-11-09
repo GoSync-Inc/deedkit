@@ -9,6 +9,7 @@ decline that marks times declined, CANCEL = cancelled; DeedKit adds stale.
 A source is a dict: message_id, revision, sender, is_owner, sent_at (aware datetime), chat_type ('private', 'group',
 ...), signal (`scheduling_rules.signals` output) and addressed (the message mentions or replies to the owner).
 """
+import json
 from datetime import datetime, timedelta
 
 STATES = ('proposed', 'counter', 'agreed', 'cancelled', 'stale')
@@ -38,20 +39,25 @@ def _entry(time, source, status):
 def _current(neg):return [t for t in neg['times'] if t['status'] == 'current']
 
 
+def _content(source):
+    """A total order on two copies of one message at one revision, so their input order never decides."""
+    return json.dumps(source, sort_keys=True, default=str)
+
+
 def _latest(sources):
     """Each message once, at its highest revision, ordered by (sent_at, message id)."""
     kept = {}
     for s in sources:
         old = kept.get(s['message_id'])
-        if old is None or s['revision'] > old['revision']:kept[s['message_id']] = s
+        if old is None or (s['revision'], _content(s)) > (old['revision'], _content(old)):kept[s['message_id']] = s
     return sorted(kept.values(), key=lambda s: (s['sent_at'], str(s['message_id'])))
 
 
 def _open(source):
     neg = {'state': 'proposed', 'proposer': source['sender'], 'proposer_is_owner': bool(source['is_owner']),
         'times': [], 'declined_times': [], 'agreed_time': None, 'previous_agreed_time': None, 'ambiguous': False,
-        'rescheduled': False, 'opened_at': source['sent_at'], 'agreed_at': None, 'sources': [], 'medium': 'unknown',
-        'confidence': 'low', 'last': source}
+        'rescheduled': False, 'opened_at': source['sent_at'], 'sources': [], 'medium': 'unknown',
+        'confidence': 'low', 'last': source, 'declined_last': False}
     _note(neg, source)
     _reject(neg, source)
     _add(neg, source)
@@ -94,12 +100,15 @@ def _counter(neg, source):
 
 
 def _agree(neg, source, chosen, ambiguous):
-    neg.update(state='agreed', agreed_time=chosen, ambiguous=ambiguous, agreed_at=source['sent_at'])
+    neg.update(state='agreed', agreed_time=chosen, ambiguous=ambiguous)
     for t in _current(neg):t['status'] = 'countered' if chosen is not None else 'current'
     if chosen is not None:
         match = [t for t in neg['times'] if _key(t) == _key(chosen)]
         if match:match[-1]['status'] = 'agreed'
         else:neg['times'].append(dict(chosen, status='agreed'))
+
+
+def _inside(inner, outer):return _at(outer['start']) <= _at(inner['start']) and _at(inner['end']) <= _at(outer['end'])
 
 
 def _accept(neg, source):
@@ -108,13 +117,17 @@ def _accept(neg, source):
         return
     current, named = _current(neg), _times(source, 'offered')
     if named:
-        hits = [o for o in named if any(_overlap(o, c) for c in current)]
-        if not hits:
+        # The named times select current options; only one selected option is an agreed time.
+        selected = [c for c in current if any(_overlap(o, c) for o in named)]
+        if not selected:
             # An "ok" naming a time nobody offered is a new offer, not an agreement.
             _counter(neg, source)
-        elif len(hits) == 1:
-            exact = [c for c in current if _key(c) == _key(hits[0])]
-            _agree(neg, source, exact[0] if exact else _entry(hits[0], source, 'agreed'), False)
+        elif len(selected) == 1:
+            # A named time inside the option narrows it («ок, среда 10:00» inside «в среду утром»); a broader one never
+            # widens it («ок, в пятницу» keeps the offered 12:00).
+            option = selected[0]
+            narrower = [o for o in named if _inside(o, option) and _key(o) != _key(option)]
+            _agree(neg, source, _entry(narrower[0], source, 'agreed') if narrower else option, False)
         else:
             _agree(neg, source, None, True)
     elif len(current) == 1:
@@ -124,12 +137,16 @@ def _accept(neg, source):
 
 
 def _after_agreed(neg, source, intent):
+    if intent == 'accept' and neg['ambiguous']:
+        # A later accept that names one of the options settles an ambiguous agreement.
+        if _times(source, 'offered') and source['sender'] != neg['proposer']:_accept(neg, source)
+        return
     if intent not in MOVES:return
     agreed = neg['agreed_time']
+    # The agreed time and, after an ambiguous agreement, every option still open leave the table.
     for t in neg['times']:
-        if t['status'] == 'agreed':t['status'] = 'declined' if intent == 'decline' else 'countered'
-    neg.update(state='counter', rescheduled=True, previous_agreed_time=agreed, agreed_time=None, ambiguous=False,
-        agreed_at=None)
+        if t['status'] in ('agreed', 'current'):t['status'] = 'declined' if intent == 'decline' else 'countered'
+    neg.update(state='counter', rescheduled=True, previous_agreed_time=agreed, agreed_time=None, ambiguous=False)
     # A bare decline leaves the proposer of the agreed time to offer again; any new time makes its sender the proposer.
     if intent != 'decline' or _times(source, 'offered'):
         neg.update(proposer=source['sender'], proposer_is_owner=bool(source['is_owner']))
@@ -142,6 +159,12 @@ def _step(neg, source):
     if intent == 'cancel':
         neg['state'] = 'cancelled'
         return
+    _move(neg, source, intent)
+    # A decline that leaves nothing on the table hands the turn to the proposer (criterion 2).
+    neg['declined_last'] = (intent == 'decline' or bool(_times(source, 'rejected'))) and not _current(neg)
+
+
+def _move(neg, source, intent):
     _reject(neg, source)
     if neg['state'] == 'agreed':
         _after_agreed(neg, source, intent)
@@ -157,13 +180,19 @@ def _step(neg, source):
 
 
 def _agreed_end(neg):
+    """The agreed end; for an ambiguous agreement the latest option's end; None when no time is known at all."""
     agreed = neg['agreed_time']
-    return _at(agreed['end']) if agreed else neg['agreed_at']
+    if agreed:return _at(agreed['end'])
+    ends = [_at(t['end']) for t in _current(neg)]
+    return max(ends) if ends else None
 
 
 def _closed(neg, at):
-    """Only after cancelled, stale, or agreed whose end is more than 24 h past does a new negotiation open."""
-    return neg['state'] in ('cancelled', 'stale') or (neg['state'] == 'agreed' and at - _agreed_end(neg) > AGREED_KEEPS)
+    """Only after cancelled, stale, or agreed whose end is more than 24 h past does a new negotiation open. An
+    agreement with no known time never counts as past."""
+    if neg['state'] in ('cancelled', 'stale'):return True
+    end = _agreed_end(neg) if neg['state'] == 'agreed' else None
+    return end is not None and at - end > AGREED_KEEPS
 
 
 def _stale(neg, at):
@@ -176,8 +205,8 @@ def _awaiting(neg):
     if neg['state'] not in OPEN:return 'none'
     last = neg['last']
     private = last.get('chat_type') == 'private'
-    if not _current(neg) and (neg['times'] or neg['declined_times']):
-        # Everything offered was declined or replaced: the proposer has to offer again.
+    if neg['declined_last']:
+        # The latest source declined what was left on the table: the proposer has to offer again.
         if neg['proposer_is_owner']:return 'owner'
         return 'peer' if private or last['is_owner'] else 'others'
     if last['is_owner']:return 'peer'
