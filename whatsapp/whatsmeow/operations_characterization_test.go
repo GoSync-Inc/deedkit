@@ -437,8 +437,9 @@ func TestCharacterizeAnErrorBeforeAnyChangeKeepsAWireCodeOrBecomesItsKindsGeneri
 			t.Run(tc.op+"/"+raw, func(t *testing.T) {
 				d := operationsFake(t)
 				characterizeNoWrites(t, &d)
-				d.contacts = func(context.Context) (map[types.JID]types.ContactInfo, error) { return nil, errors.New(raw) }
-				d.group = func(context.Context, types.JID) (*types.GroupInfo, error) { return nil, errors.New(raw) }
+				sentinel := errors.New(raw)
+				d.contacts = func(context.Context) (map[types.JID]types.ContactInfo, error) { return nil, sentinel }
+				d.group = func(context.Context, types.JID) (*types.GroupInfo, error) { return nil, sentinel }
 				job := operationJob(tc.op, operationsGroup, map[string]any{"title": "Synthetic"})
 				if tc.op == "list_contacts" {
 					job = operationJob(tc.op, "", nil)
@@ -451,6 +452,9 @@ func TestCharacterizeAnErrorBeforeAnyChangeKeepsAWireCodeOrBecomesItsKindsGeneri
 					}
 				}
 				requireError(t, err, want)
+				if (want == raw) != (err == sentinel) {
+					t.Fatalf("error value kept = %v, want %v", err == sentinel, want == raw)
+				}
 				if result != nil {
 					t.Fatalf("result = %v, want nil", result)
 				}
