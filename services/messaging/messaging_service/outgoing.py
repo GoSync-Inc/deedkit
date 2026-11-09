@@ -439,7 +439,8 @@ def result(row,c=None,p=None):
             'preview_digest':row.get('preview_digest')},
         'next_action':'get_send_status' if row['status'] in ('queued','dispatching') else
             'verify_history_before_any_new_send' if row['status']=='unknown' else
-            MENU_SENT_NEXT if row['status']=='sent' and menu else 'none',
+            MENU_SENT_NEXT if row['status']=='sent' and menu else
+            menu_failed_next(row['error_code']) if row['status']=='failed' and menu else 'none',
         **({'menu_choice':menu} if menu else {}),
     })
 
@@ -447,6 +448,12 @@ def result(row,c=None,p=None):
 # ANYM-837: sent means WhatsApp accepted the reply, not that the bot acted on it.
 MENU_SENT_NEXT=('the bot answers within seconds with a new message: read the chat after the send time (get_messages) '
     'before the next step')
+
+
+def menu_failed_next(code):
+    """ANYM-837: the recovery a failed menu choice's refusal names; never a resend of the same choice."""
+    from . import menu_choice
+    return menu_choice.FAILED_NEXT.get(code,'none')
 
 
 def policy_blocks(policy):
@@ -705,6 +712,9 @@ def enqueue_menu_choice(c,p,account,chat_id,text,request_id,preview_digest,expec
         if not menu_matches(existing,account,chat_id,text,preview_digest,menu_choice):
             raise APIError('idempotency_conflict',409)
         return result(existing,c,p)
+    # A new choice reads the archived menu, and a refusal may name its label: only a key that may read the chat
+    # (preview_message's permission) resolves it; a saved row above stays send-only (ANYM-837).
+    if 'read' not in p['permissions']:raise APIError('forbidden',403)
     if guard_refusal is not None:raise guard_refusal
     # Before any menu read: a database without the column stores nothing (plain sends never ask).
     if not menus.column_present(c):raise menus.refusal('menu_choice_unavailable',503)
@@ -748,15 +758,22 @@ DUPLICATE_SQL=f"""SELECT request_id,status FROM outgoing_messages
     ORDER BY created_at DESC LIMIT 1"""
 
 
-# ANYM-837: a menu choice is the same intent only for the same option of the same menu.
-MENU_DUPLICATE_SQL=DUPLICATE_SQL.replace("AND request_id<>%s","AND render_artifact->'menu_choice'->>'option_id'=%s AND request_id<>%s")
+# ANYM-837: a menu choice is the same intent for the same option of the same menu, whatever its label now says:
+# a bot that renames an option cannot make one action run twice.
+MENU_DUPLICATE_SQL=f"""SELECT request_id,status FROM outgoing_messages
+    WHERE principal=%s AND account=%s AND chat=%s AND reply_provider_id=%s AND menu_choice IS NOT NULL
+      AND render_artifact->'menu_choice'->>'option_id'=%s
+      AND request_id<>%s AND left(request_id,{len(CHILD_KEY_PREFIX)})<>%s
+      AND (status IN ('dispatching','unknown') OR status='queued' AND expires_at>clock_timestamp())
+      AND created_at>statement_timestamp()-interval '{DUPLICATE_WINDOW_MINUTES} minutes'
+    ORDER BY created_at DESC LIMIT 1"""
 
 
 def unresolved_send(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id,option_id=None):
     """The newest unresolved earlier send of this principal with the same intent, or None."""
     policy=Jsonb({'link_preview':link_preview,'allow_lossy':allow_lossy})
     if option_id is not None:
-        return c.execute(MENU_DUPLICATE_SQL,(p['id'],account,chat_id,text,format,policy,reply_id,option_id,request_id,
+        return c.execute(MENU_DUPLICATE_SQL,(p['id'],account,chat_id,reply_id,option_id,request_id,
             CHILD_KEY_PREFIX)).fetchone()
     return c.execute(DUPLICATE_SQL,(p['id'],account,chat_id,text,format,
         policy,reply_id,request_id,CHILD_KEY_PREFIX)).fetchone()

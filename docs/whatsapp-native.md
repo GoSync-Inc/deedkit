@@ -212,8 +212,12 @@ menu_type}` and `reply_provider_id` = the menu answers that menu with its struct
 with the same code that renders them for the archive (`menuOptions`, menu.go). The option binds by its RAW ID,
 which must equal `option_id` exactly (already in the archive's cleaned form; else
 `menu_option_id_unrepresentable`), and its cleaned `title - description` must equal `label` (else
-`menu_changed`); several matches are `menu_option_ambiguous`, a link, call, copy, Flow or payment button
-`menu_option_unsupported`. Shipped units (`shippedMenuReplies`, mirrored by Python's
+`menu_changed`); several matches are `menu_option_ambiguous`, also a match past the 100 kept options or in a
+menu the scan budget cut (uniqueness unproven); a link, call, copy, Flow or payment button
+`menu_option_unsupported`. A buttons-menu button is classified by its native-flow fields and type before its
+display text: a native-flow one is never a reply button, and its units are not answerable there. The archive
+render (`optionLine`) shows the plain `[id: X]` only for an ID kept losslessly and answerable; others carry
+`[id (inexact): X]` or `[id (native flow): X]`, which Python's parser never offers as a choice. Shipped units (`shippedMenuReplies`, mirrored by Python's
 `menu_choice.SHIPPED_MENU_TYPES`): list row (`ListResponseMessage{Title, Description, ListType
 SINGLE_SELECT, SingleSelectReply{SelectedRowID}}`) and button (`ButtonsResponseMessage{SelectedButtonID,
 SelectedDisplayText, Type DISPLAY_TEXT}`), both with `ContextInfo{StanzaID, Participant}` of the menu and no

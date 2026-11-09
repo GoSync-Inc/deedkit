@@ -43,6 +43,10 @@ type menuOption struct {
 	// reply names the structured reply that answers this option (ANYM-837);
 	// empty for a link, call, copy, Flow, payment or unreadable button.
 	reply string
+	// idNote marks an ID the archive shows but a choice cannot name (ANYM-837):
+	// "native flow" for a native-flow unit inside a buttons menu. optionLine adds
+	// "inexact" itself for an ID the shown form does not keep losslessly.
+	idNote string
 	// A hydrated template quick reply's explicit Index and its position among
 	// all buttons of the template.
 	index    uint32
@@ -63,6 +67,11 @@ type menuCollector struct {
 	seen     int  // budget spent: sections and options
 	params   int  // native-flow parameter bytes decoded
 	cut      bool // the scan budget ended before the menu did
+	// IDs of the options examined past maxMenuOptions (at most maxMenuScan), so a
+	// choice can prove its ID is unique in the whole menu, not the kept prefix.
+	overflowIDs []string
+	// note, when set, makes every added option unanswerable with this idNote.
+	note string
 }
 
 func (c *menuCollector) spend() bool {
@@ -91,10 +100,15 @@ func (c *menuCollector) add(o menuOption) bool {
 		c.sections = append(c.sections, menuSection{})
 	}
 	c.options++
+	if c.note != "" {
+		o.reply, o.idNote = "", c.note
+	}
 	if c.kept < maxMenuOptions {
 		last := &c.sections[len(c.sections)-1]
 		last.options = append(last.options, o)
 		c.kept++
+	} else if o.id != "" {
+		c.overflowIDs = append(c.overflowIDs, o.id)
 	}
 	return true
 }
@@ -140,7 +154,18 @@ func optionLine(i int, o menuOption) string {
 		line = "(no label)"
 	}
 	if id := menuClean(o.id, maxMenuID); id != "" {
-		line += " [id: " + id + "]"
+		// Only an ID shown exactly as the bot sent it gets the plain marker the
+		// archive side accepts (menu_choice.WITH_ID); any other form is shown
+		// for reading but cannot be chosen (ANYM-837).
+		note := o.idNote
+		if id != o.id {
+			note = "inexact"
+		}
+		if note != "" {
+			line += " [id (" + note + "): " + id + "]"
+		} else {
+			line += " [id: " + id + "]"
+		}
 	}
 	if o.link != "" {
 		line += " [link: " + o.link + "]"
@@ -259,8 +284,17 @@ func buttonsOptions(v *waE2E.ButtonsMessage) *menuCollector {
 		if c.cut {
 			break
 		}
-		if info := btn.GetNativeFlowInfo(); info != nil && btn.GetButtonText().GetDisplayText() == "" {
-			nativeFlowButton(c, info.GetName(), info.GetParamsJSON())
+		// The button's own kind decides, before any display text: a native-flow
+		// button (payment, Flow, quick reply, ...) is never a plain reply button,
+		// and its units are not answerable inside a buttons menu (ANYM-837).
+		if info := btn.GetNativeFlowInfo(); info != nil || btn.GetType() == waE2E.ButtonsMessage_Button_NATIVE_FLOW {
+			c.note = "native flow"
+			if info == nil {
+				c.add(menuOption{title: joinNonEmpty(" ", menuClean(btn.GetButtonText().GetDisplayText(), maxMenuText), "(native flow button)")})
+			} else {
+				nativeFlowButton(c, info.GetName(), info.GetParamsJSON())
+			}
+			c.note = ""
 			continue
 		}
 		c.add(menuOption{title: btn.GetButtonText().GetDisplayText(), id: btn.GetButtonID(), reply: "button"})
@@ -472,8 +506,16 @@ func menuAnswer(menu *events.Message, req menuChoiceRequest) (*waE2E.Message, er
 			}
 		}
 	}
+	// Uniqueness covers the whole menu: options past the kept prefix count, and a
+	// menu the scan budget cut cannot prove it (ANYM-837).
+	extra := false
+	for _, id := range c.overflowIDs {
+		if id == req.OptionID || menuClean(id, maxMenuID) == req.OptionID {
+			extra = true
+		}
+	}
 	switch {
-	case len(match) > 1, len(match) == 1 && shownOnly:
+	case len(match) > 0 && (extra || c.cut), len(match) > 1, len(match) == 1 && shownOnly:
 		return nil, errors.New("menu_option_ambiguous")
 	case len(match) == 0 && shownOnly:
 		return nil, errors.New("menu_option_id_unrepresentable")
@@ -488,7 +530,7 @@ func menuAnswer(menu *events.Message, req menuChoiceRequest) (*waE2E.Message, er
 	if label == "" || label != req.Label {
 		return nil, errors.New("menu_changed")
 	}
-	if o.reply == "" {
+	if o.reply == "" || o.idNote != "" {
 		return nil, errors.New("menu_option_unsupported")
 	}
 	if !shippedMenuReplies[kind+"/"+o.reply] {

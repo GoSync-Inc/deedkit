@@ -177,6 +177,19 @@ def test_a_send_needs_its_preview_stores_the_label_and_replays_or_conflicts_by_m
 
 
 # spec: ANYM-837
+def test_a_send_only_key_cannot_resolve_a_new_menu_choice_or_read_its_labels(native):
+    s, _, _, _ = native
+    send_only = s.issue_key('menu-send-only', [ACCOUNT], permissions=['send'])
+    for text, digest in (('Dentistry', ''), ('', ''), ('', '0' * 64)):
+        failure = refused(lambda: s.send_message(send_only, ACCOUNT, CHAT, text, 'menu-request-0101',
+            preview_digest=digest, menu_choice=choice(), duplicate_guard=True))
+        assert (failure.code, failure.status) == ('forbidden', 403)
+        assert 'archived_label' not in error_payload(failure) and CARDIOLOGY not in json.dumps(error_payload(failure))
+    with s.pool.connection() as c:
+        assert c.execute('SELECT count(*) AS n FROM outgoing_messages').fetchone()['n'] == 0
+
+
+# spec: ANYM-837
 def test_the_duplicate_guard_keys_on_menu_and_option(native):
     s, _, _, key = native
     send(s, key)
@@ -187,6 +200,21 @@ def test_the_duplicate_guard_keys_on_menu_and_option(native):
     with s.pool.connection() as c:
         c.execute("UPDATE outgoing_messages SET status='sent',provider_message_id='p' WHERE request_id LIKE 'menu-request-000%%'")
     assert send(s, key, 'menu-request-0005')['status'] == 'queued'
+
+
+# spec: ANYM-837
+@pytest.mark.parametrize('status', ['queued', 'dispatching', 'unknown'])
+def test_a_renamed_option_is_still_the_unresolved_duplicate(native, status):
+    s, _, state, key = native
+    send(s, key)
+    with s.pool.connection() as c:
+        c.execute('UPDATE outgoing_messages SET status=%s WHERE request_id=%s', (status, 'menu-request-0001'))
+    # The bot renames the option behind the same menu and ID; a fresh preview binds the new label.
+    state.apply(capture({**menu_event('MENU1', MENU_BODY.replace('Cardiology - Adults', 'Cardiology - Everyone')),
+        'editedTimestampMs': 1790000100000}, account=ACCOUNT, change='edit'))
+    again = refused(lambda: send(s, key, 'menu-request-0002'))
+    assert again.code == 'duplicate_send_unresolved' and again.earlier_request_id == 'menu-request-0001'
+    assert again.earlier_status == status
 
 
 def worker(state, reply):
@@ -220,6 +248,10 @@ def test_each_menu_refusal_ends_the_send_failed(native, code):
     asyncio.run(runner.once())
     saved = row(s, queued['send_id'])
     assert (saved['status'], saved['error_code']) == ('failed', code)
+    # Each refusal names its recovery; a text fallback always says it needs the owner's confirmation.
+    status = s.get_send_status(key, queued['send_id'])
+    assert status['next_action'] == menus.FAILED_NEXT[code] != 'none'
+    assert "needs the owner's confirmation" in status['next_action']
 
 
 # spec: ANYM-837
@@ -308,7 +340,7 @@ def test_the_base_commits_dispatch_and_send_text_refuse_a_menu_row_with_no_adapt
 def test_a_database_without_the_column_queues_nothing_and_plain_sends_and_purges_still_work(native):
     s, _, _, key = native
     digest = preview(s, key)['preview_digest']
-    migration = (ROOT / 'services/messaging/messaging_service/migrations/068_menu_choice.sql').read_text()
+    migration = (ROOT / 'services/messaging/messaging_service/migrations/070_menu_choice.sql').read_text()
     with s.pool.connection() as c:c.execute('ALTER TABLE outgoing_messages DROP COLUMN menu_choice')
     try:
         failure = refused(lambda: send(s, key, digest=digest))
@@ -318,6 +350,61 @@ def test_a_database_without_the_column_queues_nothing_and_plain_sends_and_purges
         assert s.send_message(key, ACCOUNT, CHAT, 'Plain words', 'plain-request-0002')['status'] == 'queued'
     finally:
         with s.pool.connection() as c:c.execute(migration)
+
+
+# spec: ANYM-837
+@pytest.mark.parametrize('order', ['purged_before_finish', 'purged_after_finish'])
+def test_a_deleted_menu_answer_loses_its_label_and_option_whichever_comes_first(native, order):
+    from messaging_service.message_purge import Purger
+    s, _, state, key = native
+    with s.pool.connection() as c:
+        c.execute("""UPDATE purge_state SET value=CASE name WHEN 'event_cursor' THEN '0' WHEN 'receipt_cursor' THEN ''
+            WHEN 'receipt_backfill' THEN 'pending' ELSE 'true' END""")
+    queued = send(s, key)
+    runner = OutgoingWorker(state, None)
+    job = runner.claim()
+    assert job['id'] == queued['send_id']
+    answer = menu_event('ANSWER', 'Chose menu option: Cardiology - Adults [id: card_1]', 'list_response', True,
+        stamp=7, reply=f'false_{BOT}_MENU1')
+    state.apply(capture(answer, account=ACCOUNT))
+    state.apply(capture(answer, account=ACCOUNT, change='delete'))
+    if order == 'purged_after_finish': runner.finish(job, 'sent', answer['messageId'])
+    assert Purger(s).run_once()['purged'] == 1
+    if order == 'purged_before_finish': runner.finish(job, 'sent', answer['messageId'])
+    saved = row(s, queued['send_id'])
+    assert saved['status'] == 'sent' and saved['body'] == saved['source_text'] == '[deleted]'
+    assert saved['render_artifact'] == {} and 'Cardiology' not in json.dumps(dict(saved), default=str)
+    assert 'menu_choice' not in s.get_send_status(key, queued['send_id'])
+
+
+# spec: ANYM-837
+@pytest.mark.parametrize('value', [
+    {'message_id': 'm', 'provider_message_id': 'p', 'menu_type': None},
+    {'message_id': 'm', 'provider_message_id': 'p', 'menu_type': 5},
+    {'message_id': 'm', 'provider_message_id': 'p'},
+    {'message_id': None, 'provider_message_id': 'p', 'menu_type': 'list'},
+    {'message_id': 'm', 'provider_message_id': 'p', 'menu_type': 'list', 'label': 'x'},
+    ['m', 'p', 'list']])
+def test_the_menu_choice_column_refuses_any_other_shape(native, value):
+    import psycopg
+    from psycopg.types.json import Jsonb
+    s, _, _, key = native
+    queued = send(s, key)
+    with pytest.raises(psycopg.errors.CheckViolation), s.pool.connection() as c:
+        c.execute('UPDATE outgoing_messages SET menu_choice=%s WHERE id=%s', (Jsonb(value), queued['send_id']))
+
+
+# spec: ANYM-837
+def test_an_inexact_or_native_flow_id_is_shown_but_never_choosable(native):
+    s, _, state, key = native
+    body = ('Pick\nMenu:\n1. Cardiology [id (inexact): dept cardio]\n2. Info [id (native flow): info_1]\n'
+        '3. Yes [id: yes_1]')
+    state.apply(capture(menu_event('WRAP', body, 'buttons', stamp=3), account=ACCOUNT))
+    for option in ('dept cardio', 'info_1'):
+        failure = refused(lambda: preview(s, key, menu_choice=choice(option, 'WRAP')))
+        assert failure.code == 'menu_option_not_found' and '[id (inexact)' in failure.next_action
+    assert preview(s, key, menu_choice=choice('yes_1', 'WRAP'))['menu_choice']['chosen_option']['label'] == 'Yes'
+    assert menus.CHOSEN.fullmatch('Chose menu option: Cardiology [id (inexact): dept cardio]').group(1) == 'Cardiology'
 
 
 # spec: ANYM-837

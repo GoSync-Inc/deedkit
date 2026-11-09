@@ -23,16 +23,29 @@ FRESH_MENU='ask the bot for a fresh menu (a text send; needs the owner\'s confir
 NEXT_ACTION={
     'menu_choice_unsupported':'WhatsApp only, on the native adapter; Telegram bot buttons: press_button',
     'menu_options_not_captured':'this menu was archived before menu options were captured; '+FRESH_MENU,
-    'menu_option_not_found':'only options shown with [id: ...] can be answered; links, numbers and codes go to the owner',
+    'menu_option_not_found':'only options shown with [id: ...] can be answered (not [id (inexact): ...] or [id (native '
+        'flow): ...]); links, numbers and codes go to the owner',
     'menu_option_ambiguous':'several options show this ID; a text reply is the fallback',
     'menu_reply_shape_unverified':'this menu kind cannot be answered yet; a text reply is the fallback; the owner can '
         'enable it by tapping an informational option of such a menu on the phone once (a later release adds the shape)',
     'menu_option_mismatch':'pass text empty, the archived_label or its title',
     'menu_choice_unavailable':'this server cannot store menu choices yet; a text reply is the fallback',
 }
+TEXT_FALLBACK="a text reply is the fallback (a text send; needs the owner's confirmation)"
+# The next_action of a failed menu choice by its refusal code (native adapter or dispatch).
+FAILED_NEXT={
+    'menu_unavailable':'the menu is no longer captured; '+FRESH_MENU,
+    'menu_changed':'the menu changed since the preview: preview_message again with its newest menu; if it is gone, '+FRESH_MENU,
+    'menu_option_ambiguous':'several options show this ID; '+TEXT_FALLBACK,
+    'menu_option_id_unrepresentable':'the option ID is not shown exactly; '+TEXT_FALLBACK,
+    'menu_option_unsupported':'this option cannot be answered with a structured reply; '+TEXT_FALLBACK,
+    'menu_reply_shape_unverified':'this menu kind cannot be answered yet; '+TEXT_FALLBACK,
+    'menu_choice_unsupported':'WhatsApp only, on the native adapter; '+TEXT_FALLBACK,
+}
 HEADER=re.compile(r'Menu(?: \(.*\))?:')
 NUMBERED=re.compile(r'(\d+)\. (.*)')
-# The last [id: ...] before the optional link and call markers (menu.go, optionLine).
+# The last [id: ...] before the optional link and call markers (menu.go, optionLine). Only this plain marker names a
+# choosable option: an ID shown inexactly or a native-flow unit in a buttons menu carries [id (<note>): ...].
 WITH_ID=re.compile(r'(.*) \[id: (.*?)\]((?: \[link: [^\]]*\])?(?: \[call: [^\]]*\])?)')
 MARKERS=re.compile(r'(?: \[link: [^\]]*\])?(?: \[call: [^\]]*\])?$')
 
@@ -95,7 +108,7 @@ ANSWERED_SQL='''SELECT m.body,m.sent_at FROM messages m LEFT JOIN message_revisi
       AND coalesce(mm.metadata,mr.snapshot->'metadata')->>'reply_to_provider_id'=%s
       AND coalesce(mm.metadata,mr.snapshot->'metadata')->>'provider_message_type'=ANY(%s)
     ORDER BY m.sent_at DESC,m.id DESC LIMIT 1'''
-CHOSEN=re.compile(r'Chose menu option: (.*?)(?: \[id: .*\])?')
+CHOSEN=re.compile(r'Chose menu option: (.*?)(?: \[id(?: \([a-z ]+\))?: .*\])?')
 
 
 def resolve(c,account,chat_id,chat,value,text):

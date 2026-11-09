@@ -9,9 +9,11 @@
 -- A schema-69 runtime never names the column; its dispatch_payload refuses a menu row by the artifact's eleventh key.
 SET LOCAL lock_timeout='2s';
 ALTER TABLE outgoing_messages ADD COLUMN IF NOT EXISTS menu_choice jsonb
-    CONSTRAINT outgoing_menu_choice_shape CHECK (menu_choice IS NULL OR (
+    -- coalesce: a predicate that evaluates to NULL (a JSON null, a missing key) fails instead of passing.
+    CONSTRAINT outgoing_menu_choice_shape CHECK (menu_choice IS NULL OR coalesce(
         jsonb_typeof(menu_choice)='object' AND reply_provider_id IS NOT NULL AND
         menu_choice ?& ARRAY['message_id','provider_message_id','menu_type'] AND
         menu_choice-'message_id'-'provider_message_id'-'menu_type'='{}'::jsonb AND
         jsonb_typeof(menu_choice->'message_id')='string' AND jsonb_typeof(menu_choice->'provider_message_id')='string' AND
-        menu_choice->>'menu_type' IN ('list','buttons','interactive','template')));
+        jsonb_typeof(menu_choice->'menu_type')='string' AND
+        menu_choice->>'menu_type' IN ('list','buttons','interactive','template'),false));

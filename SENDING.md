@@ -410,7 +410,7 @@ Honest scope: this is not exactly-once delivery. Changed text, another chat or r
 child steps are not covered. Against a messaging service from before this change a call with
 `allow_duplicate` fails closed (`invalid_parameters`, `unknown_field`); one without it works as before.
 
-### Menu choices: answering a WhatsApp bot menu (`menu_choice`, ANYM-837, schema 68)
+### Menu choices: answering a WhatsApp bot menu (`menu_choice`, ANYM-837, schema 70)
 
 Many WhatsApp bots act only on the structured reply a phone sends when the user taps a menu option; a
 text reply sends them back to their menu. A menu is archived with numbered options and their IDs
@@ -419,9 +419,13 @@ text reply sends them back to their menu. A menu is archived with numbered optio
 shown after `[id: `. DeedKit never picks an option.
 
 1. Read the menu (`get_messages`). Only options shown with `[id: ...]` can be answered: links, calls,
-   copy codes, forms (Flows), payments, product lists and orders go to the owner.
+   copy codes, forms (Flows), payments, product lists and orders go to the owner. An ID the archive cannot
+   show exactly (a control character, over 256 characters) is shown as `[id (inexact): ...]`, and a
+   native-flow button inside a buttons menu as `[id (native flow): ...]`: both are for reading only
+   (`menu_option_not_found`).
 2. `preview_message` with `account`, `chat_id`, `text` (empty, the archived label or its title) and
-   `menu_choice`. It reads the archive only. It returns the chat title, the menu's sender, the menu text
+   `menu_choice`. It needs `read` (as `send_message` does for a new menu choice; a saved one replays with
+   `send` only). It reads the archive only. It returns the chat title, the menu's sender, the menu text
    (at most 1000 characters, untrusted bot text), the chosen option (number, label, id), the other
    option labels, `newer_menu_message_id` when the same sender sent a newer menu, `already_answered
    {label, at}` when an archived reply already answers this menu, a `risk` line and a `preview_digest`
@@ -455,11 +459,13 @@ menu the journal no longer holds fails then (`menu_unavailable`: ask the bot for
 that needs the owner's confirmation, then preview again). `menu_changed` (the menu no longer has the
 option as archived), `menu_option_unsupported` (not a reply option), `menu_option_id_unrepresentable`
 (the raw ID has characters the archive cannot show exactly), `menu_option_ambiguous` and
-`menu_reply_shape_unverified` end the send `failed` with nothing sent. A worker on whatsapp-web.js, or a
+`menu_reply_shape_unverified` end the send `failed` with nothing sent; `get_send_status` names the
+recovery for each in `next_action` (a fresh preview, or a text reply that needs the owner's confirmation). A worker on whatsapp-web.js, or a
 switch to it after the send was queued, ends it `failed` with `menu_choice_unsupported`, also with no
 provider call.
 
-The duplicate guard keys on the menu and the option: another option is not a duplicate; the same option
+The duplicate guard keys on the menu and the option ID, not the label (a renamed option is the same
+intent): another option is not a duplicate; the same option
 while an earlier choice is queued, dispatching or `unknown` (60 minutes) is `duplicate_send_unresolved`
 until `allow_duplicate`; a `sent` one never blocks a repeat. The same `request_id` with another menu or
 option is `idempotency_conflict`; an exact retry returns the saved send.

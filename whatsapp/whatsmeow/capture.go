@@ -151,6 +151,8 @@ func normalizeFixture(path string) error {
 		SenderAlt                                                            string `json:"sender_alt"`
 		RecipientAlt                                                         string `json:"recipient_alt"`
 		SenderName                                                           string `json:"sender_name"`
+		// kind "menu_list" (ANYM-837): a list menu's rows, the contract of the archive render and the Python parser.
+		Rows []struct{ ID, Title string }
 	}
 	data, err := readPrivate(path, 1<<20)
 	if err != nil {
@@ -195,6 +197,12 @@ func normalizeFixture(path string) error {
 		msg = &waE2E.Message{SenderKeyDistributionMessage: &waE2E.SenderKeyDistributionMessage{GroupID: proto.String(v.Chat), AxolotlSenderKeyDistributionMessage: []byte{1}}}
 	case "template":
 		msg = &waE2E.Message{TemplateMessage: &waE2E.TemplateMessage{Format: &waE2E.TemplateMessage_HydratedFourRowTemplate_{HydratedFourRowTemplate: &waE2E.TemplateMessage_HydratedFourRowTemplate{HydratedContentText: proto.String(v.Text)}}}}
+	case "menu_list":
+		list := &waE2E.ListMessage{Description: proto.String(v.Text), Sections: []*waE2E.ListMessage_Section{{}}}
+		for _, r := range v.Rows {
+			list.Sections[0].Rows = append(list.Sections[0].Rows, &waE2E.ListMessage_Row{RowID: proto.String(r.ID), Title: proto.String(r.Title)})
+		}
+		msg = &waE2E.Message{ListMessage: list}
 	case "notification":
 		msg = nil
 	default:

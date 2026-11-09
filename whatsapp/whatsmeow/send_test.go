@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -240,6 +241,24 @@ func TestNativeMenuChoiceRefusesBeforeAnySend(t *testing.T) {
 		"unverified shape": {menuFixture("M", interactive), func(m *events.Message) textRequest {
 			return menuChoiceFixture(m, "info_1", "Info", "interactive")
 		}, "menu_reply_shape_unverified"},
+		// A duplicate past the kept prefix, or a menu the scan budget cut, cannot prove the ID unique.
+		"duplicate past the kept options": {menuFixture("M", manyRowsMenu(maxMenuOptions+1, "dup", "dup")), func(m *events.Message) textRequest {
+			return menuChoiceFixture(m, "dup", "Row 1", "list")
+		}, "menu_option_ambiguous"},
+		"scan budget exhausted": {menuFixture("M", manyRowsMenu(maxMenuScan+5, "first", "")), func(m *events.Message) textRequest {
+			return menuChoiceFixture(m, "first", "Row 1", "list")
+		}, "menu_option_ambiguous"},
+		// A native-flow button inside a buttons menu is never a plain reply button,
+		// whatever display text and button ID it also carries.
+		"payment button with display text": {menuFixture("M", &waE2E.Message{ButtonsMessage: &waE2E.ButtonsMessage{Buttons: []*waE2E.ButtonsMessage_Button{{
+			ButtonID: proto.String("pay_1"), ButtonText: &waE2E.ButtonsMessage_Button_ButtonText{DisplayText: proto.String("Pay")},
+			Type:           waE2E.ButtonsMessage_Button_RESPONSE.Enum(),
+			NativeFlowInfo: &waE2E.ButtonsMessage_Button_NativeFlowInfo{Name: proto.String("review_and_pay"), ParamsJSON: proto.String(`{"display_text":"Pay","id":"pay_1"}`)}}}}}),
+			func(m *events.Message) textRequest { return menuChoiceFixture(m, "pay_1", "Pay", "buttons") }, "menu_changed"},
+		"quick reply inside buttons": {menuFixture("M", &waE2E.Message{ButtonsMessage: &waE2E.ButtonsMessage{Buttons: []*waE2E.ButtonsMessage_Button{{
+			Type:           waE2E.ButtonsMessage_Button_NATIVE_FLOW.Enum(),
+			NativeFlowInfo: &waE2E.ButtonsMessage_Button_NativeFlowInfo{Name: proto.String("quick_reply"), ParamsJSON: proto.String(`{"display_text":"Info","id":"info_1"}`)}}}}}),
+			func(m *events.Message) textRequest { return menuChoiceFixture(m, "info_1", "Info", "buttons") }, "menu_option_unsupported"},
 		"text is not the label": {menuFixture("M", listMenuMessage("dept_cardio", "Cardiology", "")), func(m *events.Message) textRequest {
 			r := menuChoiceFixture(m, "dept_cardio", "Cardiology", "list")
 			r.Text = "Pay"
@@ -259,6 +278,51 @@ func TestNativeMenuChoiceRefusesBeforeAnySend(t *testing.T) {
 			_, err := sendText(context.Background(), c.r(c.menu), d)
 			requireError(t, err, c.code)
 		})
+	}
+}
+
+func manyRowsMenu(n int, first, last string) *waE2E.Message {
+	rows := make([]*waE2E.ListMessage_Row, n)
+	for i := range rows {
+		rows[i] = &waE2E.ListMessage_Row{RowID: proto.String(fmt.Sprintf("row_%d", i+1)), Title: proto.String(fmt.Sprintf("Row %d", i+1))}
+	}
+	rows[0].RowID = proto.String(first)
+	if last != "" {
+		rows[n-1].RowID = proto.String(last)
+	}
+	return &waE2E.Message{ListMessage: &waE2E.ListMessage{Sections: []*waE2E.ListMessage_Section{{Rows: rows}}}}
+}
+
+// The archive shows the plain [id: X] marker, the only one a choice can name,
+// only for an ID kept losslessly and answerable in its menu: a raw ID with a tab
+// shows as inexact, so a later edit to the clean form cannot pass behind it.
+// spec: ANYM-837
+func TestNativeMenuArchiveShowsAChoosableIDOnlyWhenExact(t *testing.T) {
+	render := func(m *waE2E.Message) string { _, c := menuOptions(m); return withMenu("", "", c) }
+	tabbed := render(listMenuMessage("dept\tcardio", "Cardiology", ""))
+	clean := render(listMenuMessage("dept cardio", "Cardiology", ""))
+	long := render(listMenuMessage(strings.Repeat("a", maxMenuID+3), "Cardiology", ""))
+	if !strings.Contains(tabbed, "Cardiology [id (inexact): dept cardio]") || strings.Contains(tabbed, "[id: dept cardio]") {
+		t.Fatalf("tabbed %q", tabbed)
+	}
+	if !strings.Contains(clean, "Cardiology [id: dept cardio]") || !strings.Contains(clean, "Neurology [id: dept_neuro]") {
+		t.Fatalf("clean %q", clean)
+	}
+	if !strings.Contains(long, "[id (inexact): "+strings.Repeat("a", maxMenuID)+"]") {
+		t.Fatalf("long %q", long)
+	}
+	wrapped := render(&waE2E.Message{ButtonsMessage: &waE2E.ButtonsMessage{Buttons: []*waE2E.ButtonsMessage_Button{
+		{ButtonID: proto.String("yes_1"), ButtonText: &waE2E.ButtonsMessage_Button_ButtonText{DisplayText: proto.String("Yes")}},
+		{NativeFlowInfo: &waE2E.ButtonsMessage_Button_NativeFlowInfo{Name: proto.String("quick_reply"), ParamsJSON: proto.String(`{"display_text":"Info","id":"info_1"}`)}},
+		{ButtonID: proto.String("pay_1"), ButtonText: &waE2E.ButtonsMessage_Button_ButtonText{DisplayText: proto.String("Pay")},
+			NativeFlowInfo: &waE2E.ButtonsMessage_Button_NativeFlowInfo{Name: proto.String("review_and_pay"), ParamsJSON: proto.String(`{"display_text":"Pay","id":"pay_1"}`)}}}}})
+	if !strings.Contains(wrapped, "Yes [id: yes_1]") || !strings.Contains(wrapped, "Info [id (native flow): info_1]") ||
+		!strings.Contains(wrapped, "Pay (review_and_pay button)") || strings.Contains(wrapped, "pay_1") {
+		t.Fatalf("wrapped %q", wrapped)
+	}
+	// The archived reply to an option keeps the same rule.
+	if got := menuChoice("Cardiology", "", "dept\tcardio"); got != "Chose menu option: Cardiology [id (inexact): dept cardio]" {
+		t.Fatalf("choice %q", got)
 	}
 }
 

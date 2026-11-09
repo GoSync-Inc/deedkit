@@ -317,6 +317,19 @@ def test_actual_go_album_photo_and_template_are_archived_with_content(native_fix
     assert archive.ingest(envelope)['outcome'] == 'created'
 
 
+# spec: ANYM-837
+def test_actual_go_menu_render_offers_only_exact_ids_to_the_python_menu_parser(native_fixture_binary, tmp_path):
+    from messaging_service import menu_choice
+    _, menu = _normalize_fixture(native_fixture_binary, tmp_path, {'kind': 'menu_list', 'text': 'Choose', 'rows': [
+        {'id': 'dept_cardio', 'title': 'Cardiology'}, {'id': 'dept\tneuro', 'title': 'Neurology'},
+        {'id': 'x' * 300, 'title': 'Long'}]})
+    envelope = menu['envelope']
+    assert envelope['metadata']['provider_message_type'] == 'list'
+    # The tab and the cut ID are shown for reading but never offered as a choice.
+    assert menu_choice.options(envelope['body']) == [(1, 'Cardiology', 'dept_cardio'),
+        (2, 'Neurology [id (inexact): dept neuro]', None), (3, 'Long [id (inexact): ' + 'x' * 256 + ']', None)]
+
+
 # spec: ANYM-471
 def test_actual_go_document_after_sender_key_event_is_created_without_conflict(native_fixture_binary, tmp_path, seeded):
     from messaging_service.archive import Archive
