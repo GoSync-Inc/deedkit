@@ -102,6 +102,95 @@ def test_page_first_activity_pages_equal_the_per_chat_plan(seeded, chats, pairs,
         assert {r['id'] for page in got for r in page['items']} <= set(allowed)
 
 
+class Verdicts:
+    """The connection, recording each page statement's proof verdict."""
+    def __init__(self, connection):self.connection, self.seen = connection, []
+    def execute(self, sql, args=None):
+        cursor = self.connection.execute(sql, args)
+        if 'page_proof AS MATERIALIZED' not in sql:return cursor
+        rows = cursor.fetchall();self.seen.append(bool(rows and rows[0]['_page_proof']))
+        return Rows(rows)
+    def __getattr__(self, name):return getattr(self.connection, name)
+
+
+class Rows:
+    def __init__(self, rows):self.rows = rows
+    def fetchall(self):return self.rows
+
+
+# Writes between _page_first's reads and the page statement, around the page's floor (its oldest head).
+CHANGES = ('none', 'at_floor', 'after_floor', 'deleted_after', 'purged_after', 'head_deleted', 'arrives_now')
+changes = itertools.count()
+
+
+def changing(page_first, change, pick):
+    """`page_first` that, once per call chain, writes `change` in the call's own transaction after its reads."""
+    done = []
+    def wrapped(c, p, clauses, args, **kw):
+        result = page_first(c, p, clauses, args, **kw)
+        if result is None or done or change == 'none':return result
+        done.append(change)
+        floor = result['proof_args'][0]
+        if floor is None:return result
+        if change == 'head_deleted':
+            c.execute('''UPDATE messages SET deleted=true WHERE id=(SELECT id FROM messages WHERE chat=ANY(%s) AND NOT deleted
+                AND sent_at=%s ORDER BY id LIMIT 1)''', (result['found'], floor))
+            return result
+        outside = [r['id'] for r in c.execute("SELECT id FROM chats WHERE id LIKE 'h-%%' AND NOT id=ANY(%s) ORDER BY id",
+            (result['found']+result['excluded'],)).fetchall()]
+        if not outside:return result
+        chat = outside[pick % len(outside)]
+        n = next(changes)
+        at = {'at_floor': floor, 'arrives_now': datetime.now(timezone.utc)}.get(change, floor+timedelta(seconds=30))
+        c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction,deleted,purged)
+            SELECT %s,account,id,%s,'peer',%s,%s,'incoming',%s,%s FROM chats WHERE id=%s''',
+            ('h-x-'+str(n), 'x-'+str(n), '' if change == 'purged_after' else 'synthetic late text', at,
+             change == 'deleted_after', change == 'purged_after', chat))
+        return result
+    return wrapped
+
+
+def proven_pages(s, c, p, plan, *, limit, view):
+    """Two pages (the second from the first's cursor) with `plan` as _page_first, rolled back after; their verdicts."""
+    real, pages, measured = chat_queries._page_first, [], Verdicts(c)
+    chat_queries._page_first = plan
+    c.execute('SAVEPOINT bounded_proof')
+    try:
+        after = ''
+        for _ in range(2):
+            pages.append(chat_queries.list_chats(s, measured, p, after, limit, order='activity', view=view,
+                include_coverage=False))
+            after = pages[-1]['next_cursor']
+            if not after:break
+    finally:
+        chat_queries._page_first = real
+        c.execute('ROLLBACK TO SAVEPOINT bounded_proof')
+    return pages, measured.seen
+
+
+# spec: ANYM-950
+@settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow])
+@given(st.lists(CHAT, max_size=12), st.lists(PAIR, max_size=3), st.integers(1, 3), st.sampled_from(('conversation', 'archive')),
+       st.booleans(), st.sampled_from(CHANGES), st.integers(0, 50), st.data())
+def test_bounded_page_proof_answers_and_decides_as_todays_proof(seeded, chats, pairs, limit, view, restricted, change, pick,
+        data):
+    from page_proof_legacy import with_legacy_proof
+    s, a, _ = seeded
+    ids = build(s, chats, pairs)
+    token = a
+    if restricted and ids:
+        allowed = data.draw(st.lists(st.sampled_from(ids), min_size=1, unique=True))
+        token = s.issue_key('bounded-proof-'+str(next(keys)), ['telegram-demo', 'whatsapp-demo-1'], chats=allowed)
+    real = chat_queries._page_first
+    with s.authorized(token, 'list_chats') as (c, p):
+        got, verdicts = proven_pages(s, c, p, changing(real, change, pick), limit=limit, view=view)
+        old, old_verdicts = proven_pages(s, c, p, with_legacy_proof(changing(real, change, pick)), limit=limit, view=view)
+    # The same pages, and in every page statement the same verdict as today's proof (a failed one reran per chat).
+    assert got == old and verdicts == old_verdicts
+    if restricted and ids:
+        assert {r['id'] for page in got for r in page['items']} <= set(allowed)
+
+
 # spec: ANYM-878
 def test_page_first_second_page_after_a_new_message_matches_the_per_chat_plan(seeded):
     s, a, _ = seeded

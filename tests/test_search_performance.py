@@ -428,6 +428,55 @@ def check_attention_groups(s,monkeypatch):
             assert max(n for _,n in old_reads)>20000,(chat,old_reads)
 
 
+def seed_page_proof(s):
+    """ANYM-950 criterion 1: 60,000 messages over 400 chats (Telegram and WhatsApp), metadata rows for 80% of them.
+    Message k of chat n is k*400+n minutes old, so the newest 400 messages are the chats' heads, chat 0's newest."""
+    with s.pool.connection() as c:
+        c.execute("SET LOCAL statement_timeout='120s'")
+        c.execute("""INSERT INTO chats(id,account,provider_chat,title,chat_type)
+            SELECT 'bp-'||n,CASE WHEN n%2=0 THEN 'telegram-demo' ELSE 'whatsapp-demo-1' END,
+              CASE WHEN n%2=0 THEN 'bp-'||n ELSE (720000+n)::text||'@c.us' END,'Synthetic '||n,'private'
+            FROM generate_series(0,399) n""")
+        c.execute("""INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
+            SELECT 'bp-m-'||n||'-'||k,CASE WHEN n%2=0 THEN 'telegram-demo' ELSE 'whatsapp-demo-1' END,'bp-'||n,
+              CASE WHEN n%2=0 THEN (n*1000+k)::text ELSE 'wamid-bp-'||n||'-'||k END,CASE WHEN k%2=0 THEN 'peer' ELSE 'owner' END,
+              'synthetic text '||k,now()-(k*400+n)*interval '1 minute',CASE WHEN k%2=0 THEN 'incoming' ELSE 'outgoing' END
+            FROM generate_series(0,399) n,generate_series(0,149) k""")
+        c.execute("""INSERT INTO message_metadata(message,revision,metadata)
+            SELECT 'bp-m-'||n||'-'||k,1,'{"synthetic":true}'::jsonb FROM generate_series(0,399) n,generate_series(0,149) k
+            WHERE (n+k)%5<>0""")
+        c.execute('ANALYZE messages');c.execute('ANALYZE message_metadata');c.execute('ANALYZE chats')
+
+
+def page_proof_reads(plans):
+    """Rows the page statement's proof read from messages (actual and filtered rows x loops). One page statement ran:
+    a failed proof would add the per-chat plan's own chat_page statement."""
+    page=[plan for chain,plan in plans if chain and chain[-1] in ('list_chats','_list_chats') and 'chat_page' in str(plan)]
+    assert len(page)==1 and 'page_proof' in str(page[0]),[chain[-1:] for chain,_ in plans]
+    proofs=[node for node in nodes(page[0]) if node.get('Subplan Name')=='CTE page_proof']
+    assert len(proofs)==1,proofs
+    return visited(proofs[0],{'messages'})
+
+
+# spec: ANYM-950
+def test_page_proof_reads_the_messages_after_the_page_floor_not_the_archive(seeded,monkeypatch):
+    from page_proof_legacy import with_legacy_proof
+    from messaging_service import chat_queries
+    s,a,_=seeded
+    seed_page_proof(s)
+    try:
+        got,plans=listed(s,a)
+        with monkeypatch.context() as patched:
+            patched.setattr(chat_queries,'_page_first',with_legacy_proof(chat_queries._page_first))
+            old,old_plans=listed(s,a)
+        # Both proofs passed: the page is the 25 newest chats, from the page-first plan in both routes.
+        assert [r['id'] for r in got['items']]==['bp-'+str(n) for n in range(25)]
+        assert timeless(got)==timeless(old)
+        reads,old_reads=page_proof_reads(plans),page_proof_reads(old_plans)
+        assert reads<=1000 and old_reads>20000,(reads,old_reads)
+    finally:forget_attention_groups(s)
+
+
 def page_first_heads(plans):
     """Head reads the page-first plan added: per statement the most-run messages scan, summed over its statements."""
     return sum(max((node.get('Actual Loops',1) for node in nodes(plan) if node.get('Relation Name')=='messages'),default=0)
