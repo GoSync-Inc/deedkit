@@ -1192,6 +1192,47 @@ The agent who releases it, in this order:
 Undo: before step 3, restore the copied Compose files. After it, a rollback to a pre-claim tree needs
 `--pre-claim-rollback "<reason>"` (above); migration 078 stays (expand only).
 
+### Session holder role (hand release, ANYM-936)
+
+Migration 082 and `session_holder_role.sql` give the session holders (ANYM-937 WhatsApp, ANYM-938 Telegram) their
+database access: a NOLOGIN group `session_holder` with SELECT, INSERT and UPDATE on `session_claims`,
+SELECT(account, owner, epoch, expires_at) on `collector_leases` and SELECT(account, status) on `source_status`, and
+row security on those three tables (one policy, `session_holder_scope`). A holder login sees and writes only the rows of
+the account `session_holder_accounts` binds it to. An unbound login, or `SET ROLE session_holder`, sees no row. Every
+other role keeps exactly its current rows, and the table owner (migrations, `pg_dump`, owner functions) bypasses row
+security. Risk tier: non-critical (no row is deleted or rewritten). The new role file changes the role-file set, so
+`deploy` pauses the range ("the SQL inventory changed"), and this hand release ships it:
+
+1. Read-only: no active call, and `production.py status` shows no unfinished operation.
+2. Release the migration by the hand route of "Migration releases and the backup gate", item 4 (timers stopped,
+   prepare, runner lock, migrate, apply and promote, timers started). Before the next step, read back
+   `schema_version` 82 and the three `session_holder_scope` policies in `pg_policies`.
+3. Apply the role file as the database owner: `psql -v ON_ERROR_STOP=1 -f session_holder_role.sql` from the
+   release's source, inside the database container. Read back the grants of `session_holder` with
+   `\dp session_claims collector_leases source_status`, and the PUBLIC read (`=r/`) on `\dp session_holder_accounts`.
+4. Only when a holder service is about to be configured (ANYM-937's cutover plan): for each holder account, create
+   one login, `session_holder_<n>` (letters, digits, `_`), with `CREATE ROLE ... LOGIN NOSUPERUSER NOBYPASSRLS IN ROLE
+   session_holder PASSWORD '<random 32 bytes, hex>'` and bind it in the same transaction with `INSERT INTO
+   session_holder_accounts(role_name,account) VALUES(...) ON CONFLICT (account) DO UPDATE SET
+   role_name=excluded.role_name, created_at=clock_timestamp()`: an account's earlier binding (a replaced login, or
+   one a restore brought back) moves to the new login in one step. Write its DSN file in the host's private directory
+   (`deploy/private/<service>-holder.dsn`, mode 0600, owner uid 10001). The password goes through a private operator
+   connection, never a command line kept in shell history, never Git or an image. Read back: as that login, `SELECT
+   account FROM session_claims` returns only its account.
+5. Receipt in the release record: the schema, the policies, the grants, each login's name and binding, never a
+   password.
+
+Undo: step 4: `DELETE FROM session_holder_accounts WHERE role_name=...`, then `DROP ROLE` the login and delete its
+DSN file. Step 3: `REVOKE ALL ON session_claims, collector_leases, source_status FROM session_holder`. Step 2:
+migration 082 stays. Its policies pass every non-holder row, so a rollback to a schema-81 runtime is refused only by
+the runtime's own `database_newer_than_runtime`, as for any newer schema. A restore recreates `session_holder` as a
+fixed NOLOGIN role (`backup_restore_worker.RESTORE_ROLES`). A `pg_restore --no-acl` keeps the policies and drops
+every grant, the PUBLIC read of `session_holder_accounts` they need included: until `session_holder_role.sql` is
+applied again (with the other role files, before any restricted service connects), every non-owner caller of the three
+tables gets `permission denied for table session_holder_accounts`. The logins are never restored, but their
+bindings are (backup inventory): such a binding names a login the fresh cluster does not have and passes no row,
+and step 4's binding statement moves it to the restored host's new login.
+
 ### Waiting for a running backup (ANYM-744)
 
 `apply`, the standalone `seamless_release.py promote` and a manual `deploy` (not `--auto`, not `--dry-run`) wait up to

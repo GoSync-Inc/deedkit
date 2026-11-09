@@ -22,7 +22,7 @@ DATABASE = 'deedkit_verify_restore_test'
 # every migration and role file against it.
 RESTORE_ROLES=('messaging_cold_archive','messaging_collector','messaging_enricher','messaging_event_delivery',
                'messaging_file_lifecycle','messaging_gateway','messaging_indexer','messaging_module_router',
-               'messaging_negotiations','messaging_purge','messaging_subscriptions')
+               'messaging_negotiations','messaging_purge','messaging_subscriptions','session_holder')
 # The calendar's roles (services/calendar/family_calendar/service/roles.sql). No calendar policy names one today;
 # the same fixed treatment keeps a future one restorable (tests/test_backup_restore_roles.py checks the files).
 CALENDAR_RESTORE_ROLES=('fcs_gateway','fcs_worker')
