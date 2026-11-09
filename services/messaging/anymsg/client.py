@@ -195,10 +195,10 @@ def _subscription_sources(value):
 
 
 def _excluded_chats(value):
-    """ANYM-830: at most 40 {account, chat} pairs; the server checks visibility and the 6,000-byte bound."""
-    return isinstance(value,list) and len(value)<=40 and all(isinstance(pair,dict) and pair.keys()=={'account','chat'}
-        and isinstance(pair['account'],str) and 1<=len(pair['account'])<=64 and _subscription_reference(pair['chat'])
-        for pair in value)
+    """ANYM-830: a list of {account, chat} string pairs; the server checks lengths, the 40-pair and 6,000-byte
+    bounds (invalid_filter) and visibility (not_found), so every entry point answers with the same code."""
+    return isinstance(value,list) and all(isinstance(pair,dict) and pair.keys()=={'account','chat'}
+        and isinstance(pair['account'],str) and isinstance(pair['chat'],str) for pair in value)
 
 
 def _subscription_reference(value):

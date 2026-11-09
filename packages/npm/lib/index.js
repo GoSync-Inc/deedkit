@@ -230,10 +230,10 @@ function subscriptionReference(value) {
 }
 const SOURCE_CHAT_TYPES = new Set(['private','group','channel','unknown']);
 function excludedChats(value) {
-  // ANYM-830: at most 40 {account, chat} pairs; the server checks visibility and the 6,000-byte bound.
-  return Array.isArray(value) && value.length<=40 && value.every(pair=>plainObject(pair) &&
-    Object.keys(pair).length===2 && typeof pair.account==='string' && pair.account.length>=1 &&
-    [...pair.account].length<=64 && subscriptionReference(pair.chat));
+  // ANYM-830: a list of {account, chat} string pairs; the server checks lengths, the 40-pair and 6,000-byte
+  // bounds (invalid_filter) and visibility (not_found), so every entry point answers with the same code.
+  return Array.isArray(value) && value.every(pair=>plainObject(pair) && Object.keys(pair).length===2 &&
+    typeof pair.account==='string' && typeof pair.chat==='string');
 }
 function subscriptionSources(value) {
   // ANYM-522 dynamic sources; chat_types (ANYM-825): 1-4 distinct types, include_channels needs channel.

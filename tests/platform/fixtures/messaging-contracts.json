@@ -3185,14 +3185,10 @@
             "additionalProperties": false,
             "properties": {
               "account": {
-                "maxLength": 64,
-                "minLength": 1,
                 "title": "Account",
                 "type": "string"
               },
               "chat": {
-                "maxLength": 256,
-                "minLength": 1,
                 "title": "Chat",
                 "type": "string"
               }
@@ -3610,14 +3606,10 @@
             "additionalProperties": false,
             "properties": {
               "account": {
-                "maxLength": 64,
-                "minLength": 1,
                 "title": "Account",
                 "type": "string"
               },
               "chat": {
-                "maxLength": 256,
-                "minLength": 1,
                 "title": "Chat",
                 "type": "string"
               }
@@ -3648,7 +3640,6 @@
                 "items": {
                   "$ref": "#/$defs/ExcludedChat"
                 },
-                "maxItems": 40,
                 "type": "array"
               },
               {

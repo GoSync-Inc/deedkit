@@ -274,6 +274,8 @@ def _absorb(c, row, binding, window, p=None, *, limit=1000, pages=16):
     count, match time or on-time reply: the next tick replays the same committed matches. A
     caller settles nothing on False: the progress is saved and the next tick continues.
     """
+    if p is not None and window['first_match_at'] is not None:
+        _rebuild_excluded(c, row, window, p)
     for _ in range(pages):
         if _absorb_page(c, row, binding, window, limit, p) < limit:
             return True
@@ -282,6 +284,22 @@ def _absorb(c, row, binding, window, p=None, *, limit=1000, pages=16):
     through = window['through_position'] if window['through_position'] is not None else window['hinted_through']
     return c.execute('SELECT 1 FROM subscription_matches WHERE subscription=%s AND event>%s LIMIT 1',
         (row['id'], through)).fetchone() is None
+
+
+def _rebuild_excluded(c, row, window, p):
+    """ANYM-830: a held range absorbed before its definition's exclusion list changed counts references it can
+    no longer show (or misses ones shown again). When its count differs from the references visible now in the
+    same range, the range starts over above hinted_through, so the pages below rebuild count, reasons and match
+    times from visible references only. Version, queued hints and the silence timer stay."""
+    from .subscriptions import dynamic, visible_filter
+    if not dynamic(row) or 'exclusions_revision' not in row['selector']['sources']:
+        return
+    low = window['hinted_through'] if window['hinted_through'] is not None else row['start_position']
+    where, args = visible_filter(row, p)
+    shown = c.execute('SELECT count(*) AS n FROM subscription_matches m WHERE m.subscription=%s AND m.event>%s AND '
+        'm.event<=%s AND ' + where, (row['id'], low, window['through_position'], *args)).fetchone()['n']
+    if min(1000000, shown) != window['match_count']:
+        window.update(_EMPTY)
 
 
 def _absorb_page(c, row, binding, window, limit, p=None):

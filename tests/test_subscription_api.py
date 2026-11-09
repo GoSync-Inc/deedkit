@@ -121,6 +121,37 @@ def test_subscription_strict_bounds_before_backend(method,extra):
     assert store.calls==[]
 
 
+OVERSIZED_EXCLUSIONS=[{'account':'a'*65,'chat':'c'}],[{'account':'a','chat':'c'*257}],[
+    {'account':'a','chat':'c%d'%n} for n in range(41)],[{'account':'a'*62+'%02d'%n,'chat':'c'*256} for n in range(20)]
+
+
+# spec: ANYM-830
+@pytest.mark.parametrize('pairs',OVERSIZED_EXCLUSIONS,ids=['account65','chat257','pairs41','bytes'])
+def test_an_oversized_exclusion_list_reaches_the_server_bounds_on_rest_mcp_and_client(pairs):
+    from messaging_service.subscriptions import _exclusion_pairs
+    from anymsg.client import _excluded_chats
+    update={'subscription_id':'sub_synthetic','version':2,'action':'set_exclusions','exclude_chats':pairs,
+        'exclusions_revision':0}
+    create={'sources':{'all_visible_chats':True,'exclude_chats':pairs}}
+    for method,params in (('update_subscription',update),('create_subscription',create)):
+        store=RecordingStore()
+        with TestClient(create_app(store,['testserver'])) as client:
+            rest=client.post('/v1/'+method,headers={'Authorization':'Bearer synthetic-token'},json=params)
+            mcp=rpc(client,method,params)
+        # The tool schema lets the list through, so the server's own check answers (invalid_filter), as for create.
+        assert rest.status_code==200 and not mcp.json().get('error'),(method,rest.text)
+        assert [call[0] for call in store.calls]==[method,method]
+    assert _excluded_chats(pairs)
+    with pytest.raises(APIError,match='invalid_filter'):
+        _exclusion_pairs(pairs)
+    # A pair that is not two strings still stops at the schema.
+    store=RecordingStore()
+    with TestClient(create_app(store,['testserver'])) as client:
+        rest=client.post('/v1/update_subscription',headers={'Authorization':'Bearer synthetic-token'},
+            json={**update,'exclude_chats':[{'account':1,'chat':'c'}]})
+    assert rest.status_code==400 and rest.json()['error']=='invalid_parameters' and store.calls==[]
+
+
 # spec: ANYM-733
 def test_live_recovered_is_an_accepted_subscription_origin_on_rest_and_mcp():
     store=RecordingStore();origins=['live','live_recovered','backfill','reconcile','fixture']
