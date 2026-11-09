@@ -79,12 +79,8 @@ live action from it wait for the owner, and so does that document's boundary.
 
 The signal grep is in docs/operations/review-protocol.md.
 
-Override: harness reviews.md Routing (one independent review) and tiden.md card-first, small fixes
-only (owner 11-09: «такую карточку не нужно ревьють, это одна строка»). A small fix (≤3 SP; no
-migration, data-policy, egress, grant, allowlist, key, deploy-tool or gate change) ships as one
-PR: failing test first, `Spec:` line, no card or Codex review. The orchestrator reads the diff
-(PR line `Diff read: <orchestrator> <SHA>`, the enforcer); merge on green. The card criterion
-follows in the next Tiden window.
+Small fixes (owner 11-09, D55: «такую карточку не нужно ревьють, это одна строка»): harness reviews.md
+Routing "Small fix: no review"; PR lines `Review record: none (small fix)` and `Diff read: <orch> <head SHA>`.
 
 ## 4. Product context and Tiden
 
