@@ -246,11 +246,12 @@ def digest(value: str) -> str:
 
 
 KEY_OPERATION_SCHEMA=44  # api_key_operations (ANYM-495)
-# ANYM-907: 076's grants on its own tables, re-applied by every migrate (idempotent) because pg_restore --no-acl
-# drops them. Only an owner of the tables grants, and only to roles that exist.
+# ANYM-907: 076's grants on its own tables, re-applied by migrate when the tables carry no ACL at all, as pg_restore
+# --no-acl leaves them; otherwise migrate changes no ACL. Only an owner of the tables grants, only to roles that exist.
 NEGOTIATION_GRANTS='''DO $$ BEGIN
  IF to_regclass('public.negotiations') IS NOT NULL AND pg_has_role((SELECT relowner FROM pg_class
-   WHERE oid=to_regclass('public.negotiations')),'USAGE') THEN
+   WHERE oid=to_regclass('public.negotiations')),'USAGE') AND (SELECT relacl FROM pg_class
+   WHERE oid=to_regclass('public.negotiations')) IS NULL THEN
   IF EXISTS (SELECT FROM pg_roles WHERE rolname='messaging_negotiations') THEN
    GRANT USAGE ON SCHEMA public TO messaging_negotiations;
    GRANT SELECT,INSERT,UPDATE,DELETE ON negotiations,negotiation_sources,negotiation_times,negotiation_transitions,
