@@ -270,6 +270,54 @@ def test_a_proof_can_be_reused_for_the_configured_freshness():
     assert len(fake.attempts) == 2 * first
 
 
+# spec: ANYM-838
+def test_two_lanes_claiming_at_once_share_one_proof_made_after_both_asked():
+    import threading
+    g = guard(fresh=0.0)
+    probes, entered = [], threading.Event()
+    def slow_probe():
+        probes.append(threading.current_thread().name)
+        entered.set()
+        time.sleep(0.3)
+        return []
+    g.probe = slow_probe
+    first = threading.Thread(target=g.ensure, name='main-lane')
+    first.start()
+    assert entered.wait(5)
+    started = time.monotonic()
+    g.ensure()          # asked while the other lane's proof runs: that proof ends after this call asked, so it counts
+    waited = time.monotonic() - started
+    first.join(5)
+    assert probes == ['main-lane'] and waited < 0.3
+    g.ensure()          # nobody else is proving: a claim still gets its own proof (fresh 0)
+    assert len(probes) == 2
+
+
+# spec: ANYM-838
+def test_a_lane_waiting_for_a_proof_that_fails_is_stopped_by_it():
+    import threading
+    g = guard(fresh=0.0)
+    entered = threading.Event()
+    def failing_probe():
+        entered.set()
+        time.sleep(0.2)
+        return ['tcp:synthetic']
+    g.probe = failing_probe
+    errors = []
+    def lane():
+        try:
+            g.ensure()
+        except ConfinementLost as error:
+            errors.append(error.args[0])
+    first = threading.Thread(target=lane)
+    first.start()
+    assert entered.wait(5)
+    with pytest.raises(ConfinementLost):
+        g.ensure()
+    first.join(5)
+    assert errors == [['tcp:synthetic']]
+
+
 # spec: ANYM-688
 def test_only_a_deedkit_inference_config_needs_the_proof_and_names_its_hosts(tmp_path):
     key = tmp_path / 'k'

@@ -579,8 +579,9 @@ class EnrichmentWorker:
                     try:
                         self.publish_profiles()
                         if lane and thread is None:  # after the first publication and confinement proof
-                            thread=threading.Thread(target=lane.lane_loop,args=(failure,),daemon=True,
-                                name='enrichment-audio-lane');thread.start()
+                            started=threading.Thread(target=lane.lane_loop,args=(failure,),daemon=True,
+                                name='enrichment-audio-lane')
+                            started.start();thread=started  # only a started lane is stopped and joined
                         if not self.once():STOP.wait(IDLE_SECONDS)
                     except psycopg.OperationalError as error:
                         # Incident 11-05: one statement timeout in claim() ended the worker. A job whose finish failed, or
@@ -591,13 +592,15 @@ class EnrichmentWorker:
                         STOP.wait(delay);delay=min(DB_RETRY_LIMIT_SECONDS,delay*2)
                     else:delay=DB_RETRY_SECONDS
             finally:
-                if thread:
-                    # This lane ended on its own error: stop the audio lane's job too, then wait for its requeue.
-                    if not STOP.is_set():request_stop()
-                    thread.join(LANE_JOIN_SECONDS)
-                # Also when the stop path itself fails: never keep advertising a worker that is going away.
-                if guard:guard.stop_monitor()
-                self.unpublish_profiles()
+                try:
+                    if thread:
+                        # This lane ended on its own error: stop the audio lane's job too, then wait for its requeue.
+                        if not STOP.is_set():request_stop()
+                        thread.join(LANE_JOIN_SECONDS)
+                finally:
+                    # Also when the stop path itself fails: never keep advertising a worker that is going away.
+                    if guard:guard.stop_monitor()
+                    self.unpublish_profiles()
             if failure:raise failure[0]
         except Exception:
             # ANYM-786: exit 78 must stay fatal and readable, so a lost confinement outranks whatever failed on the way
