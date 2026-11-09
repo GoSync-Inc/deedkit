@@ -21,9 +21,10 @@ unlinked-tests list `config/tiden-unlinked-tests.json`; Tiden CI document TIDEN-
 paths and deployed consumers: section 5; live actions: send, call, ACK, pairing,
 provider-session start/stop, allowlist changes (agents' own: an agent's webhook endpoint under
 SUBSCRIPTIONS.md Self-registration and a vendor's documented webhook host in the delivery policy,
-owner 10-28); live activity: an active call; review notes
-(Codex points, change-path grep): docs/operations/review-protocol.md; lanes:
-docs/operations/parallel-development.md.
+owner 10-28); review paths: send, call and ACK code, collector and provider-session code, user-data
+deletion/rewrite, access/secrets/CI permissions, live-production operation plans; live activity: an
+active call; review notes (Codex points, change-path grep): docs/operations/review-protocol.md;
+lanes: docs/operations/parallel-development.md.
 
 ## 1. Always
 
@@ -88,7 +89,7 @@ Product IDs and DeedKit's queue rules: docs/operations/tiden-product-workflow.md
 
 ## 5. Reviews
 
-Every Astra task starts with DeedKit's copy of the four questions (harness `process.md` section 5):
+Every Astra task starts with DeedKit's copy of the three questions (harness `process.md` section 5):
   1. Failure isolation: can an exception, timeout or bad input in the new code break or silence an
      existing path (call audio, sends, collectors, queue, backup)? Name the line.
   2. Data egress vs PR claims: what data leaves the process (model APIs, logs, telemetry, third
@@ -97,7 +98,6 @@ Every Astra task starts with DeedKit's copy of the four questions (harness `proc
   3. Deployed-version compatibility: does it work against what is deployed now (other services at
      the current prod SHA, schema N-1, the host `production.py`, the installed gateway)? Name the
      breaking consumer.
-  4. Tests: do new tests fail on the base commit and assert the spec criterion?
 
 ## 6. Working with the orchestrator
 
