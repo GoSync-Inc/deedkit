@@ -979,6 +979,43 @@ once and pauses. A release adds at most 10 seconds per project; services with a
 healthcheck rely on `--wait` and add none. Docker does not restart an unhealthy
 container; monitor `docker ps`/`health_status` events.
 
+### Only changed services are recreated (ANYM-895)
+
+Builds are not reproducible, so image IDs differ on every release. `prepare` therefore computes an
+input digest per selected service from what the repository and host control: the full content of the
+target's Dockerfile and its context's `.dockerignore`; the stage and build arguments without
+`DEEDKIT_SOURCE_SHA`/`VERSION_REF`; the git objects (with their modes) at the release commit of every
+context path the target's stage chain copies (`COPY --from` stages and base stages included); for an
+image that copies `services/messaging/messaging_service`, its migrations as a part of their own; the
+rendered Compose service without `image`, `build` and the revision and input labels; and sha256 digests
+of its env files, bind-mounted files and the files of the top-level secrets and configs it uses (a
+mounted directory counts by path only). A version constant (`INPUT_VERSION`) is part of the digest, so a
+change of the rule recreates every service once. A recreated service's container carries the digest as
+the label `io.deedkit.production.inputs`.
+
+A service is **kept** only when its running container (running, not restarting or paused) carries the
+candidate's digest as that label and the current applied release (`current.json`) recorded that very
+container, image and `container_settings` digest with the same digest. Anything else recreates it, as
+before: no label (every container created before ANYM-895, so the first release recreates everything),
+another container (one created by hand with a copied label), a settings drift, a part the digest cannot
+read (an `ONBUILD`, an `ADD` of a URL or an archive, a `RUN --mount=type=bind` of the context, a Dockerfile
+the parser cannot read: never kept), or a `current.json` that is not an applied release (after a rollback
+the next release recreates everything). Apply hashes the host files again right before the first stop and
+refuses with `inputs_changed_since_prepare` when they changed or a kept container no longer runs steadily
+with its label; then prepare again. Kept services are left out of both `stop` and `up`; the call wait
+still runs before any stop. After the last project the tool checks that each kept service still runs the
+same container with the same settings, like a recreated one. Rollback stops and restores only the services
+the release recreated; what it kept keeps running, and image retention keeps its image (`kept_images` in
+the rollback receipt). `status` expects a kept service on the revision its digest names. Unpinned
+packages a Dockerfile installs (apt) arrive only with a service's next recreate.
+
+Receipt fields: `prepared.json` projects carry `inputs` (`{service: {digest, parts}}`), `kept`
+(`{service: {container, image, revision}}`) and `recreated` (`{service: [changed parts]}`, parts from
+`dockerfile recipe code migration compose env mounts secrets`, or `unlabeled`/`unreadable`). `result.json`
+adds `services` (`{project: {service: {"recreated": [...]} | {"kept": {container, revision}}}}`) and
+`boot_id` (the host's boot ID, so a reboot is told from a recreate); its rollback projects add `inputs`
+and `kept` (`{service: revision}`). Digests only, never a value.
+
 A plan A stop never cuts a call (ANYM-442): restarting the calls service ends
 every unfinished call as `interrupted`, and the Telegram collector carries
 Telegram call audio, so apply waits while any call is active in any running
