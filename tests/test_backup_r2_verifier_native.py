@@ -55,7 +55,7 @@ try:
     # ANYM-627: the image's pg_dump writes a zstd custom-format dump; the seven checks below restore it.
     listing=subprocess.run(['pg_restore','--list',str(root/'snapshot/database.dump')],check=True,capture_output=True,text=True).stdout
     assert ';     Compression: zstd' in listing.splitlines()
-    assert any(line.endswith('EXTENSION - pg_stat_statements') for line in listing.splitlines())
+    assert any(line.split()[3:]==['EXTENSION','-','pg_stat_statements'] for line in listing.splitlines())
     recovery=b'{\"synthetic_recovery_setting\":true}\n';recovery_sha=hashlib.sha256(recovery).hexdigest()
     (root/'snapshot/recovery').mkdir(mode=0o700);(root/'snapshot/recovery'/recovery_sha).write_bytes(recovery)
     manifest=json.loads((root/'snapshot/manifest.json').read_text());assert len(manifest['blobs'])>=2
