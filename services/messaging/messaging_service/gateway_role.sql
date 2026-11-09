@@ -125,3 +125,5 @@ GRANT SELECT ON media_recovery TO messaging_gateway;
 -- Schema 70 (ANYM-824): get_subscription reads the definition's per-day matcher counts; a compact event read
 -- adds its reads_compact count (ANYM-826). Counts only; no DELETE (retention is the matcher's).
 GRANT SELECT,INSERT,UPDATE ON subscription_activity TO messaging_gateway;
+-- Schema 71 (ANYM-837): a send_message menu choice names its menu in outgoing_messages.menu_choice.
+GRANT INSERT(menu_choice) ON outgoing_messages TO messaging_gateway;

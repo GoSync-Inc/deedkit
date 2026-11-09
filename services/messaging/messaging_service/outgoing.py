@@ -143,7 +143,8 @@ def target(c,p,account,chat_id,reply_to):
     return chat,reply_id
 
 
-def reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id):
+def reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id,menu=None):
+    """menu (ANYM-837): a resolved menu_choice; its menu, revision, type, option and label join the digest."""
     from .formatting import render_message
     from .whatsapp_capabilities import account_provider
     if (link_preview and chat['platform']=='whatsapp' and
@@ -153,27 +154,77 @@ def reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,c
         link_preview=link_preview,allow_lossy=allow_lossy)
     policy={'link_preview':link_preview,'allow_lossy':allow_lossy}
     # This binds a scoped draft, never the owner's identity or approval.
-    digest=hashlib.sha256(canonical({'principal':p['id'],'scope_version':p['scope_version'],
+    bound={'principal':p['id'],'scope_version':p['scope_version'],
         'account':account,'chat_id':chat_id,'provider_chat':chat['provider_chat'],
         'platform':chat['platform'],'reply_to':reply_to,'reply_provider_id':reply_id,
-        'source_text':text,'artifact':artifact,'render_policy':policy})).hexdigest()
-    return {**artifact,'account':account,'chat_id':chat_id,'provider_chat_id':chat['provider_chat'],
+        'source_text':text,'artifact':artifact,'render_policy':policy}
+    if menu is not None:
+        bound['menu_choice']={name:menu[name] for name in ('message_id','provider_message_id','revision','menu_type',
+            'option_id','label')}
+    digest=hashlib.sha256(canonical(bound)).hexdigest()
+    draft={**artifact,'account':account,'chat_id':chat_id,'provider_chat_id':chat['provider_chat'],
         'reply_to':reply_to,'reply_provider_id':reply_id,'render_policy':policy,
         'preview_digest':digest,'owner_approval_verified_by_server':False}
+    if menu is not None:
+        from . import menu_choice
+        draft['menu_choice']=menu_choice.preview_block(menu,chat)
+    return draft
 
 
-def preview(c,p,account,chat_id,text,reply_to='',format='plain',link_preview=False,allow_lossy=False):
+def preview(c,p,account,chat_id,text,reply_to='',format='plain',link_preview=False,allow_lossy=False,menu_choice=None):
     """Render a scoped draft without provider calls, readiness or enqueueing."""
     format_options(format,link_preview,allow_lossy)
+    if menu_choice is not None:
+        chat,menu=menu_target(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,menu_choice)
+        return reviewed(c,p,account,chat_id,menu['label'],menu['message_id'],'plain',False,False,chat,
+            menu['provider_message_id'],menu)
     chat,reply_id=target(c,p,account,chat_id,reply_to)
     return reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id)
+
+
+def menu_arguments(text,reply_to,format,link_preview,allow_lossy,menu_choice):
+    """ANYM-837: a menu choice is a plain reply to its menu; anything else beside it is invalid_parameters."""
+    from . import menu_choice as menus
+    message_id,_=menus.validate(menu_choice)
+    if (format!='plain' or link_preview is not False or allow_lossy is not False or
+            not isinstance(reply_to,str) or reply_to not in ('',message_id)):
+        from .field_errors import refusal
+        raise refusal('invalid_parameters',[('menu_choice','format','chat_id, plain format, reply_to empty or the menu')])
+    if not isinstance(text,str) or any(ord(v)<32 and v not in '\n\r\t' or 0xD800<=ord(v)<=0xDFFF for v in text):
+        raise APIError('invalid_message_text')
+
+
+def menu_target(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,menu_choice):
+    """The chat and the resolved menu choice of a preview or send (archive reads only)."""
+    from . import menu_choice as menus
+    menu_arguments(text,reply_to,format,link_preview,allow_lossy,menu_choice)
+    chat,_=target(c,p,account,chat_id,'')
+    menu=menus.resolve(c,account,chat_id,chat,menu_choice,text)
+    targets(p,[chat_id,menu['message_id']])
+    return chat,menu
 
 
 def dispatch_payload(job,platform):
     """Validate persisted output without invoking the renderer again."""
     from .formatting import validate_entities,validate_semantic_entities,validate_provider_payload
+    menu=job.get('menu_choice')
+    artifact=job.get('render_artifact')
+    if menu is not None or isinstance(artifact,dict) and 'menu_choice' in artifact:
+        # ANYM-837: a menu choice goes only to a WhatsApp adapter; the collector also checks it is the native one.
+        if platform!='whatsapp':raise SendRejected('menu_choice_unsupported')
     try:
-        artifact=job.get('render_artifact')
+        if menu is not None or isinstance(artifact,dict) and 'menu_choice' in artifact:
+            choice=artifact.get('menu_choice') if isinstance(artifact,dict) else None
+            if (not isinstance(menu,dict) or set(menu)!={'message_id','provider_message_id','menu_type'} or
+                not isinstance(choice,dict) or set(choice)!={'option_id','label','menu_type'} or
+                not all(isinstance(v,str) and 1<=len(v)<=256 for v in (*menu.values(),choice['option_id'],choice['menu_type'])) or
+                not isinstance(choice['label'],str) or not 1<=len(choice['label'])<=1024 or
+                choice['menu_type']!=menu['menu_type'] or menu['provider_message_id']!=job.get('reply_provider_id') or
+                choice['label']!=job.get('source_text') or job.get('source_format')!='plain' or
+                not isinstance(job.get('preview_digest'),str) or not re.fullmatch(r'[a-f0-9]{64}',job['preview_digest'])):
+                raise ValueError('invalid_persisted_menu_choice')
+            artifact={k:v for k,v in artifact.items() if k!='menu_choice'}
+        else:choice=None
         if artifact is None:
             # A pre-migration plain row has no render artifact or preview policy.
             if job.get('source_format','plain')!='plain' or job.get('render_policy') is not None:
@@ -214,7 +265,12 @@ def dispatch_payload(job,platform):
                 not isinstance(job.get('preview_digest'),str) or
                 not re.fullmatch(r'[a-f0-9]{64}',job['preview_digest'])):
                 raise ValueError('invalid_persisted_digest')
-        return validate_provider_payload(platform,payload)
+        payload=validate_provider_payload(platform,payload)
+        if choice is not None:
+            if payload.get('text')!=choice['label'] or payload.get('link_preview') is not False:
+                raise ValueError('invalid_persisted_menu_choice')
+            payload={**payload,'menu_choice':dict(choice)}
+        return payload
     except (APIError,ValueError,TypeError,KeyError,AttributeError):
         raise SendRejected('send_target_invalid') from None
 
@@ -345,6 +401,9 @@ def result(row,c=None,p=None):
     artifact=row.get('render_artifact')
     artifact=artifact if isinstance(artifact,dict) else {}
     warning_codes=artifact.get('warnings',[]) if isinstance(artifact,dict) else []
+    saved=row.get('menu_choice');chosen=artifact.get('menu_choice')
+    menu={'message_id':saved.get('message_id'),'option_id':chosen.get('option_id'),'label':chosen.get('label')} \
+        if isinstance(saved,dict) and isinstance(chosen,dict) else None
     hint={}
     if row['status']=='sent':
         # ANYM-659: a pure function of facts already read plus one guarded, bounded chat lookup; a restricted scope
@@ -379,8 +438,15 @@ def result(row,c=None,p=None):
                 re.fullmatch(r'[a-z_]{1,64}',code)][:32],
             'preview_digest':row.get('preview_digest')},
         'next_action':'get_send_status' if row['status'] in ('queued','dispatching') else
-            'verify_history_before_any_new_send' if row['status']=='unknown' else 'none',
+            'verify_history_before_any_new_send' if row['status']=='unknown' else
+            MENU_SENT_NEXT if row['status']=='sent' and menu else 'none',
+        **({'menu_choice':menu} if menu else {}),
     })
+
+
+# ANYM-837: sent means WhatsApp accepted the reply, not that the bot acted on it.
+MENU_SENT_NEXT=('the bot answers within seconds with a new message: read the chat after the send time (get_messages) '
+    'before the next step')
 
 
 def policy_blocks(policy):
@@ -482,8 +548,10 @@ def outbound_status(c,accounts):
 
 def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
             preview_digest='',link_preview=False,allow_lossy=False,phone_hash=None,child=False,
-            expected_last_message_id=None,guard=None,duplicate_guard=False,allow_duplicate=None):
-    """expected_last_message_id, guard (ANYM-736): the optional chat-head precondition, send_guard.py.
+            expected_last_message_id=None,guard=None,duplicate_guard=False,allow_duplicate=None,menu_choice=None):
+    """menu_choice (ANYM-837): {message_id, option_id} of an archived WhatsApp menu, answered with its structured
+    reply; it needs its own preview_digest and stores the archived label as the text.
+    expected_last_message_id, guard (ANYM-736): the optional chat-head precondition, send_guard.py.
     duplicate_guard (ANYM-748): only the send_message tool passes True; allow_duplicate=True skips it for one call.
     phone_hash: a phone send (ANYM-532) whose digest the caller checked; it is the request hash.
     child: a messages_send step (ANYM-546) under its child key; only such a call may use the child prefix."""
@@ -497,6 +565,14 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
         from . import preview_refusal
         return preview_refusal.send(error,p,account,chat_id,reply_to=reply_to if isinstance(reply_to,str) else '',
             format=format,link_preview=link_preview,allow_lossy=allow_lossy)
+    if menu_choice is not None:
+        if phone_hash is not None or child:
+            from .field_errors import refusal as field_refusal
+            raise field_refusal('invalid_parameters',[('menu_choice','format','a chat_id send_message')])
+        format_options(format,link_preview,allow_lossy,preview_digest)
+        menu_arguments(text,reply_to,format,link_preview,allow_lossy,menu_choice)
+        return enqueue_menu_choice(c,p,account,chat_id,text,request_id,preview_digest,expected_last_message_id,guard,
+            duplicate_guard,allow_duplicate,menu_choice)
     try:format_options(format,link_preview,allow_lossy,preview_digest)
     except APIError as error:raise refused(error) from None
     # Source length is bounded by the renderer; the actual provider wire payload
@@ -541,7 +617,8 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
         elif existing.get('render_artifact') is None:
             matches=default_policy and not preview_digest and existing['request_hash']==legacy_hash
         else:
-            matches=(existing['account']==account and existing['chat']==chat_id and
+            matches=('menu_choice' not in existing['render_artifact'] and
+                existing['account']==account and existing['chat']==chat_id and
                 existing['provider_chat']==chat['provider_chat'] and existing['reply_provider_id']==reply_id and
                 existing.get('source_text')==text and existing.get('source_format')==format and
                 existing.get('render_policy')=={'link_preview':link_preview,'allow_lossy':allow_lossy} and
@@ -559,6 +636,18 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
         'provider_payload','warnings','links','utf16_units','renderer_version')}
     request_hash=phone_hash or legacy_hash if default_policy else phone_hash or hashlib.sha256(canonical([
         account,chat_id,chat['provider_chat'],reply_id,artifact,draft['render_policy'],preview_digest])).hexdigest()
+    admit(c,account,chat)
+    row=c.execute('''INSERT INTO outgoing_messages(principal,key_id,scope_version,key_permission_version,request_id,request_hash,
+        account,chat,provider_chat,body,reply_provider_id,source_text,source_format,render_artifact,render_policy,
+        preview_digest) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *''',
+        (p['id'],p['key_id'],p['scope_version'],p['key_permission_version'],request_id,request_hash,account,chat_id,chat['provider_chat'],
+         artifact['provider_text'],reply_id,text,format,Jsonb(artifact),Jsonb(draft['render_policy']),preview_digest or None)).fetchone()
+    targets(p,[chat_id,row['id']])
+    return result(row,c,p)
+
+
+def admit(c,account,chat):
+    """The account policy, collector, connection and 60-a-minute gates every chat_id send passes before its insert."""
     policy=c.execute('SELECT * FROM account_policies WHERE account=%s',(account,)).fetchone()
     if policy_blocks(policy):raise APIError('sending_disabled',409)
     from .collector_state import CollectorState
@@ -571,11 +660,78 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
     count=c.execute("SELECT count(*) AS n FROM outgoing_messages WHERE account=%s AND created_at>clock_timestamp()-interval '1 minute'",
         (account,)).fetchone()['n']
     if count>=60:raise APIError('rate_limited',429)
+
+
+def menu_matches(existing,account,chat_id,text,preview_digest,menu_choice):
+    """ANYM-837: an exact retry of a saved menu choice: same chat, menu, option, accepted text and digest."""
+    artifact=existing.get('render_artifact');saved=existing.get('menu_choice')
+    if not isinstance(artifact,dict) or not isinstance(artifact.get('menu_choice'),dict) or not isinstance(saved,dict):
+        return False
+    label=artifact['menu_choice'].get('label')
+    return (existing['account']==account and existing['chat']==chat_id and
+        saved.get('message_id')==menu_choice['message_id'] and
+        artifact['menu_choice'].get('option_id')==menu_choice['option_id'] and isinstance(label,str) and
+        (text in ('',label) or label.startswith(text+' - ')) and (existing.get('preview_digest') or '')==preview_digest)
+
+
+def enqueue_menu_choice(c,p,account,chat_id,text,request_id,preview_digest,expected_last_message_id,guard,
+                        duplicate_guard,allow_duplicate,menu_choice):
+    """ANYM-837: queue one structured answer to an archived menu; the steps and their order follow enqueue."""
+    from . import menu_choice as menus
+    if not isinstance(request_id,str) or not re.fullmatch(r'[a-zA-Z0-9_.:-]{8,128}',request_id) or (
+            request_id.startswith(CHILD_KEY_PREFIX)):
+        raise APIError('invalid_request_id')
+    if allow_duplicate is not None and not isinstance(allow_duplicate,bool):
+        from .field_errors import refusal
+        raise refusal('invalid_parameters',[('allow_duplicate','type','boolean')])
+    guarded=expected_last_message_id is not None or guard is not None
+    if guarded:
+        from . import send_guard
+        send_guard.validate(expected_last_message_id,guard)
+    chat,_=target(c,p,account,chat_id,'')
+    guard_refusal=None
+    if guarded and not c.execute('SELECT 1 FROM outgoing_messages WHERE principal=%s AND request_id=%s',
+            (p['id'],request_id)).fetchone():
+        try:send_guard.check(c,p,account,chat_id,chat['platform'],expected_last_message_id,guard)
+        except APIError as failure:guard_refusal=failure
+    c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('outgoing:'+p['id'],))
+    existing=c.execute('SELECT * FROM outgoing_messages WHERE principal=%s AND request_id=%s',
+        (p['id'],request_id)).fetchone()
+    targets(p,[chat_id])
+    if c.execute('SELECT 1 FROM messenger_commands WHERE principal=%s AND request_id=%s',
+            (p['id'],phone_step_id(request_id))).fetchone():raise APIError('idempotency_conflict',409)
+    if existing:
+        # The saved row decides an exact retry, even once the menu is gone or newer.
+        if not menu_matches(existing,account,chat_id,text,preview_digest,menu_choice):
+            raise APIError('idempotency_conflict',409)
+        return result(existing,c,p)
+    if guard_refusal is not None:raise guard_refusal
+    # Before any menu read: a database without the column stores nothing (plain sends never ask).
+    if not menus.column_present(c):raise menus.refusal('menu_choice_unavailable',503)
+    menu=menus.resolve(c,account,chat_id,chat,menu_choice,text)
+    reply_id=menu['provider_message_id']
+    targets(p,[chat_id,menu['message_id']])
+    if duplicate_guard and allow_duplicate is not True:
+        refuse_unresolved_duplicate(c,p,account,chat_id,request_id,menu['label'],'plain',False,False,reply_id,
+            option_id=menu['option_id'])
+    if not preview_digest:
+        failure=APIError('preview_required',409)
+        setattr(failure,'next_action','preview_message with the same account, chat_id and menu_choice')
+        raise failure
+    draft=reviewed(c,p,account,chat_id,menu['label'],menu['message_id'],'plain',False,False,chat,reply_id,menu)
+    if preview_digest!=draft['preview_digest']:raise APIError('preview_mismatch',409)
+    artifact={name:draft[name] for name in ('format','source_text','rendered_text','provider_text','entities',
+        'provider_payload','warnings','links','utf16_units','renderer_version')}
+    artifact['menu_choice']=menus.artifact_key(menu)
+    request_hash=hashlib.sha256(canonical([account,chat_id,chat['provider_chat'],reply_id,artifact,
+        draft['render_policy'],preview_digest])).hexdigest()
+    admit(c,account,chat)
     row=c.execute('''INSERT INTO outgoing_messages(principal,key_id,scope_version,key_permission_version,request_id,request_hash,
         account,chat,provider_chat,body,reply_provider_id,source_text,source_format,render_artifact,render_policy,
-        preview_digest) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *''',
-        (p['id'],p['key_id'],p['scope_version'],p['key_permission_version'],request_id,request_hash,account,chat_id,chat['provider_chat'],
-         artifact['provider_text'],reply_id,text,format,Jsonb(artifact),Jsonb(draft['render_policy']),preview_digest or None)).fetchone()
+        preview_digest,menu_choice) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *''',
+        (p['id'],p['key_id'],p['scope_version'],p['key_permission_version'],request_id,request_hash,account,chat_id,
+         chat['provider_chat'],artifact['provider_text'],reply_id,menu['label'],'plain',Jsonb(artifact),
+         Jsonb(draft['render_policy']),preview_digest,Jsonb(menus.column(menu)))).fetchone()
     targets(p,[chat_id,row['id']])
     return result(row,c,p)
 
@@ -592,13 +748,22 @@ DUPLICATE_SQL=f"""SELECT request_id,status FROM outgoing_messages
     ORDER BY created_at DESC LIMIT 1"""
 
 
-def unresolved_send(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id):
+# ANYM-837: a menu choice is the same intent only for the same option of the same menu.
+MENU_DUPLICATE_SQL=DUPLICATE_SQL.replace("AND request_id<>%s","AND render_artifact->'menu_choice'->>'option_id'=%s AND request_id<>%s")
+
+
+def unresolved_send(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id,option_id=None):
     """The newest unresolved earlier send of this principal with the same intent, or None."""
+    policy=Jsonb({'link_preview':link_preview,'allow_lossy':allow_lossy})
+    if option_id is not None:
+        return c.execute(MENU_DUPLICATE_SQL,(p['id'],account,chat_id,text,format,policy,reply_id,option_id,request_id,
+            CHILD_KEY_PREFIX)).fetchone()
     return c.execute(DUPLICATE_SQL,(p['id'],account,chat_id,text,format,
-        Jsonb({'link_preview':link_preview,'allow_lossy':allow_lossy}),reply_id,request_id,CHILD_KEY_PREFIX)).fetchone()
+        policy,reply_id,request_id,CHILD_KEY_PREFIX)).fetchone()
 
 
-def refuse_unresolved_duplicate(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id):
+def refuse_unresolved_duplicate(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id,
+                                option_id=None):
     """ANYM-748: refuse a send whose same content to the same chat is still queued, dispatching or unknown.
 
     Runs under the principal lock, so of two concurrent identical calls one queues and the other sees it. Its own
@@ -608,7 +773,7 @@ def refuse_unresolved_duplicate(c,p,account,chat_id,request_id,text,format,link_
         with c.transaction():
             previous=c.execute("SELECT current_setting('statement_timeout') AS v").fetchone()['v']
             c.execute("SELECT set_config('statement_timeout',%s,true)",(str(DUPLICATE_TIMEOUT_MS),))
-            earlier=unresolved_send(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id)
+            earlier=unresolved_send(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id,option_id)
             c.execute("SELECT set_config('statement_timeout',%s,true)",(previous,))
     except Exception:
         raise APIError('chat_guard_unavailable',503) from None
@@ -647,6 +812,12 @@ def status(c,p,send_id=None,request_id=None):
             row={**row,'status':'unknown','error_code':'sender_interrupted'}
     targets(p,[row['chat'],row['id']])
     return result(row,c,p)
+
+
+# Local refusals a finished row keeps by name; menu codes (ANYM-837) come from the native adapter or dispatch.
+SEND_REFUSALS=('send_expired','sending_disabled','send_target_invalid','send_access_changed','menu_choice_unsupported',
+    'menu_unavailable','menu_changed','menu_option_ambiguous','menu_option_id_unrepresentable','menu_option_unsupported',
+    'menu_reply_shape_unverified')
 
 
 class OutgoingWorker:
@@ -750,6 +921,12 @@ class OutgoingWorker:
             from .collector_state import CollectorState
             if not policy or not policy['enabled'] or not policy['send_enabled'] or not CollectorState.allows(policy,job['provider_chat']):
                 raise SendRejected('sending_disabled')
+            # ANYM-837: a menu choice whose menu is gone is menu_unavailable, before the generic reply check.
+            menu=job.get('menu_choice')
+            if menu is not None and (not isinstance(menu,dict) or not c.execute('''SELECT 1 FROM messages WHERE id=%s
+                AND account=%s AND chat=%s AND provider_id=%s AND NOT deleted''',
+                (menu.get('message_id'),st.account,job['chat'],job.get('reply_provider_id'))).fetchone()):
+                raise SendRejected('menu_unavailable')
             if job.get('reply_provider_id') and not c.execute('''SELECT 1 FROM messages WHERE account=%s
                 AND chat=%s AND provider_id=%s AND NOT deleted''',
                 (st.account,job['chat'],job['reply_provider_id'])).fetchone():
@@ -789,7 +966,7 @@ class OutgoingWorker:
                 raise RuntimeError('send_receipt_missing')
             job['_archive_reference']=archive_reference(job,receipt)
         except SendRejected as exc:
-            code=str(exc) if str(exc) in ('send_expired','sending_disabled','send_target_invalid','send_access_changed') else 'send_rejected'
+            code=str(exc) if str(exc) in SEND_REFUSALS else 'send_rejected'
             terminal='expired' if code=='send_expired' else 'cancelled' if code=='send_access_changed' else 'failed'
             await finish_durably(self.finish,job,terminal,None,code)
         except DispatchNotStarted:
