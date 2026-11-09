@@ -1226,13 +1226,24 @@ PROTECTED = re.compile(
 TEST_DIR = re.compile(r'(^|/)tests?/', re.I)
 CODE_FILE = re.compile(r'\.(py|pyi|js|mjs|cjs|ts|tsx|go|sh)$', re.I)
 TEST_FILE = re.compile(r'(^|/)test_[^/]*\.py$|\.test\.[^/]+$|_test\.go$')
+# The harness review paths in this repository (owner review cut 11-09, D56; harness reviews.md, Routing): sends,
+# calls and ACKs, collector and provider-session code, keys, access policy and role SQL (a grant ANYM-590 L1 admits).
+# Only a diff that touches one gets the controller's own Astra review; deletion, secrets, other grants and CI
+# permissions already park on SIGNAL_TEXT and PROTECTED. Wider than the code needs on purpose: a false match costs one
+# review, a miss merges unreviewed.
+REVIEW_PATHS = re.compile(r'^(services/calls/|whatsapp/)|^services/messaging/messaging_service/[^/]*(send|outgoing|'
+                          r'receipt|collector|pair|session|identity|governor|operations|button_press|adapters|policy|'
+                          r'key_admin|security)[^/]*$|(^|/)[^/]*roles?\.sql$', re.I)
+REVIEW_RISK = ('the feedback autoloop merges this PR with no human step and its diff touches a review path (sends, '
+               'calls, ACKs, collector or provider sessions, keys or access policy): a defect there acts on the '
+               "owner's accounts")
 ENVELOPE = ('defect', 'improvement', 'feature')
 MAX_SP = 8
 MAX_FILES = 300  # GitHub's compare lists at most 300 files: a longer diff cannot be checked whole
 VERDICT = re.compile(r'VERDICT: (APPROVE|CHANGES REQUIRED) \S+ (\d+) blocking, (\d+) major, (\d+) minor')
 REVIEWS = 'reviews'  # under the state: the controller's review files, one directory per build intent
 REVIEW_CODEX = BRIEFS.parent / 'bin' / 'review-codex.sh'
-REVIEWER, REVIEW_MINUTES = 'astra', 45  # a loop build changes product behaviour: Astra (common.md, Reviewer routing)
+REVIEWER, REVIEW_MINUTES = 'astra', 45  # a review-path loop build: Astra r1 (harness reviews.md, Routing)
 REQUIRED = ('checks / verify', 'CI gate')  # deploy/main-ruleset.json required status checks (a test keeps them equal)
 ENQUEUE = ('mutation($id: ID!, $head: GitObjectID!) { enqueuePullRequest(input: {pullRequestId: $id, '
            'expectedHeadOid: $head}) { mergeQueueEntry { state } } }')
@@ -1534,7 +1545,8 @@ def review_run(state, name, head, attempt, git=None, run=None):
             git(['worktree', 'add', '--detach', str(paths['checkout']), head])
             try:
                 outcome['exit'] = run([str(REVIEW_CODEX), REVIEWER, str(paths['task']), str(paths['report']),
-                                       '--minutes', str(REVIEW_MINUTES), '--cd', str(paths['checkout'])])
+                                       '--risk', REVIEW_RISK, '--minutes', str(REVIEW_MINUTES),
+                                       '--cd', str(paths['checkout'])])
             finally:
                 git(['worktree', 'remove', '--force', str(paths['checkout'])])
             found = VERDICT.findall(paths['report'].read_text(errors='replace')) if paths['report'].is_file() else []
@@ -1902,7 +1914,7 @@ def audit(state, prs, now):
 def controller(state, cfg, snap, now, gh, prs, review=None):
     """The controller merge, each tick: records each build's PR (number, state, head, merge SHA) and parks a PR whose
     worker is gone. For a finished worker it checks the PR at its exact head on every tick, armed or not: lines,
-    envelope, the real diff, the reservations, then its own review of that head; only an approved head whose
+    envelope, the real diff, the reservations, then its own review of a review-path head; only an approved head whose
     required checks are green goes into the merge queue, bound to that head. Anything else is disarmed (dequeued)
     before it is parked. Returns ({intent: what happened}, what failed)."""
     review, out, failed, others = review or spawn_review, {}, [], None
@@ -1973,7 +1985,11 @@ def controller(state, cfg, snap, now, gh, prs, review=None):
                 out[name] = 'disarm failed'
                 continue
             armed = False
-        seen = review_of(state, name, i, pr, head, spec, now, review, failed)
+        # Only a review-path diff waits for the controller's own review (owner review cut 11-09, D56); any other
+        # clean head is approved as it stands, bound to that head and card like a reviewed one.
+        risky = [n for f in files for n in (f['filename'], f.get('previous_filename')) if isinstance(n, str)
+                 and REVIEW_PATHS.search(n)]
+        seen = review_of(state, name, i, pr, head, spec, now, review, failed) if risky else 'approve'
         if seen != 'approve':
             out[name] = seen if seen in ('reviewing', 'waiting') else park(seen)
             continue
