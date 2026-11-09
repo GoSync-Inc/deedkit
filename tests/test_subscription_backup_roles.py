@@ -29,9 +29,9 @@ def test_schema26_manifest_includes_definitions_sources_and_exact_match_referenc
     _, definition, event = _subscription(store, 'synthetic-manifest-subscriber')
     match_subscriptions(store)
     with store.pool.connection() as connection:
-        assert connection.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '73'
+        assert connection.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '75'
         manifest = database_manifest(connection)
-    assert len(manifest) == 93
+    assert len(manifest) == 95
     assert all(manifest[name]['rows'] == 1 for name in (
         'subscriptions', 'subscription_sources', 'subscription_matches'))
     assert all(len(manifest[name]['sha256']) == 64 for name in (
@@ -114,7 +114,7 @@ def test_native_schema26_quarantine_closes_versions_preserves_refs_and_revokes_r
             assert connection.execute('SELECT count(*) AS n FROM subscription_receipts').fetchone()['n'] == 0
             assert after['subscription_consumption'] == before['subscription_consumption']
             assert after['agent_feedback'] == before['agent_feedback']
-        assert len(after) == 93 and after['subscriptions']['rows'] == 2
+        assert len(after) == 95 and after['subscriptions']['rows'] == 2
         assert all(row['state'] == 'closed' and row['version'] == before_versions[str(row['id'])] + 1
             for row in definitions)
         assert after['subscription_sources'] == before['subscription_sources']
@@ -189,6 +189,65 @@ def test_dedicated_matcher_role_matches_without_credentials_or_provider_mutation
             with store.pool.connection() as connection:
                 connection.execute(sql.SQL('DROP OWNED BY {}').format(sql.Identifier(role)))
                 connection.execute(sql.SQL('DROP ROLE {}').format(sql.Identifier(role)))
+
+
+# spec: ANYM-848
+def test_quarantine_restore_disables_every_wake_target_until_the_operator_enables_it(database, tmp_path):
+    """Never quarantine the fixture source: own an isolated *_restore_test DB."""
+    from messaging_service.store import APIError
+    base_dsn = database.pool.conninfo
+    restore_name = 'anymsg_wake_' + uuid4().hex + '_restore_test'
+    restored, created = None, False
+    try:
+        with psycopg.connect(base_dsn, autocommit=True) as owner:
+            owner.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(restore_name)))
+        created = True
+        restored = Store(make_conninfo(base_dsn, dbname=restore_name), tmp_path / 'synthetic-originals', 'http://testserver')
+        restored.migrate()
+        restored.seed()
+        permissions = ['read', 'subscription-write', 'delivery-write']
+        token = restored.issue_key('synthetic-wake-owner', ['telegram-demo'], permissions=permissions,
+            key_permissions=permissions)
+        restored.set_delivery_features(True)
+        ids = {}
+        for state in ('enabled', 'agent_paused', 'operator_disabled', 'deleted'):
+            sid = restored.create_subscription(token, ['telegram-demo-chat'])['subscription_id']
+            tid = restored.register_wake_target(token, 'wake-restore-' + state, 'codex_thread', 'Restore chat', [sid])[
+                'wake_target_id']
+            if state == 'agent_paused':
+                restored.update_wake_target(token, tid, 1, 'pause')
+            elif state == 'operator_disabled':
+                restored.set_wake_target_operator_state(tid, False)
+            elif state == 'deleted':
+                restored.delete_wake_target(token, tid, 1)
+            ids[state] = tid
+        with restored.pool.connection() as connection:
+            versions = {str(row['id']): row['version'] for row in connection.execute('SELECT id,version FROM wake_targets')}
+        quarantine_restore(restored)
+        with restored.pool.connection() as connection:
+            rows = {str(row['id']): row for row in connection.execute('SELECT id,state,disabled_reason,version FROM wake_targets')}
+        assert rows[ids['deleted']]['state'] == 'deleted' and rows[ids['deleted']]['version'] == versions[ids['deleted']]
+        for state in ('enabled', 'agent_paused', 'operator_disabled'):
+            row = rows[ids[state]]
+            assert (row['state'], row['disabled_reason']) == ('operator_disabled', 'restore')
+            assert row['version'] == versions[ids[state]] + 1
+        # The restore also revokes the runtime keys; an agent's action on a restored target, also pause then resume,
+        # is refused with the restore reason and the operator's command; the operator's enable --all lifts it.
+        from messaging_service.wake_targets import _state_error
+        with restored.pool.connection() as connection:
+            row = connection.execute('SELECT state,disabled_reason FROM wake_targets WHERE id=%s',
+                (ids['agent_paused'],)).fetchone()
+        refusal = _state_error(row)
+        assert isinstance(refusal, APIError) and refusal.code == 'invalid_wake_target_state'
+        assert refusal.disabled_reason == 'restore' and 'enable --all' in refusal.next_step
+        assert restored.enable_all_wake_targets() == {'enabled': 3}
+    finally:
+        if restored is not None:
+            restored.set_delivery_features(False)
+            restored.close()
+        if created:
+            with psycopg.connect(base_dsn, autocommit=True) as owner:
+                owner.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(restore_name)))
 
 
 # spec: ANYM-519

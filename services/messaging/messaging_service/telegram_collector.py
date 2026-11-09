@@ -20,6 +20,7 @@ import sqlite3
 import stat
 import time
 import traceback
+from types import SimpleNamespace
 
 from .adapters import telegram_message
 from .archive import MEDIA_CONTENDED,Archive
@@ -404,6 +405,10 @@ class TelethonProvider:
         from telethon import events,types
         self.client.add_event_handler(capture,events.NewMessage())
         self.client.add_event_handler(capture,events.MessageEdited())
+        # NewMessage builds nothing for a MessageService (Telethon 1.45.0 events/newmessage.py), so creation
+        # notices, joins and title changes arrive here; ordinary messages stay with NewMessage (ANYM-847).
+        self.client.add_event_handler(self.service_messages(capture),
+            events.Raw([types.UpdateNewMessage,types.UpdateNewChannelMessage]))
         self.client.add_event_handler(deleted,events.MessageDeleted())
         if receipts is not None:
             self.client.add_event_handler(receipts,events.Raw(types.UpdateReadHistoryOutbox))
@@ -412,6 +417,17 @@ class TelethonProvider:
         if group_receipts is not None:
             # ANYM-868: a basic group's boundary shares the private one's update type; each handler takes its own peers.
             self.client.add_event_handler(group_receipts,events.Raw([types.UpdateReadHistoryOutbox,types.UpdateReadChannelOutbox]))
+
+    def service_messages(self,capture):
+        from telethon import types
+        async def service_message(update):
+            message=getattr(update,'message',None)
+            if not isinstance(message,types.MessageService):return
+            # Run by capture inside its guard: the entities Telegram sent with this update and the offline
+            # cache only, never an entity-fetch request.
+            prepare=lambda:message._finish_init(self.client,getattr(update,'_entities',None) or {},None)
+            await capture(SimpleNamespace(message=message,prepare=prepare),guarded=True)
+        return service_message
 
     async def connect(self):
         self.verified_self=None
@@ -762,19 +778,25 @@ class TelegramCollector:
             self.rejected_messages=[*self.rejected_messages,{'chat':chat,'message_id':message_id,
                 'reason_code':code,'observed_at':datetime.now(timezone.utc).isoformat()}][-20:]
 
-    async def capture(self,event):
+    async def capture(self,event,*,guarded=False):
         # Bound pending fsync work: callbacks wait for a slot. Overload fails closed; reconciliation
         # after restart is required rather than claiming dropped callbacks succeeded.
+        # guarded (a live service message, ANYM-847): any exception before the spool write rejects that one
+        # update instead of failing the session; the spool write keeps its fail-closed rules.
         if self.stopping.is_set() or self.failed.is_set(): return
         if not await self.capture_slot(): return
         message=chat=None
         try:
-            message=event.message; chat=str(getattr(message,'chat_id',None))
             try:
+                message=event.message
+                if guarded: event.prepare()
+                chat=str(getattr(message,'chat_id',None))
                 e=telegram_message(self.account,message,verified_self=getattr(self.provider,'verified_self',None))
                 kind=peer_kind(message)
-            except ValueError as exc:
-                if isinstance(exc,OSError):raise
+            except Exception as exc:
+                # Unguarded, only a ValueError from normalization (after the chat read) is unstorable; anything
+                # else fails closed as before.
+                if not guarded and (not isinstance(exc,ValueError) or isinstance(exc,OSError) or chat is None):raise
                 # Deterministically unstorable; reconciliation skips it the same way.
                 self.invalid_messages+=1; self.reject('invalid_provider_message',chat,getattr(message,'id',None)); return
             if not self.state.allows(self.policy,e['chat']): return

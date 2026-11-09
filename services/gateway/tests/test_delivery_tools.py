@@ -431,6 +431,49 @@ def test_endpoint_tools_need_delivery_write_and_fail_closed_without_manifest(tmp
         assert rest.status_code == 403 and mcp["isError"]
 
 
+WAKE_TARGET = "22222222-2222-4222-8222-222222222222"
+WAKE_TOOLS = [
+    ("register_wake_target", {"request_id": "synthetic-wake", "kind": "codex_thread", "thread": "Synthetic chat",
+                              "subscription_ids": [ENDPOINT], "label": "synthetic", "hourly_budget": 6, "rebind": True}),
+    ("list_wake_targets", {}),
+    ("update_wake_target", {"wake_target_id": WAKE_TARGET, "version": 2, "action": "set_thread", "thread": "Other chat"}),
+    ("delete_wake_target", {"wake_target_id": WAKE_TARGET, "version": 3}),
+    ("confirm_wake_target", {"wake_target_id": WAKE_TARGET, "code": "a" * 32}),
+]
+
+
+# spec: ANYM-848
+def test_wake_target_tools_forward_exact_arguments(tmp_path):
+    view = {"wake_target_id": WAKE_TARGET, "version": 1, "state": "enabled"}
+    for operation, values in WAKE_TOOLS:
+        app, seen = endpoint_app(tmp_path, operation, lambda request: httpx.Response(200, json=view))
+        name = "messages_" + operation
+        with TestClient(app) as client:
+            assert [t["name"] for t in rpc(client, "tools/list").json()["result"]["tools"]] == [name]
+            rest, mcp = both(client, name, values)
+        assert rest.status_code == 200 and not mcp.get("isError") and rest.json() == mcp["structuredContent"] == view
+        assert seen[0] == seen[1] and seen[0][0] == "/v1/" + operation
+        assert {k: v for k, v in seen[0][1].items() if k in values} == values
+
+
+# spec: ANYM-848
+def test_wake_target_tools_need_both_scopes_and_the_profile_entry(tmp_path):
+    for operation, values in WAKE_TOOLS:
+        name = "messages_" + operation
+        assert CATALOG[name]["scopes"] == ["read", "delivery-write"]
+        for permissions, manifest, exposed in ((["read"], [operation], [name]), (ENDPOINT_PERMISSIONS, None, [name]),
+                                               (ENDPOINT_PERMISSIONS, [operation], [])):
+            def backend(request, permissions=permissions, manifest=manifest):
+                assert request.url.path == "/v1/capabilities"
+                return httpx.Response(200, json={"permissions": permissions,
+                                                **({"tool_manifest": {"names": manifest}} if manifest else {})})
+            app, _, _ = configured(tmp_path, backend, module="messaging", tools=exposed, grants=permissions)
+            with TestClient(app) as client:
+                assert rpc(client, "tools/list").json()["result"]["tools"] == []
+                rest, mcp = both(client, name, values)
+            assert rest.status_code in (403, 404) and mcp["isError"]
+
+
 # spec: ANYM-519
 @pytest.mark.parametrize("operation,values", [
     ("register_delivery_endpoint", {"request_id": "synthetic-endpoint", "url": "https://hooks.example", "signing_secret": "plain"}),

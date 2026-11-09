@@ -1064,13 +1064,13 @@ def test_migration_70_runs_twice_and_keeps_the_counts_and_every_grant(seeded):
     emit(store)
     match_subscriptions(store)
     with store.pool.connection() as c:
-        c.execute('DELETE FROM archive_migrations WHERE version IN (70,71,72,73)')
+        c.execute('DELETE FROM archive_migrations WHERE version IN (70,71,72,73,75)')
         c.execute("UPDATE probe_metadata SET value='69' WHERE name='schema_version'")
         grants = c.execute("SELECT oid,relacl::text FROM pg_class WHERE relnamespace='public'::regnamespace ORDER BY oid").fetchall()
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '73'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '75'
         assert c.execute('SELECT count(*) AS n FROM archive_migrations WHERE version=70').fetchone()['n'] == 1
         assert c.execute("SELECT oid,relacl::text FROM pg_class WHERE relnamespace='public'::regnamespace ORDER BY oid").fetchall() == grants
     assert activity(store, token, sid) == {'telegram': {'scanned': 1, 'matched': 1}}

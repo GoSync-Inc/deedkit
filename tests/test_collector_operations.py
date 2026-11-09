@@ -148,29 +148,105 @@ def test_cancelled_group_catalog_write_still_settles_the_confirmed_receipt_first
     assert answer['data']['archive_reason'] == 'catalog_failed' and 'chat_id' not in answer['data']
 
 
-def creation_notice(mid, chat=GROUP):
-    """The live service message Telegram sends when a basic group is created in the app (no DeedKit operation)."""
+NOTICE_AT = datetime(2026, 11, 9, 1, 10, tzinfo=timezone.utc)
+SUPERGROUP, CHANNEL = '-1000000000777', '-1000000000778'
+
+
+def creation_notice(mid, chat=GROUP, *, out=False, sender=43, title='Synthetic team', **fields):
+    """The live service message Telegram sends when a group or channel is created in the app (no DeedKit operation)."""
     from telethon import types
-    return types.MessageService(id=mid, peer_id=types.PeerChat(-int(chat)), from_id=types.PeerUser(42),
-                                date=datetime(2026, 11, 9, 1, 10, tzinfo=timezone.utc), out=False,
-                                action=types.MessageActionChatCreate(title='Synthetic team', users=[42]))
+    if chat.startswith('-100'):
+        peer, action = types.PeerChannel(-int(chat) - 1000000000000), types.MessageActionChannelCreate(title=title)
+    else:
+        peer, action = types.PeerChat(-int(chat)), types.MessageActionChatCreate(title=title, users=[sender])
+    fields = {'peer_id': peer, 'action': action, 'from_id': types.PeerUser(sender) if sender else None, **fields}
+    return types.MessageService(id=mid, date=NOTICE_AT, out=out, **fields)
 
 
-def registered_events(update):
-    """The events the handlers TelethonProvider.subscribe registers for capture build from one raw update."""
-    from messaging_service.telegram_collector import TelethonProvider
-    handlers = []
+def chat_entity(chat=GROUP, title='Synthetic team', **flags):
+    """The chat entity Telegram sends with an update (Updates.chats), as _preprocess_updates attaches it."""
+    from telethon import types
+    if chat.startswith('-100'):
+        return types.Channel(id=-int(chat) - 1000000000000, title=title, photo=types.ChatPhotoEmpty(), date=NOTICE_AT,
+                             access_hash=1, **flags)
+    return types.Chat(id=-int(chat), title=title, photo=types.ChatPhotoEmpty(), participants_count=1,
+                      date=NOTICE_AT, version=1)
 
-    class Client:
-        def add_event_handler(self, callback, event):
-            handlers.append((callback, event))
-    provider = TelethonProvider.__new__(TelethonProvider)
-    provider.client = Client()
-    capture = object()
-    provider.subscribe(capture, object())
-    builders = [event for callback, event in handlers if callback is capture]
-    assert builders
-    return [event for event in (type(b).build(update, None, None) for b in builders) if event is not None]
+
+def text_message(mid, chat=GROUP, **fields):
+    from telethon import types
+    fields = {'message': 'Synthetic text', **fields}
+    return types.Message(id=mid, peer_id=types.PeerChat(-int(chat)), date=NOTICE_AT, from_id=types.PeerUser(43),
+                         out=False, **fields)
+
+
+class Live:
+    """A real offline TelegramClient carrying the handlers TelethonProvider.subscribe registers for a collector.
+
+    Updates go through Telethon's own dispatch: builder resolution, filters and event initialization run for real.
+    `captures` records each capture call (its guarded flag), `requests` each request the client tried to send.
+    """
+
+    def __init__(self, w):
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+        from messaging_service.telegram_collector import TelethonProvider
+        self.client = TelegramClient(StringSession(), 1, 'synthetic', receive_updates=False)
+        self.client._mb_entity_cache.self_id = 42
+        self.captures, self.requests, self.disconnects = [], [], []
+
+        async def call(sender, request, *args, **kwargs):
+            self.requests.append(type(request).__name__)
+            raise ConnectionError('offline')
+
+        async def disconnect():
+            self.disconnects.append(True)
+        self.client._call, self.client.disconnect = call, disconnect
+
+        async def capture(event, **options):
+            self.captures.append(options.get('guarded', False))
+            await w.capture(event, **options)
+        provider = TelethonProvider.__new__(TelethonProvider)
+        provider.client = self.client
+        provider.subscribe(capture, w.deleted)
+
+    def dispatch(self, update, *entities):
+        from telethon import utils
+        update._entities = {utils.get_peer_id(x): x for x in entities}
+        before = len(self.captures)
+        asyncio.run(self.client._dispatch_update(update))
+        return self.captures[before:]
+
+
+def new_message(message, pts=1):
+    from telethon import types
+    update = types.UpdateNewChannelMessage if isinstance(message.peer_id, types.PeerChannel) else types.UpdateNewMessage
+    return update(message=message, pts=pts, pts_count=1)
+
+
+def listed(w, s, key, chat=GROUP):
+    chat_id = stable_id('chat', w.account, chat)
+    return next((c for c in s.list_chats(key, accounts=[w.account])['items'] if c['id'] == chat_id), None)
+
+
+def stored(w, chat, mid):
+    with w.archive.store.pool.connection() as c:
+        return c.execute('SELECT body,revision,sent_at FROM messages WHERE account=%s AND chat=%s AND provider_id=%s',
+                         (w.account, stable_id('chat', w.account, chat), str(mid))).fetchall()
+
+
+def assert_session_healthy(w, live):
+    assert not w.failed.is_set() and not w.stopping.is_set() and w.failure_code is None
+    assert w.capture_count == 0 and not w.capture_waiters
+    assert not live.disconnects and not w.provider.closed
+
+
+def preview_accepted(w, s, chat_id):
+    w.archive.set_sending(w.account, True)
+    w.state.phase('connection', 'connected', 'provider_ready')
+    sender = s.issue_key('notice-sender', [w.account], permissions=['read', 'send'])
+    preview = s.preview_message(sender, w.account, chat_id, 'Synthetic hello')
+    return preview['chat_id'] == chat_id and bool(preview.get('preview_digest'))
 
 
 # spec: ANYM-845
@@ -178,7 +254,6 @@ def registered_events(update):
                          ids=['discovery_on', 'excluded', 'discovery_off_not_included'])
 def test_a_group_whose_only_message_is_its_creation_notice_is_listed_after_the_next_discovery_pass_not_live(
         worker, policy, listed):
-    from telethon import types
     w, s, key = worker
     if policy:
         set_policy(w, policy)
@@ -188,26 +263,161 @@ def test_a_group_whose_only_message_is_its_creation_notice_is_listed_after_the_n
     def chats():
         return [c['id'] for c in s.list_chats(key, accounts=[w.account])['items']]
     assert chat_id not in chats()
-    # The registered handlers build an event from an ordinary new message in the same chat ...
-    text = types.Message(id=8, peer_id=types.PeerChat(-int(GROUP)), date=datetime(2026, 11, 9, 1, 11, tzinfo=timezone.utc),
-                         message='Synthetic text', from_id=types.PeerUser(42), out=False)
-    assert len(registered_events(types.UpdateNewMessage(message=text, pts=2, pts_count=1))) == 1
-    # ... but none from the creation notice: Telethon 1.45.0 NewMessage skips MessageService updates.
-    assert registered_events(types.UpdateNewMessage(message=creation_notice(7), pts=1, pts_count=1)) == []
+    # ANYM-847: the creation notice is captured live, once, through the handlers subscribe registers ...
+    live = Live(w)
+    assert live.dispatch(new_message(creation_notice(7)), chat_entity()) == [True]
     w.spool.drain(w.state.apply)
-    assert chat_id not in chats() and not w.failed.is_set()
-    # The next dialog discovery pass lists the group, as far as the account's policy allows it.
+    assert (chat_id in chats()) is listed and not w.failed.is_set()
+    # ... and the next dialog discovery pass keeps the same listing, as far as the account's policy allows it.
     async def dialogs(limit):
         return [(GROUP, 'chat', 'Synthetic team', 'group')]
     w.provider.dialogs, w.provider.messages, w._next_discovery = dialogs, [], 0
     asyncio.run(w.sync_once())
     assert (chat_id in chats()) is listed
     if listed:
-        w.archive.set_sending(w.account, True)
-        w.state.phase('connection', 'connected', 'provider_ready')
-        sender = s.issue_key('notice-sender', [w.account], permissions=['read', 'send'])
-        preview = s.preview_message(sender, w.account, chat_id, 'Synthetic hello')
-        assert preview['chat_id'] == chat_id and preview.get('preview_digest')
+        assert preview_accepted(w, s, chat_id)
+
+
+# spec: ANYM-847
+@pytest.mark.parametrize('chat,flags,out,chat_type', [
+    (GROUP, {}, False, 'group'),
+    (SUPERGROUP, {'megagroup': True}, False, 'group'),
+    (CHANNEL, {'broadcast': True}, False, 'channel'),
+    (GROUP, {}, True, 'group'),
+], ids=['basic_group', 'supergroup', 'broadcast_channel', 'outgoing_from_another_device'])
+def test_a_live_creation_notice_lists_the_new_chat_at_once_with_its_title_and_type(worker, chat, flags, out, chat_type):
+    from telethon import types
+    w, s, key = worker
+    chat_id = stable_id('chat', w.account, chat)
+    if out:
+        w.provider.verified_self = types.User(id=42, is_self=True, first_name='Synthetic owner')
+    assert listed(w, s, key, chat) is None
+    live = Live(w)
+    sender = 42 if out else (None if flags.get('broadcast') else 43)
+    assert live.dispatch(new_message(creation_notice(7, chat, out=out, sender=sender, title='Synthetic new chat')),
+                         chat_entity(chat, 'Synthetic new chat', **flags)) == [True]
+    w.spool.drain(w.state.apply)
+    row = listed(w, s, key, chat)
+    assert row is not None and row['title'] == 'Synthetic new chat' and row['type'] == chat_type
+    items = s.get_messages(key, chat_id, include_system=True)['items']
+    assert [(m['message_kind'], m['direction']) for m in items] == [('system', 'outgoing' if out else 'incoming')]
+    # Entity initialization used the update's entities only: the client sent no request.
+    assert live.requests == [] and w.rejected == {}
+    assert_session_healthy(w, live)
+    if chat_type == 'group':
+        assert preview_accepted(w, s, chat_id)
+
+
+# spec: ANYM-847
+def test_the_service_message_handler_adds_no_capture_for_ordinary_messages_edits_or_other_updates(worker):
+    from telethon import types
+    w, s, key = worker
+    live = Live(w)
+    # An ordinary new message stays with NewMessage (one unguarded capture); a service message is the new handler's.
+    assert live.dispatch(new_message(text_message(8), pts=2)) == [False]
+    assert live.dispatch(new_message(creation_notice(7)), chat_entity()) == [True]
+    # Edits keep their own handler; deletions and unrelated updates reach no capture.
+    edited = text_message(8, edit_date=datetime(2026, 11, 9, 1, 12, tzinfo=timezone.utc), message='Synthetic edit')
+    assert live.dispatch(types.UpdateEditMessage(message=edited, pts=3, pts_count=1)) == [False]
+    assert live.dispatch(types.UpdateDeleteMessages(messages=[99], pts=4, pts_count=1)) == []
+    assert live.dispatch(types.UpdateReadHistoryOutbox(peer=types.PeerChat(4001), max_id=8, pts=5, pts_count=1)) == []
+    w.spool.drain(w.state.apply)
+    assert stored(w, GROUP, 8)[0]['body'] == 'Synthetic edit' and len(stored(w, GROUP, 7)) == 1
+    assert live.requests == [] and w.rejected == {}
+    assert_session_healthy(w, live)
+
+
+def malformed_notice():
+    # MessageActionChatCreate without its users list: Telethon's own entity initialization raises TypeError.
+    from telethon import types
+    return creation_notice(5, action=types.MessageActionChatCreate(title='Synthetic team', users=None))
+
+
+def unsupported_peer_notice():
+    from telethon import types
+    return creation_notice(5, peer_id=types.InputPeerEmpty())
+
+
+# spec: ANYM-847
+@pytest.mark.parametrize('case', ['malformed_service_message', 'unsupported_peer', 'adapter_raises'])
+def test_a_service_message_that_fails_before_the_spool_rejects_only_that_update(worker, monkeypatch, case):
+    import messaging_service.telegram_collector as collector
+    w, s, key = worker
+    live = Live(w)
+    adapter = collector.telegram_message
+    if case == 'adapter_raises':
+        def raising(account, message, **options):
+            if message.id == 5:
+                raise LookupError('synthetic adapter failure')
+            return adapter(account, message, **options)
+        monkeypatch.setattr(collector, 'telegram_message', raising)
+    bad = {'malformed_service_message': malformed_notice, 'unsupported_peer': unsupported_peer_notice,
+           'adapter_raises': lambda: creation_notice(5)}[case]()
+    assert live.dispatch(new_message(bad), chat_entity()) == [True]
+    assert w.invalid_messages == 1 and w.rejected == {'invalid_provider_message': 1}
+    assert_session_healthy(w, live)
+    # The session goes on: a following ordinary message and a following valid service message are both captured.
+    assert live.dispatch(new_message(text_message(8), pts=2)) == [False]
+    assert live.dispatch(new_message(creation_notice(7), pts=3), chat_entity()) == [True]
+    w.spool.drain(w.state.apply)
+    assert len(stored(w, GROUP, 8)) == 1 and len(stored(w, GROUP, 7)) == 1 and stored(w, GROUP, 5) == []
+    assert w.invalid_messages == 1 and w.rejected == {'invalid_provider_message': 1}
+    assert_session_healthy(w, live)
+
+
+# spec: ANYM-847
+def test_a_service_message_whose_spool_write_fails_still_fails_closed(worker, monkeypatch):
+    w, _, _ = worker
+    live = Live(w)
+
+    def broken(item):
+        raise OSError('synthetic spool failure')
+    monkeypatch.setattr(w.spool, 'put', broken)
+    assert live.dispatch(new_message(creation_notice(7)), chat_entity()) == [True]
+    assert w.failed.is_set() and (w.failure_code, w.failure_detail) == ('durable_capture_failed', 'spool_io_error')
+    assert w.capture_count == 0 and w.rejected == {}
+
+
+# spec: ANYM-847
+def test_a_live_creation_notice_without_entities_falls_back_and_the_next_pass_fills_the_title(worker):
+    w, s, key = worker
+    live = Live(w)
+    assert live.dispatch(new_message(creation_notice(7))) == [True]
+    w.spool.drain(w.state.apply)
+    assert listed(w, s, key) is not None and live.requests == []
+    async def dialogs(limit):
+        return [(GROUP, 'chat', 'Synthetic team', 'group')]
+    w.provider.dialogs, w.provider.messages, w._next_discovery = dialogs, [], 0
+    asyncio.run(w.sync_once())
+    row = listed(w, s, key)
+    assert row['title'] == 'Synthetic team' and row['type'] == 'group'
+
+
+# spec: ANYM-847
+@pytest.mark.parametrize('order', ['live_before_history', 'history_before_live', 'live_twice'])
+def test_live_and_history_copies_of_a_service_message_converge_on_one_archived_message(worker, order):
+    w, s, key = worker
+    live = Live(w)
+
+    def live_copy():
+        assert live.dispatch(new_message(creation_notice(7)), chat_entity()) == [True]
+        w.spool.drain(w.state.apply)
+
+    def history_copy():
+        notice = creation_notice(7)
+        notice._finish_init(live.client, {}, None)
+        async def dialogs(limit):
+            return [(GROUP, 'chat', 'Synthetic team', 'group')]
+        w.provider.dialogs, w.provider.messages, w._next_discovery = dialogs, [notice], 0
+        asyncio.run(w.sync_once())
+    steps = {'live_before_history': (live_copy, history_copy), 'history_before_live': (history_copy, live_copy),
+             'live_twice': (live_copy, live_copy)}[order]
+    steps[0]()
+    first = stored(w, GROUP, 7)
+    steps[1]()
+    assert first and stored(w, GROUP, 7) == first and first[0]['revision'] == 1
+    assert len(s.get_messages(key, stable_id('chat', w.account, GROUP), include_system=True)['items']) == 1
+    assert_session_healthy(w, live)
 
 
 def test_history_gap_does_not_mark_connection_or_live_capture_failed(wa):

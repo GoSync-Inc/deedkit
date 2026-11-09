@@ -124,7 +124,7 @@ def test_schema_68_has_the_table_and_the_collector_reads_and_updates_only_what_i
     ar, s = wa
     fid = failed(ar, s, '1')
     with s.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '73'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '75'
     recover(s)
     role = install(s, 'collector_role.sql', 'messaging_collector', account=ACCOUNT)
     try:

@@ -2075,6 +2075,26 @@ def delivery_endpoints(run, args, config: dict | None = None) -> dict:
     return ask(run, "messaging", [args.verb + "-delivery-endpoint", "--id", endpoint_id])
 
 
+def wake_targets(run, args, config: dict | None = None) -> dict:
+    """The messaging operator commands for agents' wake targets (ANYM-848); a UUID is checked before any run."""
+    principal = ["--principal", args.principal] if getattr(args, "principal", None) else []
+    if args.verb == "list":
+        listed = ask(run, "messaging", ["wake-targets-list"] + principal)
+        labels = load_labels(config or {})
+        for item in listed.get("items", []):
+            item["key_label"] = labels.get(item.get("principal"))
+        return listed
+    if args.verb == "enable" and args.all:
+        if args.wake_target_id:
+            raise AdminError("wake-targets: enable takes one ID or --all, not both; nothing changed")
+        return ask(run, "messaging", ["enable-wake-target", "--all"] + principal)
+    try:
+        wake_target_id = str(UUID(args.wake_target_id or ""))
+    except ValueError:
+        raise AdminError("wake-targets: the wake target ID is not a UUID; nothing changed") from None
+    return ask(run, "messaging", [args.verb + "-wake-target", "--id", wake_target_id])
+
+
 def main(argv: list[str] | None = None, run=None, docker=None, host=None) -> int:
     parser = argparse.ArgumentParser(prog="deedkit admin", description="DeedKit admin CLI (ANYM-491)")
     parser.add_argument("--config", type=Path, default=CONFIG, help=f"private admin configuration (default {CONFIG})")
@@ -2124,11 +2144,24 @@ def main(argv: list[str] | None = None, run=None, docker=None, host=None) -> int
     for verb in ("disable", "enable"):
         endpoint_verbs.add_parser(verb, help=f"{verb} one endpoint; only an operator changes operator_disabled") \
             .add_argument("endpoint_id")
+    wakes = nouns.add_parser("wake-targets", help="agent chat wake rules: the operator's view and switch (ANYM-848)")
+    wake_verbs = wakes.add_subparsers(dest="verb", required=True)
+    wake_verbs.add_parser("list", help="every agent's wake targets with counts by state, read-only") \
+        .add_argument("--principal")
+    wake_verbs.add_parser("disable", help="disable one target; only an operator changes operator_disabled") \
+        .add_argument("wake_target_id")
+    wake_enable = wake_verbs.add_parser("enable", help="enable one target, or --all after a restore")
+    wake_enable.add_argument("wake_target_id", nargs="?")
+    wake_enable.add_argument("--all", action="store_true", help="every operator-disabled target")
+    wake_enable.add_argument("--principal", help="with --all: only this principal's targets")
     args = parser.parse_args(argv)
     try:
         config = load_json(args.config, "admin configuration")
         if args.noun == "delivery-endpoints":
             print(json.dumps(delivery_endpoints(run or runner(config), args, config), ensure_ascii=False, indent=2))
+            return 0
+        if args.noun == "wake-targets":
+            print(json.dumps(wake_targets(run or runner(config), args, config), ensure_ascii=False, indent=2))
             return 0
         if args.noun in ("undo", "profile") or args.verb in ("issue", "extend", "revoke"):
             os.umask(0o077)

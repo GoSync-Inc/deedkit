@@ -41,7 +41,8 @@ from .tool_types import (  # noqa: F401  (the moved names stay importable from h
     SubscriptionPosition, LocalClock, QuietWindow, QuietHours, DeliveryPolicy, EndpointReference,
     EndpointUrl, SigningSecret, EndpointHeaders, EndpointLabel, AttemptLimit, SubscriptionSources, ExcludedChat, ExcludedChats,
     ExclusionsRevision,
-    SubscriptionEndpoint, subscription_expiry, SubscriptionExpiry)
+    SubscriptionEndpoint, subscription_expiry, SubscriptionExpiry, WakeTargetReference, WakeThread,
+    WakeTargetSubscriptions, WakeTargetLabel, WakeTargetBudget, WakeConfirmationCode)
 # The only calls whose body may pass 16 KiB (ANYM-547: inline files of messages_send); REST path or MCP tool name.
 # Both stage bytes as uploads, so only a key that may upload (upload_file_chunk) reads more than 16 KiB.
 LARGE_BODIES = {'upload_file_chunk': UPLOAD_BODY_BYTES, 'messages_send': SEND_BODY_BYTES}
@@ -90,6 +91,7 @@ OMITTED_WHEN_NONE = {'create_subscription':('chat_ids','sources','wake_rules','r
     'search_files':('media_kind','ready'),
     'search':('body_format',),'get_messages':('body_format',),'get_context':('body_format',),
     'list_delivery_attempts':('before',),
+    'register_wake_target':('hourly_budget',),'update_wake_target':('thread','subscription_ids'),
     # ANYM-826: an omitted detail keeps every page and audit record as before.
     'get_subscription_events':('detail','include'),'fetch_subscription_events':('detail','include'),
     'wait_for_subscription_events':('detail','include'),
@@ -718,7 +720,7 @@ def register_conversation_tools(mcp, call, read):
                    can_post: StrictBool | None=None,awaiting_their_reply: StrictBool=False,
                    min_wait_hours: StrictInt | None=None,
                    courtesies: Literal['include','exclude','only']='include') -> dict[str, Any]:
-        """List permitted chats. order: activity (default) or last_activity_desc = recent first; id = stable catalogue traversal. query also matches a channel @username. account/accounts: each account's source status and last ingest; catalog_refresh; new empty groups wait for the next pass. No provider read changes.
+        """List permitted chats. order: activity (default) or last_activity_desc = recent first; id = stable catalogue traversal. query also matches a channel @username. account/accounts: each account's source status and last ingest; catalog_refresh; groups created in the app list at once. No provider read changes.
         awaiting_reply: private incoming, excluding known bots, or explicit group owner mention/reply; heuristic, not obligation. Attention expires after awaiting_reply_days (0 = no age limit) from the attention message time; group evidence survives others' chatter and clears after owner writes. priority requires awaiting_reply=true; score/reasons are transparent heuristics (an owner group mention without a question mark scores owner_request; detail=full adds awaiting_reply_priority_components). chat_types=['private']. A due snooze returns with snoozed_until and snooze_due.
         courtesies=exclude (excluded_courtesies_total) hides thanks/ok/sticker ends; review courtesies=only once.
         Compact rows omit values the row fixes (rows without type omit nothing); an absent field means the value below.
@@ -1341,6 +1343,55 @@ def register_delivery_tools(mcp, call, async_call, read, upload_write):
         """
         return await async_call(ctx,'test_delivery_endpoint',endpoint_id=endpoint_id,request_id=request_id)
 
+    # ANYM-848: an agent's own wake targets; a host waker (packages/wake-relay) reads them, DeedKit never contacts the chat.
+    @mcp.tool(structured_output=True,annotations=upload_write)
+    def register_wake_target(ctx: Context,request_id: RequestReference,kind: Literal['codex_thread'],thread: WakeThread,
+                             subscription_ids: WakeTargetSubscriptions,label: WakeTargetLabel='',
+                             hourly_budget: WakeTargetBudget | None=None,rebind: StrictBool=False) -> dict[str,Any]:
+        """Register one of your own chats to be woken when any of your own listed active subscriptions has new events.
+
+        Requires read + explicit delivery-write and the operator's delivery switch (else delivery_disabled). A Codex
+        agent passes its own CODEX_THREAD_ID as thread. The host waker on the owner's machine reads your targets, sends
+        the chat one challenge with a code, and wakes it for events only after that chat calls confirm_wake_target
+        with the code. A subscription wakes at most one chat: subscription_already_bound names your target that holds
+        it; rebind true moves it here. hourly_budget (default 12) caps wakes per hour on the waker. Repeat the same
+        request_id and arguments to recover a lost response; DeedKit never sends anything to the chat.
+        """
+        return call(ctx,'register_wake_target',request_id=request_id,kind=kind,thread=thread,
+                    subscription_ids=subscription_ids,label=label,hourly_budget=hourly_budget,rebind=rebind)
+
+    @mcp.tool(structured_output=True,annotations=read)
+    def list_wake_targets(ctx: Context) -> dict[str,Any]:
+        """List this exact key's wake targets, newest first: thread, label, state, hourly_budget, confirmation and the IDs of their still-active subscriptions (bound counts them). Requires read + explicit delivery-write."""
+        return call(ctx,'list_wake_targets')
+
+    @mcp.tool(structured_output=True,annotations=upload_write)
+    def update_wake_target(ctx: Context,wake_target_id: WakeTargetReference,version: SubscriptionVersion,
+                           action: Literal['pause','resume','set_thread','set_subscriptions'],thread: WakeThread | None=None,
+                           subscription_ids: WakeTargetSubscriptions | None=None,rebind: StrictBool=False) -> dict[str,Any]:
+        """Version-checked change of your own wake target: pause, resume, set_thread (thread; needs a new confirmation) or set_subscriptions (subscription_ids, rebind).
+
+        Requires read + explicit delivery-write. A stale version gives wake_target_conflict with the current version.
+        Only the owner lifts operator_disabled: then every action except delete gives invalid_wake_target_state with
+        disabled_reason and the command to ask for.
+        """
+        return call(ctx,'update_wake_target',wake_target_id=wake_target_id,version=version,action=action,thread=thread,
+                    subscription_ids=subscription_ids,rebind=rebind)
+
+    @mcp.tool(structured_output=True,annotations=upload_write)
+    def delete_wake_target(ctx: Context,wake_target_id: WakeTargetReference,version: SubscriptionVersion) -> dict[str,Any]:
+        """Delete your own wake target; its subscriptions are unbound and the chat is no longer woken. Requires read + explicit delivery-write."""
+        return call(ctx,'delete_wake_target',wake_target_id=wake_target_id,version=version)
+
+    @mcp.tool(structured_output=True,annotations=upload_write)
+    def confirm_wake_target(ctx: Context,wake_target_id: WakeTargetReference,code: WakeConfirmationCode) -> dict[str,Any]:
+        """Return the code of the host waker's challenge that this chat received, so the waker starts waking it.
+
+        Call it only from the chat that got the challenge and only for a target this chat registered. The latest code
+        replaces an earlier one. Requires read + explicit delivery-write.
+        """
+        return call(ctx,'confirm_wake_target',wake_target_id=wake_target_id,code=code)
+
 
 def register_feedback_tools(mcp, call, read, upload_write):
     @mcp.tool(structured_output=True,annotations=upload_write)
@@ -1524,7 +1575,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
                     'create_subscription','list_subscriptions','get_subscription','update_subscription','get_subscription_events',
                     'fetch_subscription_events','ack_subscription_events','wait_for_subscription_events','configure_subscription_delivery','test_subscription','submit_feedback','list_feedback',
                     'register_delivery_endpoint','list_delivery_endpoints','update_delivery_endpoint','delete_delivery_endpoint','test_delivery_endpoint',
-                    'list_delivery_attempts'}
+                    'list_delivery_attempts','register_wake_target','list_wake_targets','update_wake_target',
+                    'delete_wake_target','confirm_wake_target'}
         method=request.path_params['operation']
         if method not in operations: raise APIError('not_found',404)
         try:

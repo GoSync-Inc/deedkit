@@ -35,7 +35,7 @@ def test_provider_subscribes_optional_raw_receipt_callback_without_network():
     capture, deleted, receipt = object(), object(), object()
     provider.subscribe(capture, deleted, receipt)
     assert provider.supports_receipts is True
-    assert len(registered) == 4
+    assert len(registered) == 5  # NewMessage, MessageEdited, the service-message Raw handler (ANYM-847), MessageDeleted
     assert registered[-1][0] is receipt
     assert isinstance(registered[-1][1], events.Raw)
     assert registered[-1][1].types is types.UpdateReadHistoryOutbox
@@ -46,7 +46,7 @@ def test_existing_two_callback_provider_subscription_remains_supported():
     provider = TelethonProvider.__new__(TelethonProvider)
     provider.client = NS(add_event_handler=lambda callback, event: registered.append((callback, event)))
     provider.subscribe(object(), object())
-    assert len(registered) == 3
+    assert len(registered) == 4  # with the service-message Raw handler (ANYM-847)
 
 
 def test_private_outbox_boundary_has_no_invented_provider_timestamp():

@@ -47,6 +47,9 @@ OPERATION_PERMISSIONS = {
     'register_delivery_endpoint':'delivery-write','list_delivery_endpoints':'delivery-write',
     'update_delivery_endpoint':'delivery-write','delete_delivery_endpoint':'delivery-write',
     'test_delivery_endpoint':'delivery-write','list_delivery_attempts':'delivery-write',
+    # ANYM-848: an agent's own wake targets, with the same permission pair as its endpoints.
+    'register_wake_target':'delivery-write','list_wake_targets':'delivery-write','update_wake_target':'delivery-write',
+    'delete_wake_target':'delivery-write','confirm_wake_target':'delivery-write',
 }
 # resolve_target is audited as resolve_reference (ANYM-545) and messages_send as its preview_message and
 # send_message steps (ANYM-546): the audit_log CHECK lists operations by migration.
@@ -55,6 +58,9 @@ AUDIT_OPERATIONS = frozenset(OPERATION_PERMISSIONS) - {'resolve_target', 'messag
     'set_key_permissions', 'set_operations', 'messenger_dispatch', 'extend_key', 'set_feedback_status',
 }
 AUDIT_CODES = frozenset({
+    # ANYM-848: wake target refusals.
+    'invalid_wake_target','wake_target_conflict','wake_target_limit','invalid_wake_target_state',
+    'subscription_already_bound',
     'unauthorized', 'forbidden', 'not_found', 'invalid_limit', 'invalid_query', 'mute_limit_reached',
     'invalid_utc_date', 'invalid_date_range', 'invalid_filter', 'invalid_consumer',
     'consumer_limit', 'invalid_version', 'invalid_receipt', 'stale_ack',
