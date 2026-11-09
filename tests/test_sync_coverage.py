@@ -660,6 +660,9 @@ def test_the_job_pass_joins_messages_only_to_the_jobs_still_without_their_origin
     with explained(ar, plans):
         with s.pool.connection() as c:
             c.execute("SET LOCAL statement_timeout='120s'")
+            # Plan shape, not speed: a CI database's small /dev/shm cannot hold parallel hash joins of this size
+            # (DiskFull on 11-09); the materialized set keeps the join order with or without workers.
+            c.execute('SET LOCAL max_parallel_workers_per_gather=0')
             get_sync_status(c, {'accounts': [ACCOUNT], 'chat_ids': None})
     passes = [plan for query, plan in plans if 'unstored AS MATERIALIZED' in query]
     assert len(passes) == 1
