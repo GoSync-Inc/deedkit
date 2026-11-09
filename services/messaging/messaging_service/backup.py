@@ -77,7 +77,7 @@ V61_TABLES={'delivery_attempts':'id'}
 V69_TABLES={'media_recovery':'job'}
 # ANYM-824: per-day matcher counts of each subscription (numbers, platform names, UTC days; no IDs or text).
 V70_TABLES={'subscription_activity':'subscription,day,platform,scope_version,metric'}
-SCHEMAS=range(2,72)
+SCHEMAS=range(2,73)
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
 V17_TABLES={'message_conflicts':'receipt_digest'}
