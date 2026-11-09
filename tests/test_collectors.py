@@ -1634,6 +1634,21 @@ def test_telegram_poll_capture_stays_off_until_its_flag_so_a_rollback_target_nev
 
 
 # spec: ANYM-920
+def test_telegram_poll_capture_is_on_by_default_once_schema_84_is_the_rollback_target(tg_polls,monkeypatch):
+    # Schema 84 is deployed and is the rollback base: an unset flag captures the poll block and pushed counts.
+    from telethon import types
+    from messaging_service.envelope import validate
+    w,_,_=tg_polls
+    monkeypatch.delenv('ANYMSG_CAPTURE_TELEGRAM_POLLS')
+    capture=tg_poll_capture(public=True)
+    metadata=capture['envelope']['metadata']
+    assert metadata['message_kind']=='poll' and metadata['poll']['question'] and 'poll_results' in metadata
+    assert validate(capture['envelope'])==capture['envelope']
+    asyncio.run(w.poll_update(types.UpdateMessagePoll(poll_id=777,results=tg_poll_results((1,0,0)))))
+    assert len(list(w.spool.path.glob('*.json')))==1
+
+
+# spec: ANYM-920
 def test_voter_reads_follow_the_policy_and_one_read_serves_every_forwarded_copy(tg_polls):
     # Astra r1 M1 (an excluded chat is never read) and M3 (the throttle is the poll ID's, not one message's).
     from messaging_service.adapters import telegram_message
