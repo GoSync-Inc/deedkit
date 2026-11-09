@@ -150,7 +150,8 @@ its configuration and service/timer are described in the [enablement order](BACK
 Installation does not switch the delivery route by itself and does not enable the timer.
 
 `backup_runner.py` is a separate stdlib operator program on the source VM. Its
-example configuration is in `deploy/backup-runner.example.json`.
+recordings and calls profiles live in `backup_profiles.py`, installed beside it, which it loads from its
+own directory (production.md, Backup runner). Its example configuration is in `deploy/backup-runner.example.json`.
 The operator sets up the scheduler (for example a systemd timer) and the cleanup of the
 source runner separately; service/timer examples for it are not shipped. The examples
 in BACKUP_R2.md concern verification on the receiver and do not start a capture.

@@ -1888,6 +1888,48 @@ def test_a_failed_reread_never_changes_the_outcome_and_a_new_message_or_edit_is_
 
 
 # spec: ANYM-676
+def test_every_read_around_a_press_runs_inside_the_governor(pressing):
+    """The re-read after the press is paced like the reads before it (the handler passes the request's governor)."""
+    governing, reads = [False], []
+
+    class Watched(PressClient):
+        async def get_messages(self, peer, *, ids=None, limit=None):
+            reads.append(governing[0])
+            return await super().get_messages(peer, ids=ids, limit=limit)
+    clock, state, governor = governed()
+    governor.interval = 0
+    original = governor.call
+
+    async def watched(operation, phase, **kwargs):
+        governing[0] = True
+        try:
+            return await original(operation, phase, **kwargs)
+        finally:
+            governing[0] = False
+    governor.call = watched
+    result = press(Watched(), governor=governor)
+    assert result['outcome'] == 'submitted' and result['data']['message_after'] is not None
+    assert len(reads) == 4 and all(reads)  # exact read and newest id, before and after the press
+
+
+# spec: ANYM-676
+def test_a_chat_excluded_once_the_press_left_is_not_read_again(pressing):
+    """The re-read checks the collection policy at call time (the handler passes the request's policy check)."""
+    block = press_block(PressClient().message)
+    work = job('press_button', {k: block[k] for k in ('row', 'column', 'label', 'fp')}, press=block)
+
+    class Excluding(PressClient):
+        async def __call__(self, request):
+            if isinstance(request, functions.messages.GetBotCallbackAnswerRequest):
+                work['_policy']['exclude_chats'].append('100')
+            return await super().__call__(request)
+    client = Excluding()
+    result = asyncio.run(execute(client, work))
+    assert result['outcome'] == 'submitted' and result['data']['message_after'] is None
+    assert result['data']['message_after_code'] == 'reread_failed' and client.reads == 1
+
+
+# spec: ANYM-676
 def test_presses_are_paced_per_account_in_memory_and_refuse_before_any_request(pressing):
     from messaging_service.telegram_governor import LIVE_BUDGETS
     assert LIVE_BUDGETS['press_button'] == (3, 5.0, 200)
