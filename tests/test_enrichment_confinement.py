@@ -270,6 +270,96 @@ def test_a_proof_can_be_reused_for_the_configured_freshness():
     assert len(fake.attempts) == 2 * first
 
 
+# spec: ANYM-838
+def test_two_lanes_claiming_at_once_share_one_proof_made_after_both_asked():
+    import threading
+    g = guard(fresh=0.0)
+    probes, entered = [], threading.Event()
+    def slow_probe():
+        probes.append(threading.current_thread().name)
+        entered.set()
+        time.sleep(0.3)
+        return []
+    g.probe = slow_probe
+    first = threading.Thread(target=g.ensure, name='main-lane')
+    first.start()
+    assert entered.wait(5)
+    started = time.monotonic()
+    g.ensure()          # asked while the other lane's proof runs: that proof ends after this call asked, so it counts
+    waited = time.monotonic() - started
+    first.join(5)
+    assert probes == ['main-lane'] and waited < 0.55     # one shared proof, never a second one of its own
+    g.ensure()          # nobody else is proving: a claim still gets its own proof (fresh 0)
+    assert len(probes) == 2
+
+
+# spec: ANYM-838
+def test_the_background_monitor_never_queues_a_second_proof_in_front_of_a_waiting_lane():
+    import threading
+    g = guard(fresh=0.0, interval=0.05)
+    probes, entered, release = [], threading.Event(), threading.Event()
+    waiting, served = set(), {}
+    def held_probe():
+        probes.append(threading.current_thread().name)
+        entered.set()
+        assert release.wait(10)          # the first proof lasts until the monitor and the audio lane both wait
+        return []
+    g.probe = held_probe
+    real_verify = g.verify
+    def verify(since=None):
+        name = threading.current_thread().name
+        waiting.add(name)
+        real_verify(since=since)
+        served.setdefault(name, len(probes))   # proofs made when this caller's first request was served
+    g.verify = verify
+    first = threading.Thread(target=g.ensure, name='main-lane')
+    first.start()
+    assert entered.wait(10)
+    g.start_monitor(lambda: None)
+    audio = threading.Thread(target=g.ensure, name='audio-lane')
+    audio.start()
+    try:
+        deadline = time.monotonic() + 10
+        while not {'confinement-monitor', 'audio-lane'} <= waiting and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert {'confinement-monitor', 'audio-lane'} <= waiting
+        release.set()
+        audio.join(10)
+        first.join(10)
+        while 'confinement-monitor' not in served and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        release.set()
+        g.stop_monitor()
+    # Both requests asked during the main lane's proof and were served by it: no second full proof before them.
+    assert served['audio-lane'] == 1 and served['confinement-monitor'] == 1
+
+
+# spec: ANYM-838
+def test_a_lane_waiting_for_a_proof_that_fails_is_stopped_by_it():
+    import threading
+    g = guard(fresh=0.0)
+    entered = threading.Event()
+    def failing_probe():
+        entered.set()
+        time.sleep(0.2)
+        return ['tcp:synthetic']
+    g.probe = failing_probe
+    errors = []
+    def lane():
+        try:
+            g.ensure()
+        except ConfinementLost as error:
+            errors.append(error.args[0])
+    first = threading.Thread(target=lane)
+    first.start()
+    assert entered.wait(5)
+    with pytest.raises(ConfinementLost):
+        g.ensure()
+    first.join(5)
+    assert errors == [['tcp:synthetic']]
+
+
 # spec: ANYM-688
 def test_only_a_deedkit_inference_config_needs_the_proof_and_names_its_hosts(tmp_path):
     key = tmp_path / 'k'

@@ -101,6 +101,16 @@ BACKPRESSURE_CAP_SECONDS=900
 # After a pass that failed on a transient database error: this delay, doubled per consecutive failure up to the limit.
 DB_RETRY_SECONDS=5
 DB_RETRY_LIMIT_SECONDS=60
+# ANYM-838: an idle main lane looks for work every IDLE_SECONDS. An idle audio lane reads the newest attachment.ready
+# event every LANE_PROBE_SECONDS (one step back on the events primary key, 0.2 ms on prod); it runs the lock-free
+# candidate read (due(), about 50 ms) only when that mark moved, after a job, or every LANE_FULL_PROBE_SECONDS (jobs
+# that become due by time: retries, expired leases, requests), and claims only what that read found. At stop, the main
+# lane waits LANE_JOIN_SECONDS for the audio lane's requeue (run in parallel with its own), inside the 90 s stop grace
+# (deploy/compose.enrichment.yaml).
+IDLE_SECONDS=10
+LANE_PROBE_SECONDS=1
+LANE_FULL_PROBE_SECONDS=10
+LANE_JOIN_SECONDS=REQUEUE_SECONDS+15
 DB_TRANSIENT=(psycopg.errors.QueryCanceled,psycopg.errors.LockNotAvailable,psycopg.errors.DeadlockDetected,
     psycopg.errors.SerializationFailure,psycopg.errors.AdminShutdown,psycopg.errors.CrashShutdown,
     psycopg.errors.CannotConnectNow,psycopg.errors.IdleSessionTimeout,psycopg.errors.TooManyConnections,
@@ -203,10 +213,21 @@ def database_retry(error,delay):
         'exception_type':type(error).__name__,'retry_seconds':delay}),file=sys.stderr,flush=True)
 
 
+def audio_lane(config):
+    """ANYM-838: a worker that serves audio and another kind claims audio in its own lane, so a fresh voice note never
+    waits behind an image or document job (the mini runs speech and vision on separate slots). Never for a local heavy
+    profile: those share one machine-wide slot (resource_admission), so a second lane would only wait for it."""
+    profiles=config['profiles']
+    return ('audio' in profiles and len(profiles)>1
+            and not any(resource_admission.local_heavy(profile) for profile in profiles.values()))
+
+
 class EnrichmentWorker:
-    def __init__(self,dsn,files,config,*,processor=process,lock_directory=None,confinement=None):
+    def __init__(self,dsn,files,config,*,processor=process,lock_directory=None,confinement=None,kinds=None):
         self.dsn,self.files,self.config,self.processor=dsn,Path(files),config,processor
         self.confinement=confinement
+        # The kinds this lane claims; profile publication always covers every configured kind (main lane only).
+        self.kinds=frozenset(config['profiles'] if kinds is None else kinds)
         self.requeueing=False
         self.lock_directory=lock_directory or os.environ.get('PROCESSING_LOCK_DIR','/processing-locks')
     def connection(self):
@@ -264,10 +285,63 @@ class EnrichmentWorker:
                             'error_code':'retry_exhausted'},basis='model_generated',
                         provider=failed['provider'],model=failed['model'],error_code='retry_exhausted')
 
+    def _candidate_queries(self,c,withheld):
+        """(kind, profile, profile hash, candidate SELECT, params) for each kind of this lane within its budgets.
+
+        The SELECT has no ORDER BY, LIMIT or lock: claim() adds them under its locks; due() reads it with none."""
+        from .file_lifecycle import PROCESSABLE_ORIGINAL
+        account_used={r['account']:r['n'] for r in c.execute('''SELECT account,sum(attempts) n
+            FROM processing_budget WHERE day=current_date GROUP BY account''').fetchall()}
+        for kind,profile in self.config['profiles'].items():
+            if kind not in self.kinds:continue
+            used_profile=c.execute('''SELECT coalesce(sum(attempts),0) n FROM processing_budget
+                WHERE day=current_date AND kind=%s''',(kind,)).fetchone()['n']
+            if used_profile>=self.config.get('profile_max_jobs_per_day',{}).get(kind,10000):continue
+            ph=profile_hash(profile)
+            eligible=[account for account in self.config['accounts'] if account_used.get(account,0)<
+                self.config.get('account_max_jobs_per_day',{}).get(account,10000)]
+            if not eligible:continue
+            condition={'audio':"(a.mime LIKE 'audio/%%' OR a.mime='application/ogg')",'image':"a.mime LIKE 'image/%%'",
+                'document':"a.mime NOT LIKE 'audio/%%' AND a.mime<>'application/ogg' AND a.mime NOT LIKE 'image/%%' AND f.state='ready' AND f.source_revision=m.revision AND f.source_digest=a.digest AND length(f.text_content)>0"}[kind]
+            # A note downloaded on request today is as fresh as one sent today (ANYM-455).
+            fresh="m.sent_at>=clock_timestamp()-interval '1 day'"+(" OR r.updated_at>=clock_timestamp()-interval '1 day'" if kind=='audio' else '')
+            residency=' LEFT JOIN attachment_residency r ON r.digest=a.digest' if kind=='audio' else ''
+            yield kind,profile,ph,'''SELECT e.*,a.message,a.mime,a.bytes,m.account,m.sent_at,coalesce(f.text_content,'') AS source_text,
+                coalesce(f.truncated,false) AS source_truncated,
+                '''+fresh+''' AS fresh,
+                coalesce(pc.last_started_at,'epoch'::timestamptz) AS last_started_at
+                FROM attachment_enrichment e
+                JOIN attachments a ON a.id=e.attachment JOIN messages m ON m.id=a.message
+                LEFT JOIN attachment_text f ON f.attachment=a.id'''+residency+'''
+                LEFT JOIN processing_control pc ON pc.account=m.account AND pc.kind=%s AND pc.profile_hash=%s
+                WHERE '''+PROCESSABLE_ORIGINAL+''' AND NOT '''+withheld+''' AND (pc.pause_reason IS NULL OR pc.paused_until<=clock_timestamp()) AND a.active AND NOT m.deleted AND e.source_digest=a.digest AND e.source_revision=m.revision
+                AND m.account=ANY(%s) AND '''+condition+''' AND e.next_due<=clock_timestamp()
+                AND ((e.state IN ('unconfigured','queued','failed') AND (e.attempts<3 OR e.profile_hash IS DISTINCT FROM %s)
+                        AND NOT (e.state='failed' AND coalesce(e.error_code,'')=ANY(%s) AND e.profile_hash IS NOT DISTINCT FROM %s))
+                    OR (e.state='leased' AND e.lease_until<clock_timestamp() AND e.attempts<3)
+                    OR (e.state='unsupported' AND e.profile_hash IS DISTINCT FROM %s))
+                ''',(kind,ph,eligible,ph,list(FINAL_LIMIT_CODES),ph,ph)
+
+    def ready_mark(self):
+        """ANYM-838: the newest attachment.ready event id, the usual sign that a new file may be due."""
+        with self.connection() as c:
+            return c.execute("SELECT max(id) AS id FROM events WHERE kind='attachment.ready'").fetchone()['id']
+
+    def due(self):
+        """ANYM-838: whether claim() would find a job of this lane's kinds, read with no advisory or row lock and no
+        write, so an idle lane can look every LANE_PROBE_SECONDS without queueing on the residency or admission lock.
+        A stale answer only costs one empty claim, or one probe interval."""
+        from .media_policy import recognition_withheld
+        with self.connection() as c:
+            withheld=recognition_withheld(c)
+            used=c.execute('SELECT coalesce(max(attempts),0) AS n FROM enrichment_budget WHERE day=current_date').fetchone()['n']
+            if used>=self.config['max_jobs_per_day']:return False
+            return any(c.execute(query+' LIMIT 1',params).fetchone() for *_,query,params in self._candidate_queries(c,withheld))
+
     def claim(self):
         self._expire_leases()
         with resource_admission.transaction(self.connection()) as (c,resources):
-            from .file_lifecycle import lifecycle_lock,PROCESSABLE_ORIGINAL
+            from .file_lifecycle import lifecycle_lock
             from .media_policy import recognition_withheld
             lifecycle_lock(c)
             # Serialize claims/budget only, never inference. Failed attempts count.
@@ -278,39 +352,9 @@ class EnrichmentWorker:
             used=c.execute('SELECT attempts FROM enrichment_budget WHERE day=current_date FOR UPDATE').fetchone()['attempts']
             if used>=self.config['max_jobs_per_day']:return None
             candidates=[]
-            account_used={r['account']:r['n'] for r in c.execute('''SELECT account,sum(attempts) n
-                FROM processing_budget WHERE day=current_date GROUP BY account''').fetchall()}
-            for kind,profile in self.config['profiles'].items():
-                used_profile=c.execute('''SELECT coalesce(sum(attempts),0) n FROM processing_budget
-                    WHERE day=current_date AND kind=%s''',(kind,)).fetchone()['n']
-                if used_profile>=self.config.get('profile_max_jobs_per_day',{}).get(kind,10000):continue
-                ph=profile_hash(profile)
-                eligible=[]
-                for account in self.config['accounts']:
-                    used_account=account_used.get(account,0)
-                    if used_account<self.config.get('account_max_jobs_per_day',{}).get(account,10000):eligible.append(account)
-                if not eligible:continue
-                condition={'audio':"(a.mime LIKE 'audio/%%' OR a.mime='application/ogg')",'image':"a.mime LIKE 'image/%%'",
-                    'document':"a.mime NOT LIKE 'audio/%%' AND a.mime<>'application/ogg' AND a.mime NOT LIKE 'image/%%' AND f.state='ready' AND f.source_revision=m.revision AND f.source_digest=a.digest AND length(f.text_content)>0"}[kind]
-                # A note downloaded on request today is as fresh as one sent today (ANYM-455).
-                fresh="m.sent_at>=clock_timestamp()-interval '1 day'"+(" OR r.updated_at>=clock_timestamp()-interval '1 day'" if kind=='audio' else '')
-                residency=' LEFT JOIN attachment_residency r ON r.digest=a.digest' if kind=='audio' else ''
-                row=c.execute('''SELECT e.*,a.message,a.mime,a.bytes,m.account,m.sent_at,coalesce(f.text_content,'') AS source_text,
-                    coalesce(f.truncated,false) AS source_truncated,
-                    '''+fresh+''' AS fresh,
-                    coalesce(pc.last_started_at,'epoch'::timestamptz) AS last_started_at
-                    FROM attachment_enrichment e
-                    JOIN attachments a ON a.id=e.attachment JOIN messages m ON m.id=a.message
-                    LEFT JOIN attachment_text f ON f.attachment=a.id'''+residency+'''
-                    LEFT JOIN processing_control pc ON pc.account=m.account AND pc.kind=%s AND pc.profile_hash=%s
-                    WHERE '''+PROCESSABLE_ORIGINAL+''' AND NOT '''+withheld+''' AND (pc.pause_reason IS NULL OR pc.paused_until<=clock_timestamp()) AND a.active AND NOT m.deleted AND e.source_digest=a.digest AND e.source_revision=m.revision
-                    AND m.account=ANY(%s) AND '''+condition+''' AND e.next_due<=clock_timestamp()
-                    AND ((e.state IN ('unconfigured','queued','failed') AND (e.attempts<3 OR e.profile_hash IS DISTINCT FROM %s)
-                            AND NOT (e.state='failed' AND coalesce(e.error_code,'')=ANY(%s) AND e.profile_hash IS NOT DISTINCT FROM %s))
-                        OR (e.state='leased' AND e.lease_until<clock_timestamp() AND e.attempts<3)
-                        OR (e.state='unsupported' AND e.profile_hash IS DISTINCT FROM %s))
-                    ORDER BY fresh DESC,last_started_at,m.sent_at DESC,a.id LIMIT 1 FOR UPDATE OF e SKIP LOCKED''',
-                    (kind,ph,eligible,ph,list(FINAL_LIMIT_CODES),ph,ph)).fetchone()
+            for kind,profile,ph,query,params in self._candidate_queries(c,withheld):
+                row=c.execute(query+''' ORDER BY fresh DESC,last_started_at,m.sent_at DESC,a.id
+                    LIMIT 1 FOR UPDATE OF e SKIP LOCKED''',params).fetchone()
                 if row:candidates.append((row,kind,profile,ph))
             candidates.sort(key=lambda item:(not item[0]['fresh'],item[0]['last_started_at'],-item[0]['sent_at'].timestamp()))
             for row,kind,profile,ph in candidates:
@@ -491,8 +535,36 @@ class EnrichmentWorker:
             # Outside the handlers above, so it reaches the backoff in run() as no recorded failure.
             if unwritten:raise unwritten
         return True
+    def lane_loop(self,failure):
+        """ANYM-838: the audio lane, a thread of run(). An idle pass reads the ready mark every LANE_PROBE_SECONDS and the
+        lock-free candidate read only when needed (see LANE_FULL_PROBE_SECONDS); only a read that finds a job proves the
+        confinement and claims. Transient database errors back off as in run(); any other error ends the whole worker
+        through the stop path, as an error of the main lane does."""
+        delay=DB_RETRY_SECONDS;seen=None;full_at=0.0
+        try:
+            while not STOP.is_set():
+                try:
+                    mark=self.ready_mark();found=False
+                    if mark!=seen or time.monotonic()>=full_at:
+                        found=self.due();seen=mark;full_at=time.monotonic()+LANE_FULL_PROBE_SECONDS
+                    if found and self.confinement:self.confinement.ensure()
+                    if found and self.once():full_at=0.0  # more audio may be due: read again at once
+                    else:STOP.wait(LANE_PROBE_SECONDS)
+                except psycopg.OperationalError as error:
+                    if STOP.is_set() or self.requeueing or not transient_database_error(error):raise
+                    database_retry(error,delay)
+                    STOP.wait(delay);delay=min(DB_RETRY_LIMIT_SECONDS,delay*2)
+                else:delay=DB_RETRY_SECONDS
+        except BaseException as error:
+            failure.append(error);request_stop()
     def run(self):
         guard=self.confinement
+        # ANYM-838: audio gets its own lane; this lane keeps the other kinds and alone publishes every profile.
+        lane=thread=None;failure=[]
+        if self.kinds==frozenset(self.config['profiles']) and audio_lane(self.config):
+            self.kinds=self.kinds-{'audio'}
+            lane=EnrichmentWorker(self.dsn,self.files,self.config,processor=self.processor,
+                lock_directory=self.lock_directory,confinement=guard,kinds={'audio'})
         if guard:
             # ANYM-688: a worker that sends files to the mini proves it cannot leave its network before it
             # publishes a profile or claims anything (raises ConfinementLost; nothing was published yet), and
@@ -506,7 +578,11 @@ class EnrichmentWorker:
                     if guard:guard.ensure()
                     try:
                         self.publish_profiles()
-                        if not self.once():STOP.wait(10)
+                        if lane and thread is None:  # after the first publication and confinement proof
+                            started=threading.Thread(target=lane.lane_loop,args=(failure,),daemon=True,
+                                name='enrichment-audio-lane')
+                            started.start();thread=started  # only a started lane is stopped and joined
+                        if not self.once():STOP.wait(IDLE_SECONDS)
                     except psycopg.OperationalError as error:
                         # Incident 11-05: one statement timeout in claim() ended the worker. A job whose finish failed, or
                         # a claim whose commit was lost, stays under its lease until that expires. The stop path keeps
@@ -516,9 +592,16 @@ class EnrichmentWorker:
                         STOP.wait(delay);delay=min(DB_RETRY_LIMIT_SECONDS,delay*2)
                     else:delay=DB_RETRY_SECONDS
             finally:
-                # Also when the stop path itself fails: never keep advertising a worker that is going away.
-                if guard:guard.stop_monitor()
-                self.unpublish_profiles()
+                try:
+                    if thread:
+                        # This lane ended on its own error: stop the audio lane's job too, then wait for its requeue.
+                        if not STOP.is_set():request_stop()
+                        thread.join(LANE_JOIN_SECONDS)
+                finally:
+                    # Also when the stop path itself fails: never keep advertising a worker that is going away.
+                    if guard:guard.stop_monitor()
+                    self.unpublish_profiles()
+            if failure:raise failure[0]
         except Exception:
             # ANYM-786: exit 78 must stay fatal and readable, so a lost confinement outranks whatever failed on the way
             # out; that error's text stays out of stderr, which carries only the check names.

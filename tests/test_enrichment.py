@@ -1,4 +1,5 @@
 import base64
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -1443,6 +1444,205 @@ def test_a_real_statement_timeout_in_the_claim_backs_off_and_the_job_is_still_cl
     with s.pool.connection() as c:
         assert c.execute("SELECT state,attempts FROM attachment_enrichment WHERE attachment='enrich-audio'").fetchone()=={'state':'queued','attempts':0}
         assert c.execute("SELECT enabled FROM processing_profiles WHERE account='telegram-demo' AND kind='audio'").fetchone()['enabled'] is False
+
+
+def two_kind_worker(s,tmp_path,processor):
+    """ANYM-838: one worker serving audio and image, as enricher-mini does."""
+    cfg={'accounts':['telegram-demo'],'max_jobs_per_day':20,
+         'profiles':{'audio':profile(tmp_path,kind='audio'),'image':profile(tmp_path,kind='image')}}
+    with s.pool.connection() as c:c.execute('TRUNCATE enrichment_budget')
+    return EnrichmentWorker(s.pool.conninfo,s.files,cfg,processor=processor)
+
+
+@contextmanager
+def running(w,module,limit=30):
+    """Run the worker in a thread; a watchdog stops it after `limit` seconds, and leaving the block (also on a failed
+    assertion) cancels the watchdog and stops and joins the worker, so nothing outlives the test."""
+    import threading
+    errors=[]
+    def target():
+        try:w.run()
+        except BaseException as error:errors.append(error)
+    thread=threading.Thread(target=target,daemon=True);thread.start()
+    watchdog=threading.Timer(limit,module.request_stop);watchdog.daemon=True;watchdog.start()
+    try:yield thread,errors
+    finally:
+        watchdog.cancel()
+        if thread.is_alive():module.request_stop()
+        thread.join(60)
+
+
+def announce(s):
+    """The attachment.ready event a finished download publishes (the audio lane's wake mark)."""
+    import uuid
+    from messaging_service.store import Store
+    with s.pool.connection() as c:
+        Store.append_event(c,'telegram-demo','demo-tg-2','attachment.ready',event_key='event_lane-'+uuid.uuid4().hex)
+
+
+def enrichment_states(s):
+    with s.pool.connection() as c:
+        return {r['attachment']:(r['state'],r['attempts']) for r in c.execute(
+            "SELECT attachment,state,attempts FROM attachment_enrichment WHERE attachment IN ('enrich-audio','enrich-image')")}
+
+
+# spec: ANYM-838
+def test_only_a_worker_with_audio_and_another_remote_kind_runs_an_audio_lane(tmp_path):
+    from messaging_service.enrichment import audio_lane
+    audio,image=profile(tmp_path,kind='audio'),profile(tmp_path,kind='image')
+    local=validate_profile({'provider':'faster_whisper','model':str(tmp_path),'timeout_seconds':1800},'audio')
+    assert audio_lane({'profiles':{'audio':audio,'image':image}})
+    assert not audio_lane({'profiles':{'audio':audio}}) and not audio_lane({'profiles':{'image':image}})
+    # A local heavy profile shares one machine-wide slot: a second lane would only wait for it.
+    assert not audio_lane({'profiles':{'audio':local,'image':image}})
+
+
+# spec: ANYM-838
+def test_a_voice_note_is_transcribed_while_an_image_job_is_still_running(seeded,tmp_path,monkeypatch,stop_state):
+    import threading
+    module=stop_state;s,_,_=seeded
+    image_started,audio_done=threading.Event(),threading.Event();order=[];publishers=set()
+    def processor(files,row,profile):
+        order.append(row['kind'])
+        if row['kind']=='image':
+            image_started.set()
+            # The image job runs until the voice note is done: one lane would deadlock here (the watchdog fails it).
+            assert audio_done.wait(20)
+            module.STOP.set()
+            return normalize_result({'title':'Synthetic','summary':'Synthetic image'})
+        assert image_started.is_set()
+        audio_done.set()
+        return normalize_result({'text':'synthetic','segments':[]},audio=True)
+    w=two_kind_worker(s,tmp_path,processor)
+    real_publish=EnrichmentWorker.publish_profiles
+    def publish(self,**kwargs):
+        publishers.add((threading.current_thread().name,self.kinds));return real_publish(self,**kwargs)
+    monkeypatch.setattr(EnrichmentWorker,'publish_profiles',publish)
+    add_image(s)
+    with running(w,module) as (thread,errors):
+        assert image_started.wait(20)
+        add_audio(s);announce(s)
+        thread.join(40)
+    assert not thread.is_alive() and errors==[] and order==['image','audio']
+    assert enrichment_states(s)=={'enrich-audio':('ready',1),'enrich-image':('ready',1)}
+    # Only the main lane publishes, and it publishes every configured kind (publish_profiles covers the config).
+    assert len({name for name,_ in publishers})==1 and 'enrichment-audio-lane' not in {name for name,_ in publishers}
+    assert all(kinds==frozenset({'image'}) for _,kinds in publishers)
+    with s.pool.connection() as c:
+        assert {r['kind'] for r in c.execute("SELECT kind FROM processing_profiles WHERE account='telegram-demo'")}=={'audio','image'}
+
+
+# spec: ANYM-838
+def test_an_idle_audio_lane_reads_only_its_mark_and_claims_a_new_note_on_its_next_read(seeded,tmp_path,monkeypatch,stop_state):
+    import threading
+    import messaging_service.file_lifecycle as lifecycle
+    module=stop_state;s,_,_=seeded
+    monkeypatch.setattr(module,'IDLE_SECONDS',600)  # the main lane claims once, then stays asleep
+    monkeypatch.setattr(module,'LANE_FULL_PROBE_SECONDS',600)  # only a moved mark makes the lane read candidates
+    calls=[];claimed=threading.Event()
+    def processor(files,row,profile):
+        claimed.set();module.STOP.set();return normalize_result({'text':'synthetic','segments':[]},audio=True)
+    w=two_kind_worker(s,tmp_path,processor)
+    real_lock,real_mark,real_due,real_claim=(lifecycle.lifecycle_lock,EnrichmentWorker.ready_mark,
+        EnrichmentWorker.due,EnrichmentWorker.claim)
+    def lock(c):
+        calls.append(('lock',threading.current_thread().name));return real_lock(c)
+    def mark(self):
+        calls.append(('mark',None));return real_mark(self)
+    def due(self):
+        found=real_due(self);calls.append(('due',found));return found
+    def claim(self):
+        calls.append(('claim',self.kinds));return real_claim(self)
+    monkeypatch.setattr(lifecycle,'lifecycle_lock',lock);monkeypatch.setattr(EnrichmentWorker,'ready_mark',mark)
+    monkeypatch.setattr(EnrichmentWorker,'due',due);monkeypatch.setattr(EnrichmentWorker,'claim',claim)
+    with running(w,module) as (thread,errors):
+        deadline=time.monotonic()+20
+        while sum(1 for kind,_ in calls if kind=='mark')<4 and time.monotonic()<deadline:time.sleep(0.05)
+        idle=list(calls)
+        # Idle: after its first candidate read the lane reads only the mark; no claim, no residency lock.
+        assert [found for kind,found in idle if kind=='due']==[False]
+        assert ('claim',frozenset({'audio'})) not in idle
+        assert not [name for kind,name in idle if kind=='lock' and name=='enrichment-audio-lane']
+        before=len(calls)
+        add_audio(s);announce(s)
+        assert claimed.wait(20)
+        thread.join(30)
+    assert not thread.is_alive() and errors==[]
+    after=calls[before:]
+    # The note is read and claimed on the first or second mark read after it was announced (one may have begun before).
+    first=next(i for i,(kind,found) in enumerate(after) if kind=='due' and found)
+    assert sum(1 for kind,_ in after[:first] if kind=='mark')<=2 and ('claim',frozenset({'audio'})) in after[first:]
+    assert enrichment_states(s)['enrich-audio']==('ready',1)
+
+
+# spec: ANYM-838
+def test_an_audio_job_due_without_a_new_event_is_found_by_the_periodic_candidate_read(seeded,tmp_path,monkeypatch,stop_state):
+    import threading
+    module=stop_state;s,_,_=seeded
+    monkeypatch.setattr(module,'IDLE_SECONDS',600);monkeypatch.setattr(module,'LANE_FULL_PROBE_SECONDS',0.3)
+    claimed=threading.Event()
+    def processor(files,row,profile):
+        claimed.set();module.STOP.set();return normalize_result({'text':'synthetic','segments':[]},audio=True)
+    w=two_kind_worker(s,tmp_path,processor)
+    with running(w,module) as (thread,errors):
+        time.sleep(0.5)
+        add_audio(s)  # due with no attachment.ready event, like a retry whose backoff ended
+        assert claimed.wait(20)
+        thread.join(30)
+    assert not thread.is_alive() and errors==[] and enrichment_states(s)['enrich-audio']==('ready',1)
+
+
+# spec: ANYM-838
+def test_a_stop_requeues_the_running_jobs_of_both_lanes(seeded,tmp_path,stop_state):
+    import threading
+    module=stop_state;s,_,_=seeded;started=[]
+    def processor(files,row,profile):
+        started.append(row['kind'])
+        while not module.STOP.wait(0.05):pass
+        raise module.WorkerStopping()
+    w=two_kind_worker(s,tmp_path,processor)
+    add_image(s);add_audio(s)
+    def stop_when_both_run():
+        deadline=time.monotonic()+20
+        while len(started)<2 and time.monotonic()<deadline:time.sleep(0.05)
+        module.request_stop()
+    threading.Thread(target=stop_when_both_run,daemon=True).start()
+    began=time.monotonic();w.run();elapsed=time.monotonic()-began
+    assert sorted(started)==['audio','image'] and elapsed<module.LANE_JOIN_SECONDS
+    assert enrichment_states(s)=={'enrich-audio':('queued',0),'enrich-image':('queued',0)}
+    with s.pool.connection() as c:
+        assert not any(r['enabled'] for r in c.execute("SELECT enabled FROM processing_profiles WHERE account='telegram-demo'"))
+
+
+# spec: ANYM-838
+def test_an_audio_lane_error_ends_the_worker_through_the_stop_path(seeded,tmp_path,monkeypatch,stop_state):
+    module=stop_state;s,_,_=seeded
+    w=two_kind_worker(s,tmp_path,lambda *_:None)
+    real_due=EnrichmentWorker.due
+    def due(self):
+        if self.kinds==frozenset({'audio'}):raise RuntimeError('synthetic lane failure')
+        return real_due(self)
+    monkeypatch.setattr(EnrichmentWorker,'due',due)
+    with pytest.raises(RuntimeError,match='synthetic lane failure'):w.run()
+    assert module.STOP.is_set()
+    with s.pool.connection() as c:
+        assert not any(r['enabled'] for r in c.execute("SELECT enabled FROM processing_profiles WHERE account='telegram-demo'"))
+
+
+# spec: ANYM-838
+def test_a_lane_that_cannot_start_still_unpublishes_the_profiles(seeded,tmp_path,monkeypatch,stop_state):
+    import threading
+    s,_,_=seeded
+    w=two_kind_worker(s,tmp_path,lambda *_:None)
+    real_start=threading.Thread.start
+    def start(self):
+        if self.name=='enrichment-audio-lane':raise RuntimeError('synthetic thread start failure')
+        return real_start(self)
+    monkeypatch.setattr(threading.Thread,'start',start)
+    with pytest.raises(RuntimeError,match='synthetic thread start failure'):w.run()
+    with s.pool.connection() as c:
+        rows=c.execute("SELECT enabled FROM processing_profiles WHERE account='telegram-demo'").fetchall()
+        assert rows and not any(r['enabled'] for r in rows)
 
 
 # spec: ANYM-688

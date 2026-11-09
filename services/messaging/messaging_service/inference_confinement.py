@@ -216,8 +216,14 @@ class Confinement:
         # a check that has not finished by now is NOT confined (fail closed), whatever it would have said later
         return sorted(name for index, (name, _) in enumerate(checks) if outcome.get(index, True))
 
-    def verify(self):
+    def verify(self, since=None):
         with self.lock:
+            # ANYM-838: a proof that finished after `since` (while this caller waited for the lock) is a proof made
+            # after the caller decided to claim, so it counts; two lanes never prove twice in a row for one claim.
+            if since is not None and self.lost:
+                raise ConfinementLost(self.lost)   # the proof this caller waited for failed
+            if since is not None and self.verified_at is not None and self.verified_at > since:
+                return
             try:
                 failed = self.probe()
             except Exception:
@@ -231,14 +237,17 @@ class Confinement:
         """Called before every claim: raise at once once lost; probe again when the last proof is older than `fresh`."""
         if self.lost:
             raise ConfinementLost(self.lost)
-        if self.verified_at is None or self.clock() - self.verified_at >= self.fresh:
-            self.verify()
+        asked = self.clock()
+        if self.verified_at is None or asked - self.verified_at >= self.fresh:
+            self.verify(since=asked)
 
     def start_monitor(self, on_lost):
         def watch():
             while not self.stopping.wait(self.interval):
                 try:
-                    self.verify()
+                    # ANYM-838: like a claim, the monitor counts a proof that finishes after it asked, so it never
+                    # queues a second full proof in front of a waiting lane.
+                    self.verify(since=self.clock())
                 except ConfinementLost:
                     on_lost()
                     return
