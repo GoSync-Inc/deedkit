@@ -9,7 +9,7 @@ from .catalog import routed
 from .diagnostics import manifest_summary
 from .policy import Denied
 from .sections import capabilities_view, subscription_blocks
-from .catalog import CATALOG
+from .catalog import ACTIONS, CATALOG
 
 CALENDAR_CONSTRAINTS = {
     "event_write",
@@ -271,6 +271,36 @@ def relayed_error(detail, runnable, read_only, payload, candidate_payload=None):
     return detail
 
 
+def not_granted(rows, snapshot, agent, caps, allowed_actions):
+    """ANYM-846: supported operations this principal is not granted, each with every grant layer it lacks.
+
+    The layers are those `Policy.actions` intersects. Only operation and scope names from `ACTIONS` appear;
+    account opt-in and full-account scope stay the backend's `available`. Authorization is unchanged.
+    """
+    profile = set(snapshot["profiles"][agent["profile"]]["actions"].get("messenger_operations", []))
+    principal = set(agent["actions"].get("messenger_operations", []))
+    gateway_scopes = set(agent["grants"].get("messaging", []))
+    permissions = caps.get("permissions")
+    backend = {p for p in permissions if isinstance(p, str)} if isinstance(permissions, list) else set()
+    listed, result = set(), []
+    for row in rows:
+        operation = row.get("operation")
+        if (not isinstance(operation, str) or operation not in ACTIONS or row.get("supported") is not True
+                or operation in allowed_actions or operation in listed):
+            continue
+        scopes = sorted(ACTIONS[operation])
+        missing = (
+            ([] if operation in profile else ["profile_action"])
+            + ([] if operation in principal else ["principal_action"])
+            + ["gateway_scope:" + scope for scope in scopes if scope not in gateway_scopes]
+            + ["backend_permission:" + scope for scope in scopes if scope not in backend]
+        )
+        if missing:
+            listed.add(operation)
+            result.append({"operation": operation, "missing": missing})
+    return result
+
+
 def shape_result(gateway, result, *, tool, module, snapshot, agent, caps, current, principal, allowed_actions,
                  rules_ceiling, live_denied, live_requested, key, credential, args, started):
     """The per-module tail of `Dispatch.call`: what a backend result becomes before the caller sees it. A pure
@@ -326,13 +356,16 @@ def shape_result(gateway, result, *, tool, module, snapshot, agent, caps, curren
             ]
     if tool.get("action_group"):
         if tool["operation"] == "list_messenger_operations":
+            rows = result.get("items")
+            rows = [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
             result = {
                 **result,
                 "items": [
                     row
-                    for row in result.get("items", [])
+                    for row in rows
                     if row.get("operation") in allowed_actions and row.get("supported") is True
                 ],
+                "not_granted": not_granted(rows, snapshot, agent, caps, allowed_actions),
             }
         elif result.get("operation") not in allowed_actions:
             raise Denied()

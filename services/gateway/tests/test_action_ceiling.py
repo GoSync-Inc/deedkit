@@ -6,11 +6,12 @@ import pytest
 from starlette.testclient import TestClient
 
 from agent_gateway.app import create_app
+from agent_gateway.catalog import CATALOG
 from test_policy import config
 from test_transport import rpc
 
 
-def setup(tmp_path, supported=None, selected=None, permissions=None):
+def setup(tmp_path, supported=None, selected=None, permissions=None, items=None, backend_permissions=None):
     value = config()
     value["deployment"] = {
         "modules": ["messaging"],
@@ -53,7 +54,7 @@ def setup(tmp_path, supported=None, selected=None, permissions=None):
             return httpx.Response(
                 200,
                 json={
-                    "permissions": agent["grants"]["messaging"],
+                    "permissions": agent["grants"]["messaging"] if backend_permissions is None else backend_permissions,
                     "messenger_operations": {
                         "supported_by_account": supported
                         if supported is not None
@@ -69,7 +70,9 @@ def setup(tmp_path, supported=None, selected=None, permissions=None):
             return httpx.Response(
                 200,
                 json={
-                    "items": [
+                    "items": items
+                    if items is not None
+                    else [
                         {"operation": n, "supported": True, "available": True}
                         for n in ["rename_group", "leave_group", "remove_participant"]
                     ]
@@ -144,6 +147,151 @@ def test_only_exact_actions_are_discovered_and_admitted_in_both_transports(tmp_p
         )
         assert rpc(c, "tools/list").json()["result"]["tools"] == []
         assert len(seen) == count
+
+
+def listed_operations(client, account="synthetic"):
+    """The shaped list through REST and MCP; both transports return the same result."""
+    rest = client.post(
+        "/v1/messages_list_messenger_operations", json={"account": account}, headers={"Authorization": "Bearer gateway-a"}
+    )
+    assert rest.status_code == 200
+    mcp = rpc(
+        client, "tools/call", {"name": "messages_list_messenger_operations", "arguments": {"account": account}}
+    ).json()["result"]
+    assert not mcp.get("isError") and mcp["structuredContent"] == rest.json()
+    return rest.json()
+
+
+def layered(tmp_path, profile, principal, grants, backend, items=None):
+    """Profile and principal actions, gateway messaging grants and backend key permissions set independently."""
+    supported = {"synthetic": {"operations": ["rename_group", "archive_chat"]}}
+    rows = items if items is not None else [
+        {"operation": n, "supported": True, "available": True} for n in ["rename_group", "archive_chat"]
+    ]
+    app, value, path, _ = setup(tmp_path, supported, permissions=grants, backend_permissions=backend, items=rows)
+    value["profiles"]["reader"]["actions"]["messenger_operations"] = profile
+    value["principals"][0]["actions"]["messenger_operations"] = principal
+    value["revision"] += 1
+    path.write_text(json.dumps(value))
+    return app, rows
+
+
+BOTH = ["rename_group", "archive_chat"]
+SCOPES = ["groups-manage", "chat-manage"]
+
+
+# spec: ANYM-846
+@pytest.mark.parametrize(
+    ("profile", "principal", "grants", "backend", "missing"),
+    [
+        pytest.param(["rename_group"], BOTH, SCOPES, SCOPES, ["profile_action"], id="profile_action"),
+        pytest.param(BOTH, ["rename_group"], SCOPES, SCOPES, ["principal_action"], id="principal_action"),
+        pytest.param(BOTH, BOTH, ["groups-manage"], SCOPES, ["gateway_scope:chat-manage"], id="gateway_scope"),
+        pytest.param(BOTH, BOTH, SCOPES, ["groups-manage"], ["backend_permission:chat-manage"],
+                     id="backend_permission"),
+        pytest.param(["rename_group"], BOTH, ["groups-manage"], SCOPES,
+                     ["profile_action", "gateway_scope:chat-manage"], id="two_layers"),
+        pytest.param(["rename_group"], ["rename_group"], ["groups-manage"], ["groups-manage"],
+                     ["profile_action", "principal_action", "gateway_scope:chat-manage",
+                      "backend_permission:chat-manage"], id="every_layer"),
+    ],
+)
+def test_a_supported_operation_outside_the_action_set_is_listed_with_each_missing_grant(
+    tmp_path, profile, principal, grants, backend, missing
+):
+    app, rows = layered(tmp_path, profile, principal, grants, backend)
+    with TestClient(app) as client:
+        listed = listed_operations(client)
+    # items stays exactly as before: the granted rows, unchanged.
+    assert listed["items"] == [rows[0]]
+    assert listed["not_granted"] == [{"operation": "archive_chat", "missing": missing}]
+
+
+# spec: ANYM-846
+def test_a_fully_granted_principal_has_an_empty_not_granted_list(tmp_path):
+    app, rows = layered(tmp_path, BOTH, BOTH, SCOPES, SCOPES)
+    with TestClient(app) as client:
+        listed = listed_operations(client)
+    assert listed["items"] == rows
+    assert listed["not_granted"] == []
+
+
+# spec: ANYM-846
+def test_unsupported_unknown_and_malformed_rows_never_appear_and_the_rest_still_shapes(tmp_path):
+    rows = [
+        # Granted but not available (opt-in, full account): stays in items as today, never in not_granted.
+        {"operation": "rename_group", "supported": True, "available": False, "requires_full_account": True},
+        {"operation": "archive_chat", "supported": False, "available": False},
+        {"operation": "teleport", "supported": True},
+        {"operation": "create_group", "supported": "true"},
+        {"operation": "create_group"},
+        {"supported": True},
+        {"operation": ["leave_group"], "supported": True},
+        {"operation": None, "supported": True},
+        "leave_group",
+        None,
+        7,
+        ["leave_group"],
+        # Not granted and not opted in: reported by its missing grant only, never by the opt-in.
+        {"operation": "leave_group", "supported": True, "available": False, "opt_in_required": True},
+        {"operation": "leave_group", "supported": True},
+    ]
+    app, _, _, _ = setup(tmp_path, items=rows)
+    with TestClient(app) as client:
+        listed = listed_operations(client)
+    assert listed["items"] == [rows[0]]
+    assert listed["not_granted"] == [{"operation": "leave_group", "missing": ["profile_action"]}]
+
+
+# spec: ANYM-846
+def test_an_operation_listed_as_not_granted_stays_denied_in_discovery_preview_execute_and_receipts(tmp_path):
+    app, value, path, seen = setup(tmp_path)
+    value["profiles"]["reader"]["tools"].append("messages_manage_chat")
+    value["revision"] += 1
+    path.write_text(json.dumps(value))
+    headers = {"Authorization": "Bearer gateway-a"}
+    with TestClient(app) as client:
+        listed = listed_operations(client)
+        assert listed["not_granted"] == [
+            {"operation": "leave_group", "missing": ["profile_action"]},
+            {"operation": "remove_participant", "missing": ["profile_action", "principal_action"]},
+        ]
+        tools = {t["name"]: t for t in rpc(client, "tools/list").json()["result"]["tools"]}
+        assert "messages_manage_chat" in tools
+        for tool in tools.values():
+            if "operation" in tool["inputSchema"]["properties"]:
+                assert tool["inputSchema"]["properties"]["operation"]["enum"] == ["rename_group"], tool["name"]
+        for operation in [row["operation"] for row in listed["not_granted"]]:
+            low = {"account": "synthetic", "operation": operation, "parameters": {"title": "Synthetic"}}
+            risk = {"account": "synthetic", "operation": operation, "chat_id": "chat-synthetic",
+                    "parameters": {"title": "Synthetic"}}
+            calls = [
+                ("messages_preview_messenger_operation", low),
+                ("messages_execute_messenger_operation",
+                 {**low, "request_id": "synthetic-request", "preview_digest": "a" * 64}),
+                ("messages_manage_chat", {**risk, "dry_run": True}),
+                ("messages_manage_chat",
+                 {**risk, "dry_run": False, "request_id": "synthetic-request", "preview_digest": "a" * 64}),
+            ]
+            for name, args in calls:
+                count = len(seen)
+                assert client.post("/v1/" + name, json=args, headers=headers).status_code == 403, (name, operation)
+                assert rpc(client, "tools/call", {"name": name, "arguments": args}).json()["result"]["isError"]
+                assert len(seen) == count, (name, operation)
+        # The backend names leave_group for this receipt; the gateway still withholds it.
+        receipt = {"operation_id": "synthetic-leave"}
+        assert client.post("/v1/messages_get_messenger_operation", json=receipt, headers=headers).status_code == 403
+        assert rpc(
+            client, "tools/call", {"name": "messages_get_messenger_operation", "arguments": receipt}
+        ).json()["result"]["isError"]
+
+
+# spec: ANYM-846
+def test_the_list_description_says_a_not_granted_operation_exists_and_names_the_grant_to_ask_for():
+    description = CATALOG["messages_list_messenger_operations"]["description"]
+    for code in ("not_granted", "profile_action", "principal_action", "gateway_scope:<scope>",
+                 "backend_permission:<scope>", "do not report a missing feature", "ask the owner for the named grant"):
+        assert code in description, code
 
 
 def test_backend_support_narrows_discovery_and_rechecks_cached_calls(tmp_path):
