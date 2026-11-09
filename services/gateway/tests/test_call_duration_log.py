@@ -175,8 +175,12 @@ def test_the_documented_one_liner_prints_p50_and_p90_per_tool_from_captured_line
             client.post("/v1/calendar_calendars", json={}, headers=HEADERS)
         client.post("/v1/calendar_apply", json={}, headers=HEADERS)
     rows = parsed(lines)
-    # Other container output around the lines is ignored.
-    log = "\n".join(["INFO:     Started server process [1]", '{"other":1}', *lines, "gateway key warning"]) + "\n"
+    # Other container output around the lines is ignored, also lines that start like them or carry bad values.
+    noise = ["INFO:     Started server process [1]", '{"other":1}', '{"tool": unrelated diagnostic',
+             '{"tool":"calendar_apply","outcome":"ok","duration_ms":"n/a"}',
+             '{"tool":"calendar_apply","outcome":"ok","duration_ms":-5}',
+             '{"tool":"calendar_apply","outcome":"ok","duration_ms":7,"extra":1}']
+    log = "\n".join([*noise[:3], *lines[:2], *noise[3:], *lines[2:], "gateway key warning"]) + "\n"
     out = subprocess.run([sys.executable, "-c", documented_program()], input=log, capture_output=True, text=True,
                          check=True, timeout=30).stdout.splitlines()
     expected = {}

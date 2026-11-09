@@ -3355,9 +3355,10 @@ refuses before the handler (no key, wrong origin, body too large) write no line.
 day, calls and nearest-rank p50/p90 in milliseconds (the container: `docker ps --format '{{.Names}}' | grep gateway`):
 
 ```sh
-docker logs --since 24h <gateway container> 2>&1 | python3 -c 'import sys,json;R=[json.loads(x) for x in sys.stdin if x.startswith("{\"tool\":")];D={};[D.setdefault(r["tool"],[]).append(r["duration_ms"]) for r in R if set(r)=={"tool","outcome","duration_ms"}];[print(t,"calls=%d"%len(v),"p50_ms=%d"%sorted(v)[(len(v)-1)//2],"p90_ms=%d"%sorted(v)[(9*len(v)-1)//10]) for t,v in sorted(D.items())]'
+docker logs --since 24h <gateway container> 2>&1 | python3 -c 'import sys,re,json;P=re.compile(r"\{\"tool\":\"[a-z0-9_]+\",\"outcome\":\"[a-z0-9_]+\",\"duration_ms\":[0-9]+\}");D={};[D.setdefault(r["tool"],[]).append(r["duration_ms"]) for r in (json.loads(x) for x in map(str.strip,sys.stdin) if P.fullmatch(x))];[print(t,"calls=%d"%len(v),"p50_ms=%d"%sorted(v)[(len(v)-1)//2],"p90_ms=%d"%sorted(v)[(9*len(v)-1)//10]) for t,v in sorted(D.items())]'
 ```
 
+Only lines of exactly that shape count; any other output, also one that starts like it, is skipped.
 Docker's log rotation for the container bounds how far back `--since` reaches.
 services/gateway/tests/test_call_duration_log.py runs this program on captured lines.
 
