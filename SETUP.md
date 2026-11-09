@@ -255,13 +255,13 @@ an older server or drainer rejects and quarantines envelopes that still hold the
 ### Telegram polls
 
 The Telegram collector keeps a poll's question, options and flags (`metadata.poll`), Telegram's counts and, for a
-public poll, its voter list ([CONVERSATION.md](CONVERSATION.md), ANYM-920) only when its environment sets
-`ANYMSG_CAPTURE_TELEGRAM_POLLS=1`; it is off by default. Off, a poll message is stored with its kind only, pushed
-poll updates are ignored and no voter list is read. Set it once the release a rollback would return to has schema 84
-(migration 084): an older server or drainer rejects a captured poll message, a `telegram_poll_results` or a
-`telegram_poll_votes` entry and quarantines it. Enabling it needs a collector restart, which stops and starts the
-provider session: it runs only on the owner's exact confirmation, or rides the restart of a deploy. To roll back
-past schema 84, remove the flag, restart and let the spool drain first.
+public poll, its voter list ([CONVERSATION.md](CONVERSATION.md), ANYM-920); it is on by default, and
+`ANYMSG_CAPTURE_TELEGRAM_POLLS=0` in the collector's environment is the kill switch. Off, a poll message is stored
+with its kind only, pushed poll updates are ignored and no voter list is read. An older server or drainer (before
+schema 84, migration 084) rejects a captured poll message, a `telegram_poll_results` or a `telegram_poll_votes`
+entry and quarantines it: to roll back past schema 84, set the kill switch, restart and let the spool drain first.
+Changing it needs a collector restart, which stops and starts the provider session: it runs only on the owner's
+exact confirmation, or rides the restart of a deploy.
 
 ### Reply queue upgrade (0.9.17)
 

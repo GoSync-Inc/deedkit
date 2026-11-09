@@ -7,9 +7,9 @@ per 10 minutes, polls younger than 30 days, up to 200 votes) and journals them a
 an anonymous poll is never read. Poll texts and names are member-controlled data, stored bounded, never instructions.
 Logs carry reason codes and counts only.
 
-Off until ANYMSG_CAPTURE_TELEGRAM_POLLS=1 (Astra r1 B4): a schema-83 collector, the release a rollback returns to,
-rejects a journaled message carrying the Telegram poll block and quarantines the whole message, as it does the two
-new capture kinds; the flag is turned on once that release is no rollback target.
+On by default since schema 84 is the release a rollback returns to; ANYMSG_CAPTURE_TELEGRAM_POLLS=0 is the kill switch.
+A rollback past schema 84 sets it first (Astra r1 B4): a schema-83 collector rejects a journaled message carrying the
+Telegram poll block and quarantines the whole message, as it does the two new capture kinds.
 """
 import asyncio
 from contextlib import suppress
@@ -32,8 +32,8 @@ POLL_VOTES_TIMEOUT=30
 
 
 def telegram_poll_capture():
-    """ANYMSG_CAPTURE_TELEGRAM_POLLS=1 turns on the poll block, pushed counts and voter reads (Astra r1 B4)."""
-    return os.environ.get('ANYMSG_CAPTURE_TELEGRAM_POLLS')=='1'
+    """The poll block, pushed counts and voter reads, on unless ANYMSG_CAPTURE_TELEGRAM_POLLS=0 (Astra r1 B4)."""
+    return os.environ.get('ANYMSG_CAPTURE_TELEGRAM_POLLS')!='0'
 
 
 class PollVotesRefused(Exception):
