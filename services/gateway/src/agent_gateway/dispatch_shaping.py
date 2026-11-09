@@ -8,7 +8,7 @@ from .adapters.calls import receipt_reference
 from .catalog import routed
 from .diagnostics import manifest_summary
 from .policy import Denied
-from .sections import capabilities_view, subscription_blocks
+from .sections import capabilities_view, negotiation_calls, subscription_blocks
 from .catalog import ACTIONS, CATALOG
 
 CALENDAR_CONSTRAINTS = {
@@ -307,6 +307,8 @@ def shape_result(gateway, result, *, tool, module, snapshot, agent, caps, curren
     move of the code that ran inline; `gateway` is the Dispatch that called it."""
     if module == "messaging":
         result = gateway.next_call(result, snapshot, agent, caps)
+    if module == "messaging" and tool["operation"] == "list_negotiations":
+        result = negotiation_calls(result, gateway.policy.visible(snapshot, agent))
     if live_denied and isinstance(result, dict):
         # detail=transcript moves live and suggested_call from result_evidence to the top level.
         evidence = result["result_evidence"] if isinstance(result.get("result_evidence"), dict) else result

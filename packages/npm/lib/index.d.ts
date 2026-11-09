@@ -267,6 +267,25 @@ export interface CapabilitiesArgs {
   detail?: 'summary' | 'full';
   sections?: CapabilitySection[];
 }
+export interface ListNegotiationsArgs {
+  states?: Array<'open' | 'upcoming' | 'past' | 'cancelled' | 'stale'>;
+  chat_types?: Array<'private' | 'group' | 'channel' | 'unknown'>;
+  chat_ids?: string[];
+  accounts?: string[];
+  /** A person UUID or any resolve_target input. */
+  person?: string;
+  from_time?: string;
+  to_time?: string;
+  updated_since?: string;
+  /** At most 50. */
+  negotiation_ids?: string[];
+  min_confidence?: 'low' | 'medium' | 'high';
+  order?: 'awaiting_owner_first' | 'updated' | 'soonest';
+  detail?: 'compact' | 'full';
+  /** 1-50, default 20. */
+  limit?: number;
+  cursor?: string;
+}
 export declare class AnyMsgClient {
   constructor(options: {baseUrl: string; token: string; timeoutMs?: number;
     maxResponseBytes?: number; fetch?: typeof globalThis.fetch});
@@ -285,6 +304,8 @@ export declare class AnyMsgClient {
   muteReplySource(args: {chat_id?: string; account?: string; sender_id?: string; reason?: ReplyReason; note?: string}): Promise<Record<string, unknown>>;
   unmuteReplySource(args: {chat_id?: string; account?: string; sender_id?: string}): Promise<Record<string, unknown>>;
   listReplyDismissals(args: {kind?: 'dismissed' | 'snoozed' | 'muted'; after?: string; limit?: number}): Promise<Record<string, unknown>>;
+  /** Read only: everything being arranged now, one item per chat's negotiation, with next read calls (ANYM-909). */
+  listNegotiations(args?: ListNegotiationsArgs): Promise<Record<string, unknown>>;
   listChats(args?: ListChatsArgs): Promise<ListChatsResult>;
   search(args?: SearchArgs): Promise<Record<string, unknown>>;
   searchPeople(args?: Arguments): Promise<Record<string, unknown>>;

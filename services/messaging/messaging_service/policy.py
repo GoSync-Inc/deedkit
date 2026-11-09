@@ -50,6 +50,8 @@ OPERATION_PERMISSIONS = {
     # ANYM-848: an agent's own wake targets, with the same permission pair as its endpoints.
     'register_wake_target':'delivery-write','list_wake_targets':'delivery-write','update_wake_target':'delivery-write',
     'delete_wake_target':'delivery-write','confirm_wake_target':'delivery-write',
+    # ANYM-909: every negotiation being arranged (ANYM-907 rows), read only.
+    'list_negotiations':'read',
 }
 # resolve_target is audited as resolve_reference (ANYM-545) and messages_send as its preview_message and
 # send_message steps (ANYM-546): the audit_log CHECK lists operations by migration.
@@ -88,6 +90,8 @@ AUDIT_CODES = frozenset({
     'reserved_header','rotation_in_progress','endpoint_limit','endpoint_conflict','operator_disabled',
     'invalid_endpoint_state','endpoint_paused','endpoint_auto_paused','dynamic_sources_disabled','source_filters_disabled','source_exclusions_disabled',
     'duplicate_send_unresolved','chat_changed_since_seen','chat_guard_unavailable',
+    # ANYM-909: list_negotiations refusals.
+    'not_ready','not_found_or_forbidden','selection_required',
 })
 UNSET = object()
 

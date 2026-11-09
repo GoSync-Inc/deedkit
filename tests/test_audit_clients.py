@@ -326,6 +326,21 @@ def test_python_attempt_listing_helper_sends_exact_wire_arguments_and_checks_the
         ('/v1/list_delivery_attempts', {'endpoint_id': ENDPOINT, 'limit': 5, 'before': ENDPOINT})]
 
 
+# spec: ANYM-909
+def test_python_negotiation_listing_helper_reads_list_negotiations_with_its_wire_arguments():
+    seen = []
+    def transport(request):
+        seen.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={'items': [], 'cursor': None})
+    with Client('https://archive.example', 'synthetic-token', transport=httpx.MockTransport(transport)) as client:
+        assert client.list_negotiations() == {'items': [], 'cursor': None}
+        client.list_negotiations(states=['past'], detail='full', limit=5)
+        with pytest.raises(TypeError):
+            client.list_negotiations(fill=True)
+    assert seen == [('/v1/list_negotiations', {}),
+        ('/v1/list_negotiations', {'states': ['past'], 'detail': 'full', 'limit': 5})]
+
+
 # spec: ANYM-519
 @pytest.mark.parametrize('operation,arguments', [
     ('register_delivery_endpoint', {'request_id': 'synthetic-endpoint', 'url': 'https://hooks.example', 'signing_secret': 'plain'}),

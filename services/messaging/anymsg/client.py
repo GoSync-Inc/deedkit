@@ -158,6 +158,9 @@ _SUBSCRIPTION_FIELDS = {
     'test_delivery_endpoint': ({'endpoint_id','request_id'}, {'endpoint_id','request_id'}),
     'list_delivery_attempts': ({'endpoint_id'}, {'endpoint_id','limit','before'}),
 }
+# ANYM-909: list_negotiations arguments, all optional.
+NEGOTIATION_ARGUMENTS = frozenset({'states','chat_types','chat_ids','accounts','person','from_time','to_time',
+    'updated_since','negotiation_ids','min_confidence','order','detail','limit','cursor'})
 _FEEDBACK_STATUSES = ('received','accepted','declined','duplicate','fixed','verify_requested','verified','reopened')
 _FEEDBACK_FIELDS = {
     'submit_feedback': ({'request_id','category','description'}, {'request_id','category','description','operation','refs'}),
@@ -572,6 +575,13 @@ class Client:
     def list_reply_dismissals(self, *, kind='dismissed', after='', limit=20):
         """List this key's dismissals or snoozes, or this agent's mutes, in chats it can read now."""
         return self.call('list_reply_dismissals',dict(kind=kind,after=after,limit=limit))
+
+    def list_negotiations(self, **arguments):
+        """ANYM-909: every negotiation being arranged now (states, chat_types, chat_ids, accounts, person, from_time,
+        to_time, updated_since, negotiation_ids, min_confidence, order, detail, limit, cursor); read only."""
+        unknown = set(arguments) - NEGOTIATION_ARGUMENTS
+        if unknown:raise TypeError('unknown list_negotiations arguments: ' + ', '.join(sorted(unknown)))
+        return self.call('list_negotiations', arguments)
 
     def preview_message(self,*,account,chat_id,text,reply_to='',format='plain',
                         link_preview=False,allow_lossy=False):

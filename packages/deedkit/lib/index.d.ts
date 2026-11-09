@@ -73,6 +73,7 @@ export type ToolName =
   | 'messages_list_delivery_endpoints'
   | 'messages_list_feedback'
   | 'messages_list_messenger_operations'
+  | 'messages_list_negotiations'
   | 'messages_list_reply_dismissals'
   | 'messages_list_subscriptions'
   | 'messages_list_wake_targets'

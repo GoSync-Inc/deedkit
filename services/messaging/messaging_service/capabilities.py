@@ -104,6 +104,7 @@ def capabilities(self, token, detail='full', sections=None):
             features['cursor-write'].append('dismiss_reply')
             features['cursor-write'].extend(['snooze_reply','restore_reply','mute_reply_source','unmute_reply_source'])
             features['read'].append('list_reply_dismissals')
+            features['read'].append('list_negotiations')
             features['read'].extend(['list_subscriptions','get_subscription','get_subscription_events','fetch_subscription_events','wait_for_subscription_events','list_feedback'])
             features['subscription-ack']=['ack_subscription_events']
             features['feedback-write']=['submit_feedback']

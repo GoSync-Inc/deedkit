@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
+import jsonschema
 import psycopg
 from psycopg import sql
 import pytest
@@ -13,7 +14,7 @@ from family_calendar.errors import CalendarError
 from family_calendar.service import cli
 from family_calendar.service.core import READ
 from family_calendar.service.store import Store
-from tests.service.test_find_time_intent import DAY, find, setup
+from tests.service.test_find_time_intent import DAY, find, schema, setup
 
 MASHA = "6f1c2a3e-4b5d-4e6f-8a7b-9c0d1e2f3a4b"
 ZOE = "0d9e8f7a-6b5c-4d3e-9f2a-1b0c9d8e7f6a"
@@ -68,6 +69,22 @@ def test_a_person_id_resolves_to_the_linked_member_of_the_callers_calendar_only(
     # A disabled member is hidden too, although the link stays.
     store.query("UPDATE memberships SET enabled=false WHERE group_id='family' AND person_id='child'")
     assert find(store, key, people=[MASHA], window=DAY)["error"] == "not_found"
+
+
+# spec: ANYM-909
+def test_a_negotiation_next_for_an_unlinked_owner_is_not_found_and_nothing_else(store, tmp_path):
+    """The call list_negotiations puts in `next` (the owner's messaging UUID only, a {from, to} window with an offset,
+    a duration), made as given for an owner the calendar has no link for: the deployed answer is not_found with
+    next calendar_members only, so the agent skips the calendar check (CONVERSATION.md "Help with the schedule")."""
+    key = setup(store)
+    owner = "22222222-3333-4444-8555-666666666666"
+    request = {"people": [owner], "window": {"from": "2026-10-20T09:30:00+08:00", "to": "2026-10-20T11:00:00+08:00"},
+               "duration": 60}
+    jsonschema.validate(request, schema("find_time"))
+    assert find(store, key, **request) == {"error": "not_found", "next": {"tool": "calendar_members", "arguments": {}}}
+    # Linked, the same call resolves the owner's member.
+    link(store, tmp_path, "--member", "adult-a", "--person", owner)
+    assert [m["member_id"] for m in find(store, key, **request)["people"]] == ["adult-a"]
 
 
 # spec: ANYM-554
