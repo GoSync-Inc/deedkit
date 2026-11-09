@@ -904,6 +904,25 @@ def test_filtered_module_batches_keep_the_matcher_busy_until_the_matching_event(
     assert store.get_subscription(token, sid)['module_stream']['matched_through'] == wanted
 
 
+# spec: ANYM-841
+def test_a_rolled_back_module_step_counts_no_progress_so_the_matcher_sleeps(modules, monkeypatch):
+    from messaging_service.subscription_worker import busy
+    store = modules[0]
+    token = subscriber(store)
+    sid = mixed(store, token, types=('call.owner_request',))
+    publish(store, call_event(1))  # call.finished: not selected
+    real = module_events.match
+
+    def failing(c, row, **kwargs):
+        real(c, row, **kwargs)
+        raise RuntimeError('synthetic frontier failure')  # after the counts, inside the module savepoint
+
+    monkeypatch.setattr(module_events, 'match', failing)
+    stats = match_subscriptions(store, batch_size=1)
+    assert (stats['module_scanned'], stats['module_matched']) == (0, 0) and not busy(stats)
+    assert store.get_subscription(token, sid)['module_stream']['matched_through'] == 0
+
+
 # spec: ANYM-562
 def test_a_failing_hint_step_keeps_the_module_matches(modules, monkeypatch):
     store = modules[0]

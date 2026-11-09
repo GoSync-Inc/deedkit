@@ -909,10 +909,13 @@ def _match_modules(c, row, batch_size, maximum, stats):
     """ANYM-562: the module stream after the message pass, in a savepoint of its own: a failure is
     logged and rolls back only the module step; the message matches above still commit."""
     from . import module_events
+    # ANYM-841: a rolled-back module step made no progress, so its counts never keep the matcher busy.
+    progress = {key: stats.get(key, 0) for key in ('module_matched', 'module_scanned')}
     try:
         with c.transaction():
             module_events.match(c, row, batch_size=batch_size, maximum=maximum, stats=stats)
     except Exception as error:
+        stats.update(progress)
         from .telemetry import capture
         capture(error, 'subscription_module_match_failed')
         print(json.dumps({'error': 'subscription_module_match_failed', 'class': type(error).__name__}), flush=True)
