@@ -8466,6 +8466,36 @@ def test_status_prints_one_json_document_and_the_inference_worker_line_with_no_r
     assert p.inference_worker_line() == INFERENCE_WORKER_LINE
 
 
+# spec: ANYM-908
+def test_status_shows_the_negotiation_worker_heartbeat_and_owner_zone_only_once_it_is_selected(monkeypatch):
+    project = {"name": "deedkit", "directory": "/srv/deedkit/deploy", "files": ["compose.yaml"], "env_files": [],
+               "services": {"api": "runtime", "negotiations": "runtime"}}
+    assert p.negotiation_worker_line({"projects": [{**project, "services": {"api": "runtime"}}]}) is None
+    assert p.negotiation_worker_line({}) is None
+    calls = []
+    def reply(output):
+        def run(argv, **options):
+            calls.append(argv)
+            return output
+        return run
+    monkeypatch.setattr(p, "run", reply(json.dumps({"owner_zone": "Europe/Moscow", "heartbeat": {
+        "version": "0.9.19+source-filters.source-exclusions", "beat_at": "2026-11-09T12:00:00+00:00"}})))
+    assert p.negotiation_worker_line({"projects": [project]}) == ("negotiation worker: heartbeat "
+        "0.9.19+source-filters.source-exclusions at 2026-11-09T12:00:00+00:00, owner zone Europe/Moscow")
+    assert calls[-1][:2] == ["docker", "compose"] and calls[-1][-7:] == [
+        "exec", "-T", "negotiations", "python", "-m", "messaging_service.negotiation_worker", "--status"]
+    monkeypatch.setattr(p, "run", reply(json.dumps({"owner_zone": "UTC_fallback", "heartbeat": None})))
+    assert p.negotiation_worker_line({"projects": [project]}) == "negotiation worker: no heartbeat, owner zone UTC_fallback"
+    for output in ("not json", json.dumps({"owner_zone": "a b"}), json.dumps({"owner_zone": "UTC", "heartbeat": {
+            "version": "x y", "beat_at": "now"}})):
+        monkeypatch.setattr(p, "run", reply(output))
+        assert p.negotiation_worker_line({"projects": [project]}).startswith("negotiation worker: unreadable (")
+    def refused(argv, **options):
+        raise p.Refused("docker failed (exit 1); production was not accepted")
+    monkeypatch.setattr(p, "run", refused)
+    assert p.negotiation_worker_line({"projects": [project]}) == "negotiation worker: unreadable (Refused)"
+
+
 # spec: ANYM-794
 @given(st.binary(max_size=200) | JSON_VALUES.map(lambda value: json.dumps(value).encode()))
 def test_any_inference_worker_receipt_gives_one_line_and_no_error(content):

@@ -1469,6 +1469,39 @@ Read-back: a synthetic module event published by a test producer appears in `mod
 compose $F stop event-router`, remove it from `files`; cursors and gaps stay (schema 58 is
 additive) and a later start resumes from the stored cursor.
 
+### Negotiation worker (ANYM-908)
+
+The negotiation worker (`negotiations` in `deploy/compose.subscriptions.yaml`, `python -m
+messaging_service.negotiation_worker`) is the only writer of the ANYM-907 tables. It reads the journal and the
+archive, never sends, calls a model or opens a provider, and no collector, send or hint path imports it. No
+release starts it: it runs only once the steps below select it. A new role file and migration
+`081_negotiation_heartbeat.sql` (manual: the `component_heartbeats` CHECK gains `negotiations`, and an RLS
+policy limits the role to that row) pause autodeploy; release them by hand at once ("Migration releases" item
+4). Neither deletes or rewrites user data (non-critical tier). None of it runs during an active call (check
+read-only first).
+1. Install the role file as owner: `negotiation_role.sql` (grants only, on existing objects; the role comes
+   with 076). Undo: `REVOKE` each grant it lists (the file names them), or `DROP OWNED BY messaging_negotiations`
+   after the worker is stopped (076's own table grants then need `store.migrate`'s re-apply).
+2. Create the LOGIN and its DSN file: `CREATE ROLE messaging_negotiations_runtime LOGIN PASSWORD '<random>' IN ROLE
+   messaging_negotiations` (member of that role only), DSN in `private/negotiations.dsn` (0600, owned by uid
+   10001 like the other DSNs). Never the value into Git, a log or a chat. Undo: stop the service, `DROP ROLE
+   messaging_negotiations_runtime`, remove the file.
+3. Apply the heartbeat migration: the item 4 route (`prepare`, the runner lock wrapper, `migrate`), together with
+   any other pending migration. Undo: none needed for a compatible older runtime (it writes no `negotiations`
+   row); the CHECK and the policy stay.
+4. Start the service. `/etc/deedkit/production.json` (backup first): add `"negotiations": "runtime"` to the
+   messaging project's `services`, whose `files` already hold `compose.subscriptions.yaml`. Then apply the next
+   green `main` SHA under the pause file (`prepare --sha S`, `apply --sha S`). The worker's start fence exits
+   `not_ready` and writes nothing while a grant of step 1 or a table of 076 is missing. Its first start backfills
+   the journal's events of the last 14 days. Undo: remove the service from `services` and `docker compose $F
+   stop negotiations`; the tables keep what it wrote (a later start resumes from its cursor).
+5. Check: `production.py status` prints `negotiation worker: heartbeat <version> at <time>, owner zone <label>`.
+   The label must not be `UTC_fallback`: `ANYMSG_OWNER_TIMEZONE` comes from the project's env file. The start
+   log line `negotiation_worker_started owner_zone=<label>` says the same. Skipped events log
+   `negotiation_event_skipped message=<id> error=<class>`; every 10 minutes
+   `negotiation_worker_totals processed=<n> skipped=<n>` counts them (criterion 7 reads these lines and the
+   tables, read-only).
+
 Host steps that touch the firewall (the delivery and inference rules) read the boot receipt first: `python3
 scripts/inference_egress_check.py verify --receipt-check` and the same for `delivery_egress_check.py` print
 `ok` and `receipt ok` only when the rules agree and `/var/lib/deedkit/firewall-verify.json` is ok for the current boot

@@ -34,6 +34,20 @@ def record(store, component):
         return False
 
 
+def beat(c, component):
+    """The same upsert on an autocommit connection a worker already holds (ANYM-908: the negotiation worker, whose
+    component row the negotiation_heartbeat migration allows). Not a COMPONENTS member: the delivery gate never waits on it. Never raises."""
+    import psycopg
+    from .store import RUNTIME_SCHEMA
+    try:
+        c.execute('''INSERT INTO component_heartbeats(component,version,schema_version,beat_at)
+            VALUES(%s,%s,%s,clock_timestamp()) ON CONFLICT(component) DO UPDATE SET version=EXCLUDED.version,
+            schema_version=EXCLUDED.schema_version,beat_at=EXCLUDED.beat_at''', (component, identity(), RUNTIME_SCHEMA))
+        return True
+    except psycopg.Error:
+        return False
+
+
 def mismatch(c, *, features=()):
     """None when every component is fresh and runs this version on the current schema (and, when named,
     reports these build features), else the first problem."""

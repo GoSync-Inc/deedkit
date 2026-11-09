@@ -29,13 +29,13 @@ BASE = ["compose.yaml", "compose.collectors.yaml", "compose.whatsapp.yaml", "com
 NATIVE = "compose.whatsapp-native.yaml"
 APPLICATIONS = {"api", "telegram", "whatsapp1", "whatsapp2", "indexer", "enricher", "enricher-local",
                 "operator", "subscriptions", "file-lifecycle", "cold-archive", "cold-restore",
-                "file-understanding", "message-purge", "delivery", "delivery-egress", "enricher-mini"}
+                "file-understanding", "message-purge", "delivery", "delivery-egress", "enricher-mini", "negotiations"}
 COLLECTORS = {"telegram", "whatsapp1", "whatsapp2"}
 SECRET_DIRECTORIES = ["processing-locks", "telegram-session", "whatsapp1-session", "whatsapp2-session",
                       "issued-keys", "cold-archive-identity", "cold-archive-ssh", "enrichment-models", "delivery-receivers", "inference"]
 SECRET_FILES = ["app.dsn", "collector.dsn", "indexer.dsn", "owner.dsn", "subscriptions.dsn", "enrichment.dsn",
                 "enrichment-local.dsn", "file-lifecycle.dsn", "cold-archive.dsn", "file-understanding.dsn", "message-purge.dsn",
-                "delivery.dsn", "delivery-policy.json",
+                "delivery.dsn", "delivery-policy.json", "negotiations.dsn",
                 "enrichment.keys", "enrichment.json", "enrichment-local.json", "enrichment-mini.json", "file-understanding.json",
                 "cold-archive.json", "telegram.json", "telegram.credentials.json", "telegram.permit.json",
                 "whatsapp1.json", "whatsapp1.permit.json", "whatsapp2.json", "whatsapp2.permit.json"]
