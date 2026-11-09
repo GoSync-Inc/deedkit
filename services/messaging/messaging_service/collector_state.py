@@ -416,8 +416,10 @@ class CollectorState:
             if row['peer_kind']!=peer_kind: raise PeerKindConflict()
             return row
 
-    def inventory(self,dialogs,history_since,*,discovery=False):
-        """Persist the catalog before any history fetch. Fence bounded batches."""
+    def inventory(self,dialogs,history_since,*,discovery=False,listed_at=None):
+        """Persist the catalog before any history fetch. Fence bounded batches.
+
+        listed_at: when the dialog list was read (ANYM-869 group titles); unknown means now."""
         for offset in range(0,len(dialogs),100):
             with self.archive.store.pool.connection() as c:
                 self.archive.fence(c,self.account,self.lease)
@@ -443,7 +445,9 @@ class CollectorState:
                             THEN 'channel' ELSE collector_chats.peer_kind END''',
                         (self.account,chat,kind,history_since,discovery))
                     from .archive import group_title_kept
-                    if group_title_kept(c,self.account,stable_id('chat',self.account,chat),chat,title or chat):title=chat
+                    from datetime import timezone
+                    if group_title_kept(c,self.account,stable_id('chat',self.account,chat),chat,title or chat,
+                            listed_at or datetime.now(timezone.utc)):title=chat
                     c.execute('''INSERT INTO chats(id,account,title,chat_type,provider_chat) VALUES(%s,%s,%s,%s,%s)
                         ON CONFLICT(id) DO UPDATE SET
                         title=CASE WHEN excluded.title<>%s AND excluded.title<>'' THEN excluded.title ELSE chats.title END,

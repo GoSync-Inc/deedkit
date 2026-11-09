@@ -202,15 +202,17 @@ def whatsapp_unreadable_shape(e):
 _SNAPSHOT=object()
 
 
-def group_title_kept(c,account,chat_id,provider_chat,title):
-    """ANYM-869: a WhatsApp group whose name came from a rename or join row keeps the newest of those. A page or
-    dialog list carrying another title (read before the rename, e.g. at the start of a scan) never rewinds it.
-    Only a title that differs from the stored one pays for the lookup."""
+def group_title_kept(c,account,chat_id,provider_chat,title,observed_at):
+    """ANYM-869: a WhatsApp group title observed at `observed_at` (a page message's sent time, a dialog list's read
+    time) does not replace the stored one while a rename or join row newer than that observation exists: it was
+    read before that rename. A later observation names the group again, so a rename that was never captured
+    (session down) still reaches the title. Only a title that differs from the stored one pays for the lookup."""
     if not provider_chat.endswith('@g.us') or title in ('',provider_chat):return False
     stored=c.execute('SELECT title FROM chats WHERE id=%s',(chat_id,)).fetchone()
     return bool(stored and stored['title']!=title and c.execute('''SELECT 1 FROM messages m
-        JOIN message_metadata md ON md.message=m.id WHERE m.account=%s AND m.chat=%s
-        AND md.metadata->'group_change'->>'change' IN ('rename','joined_group') LIMIT 1''',(account,chat_id)).fetchone())
+        JOIN message_metadata md ON md.message=m.id WHERE m.account=%s AND m.chat=%s AND m.sent_at>%s
+        AND md.metadata->'group_change'->>'change' IN ('rename','joined_group') LIMIT 1''',
+        (account,chat_id,observed_at)).fetchone())
 
 
 def ingest_outcome(old,e,retained_snapshot,sender_alias=False,retained_buttons=_SNAPSHOT):
@@ -452,7 +454,7 @@ class Archive:
             # may create its chat but never rewrites the chat's title or type.
             unreadable_shape=whatsapp_unreadable_shape(e)
             title=e['chat_title']
-            if e['platform']=='whatsapp' and 'group_change' not in e.get('metadata',{}) and group_title_kept(c,aid,cid,e['chat'],title):
+            if e['platform']=='whatsapp' and 'group_change' not in e.get('metadata',{}) and group_title_kept(c,aid,cid,e['chat'],title,e['sent_at']):
                 title=e['chat']
             # So does a stored receipt's replay: the chat row may have moved on since (ANYM-796).
             if unreadable_shape or replay:c.execute('''INSERT INTO chats(id,account,title,provider_chat,chat_type)

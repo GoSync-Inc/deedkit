@@ -1124,10 +1124,18 @@ def test_an_older_synced_rename_never_overwrites_the_newer_group_title(wa_groups
     assert state.apply(group_capture('rename',1700000300,value='Ещё новее'))['outcome']=='created'
     assert wa_chat(store)['title']=='Ещё новее'
     # A scan page or a dialog list read before the rename carries the old title: neither rewinds it (Astra r1 M1).
+    at=lambda unix:datetime.fromtimestamp(unix,timezone.utc)
     assert state.apply(wa_capture('false_'+WA_GROUP+'_PAGE',1700000050,body='старое сообщение',origin='reconcile',
         title='Новое имя'))['outcome']=='created'
-    state.inventory([(WA_GROUP,'chat','Старое имя','group')],None)
+    state.inventory([(WA_GROUP,'chat','Старое имя','group')],None,listed_at=at(1700000250))
     assert wa_chat(store)['title']=='Ещё новее'
+    # A rename that was never captured (session down) still arrives: a dialog list read after the newest
+    # rename row, then a page message sent after it, name the group again (orchestrator fix-diff read).
+    state.inventory([(WA_GROUP,'chat','Пропущенное имя','group')],None,listed_at=at(1700000400))
+    assert wa_chat(store)['title']=='Пропущенное имя'
+    assert state.apply(wa_capture('false_'+WA_GROUP+'_LATER',1700000500,body='новое сообщение',origin='reconcile',
+        title='Имя со страницы'))['outcome']=='created'
+    assert wa_chat(store)['title']=='Имя со страницы'
     # A group with no rename or join row keeps today's behaviour: the page and the dialog list name it.
     other='120363000000000010@g.us'
     state.apply(wa_capture('false_'+other+'_A',1700000050,body='привет',chat=other,title='Из списка чатов'))
