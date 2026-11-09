@@ -1227,13 +1227,18 @@ TEST_DIR = re.compile(r'(^|/)tests?/', re.I)
 CODE_FILE = re.compile(r'\.(py|pyi|js|mjs|cjs|ts|tsx|go|sh)$', re.I)
 TEST_FILE = re.compile(r'(^|/)test_[^/]*\.py$|\.test\.[^/]+$|_test\.go$')
 # The harness review paths in this repository (owner review cut 11-09, D56; harness reviews.md, Routing): sends,
-# calls and ACKs, collector and provider-session code, keys, access policy and role SQL (a grant ANYM-590 L1 admits).
+# calls and ACKs, collector and provider-session code, the gateway, keys, access policy and role SQL (a grant
+# ANYM-590 L1 admits).
 # Only a diff that touches one gets the controller's own Astra review; deletion, secrets, other grants and CI
 # permissions already park on SIGNAL_TEXT and PROTECTED. Wider than the code needs on purpose: a false match costs one
 # review, a miss merges unreviewed.
-REVIEW_PATHS = re.compile(r'^(services/calls/|whatsapp/)|^services/messaging/messaging_service/[^/]*(send|outgoing|'
-                          r'receipt|collector|pair|session|identity|governor|operations|button_press|adapters|policy|'
-                          r'key_admin|security)[^/]*$|(^|/)[^/]*roles?\.sql$', re.I)
+REVIEW_PATHS = re.compile(r'^(services/calls/|whatsapp/)|^services/gateway/(?!.*\.md$)|'
+                          r'^services/messaging/messaging_service/([^/]*(send|outgoing|receipt|collector|pair|session|'
+                          r'identity|governor|operations|button_press|adapters|policy|key_admin|security|subscription)'
+                          r'[^/]*|update_queries\.py)$|(^|[/_])acks?[_.][^/]*$|(^|/)[^/]*roles?\.sql$', re.I)
+# ACK code also lives inside the large shared modules (app.py, store.py, the client): a changed line naming an ACK
+# (`ack_updates`, `acked_at`, `_ack`) is a review path wherever it is.
+REVIEW_TEXT = re.compile(r'^[-+](?![-+]).*(\back(ed|s)?_|_ack(ed|s)?\b)', re.I)
 REVIEW_RISK = ('the feedback autoloop merges this PR with no human step and its diff touches a review path (sends, '
                'calls, ACKs, collector or provider sessions, keys or access policy): a defect there acts on the '
                "owner's accounts")
@@ -1988,7 +1993,8 @@ def controller(state, cfg, snap, now, gh, prs, review=None):
         # Only a review-path diff waits for the controller's own review (owner review cut 11-09, D56); any other
         # clean head is approved as it stands, bound to that head and card like a reviewed one.
         risky = [n for f in files for n in (f['filename'], f.get('previous_filename')) if isinstance(n, str)
-                 and REVIEW_PATHS.search(n)]
+                 and REVIEW_PATHS.search(n)] + [f['filename'] for f in files if isinstance(f.get('patch'), str)
+                                                and any(map(REVIEW_TEXT.search, f['patch'].splitlines()))]
         seen = review_of(state, name, i, pr, head, spec, now, review, failed) if risky else 'approve'
         if seen != 'approve':
             out[name] = seen if seen in ('reviewing', 'waiting') else park(seen)

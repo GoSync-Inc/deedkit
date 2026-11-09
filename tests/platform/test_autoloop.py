@@ -2120,6 +2120,12 @@ def test_a_clean_pr_off_the_review_paths_is_armed_on_green_checks_with_no_contro
     ('services/calls/outbound.py', True),
     ('services/calls/telegram_session_owner.py', True),
     ('whatsapp/whatsmeow/client.go', True),
+    ('services/gateway/src/agent_gateway/sections.py', True),
+    ('services/messaging/messaging_service/subscription_consumption.py', True),
+    ('services/messaging/messaging_service/update_queries.py', True),
+    ('services/messaging/messaging_service/event_ack.py', True),
+    ('services/gateway/README.md', False),
+    ('services/messaging/messaging_service/feedback.py', False),
     ('services/messaging/messaging_service/chat_titles.py', False),
     ('services/messaging/messaging_service/negotiation_state.py', False),
     ('services/calendar/family_calendar/service/app.py', False),
@@ -2127,6 +2133,27 @@ def test_a_clean_pr_off_the_review_paths_is_armed_on_green_checks_with_no_contro
 def test_the_review_paths_are_send_call_ack_collector_session_key_and_access_code(path, review):
     assert bool(autoloop.REVIEW_PATHS.search(path)) is review
     assert bool(autoloop.REVIEW_PATHS.search(path.upper())) is review  # any case, as the other path lists
+
+
+# spec: ANYM-572
+@pytest.mark.parametrize('row, review', [
+    ('+    def ack_updates(ctx, consumer, receipt, expected_version):', True),
+    ('-        store.ack_subscription_events(token, sid, receipt, version)', True),
+    ("+    c.execute('UPDATE update_cursors SET acked_at = now()')", True),
+    ('+def _ack(receipt):', True),
+    ('+    feedback = load_feedback()  # a fallback, not an ACK', False),
+    ('+++ b/services/messaging/messaging_service/ack_notes.py', False)])
+def test_a_changed_line_naming_an_ack_in_a_shared_module_is_a_review_path(tmp_path, row, review):
+    assert bool(autoloop.REVIEW_TEXT.search(row)) is review
+    a = tmp_path / 'autoloop'
+    a.mkdir(mode=0o700)
+    finished_build(a)
+    autoloop.put(a, dict(autoloop.intents(a)[BUILD], paths=['services/messaging/messaging_service/app.py']))
+    fakes, started = Fakes(open_prs=[build_pr()]), []
+    fakes.compares = {H1: [changed_file('services/messaging/messaging_service/app.py', 'modified', row)]}
+    done = autoloop.controller(a, cfg(), snap(ready(30)), NOW, fakes.gh, fakes.prs,
+                               lambda *args: started.append(args))[0]
+    assert done == ({BUILD: 'reviewing'} if review else {BUILD: 'armed'}) and bool(started) is review
 
 # spec: ANYM-572
 def test_an_armed_pr_is_checked_again_each_tick_and_dequeued_when_its_lines_or_card_change(tmp_path):
