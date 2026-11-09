@@ -813,6 +813,17 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
         'matched_at': event['matched_at'], 'delivered_at': delivered_at(event),
         'historical': origin in ('backfill', 'reconcile'),
         'matching_basis': 'exact_event_revision'} for event, origin in zip(events, seen)]
+    # ANYM-866: each file's state as a message read shows it now. The lookup runs in a savepoint: a failure (timeout,
+    # bad row) leaves the page and its transaction whole, without attachments, and is counted.
+    from . import result_evidence
+    try:
+        with c.transaction():
+            result_evidence.event_attachments(c, items)
+    except Exception:
+        from .attachment_metadata import count_media_error
+        count_media_error('lookup_failed')
+        for item in items:
+            item.pop('attachments', None)
     from .subscription_consumption import wake_reason
     for item, event in zip(items, events):
         item['wake_reason'] = wake_reason({**item, 'reply_to_own_send': event['own_send_reply']}, row['selector'])

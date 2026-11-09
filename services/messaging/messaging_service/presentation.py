@@ -13,11 +13,11 @@ CONVERSATION_FIELDS = ('body','kind','is_service','display_text','position','ord
 FILE_FIELDS = ('attachment_id','id','message_id','account','chat','revision','sha256','mime',
     'bytes','display_name','download_status','extraction_status','extraction_quality','enrichment_status',
     'truncated','error_code','title','document_type','snippet','match_type',
-    'matched_content','media_class','match_sources','matched_in','matched_in_unverified','content_searched','message_context','excerpt_source','transcript_ready','text_excerpt','processing_profile','error_detail','attempts','next_due')
+    'matched_content','media_class','match_sources','matched_in','matched_in_unverified','content_searched','message_context','excerpt_source','transcript_ready','text_excerpt','processing_profile','error_detail','attempts','next_due','media')
 
 
 TRANSCRIPT_BODY_CHARS = 2000
-LEAN_FILE_FIELDS = ('id','display_name','mime','bytes','download_status','extraction_status','extraction_quality','error_code','transcript_ready','text_excerpt')
+LEAN_FILE_FIELDS = ('id','display_name','mime','bytes','download_status','extraction_status','extraction_quality','error_code','transcript_ready','text_excerpt','media')
 
 
 def options(method, arguments):

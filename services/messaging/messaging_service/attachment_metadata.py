@@ -7,7 +7,9 @@ not a replacement for the archive's digest/integrity verification.
 """
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime, timezone
+import json
 
 from .file_index import file_response_fields
 from .file_lifecycle import CHAT_POLICY_HOURS
@@ -175,3 +177,85 @@ def attachment_fields(row, *, original_present=None):
                 source[name]=row[alias];break
     item['source']=source
     return item
+
+
+# ANYM-866: one state per file, the same in a message read (the item's `media`) and in the event stream's
+# attachments. media_view derives it from attachment_fields' item only, so the two cannot disagree.
+MEDIA_STATES = ('queued', 'available_on_request', 'ready', 'failed', 'superseded', 'blocked')
+STAGE_STATES = ('queued', 'available_on_request', 'ready', 'failed', 'unsupported', 'not_applicable')
+BLOCKED_REASONS = {'collection_excluded': 'collection_excluded', 'media_size_limit': 'size_limit'}  # else policy
+# Later stages of a file that will not reach them by itself: waiting for a request, failed, or never.
+_LATER = {'available_on_request': 'available_on_request', 'failed': 'failed', 'superseded': 'not_applicable',
+    'blocked': 'not_applicable'}
+_STAGE = {'ready': 'ready', 'failed': 'failed', 'unsupported': 'unsupported',
+    'available_on_request': 'available_on_request', 'not_configured': 'not_applicable', 'unconfigured': 'not_applicable'}
+# Process-lifetime count of files whose state could not be computed, by reason code (criterion 4).
+MEDIA_STATE_ERRORS = Counter()
+
+
+def _profile_kind(mime):
+    # The processing profile kind of the read's SQL: audio, image, else document.
+    mime = mime or ''
+    return 'audio' if mime.startswith('audio/') or mime == 'application/ogg' else (
+        'image' if mime.startswith('image/') else 'document')
+
+
+def media_view(item, row):
+    state, phase = item['state'], item['download_phase']
+    if state not in ('queued', 'leased', 'ready', 'failed', 'superseded'):
+        raise ValueError('unknown_job_state')
+    if state == 'superseded':
+        media = 'superseded'
+    elif phase == 'blocked':
+        media = 'blocked'
+    elif phase == 'available_on_request':
+        media = 'available_on_request'
+    elif state == 'failed' or state == 'queued' and (item.get('attempts') or 0) >= MEDIA_MAX_ATTEMPTS:
+        media = 'failed'
+    elif item['download_status'] == 'ready':
+        media = 'ready'
+    elif state in ('queued', 'leased'):
+        media = 'queued'
+    else:
+        raise ValueError('original_not_registered')
+    # A request never revives a failed or exhausted job (media_requests.request answers request_status=failed), so
+    # a failed file has no next action.
+    view = {'media_state': media,
+        'next_action': {'ready': 'get_attachment', 'available_on_request': 'request_file_download'}.get(media)}
+    if media == 'blocked':
+        view['reason'] = BLOCKED_REASONS.get(item['download_reason']) or BLOCKED_REASONS.get(
+            item.get('error_code')) or 'policy'
+    kind = _profile_kind(item.get('mime'))
+    if item.get('digest'):
+        text, model = _STAGE.get(item['extraction_status'], 'queued'), _STAGE.get(item['enrichment_status'], 'queued')
+    else:
+        # Before the download: text is tried for every file; a model stage only where the account has a profile.
+        kinds = row.get('profile_kinds')
+        text, model = 'queued', 'queued' if kinds is None or kind in kinds else 'not_applicable'
+    later = _LATER.get(media)
+
+    def stage(value):
+        return later if later and value == 'queued' or media == 'superseded' else value
+    view['processing'] = {'text': stage(text), 'transcript': stage(model) if kind == 'audio' else 'not_applicable',
+        'description': 'not_applicable' if kind == 'audio' else stage(model)}
+    return view
+
+
+def count_media_error(code):
+    MEDIA_STATE_ERRORS[code] += 1
+    print(json.dumps({'error': 'attachment_media_state_unavailable', 'code': code}), flush=True)
+
+
+def media_unavailable(code):
+    count_media_error(code)
+    return {'media_state': None, 'next_action': None, 'processing': None, 'media_error': code}
+
+
+def media_fields(row, item=None):
+    """The file's media state; a row it cannot read degrades to media_state null with a counted code."""
+    try:
+        return media_view(attachment_fields(row) if item is None else item, row)
+    except Exception as error:  # one file's state never fails the read or the page that carries it
+        code = error.args[0] if (isinstance(error, ValueError) and error.args and isinstance(error.args[0], str)
+            and error.args[0].isidentifier()) else type(error).__name__
+        return media_unavailable(code)

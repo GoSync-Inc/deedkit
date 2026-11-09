@@ -93,7 +93,7 @@ COMPACT_SUBSCRIPTION = ('subscription_id', 'state', 'version', 'label', 'matched
     'acked_through', 'blocked_reason', 'gap', 'scope_masked')
 COMPACT_ITEM = ('event_id', 'kind', 'origin', 'revision', 'observed_at', 'matched_at', 'delivered_at', 'historical',
     'wake_reason', 'message', 'account', 'chat', 'sender', 'provider_id', 'sent_at', 'direction', 'deleted',
-    'processing', 'send_id', 'error_code', 'status')
+    'processing', 'attachments', 'send_id', 'error_code', 'status')
 PAGE_INCLUDE = ('subscription', 'delivery', 'metadata', 'reply_evidence')
 
 
