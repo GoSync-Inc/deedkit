@@ -30,7 +30,7 @@
     "services/messaging/messaging_service/whatsapp_collector.py": {"lines": 937, "longest_function": 45},
     "services/recordings/src/deedkit_recordings/archive_store.py": {"lines": 1406, "longest_function": 75},
     "whatsapp/whatsmeow/capture.go": {"lines": 920, "longest_function": 250},
-    "whatsapp/whatsmeow/operations.go": {"lines": 1166, "longest_function": 291},
+    "whatsapp/whatsmeow/operations.go": {"lines": 1204, "longest_function": 207},
     "whatsapp/whatsmeow/store.go": {"lines": 959, "longest_function": 119}
   }
 }
