@@ -1,13 +1,13 @@
 # Review protocol
 
-Who reviews what is in harness `process.md` section 5; DeedKit's four questions are in
+Who reviews what is in harness `process.md` section 5; DeedKit's three questions are in
 [AGENTS.md](../../AGENTS.md) section 5.
 The procedure (routing, the packet, the rounds, the verdict, the Codex budget, the pull request
 lines) is harness `reviews.md`; this document holds DeedKit's values for it.
 
 ## Packet
 
-- An Astra task starts with the four fixed questions of AGENTS.md section 5 (DeedKit's filled-in
+- An Astra task starts with the three fixed questions of AGENTS.md section 5 (DeedKit's filled-in
   copy of harness `process.md` section 5), verbatim.
 - A code packet names the deployed versions for question 3: the production SHA, the host
   `production.py` SHA, the schema and the installed gateway (read-only `production.py status`,
