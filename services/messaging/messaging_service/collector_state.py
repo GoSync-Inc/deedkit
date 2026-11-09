@@ -72,6 +72,12 @@ def validate_capture(value):
     if value.get('kind')=='poll_vote':
         from .polls import validate_vote
         return validate_vote(value)
+    if value.get('kind')=='telegram_poll_results':
+        from .polls import validate_telegram_update
+        return validate_telegram_update(value)
+    if value.get('kind')=='telegram_poll_votes':
+        from .polls import validate_telegram_votes
+        return validate_telegram_votes(value)
     if value.get('kind') in ('telegram_delete','whatsapp_delete'):
         if set(value)!={'kind','account','chat','ids','observed_at'}: raise ValueError('invalid_capture')
         if not isinstance(value['account'],str) or not ACCOUNT_RE.fullmatch(value['account']):
@@ -122,7 +128,7 @@ LIVE_REJECT_CODES=frozenset({'invalid_capture','invalid_capture_kind','invalid_c
     'invalid_receipt','invalid_receipt_account','invalid_receipt_chat','invalid_receipt_platform',
     'invalid_receipt_reference','unsupported_receipt_provider_time','invalid_whatsapp_event',
     'invalid_provider_message','receipt_parse_failed','read_parse_failed','receipt_peer_unsupported',
-    'receipt_deferred_full','invalid_poll_vote'})
+    'receipt_deferred_full','invalid_poll_vote','invalid_poll_update','invalid_poll_votes'})
 # Stop codes of live capture itself; the fixed causes of a fail-closed write are CAPTURE_STOP_DETAILS.
 CAPTURE_STOPS={'durable_capture_failed','capture_overload'}
 
@@ -371,7 +377,8 @@ class CollectorState:
                     'provider_age_at_capture_seconds':round((observed-sent).total_seconds(),3) if sent and observed else None,
                     'origin':envelope['origin'] if envelope else
                         'receipt' if capture['kind']=='message_receipt' else 'owner_read_state' if capture['kind']=='owner_read_state'
-                        else 'poll_vote' if capture['kind']=='poll_vote' else 'deletion',
+                        else 'poll_vote' if capture['kind'] in ('poll_vote','telegram_poll_results','telegram_poll_votes')
+                        else 'deletion',
                     'mcp_available_after_commit':True,'measurement':'upper_bound_after_archive_commit' if observed else 'capture_time_not_recorded'}
             # ANYM-813: the first live message committed under the native WhatsApp provider (the drain keeps the
             # batch's first one, not only its last item); written once. Diagnostics only: a bad candidate is ignored.
@@ -640,6 +647,12 @@ class CollectorState:
         if capture['kind']=='poll_vote':
             from .polls import apply_vote
             return apply_vote(self,capture)
+        if capture['kind']=='telegram_poll_results':
+            from .polls import apply_telegram_update
+            return apply_telegram_update(self,capture)
+        if capture['kind']=='telegram_poll_votes':
+            from .polls import apply_telegram_votes
+            return apply_telegram_votes(self,capture)
         chat=capture['chat']
         if chat and not self.allows(self.policy(),chat): return {'outcome':'excluded'}
         if capture['kind']=='owner_read_state':

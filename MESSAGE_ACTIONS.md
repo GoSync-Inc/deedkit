@@ -85,6 +85,14 @@ backlog. If enabled, server approval must be payload-bound, single-use and
 expiring; agent keys cannot approve drafts. The report does not change the
 owner's acting-agent approval mode.
 
+## Polls
+
+Reading a poll is passive: the archive keeps a Telegram (ANYM-920) or WhatsApp (ANYM-921) poll's question,
+options, counts and, where the provider attributes votes, who chose what ([CONVERSATION.md](CONVERSATION.md)).
+None of it votes. Voting stays the existing `vote_poll` operation (Telegram, owner-confirmed;
+[MESSENGER_OPERATIONS.md](MESSENGER_OPERATIONS.md)), and creating one stays `send_poll`. The background read of
+a public Telegram poll's voter list is a read (`messages.getPollVotes`), never a vote.
+
 ## Client discovery
 
 Tool counts depend on the current version, provider and grants. A different

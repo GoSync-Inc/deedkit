@@ -234,6 +234,12 @@ def telegram_message(account,message,*,chat_title='',origin='live',verified_self
     shared=getattr(message,'media',None)
     contact=telegram_contact(shared) if isinstance(shared,types.MessageMediaContact) and contact_card_capture() else None
     preview_id=telegram_web_preview_id(shared) if web_preview_capture() else None
+    poll,poll_results=None,None
+    if isinstance(shared,types.MessageMediaPoll):
+        # The poll's question, options and Telegram's counts (ANYM-920); a poll it cannot read keeps only its kind.
+        # Off until ANYMSG_CAPTURE_TELEGRAM_POLLS=1: the release a rollback returns to rejects the block (Astra r1 B4).
+        from .telegram_polls import telegram_poll,telegram_poll_capture
+        if telegram_poll_capture():poll,poll_results=telegram_poll(shared)
     location=telegram_location(shared) if kind=='location' else None
     data={'account':account,'platform':'telegram','chat':str(message.chat_id),
         'chat_title':(chat_title if chat_title and chat_title!=str(message.chat_id) else observed_title) or str(message.chat_id),
@@ -259,6 +265,7 @@ def telegram_message(account,message,*,chat_title='',origin='live',verified_self
             **({'forward_origin':forward} if forward else {}),
             **({'contact':contact} if contact else {}),
             **({'web_preview_id':preview_id} if preview_id else {}),
+            **({'poll':poll,'poll_results':poll_results} if poll else {}),
             **({'location':location} if location else {}),
             # Only a stated flag is captured; an absent one is unknown, never "not verified".
             **({'sender_is_business_or_verified':True} if provider_flags_capture() and isinstance(entity,types.User)

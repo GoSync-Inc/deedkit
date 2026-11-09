@@ -71,3 +71,6 @@ GRANT SELECT,INSERT,UPDATE ON session_claims TO messaging_collector;
 -- (the tables' row-level security).
 GRANT SELECT,INSERT,UPDATE ON poll_results,poll_votes TO messaging_collector;
 GRANT SELECT,INSERT,DELETE ON poll_voters TO messaging_collector;
+-- Schema 84 (ANYM-920): a Telegram poll's ID, option keys, Telegram's total, the owner's choice and the voter-list read.
+-- Ingest inserts and updates its own account's rows (the table's row-level security); it never deletes one.
+GRANT SELECT,INSERT,UPDATE ON telegram_polls TO messaging_collector;

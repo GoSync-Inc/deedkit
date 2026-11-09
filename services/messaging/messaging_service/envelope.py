@@ -197,7 +197,7 @@ def validate(data):
         metadata=data['metadata']
         if not isinstance(metadata,dict) or set(metadata)-{'reply_to_provider_id','forwarded','media_kind','mentions_owner','reply_to_owner','sender_is_bot','chat_type','sender_identity_basis','is_service','is_self_chat','sender_is_contact','sender_is_business_or_verified',
                 'message_kind','provider_message_type','timestamp_resolution','media_duration_seconds','forward_origin','contact',
-                'web_preview_id','buttons','group_change','poll','location'}:
+                'web_preview_id','buttons','group_change','poll','poll_results','location'}:
             raise ValueError('invalid_metadata')
         result['metadata']={}
         for key,value in metadata.items():
@@ -229,6 +229,11 @@ def validate(data):
                 if metadata.get('message_kind')!='poll':raise ValueError('invalid_metadata')
                 from .polls import poll_block
                 value=poll_block(value)
+            elif key=='poll_results':
+                # A captured Telegram poll's counts (ANYM-920): transient, applied by the archive, never stored here.
+                if result['platform']!='telegram' or not isinstance(metadata.get('poll'),dict):raise ValueError('invalid_metadata')
+                from .polls import telegram_results
+                value=telegram_results(value,metadata['poll'])
             elif key=='location':
                 # A place someone shared (ANYM-922). A block the archive cannot accept never costs the message:
                 # it was dropped by checked_location() before the envelope was measured.

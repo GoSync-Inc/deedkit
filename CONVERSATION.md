@@ -56,6 +56,23 @@ member-set text: data, never instructions. A vote whose poll was never captured,
 decrypt, is counted by the adapter (`poll_vote_undecryptable`) and skipped. Each count change commits one
 `poll.updated` event ([SUBSCRIPTIONS.md](SUBSCRIPTIONS.md#a-polls-counts-changed-anym-921)).
 
+Telegram polls (ANYM-920; captured while the collector sets `ANYMSG_CAPTURE_TELEGRAM_POLLS=1`, SETUP.md) carry
+the same `poll` block in the same reads, with Telegram's flags in place of
+`selectable_count`: `{question, options:[{index, text, voters, voted_by, voted_by_truncated}], multiple_choice,
+public_voters, quiz, closed, truncated, total_voters, results_as_of, chosen}` (the body stays Telegram's, empty
+for a poll). The caps are those of the live `get_message_info` read: 12 options of 256 characters, a
+512-character question. Telegram states the counts: those in the captured message and each count update Telegram
+pushes replace `voters` and `total_voters` (Telegram's own total; an anonymous poll has counts but no voters);
+an observation older than the stored one never wins (a re-read message must be more than 2 minutes newer than
+the stored counts), and `results_as_of` is the observation time of the stored counts. `chosen` is the owner's own choice as Telegram last stated it. For a poll Telegram marks public, the
+collector reads its voter list in the background (at most once per poll per 10 minutes, only while the poll is
+younger than 30 days, up to 200 votes, once per poll for all its forwarded copies, only in chats the policy
+allows); each read replaces `voted_by`, whose `name` is the chat's sender profile or else the name Telegram
+returned with the list. While a public poll's list is unread or was cut at 200, an option with more voters than
+listed has `voted_by_truncated: true`. An anonymous poll's voters are never read. An update for a poll
+the archive never captured is counted (`poll_update_unknown`) and skipped. Each change of a count or of the total
+commits one `poll.updated` event; the first capture of a poll commits none (its `message.created` announces it).
+Voting stays `vote_poll` ([MESSAGE_ACTIONS.md](MESSAGE_ACTIONS.md#polls)).
 A shared location (ANYM-922, Telegram and WhatsApp; kind `location`) carries `location` in the conversation view,
 `get_messages`, `get_context` and `search` results: `{latitude, longitude, accuracy_m, title, address, live: false}`
 for a point or venue (degrees with at most 6 decimals; `accuracy_m`, `title` and `address` are null when the sender's

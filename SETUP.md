@@ -252,6 +252,17 @@ owner's exact confirmation. Set it once the release a rollback would return to a
 the field. To roll back, remove the flag and restart, and let the spool drain first:
 an older server or drainer rejects and quarantines envelopes that still hold the field.
 
+### Telegram polls
+
+The Telegram collector keeps a poll's question, options and flags (`metadata.poll`), Telegram's counts and, for a
+public poll, its voter list ([CONVERSATION.md](CONVERSATION.md), ANYM-920) only when its environment sets
+`ANYMSG_CAPTURE_TELEGRAM_POLLS=1`; it is off by default. Off, a poll message is stored with its kind only, pushed
+poll updates are ignored and no voter list is read. Set it once the release a rollback would return to has schema 84
+(migration 084): an older server or drainer rejects a captured poll message, a `telegram_poll_results` or a
+`telegram_poll_votes` entry and quarantines it. Enabling it needs a collector restart, which stops and starts the
+provider session: it runs only on the owner's exact confirmation, or rides the restart of a deploy. To roll back
+past schema 84, remove the flag, restart and let the spool drain first.
+
 ### Reply queue upgrade (0.9.17)
 
 Apply migration 027 as owner and reapply `gateway_role.sql` and
