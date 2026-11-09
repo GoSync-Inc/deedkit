@@ -54,7 +54,7 @@ def test_a_restored_schema72_backup_quarantines_and_migrates_to_the_wake_tables(
             restored.migrate()
             restored.migrate()
             with restored.pool.connection() as c:
-                assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='75'
+                assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='76'
                 assert schema_ready(c) is True
                 assert c.execute('SELECT count(*) AS n FROM wake_targets').fetchone()['n']==0
 
@@ -81,6 +81,54 @@ def test_schema73_snapshot_round_trips_the_wake_targets(database,tmp_path):
                 assert {name:manifest[name] for name in before}==before
 
 
+# spec: ANYM-851
+def test_a_restored_schema75_backup_migrates_to_the_structure_tables(database,tmp_path):
+    from messaging_service.backup import database_manifest
+    from test_subscription_retention import acked_subscription,restore_database,snapshot_restored
+    with restore_database(database,tmp_path/'source',through=75) as source:
+        acked_subscription(source,name='structure-old-snapshot')
+        with source.pool.connection() as c:
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='75'
+            before=database_manifest(c)
+        assert 'attachment_structure' not in before and 'structure_profiles' not in before
+        with snapshot_restored(source,tmp_path) as restored:
+            quarantine_restore(restored)
+            restored.migrate()
+            with restored.pool.connection() as c:
+                assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='76'
+                assert c.execute('SELECT count(*) AS n FROM attachment_structure').fetchone()['n']==0
+                assert c.execute('SELECT count(*) AS n FROM structure_profiles').fetchone()['n']==0
+
+
+# spec: ANYM-851
+def test_schema76_backup_carries_the_structured_versions_and_a_schema75_receiver_refuses_it(database,tmp_path,monkeypatch):
+    from messaging_service import backup
+    from messaging_service.backup import database_manifest,verify_bundle
+    from test_document_structure import add_document
+    from test_file_index import stored_structure
+    from test_subscription_retention import restore_database,snapshot_restored
+    with restore_database(database,tmp_path/'source') as source:
+        source.seed()
+        add_document(source,'backup-structure');stored_structure(source,'backup-structure')
+        with source.pool.connection() as c:
+            manifest=database_manifest(c)
+        before={name:manifest[name] for name in ('attachment_structure','structure_profiles')}
+        assert before['attachment_structure']['rows']==1 and before['structure_profiles']['rows']==1
+        capture=tmp_path/'capture'
+        create_snapshot(source,capture,[sys.executable,'-c','print("SYNTHETIC_DUMP")'])
+        with monkeypatch.context() as old:
+            # A receiver on a schema-75 runtime names the refusal; it never reads a schema-76 backup silently.
+            old.setattr(backup,'SCHEMAS',range(2,76))
+            with pytest.raises(ValueError,match='unsupported_backup'):verify_bundle(capture)
+            with source.pool.connection() as c,pytest.raises(ValueError,match='unsupported_backup_schema'):
+                database_manifest(c)
+        assert verify_bundle(capture)['schema_version']==76
+        with snapshot_restored(source,tmp_path/'restore') as restored:
+            with restored.pool.connection() as c:
+                manifest=database_manifest(c)
+                assert {name:manifest[name] for name in before}==before
+
+
 # spec: ANYM-824
 def test_schema70_snapshot_restores_the_activity_counts(database,tmp_path):
     from messaging_service.backup import database_manifest
@@ -88,7 +136,7 @@ def test_schema70_snapshot_restores_the_activity_counts(database,tmp_path):
     with restore_database(database,tmp_path/'source') as source:
         acked_subscription(source,name='activity-snapshot')
         with source.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='75'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='76'
             before=database_manifest(c)['subscription_activity']
             rows=c.execute('SELECT * FROM subscription_activity ORDER BY metric').fetchall()
         assert before['rows']==2 and [row['metric'] for row in rows]==['matched','scanned']

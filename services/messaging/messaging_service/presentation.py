@@ -520,7 +520,8 @@ def transcript(method, result):
 
 FILE_TEXT_KEYS=('text','content','offset','next_offset','content_chars','truncated','extraction_status',
     'enrichment_status','download_status','empty_reason','empty_reason_detail','failure_reason','next_action',
-    'message_id','mime','display_name','model_generated','notice','extraction_quality','quality_notice')
+    'message_id','mime','display_name','model_generated','notice','extraction_quality','quality_notice',
+    'retryable','structured_text')  # ANYM-851: a document's structured version (state and how to get it)
 PROVENANCE_KEYS=('attachment_id','message_id','revision','content','extractor','model','provider','processor_version','sha256')
 
 
@@ -529,7 +530,7 @@ def lean_file_text(result):
     output={k:result[k] for k in FILE_TEXT_KEYS if k in result}
     if isinstance(result.get('content_coverage'),dict):
         output['content_coverage']={k:v for k,v in result['content_coverage'].items()
-            if k in ('retained_chars','truncated','complete')}
+            if k in ('retained_chars','truncated','complete','pages','pages_with_text','tables','headings')}
     if isinstance(result.get('provenance'),dict):
         output['provenance']={k:v for k,v in result['provenance'].items() if k in PROVENANCE_KEYS and v is not None}
     spans=[s for s in result.get('source_spans') or [] if s.get('kind') in ('page','sheet')]

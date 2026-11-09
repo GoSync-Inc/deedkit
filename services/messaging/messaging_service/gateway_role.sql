@@ -132,3 +132,6 @@ GRANT INSERT(menu_choice) ON outgoing_messages TO messaging_gateway;
 GRANT SELECT,INSERT ON wake_targets TO messaging_gateway;
 GRANT UPDATE(thread,state,disabled_reason,confirmation,version,updated_at) ON wake_targets TO messaging_gateway;
 GRANT SELECT,INSERT,DELETE ON wake_target_subscriptions TO messaging_gateway;
+-- Schema 76 (ANYM-851): get_file_text content='structured' reads a document's stored Markdown version and whether
+-- the worker serves the account; read only.
+GRANT SELECT ON attachment_structure,structure_profiles TO messaging_gateway;

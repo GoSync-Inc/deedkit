@@ -1168,7 +1168,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Read-only. Bounded derived text of one file (max 8000 characters a page; follow next_offset; truncated means extraction was capped), indexing status, original SHA256 and source message/revision. A voice note returns its model transcript; other files their extracted text. Not downloaded or not ready: empty_reason and next_action say what to do. Compact omits understanding and cell spans: detail=full adds them. Text and OCR may be incomplete or inaccurate. Example: {\"attachment_id\":\"att-synthetic\",\"limit\":4000}",
+    "description": "Read-only. Bounded derived text of one file (max 8000 characters a page; follow next_offset; truncated means extraction was capped), indexing status, original SHA256 and source message/revision. A voice note returns its model transcript; other files their extracted text. Not downloaded or not ready: empty_reason and next_action say what to do. Compact omits understanding and cell spans: detail=full adds them. Text and OCR may be incomplete or inaccurate. content=structured: a PDF, DOCX or PPTX as Markdown with its headings and table rows (converted on the owner's machine), paged the same way, with page spans; structured_text on the other reads of such a file says whether it is ready and how to get it. Example: {\"attachment_id\":\"att-synthetic\",\"limit\":4000}",
     "inputSchema": {
       "properties": {
         "attachment_id": {
@@ -1186,10 +1186,11 @@
           "type": "integer"
         },
         "content": {
-          "description": "Omitted: a voice note returns its transcript (content=enriched in the reply; if not ready, empty_reason says whether to wait), other files extracted text. A file not downloaded yet returns empty_reason=attachment_not_downloaded, its download status and next_action; messages_request_file_download moves it ahead and transcription follows. The original download needs the separate download permission.",
+          "description": "Omitted: a voice note returns its transcript (content=enriched in the reply; if not ready, empty_reason says whether to wait), other files extracted text. A file not downloaded yet returns empty_reason=attachment_not_downloaded, its download status and next_action; messages_request_file_download moves it ahead and transcription follows. The original download needs the separate download permission. structured: a PDF, DOCX or PPTX as Markdown (headings, table rows); if not ready, empty_reason and next_action say what to do.",
           "enum": [
             "extracted",
-            "enriched"
+            "enriched",
+            "structured"
           ],
           "title": "Content",
           "type": "string"

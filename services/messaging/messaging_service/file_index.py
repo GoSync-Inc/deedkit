@@ -568,8 +568,12 @@ def get_file_text(store, c, p, attachment_id, offset=0, limit=4000, *, content=N
     """An omitted content reads a voice note's transcript when it has no extracted text (ANYM-453)."""
     from .store import APIError, bounded, serial
     bounded(limit, 8000)
-    if content not in (None, 'extracted', 'enriched') or type(offset) is not int or not 0 <= offset <= (1000000 if content == 'enriched' else MAX_TEXT_CHARS):
+    if content not in (None, 'extracted', 'enriched', 'structured') or type(offset) is not int or not 0 <= offset <= (1000000 if content in ('enriched', 'structured') else MAX_TEXT_CHARS):
         raise APIError('invalid_filter')
+    # ANYM-851: a structured read is the extracted read of the same file with the stored Markdown version's text.
+    structured = content == 'structured'
+    if structured:
+        content = 'extracted'
     if not isinstance(attachment_id, str) or not 1 <= len(attachment_id) <= 256 or '\x00' in attachment_id:
         raise APIError('not_found', 404)
     scope, args = scope_filter(p, 'm')
@@ -647,6 +651,16 @@ def get_file_text(store, c, p, attachment_id, offset=0, limit=4000, *, content=N
     response = _response(row)
     if content == 'extracted' and response.get('extraction_quality') == 'low':
         response['quality_notice'] = QUALITY_NOTICE
+    if content == 'extracted':
+        # ANYM-851: a PDF, DOCX or PPTX says whether its structured version exists and how to get it (one additive
+        # field); every other field stays as it was.
+        from . import document_structure
+        state = document_structure.read_state(c, row['attachment_id'])
+        if structured:
+            found = document_structure.read_text(c, row['attachment_id'], offset, limit) if state and state['state'] == 'ready' else None
+            response = document_structure.structured_response(response, state, found, offset)
+        elif state is not None:
+            response['structured_text'] = {'state': state['state'], 'next_action': state['next_action']}
     return serial({**response, **store.dataset(c, p)})
 
 
