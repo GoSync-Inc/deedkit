@@ -549,7 +549,7 @@ def test_old_backlog_leaves_a_daily_reserve_for_fresh_images(configured,tmp_path
     """Prod 11-08: the image backlog spent the whole daily cap by 15:00 UTC, so images sent later waited for midnight.
     Old work stops at backlog_share of every daily cap; a fresh image may still use the rest."""
     s,make,_=configured
-    for n in range(4):add_file(s,f'old-{n}','demo-tg-1',mime='image/png')
+    for n in range(4):add_file(s,f'old-{n}','demo-tg-1',mime='image/png',data=PNG_1X1+bytes([n]))  # distinct files: a duplicate is reused for free (ANYM-912)
     add_file(s,'fresh-image','demo-tg-2',mime='image/png')
     age(s,'demo-tg-1','1 year');age(s,'demo-tg-2','1 hour')
     cap={'max_jobs_per_day':4,'profile_max_jobs_per_day':{'image':4},'account_max_jobs_per_day':{'telegram-demo':4}}[limit]
@@ -569,7 +569,7 @@ def test_fresh_spending_does_not_use_up_the_backlog_share(configured,tmp_path,li
     """Astra r1 M1: old work counts only its own attempts, so fresh work done first leaves the backlog its share."""
     s,make,_=configured
     for n in range(2):add_file(s,f'fresh-{n}','demo-tg-2',mime='image/png')
-    for n in range(3):add_file(s,f'old-{n}','demo-tg-1',mime='image/png')
+    for n in range(3):add_file(s,f'old-{n}','demo-tg-1',mime='image/png',data=PNG_1X1+bytes([n]))  # distinct files: a duplicate is reused for free (ANYM-912)
     age(s,'demo-tg-1','1 year');age(s,'demo-tg-2','1 hour')
     cap={'max_jobs_per_day':4,'profile_max_jobs_per_day':{'image':4},'account_max_jobs_per_day':{'telegram-demo':4}}[limit]
     w=make({'image':cloud_profile(tmp_path)},backlog_share=0.5,**{limit:cap})
@@ -587,7 +587,7 @@ def test_backlog_allowance_is_whole_and_leaves_fresh_a_slot(configured,tmp_path,
     """Astra r1 M2: a fractional share is rounded down to whole jobs, at least one (old work is never shut out) and
     below the cap (fresh work keeps a slot of any cap of 2 or more)."""
     s,make,_=configured
-    for n in range(cap+1):add_file(s,f'old-{n}','demo-tg-1',mime='image/png')
+    for n in range(cap+1):add_file(s,f'old-{n}','demo-tg-1',mime='image/png',data=PNG_1X1+bytes([n]))  # distinct files: a duplicate is reused for free (ANYM-912)
     age(s,'demo-tg-1','1 year')
     w=make({'image':cloud_profile(tmp_path)},backlog_share=share,profile_max_jobs_per_day={'image':cap})
     for _ in range(old_jobs):
@@ -601,7 +601,7 @@ def test_backlog_allowance_is_whole_and_leaves_fresh_a_slot(configured,tmp_path,
 # spec: ANYM-71
 def test_backlog_share_one_keeps_the_whole_cap_for_old_work(configured,tmp_path):
     s,make,_=configured
-    for n in range(3):add_file(s,f'old-{n}','demo-tg-1',mime='image/png')
+    for n in range(3):add_file(s,f'old-{n}','demo-tg-1',mime='image/png',data=PNG_1X1+bytes([n]))  # distinct files: a duplicate is reused for free (ANYM-912)
     age(s,'demo-tg-1','1 year')
     w=make({'image':cloud_profile(tmp_path)},backlog_share=1.0,max_jobs_per_day=2)
     for _ in range(2):

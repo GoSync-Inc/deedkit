@@ -398,6 +398,18 @@ class EnrichmentWorker:
                 token=uuid4();ttl=profile['timeout_seconds']+60
                 # Read before the UPDATE starts the database's clock, so this end is never later than e.lease_until.
                 lease_end=time.monotonic()+ttl
+                reuse=self._reusable(c,row,kind,ph)
+                if reuse:
+                    # ANYM-912: a ready result of the same file and profile in this account is copied, not recomputed.
+                    # The lease fences the copy like a model result; no attempt, budget, start time or resource is taken.
+                    # Attempts of an older profile are not this profile's (as a model claim's reset to 1), so an expired
+                    # reuse lease never reads as exhausted (_expire_leases: attempts>=3) without a model attempt (Astra r1).
+                    c.execute('''UPDATE attachment_enrichment SET state='leased',kind=%s,profile_hash=%s,provider=%s,model=%s,
+                        attempts=CASE WHEN profile_hash IS DISTINCT FROM %s THEN 0 ELSE attempts END,
+                        lease_token=%s,lease_until=clock_timestamp()+make_interval(secs=>%s),updated_at=clock_timestamp()
+                        WHERE attachment=%s''',(kind,ph,profile['provider'],profile['model'],ph,token,ttl,row['attachment']))
+                    return {**row,'kind':kind,'provider':profile['provider'],'model':profile['model'],
+                        'attempts':0 if row['profile_hash']!=ph else row['attempts'],'lease_token':token,'profile_hash':ph,'_resource_lease':None,'_lease_end':lease_end,'_reuse':reuse},profile
                 resource_lease=None
                 if resource_admission.local_heavy(profile):
                     resource_lease=resource_admission.acquire(c,self.lock_directory,'enrichment',row['attachment'],token,ttl)
@@ -426,6 +438,20 @@ class EnrichmentWorker:
                     'lease_token':token,'profile_hash':ph,'_resource_lease':resource_lease,'_claim_day':claim_day,'_budget_key':budget_key,
                     '_lease_end':lease_end},profile
         return None
+    @staticmethod
+    def _reusable(c,row,kind,ph):
+        """ANYM-912: the newest ready result of the same file (digest) and profile in the same account, else None.
+
+        Read through the attachments digest index (068); the source must still be current (active, not deleted, same
+        digest and revision). A copy names its first source, so a copy of a copy points at the original."""
+        return c.execute('''SELECT s.title,s.summary,s.text_content,s.metadata,s.truncated,
+                coalesce(s.metadata->>'reused_from',s.attachment) AS reused_from
+            FROM attachments sa JOIN attachment_enrichment s ON s.attachment=sa.id JOIN messages sm ON sm.id=sa.message
+            WHERE sa.digest=%s AND sa.id<>%s AND sa.active AND NOT sm.deleted AND sm.account=%s
+                AND s.state='ready' AND s.kind=%s AND s.profile_hash=%s
+                AND s.source_digest=sa.digest AND s.source_revision=sm.revision
+            ORDER BY (s.metadata->>'reused_from') IS NOT NULL,s.updated_at DESC LIMIT 1''',
+            (row['source_digest'],row['attachment'],row['account'],kind,ph)).fetchone()
     def finish(self,row,result=None,error=None):
         try:return self._finish(row,result,error)
         finally:
@@ -434,7 +460,14 @@ class EnrichmentWorker:
 
     def _finish(self,row,result=None,error=None):
         from .enrichment_providers import normalize_result
-        if result is not None:
+        reuse=row.get('_reuse')
+        if reuse is not None:
+            # ANYM-912: the stored result was validated when it was written; it is copied as it is. Agents see only
+            # `reused` (file_index); the source id stays operator evidence.
+            result={}
+            clean={'title':reuse['title'],'summary':reuse['summary'],'text':reuse['text_content'],'truncated':reuse['truncated'],
+                'metadata':{**reuse['metadata'],'reused':True,'reused_from':reuse['reused_from']}}
+        elif result is not None:
             # Child isn't a trusted SQL/value source. Revalidate sizes/types.
             clean=normalize_result({**result,'segments':result.get('metadata',{}).get('segments',[])},audio=row['kind']=='audio')
             clean['truncated']=clean['truncated'] or bool(result.get('truncated')) or bool(row.get('source_truncated'))
@@ -559,7 +592,7 @@ class EnrichmentWorker:
         claim=self.claim()
         if not claim:return False
         row,profile=claim
-        try:unwritten=self.write_result(row,self.processor(self.files,row,profile))
+        try:unwritten=self.write_result(row,{} if '_reuse' in row else self.processor(self.files,row,profile))
         except WorkerStopping:
             self.requeueing=True
             self.requeue(row)

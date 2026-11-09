@@ -80,6 +80,14 @@ WORKERS_SQL = '''SELECT account FROM processing_profiles
         AND observed_at<=now()-make_interval(secs=>%(no_worker)s)
         AND observed_at>=now()-make_interval(secs=>%(no_worker_age)s)'''
 
+# ANYM-912: operator evidence of digest reuse, ready copies (metadata.reused_from) written in the last 24 hours per
+# (account, kind) of the mini. A count only: the source ids stay in SQL.
+REUSED_SQL = '''SELECT m.account,e.kind,count(*) AS reused
+    FROM attachment_enrichment e JOIN attachments a ON a.id=e.attachment JOIN messages m ON m.id=a.message
+    WHERE e.state='ready' AND e.provider=%(provider)s AND e.kind IS NOT NULL
+        AND e.updated_at>=now()-interval '24 hours' AND e.metadata->>'reused_from' IS NOT NULL
+    GROUP BY 1,2'''
+
 _last = None
 
 
@@ -120,6 +128,7 @@ def evaluate(store):
         checked_at = c.execute('SELECT now() AS at').fetchone()['at']
         scopes = c.execute(SCOPES_SQL, params).fetchall()
         workers = c.execute(WORKERS_SQL, params).fetchall()
+        reused = c.execute(REUSED_SQL, params).fetchall()
     accounts, codes = {}, set()
 
     def account(name):
@@ -138,6 +147,9 @@ def evaluate(store):
             item['codes'].add(STARVED)
     for row in workers:
         account(row['account'])['codes'].add(NO_WORKER)
+    for row in reused:  # evidence, never a code
+        counts = account(row['account'])['counts'].setdefault(row['kind'], {'queued': 0, 'sent_6h_to_48h': 0})
+        counts['reused_24h'] = row['reused']
     for item in accounts.values():
         codes |= item['codes']
         item['codes'] = sorted(item['codes'])

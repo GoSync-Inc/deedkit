@@ -507,6 +507,24 @@ raises no alarm for them. The window is a module setting, not a worker config ke
 check and the worker must read the same window. A group's or channel's images are described only when a
 subscription names that chat; a dynamic (all-chats) subscription lists no chat, so it does not count (ANYM-805).
 
+### Reuse of a ready result for a duplicate file (ANYM-912)
+
+Owner 2026-11-09: «отсеять из очереди совсем не нужное». At claim time, before a model call, the worker looks for a
+ready image, audio or document result of the same account with the same file (`source_digest`, read through the
+attachments digest index) and the same `profile_hash` (provider, model and profile settings), whose source attachment
+is still current. If it finds one, it copies title, summary, text, truncation and metadata into the claimed row under
+a normal lease and publishes the same readiness event. It counts no model attempt, daily budget, processing budget or
+start time and takes no local resource lease. The copy's metadata adds `reused: true` and `reused_from` (the first
+source attachment id; a copy of a copy names the original). Agents see only `enrichment_coverage.reused` in
+`get_file_text`; `reused_from` is operator evidence for SQL and never leaves the database through an agent read or an
+event. `enrichment_health` counts the mini's ready copies of the last 24 hours per kind (`reused_24h`, a count only).
+A reuse lease of a row whose attempts belong to an older profile starts at 0 attempts, so an expired reuse lease is
+claimed again and never ends as `retry_exhausted` without a model attempt. No match means a normal model call. Reuse never crosses an account or a profile, and happens only for work the
+worker claims: a copy that waits for a request (ANYM-805, ANYM-887, ANYM-890) stays on request and gets the copy at
+once after the request. The daily cap check still runs first, so at the cap a duplicate waits like other work. Text
+extraction and OCR are unchanged; nothing is deleted, and a source that is superseded later leaves its copies as they
+are.
+
 ### Voice notes only in groups and channels (ANYM-890)
 
 Owner 2026-11-09: «отсеять из очереди совсем не нужное»; on groups and channels: «их лучше не надо». In a group or
