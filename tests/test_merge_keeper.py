@@ -1,5 +1,6 @@
 """The merge keeper enqueues only approved, green, correctly numbered ship pull requests (scripts/merge_keeper.py)."""
 from hypothesis import given, settings, strategies as st
+import pytest
 
 from scripts import merge_keeper as mk
 
@@ -89,7 +90,8 @@ def test_skipped_gate_or_all_skipped_or_pending_never_enqueues():
 
 
 # spec: ANYM-625
-def test_one_queue_failure_retries_once_after_the_worker_window_and_a_second_stops():
+def test_one_queue_failure_retries_once_after_the_worker_window_and_a_second_stops(monkeypatch):
+    monkeypatch.setattr(mk, 'RETRY_FAILED_CHECKS', True)
     one = [{'at': '2026-11-09T01:30:00Z', 'reason': 'failed_checks', 'group': 'c' * 40}]
     early = mk.decide(facts(removals=one, now='2026-11-09T01:31:00Z'))
     assert early.action == 'hold' and 'unless a worker does' in early.reason
@@ -104,14 +106,26 @@ def test_one_queue_failure_retries_once_after_the_worker_window_and_a_second_sto
 
 
 # spec: ANYM-625
-def test_a_head_queued_or_armed_again_after_two_failures_is_taken_out_by_any_actor():
-    two = [{'at': '2026-11-09T01:30:00Z', 'reason': 'failed_checks', 'group': None},
-           {'at': '2026-11-09T02:30:00Z', 'reason': 'failed_checks', 'group': None}]
-    for state in ({'queued': True}, {'auto_merge': True}):
-        decision = mk.decide(facts(removals=two, **state))
-        assert (decision.action, decision.comment_key) == ('dequeue', f'budget:{HEAD}')
-        assert mk.act(mk.GitHub(dry_run=True), facts(removals=two, **state), 'id', decision)[-1] == 'would dequeue'
-    assert mk.decide(facts(removals=two[:1], queued=True)).action == 'skip'
+def test_with_retry_off_a_failed_checks_removal_is_commented_and_never_re_enqueued():
+    one = [{'at': '2026-11-09T01:30:00Z', 'reason': 'failed_checks', 'group': 'c' * 40}]
+    assert mk.RETRY_FAILED_CHECKS is False
+    decision = mk.decide(facts(removals=one, failing_jobs=['CI / checks / verify: failure https://x']))
+    assert (decision.action, decision.comment_key) == ('hold', f'dequeued:{HEAD}')
+    assert 'checks / verify' in decision.comment
+    assert mk.decide(facts(removals=one, queued=True)).action == 'skip'
+
+
+# spec: ANYM-625
+def test_a_permission_read_failure_is_an_error_and_a_404_is_no_write(monkeypatch):
+    def failing(status):
+        def api(self, path, *arguments, paginate=False):
+            raise mk.subprocess.CalledProcessError(1, 'gh', stderr=f'gh: Not Found (HTTP {status})')
+        return api
+    monkeypatch.setattr(mk.GitHub, 'api', failing(404))
+    assert mk.GitHub().can_write('someone') is False
+    monkeypatch.setattr(mk.GitHub, 'api', failing(403))
+    with pytest.raises(mk.subprocess.CalledProcessError):
+        mk.GitHub().can_write('someone')
 
 
 # spec: ANYM-625
@@ -213,7 +227,7 @@ def test_enqueue_only_when_every_gate_holds(comments, checks, removals, mergeabl
     assert all(c['status'] == 'completed' and c['conclusion'] in ('success', 'skipped') for c in checks.values())
     assert set(checks) == set(f.required) and added in ((), ('074_x.sql',))
     failures = [r for r in since if r['reason'] == 'failed_checks']
-    assert len(failures) <= 1 and all(r['at'] <= '2026-11-09T04:57:00Z' for r in failures)
+    assert not failures  # RETRY_FAILED_CHECKS is off: a failed-checks removal is never re-enqueued by the keeper
     conflicts = [r for r in since if r['reason'] == 'merge_conflict']
     assert len(conflicts) <= 1 and all(r['at'] <= main_at for r in conflicts)
     assert not any(r['reason'] == 'manual' for r in since)

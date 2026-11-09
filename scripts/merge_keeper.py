@@ -14,13 +14,12 @@ For each open, non-draft, same-repository pull request into `main` that carries 
   2. Every required check of the live `main` rules (name and app) has its newest run on the head completed: `CI
      gate` success, the others success or skipped (`CI gate` validates their skip; never all skipped).
   3. The new migrations must take the next free numbers on `main`; otherwise one comment with the exact rename.
-  4. A merge-queue removal for failed checks is retried once (re-enqueue, which reruns the group), RETRY_AFTER
-     minutes after it so a worker's `wait-merge.sh` re-enqueues first; a second one on the same head gets one
-     comment with the failing jobs and the keeper leaves the pull request alone. A queue conflict waits until main
-     moves and is retried once; a removal by hand holds the pull request until a new head or the `ship` label is
-     added again. The counts come from the pull request's timeline, so they are shared with every other actor, and
-     the keeper enforces the budget on all of them: a `ship` pull request queued or armed again after two failures
-     on its head is taken out of the queue (or disarmed) with one comment.
+  4. A merge-queue removal for failed checks gets one comment with the failing jobs. The keeper re-enqueues it
+     only when RETRY_FAILED_CHECKS is on (once, RETRY_AFTER minutes after the removal); it is off while the
+     harness `wait-merge.sh` keeps its own process-local retry, so the queue has one retry actor (Sol r3 M3). Two
+     failures on a head: one comment and the keeper stops. A queue conflict waits until main moves and is retried
+     once (wait-merge.sh never retries conflicts); a removal by hand holds the pull request until a new head or the
+     `ship` label is added again. The counts come from the pull request's timeline.
 Comments carry an HTML marker and are posted once per head. `--dry-run` writes nothing and prints every decision.
 """
 from __future__ import annotations
@@ -46,6 +45,8 @@ MIGRATION = re.compile(r'^(\d{3})_[A-Za-z0-9_]+\.sql$')
 APPROVAL_LINE = re.compile(r'^\s*Review:\s*orchestrator diff read\s+([0-9a-f]{7,40})\b', re.I | re.M)
 KEEPER_BOT = 'github-actions[bot]'
 RETRY_AFTER = 3  # minutes a failed-checks removal waits before the keeper re-enqueues
+# Off until the harness wait-merge.sh skips its re-enqueue for `ship` pull requests: one retry actor per queue.
+RETRY_FAILED_CHECKS = False
 WRITE = {'admin', 'maintain', 'write'}  # effective repository permissions that may approve
 MARK_PREFIX = '<!-- merge-keeper:'
 MARK = MARK_PREFIX + '{} -->'
@@ -86,7 +87,7 @@ class Facts:
 
 @dataclass
 class Decision:
-    action: str  # enqueue | dequeue | hold | skip
+    action: str  # enqueue | hold | skip
     reason: str
     comment_key: str = ''
     comment: str = ''
@@ -195,19 +196,12 @@ def decide(facts):
     if not facts.same_repository:
         return Decision('skip', 'head in a fork: never enqueued by the keeper')
     since = [r for r in facts.removals if (r.get('at') or '') >= (facts.head_at or '')]
-    failures = [r for r in since if r.get('reason') not in QUEUE_DONE | QUEUE_RETRYLESS]
-    if (facts.queued or facts.auto_merge) and len(failures) >= 2:
-        return Decision('dequeue', f'queued again after {len(failures)} failures on this head', f'budget:{facts.head}',
-                        '\n'.join([MARK.format(f'budget:{facts.head}'),
-                                    f'Merge keeper: this head (`{facts.head[:12]}`) already failed in the queue '
-                                    f'{len(failures)} times, the retry budget for every actor, so the keeper took it '
-                                    'out of the queue. Fix the cause and push, or remove the `ship` label to enqueue '
-                                    'it by hand.']))
     if facts.queued:
         return Decision('skip', 'in the merge queue')
     if facts.auto_merge:
         return Decision('skip', 'auto-merge armed: GitHub enqueues it')
     manual = [r for r in since if r.get('reason') == 'manual']
+    failures = [r for r in since if r.get('reason') not in QUEUE_DONE | QUEUE_RETRYLESS]
     if manual and (facts.labeled_at or '') <= manual[-1]['at']:
         return Decision('hold', 'removed from the queue by hand on this head; push or add the ship label again')
     conflicts = [r for r in since if r.get('reason') == 'merge_conflict']
@@ -249,6 +243,14 @@ def decide(facts):
     if plan:
         return Decision('hold', 'migration numbers do not follow main', f'migration:{facts.head}',
                         migration_comment(facts, plan))
+    if failures and not RETRY_FAILED_CHECKS:
+        return Decision('hold', 'dequeued for failed checks: wait-merge.sh or a person re-enqueues',
+                        f'dequeued:{facts.head}', '\n'.join([
+                            MARK.format(f'dequeued:{facts.head}'),
+                            f'Merge keeper: dequeued on head `{facts.head[:12]}` (`{failures[-1].get("reason")}`). '
+                            'Failing jobs of that group run:', jobs, '',
+                            'The keeper does not re-enqueue a failed-checks removal: the worker\'s wait-merge.sh '
+                            'retries a flake once, or fix and push (a new head is enqueued again).']))
     if failures and minutes_between(failures[-1]['at'], facts.now) < RETRY_AFTER:
         return Decision('hold', f'dequeued for failed checks; re-enqueue after {RETRY_AFTER} min unless a worker does')
     if failures:
@@ -294,8 +296,10 @@ class GitHub:
         if login not in cache:
             try:
                 cache[login] = self.api(self.repo(f'collaborators/{quote(login)}/permission'))['permission'] in WRITE
-            except subprocess.CalledProcessError:  # 404: not a collaborator
-                cache[login] = False
+            except subprocess.CalledProcessError as error:
+                if 'HTTP 404' not in (error.stderr or ''):
+                    raise  # any other failure is this pull request's error in the report, not a silent "no"
+                cache[login] = False  # 404: not a collaborator
         return cache[login]
 
 
@@ -377,10 +381,6 @@ ENQUEUE = '''mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pull
 mergeQueueEntry{position state}}}'''
 
 
-DEQUEUE = 'mutation($id:ID!){dequeuePullRequest(input:{id:$id}){clientMutationId}}'
-DISARM = 'mutation($id:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$id}){clientMutationId}}'
-
-
 def act(gh, facts, node_id, decision):
     """Post the decision's comment once, then enqueue; returns what was done."""
     done = []
@@ -388,10 +388,6 @@ def act(gh, facts, node_id, decision):
         if not gh.dry_run:
             gh.api(gh.repo(f'issues/{facts.number}/comments'), '-f', f'body={decision.comment}')
         done.append(f'comment {decision.comment_key}')
-    if decision.action == 'dequeue':
-        if not gh.dry_run:
-            gh.graphql(DEQUEUE if facts.queued else DISARM, id=node_id)
-        done.append(('dequeued' if facts.queued else 'disarmed') if not gh.dry_run else 'would dequeue')
     if decision.action == 'enqueue':
         if not gh.dry_run:
             entry = gh.graphql(ENQUEUE, id=node_id, head=facts.head)['enqueuePullRequest']['mergeQueueEntry']

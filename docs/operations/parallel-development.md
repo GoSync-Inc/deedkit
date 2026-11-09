@@ -58,15 +58,16 @@ It acts only on an open, non-draft, same-repository pull request into `main` tha
    free numbers on `main`. Otherwise the keeper comments the exact `git mv` lines and the schema pins to change,
    and does not enqueue. It never renumbers: the pins include comments, table-set names and test expectations
    (ANYM-848's renumber changed 15 files).
-4. **Dequeues.** A merge-queue removal for failed checks on the current head is retried once: an enqueue again
-   reruns the whole group, which a rerun of a dropped group's jobs cannot. The keeper waits 3 minutes first, so
-   a worker's `wait-merge.sh` (30-s polls) re-enqueues a flake first. The counts come from the pull request's
-   timeline, so every actor shares them. A second failure gets one comment with the failing jobs, and the keeper
-   stops for that head. Two failures are the budget for every actor: when a `ship` pull request is queued or
-   armed again on that head (a later `wait-merge.sh` retry, a hand enqueue), the keeper takes it out of the
-   queue (or disarms it) and comments once. Remove the `ship` label to enqueue it by hand anyway. A queue `merge_conflict` waits until main moves past the entry ahead and is retried
-   once; a second one gets a comment and stops. A removal by hand holds the pull request until a new head
-   arrives or the `ship` label is added again. A conflict with main gets one comment.
+4. **Dequeues.** A merge-queue removal for failed checks on the current head gets one comment with the
+   failing jobs, and the keeper does not re-enqueue it. The one flake retry stays with the worker's
+   `wait-merge.sh`, so the queue has a single retry actor. The keeper can retry once (`RETRY_FAILED_CHECKS` in
+   the script, 3 minutes after the removal). It stays off until `wait-merge.sh` skips its re-enqueue for `ship`
+   pull requests, because two actors with separate retry counts could start a third attempt (Sol r3 on #790).
+   A second failure on a head gets one comment, and the keeper stops. A queue `merge_conflict` waits until main
+   moves past the entry ahead and is retried once; `wait-merge.sh` never retries conflicts. A second conflict
+   gets a comment, and the keeper stops. A removal by hand holds the pull request until a new head arrives or
+   the `ship` label is added again. A conflict with main gets one comment. The counts come from the pull
+   request's timeline.
 
 A pull request that is queued or has auto-merge armed is left to GitHub. Each comment carries an HTML marker
 `<!-- merge-keeper:<kind>:<head> -->` and is posted once per head; markers count only from a write-access account
