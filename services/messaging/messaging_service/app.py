@@ -718,7 +718,7 @@ def register_conversation_tools(mcp, call, read):
                    can_post: StrictBool | None=None,awaiting_their_reply: StrictBool=False,
                    min_wait_hours: StrictInt | None=None,
                    courtesies: Literal['include','exclude','only']='include') -> dict[str, Any]:
-        """List permitted chats. order: activity (default) or last_activity_desc = recent first; id = stable catalogue traversal. query also matches a channel @username. account/accounts: each account's source status and last ingest; catalog_refresh; new empty groups wait for the next pass. No provider read changes.
+        """List permitted chats. order: activity (default) or last_activity_desc = recent first; id = stable catalogue traversal. query also matches a channel @username. account/accounts: each account's source status and last ingest; catalog_refresh; groups created in the app list at once. No provider read changes.
         awaiting_reply: private incoming, excluding known bots, or explicit group owner mention/reply; heuristic, not obligation. Attention expires after awaiting_reply_days (0 = no age limit) from the attention message time; group evidence survives others' chatter and clears after owner writes. priority requires awaiting_reply=true; score/reasons are transparent heuristics (an owner group mention without a question mark scores owner_request; detail=full adds awaiting_reply_priority_components). chat_types=['private']. A due snooze returns with snoozed_until and snooze_due.
         courtesies=exclude (excluded_courtesies_total) hides thanks/ok/sticker ends; review courtesies=only once.
         Compact rows omit values the row fixes (rows without type omit nothing); an absent field means the value below.
