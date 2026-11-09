@@ -482,6 +482,105 @@ def prepare_image(profile,path):
     return data,'image/jpeg',flags
 
 
+# ANYM-851: the messaging copy of ANYM-850's typed document contract (services/inference schemas.py DocumentResult);
+# tests/test_inference_contract.py keeps these limits equal to the service's.
+DOCUMENT_ALIAS='document-structure'
+DOCUMENT_MAX_BYTES=32*1024*1024
+DOCUMENT_MAX_PAGES=100
+DOCUMENT_MAX_CHARS=1_000_000
+DOCUMENT_REFUSALS=('unsupported_format','page_limit','invalid_document')
+# A mini that cannot take the job now, or that has no document route yet (404 before ANYM-850's install): no attempt.
+DOCUMENT_BACKPRESSURE=SERVICE_BACKPRESSURE|{'engine_unavailable','unknown_model','not_found'}
+DOCUMENT_MIMES={'pdf':'application/pdf',
+    'docx':'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'pptx':'application/vnd.openxmlformats-officedocument.presentationml.presentation'}
+ENGINE_VERSION=re.compile(r'[0-9][0-9A-Za-z.]{0,31}')
+ENGINE_MODEL_NAME=re.compile(r'[a-z0-9_]{1,16}')
+ENGINE_MODEL_REVISION=re.compile(r'[0-9a-f]{40}')
+
+
+def _bounded_int(value,low,high):
+    return type(value) is int and low<=value<=high
+
+
+def normalize_document(value):
+    """The mini's DocumentResult, checked again here: the answer is untrusted input. Anything outside the contract is
+    `invalid_model_response` (a failed attempt), never stored."""
+    if not isinstance(value,dict) or set(value)!={'markdown','truncated','page_spans','coverage','engine'}:
+        raise ModelError('invalid_model_response')
+    markdown,truncated,spans,coverage,engine=(value[k] for k in ('markdown','truncated','page_spans','coverage','engine'))
+    if not isinstance(markdown,str) or len(markdown)>DOCUMENT_MAX_CHARS or '\x00' in markdown or type(truncated) is not bool:
+        raise ModelError('invalid_model_response')
+    if not isinstance(spans,list) or len(spans)>DOCUMENT_MAX_PAGES:raise ModelError('invalid_model_response')
+    clean=[];previous_end=previous_page=0
+    for span in spans:
+        if (not isinstance(span,dict) or set(span)!={'page','start','end'} or not _bounded_int(span['page'],1,DOCUMENT_MAX_PAGES)
+                or not _bounded_int(span['start'],0,DOCUMENT_MAX_CHARS) or not _bounded_int(span['end'],0,DOCUMENT_MAX_CHARS)
+                or span['start']<previous_end or span['end']<span['start'] or span['page']<=previous_page
+                or span['end']>len(markdown)):
+            raise ModelError('invalid_model_response')
+        previous_end,previous_page=span['end'],span['page']
+        clean.append({'page':span['page'],'start':span['start'],'end':span['end']})
+    if (not isinstance(coverage,dict) or set(coverage)-{'pages'} != {'pages_with_text','tables','headings'}
+            or not (coverage.get('pages') is None or _bounded_int(coverage['pages'],0,DOCUMENT_MAX_PAGES))
+            or not _bounded_int(coverage['pages_with_text'],0,DOCUMENT_MAX_PAGES)
+            or not _bounded_int(coverage['tables'],0,DOCUMENT_MAX_CHARS) or not _bounded_int(coverage['headings'],0,DOCUMENT_MAX_CHARS)):
+        raise ModelError('invalid_model_response')
+    models=engine.get('models') if isinstance(engine,dict) else None
+    if (not isinstance(engine,dict) or set(engine)!={'name','version','models','network_attempts','peak_rss_mb'}
+            or engine['name']!='docling' or not isinstance(engine['version'],str) or not ENGINE_VERSION.fullmatch(engine['version'])
+            or not isinstance(models,dict) or len(models)>8
+            or any(not isinstance(k,str) or not ENGINE_MODEL_NAME.fullmatch(k) or not isinstance(v,str)
+                   or not ENGINE_MODEL_REVISION.fullmatch(v) for k,v in models.items())
+            # The service refuses a job with any outbound attempt; a non-zero figure here is not its answer.
+            or engine['network_attempts']!=0 or type(engine['network_attempts']) is not int
+            or not _bounded_int(engine['peak_rss_mb'],0,1_048_576)):
+        raise ModelError('invalid_model_response')
+    return {'markdown':markdown,'truncated':truncated,
+        'engine':{'name':'docling','version':engine['version'],'models':dict(sorted(models.items())),
+                  'peak_rss_mb':engine['peak_rss_mb']},
+        'metadata':{'page_spans':clean,'coverage':{'pages':coverage.get('pages'),'pages_with_text':coverage['pages_with_text'],
+            'tables':coverage['tables'],'headings':coverage['headings']}}}
+
+
+def convert_document(profile,path,kind,*,transport=None):
+    """ANYM-851: one document to the mini's POST /v1/documents/convert (ANYM-850). ModelBackpressure when the mini
+    cannot take it now (no attempt); ModelError with the service's final refusal code (DOCUMENT_REFUSALS) or a failed
+    attempt's code; else the service's answer, checked by normalize_document. Bodies and key never leave this function."""
+    key=private_text(profile['api_key_file']).strip()
+    if not key or any(c in key for c in '\r\n'):raise ModelError('invalid_model_key')
+    headers={'Authorization':'Bearer '+key,'X-Request-Deadline-Seconds':str(profile['timeout_seconds']),
+             'Accept-Encoding':'identity'}
+    if kind not in DOCUMENT_MIMES:raise ModelError('unsupported_format')
+    try:
+        with httpx.Client(timeout=httpx.Timeout(profile['timeout_seconds'],connect=10),follow_redirects=False,
+                trust_env=False,transport=transport) as client,Path(path).open('rb') as stream:
+            # `kind` is the worker's reading of the stored file (pdf, docx, pptx); the upload name and type carry no part
+            # of the chat's filename, and the service checks the content itself.
+            with client.stream('POST',profile['base_url']+'/documents/convert',headers=headers,
+                    data={'model':profile['model']},files={'file':('document.'+kind,stream,DOCUMENT_MIMES[kind])}) as response:
+                status=response.status_code
+                if status==429:raise ModelBackpressure(retry_after_seconds(response.headers.get('Retry-After')))
+                if status in (404,422,502,503,504):
+                    code=service_error_code(error_body(response))
+                    if status==422 and code in DOCUMENT_REFUSALS:raise ModelError(code)
+                    if status==404 or code is None and status in (502,503,504) or code in DOCUMENT_BACKPRESSURE:
+                        raise ModelBackpressure(retry_after_seconds(response.headers.get('Retry-After')))
+                    if code in ('engine_timeout','engine_failed'):raise ModelError(code)
+                    raise ModelError('model_http_error')
+                if status in (401,403):raise ModelError('model_auth_failed')
+                if not 200<=status<300:raise ModelError('model_http_error')
+                data=bytearray()
+                for part in response.iter_bytes():
+                    data.extend(part)
+                    if len(data)>8*1024**2:raise ModelError('model_response_too_large')
+        value=json.loads(data)
+    except (httpx.ConnectError,httpx.ConnectTimeout):raise ModelBackpressure() from None
+    except (httpx.HTTPError,ValueError,RecursionError):raise ModelError('model_request_failed') from None
+    normalize_document(value)  # refuses anything outside the contract here, before it leaves the child
+    return value
+
+
 def infer(profile,kind,path,mime,source_text='',*,transport=None):
     provider=profile['provider'];model=profile['model'];mini=provider=='deedkit_inference'
     if kind=='audio':return infer_audio(profile,path,mime,transport=transport)

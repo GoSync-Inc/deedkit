@@ -63,6 +63,116 @@ def test_forged_edited_abbreviated_or_pre_head_approval_comments_do_not_approve(
 
 
 # spec: ANYM-625
+def test_review_record_none_approves_a_clean_diff_and_holds_a_risk_path_with_one_comment():
+    clean = facts(comments=[], review_none=True, signals=())
+    assert mk.decide(clean).action == 'enqueue'
+    risky = facts(comments=[], review_none=True, signals=('.github/workflows/ci.yml: change-path',))
+    decision = mk.decide(risky)
+    assert (decision.action, decision.comment_key) == ('hold', f'risk:{HEAD}')
+    assert '.github/workflows/ci.yml' in decision.comment and f'Diff read: <session> {HEAD}' in decision.comment
+    assert mk.decide(facts(review_none=True, signals=('x.sql: change-path',))).action == 'enqueue'  # Diff read on the head
+    assert mk.decide(facts(comments=[], review_none=False, signals=())).reason == 'no approval recorded for the head'
+
+
+# spec: ANYM-625
+def test_review_record_none_line_forms():
+    for body in ('Review record: none (owner review cut 11-09)', 'Review record: none (small fix)',
+                 'x\nReview record: none\ny'):
+        assert mk.REVIEW_NONE_LINE.search(body), body
+    for body in ('Review record: Astra r1 APPROVE', 'Review record: none yet, Astra running', 'see Review record: none'):
+        assert not mk.REVIEW_NONE_LINE.search(body), body
+
+
+# spec: ANYM-625
+def test_signal_grep_reads_the_whole_diff_headers_included_and_never_passes_an_unreadable_one():
+    def diff(name, body='+x = 1', old=None):
+        return (f'diff --git a/{old or name} b/{name}\nindex 1..2 100644\n--- a/{old or name}\n+++ b/{name}\n'
+                f'@@ -1 +1 @@\n{body}\n')
+    assert mk.signal_hits(diff('scripts/a.py') + diff('docs/b.md', '+plain text\n-old')) == ()
+    assert mk.signal_hits(diff('scripts/secrets.py'))  # only the +++ header names it
+    assert mk.signal_hits(diff('docs/new.md', old='AGENTS.md'))
+    assert mk.signal_hits(diff('s/c.py', '+c.execute("DROP TABLE t")'))
+    assert mk.signal_hits(diff('scripts/a.py', ' context GRANT\n+ok')) == ()  # context lines are not signals
+    binary = 'diff --git a/x.bin b/x.bin\nindex 1..2 100644\nBinary files a/x.bin and b/x.bin differ\n'
+    assert mk.signal_hits(binary)
+    assert mk.signal_hits('') == ('diff not readable',) and mk.signal_hits('\n') == ('diff not readable',)
+
+
+def documented_grep(root):
+    """review-protocol.md's two signal grep commands, run as written against `main`."""
+    names = mk.subprocess.run(['git', '-C', str(root), 'diff', '--no-renames', '--name-only', 'main...'], check=True,
+                              capture_output=True, text=True).stdout
+    lines = mk.subprocess.run(['git', '-C', str(root), 'diff', '-U5', 'main...'], check=True, capture_output=True,
+                              text=True).stdout
+    return any(mk.SIGNAL_PATH.search(n) for n in names.splitlines()) or bool(mk.SIGNAL_LINE.search(lines))
+
+
+# spec: ANYM-625
+@pytest.mark.parametrize('change', [
+    {'scripts/a.py': 'x = 2\n'}, {'scripts/secrets.py': 'x = 1\n'}, {'docs/x.md': 'drop the old plan\n'},
+    {'svc/m/migrations/075_a.sql': 'SELECT 1;\n'}, {'deploy/compose.yml': 'a: 1\n'}, {'scripts/a.py': 'ok\n',
+     'docs/y.md': 'permissions: read\n'}])
+def test_signal_grep_agrees_with_the_documented_commands(tmp_path, change):
+    root = tmp_path / 'repo'
+    env = {'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@example.invalid', 'GIT_COMMITTER_NAME': 't',
+           'GIT_COMMITTER_EMAIL': 't@example.invalid', 'HOME': str(tmp_path), 'GIT_CONFIG_NOSYSTEM': '1',
+           'PATH': mk.os.environ['PATH']}
+    git = lambda *a: mk.subprocess.run(['git', '-C', str(root), *a], check=True, capture_output=True, text=True,  # noqa: E731
+                                       env=env).stdout
+    (root / 'scripts').mkdir(parents=True)
+    (root / 'scripts/a.py').write_text('x = 1\n')
+    git('init', '-q', '-b', 'main'), git('add', '-A'), git('commit', '-q', '-m', 'base'), git('switch', '-q', '-c', 'pr')
+    for name, text in change.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(text)
+    git('add', '-A'), git('commit', '-q', '-m', 'change')
+    assert bool(mk.signal_hits(git('diff', 'main...'))) == documented_grep(root), change
+
+
+class FakeGitHub(mk.GitHub):
+    """Answers collect()'s reads; the pull request's file list and detail already show a newer, clean head B."""
+
+    def __init__(self, diffs):
+        super().__init__(dry_run=True)
+        self.diffs, self.asked = diffs, []
+
+    def api(self, path, *arguments, paginate=False):
+        tail = path.split(f'{self.repository}/', 1)[-1]
+        if tail.startswith('pulls/7/files'):
+            return [{'filename': 'scripts/a.py', 'status': 'modified'}]
+        if tail.startswith('pulls/7/reviews') or tail.startswith('issues/7/comments'):
+            return []
+        if tail.startswith('pulls/7'):
+            return {'mergeable': True, 'changed_files': 1, 'head': {'sha': OLD}}
+        if '/check-suites' in tail:
+            return {'check_suites': [{'created_at': '2026-11-09T00:00:00Z'}]}
+        if '/check-runs' in tail:
+            return {'check_runs': []}
+        raise AssertionError(tail)
+
+    def graphql(self, query, **variables):
+        return {'repository': {'pullRequest': {'id': 'PR_1', 'isInMergeQueue': False, 'autoMergeRequest': None,
+                                               'timelineItems': {'nodes': []}}}}
+
+    def diff(self, base, head):
+        self.asked.append(head)
+        return self.diffs[head]
+
+
+# spec: ANYM-625
+def test_the_scanned_diff_is_the_listed_head_that_would_be_enqueued():
+    risky = 'diff --git a/.github/workflows/x.yml b/.github/workflows/x.yml\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n+a\n'
+    gh = FakeGitHub({HEAD: risky, OLD: ''})
+    pr = {'number': 7, 'state': 'open', 'draft': False, 'labels': [{'name': 'ship'}], 'body': 'Review record: none',
+          'head': {'sha': HEAD, 'repo': {'full_name': gh.repository}}, 'base': {'ref': 'main', 'sha': 'c' * 40}}
+    facts_, _ = mk.collect(gh, pr, [('CI gate', 15368)], '2026-11-09T00:00:00Z')
+    assert gh.asked == [HEAD] and facts_.head == HEAD and facts_.signals
+    assert mk.head_signals(type('Broken', (), {'diff': lambda self, b, h: (_ for _ in ()).throw(
+        mk.subprocess.CalledProcessError(1, 'gh', stderr='HTTP 406 diff too large'))})(), 'c', HEAD)[0].startswith(
+        'diff not readable')
+
+
+# spec: ANYM-625
 def test_approval_of_an_older_head_holds_and_comments_once():
     stale = facts(comments=[approval(OLD)])
     decision = mk.decide(stale)
@@ -225,14 +335,17 @@ approvals = st.sampled_from([approval(), approval(HEAD[:9]), approval(OLD), appr
        checks=st.dictionaries(st.sampled_from(['checks / verify', 'CI gate']), check),
        removals=st.lists(removal, max_size=3), mergeable=st.sampled_from([True, False, None]),
        queued=st.booleans(), draft=st.booleans(), main_at=st.sampled_from(['2026-11-09T00:00:00Z', '2026-11-09T02:00:00Z']),
-       added=st.sampled_from([(), ('073_x.sql',), ('074_x.sql',), ('075_x.sql',)]))
-def test_enqueue_only_when_every_gate_holds(comments, checks, removals, mergeable, queued, draft, main_at, added):
+       added=st.sampled_from([(), ('073_x.sql',), ('074_x.sql',), ('075_x.sql',)]),
+       review_none=st.booleans(), signals=st.sampled_from([(), ('x.sql: change-path',)]))
+def test_enqueue_only_when_every_gate_holds(comments, checks, removals, mergeable, queued, draft, main_at, added,
+                                            review_none, signals):
     f = facts(comments=comments, checks=checks, removals=removals, mergeable=mergeable, queued=queued, draft=draft,
-              main_at=main_at, added_migrations=added)
+              main_at=main_at, added_migrations=added, review_none=review_none, signals=signals)
     if mk.decide(f).action != 'enqueue':
         return
     since = [r for r in removals if r['at'] >= f.head_at]
-    assert approval() in comments and not queued and not draft and mergeable is True
+    assert approval() in comments or (review_none and not signals)
+    assert not queued and not draft and mergeable is True
     assert checks.get('CI gate', {}).get('conclusion') == 'success'
     assert all(c['status'] == 'completed' and c['conclusion'] in ('success', 'skipped') for c in checks.values())
     assert set(checks) == set(f.required) and added in ((), ('074_x.sql',))

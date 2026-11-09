@@ -5,7 +5,7 @@
 -- the canonical host lock file's st_dev:st_ino). Within one boot the kernel flock proves a previous owner dead;
 -- anything else needs a clean release or an operator release (session_claim.py, deedkit admin session-claim).
 -- `restore_hold` is set only by quarantine_restore on an isolated restore. `waiting_*` show a refused opener and
--- never change ownership. A schema-76 runtime never names the table; a schema-77 opener on a schema-76 database
+-- never change ownership. A schema-77 runtime never names the table; a schema-78 opener on a schema-77 database
 -- refuses at acquire (fail-closed at start). No column default calls a function: session_claim.py writes times.
 SET LOCAL lock_timeout='2s';
 CREATE TABLE IF NOT EXISTS session_claims (

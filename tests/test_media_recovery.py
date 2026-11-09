@@ -124,7 +124,7 @@ def test_schema_68_has_the_table_and_the_collector_reads_and_updates_only_what_i
     ar, s = wa
     fid = failed(ar, s, '1')
     with s.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '77'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '78'
     recover(s)
     role = install(s, 'collector_role.sql', 'messaging_collector', account=ACCOUNT)
     try:
@@ -262,6 +262,69 @@ def test_budget_exhaustion_ends_still_failing_on_the_schedule(wa):
     assert recovery(s, fid)['state'] == 'still_failing' and recovery(s, fid)['last_code'] == 'media_network_error'
     assert job(s, fid)['attempts'] == MEDIA_MAX_ATTEMPTS and job(s, fid)['error_code'] == 'media_network_error'
     assert claim(ar) is None
+
+
+def failure_events(s, fid):
+    with s.pool.connection() as c:
+        return c.execute('''SELECT e.event_key,e.snapshot->'processing' AS processing FROM events e
+            JOIN media_jobs j ON j.message=e.message WHERE j.id=%s AND e.kind='attachment.failed' ORDER BY e.id''',
+            (fid,)).fetchall()
+
+
+def failed_for_good(ar, s, mid):
+    # A job that failed for good through the archive's own sweep: its first attachment.failed episode.
+    fid = failed(ar, s, mid)
+    with s.pool.connection() as c:
+        c.execute("""UPDATE media_jobs SET state='leased',lease_owner='worker',lease_until=now()-interval '1 second'
+            WHERE id=%s""", (fid,))
+    ar._media_sweeps.clear()
+    claim(ar)
+    assert job(s, fid)['state'] == 'failed' and len(failure_events(s, fid)) == 1
+    return fid
+
+
+# spec: ANYM-867
+def test_an_operator_requeue_that_fails_again_commits_a_new_failure_and_one_that_succeeds_commits_ready(wa):
+    ar, s = wa
+    fid = failed_for_good(ar, s, '1')
+    recover(s)
+    ar.fail_media(claim(ar), 'media_unavailable', permanent=True)
+    assert recovery(s, fid)['state'] == 'provider_unavailable'
+    first, second = failure_events(s, fid)
+    assert first['event_key'] != second['event_key']
+    assert second['processing']['failed'] == [{'attachment': fid, 'reason': 'retry_exhausted', 'next_action': None}]
+    # A retry inside the recovery budget is not terminal: nothing more is published.
+    other = failed_for_good(ar, s, '2')
+    recover(s)
+    ar.fail_media(claim(ar), 'media_network_error')
+    assert recovery(s, other)['state'] == 'queued' and len(failure_events(s, other)) == 1
+    due(s, other)
+    writer = BlobWriter(s.files, reserve_bytes=0)
+    ar.finish_media(claim(ar), writer.write([b'data'], expected_bytes=4), writer)
+    assert recovery(s, other)['state'] == 'recovered' and len(failure_events(s, other)) == 1
+    with s.pool.connection() as c:
+        assert c.execute('''SELECT count(*) AS n FROM events e JOIN media_jobs j ON j.message=e.message
+            WHERE j.id=%s AND e.kind='attachment.ready' ''', (other,)).fetchone()['n'] == 1
+
+
+# spec: ANYM-867
+def test_a_recovery_that_ends_on_a_size_refusal_or_a_spent_lease_commits_its_failure_once(wa):
+    ar, s = wa
+    big = failed_for_good(ar, s, '1')
+    recover(s)
+    assert ar.claim_media('worker', account=ACCOUNT, writer=BlobWriter(s.files, max_bytes=3, reserve_bytes=0)) is None
+    assert recovery(s, big)['state'] == 'still_failing' and recovery(s, big)['last_code'] == 'size_limit'
+    assert [e['processing']['failed'][0]['reason'] for e in failure_events(s, big)] == ['retry_exhausted', 'size_limit']
+    # The last recovery attempt's lease ran out: the claim ends it still_failing and commits its failure once.
+    spent = failed_for_good(ar, s, '2')
+    recover(s)
+    assert claim(ar)['id'] == spent
+    with s.pool.connection() as c:
+        c.execute("UPDATE media_recovery SET attempts=%s,lease_until=now()-interval '1 second' WHERE job=%s",
+            (mr.RECOVERY_BUDGET, spent))
+    assert claim(ar) is None and claim(ar) is None
+    assert recovery(s, spent)['state'] == 'still_failing' and recovery(s, spent)['last_code'] == 'lease_expired'
+    assert len(failure_events(s, spent)) == 2
 
 
 # spec: ANYM-816

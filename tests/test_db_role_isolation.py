@@ -258,6 +258,31 @@ def test_enricher_publishes_model_readiness_only_through_its_function(seeded, tm
         remove(s, role)
 
 
+# spec: ANYM-851
+def test_the_enricher_role_runs_structure_work_and_cannot_delete_it(seeded, tmp_path):
+    from test_document_structure import RESULTS, add_document, make, write_config
+    from messaging_service.enrichment_providers import normalize_document
+    s, _, _ = seeded
+    add_document(s, 'role-structure')
+    role = install(s, 'enrichment_role.sql', 'messaging_enricher')
+    try:
+        w = make(s, write_config(tmp_path))
+        w.connection = lambda: as_role(s, role)
+        w.publish_profiles()
+        w.structure.sweep()
+        row = w.structure.claim()
+        assert row['attachment'] == 'role-structure'
+        assert w.structure.store(row, normalize_document(RESULTS['table.pdf'])) is True
+        w.unpublish_profiles()
+        refused(s, role, "DELETE FROM attachment_structure WHERE attachment='role-structure'")
+        refused(s, role, "DELETE FROM structure_profiles")
+        with s.pool.connection() as c:
+            assert c.execute("SELECT state FROM attachment_structure WHERE attachment='role-structure'").fetchone()['state'] == 'ready'
+            assert c.execute("SELECT enabled FROM structure_profiles WHERE account='telegram-demo'").fetchone()['enabled'] is False
+    finally:
+        remove(s, role)
+
+
 def other_account(ar, s):
     ar.register('archive-other', 'telegram', 'Synthetic other', include_chats=['200'])
     mid = ar.ingest(media_event(account='archive-other', chat='200', provider_id='5'))['message']
@@ -366,6 +391,23 @@ def test_collector_bound_to_one_account_ingests_it_but_cannot_write_another(arch
             refused(s, role, statement)
         with s.pool.connection() as c:
             assert c.execute("SELECT body FROM messages WHERE id=%s", (other,)).fetchone()['body'] == 'Первый текст lighthouse'
+    finally:
+        remove(s, role)
+
+
+# spec: ANYM-867
+def test_a_bound_collector_publishes_attachment_failed_with_its_existing_grants(archive):  # noqa: F811
+    from messaging_service import attachment_failures
+    ar, s, key, _ = archive
+    role = install(s, 'collector_role.sql', 'messaging_collector', account='archive-test')
+    try:
+        bound = Archive(NS(pool=RolePool(s, role), append_event=s.append_event, files=s.files))
+        bound.ingest(media_event())
+        before = sum(attachment_failures.SET_ASIDE.values())
+        bound.fail_media(bound.claim_media('bound-worker', account='archive-test'), 'unavailable', permanent=True)
+        assert sum(attachment_failures.SET_ASIDE.values()) == before
+        assert [i['kind'] for i in s.get_updates(key, 'bound-failed', kinds=['attachment.failed'])['items']] == [
+            'attachment.failed']
     finally:
         remove(s, role)
 
@@ -537,7 +579,7 @@ def test_upgrade_and_rollback_keep_feed_order_and_cursors(schema36_store, monkey
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '77'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '78'
         assert c.execute('SELECT * FROM archive_migrations WHERE version<=36 ORDER BY version').fetchall() == migrations
     assert feed_state(store) == before
     try:
@@ -950,11 +992,11 @@ def test_activity_grants_add_only_the_new_table_to_each_role(seeded, template, b
         # A later schema's block (71, ANYM-837: the gateway's INSERT of outgoing_messages.menu_choice) is not this one's.
         later = {('outgoing_messages', 'menu_choice', 'INSERT')} if base == 'messaging_gateway' else set()
         # Schema 73 (ANYM-848) adds the gateway's wake target tables; they are that block's, not this one's.
-        # Schema 76 (ANYM-907) adds the gateway's read of the negotiation tables; that block's too.
-        # Schema 77 (ANYM-914) adds the gateway's read of session_claims; also a later block's.
+        # Schema 76 (ANYM-907) adds the gateway's read of the negotiation tables and schema 77 (ANYM-851) its structure
+        # reads; schema 78 (ANYM-914) its read of session_claims; those blocks' too.
         assert {grant for grant in after if grant[0] not in ('subscription_activity', 'wake_targets',
             'wake_target_subscriptions', 'negotiations', 'negotiation_sources', 'negotiation_times',
-            'session_claims')} - later == before
+            'attachment_structure', 'structure_profiles', 'session_claims')} - later == before
         assert {grant[2] for grant in after if grant[0] == 'subscription_activity' and grant[1] == ''} == added
         token = store.issue_key('activity-acl', ['telegram-demo'], permissions=['read', 'subscription-write'],
             key_permissions=['read', 'subscription-write'])

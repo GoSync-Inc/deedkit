@@ -283,7 +283,7 @@ the live DB is updated. When proxy configuration is added, include it in the exp
 list of settings sources; this does not replace a backup of the previous application and its DB.
 
 Restore first checks all hashes, then revokes the stored keys and disables
-the collectors. It also holds every provider-session claim (`session_claims.restore_hold`, schema 77; a pre-claim backup is
+the collectors. It also holds every provider-session claim (`session_claims.restore_hold`, schema 78; a pre-claim backup is
 held by its `restored_disabled` status): before re-enabling collectors on a restored database, stop the original
 environment's session services, then run `deedkit admin session-claim release` per account (COLLECTORS.md, ANYM-914). The old gateway 0.4 must not be run over a restored schema 5: it
 ignores the new chat/operation restrictions. Code, schema and role grants versions
@@ -801,6 +801,10 @@ and undo: `docs/operations/production.md`, "Backup alerts".
   - `backup_unverified.<profile>` when the last verified backup's capture is older than the limit. Recordings and
     calls read `captured_at` from the proof. Messaging and calendar read the `backup_id` time, which is the job's
     creation time and which a resumed job keeps. That is conservative: the age can only read too large.
+- **Autodeploy halts** (production host only): `deploy_halted.<code>` while `/etc/deedkit/autodeploy.pause` names
+  a halt code `deploy` wrote (`deploy_halted.other` for a code this copy does not know), component `deploy`. A
+  hand-written pause raises nothing; removing the pause ends the episode. Only the code leaves the host
+  (TELEMETRY.md, Autodeploy halts).
 - **Limits**, measured from capture, are policy rather than every timeout's worst case: messaging 30 h, calendar 32 h,
   recordings 30 h, calls 36 h. A slow verification inside its budgets can raise one `backup_unverified` event;
   resolve it.

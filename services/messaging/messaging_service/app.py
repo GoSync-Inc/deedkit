@@ -946,7 +946,7 @@ def register_archive_tools(mcp, call, async_call, read):
 
     @mcp.tool(structured_output=True, annotations=read)
     def get_file_text(ctx: Context, attachment_id: str, offset: StrictInt=0,
-                      limit: StrictInt=4000, content: Literal['extracted','enriched'] | None=None, detail: Detail='compact') -> dict[str, Any]:
+                      limit: StrictInt=4000, content: Literal['extracted','enriched','structured'] | None=None, detail: Detail='compact') -> dict[str, Any]:
         """Read bounded derived text (max8000 characters/page), indexing status, original SHA256
         and source message/revision. Follow next_offset; truncated means extraction was capped.
         Without content, a voice note returns its model transcript (content=enriched in the reply);
@@ -956,6 +956,8 @@ def register_archive_tools(mcp, call, async_call, read):
         Compact keeps text, paging, status reasons, content_coverage, provenance and page/sheet spans;
         detail=full adds understanding, extraction_coverage, cell spans and the notices.
         Text/OCR may be incomplete or inaccurate. Original download uses separate download permission.
+        content=structured: a PDF, DOCX or PPTX as Markdown with headings and table rows (converted on the
+        owner's machine), paged the same way; structured_text on other reads says whether it is ready.
         """
         return call(ctx,'get_file_text',detail=detail,attachment_id=attachment_id,offset=offset,limit=limit,content=content)
 

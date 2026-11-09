@@ -100,13 +100,18 @@ def parse_targets(raw):
     return targets
 
 
+def _mini_profiles(config):
+    # ANYM-851: the `structure` key sends document originals to the mini too, so it is proven the same way.
+    return [profile for profile in [*config['profiles'].values(), *([config['structure']] if config.get('structure') else [])]
+            if profile.get('provider') == 'deedkit_inference']
+
+
 def required(config):
-    return any(profile.get('provider') == 'deedkit_inference' for profile in config['profiles'].values())
+    return bool(_mini_profiles(config))
 
 
 def mini_hosts(config):
-    return sorted({urlsplit(profile['base_url']).hostname for profile in config['profiles'].values()
-                   if profile.get('provider') == 'deedkit_inference'})
+    return sorted({urlsplit(profile['base_url']).hostname for profile in _mini_profiles(config)})
 
 
 def blocked_targets(config):

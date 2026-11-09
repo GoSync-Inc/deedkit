@@ -14,21 +14,25 @@ import threading
 import time
 
 from . import __version__
-from .backup_health import CODES as BACKUP_HEALTH_CODES
+from .backup_health import CODES as BACKUP_HEALTH_CODES, DEPLOY_CODES
 from .operational import TELEMETRY_STOP_CODES as STOP_CODES
 
-COMPONENTS = {'gateway', 'telegram', 'whatsapp', 'indexer', 'enricher', 'subscriptions', 'module_router', 'backup'}
+COMPONENTS = {'gateway', 'telegram', 'whatsapp', 'indexer', 'enricher', 'subscriptions', 'module_router', 'backup',
+              'deploy'}
 CODES = {'request_failed', 'tool_failed', 'collector_failed', 'indexer_failed',
          'enrichment_failed', 'subscription_match_failed', 'subscription_hint_failed',
          'subscription_retention_failed', 'subscription_journal_failed',
          'subscription_module_match_failed', 'subscription_module_hint_failed',
-         'module_router_failed', 'uncaught_exception', 'setup_check'}
+         'module_router_failed', 'uncaught_exception', 'setup_check',
+         'structure_failed'}  # ANYM-851: a structure step's unexpected error (document_structure.StructureWork.step)
 # Tiden run environments; an unknown slug would silently create a duplicate (TIDEN-CI.md).
 ENVIRONMENTS = {'production', 'local-synthetic'}
 ENRICHMENT_HEALTH_CODES = frozenset({'enrichment_stalled', 'enrichment_starved', 'enrichment_no_worker'})
 CODES |= ENRICHMENT_HEALTH_CODES
 # The host backup checker's 16 codes, posted by backup_health.py itself (ANYM-807).
 CODES |= BACKUP_HEALTH_CODES
+# The autodeploy halt codes the same checker posts on the production host (ci-deploy-speed 11-09).
+CODES |= DEPLOY_CODES
 ROOT = Path(__file__).resolve().parent
 SOURCE_FILES = frozenset(p.name for p in ROOT.glob('*.py'))
 # Repository-root paths, matching Tiden component paths.
@@ -87,7 +91,7 @@ def safe_event(error, component, code):
     if code in ENRICHMENT_HEALTH_CODES:
         event['fingerprint'] = ['enrichment-health', component, code]
     # One issue per backup profile and kind, whichever host raised it (ANYM-807).
-    if component == 'backup' and code in BACKUP_HEALTH_CODES:
+    if component == 'backup' and code in BACKUP_HEALTH_CODES or component == 'deploy' and code in DEPLOY_CODES:
         event['fingerprint'] = ['backup-health', component, code]
     return event
 

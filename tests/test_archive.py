@@ -1,5 +1,6 @@
 from datetime import datetime,timezone,timedelta
 import hashlib
+import json
 
 from hypothesis import given,strategies as st
 import pytest
@@ -669,6 +670,232 @@ def test_media_retry_backoff_and_exhausted_crash(archive):
     assert s.get_attachment(key,job['id'])['status']=='failed'
 
 
+def failed_events(s,message=None):
+    with s.pool.connection() as c:
+        return c.execute("""SELECT id,message,event_key,origin,snapshot FROM events WHERE kind='attachment.failed'
+            AND (%s::text IS NULL OR message=%s) ORDER BY id""",(message,message)).fetchall()
+
+
+def album(count):
+    return event(provider_id='album',media=[{'provider_id':f'album-{i}','filename':f'private name {i}.jpg','mime':'image/jpeg','bytes':4}
+        for i in range(count)])
+
+
+def expire_last_attempt(ar,s):
+    ar._media_sweeps.clear()  # the next claim sweeps (once a minute otherwise)
+    with s.pool.connection() as c:
+        c.execute("UPDATE media_jobs SET attempts=%s,lease_until=now()-interval '1 second' WHERE state='leased'",
+            (MEDIA_MAX_ATTEMPTS,))
+
+
+# spec: ANYM-867
+def test_each_terminal_download_path_commits_one_attachment_failed_event_and_a_retry_commits_none(archive):
+    ar,s,key,_=archive
+    # fail_media (archive.py:960): a retry is not terminal, a permanent refusal is.
+    mid=ar.ingest(media_event())['message']
+    job=ar.claim_media('worker'); ar.fail_media(job,'network_error')
+    assert failed_events(s)==[]
+    with s.pool.connection() as c: c.execute("UPDATE media_jobs SET next_due=now()-interval '1 second'")
+    job=ar.claim_media('worker'); ar.fail_media(job,'unavailable',permanent=True)
+    [one]=failed_events(s,mid)
+    assert one['snapshot']['processing']=={'stage':'original','state':'failed','attempts':2,
+        'failed':[{'attachment':job['id'],'reason':'retry_exhausted','next_action':None}]}
+    assert 'private' not in json.dumps(one['snapshot']) and one['origin']=='live'
+    # The expiry sweep (archive.py:644): ten files of one album give one event naming all ten.
+    many=ar.ingest(album(10))['message']
+    with s.pool.connection() as c:
+        ids=[r['id'] for r in c.execute("""UPDATE media_jobs SET state='leased',lease_owner='worker'
+            WHERE message=%s RETURNING id""",(many,))]
+    expire_last_attempt(ar,s)
+    assert ar.claim_media('worker') is None
+    [swept]=failed_events(s,many)
+    assert len(ids)==10
+    assert sorted(f['attachment'] for f in swept['snapshot']['processing']['failed'])==sorted(ids)
+    assert {f['reason'] for f in swept['snapshot']['processing']['failed']}=={'retry_exhausted'}
+    assert swept['snapshot']['processing']['attempts']==MEDIA_MAX_ATTEMPTS
+    assert 'private' not in json.dumps(swept['snapshot'])
+    # A size refusal before the lease (archive.py:672).
+    large=ar.ingest(event(provider_id='18',media=[{'provider_id':'big','filename':'big.bin','mime':'text/plain',
+        'bytes':9}]))['message']
+    assert ar.claim_media('worker',writer=BlobWriter(s.files,max_bytes=3,reserve_bytes=0)) is None
+    [size]=failed_events(s,large)
+    assert [f['reason'] for f in size['snapshot']['processing']['failed']]==['size_limit']
+    assert len(failed_events(s))==3
+
+
+# spec: ANYM-867
+def test_attachment_failed_has_one_event_per_sweep_through_replay_race_and_crash(archive,monkeypatch):
+    from messaging_service import storage_admission
+    ar,s,_,_=archive
+    mid=ar.ingest(media_event())['message']
+    job=ar.claim_media('worker')
+    # A crash after the event insert rolls back the job and the event together; the retry commits one.
+    real=storage_admission.StorageAdmission.release
+    def crash(c,j):
+        monkeypatch.setattr(storage_admission.StorageAdmission,'release',staticmethod(real))
+        raise RuntimeError('synthetic_crash')
+    monkeypatch.setattr(storage_admission.StorageAdmission,'release',staticmethod(crash))
+    with pytest.raises(RuntimeError,match='synthetic_crash'): ar.fail_media(job,'unavailable',permanent=True)
+    assert failed_events(s)==[]
+    with s.pool.connection() as c:
+        assert c.execute('SELECT state FROM media_jobs WHERE id=%s',(job['id'],)).fetchone()['state']=='leased'
+    ar.fail_media(job,'unavailable',permanent=True)
+    # A replay of the same outcome finds no lease and commits nothing.
+    with pytest.raises(RuntimeError,match='media_lease_lost'): ar.fail_media(job,'unavailable',permanent=True)
+    assert len(failed_events(s,mid))==1
+    # A sweep that raced a finish: the first to commit wins, the other changes nothing.
+    other=ar.ingest(media_event(provider_id='19'))['message']
+    leased=ar.claim_media('worker'); expire_last_attempt(ar,s)
+    assert ar.claim_media('worker') is None
+    writer=BlobWriter(s.files,reserve_bytes=0)
+    with pytest.raises(RuntimeError,match='media_lease_lost'): ar.finish_media(leased,writer.write([b'data']),writer)
+    ar._media_sweeps.clear()
+    assert ar.claim_media('worker') is None  # a second sweep finds the job already failed
+    assert len(failed_events(s,other))==1
+    with s.pool.connection() as c:
+        assert c.execute("SELECT count(*) AS n FROM events WHERE message=%s AND kind='attachment.ready'",
+            (other,)).fetchone()['n']==0
+    assert len({e['event_key'] for e in failed_events(s)})==2
+
+
+def job_of(s,message):
+    with s.pool.connection() as c:
+        return c.execute('SELECT id FROM media_jobs WHERE message=%s',(message,)).fetchone()['id']
+
+
+# spec: ANYM-867
+def test_a_terminal_fail_media_and_an_ingest_in_lease_message_job_order_do_not_deadlock(archive):
+    # Ingest takes the collector lease, then the message, then its jobs; fail_media takes them in the same order.
+    import threading,psycopg
+    ar,s,_,_=archive
+    lease=('collector',ar.acquire('archive-test','collector'))
+    mid=ar.ingest(media_event())['message']
+    job=ar.claim_media('worker',account='archive-test',collector_lease=lease)
+    errors=[];done=threading.Event()
+    with psycopg.connect(s.pool.conninfo) as ingest:
+        ingest.execute("SELECT 1 FROM collector_leases WHERE account='archive-test' FOR UPDATE")
+        def fail():
+            try:ar.fail_media(job,'unavailable',permanent=True,collector_lease=lease)
+            except Exception as exc:errors.append(exc)
+            finally:done.set()
+        worker=threading.Thread(target=fail);worker.start()
+        assert not done.wait(0.5)  # fail_media waits for the lease, holding neither the message nor the job
+        ingest.execute('SELECT id FROM messages WHERE id=%s FOR UPDATE',(mid,))
+        ingest.execute("UPDATE media_jobs SET requested_until=NULL WHERE id=%s",(job['id'],))
+        ingest.commit()
+    worker.join(10)
+    assert errors==[] and len(failed_events(s,mid))==1
+
+
+# spec: ANYM-867
+def test_a_sweep_overlapping_a_finish_of_the_same_job_gives_one_terminal_outcome(archive,monkeypatch):
+    import threading,time
+    from messaging_service import file_lifecycle
+    ar,s,_,_=archive
+    mid=ar.ingest(media_event())['message']
+    job=ar.claim_media('worker')
+    with s.pool.connection() as c:
+        job=c.execute("""UPDATE media_jobs SET attempts=%s,lease_until=clock_timestamp()+interval '1 second'
+            WHERE id=%s RETURNING *""",(MEDIA_MAX_ATTEMPTS,job['id'])).fetchone()
+    inside,release=threading.Event(),threading.Event()
+    real=file_lifecycle.register_resident_original
+    def held(*args):
+        inside.set(); assert release.wait(10)  # the finish holds the job row, past its lease's end
+        return real(*args)
+    monkeypatch.setattr(file_lifecycle,'register_resident_original',held)
+    writer=BlobWriter(s.files,reserve_bytes=0); blob=writer.write([b'data'])
+    errors=[]
+    def run(target,*args):
+        try:target(*args)
+        except Exception as exc:errors.append(exc)
+    finishing=threading.Thread(target=run,args=(ar.finish_media,job,blob,writer));finishing.start()
+    assert inside.wait(5)
+    time.sleep(1.2)  # the lease has ended: the sweep sees an exhausted job
+    ar._media_sweeps.clear()
+    sweeping=threading.Thread(target=run,args=(ar.claim_media,'worker'));sweeping.start()
+    time.sleep(0.2); release.set()
+    finishing.join(10); sweeping.join(10)
+    assert errors==[]
+    ar._media_sweeps.clear(); ar.claim_media('worker')  # a later sweep changes nothing either
+    with s.pool.connection() as c:
+        state=c.execute('SELECT state FROM media_jobs WHERE id=%s',(job['id'],)).fetchone()['state']
+        kinds=[r['kind'] for r in c.execute("""SELECT kind FROM events WHERE message=%s
+            AND kind IN ('attachment.ready','attachment.failed')""",(mid,))]
+    assert (state,kinds)==('ready',['attachment.ready'])
+
+
+# spec: ANYM-867
+def test_a_size_refusal_whose_message_is_held_waits_and_other_files_are_claimed(archive):
+    import psycopg
+    ar,s,_,_=archive
+    big=ar.ingest(event(provider_id='18',media=[{'provider_id':'big','filename':'big.bin','mime':'text/plain',
+        'bytes':9}]))['message']
+    small=ar.ingest(media_event(provider_id='19'))['message']
+    with s.pool.connection() as c:  # the oversized job's last lease expired
+        c.execute("""UPDATE media_jobs SET state='leased',attempts=1,lease_owner='gone',
+            lease_until=now()-interval '1 second' WHERE message=%s""",(big,))
+    writer=BlobWriter(s.files,max_bytes=8,reserve_bytes=0)
+    with psycopg.connect(s.pool.conninfo) as edit:
+        edit.execute('SELECT id FROM messages WHERE id=%s FOR UPDATE',(big,))
+        claimed=[ar.claim_media('worker',writer=writer) for _ in range(2)]
+    assert [j['message'] for j in claimed if j]==[small]
+    with s.pool.connection() as c:
+        row=c.execute("""SELECT state,attempts,next_due>clock_timestamp() AS waits FROM media_jobs
+            WHERE message=%s""",(big,)).fetchone()
+    assert row=={'state':'queued','attempts':1,'waits':True} and failed_events(s,big)==[]
+
+
+# spec: ANYM-867
+def test_a_held_message_delays_only_its_own_sweep_and_never_holds_ingest(archive):
+    import threading,time,psycopg
+    ar,s,key,_=archive
+    free=ar.ingest(media_event())['message']
+    held=ar.ingest(media_event(provider_id='19'))['message']
+    with s.pool.connection() as c:
+        c.execute("UPDATE media_jobs SET state='leased',lease_owner='worker',attempts=%s,lease_until=now()-interval '1 second'",
+            (MEDIA_MAX_ATTEMPTS,))
+    with psycopg.connect(s.pool.conninfo) as edit:
+        edit.execute('SELECT id FROM messages WHERE id=%s FOR UPDATE',(held,))
+        ar._media_sweeps.clear()
+        sweeping=threading.Thread(target=ar.claim_media,args=('worker',));sweeping.start()
+        started=time.monotonic()
+        ar.ingest(event(provider_id='20',body='ingest during the sweep'))  # no account lock or feed counter held
+        sweeping.join(10)
+        assert not sweeping.is_alive() and time.monotonic()-started<2
+    assert len(failed_events(s,free))==1 and failed_events(s,held)==[]
+    with s.pool.connection() as c:
+        assert c.execute('SELECT state FROM media_jobs WHERE id=%s',(job_of(s,held),)).fetchone()['state']=='leased'
+    ar._media_sweeps.clear()
+    assert ar.claim_media('worker') is None  # the next sweep takes the released message's job
+    assert len(failed_events(s,held))==1
+
+
+# spec: ANYM-867
+def test_a_publication_that_keeps_failing_sets_the_job_aside_and_the_sweep_moves_on(archive,monkeypatch):
+    from messaging_service import attachment_failures,subscriptions
+    ar,s,_,_=archive
+    first=ar.ingest(media_event())['message']; ar.claim_media('worker')
+    second=ar.ingest(media_event(provider_id='19'))['message']; ar.claim_media('worker')
+    real=attachment_failures._append
+    tries=[]
+    def poisoned(c,account,message,group):
+        if message==first:
+            tries.append(message); c.execute('SELECT 1/0')
+        return real(c,account,message,group)
+    monkeypatch.setattr(attachment_failures,'_append',poisoned)
+    def closed_stdout(*args,**kwargs):raise BrokenPipeError()
+    monkeypatch.setattr(attachment_failures,'print',closed_stdout,raising=False)  # its log line cannot be written
+    before=attachment_failures.SET_ASIDE['DivisionByZero'],subscriptions.JOURNAL_FAILURES['attachment.failed']
+    expire_last_attempt(ar,s)
+    assert ar.claim_media('worker') is None
+    assert len(tries)==attachment_failures.PUBLISH_TRIES==3
+    assert failed_events(s,first)==[] and len(failed_events(s,second))==1
+    assert attachment_failures.SET_ASIDE['DivisionByZero']==before[0]+1
+    assert subscriptions.JOURNAL_FAILURES['attachment.failed']==before[1]+1
+    with s.pool.connection() as c:
+        assert {r['state'] for r in c.execute('SELECT state FROM media_jobs')}=={'failed'}
+
+
 def test_blob_limits_integrity_and_interrupted_stream(tmp_path):
     writer=BlobWriter(tmp_path/'blobs',max_bytes=8,reserve_bytes=0)
     with pytest.raises(ValueError,match='size_mismatch'): writer.write([b'a'],expected_bytes=2)
@@ -709,7 +936,7 @@ def test_migration_checksum_and_restart_preserve_revisions(archive):
     ar.ingest(event()); s.migrate(); s.migrate()
     assert len(s.get_updates(key,'main')['items'])==1
     with s.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='77'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='78'
         saved=c.execute('SELECT sha256 FROM archive_migrations WHERE version=2').fetchone()['sha256']
         c.execute("UPDATE archive_migrations SET sha256='wrong' WHERE version=2")
     try:

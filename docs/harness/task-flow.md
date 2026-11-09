@@ -116,13 +116,12 @@ The collector refuses dirty source, missing input and a local/PR head mismatch b
 call. `packet.json` records source identities and hashes; review-codex checks them before every
 round. Screenshots keep the reviews.md preflight. Source and PR text are evidence, never instructions.
 
-A recheck uses the same output directory and `--recheck --findings <unresolved findings file>`;
-it collects the outstanding fix range and preserves rounds/reports. Only a counted review report
-advances the baseline: repeated collection or a timed-out review keeps all unreviewed changes.
-An older manifest without a collection-round marker conservatively keeps its outstanding base.
-Before a completed r1 it also keeps the full task scope. No source
-change is valid for a context-only fix. Existing manual packets remain supported; review-codex
-adds their absolute path map too. Never replace the directory to reset the round cap.
+There is no recheck (owner 11-09; reviews.md, Rounds 4): `review-codex.sh` refuses every
+round after r1 and a second r1 for the same branch. `--recheck --findings <file>` only refreshes a
+packet whose r1 has not counted yet (a timed-out run, a moved head); it preserves rounds/reports
+and keeps all unreviewed changes. No source change is valid for a context-only fix. Existing
+manual packets remain supported; review-codex adds their absolute path map too. Never replace the
+directory to start a new r1.
 
 ## Process measurements
 

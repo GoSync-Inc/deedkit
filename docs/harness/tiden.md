@@ -130,15 +130,13 @@ owner gates apply equally to both routes.
    capability, infrastructure and main research, Opus medium for defects and small improvements
    with clear evidence, Sonnet for simple ones. Value, Effort, Score and Depends on come last, from the written
    description: no estimate for an undescribed task, no list of estimates for approval first.
-3. **Review** by kind (process.md section 5): product cards (feature, improvement, epic) one Fable
-   round with the product-manager prompt, which also checks `How others solve it` (adopt | adapt |
-   build, sized to the task) and whether the card should be split; cards that set a contract on
-   access, data, migrations or release Astra r1 and at most one scoped recheck, other contract cards
-   Fable or the author's self-check (reviews.md, Rounds 6); production operation plans at most
-   one round, none for a tested runbook (Rounds 7); small cards the author's
-   self-check. A product card that is also such a contract card gets Fable + Astra r1; no
-   separate Sol correctness round. Reviewers first
-   judge whether the card should exist and may shrink or reject it.
+3. **Review** (process.md section 5; owner 11-09): a big product epic, and a product card on
+   a review path (sends/calls, collector sessions, user-data deletion/rewrite, access/secrets/CI
+   permissions), one Fable round with the product-manager prompt, which also checks `How others
+   solve it` (adopt | adapt | build, sized to the task) and whether the card should be split; no
+   recheck, no Astra or Sol card round (reviews.md, Card review). Every other card: the author's
+   self-check. Production operation plans: one round, none for a tested runbook (reviews.md,
+   Rounds 7). The reviewer first judges whether the card should exist and may shrink or reject it.
 4. **Ready.** Clean step-3 reviews make a card ready; no acceptance follows (owner 10-26: the
    owner's request, direct or through an agent or MCP, is the need). The writer fills `Ready:` from
    the reviews' verdicts and runs the ready merge. A ready feature or epic card counts as
@@ -185,8 +183,8 @@ refactor work needs no new card when an existing spec covers it (process.md sect
 Value is the benefit to the owner. Effort is story points (1, 2, 3, 5, 8, 13, 21) by comparison
 with merged PRs (the project names its reference PRs). Agents give points only; hours and money
 come only from the estimate script's measurements of the repository (the owner's `estimate-task`
-and `estimate-backlog` skills, run on described cards only; no `--task` at card intake: the
-orchestrator logs the task's forecast, orchestration.md, Estimates), never from a model's guess. A 13 or
+and `estimate-backlog` skills, run on described cards only; no per-task forecast, owner
+11-09), never from a model's guess. A 13 or
 21 becomes a parent with child stories of at most 8, each one PR. For a new module,
 infrastructure mechanism or external integration, `How others solve it` answers specific open
 adopt/adapt/build questions using existing research first. Set a time box by uncertainty and
@@ -270,9 +268,8 @@ the planner the rest.
   decisions quoted; stories of at most 8 SP, one PR each, with the step-2 fields. Open refactor and
   defect cards on the same paths go into the epic's `History:` for the refactor slot of the wave
   before the story that shares them (or as its Depends on).
-- **P4 Reviews.** Step 3: one Fable round on the epic with its stories (split check; VISION.md
-  where it exists), one Astra r1 on its contract stories touching access, data, migrations or release
-  together, self-check on the others.
+- **P4 Reviews.** Step 3: one Fable round on a big epic with its stories (split check; VISION.md
+  where it exists), no recheck; self-check on the rest.
 - **P5 Ready and waves.** The ready merge (below). Then the orchestrator's waves: the backlog table
   (`backlog pull` where Estimates is on, orchestration.md; else one it writes in the same shape,
   plan-check.sh header) gets lane and paths columns from each story's `Lane:` and `Expected paths:`
@@ -287,8 +284,7 @@ the planner the rest.
   the owner will notice, the waves, total SP, hours and money where Estimates is on, the
   assumptions made. No owner wait before dispatch.
 - **P7 Close.** After its last story merges, leftovers become cards and the PLAN block's remaining
-  lines go to the archive. After 6 or more PRs the orchestrator may start the epic review
-  (reviews.md, Rounds 9; optional); it does not hold the close. Then the vision
+  lines go to the archive. Then the vision
   refresh (Brainstorm and vision, B7) where VISION.md exists.
 
 ### Ready merge
