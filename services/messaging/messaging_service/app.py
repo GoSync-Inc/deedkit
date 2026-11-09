@@ -1017,7 +1017,8 @@ def register_archive_tools(mcp, call, async_call, read):
 
     @mcp.tool(structured_output=True, annotations=read)
     def get_sync_status(ctx: Context,chat_id: str='',from_time: str='',to_time: str='',refresh: bool=False,
-                        detail: Detail='compact') -> dict[str, Any]:
+                        detail: Detail='compact',include_latency: StrictBool=False,
+                        latency_window_h: StrictInt=24) -> dict[str, Any]:
         """Account summary, or one chat's history traversal, scan times, gaps and file states.
         Files: available_on_request is not work waiting; coverage says per account if everything due under the current policy is done.
         Optional UTC [from_time,to_time) tests traversal of a finite range, not full provider history.
@@ -1030,8 +1031,16 @@ def register_archive_tools(mcp, call, async_call, read):
         Unscoped keys: each account row has an outbound block (full always; compact only when the sender is not ready,
         sends wait or an outbound alert fires): sender ready, cooling_down, not_ready or unavailable, queued sends, age,
         time to expiry. Alerts outbound_queue_stalled, outbound_sender_not_ready. Never answer a waiting send by sending again.
+        include_latency=true (account summary only) adds latency: per account, stage (arrival, download, text, transcript,
+        description, failed, match, hint), origin, chat_type, message_kind and hint policy, n, p50_s and p90_s over
+        latency_window_h (1, 24, 72 or 168; default 24); latency_pending: per stage what waits now, pending {n, oldest_s},
+        on_request_n (waits for a request by policy), unknown_n (download claim not known yet) or held_n (your own
+        debounce, batch or quiet hours); and
+        latency_unavailable: stages whose bounded read timed out. Counts and seconds only; match and hint rows cover
+        your own subscriptions. Arrival under 1 s is indicative (provider times have 1 s resolution).
         """
-        return call(ctx,'get_sync_status',detail=detail,chat_id=chat_id,from_time=from_time,to_time=to_time,refresh=refresh)
+        return call(ctx,'get_sync_status',detail=detail,chat_id=chat_id,from_time=from_time,to_time=to_time,refresh=refresh,
+                    include_latency=include_latency,latency_window_h=latency_window_h)
 
     @mcp.tool(structured_output=True, annotations=read)
     def resolve_reference(ctx: Context,account: str,provider_chat_id: str,

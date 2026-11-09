@@ -64,7 +64,7 @@ def main():
         'principal-info','delivery-endpoints-list','disable-delivery-endpoint','enable-delivery-endpoint',
         'reload-delivery-policy','set-delivery-features','migrate-expand','set-module-cursor','abandon-module-gap',
         'module-router-status','set-dynamic-subscriptions','set-source-filters',
-        'set-source-exclusions','wake-targets-list','disable-wake-target','enable-wake-target'])
+        'set-source-exclusions','wake-targets-list','disable-wake-target','enable-wake-target','sync-latency'])
     parser.add_argument('--principal')
     parser.add_argument('--accounts',nargs='+')
     parser.add_argument('--key-file',type=Path)
@@ -86,6 +86,8 @@ def main():
     state.add_argument('--enable',action='store_true')
     state.add_argument('--disable',action='store_true')
     parser.add_argument('--limit',type=int,default=50)
+    parser.add_argument('--window-h',type=int,choices=(1,24,72,168),default=24,
+        help='sync-latency: the percentile window in hours (ANYM-865)')
     parser.add_argument('--key-permissions-of',metavar='KEY_ID',
         help='issue-key: the new key gets this key\'s stored ceiling as is, NULL included (ANYM-496)')
     parser.add_argument('--new-principal',action='store_true',
@@ -357,6 +359,12 @@ def main():
             if not args.feedback_ids or len(args.feedback_ids)!=1:parser.error(args.command+' requires one --id')
             print(json.dumps(store.set_wake_target_operator_state(args.feedback_ids[0],
                 args.command=='enable-wake-target')))
+        elif args.command=='sync-latency':
+            # ANYM-865: every account and subscription, read-only; the same rows get_sync_status(include_latency) returns.
+            from .stage_latency import read,table
+            with store.pool.connection() as c:
+                accounts=[r['id'] for r in c.execute('SELECT id FROM accounts ORDER BY id')]
+                print(table(read(c,{'accounts':accounts,'chat_ids':None},args.window_h)))
         elif args.command in ('set-module-cursor','abandon-module-gap','module-router-status'):
             # ANYM-575: owner steps for the module router; recorded in its cursor and gap rows.
             from . import event_router
