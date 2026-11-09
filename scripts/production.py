@@ -4036,25 +4036,36 @@ def scratch_lines(copy, copied, step, text):
         raise MigrationRefused(f"the rehearsal could not read the copy ({step})") from exc
 
 
-def expand_run(name, image, network, dsn_file, plan_file, *, label=None, status=False):
+def expand_run(name, image, network, dsn_file, plan_file, *, label=None, status=False, timed=False):
     """One `migrate-expand` (or `--status`) container: the candidate's API image with MIGRATE_FLAGS, the DSN file
-    and the plan mounted read-only, at most MIGRATE_TIMEOUT seconds; its one JSON line, or None when the answer is
-    lost (a deadline kills the container). Its output holds a version or a fixed code, never PostgreSQL's message."""
+    and the plan mounted read-only, at most MIGRATE_TIMEOUT seconds; its last JSON line, or None when the answer is
+    lost (a deadline kills the container). Its output holds a version or a fixed code, never PostgreSQL's message.
+    `timed` (the rehearsal) adds `transaction_ms` to a version: the line before the answer, {"transaction_ms": N},
+    the migrator's own monotonic time from its connection to its commit's return; None when the image printed none."""
     mounts = [] if status else ["--mount", f"type=bind,src={plan_file},dst=/run/deedkit/plan.json,readonly"]
+    before = []
     found = container_json(name, image, network, dsn_file, ["python", "-m", "messaging_service", "migrate-expand",
                                                             *(["--status"] if status else ["--plan", "/run/deedkit/plan.json"])],
-                           label=label, mounts=mounts)
+                           label=label, mounts=mounts, before=before)
     if isinstance(found, dict) and set(found) == {"schema_version"} and type(found["schema_version"]) is int:
+        if timed:
+            try:
+                line = json.loads(before[-1]) if len(before) == 1 else None
+            except ValueError:
+                line = None
+            took = line.get("transaction_ms") if isinstance(line, dict) and set(line) == {"transaction_ms"} else None
+            return {**found, "transaction_ms": took if type(took) is int and took >= 0 else None}
         return found
     if isinstance(found, dict) and set(found) == {"error"}:
         return {"error": found["error"] if found["error"] in EXPAND_CODES else "failed"}
     return None
 
 
-def container_json(name, image, network, dsn_file, command, *, label=None, mounts=()):
+def container_json(name, image, network, dsn_file, command, *, label=None, mounts=(), before=None):
     """The last stdout line, as JSON, of one candidate API container with MIGRATE_FLAGS, the DSN file mounted read-only
     and PGAPPNAME=<name> (its database session carries the name), at most MIGRATE_TIMEOUT seconds; None when the
-    answer is lost (a deadline kills the container; `migration_settled` then confirms it gone)."""
+    answer is lost (a deadline kills the container; `migration_settled` then confirms it gone). A `before` list
+    gets the lines printed ahead of the last one."""
     argv = ["docker", "run", "--rm", "--name", name, *(["--label", label] if label else []), "--network", network,
             *MIGRATE_FLAGS, "-e", "DATABASE_URL_FILE=/run/secrets/database_url", "-e", "PGAPPNAME=" + name,
             "--mount", f"type=bind,src={dsn_file},dst=/run/secrets/database_url,readonly", *mounts, image, *command]
@@ -4063,8 +4074,11 @@ def container_json(name, image, network, dsn_file, command, *, label=None, mount
         with suppress(Exception):
             run(["docker", "kill", name], timeout=30)
         return None
+    lines = output.strip().splitlines() or ["null"]
+    if before is not None:
+        before.extend(lines[:-1])
     try:
-        return json.loads((output.strip().splitlines() or ["null"])[-1])
+        return json.loads(lines[-1])
     except ValueError:
         return None
 
@@ -4219,15 +4233,21 @@ def rehearse(copied, plan, image, limit):
         secret.chmod(0o644)
     container = network + "-migrate"
     claim(copy, "container", container)
-    answer = (calendar_expand if calendar else expand_run)(container, image, network, str(secret), plan_file,
-                                                           label="deedkit-copy=" + copy["id"])
+    label = "deedkit-copy=" + copy["id"]
+    answer = calendar_expand(container, image, network, str(secret), plan_file, label=label) if calendar else \
+        expand_run(container, image, network, str(secret), plan_file, label=label, timed=True)
+    # The migrator's own time, from its connection to its commit's return (every lock released), never a later
+    # read: that counted the container's exit, its removal and a new docker exec, which on the loaded host read
+    # 068's 40 ms index as 1100 to 4681 ms (fix-migration-rehearsal-11-09).
+    reported = answer.pop("transaction_ms", None) if isinstance(answer, dict) and not calendar else None
     if answer != {"schema_version": plan["target"]}:
         raise MigrationRefused("the rehearsal of migrate-expand failed: "
                                + (answer or {}).get("error", "no answer" if answer is None else "wrong version"))
     took = None
     if plan["pending"] and not calendar:
-        took = int(scratch_lines(copy, copied, "took", "SELECT coalesce(round(extract(epoch FROM clock_timestamp()"
-                                 f" - max(applied_at)) * 1000), -1) FROM archive_migrations WHERE version > {int(plan['base'])};")[0])
+        if reported is None:
+            raise MigrationRefused("the rehearsal's migrate-expand reported no transaction time")
+        took = reported
     after_data = stable_data(copy, copied, CALENDAR_DATA if calendar else MIGRATION_DATA)
     if plan["pending"] and calendar:
         took = int(float(scratch_lines(copy, copied, "busy", BUSY)[0])) - spent

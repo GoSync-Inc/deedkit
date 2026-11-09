@@ -95,8 +95,8 @@ def ledger(dsn):
         return int(version), rows['n'], column['n']
 
 
-def cli(dsn, tmp_path, *args, root=None):
-    """The real entry point; returns (exit code, its one JSON line, seconds). PostgreSQL's text never reaches
+def cli_lines(dsn, tmp_path, *args, root=None):
+    """The real entry point; returns (exit code, its stdout lines as JSON, seconds). PostgreSQL's text never reaches
     stdout or stderr: stderr must stay empty."""
     tmp_path.joinpath('dsn').write_text(dsn)
     env = dict(os.environ, DATABASE_URL_FILE=str(tmp_path / 'dsn'), PROBE_FILES=str(tmp_path / 'files'))
@@ -104,9 +104,15 @@ def cli(dsn, tmp_path, *args, root=None):
     started = time.monotonic()
     done = subprocess.run([sys.executable, '-m', 'messaging_service', 'migrate-expand', *args], env=env,
                           capture_output=True, text=True, timeout=60)
-    lines = done.stdout.splitlines()
-    assert len(lines) == 1 and done.stderr == '', done.stdout + done.stderr
-    return done.returncode, json.loads(lines[0]), time.monotonic() - started
+    assert done.stderr == '', done.stdout + done.stderr
+    return done.returncode, [json.loads(line) for line in done.stdout.splitlines()], time.monotonic() - started
+
+
+def cli(dsn, tmp_path, *args, root=None):
+    """(exit code, the answer: the last JSON line, seconds); before it only a committed plan's transaction time."""
+    code, lines, elapsed = cli_lines(dsn, tmp_path, *args, root=root)
+    assert len(lines) == 1 or len(lines) == 2 and code == 0 and set(lines[0]) == {'transaction_ms'}, lines
+    return code, lines[-1], elapsed
 
 
 def acls(dsn):
@@ -129,6 +135,43 @@ def test_the_entry_point_reads_the_ledger_and_runs_an_empty_plan(db, tmp_path):
     assert cli(dsn, tmp_path, '--status')[:2] == (0, {'schema_version': RUNTIME_SCHEMA})
     plan = plan_for(SOURCE, RUNTIME_SCHEMA, RUNTIME_SCHEMA)
     assert cli(dsn, tmp_path, '--plan', write_plan(tmp_path, plan))[:2] == (0, {'schema_version': RUNTIME_SCHEMA})
+
+
+# spec: ANYM-449
+def test_a_committed_plan_prints_its_transaction_time_before_the_answer_and_a_refusal_or_status_none(db, tmp_path):
+    # The rehearsal reads the line before the answer; a deploy tool that reads only the last line is unchanged.
+    _, dsn = db
+    root = package(tmp_path)
+    plan = write_plan(tmp_path, plan_for(root, RUNTIME_SCHEMA, NEXT))
+    code, lines, elapsed = cli_lines(dsn, tmp_path, '--plan', plan, root=root)
+    assert code == 0 and lines[1:] == [{'schema_version': NEXT}] and set(lines[0]) == {'transaction_ms'}
+    assert type(lines[0]['transaction_ms']) is int and 0 <= lines[0]['transaction_ms'] <= elapsed * 1000
+    assert cli_lines(dsn, tmp_path, '--plan', plan, root=root)[:2] == (1, [{'error': 'ledger_mismatch'}])
+    assert cli_lines(dsn, tmp_path, '--status', root=root)[:2] == (0, [{'schema_version': NEXT}])
+
+
+# spec: ANYM-449
+def test_the_transaction_time_runs_to_the_commit_s_return_while_its_locks_are_held(db, tmp_path):
+    # Astra r1 (fix-migration-rehearsal-11-09): a commit timestamp is taken before the WAL flush and the lock release,
+    # so a slow commit must count. Here the commit returns 1.2 s late while ADD COLUMN's lock on messages is held.
+    _, dsn = db
+    root = package(tmp_path)
+    held, timing = [], {}
+    def slow_commit(c):
+        commit = c.commit
+        def late():
+            with psycopg.connect(dsn) as other:
+                held.append(other.execute(
+                    "SELECT count(*) FROM pg_locks l JOIN pg_class r ON r.oid=l.relation WHERE r.relname='messages' "
+                    "AND l.mode='AccessExclusiveLock' AND l.granted").fetchone()[0])
+            time.sleep(1.2)
+            commit()
+        c.commit = late
+    found = store_module.migrate_expand(dsn, plan_for(root, RUNTIME_SCHEMA, NEXT), root=root, before_commit=slow_commit,
+                                        timing=timing)
+    assert found == {'schema_version': NEXT} and held == [1]
+    assert timing['transaction_ms'] >= 1200
+    assert ledger(dsn) == (NEXT, 1, 1)
 
 
 # spec: ANYM-596

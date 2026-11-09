@@ -592,6 +592,21 @@ def test_receipts_and_the_pause_hold_no_dsn_row_value_or_postgresql_message(tmp_
 
 
 # spec: ANYM-449
+def test_the_rehearsal_reads_the_migrator_s_transaction_time_from_the_line_before_its_answer(monkeypatch):
+    printed = iter(['{"transaction_ms": 42}\n{"schema_version": 51}\n', '{"transaction_ms": 42}\n{"schema_version": 51}\n',
+                    '{"schema_version": 51}\n', '{"transaction_ms": -1}\n{"schema_version": 51}\n',
+                    '{"transaction_ms": 4.5}\n{"schema_version": 51}\n', 'noise\n{"transaction_ms": 9}\n{"schema_version": 51}\n',
+                    'not json\n{"schema_version": 51}\n', '{"transaction_ms": 42}\n{"error": "lock_timeout"}\n'])
+    monkeypatch.setattr(p, "bounded", lambda argv, **kwargs: (0, next(printed)))
+    # The apply path and an older tool read the last line alone.
+    assert EXPAND_RUN("c", "i", "n", "/d", "/p") == {"schema_version": 51}
+    assert EXPAND_RUN("c", "i", "n", "/d", "/p", timed=True) == {"schema_version": 51, "transaction_ms": 42}
+    for _ in range(5):  # absent, negative, not an integer, not exactly one line before, not JSON
+        assert EXPAND_RUN("c", "i", "n", "/d", "/p", timed=True) == {"schema_version": 51, "transaction_ms": None}
+    assert EXPAND_RUN("c", "i", "n", "/d", "/p", timed=True) == {"error": "lock_timeout"}
+
+
+# spec: ANYM-449
 def test_the_migration_container_runs_the_candidate_image_with_the_bounded_flags_and_read_only_mounts(monkeypatch):
     seen = []
     monkeypatch.setattr(p, "bounded", lambda argv, **kwargs: seen.append((argv, kwargs)) or (0, '{"schema_version": 51}'))
@@ -862,19 +877,23 @@ def labelled(copy_id, kind):
                           check=True).stdout.split()
 
 
-def fake_migrate(migration, *, slow=False):
+def fake_migrate(migration, *, slow=False, linger=False, untimed=False):
     """migrate-expand as a psql session on the copy over the rehearsal network: the migration, its ledger row, the
-    schema version, in one transaction."""
+    schema version, in one transaction, and (timed, unless `untimed`) the transaction's own milliseconds up to its
+    COMMIT, as the migrator reports them; `linger` keeps the session and its container 1.2 s past the commit."""
     calls = []
-    def expand_run(name, image, network, dsn_file, plan_file, *, label=None, status=False):
+    def expand_run(name, image, network, dsn_file, plan_file, *, label=None, status=False, timed=False):
         calls.append((name, network, label, json.loads(Path(plan_file).read_text())["identity"]))
         host = Path(dsn_file).read_text().split("@")[1].split(":")[0]
         text = "BEGIN; " + migration + LEDGER_ROW.format(digest="a" * 64) + (" SELECT pg_sleep(1.2);" if slow else "") \
-            + " COMMIT;"
-        subprocess.run(["docker", "run", "--rm", "--network", network, "--label", label, "-i", image, "psql", "-X", "-q",
-                        "-v", "ON_ERROR_STOP=1", "-h", host, "-U", OWNER, "-d", Path(dsn_file).read_text().strip()
-                        .rsplit("/", 1)[1]], input=text, capture_output=True, text=True, check=True)
-        return {"schema_version": 51}
+            + " SELECT ceil(extract(epoch FROM clock_timestamp() - now()) * 1000)::int; COMMIT;" \
+            + (" SELECT pg_sleep(1.2);" if linger else "")
+        done = subprocess.run(["docker", "run", "--rm", "--network", network, "--label", label, "-i", image, "psql", "-X",
+                               "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-h", host, "-U", OWNER, "-d",
+                               Path(dsn_file).read_text().strip().rsplit("/", 1)[1]], input=text, capture_output=True,
+                              text=True, check=True)
+        took = int(done.stdout.split()[0])
+        return {"schema_version": 51, **({"transaction_ms": None if untimed else took} if timed else {})}
     return expand_run, calls
 
 
@@ -917,6 +936,27 @@ def test_the_rehearsal_runs_on_the_copy_over_an_internal_network_and_leaves_noth
     # The live database itself never changed.
     assert psql(copy_settings["migration"]["databases"]["messaging"]["database"],
                 "SELECT value FROM probe_metadata WHERE name = 'schema_version';").strip() == "50"
+
+
+# spec: ANYM-449
+@pytest.mark.parametrize("case", ["linger", "untimed"])
+def test_the_rehearsal_times_the_migration_transaction_not_the_container_exit_after_its_commit(copy_settings,
+                                                                                               monkeypatch, case):
+    # 068 on 11-09: a 40 ms index read 1100, 2274 and 4681 ms because the window ran to a later docker exec. Here the
+    # session stays 1.2 s past its commit at the default limit; an image that reports no time pauses.
+    expand_run, _ = fake_migrate(ADDITIVE, linger=True, untimed=case == "untimed")
+    monkeypatch.setattr(p, "expand_run", expand_run)
+    with p.database_copy(copy_settings, "messaging", NEWEST, keep=True, catalog=p.CATALOG) as copied:
+        if case == "linger":
+            record = p.rehearse(copied, {**PLAN, "roles": {}}, scratch_image(), p.REHEARSAL_LIMIT_MS)
+        else:
+            with pytest.raises(p.MigrationRefused) as refused:
+                p.rehearse(copied, {**PLAN, "roles": {}}, scratch_image(), p.REHEARSAL_LIMIT_MS)
+    if case == "linger":
+        assert 0 <= record["took_ms"] < 1000
+        assert ["relation", "public.synthetic_items"] in [key for key, _ in record["difference"]["added"]]
+    else:
+        assert str(refused.value) == "the rehearsal's migrate-expand reported no transaction time"
 
 
 # spec: ANYM-449
