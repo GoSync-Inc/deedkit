@@ -308,6 +308,11 @@ def test_retirement_deletes_the_full_receipt_cap_including_retained_expired_rece
     with store.pool.connection() as c:
         assert c.execute('SELECT count(*) AS n FROM subscription_receipts WHERE subscription=%s',
             (sid,)).fetchone()['n'] == 0
+    # A tombstone has no consumption left: its reads name no positions, full or compact, and still answer.
+    assert 'positions' not in store.get_subscription(token, sid)
+    for detail in ('full', 'compact'):
+        page = store.get_subscription_events(token, sid, detail=detail)
+        assert page['items'] == [] and 'positions' not in page and page['subscription']['state'] == 'closed'
 
 
 # spec: ANYM-446

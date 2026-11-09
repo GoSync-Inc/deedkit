@@ -151,11 +151,12 @@ def project_page(page, detail='full', include=frozenset()):
 def server_positions(c, row, acked_through):
     """ANYM-827: where the server stands for this definition: ACKed, fetched (the highest retained receipt) and
     the receipts still open or expired without an ACK. Numbers and one time only; no receipt or hash."""
-    found = c.execute('''SELECT max(through_position) AS fetched,
-        count(*) FILTER (WHERE expires_at>clock_timestamp() AND ack_result IS NULL) AS open,
-        min(expires_at) FILTER (WHERE expires_at>clock_timestamp() AND ack_result IS NULL) AS oldest,
-        count(*) FILTER (WHERE expires_at<=clock_timestamp() AND ack_result IS NULL) AS expired
-        FROM subscription_receipts WHERE subscription=%s''', (row['id'],)).fetchone()
+    # One instant for every filter, so a receipt at its expiry is either open or expired, never both.
+    found = c.execute('''WITH t AS (SELECT clock_timestamp() AS now) SELECT max(r.through_position) AS fetched,
+        count(*) FILTER (WHERE r.expires_at>t.now AND r.ack_result IS NULL) AS open,
+        min(r.expires_at) FILTER (WHERE r.expires_at>t.now AND r.ack_result IS NULL) AS oldest,
+        count(*) FILTER (WHERE r.expires_at<=t.now AND r.ack_result IS NULL) AS expired
+        FROM subscription_receipts r CROSS JOIN t WHERE r.subscription=%s''', (row['id'],)).fetchone()
     return {'acked_through': acked_through, 'fetched_through': max(acked_through, found['fetched'] or acked_through),
         'open_receipts': found['open'], 'oldest_open_receipt_expires_at':
             found['oldest'].isoformat() if found['oldest'] else None, 'expired_unacked': found['expired']}

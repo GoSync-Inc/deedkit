@@ -629,8 +629,9 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
         raise APIError('invalid_version')
     # Each stream pages, gaps and advances on its own positions (ANYM-562).
     modules = {} if module is None else {'module': module_events.page(c, row, module, module_after, limit)}
-    if with_positions:
-        # ANYM-827: the server's positions on every event page (a fetch adds them after its receipt).
+    if with_positions and 'acked_through' in state:
+        # ANYM-827: the server's positions on every event page (a fetch adds them after its receipt); a tombstone
+        # has no consumption left to name.
         from .subscription_consumption import server_positions
         modules['positions'] = server_positions(c, row, state['acked_through'])
     if after < floor:

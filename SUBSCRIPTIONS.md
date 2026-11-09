@@ -292,12 +292,18 @@ Transport is at-least-once. A consumer that must not repeat a side effect:
 - keys every downstream effect by `(account, message, event_id, revision)`;
 - handles `attachment.ready` as its own event for the same message, not as a repeat;
 - ACKs only after the effect is durable;
-- treats `invalid_receipt` as "fetch again; you may see the same events", then compares
-  `positions` after the refetch: an `expired_unacked` count names an expired receipt, a higher
-  `acked_through` a receipt already superseded, and neither a receipt that never existed.
+- treats `invalid_receipt` as "fetch again; you may see the same events". The receipt expired,
+  was evicted by the cap of 128 (each fetch without an ACK issues one), or never existed; the
+  server keeps no per-receipt reason. `positions` after the refetch is a diagnostic hint, not an
+  answer for one receipt: `expired_unacked` above zero says some receipt expired unACKed (not
+  necessarily the one refused), `open_receipts` near 128 suggests eviction, and a higher
+  `acked_through` says another receipt was ACKed in between;
+- treats `stale_ack` as "this page was superseded": a later ACK or a configuration change moved
+  the position; fetch again.
 
-The server cannot know the consumer's local cursor: a local cursor ahead of `acked_through`
-means the consumer handled events it never ACKed, and they will be offered again.
+The server cannot know the consumer's local cursor. A local cursor ahead of `acked_through`
+means the consumer moved past events it never ACKed; whether it handled them durably only the
+consumer knows, and the server will offer them again.
 
 `wait_for_subscription_events(subscription_id, timeout=25, limit=50)` polls those
 pages for at most 25 seconds. Every read reauthorizes and releases its connection
