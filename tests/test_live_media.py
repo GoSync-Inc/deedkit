@@ -273,6 +273,29 @@ def test_the_media_worker_passes_its_live_tier_and_burst_to_the_provider(worker,
     assert sources[0]['_tier']==LIVE_MEDIA and sources[0]['_burst']==[92]
 
 
+# spec: ANYM-877
+def test_a_failed_burst_lookup_fetches_the_one_message_and_logs_under_the_collector_logger(worker,monkeypatch,caplog):
+    from messaging_service.telegram_governor import LIVE_MEDIA
+    w,s,_=worker
+    sources,limits=[],[]
+    async def chunks(source,descriptor):
+        sources.append(source);yield b'voic'
+    def media_burst(job,*,window_seconds,limit):
+        limits.append(limit);raise RuntimeError('synthetic-burst-secret')
+    w.provider.chunks=chunks;w.provider.fetches_bursts=True
+    monkeypatch.setattr(w.archive,'media_burst',media_burst)
+    at=(datetime.now(timezone.utc)-timedelta(seconds=300)).isoformat()
+    w.archive.ingest(event(account=w.account,provider_id='93',sent_at=at,updated_at=at,
+        media=[{'provider_id':'media-93','filename':'voice.ogg','mime':'audio/ogg','bytes':4}]))
+    w.writer,w.live_writer=writers(s);w.live_window_seconds=86400
+    capacity(monkeypatch)
+    caplog.set_level('WARNING')
+    assert asyncio.run(w.media_once()) is True
+    assert limits==[20] and sources[0]['_tier']==LIVE_MEDIA and '_burst' not in sources[0]
+    [record]=[r for r in caplog.records if r.getMessage()=='media_burst_failed error=RuntimeError']
+    assert record.name=='messaging_service.telegram_collector' and 'synthetic-burst-secret' not in caplog.text
+
+
 def test_recent_priority_preserves_history_bound(archive,monkeypatch):
     ar,s,_,_=archive;original(ar)
     background,live=writers(s);capacity(monkeypatch)
