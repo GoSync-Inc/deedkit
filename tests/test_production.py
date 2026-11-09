@@ -4999,6 +4999,52 @@ def test_deploy_waits_for_the_api_quota_and_for_the_interval_between_automatic_d
     assert host.deploy()["sha"] == "3" * 40  # a manual run is not held back by the interval
 
 
+# spec: ANYM-407
+def test_an_automatic_deploy_starts_five_minutes_after_the_last_one_and_the_timer_runs_every_minute(tmp_path, monkeypatch):
+    # ci-deploy-speed 11-09: the interval is about one deploy's duration, not the old 20 minutes of the API quota.
+    assert p.DEPLOY_INTERVAL == 5 * 60
+    timer = (ROOT / "deploy/deedkit-autodeploy.timer").read_text()
+    assert "OnUnitInactiveSec=1min" in timer and "RandomizedDelaySec=10s" in timer
+    host = Deployer(tmp_path, monkeypatch)
+    assert host.deploy()["status"] == "deployed"
+    host.green.add("3" * 40)
+    host.history.append("3" * 40)
+    receipt = p.read(host.state / "deploy.json")
+    started = datetime.now(timezone.utc) - timedelta(minutes=4)
+    p.write(host.state / "deploy.json", {**receipt, "started_at": started.strftime("%Y-%m-%dT%H:%M:%SZ")})
+    outcome = host.deploy(auto=True)
+    assert outcome == {"status": "waiting", "reason": "less than 5 minutes since the last deploy started"}
+    started -= timedelta(minutes=2)
+    p.write(host.state / "deploy.json", {**receipt, "started_at": started.strftime("%Y-%m-%dT%H:%M:%SZ")})
+    assert host.deploy(auto=True)["sha"] == "3" * 40
+
+
+# spec: ANYM-407
+def test_an_automatic_run_retries_a_failed_read_only_after_the_retry_spacing_so_three_failures_still_take_minutes(
+        tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch, green=())
+    host.git_failures["ls-remote"] = "fatal: unable to access 'https://github.com/GoSync-Inc/deedkit.git/'\n"
+    assert host.deploy(auto=True)["failures"] == 1
+    # The next minute's run reads nothing and counts nothing until RETRY_SPACING after the counted failure.
+    calls = len(host.git)
+    outcome = host.deploy(auto=True)
+    assert outcome["status"] == "waiting" and "a git or GHCR read failed; the next try is at" in outcome["reason"]
+    assert len(host.git) == calls and p.read(host.state / "deploy.json")["fetch_failures"]["count"] == 1
+    # A manual run is never held back; it reads and counts.
+    assert host.deploy()["failures"] == 2
+    # Past the spacing the automatic run reads again; the third counted failure pauses as before.
+    receipt = p.read(host.state / "deploy.json")
+    earlier = (datetime.now(timezone.utc) - timedelta(seconds=p.RETRY_SPACING + 1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    p.write(host.state / "deploy.json", {**receipt, "fetch_failures": {**receipt["fetch_failures"], "at": earlier}})
+    outcome = host.deploy(auto=True)
+    assert outcome["status"] == "halted" and outcome["reason"].startswith("git could not read main 3 times in a row")
+    # The same spacing holds after an unreadable registry, and a record without a readable time never holds a run.
+    moment = datetime(2026, 11, 9, 8, 0, tzinfo=timezone.utc)
+    assert p.retry_after({"unreachable": {"count": 1, "at": "2026-11-09T07:57:00Z"}}, moment) == moment + timedelta(minutes=1)
+    assert p.retry_after({"unreachable": {"count": 1, "at": "2026-11-09T07:55:00Z"}}, moment) is None
+    assert p.retry_after({"fetch_failures": {"count": 1, "at": None}}, moment) is None and p.retry_after({}, moment) is None
+
+
 def test_deploy_finishes_plan_b_when_plan_a_is_ahead_of_the_serving_http_release(tmp_path, monkeypatch):
     host = Deployer(tmp_path, monkeypatch)
     host.current(NEWER)  # plan A applied NEWER; its HTTP release stopped before any change
@@ -5182,6 +5228,27 @@ def test_a_failed_fetch_changes_nothing_and_only_the_third_in_a_row_pauses(tmp_p
     assert stopped.value.code == 1 and json.loads(capsys.readouterr().out)["status"] == "fetch_failed"
 
 
+# spec: ANYM-407
+def test_a_successful_fetch_ends_the_git_failure_count_for_every_later_write_of_the_run(tmp_path, monkeypatch):
+    # Astra r1 on #791: the cleared count lived on in the run's receipt, so a GHCR count or its reset wrote it back.
+    host = Deployer(tmp_path, monkeypatch)
+    host.git_failures["ls-remote"] = "fatal: unable to access 'https://github.com/GoSync-Inc/deedkit.git/'\n"
+    assert [host.deploy()["failures"] for _ in range(2)] == [1, 2]
+    del host.git_failures["ls-remote"]
+    host.unreached.add(NEWEST)
+    assert host.deploy()["status"] == "error"
+    receipt = p.read(host.state / "deploy.json")
+    assert "fetch_failures" not in receipt and receipt["unreachable"]["count"] == 1
+    host.unreached.clear()
+    host.green = set()
+    assert host.deploy()["status"] == "waiting"
+    receipt = p.read(host.state / "deploy.json")
+    assert "fetch_failures" not in receipt and "unreachable" not in receipt
+    # A new git failure starts a new count: it never pauses as the third of the earlier two.
+    host.git_failures["ls-remote"] = "fatal: unable to access 'https://github.com/GoSync-Inc/deedkit.git/'\n"
+    assert host.deploy()["failures"] == 1 and host.paused() is None
+
+
 def test_an_unchanged_main_after_failed_fetches_resets_the_count(tmp_path, monkeypatch):
     host = Deployer(tmp_path, monkeypatch, history=())
     host.git_failures["ls-remote"] = p.Refused("git failed (exit 128): fatal: synthetic; production was not accepted")
@@ -5315,7 +5382,7 @@ def test_the_autodeploy_unit_runs_deploy_auto_at_any_hour_and_never_while_the_ba
     lines = autodeploy_unit()
     timer = (ROOT / "deploy/deedkit-autodeploy.timer").read_text()
     assert "/usr/local/lib/deedkit/production.py deploy --auto " in lines["ExecStart"]
-    assert "personal-os-backup.service" in lines["After"] and "OnUnitInactiveSec=5min" in timer
+    assert "personal-os-backup.service" in lines["After"] and "OnUnitInactiveSec=1min" in timer
     assert "date" not in lines["ExecCondition"]
 
     def skipped(*arguments, **failures):

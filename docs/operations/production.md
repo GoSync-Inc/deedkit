@@ -2943,7 +2943,7 @@ sudo touch /etc/deedkit/autodeploy.pause     # stop deploying; remove the file t
 `deploy` runs as root and holds the global, plan A and HTTP host locks for the
 whole run. It exits quietly (`paused`, `busy`, `current`, `waiting`, exit 0)
 when the pause file exists, another operation holds a lock, `git ls-remote`
-shows no new `main` commit, no newer commit has attested images yet, or, with `--auto` (the timer), the last deploy started less than 20 minutes ago.
+shows no new `main` commit, no newer commit has attested images yet, or, with `--auto` (the timer), the last deploy started less than 5 minutes ago or a git or GHCR read failed less than 4 minutes ago.
 Otherwise it:
 
 1. reads the current plan A release (`current.json`, status `applied`) and the
@@ -3022,7 +3022,10 @@ the count. A failed `git ls-remote` or mirror fetch (any cause, the
 mirror check included) changes nothing: the run prints `fetch_failed` with
 git's last error line, exits 1 and counts it in `deploy.json`
 (`fetch_failures`); a successful fetch resets the count, and the third failure
-in a row (about 15 minutes on the timer) pauses. When apply waited out an
+in a row pauses. An `--auto` run retries a failed git or GHCR read only 4
+minutes (`RETRY_SPACING`) after the last counted failure and ends `waiting`
+before that, so on the one-minute timer the pause still comes after about 10
+minutes of failures; a manual run always reads and counts. When apply waited out an
 active call, or could not read whether one is active, before any change
 ("Apply and verify"), the run ends `waiting` with that reason and keeps the
 prepared release: the next run applies it while that commit is still the
@@ -3144,7 +3147,7 @@ pauses as above without installing. `--dry-run` reports `would update tool
    through `/usr/local/lib/deedkit/production.py`. A pass records `active`; a
    failure switches `current` back to `from`, records `reverted` and pauses.
 4. End the run `tool-updated` (exit 0; `deploy.json` keeps `sha`, `base` and
-   adds `tool_update`, no `started_at`), so the next timer run, about 5 minutes
+   adds `tool_update`, no `started_at`), so the next timer run, about a minute
    later, deploys with the new tool. The replaced release and the one it
    replaced stay, as `tool-update.json` records them (an `active` record, never
    an install time: a reverted or abandoned candidate counts as none); other
@@ -3199,10 +3202,13 @@ Its undo: remove the three links and move the two `.before-<sha>` files back.
 [`deploy/deedkit-autodeploy.service`](../../deploy/deedkit-autodeploy.service)
 runs `deploy --auto` and
 [`deploy/deedkit-autodeploy.timer`](../../deploy/deedkit-autodeploy.timer)
-starts it about 5 minutes after the previous run ended (plus up to 30 seconds
-of jitter and systemd's default one-minute accuracy) and 10 minutes after boot;
-enabled later than that, the first run starts at once. `--auto` keeps at least
-20 minutes between two deploy starts. The unit reads
+starts it about a minute after the previous run ended (plus up to 10 seconds
+of jitter and a 5-second accuracy) and 10 minutes after boot; enabled later
+than that, the first run starts at once. A run with nothing new reads only
+`git ls-remote`. `--auto` keeps at least 5 minutes, about one deploy's
+duration, between two deploy starts; deploys never overlap anyway (the host
+locks and the oneshot unit). The 20 minutes it kept before guarded the GitHub
+API quota, which promotion no longer reads (ANYM-406; ci-deploy-speed 11-09). The unit reads
 `/etc/deedkit/production.json` and `/etc/deedkit/http-production.json` unless
 the optional `/etc/deedkit/autodeploy.env` (root-owned, mode `0600`) sets
 `DEEDKIT_DEPLOY_CONFIG`.
