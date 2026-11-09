@@ -721,10 +721,13 @@ def _set_exclusions(c, p, row, pairs, revision):
         raise APIError('invalid_filter')
     row = c.execute('''UPDATE subscriptions SET selector=%s,updated_at=clock_timestamp() WHERE id=%s
         RETURNING *''', (Jsonb(selector), row['id'])).fetchone()
-    # A held range absorbed under the old list: due now, so the next hint tick rebuilds it from the references
-    # visible under the new one (delivery_policy._rebuild_excluded) before it settles; the version stays.
-    c.execute('''UPDATE subscription_hint_windows SET due_at=clock_timestamp(),updated_at=clock_timestamp()
-        WHERE subscription=%s AND first_match_at IS NOT NULL''', (row['id'],))
+    # A held range absorbed under the old list is marked (delivery_policy.REBUILD_DUE, already due), so the next
+    # hint tick rebuilds it from the references visible under the new one before it settles; the version stays.
+    # A paused definition holds no range for long: its resume bumps the version, which restarts held ranges.
+    from .delivery_policy import REBUILD_DUE
+    if row['state'] == 'active':
+        c.execute('''UPDATE subscription_hint_windows SET due_at=%s,updated_at=clock_timestamp()
+            WHERE subscription=%s AND first_match_at IS NOT NULL''', (REBUILD_DUE, row['id']))
     return _view(c, row, p)
 
 

@@ -7,7 +7,7 @@ row, and outbox uniqueness on (subscription, version, kind, window) prevents a d
 """
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import re
 
 from psycopg.types.json import Jsonb
@@ -24,6 +24,9 @@ _CLOCK = re.compile(r'(?:[01][0-9]|2[0-3]):[0-5][0-9]')
 _ZONE = re.compile(r'[A-Za-z][A-Za-z0-9_+-]*(?:/[A-Za-z0-9_+-]+){0,2}')
 _EMPTY = dict(first_match_at=None, last_match_at=None, match_count=0, through_position=None,
     reasons=[], due_at=None, held_reason=None)
+# ANYM-830: set_exclusions marks a held range for a rebuild with this due time (the API role may write due_at only);
+# a real due time is never before the epoch's second day.
+REBUILD_DUE = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _NO_SILENCE = dict(silence_state=None, silence_fired_at=None, silence_due_at=None, silence_held_reason=None)
 
 
@@ -294,6 +297,10 @@ def _rebuild_excluded(c, row, window, p):
     from .subscriptions import dynamic, visible_filter
     if not dynamic(row) or 'exclusions_revision' not in row['selector']['sources']:
         return
+    if window['due_at'] is not None and window['due_at'] <= REBUILD_DUE:
+        # The list changed since the range was absorbed: equal counts can still hide other references.
+        window.update(_EMPTY)
+        return
     low = window['hinted_through'] if window['hinted_through'] is not None else row['start_position']
     where, args = visible_filter(row, p)
     shown = c.execute('SELECT count(*) AS n FROM subscription_matches m WHERE m.subscription=%s AND m.event>%s AND '
@@ -436,7 +443,8 @@ def delivery_state(c, row):
         window = None
     held = [(window[at], window[reason]) for at, reason in
         (('due_at', 'held_reason'), ('silence_due_at', 'silence_held_reason'))] if window else []
-    held = sorted(item for item in held if item[0] is not None)
+    # A range marked for its rebuild (ANYM-830) shows no due time until the next tick has rebuilt it.
+    held = sorted(item for item in held if item[0] is not None and item[0] > REBUILD_DUE)
     silence = None
     if binding['silence_deadline'] is not None:
         if window and window['silence_state']:

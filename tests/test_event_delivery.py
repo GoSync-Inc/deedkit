@@ -1398,6 +1398,60 @@ def test_a_partly_excluded_held_range_is_rebuilt_with_only_its_allowed_reference
 
 
 # spec: ANYM-830
+def test_swapping_exclusions_with_an_equal_count_rebuilds_the_held_times_and_reasons(seeded, tmp_path):
+    from datetime import timedelta
+    from psycopg.types.json import Jsonb
+    from messaging_service.delivery_policy import flush_hints
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    store.set_source_exclusions(True)
+    try:
+        token = identity(store)
+        second_chat(store)
+        with store.pool.connection() as c:
+            c.execute("INSERT INTO message_metadata(message,revision,metadata) VALUES('demo-tg-x',1,%s)",
+                (Jsonb({'mentions_owner': True}),))
+        sid = store.create_subscription(token, sources={'all_visible_chats': True})['subscription_id']
+        rid, _ = receiver(store, token, tmp_path)
+        call(store, token, 'configure_subscription_delivery', sid, 1, rid, {'batch_count': 3})
+        version = store.get_subscription(token, sid)['version']
+        mention = emit_in(store, 'demo-tg-x')
+        plain = emit(store)
+        match_subscriptions(store)
+        with store.pool.connection() as c:
+            matched = {row['event']: row['matched_at'] for row in c.execute(
+                'SELECT event,matched_at FROM subscription_matches WHERE subscription=%s', (sid,)).fetchall()}
+            # Distinct match times, so the rebuilt range shows which reference it holds.
+            c.execute("UPDATE subscription_matches SET matched_at=matched_at-interval '100 seconds' WHERE subscription=%s"
+                " AND event=%s", (sid, mention))
+        matched[mention] = matched[mention] - timedelta(seconds=100)
+        def held():
+            with store.pool.connection() as c:
+                return c.execute('''SELECT match_count,reasons,first_match_at,last_match_at,held_reason
+                    FROM subscription_hint_windows WHERE subscription=%s''', (sid,)).fetchone()
+        store.update_subscription(token, sid, version, action='set_exclusions', exclude_chats=[SECOND_CHAT],
+            exclusions_revision=0)
+        # Marked for its rebuild: no due time is shown until the tick has rebuilt it.
+        assert store.get_subscription(token, sid)['delivery']['next_hint_at'] is None
+        flush_hints(store)
+        window = held()
+        assert window['match_count'] == 1 and 'owner_mention' not in window['reasons']
+        assert window['first_match_at'] == window['last_match_at'] == matched[plain]
+        assert store.get_subscription(token, sid)['delivery']['held_reason'] == 'batch'
+        # The other chat instead: still one reference, but the other one, with its own time and reason.
+        store.update_subscription(token, sid, version, action='set_exclusions', exclude_chats=[
+            {'account': 'telegram-demo', 'chat': 'telegram-demo-chat'}], exclusions_revision=1)
+        flush_hints(store)
+        window = held()
+        assert window['match_count'] == 1 and 'owner_mention' in window['reasons']
+        assert window['first_match_at'] == window['last_match_at'] == matched[mention]
+        assert pending_hints(store, sid) == 0 and window['held_reason'] == 'batch'
+    finally:
+        store.set_dynamic_subscriptions(False)
+        store.set_source_exclusions(False)
+
+
+# spec: ANYM-830
 @pytest.mark.parametrize('mixed', [True, False], ids=['mixed', 'all_excluded'])
 def test_an_exclusion_committed_after_the_dispatcher_leased_a_hint_applies_at_its_fence(
         seeded, tmp_path, monkeypatch, mixed):
