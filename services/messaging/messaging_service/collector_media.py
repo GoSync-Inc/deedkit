@@ -1,13 +1,14 @@
 """The Telegram collector's media path: claiming, transferring and finishing originals, the idle media loop
 and the disk floors it publishes (moved from telegram_collector.py, W5-4a; WhatsAppCollector inherits it).
 
-Its log records keep the telegram_collector logger name.
+Its log records keep telegram_collector.py's logger (collector_log).
 """
 import asyncio
 from contextlib import suppress
 from datetime import datetime,timezone
 import errno
 import logging
+import sys
 import time
 
 from .archive import MEDIA_CONTENDED
@@ -17,7 +18,15 @@ from .telegram_governor import BACKGROUND,LIVE_MEDIA,ProviderRateLimited
 from .operational import MEDIA_ERRORS
 from .media_retry import MEDIA_PROVIDER_PERMANENT_CODES
 
-log=logging.getLogger('messaging_service.telegram_collector')
+def collector_log():
+    """telegram_collector.py's own logger: its module name, or __main__ when Compose starts it with `python -m`
+    (runpy sets that __main__'s spec). The moved methods keep the logger they had there (Astra r1, W5-4a)."""
+    name='messaging_service.telegram_collector'
+    spec=getattr(sys.modules.get('__main__'),'__spec__',None)
+    return logging.getLogger('__main__' if getattr(spec,'name',None)==name else name)
+
+
+log=collector_log()
 # ANYM-877: a live job's message fetch also takes the messages of up to BURST_FETCH other queued live jobs of its chat.
 BURST_FETCH=20
 # Out-of-window backfill: at most one original per MEDIA_BACKFILL_INTERVAL seconds, and a
