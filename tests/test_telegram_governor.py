@@ -231,6 +231,21 @@ def test_a_failing_cooldown_ring_write_never_changes_the_cooldown():
 
 
 # spec: ANYM-877
+def test_a_cooldown_whose_write_failed_appends_no_ring_entry():
+    from psycopg.errors import TransactionTimeout
+    async def scenario():
+        clock=Clock();state=State(clock);ring=[]
+        def stalled(seconds):raise TransactionTimeout('synthetic')
+        state.defer=stalled;state.record_cooldown=lambda seconds,phase:ring.append((seconds,phase))
+        gate=tiered(clock,state)
+        async def flooded():raise ProviderRateLimited(30)
+        with pytest.raises(ProviderRateLimited):await gate.call(flooded,'telegram_history')
+        # The pause holds in memory for a retry; the database that just failed gets no second write.
+        assert gate.unrecorded==30 and ring==[] and not gate.rings
+    asyncio.run(scenario())
+
+
+# spec: ANYM-877
 def test_a_caller_cancelled_while_its_cooldown_is_written_still_appends_the_ring_entry():
     async def scenario():
         clock=Clock();state=State(clock);entered=Event();release=Event();ring=[]

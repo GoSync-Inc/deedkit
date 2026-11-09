@@ -202,12 +202,11 @@ class RequestGovernor:
         # Commit BEFORE releasing the shared gate or propagating the error. The pause holds in memory
         # first, so a write that fails or times out still gates this process and is retried later.
         self.unrecorded=max(self.unrecorded,self.clock()+seconds)
-        try:await self._write(seconds)
-        except asyncio.CancelledError:
-            # The cooldown is written (or kept in memory); its ring entry still lands, unawaited.
-            self._ring(seconds,phase);raise
-        ring=self._ring(seconds,phase)
-        if ring is not None:await asyncio.wait({ring},timeout=RECORD_SECONDS+RECORD_GRACE)
+        # The ring entry starts only once the cooldown is written, so a stalled database is never written twice
+        # and its retry never waits behind the ring; a cancelled caller leaves the entry to land unawaited.
+        rings=[]
+        await self._write(seconds,written=lambda:rings.append(self._ring(seconds,phase)))
+        if rings and rings[0] is not None:await asyncio.wait({rings[0]},timeout=RECORD_SECONDS+RECORD_GRACE)
 
     def _ring(self,seconds,phase):
         """ANYM-877: start appending the cooldown to the health ring; best effort, never in the cooldown's way."""
@@ -222,7 +221,7 @@ class RequestGovernor:
         if not task.cancelled() and task.exception() is not None:
             logger.warning('cooldown_ring_failed exception_type=%s',type(task.exception()).__name__)
 
-    async def _write(self,seconds):
+    async def _write(self,seconds,*,written=None):
         """Persist the cooldown in one transaction bounded on the server; never past RECORD_SECONDS.
 
         Not bound to a live read's deadline: the cooldown is recorded even after it. A cancelled caller
@@ -250,6 +249,7 @@ class RequestGovernor:
         else:
             recording.result()  # a lost lease still raises
             if self.unrecorded<=self.clock()+seconds:self.unrecorded=0
+            if written is not None:written()
         if cancelled:raise asyncio.CancelledError
 
     async def _admission(self,phase,*,refusal=None,before=None,lane=None):
