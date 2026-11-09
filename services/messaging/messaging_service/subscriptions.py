@@ -558,6 +558,10 @@ def get_subscription(store, c, p, subscription_id):
     if row['state'] != 'access_changed' and row.get('tombstoned_at') is None:
         from .subscription_consumption import server_positions
         view['positions'] = server_positions(c, row, view['acked_through'])
+        # ANYM-824: per-day matcher counts, in this view only (list_subscriptions carries none).
+        activity = _activity(c, row, p)
+        if activity is not None:
+            view['activity'] = activity
     return view
 
 
@@ -718,7 +722,8 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
     bounded(max_subscriptions, 128)
     maximum = _bound_setting('SUBSCRIPTION_MAX_MATCHES', 10000, 1, 1000000)
     stats = {'checked': 0, 'scanned': 0, 'matched': 0, 'access_changed': 0,
-        'expired': 0, 'blocked': 0, 'missing_evidence': 0, 'module_matched': 0, 'module_blocked': 0, 'scope_failed': 0}
+        'expired': 0, 'blocked': 0, 'missing_evidence': 0, 'module_matched': 0, 'module_blocked': 0, 'scope_failed': 0,
+        'activity_failed': 0}
     with store.pool.connection() as c:
         from . import module_events
         modules = module_events.ready(c)
@@ -754,12 +759,14 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                 stats['access_changed'] += 1
                 continue
             head = c.execute('SELECT value FROM feed_counter WHERE id=1').fetchone()['value']
-            events = c.execute('''SELECT id,account,kind,origin,created_at,snapshot->>'sent_at' AS sent_at,
-                jsonb_strip_nulls(jsonb_build_object('chat',snapshot->'chat',
-                    'sender',snapshot->'sender','direction',snapshot->'direction',
-                    'metadata',snapshot->'metadata','reply_evidence',snapshot->'reply_evidence',
-                    'principal',snapshot->'principal','key_id',snapshot->'key_id')) AS snapshot
-                FROM events WHERE id>%s AND id<=%s ORDER BY id LIMIT %s''',
+            # ANYM-824: the account's platform labels the pass's counts (accounts(id,platform), schema 60 grant).
+            events = c.execute('''SELECT e.id,e.account,e.kind,e.origin,e.created_at,e.snapshot->>'sent_at' AS sent_at,
+                coalesce(a.platform,'unknown') AS platform,
+                jsonb_strip_nulls(jsonb_build_object('chat',e.snapshot->'chat',
+                    'sender',e.snapshot->'sender','direction',e.snapshot->'direction',
+                    'metadata',e.snapshot->'metadata','reply_evidence',e.snapshot->'reply_evidence',
+                    'principal',e.snapshot->'principal','key_id',e.snapshot->'key_id')) AS snapshot
+                FROM events e LEFT JOIN accounts a ON a.id=e.account WHERE e.id>%s AND e.id<=%s ORDER BY e.id LIMIT %s''',
                 (row['matched_through'], head, batch_size)).fetchall()
             for event in events:
                 event['origin'] = seen_origin(row['selector']['origins'], event['origin'], event['kind'],
@@ -787,6 +794,7 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
             position = row['matched_through']
             newly_matched = False
             missing = 0
+            activity = Counter()
             reason = None
             gap = row['gap'] if row['gap'] and row['gap'].get('intentional') else None
             for event in events:
@@ -798,41 +806,56 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                 snapshot = event['snapshot']
                 source = (event['account'], snapshot.get('chat'))
                 selected = source in lookup if visible is None else source in visible
-                if event['kind'] in FAILURE_KINDS:
+                failure = event['kind'] in FAILURE_KINDS
+                # ANYM-824: the first rule that leaves a selected message event out, in this loop's order.
+                metric = None
+                if failure:
                     # Direction and senders describe messages; these kinds have their own audience.
                     matches = (event['kind'] in selector['kinds'] and origin_selected(event['origin'], selector['origins']) and
                         _failure_audience(event, selected, row, p))
                 else:
-                    matches = (selected and event['kind'] in selector['kinds'] and
-                        origin_selected(event['origin'], selector['origins']))
+                    matches = selected
+                    if matches and event['kind'] not in selector['kinds']:
+                        matches, metric = False, 'left_out_kind'
+                    if matches and not origin_selected(event['origin'], selector['origins']):
+                        matches, metric = False, 'left_out_origin'
                     if matches and visible is not None:
                         left = _dynamic_match(selector['sources'], visible[source], snapshot)
                         if left is not None:
                             left_out(row, event, left)
-                            matches = False
+                            matches, metric = False, 'left_out_' + left
                     if matches and selector['direction']:
                         if 'direction' not in snapshot:
                             missing += 1
                             matches = False
                         else:
                             matches = snapshot['direction'] == selector['direction']
+                        metric = None if matches else 'left_out_direction'
                     if matches and lookup.get(source) is not None:
                         if 'sender' not in snapshot:
                             missing += 1
                             matches = False
                         else:
                             matches = snapshot['sender'] in lookup[source]
+                        metric = None if matches else 'left_out_sender'
                 if matches and selector.get('wake_rules'):
                     from .subscription_consumption import wake_reason
                     evidence = {**snapshot, 'account': event['account'], 'kind': event['kind'],
                         'historical': event['origin'] in ('backfill', 'reconcile'), 'reply_to_own_send': event['id'] in own}
                     matches = bool(set(selector['wake_rules']) & set(wake_reason(evidence, selector)))
+                    if not matches and not failure:
+                        metric = 'left_out_wake_rule'
                 if matches:
                     if count >= maximum:
                         reason = 'match_budget'
                         gap = {'reason': reason, 'after': position, 'through': head,
                             'recoverable': True, 'requires_operator': True}
+                        # The event stays unscanned: the next pass after the budget frees reads it again. A failure
+                        # event counts only as matched_failure, so a stop at one is not counted here.
+                        if not failure:
+                            activity[(event['platform'], 'match_budget_blocked')] += 1
                         break
+                    metric = 'matched_failure' if failure else 'matched'
                     if visible is None:
                         inserted = c.execute('''INSERT INTO subscription_matches(subscription,event)
                             VALUES(%s,%s) ON CONFLICT DO NOTHING RETURNING event''', (row['id'], event['id'])).fetchone()
@@ -846,6 +869,12 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                         newly_matched = True
                 position = event['id']
                 stats['scanned'] += 1
+                # Every selected message event has a metric here, so scanned = matched + left_out_*; failure events
+                # count only as matched_failure, and an event of an unselected chat counts nowhere.
+                if metric is not None:
+                    activity[(event['platform'], metric)] += 1
+                if selected and not failure:
+                    activity[(event['platform'], 'scanned')] += 1
             # If the retained range ends below a known committed frontier, the
             # tail was removed. Never convert that absence into a complete page.
             if reason is None and len(events) < batch_size and position < head:
@@ -858,6 +887,8 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
             c.execute('''UPDATE subscriptions SET matched_through=%s,blocked_reason=%s,gap=%s,
                 missing_evidence=missing_evidence+%s,last_matched_at=clock_timestamp()
                 WHERE id=%s''', (position, reason, Jsonb(gap) if gap else None, missing, row['id']))
+            if activity and not _record_pass_activity(c, row, p, activity, logged=stats['activity_failed'] > 0):
+                stats['activity_failed'] += 1
             if newly_matched:
                 from .delivery_policy import after_match
                 try:
@@ -925,7 +956,59 @@ def _dynamic_match(sources, chat_type, snapshot):
 
 def left_out(row, event, reason):
     """ANYM-825: the matcher reports each event a dynamic rule left out (no match, no hint, no budget);
-    ANYM-824 counts it as left_out_<reason>. No-op until then."""
+    ANYM-824 counts it as left_out_<reason> in the pass's activity; this hook stays a no-op."""
+
+
+def record_activity(c, subscription, scope_version, counts):
+    """ANYM-824: one upsert of a pass's {(platform, metric): n} into today's UTC row of each pair. Numbers, platform
+    names and the day only; the caller holds the definition's row lock, so concurrent passes add in turn. The day is
+    read once per statement (a materialized CTE), so a pass across midnight never splits its counts over two days."""
+    pairs = sorted(counts)
+    c.execute('''WITH today AS MATERIALIZED (SELECT (statement_timestamp() AT TIME ZONE 'UTC')::date AS day)
+        INSERT INTO subscription_activity(subscription,day,platform,scope_version,metric,n)
+        SELECT %s,today.day,u.platform,%s,u.metric,u.n
+        FROM today,unnest(%s::text[],%s::text[],%s::bigint[]) AS u(platform,metric,n)
+        ON CONFLICT (subscription,day,platform,scope_version,metric) DO UPDATE SET n=subscription_activity.n+EXCLUDED.n''',
+        (subscription, scope_version, [pair[0] for pair in pairs], [pair[1] for pair in pairs],
+         [counts[pair] for pair in pairs]))
+
+
+def _record_pass_activity(c, row, p, counts, *, logged):
+    """In a savepoint after the checkpoint update: a failed write (a missing table before schema 70, a lost grant)
+    rolls back only the counts, never a match, the checkpoint, a hint or an ACK. Logs the error code once per pass."""
+    try:
+        with c.transaction():
+            record_activity(c, row['id'], p['scope_version'], counts)
+        return True
+    except Exception as error:
+        if not logged:
+            print(json.dumps({'error': 'subscription_activity_failed',
+                'code': getattr(error, 'sqlstate', None) or type(error).__name__}), flush=True)
+        return False
+
+
+ACTIVITY_DAYS = 7
+
+
+def _activity(c, row, p):
+    """ANYM-824: the last 7 UTC days, oldest first, of the key's current scope version only (counts earned under an
+    older scope are never shown again); None when the table is missing (a schema-69 database)."""
+    from psycopg import errors
+    try:
+        with c.transaction():
+            rows = c.execute('''SELECT day,platform,metric,n FROM subscription_activity WHERE subscription=%s
+                AND scope_version=%s AND n>0 AND day>(clock_timestamp() AT TIME ZONE 'UTC')::date-%s
+                ORDER BY day,platform,metric''', (row['id'], p['scope_version'], ACTIVITY_DAYS)).fetchall()
+    except (errors.UndefinedTable, errors.InsufficientPrivilege):
+        return None
+    days = {}
+    for item in rows:
+        days.setdefault(item['day'].isoformat(), {}).setdefault(item['platform'], {})[item['metric']] = item['n']
+    return {'days': [{'day': day, 'platforms': platforms} for day, platforms in days.items()]}
+
+
+def activity_ready(c):
+    return c.execute("SELECT to_regclass('public.subscription_activity') IS NOT NULL AS ready").fetchone()['ready']
 
 
 def _own_send_replies(c, row, events, visible):

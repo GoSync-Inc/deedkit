@@ -110,7 +110,10 @@ def test_migration_is_expand_and_role_files_only_append_grants():
             ('collector_role.sql', 'GRANT SELECT,UPDATE(state,attempts,next_due,lease_until,refusal_reason,last_code,updated_at) '
              'ON media_recovery TO messaging_collector;', '-- Schema 69'),
             ('gateway_role.sql', 'GRANT SELECT ON media_recovery TO messaging_gateway;', '-- Schema 69')]:
-        current = (SOURCE/name).read_text()
+        text = (SOURCE/name).read_text()
+        # The file through this schema's section; a later schema's section (gateway_role.sql: ANYM-824, 70) may follow.
+        start = text.rindex(marker)
+        current = text[:start] + text[start:].split('\n-- Schema ')[0].rstrip('\n') + '\n'
         assert current.endswith(line+'\n')
         base = current[:current.rindex(marker)]
         assert role_class(base, current, created) == 'additive'
@@ -121,7 +124,7 @@ def test_schema_68_has_the_table_and_the_collector_reads_and_updates_only_what_i
     ar, s = wa
     fid = failed(ar, s, '1')
     with s.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '69'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '70'
     recover(s)
     role = install(s, 'collector_role.sql', 'messaging_collector', account=ACCOUNT)
     try:

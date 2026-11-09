@@ -122,3 +122,6 @@ GRANT SELECT ON conflict_reevaluations TO messaging_gateway;
 GRANT SELECT ON module_router_gaps TO messaging_gateway;
 -- Schema 69 (ANYM-816): account media status counts recovery states.
 GRANT SELECT ON media_recovery TO messaging_gateway;
+-- Schema 70 (ANYM-824): get_subscription reads the definition's per-day matcher counts; a compact event read
+-- adds its reads_compact count (ANYM-826). Counts only; no DELETE (retention is the matcher's).
+GRANT SELECT,INSERT,UPDATE ON subscription_activity TO messaging_gateway;

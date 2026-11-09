@@ -359,6 +359,69 @@ def test_pruning_runs_as_the_real_worker_role_with_only_the_named_grants(seeded)
                 connection.execute(sql.SQL('DROP ROLE {}').format(sql.Identifier(role)))
 
 
+def activity_rows(store, sid):
+    with store.pool.connection() as c:
+        return [(row['back'], row['metric']) for row in c.execute('''SELECT
+            (clock_timestamp() AT TIME ZONE 'UTC')::date-day AS back,metric FROM subscription_activity
+            WHERE subscription=%s ORDER BY back DESC,metric''', (sid,)).fetchall()]
+
+
+def aged_activity(store, sid, *rows):
+    with store.pool.connection() as c:
+        for back, metric in rows:
+            c.execute('''INSERT INTO subscription_activity(subscription,day,platform,scope_version,metric,n)
+                VALUES(%s,(clock_timestamp() AT TIME ZONE 'UTC')::date-%s,'telegram',1,%s,1)''', (sid, back, metric))
+
+
+# spec: ANYM-824
+def test_activity_older_than_35_days_goes_in_bounded_batches_and_a_held_definition_keeps_it(seeded, monkeypatch):
+    from messaging_service.subscriptions import retire_subscriptions
+    store, _, _ = seeded
+    _, sid, _ = acked_subscription(store, name='activity-retention')
+    _, held, _ = acked_subscription(store, name='activity-retention-held')
+    aged_activity(store, sid, (40, 'matched'), (40, 'scanned'), (36, 'scanned'), (35, 'scanned'), (34, 'scanned'))
+    aged_activity(store, held, (40, 'scanned'))
+    with store.pool.connection() as c:
+        c.execute('UPDATE subscriptions SET retention_hold=true WHERE id=%s', (held,))
+    monkeypatch.setattr(subscriptions, 'RETENTION_BATCH', 2)
+    first = retire_subscriptions(store)
+    assert first['activity_deleted'] == 2 and first['more'] is True and first['retire_failed'] == 0
+    assert retire_subscriptions(store)['activity_deleted'] == 1
+    assert retire_subscriptions(store)['activity_deleted'] == 0
+    # Day -36 is gone, days -35 and -34 stay, and so do today's counts of the matcher pass.
+    assert activity_rows(store, sid) == [(35, 'scanned'), (34, 'scanned'), (0, 'matched'), (0, 'scanned')]
+    assert activity_rows(store, held) == [(40, 'scanned'), (0, 'matched'), (0, 'scanned')]
+    # Without the operator's retention activation nothing is deleted.
+    aged_activity(store, sid, (36, 'scanned'))
+    set_retention(store, None)
+    assert retire_subscriptions(store)['activity_deleted'] == 0 and (36, 'scanned') in activity_rows(store, sid)
+
+
+# spec: ANYM-824
+def test_a_retired_definition_keeps_no_activity_rows_and_a_held_one_keeps_them(seeded, monkeypatch):
+    from messaging_service.subscriptions import retire_subscriptions
+    store, _, _ = seeded
+    retired, kept = [], []
+    for name, rows in (('activity-retired', retired), ('activity-retired-held', kept)):
+        token, sid, _ = acked_subscription(store, name=name)
+        view = store.get_subscription(token, sid)
+        store.update_subscription(token, sid, view['version'], action='close')
+        aged_activity(store, sid, (3, 'scanned'), (2, 'scanned'), (1, 'scanned'))
+        rows.append(sid)
+    with store.pool.connection() as c:
+        c.execute("UPDATE subscriptions SET closed_at=clock_timestamp()-interval '31 days' WHERE id=ANY(%s)",
+            ([*retired, *kept],))
+        c.execute('UPDATE subscriptions SET retention_hold=true WHERE id=%s', (kept[0],))
+    # Small batches: the counts go in the same bounded loop as the references.
+    monkeypatch.setattr(subscriptions, 'RETENTION_BATCH', 2)
+    tombstoned = sum(retire_subscriptions(store)['tombstoned'] for _ in range(8))
+    assert tombstoned == 1 and activity_rows(store, retired[0]) == []
+    with store.pool.connection() as c:
+        assert c.execute('SELECT tombstoned_at IS NOT NULL AS t FROM subscriptions WHERE id=%s',
+            (retired[0],)).fetchone()['t']
+    assert len(activity_rows(store, kept[0])) == 5
+
+
 @contextmanager
 def restore_database(database, tmp_path, *, through=None):
     """An isolated *_restore_test database, optionally stopped at an older schema."""
@@ -439,7 +502,7 @@ def test_schema38_database_migrates_with_floor_zero_and_quarantine_sets_the_hold
             restored.set_subscription_retention(True)
         restored.migrate()
         with restored.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '69'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '70'
             row = c.execute('SELECT retention_floor,retention_hold FROM subscriptions WHERE id=%s', (sid,)).fetchone()
             assert row == {'retention_floor': 0, 'retention_hold': False}
             assert legacy_matches(c) == references and len(references) == 3

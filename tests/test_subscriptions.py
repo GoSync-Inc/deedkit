@@ -654,6 +654,393 @@ def test_a_private_chat_first_seen_after_creation_matches_on_both_platforms(seed
         assert store.get_subscription(token, private)['version'] == before
 
 
+def utc_day(store, back=0):
+    with store.pool.connection() as c:
+        return c.execute("SELECT ((clock_timestamp() AT TIME ZONE 'UTC')::date-%s)::text AS d", (back,)).fetchone()['d']
+
+
+def activity(store, token, sid):
+    """Today's per-platform counts of the definition (these tests write no other day)."""
+    days = store.get_subscription(token, sid)['activity']['days']
+    assert [day['day'] for day in days] in ([], [utc_day(store)])
+    return days[0]['platforms'] if days else {}
+
+
+def balanced(platforms):
+    """scanned = matched + every left_out_* for each platform."""
+    return all(counts.get('scanned', 0) == counts.get('matched', 0) + sum(
+        n for metric, n in counts.items() if metric.startswith('left_out_')) for counts in platforms.values())
+
+
+# spec: ANYM-824
+def test_activity_counts_each_selected_event_once_by_platform_and_first_rejecting_rule(seeded):
+    from messaging_service.subscriptions import journal_send_failures
+    store, _, _ = seeded
+    with source_filters(store):
+        token = dynamic_key(store, 'activity-reader')
+        # Archived before the definitions (a named sender must be known in its chat); journaled after them.
+        chat_message(store, 'telegram-activity-channel', 'activity-channel', chat_type='channel')
+        chat_message(store, 'telegram-activity-bots', 'activity-bot', metadata={'sender_is_bot': True})
+        chat_message(store, 'telegram-demo-chat', 'activity-out')
+        with store.pool.connection() as c:
+            c.execute("UPDATE messages SET direction='outgoing' WHERE id='activity-out'")
+        everything = store.create_subscription(token, sources=ALL_VISIBLE,
+            kinds=['message.created', 'send.failed'])['subscription_id']
+        private = store.create_subscription(token, sources={**ALL_VISIBLE, 'chat_types': ['private']})['subscription_id']
+        # An account restriction: the WhatsApp account's events are outside the definition, counted nowhere.
+        telegram = store.create_subscription(token, sources={**ALL_VISIBLE, 'account_ids': ['telegram-demo']})[
+            'subscription_id']
+        senders = store.create_subscription(token, ['telegram-demo-chat'], sender_ids=['demo-person-9'])['subscription_id']
+        mentions = store.create_subscription(token, ['telegram-demo-chat'], wake_rules=['owner_mention'])['subscription_id']
+        emit(store)
+        emit(store, 'demo-wa-1')
+        emit(store, kind='message.edited')
+        emit(store, origin='backfill')
+        emit(store, 'activity-channel')
+        emit(store, 'activity-bot')
+        emit(store, 'activity-out')
+        # An account the key cannot see: counted nowhere.
+        emit(store, 'demo-private-1')
+        with store.authorized(token) as (_, p):
+            owner = p
+        with store.pool.connection() as c:
+            journal_send_failures(c, [{'status': 'failed', 'account': 'telegram-demo', 'chat': 'telegram-demo-chat',
+                'id': 'send_synthetic_activity', 'error_code': 'send_not_started', 'principal': owner['id'],
+                'key_id': owner['key_id']}])
+        assert match_subscriptions(store)['activity_failed'] == 0
+        counts = {sid: activity(store, token, sid) for sid in (everything, private, telegram, senders, mentions)}
+        assert counts[everything] == {
+            'telegram': {'scanned': 6, 'matched': 1, 'left_out_kind': 1, 'left_out_origin': 1, 'left_out_channel': 1,
+                'left_out_bot': 1, 'left_out_direction': 1, 'matched_failure': 1},
+            'whatsapp': {'scanned': 1, 'matched': 1}}
+        # chat_types (ANYM-825) leaves every untyped chat and the channel out; the kind and origin rules come first.
+        assert counts[private] == {
+            'telegram': {'scanned': 6, 'left_out_kind': 1, 'left_out_origin': 1, 'left_out_chat_type': 4},
+            'whatsapp': {'scanned': 1, 'left_out_chat_type': 1}}
+        assert counts[telegram] == {'telegram': {'scanned': 6, 'matched': 1, 'left_out_kind': 1, 'left_out_origin': 1,
+            'left_out_channel': 1, 'left_out_bot': 1, 'left_out_direction': 1}}
+        # Explicit sources scan only their own chat; direction comes before the sender rule.
+        assert counts[senders] == {'telegram': {'scanned': 4, 'left_out_kind': 1, 'left_out_origin': 1,
+            'left_out_direction': 1, 'left_out_sender': 1}}
+        assert counts[mentions] == {'telegram': {'scanned': 4, 'left_out_kind': 1, 'left_out_origin': 1,
+            'left_out_direction': 1, 'left_out_wake_rule': 1}}
+        assert all(balanced(platforms) for platforms in counts.values())
+        with store.pool.connection() as c:
+            columns = [row['column_name'] for row in c.execute('''SELECT column_name FROM information_schema.columns
+                WHERE table_name='subscription_activity' ORDER BY ordinal_position''').fetchall()]
+            platforms = {row['platform'] for row in c.execute('SELECT DISTINCT platform FROM subscription_activity').fetchall()}
+        # Numbers, platform names and days only: no chat, sender, message or account ID and no text.
+        assert columns == ['subscription', 'day', 'platform', 'scope_version', 'metric', 'n']
+        assert platforms == {'telegram', 'whatsapp'}
+
+
+# spec: ANYM-824
+def test_activity_commits_with_the_checkpoint_so_a_rolled_back_pass_counts_nothing(seeded):
+    from messaging_service.subscriptions import journal_send_failures
+    store, _, _ = seeded
+    token = key(store, 'activity-explicit')
+    sid = create(store, token, kinds=['message.created', 'send.failed'])['subscription_id']
+    emit(store)
+    with store.authorized(token) as (_, p):
+        owner = p
+    with store.pool.connection() as c:
+        journal_send_failures(c, [{'status': 'failed', 'account': 'telegram-demo', 'chat': 'telegram-demo-chat',
+            'id': 'send_synthetic_rollback', 'error_code': 'send_not_started', 'principal': owner['id'],
+            'key_id': owner['key_id']}])
+        before = c.execute('SELECT matched_through FROM subscriptions WHERE id=%s', (sid,)).fetchone()['matched_through']
+        # Fires at COMMIT, after the counts, the references and the checkpoint were all written.
+        c.execute("""CREATE FUNCTION activity_test_failure() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'synthetic commit failure'; END $$""")
+        c.execute('''CREATE CONSTRAINT TRIGGER activity_test_failure AFTER INSERT ON subscription_activity
+            DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION activity_test_failure()''')
+    try:
+        with pytest.raises(Exception, match='synthetic commit failure'):
+            match_subscriptions(store)
+        with store.pool.connection() as c:
+            assert c.execute('SELECT count(*) AS n FROM subscription_activity WHERE subscription=%s',
+                (sid,)).fetchone()['n'] == 0
+            assert c.execute('SELECT count(*) AS n FROM subscription_matches WHERE subscription=%s',
+                (sid,)).fetchone()['n'] == 0
+            assert c.execute('SELECT matched_through FROM subscriptions WHERE id=%s',
+                (sid,)).fetchone()['matched_through'] == before
+    finally:
+        with store.pool.connection() as c:
+            c.execute('DROP TRIGGER activity_test_failure ON subscription_activity')
+            c.execute('DROP FUNCTION activity_test_failure()')
+    match_subscriptions(store)
+    # One message match and one failure match: the failure is never scanned.
+    assert activity(store, token, sid) == {'telegram': {'scanned': 1, 'matched': 1, 'matched_failure': 1}}
+    match_subscriptions(store)
+    assert activity(store, token, sid) == {'telegram': {'scanned': 1, 'matched': 1, 'matched_failure': 1}}
+
+
+# spec: ANYM-824
+def test_activity_shows_seven_days_of_the_current_scope_to_the_owning_key_only(seeded):
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    try:
+        token, other = dynamic_key(store, 'activity-scope'), dynamic_key(store, 'activity-other')
+        sid = store.create_subscription(token, sources=ALL_VISIBLE)['subscription_id']
+        theirs = store.create_subscription(other, sources=ALL_VISIBLE)['subscription_id']
+        emit(store)
+        match_subscriptions(store)
+        assert activity(store, token, sid) == activity(store, other, theirs) == {'telegram': {'scanned': 1, 'matched': 1}}
+        with pytest.raises(APIError, match='not_found'):
+            store.get_subscription(other, sid)
+        assert all('activity' not in item for item in store.list_subscriptions(token)['items'])
+        with store.authorized(token) as (_, p):
+            version = p['scope_version']
+        with store.pool.connection() as c:
+            for back, metric, n in ((7, 'scanned', 7), (6, 'scanned', 6), (1, 'matched', 0)):
+                c.execute('''INSERT INTO subscription_activity(subscription,day,platform,scope_version,metric,n)
+                    VALUES(%s,(clock_timestamp() AT TIME ZONE 'UTC')::date-%s,'telegram',%s,%s,%s)''',
+                    (sid, back, version, metric, n))
+        # The last 7 UTC days, oldest first; a zero metric (and a day of only zeros) is omitted.
+        assert store.get_subscription(token, sid)['activity'] == {'days': [
+            {'day': utc_day(store, 6), 'platforms': {'telegram': {'scanned': 6}}},
+            {'day': utc_day(store), 'platforms': {'telegram': {'scanned': 1, 'matched': 1}}}]}
+        store.set_access('activity-scope', chats=['telegram-demo-chat'])
+        assert store.get_subscription(token, sid)['activity'] == {'days': []}
+        emit(store)
+        match_subscriptions(store)
+        assert activity(store, token, sid) == {'telegram': {'scanned': 1, 'matched': 1}}
+        # Re-expansion resurrects neither the first scope's counts nor the narrowed scope's.
+        store.set_access('activity-scope', chats=None)
+        assert store.get_subscription(token, sid)['activity'] == {'days': []}
+        emit(store)
+        match_subscriptions(store)
+        assert activity(store, token, sid) == {'telegram': {'scanned': 1, 'matched': 1}}
+        assert activity(store, other, theirs) == {'telegram': {'scanned': 3, 'matched': 3}}
+    finally:
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-824
+def test_a_failed_activity_write_changes_no_match_checkpoint_or_hint_and_logs_once_per_pass(seeded, tmp_path, capsys):
+    store, _, _ = seeded
+    token = lag_key(store, 'activity-failure')
+    sids = [bind(store, token, create(store, token)['subscription_id'], tmp_path, 'activity-failure') for _ in range(2)]
+    emit(store)
+    def acks():
+        with store.pool.connection() as c:
+            rows = c.execute('SELECT * FROM subscription_consumption WHERE subscription=ANY(%s::uuid[]) ORDER BY subscription',
+                (sids,)).fetchall()
+        return rows, [store.get_subscription(token, sid)['acked_through'] for sid in sids]
+    acked = acks()
+    with store.pool.connection() as c:
+        c.execute("""CREATE FUNCTION activity_write_failure() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'synthetic activity failure'; END $$""")
+        c.execute('''CREATE TRIGGER activity_write_failure BEFORE INSERT ON subscription_activity
+            FOR EACH ROW EXECUTE FUNCTION activity_write_failure()''')
+    capsys.readouterr()
+    try:
+        stats = match_subscriptions(store)
+    finally:
+        with store.pool.connection() as c:
+            c.execute('DROP TRIGGER activity_write_failure ON subscription_activity')
+            c.execute('DROP FUNCTION activity_write_failure()')
+    logged = [line for line in capsys.readouterr().out.splitlines() if 'subscription_activity_failed' in line]
+    # The error code only, once for the whole pass.
+    assert logged == ['{"error": "subscription_activity_failed", "code": "P0001"}']
+    assert stats['matched'] == 2 and stats['activity_failed'] == 2
+    with store.pool.connection() as c:
+        head = c.execute('SELECT value FROM feed_counter WHERE id=1').fetchone()['value']
+    for sid in sids:
+        view = store.get_subscription(token, sid)
+        assert view['matched_event_count'] == 1 and view['matched_through'] == head and view['blocked_reason'] is None
+        assert view['delivery']['hint_counts'] == {'pending': 1} and view['activity'] == {'days': []}
+    assert acks() == acked
+    # The next pass counts its own events only: a lost write is not replayed.
+    emit(store)
+    assert match_subscriptions(store)['activity_failed'] == 0
+    assert [activity(store, token, sid) for sid in sids] == [{'telegram': {'scanned': 1, 'matched': 1}}] * 2
+
+
+# spec: ANYM-824
+def test_a_database_before_schema_70_still_matches_and_answers_get_subscription_without_activity(database, tmp_path):
+    from messaging_service.subscriptions import retire_subscriptions
+    from test_subscription_retention import restore_database
+    with restore_database(database, tmp_path, through=69) as old:
+        token = key(old, 'activity-old-schema')
+        sid = create(old, token)['subscription_id']
+        emit(old)
+        stats = match_subscriptions(old)
+        assert stats['matched'] == 1 and stats['activity_failed'] == 1
+        view = old.get_subscription(token, sid)
+        assert 'activity' not in view and view['matched_event_count'] == 1
+        assert retire_subscriptions(old)['retire_failed'] == 0
+
+
+# spec: ANYM-824
+def test_migration_70_runs_twice_and_keeps_the_counts_and_every_grant(seeded):
+    store, _, _ = seeded
+    token = key(store, 'activity-migration')
+    sid = create(store, token)['subscription_id']
+    emit(store)
+    match_subscriptions(store)
+    with store.pool.connection() as c:
+        c.execute('DELETE FROM archive_migrations WHERE version=70')
+        c.execute("UPDATE probe_metadata SET value='69' WHERE name='schema_version'")
+        grants = c.execute("SELECT oid,relacl::text FROM pg_class WHERE relnamespace='public'::regnamespace ORDER BY oid").fetchall()
+    store.migrate()
+    store.migrate()
+    with store.pool.connection() as c:
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '70'
+        assert c.execute('SELECT count(*) AS n FROM archive_migrations WHERE version=70').fetchone()['n'] == 1
+        assert c.execute("SELECT oid,relacl::text FROM pg_class WHERE relnamespace='public'::regnamespace ORDER BY oid").fetchall() == grants
+    assert activity(store, token, sid) == {'telegram': {'scanned': 1, 'matched': 1}}
+
+
+def failure_event(store, kind, token):
+    """A synthetic send.failed of the key (through the journal writer) or source.health row of its account."""
+    from messaging_service.subscriptions import journal_send_failures
+    with store.authorized(token) as (_, p):
+        owner = p
+    with store.pool.connection() as c:
+        if kind == 'send.failed':
+            journal_send_failures(c, [{'status': 'failed', 'account': 'telegram-demo', 'chat': 'telegram-demo-chat',
+                'id': 'send_synthetic_budget', 'error_code': 'send_not_started', 'principal': owner['id'],
+                'key_id': owner['key_id']}])
+        else:
+            value = c.execute('UPDATE feed_counter SET value=value+1 WHERE id=1 RETURNING value').fetchone()['value']
+            c.execute('''INSERT INTO events(id,account,message,kind,revision,origin,snapshot,event_key)
+                VALUES(%s,'telegram-demo',NULL,'source.health',1,'live',%s,%s)''',
+                (value, Jsonb({'account': 'telegram-demo', 'status': 'degraded'}), 'source.health:synthetic-%d' % value))
+
+
+# spec: ANYM-824
+@pytest.mark.parametrize('kind', ['send.failed', 'source.health'])
+def test_a_budget_stop_counts_once_and_a_failure_event_at_the_budget_never_counts_as_blocked(seeded, monkeypatch, kind):
+    store, _, _ = seeded
+    token = key(store, 'activity-budget')
+    sid = create(store, token, kinds=['message.created', kind])['subscription_id']
+    monkeypatch.setenv('SUBSCRIPTION_MAX_MATCHES', '2')
+    for _ in range(3):
+        emit(store)
+    assert match_subscriptions(store)['blocked'] == 1
+    # The event that hit the budget is not scanned yet.
+    assert activity(store, token, sid) == {'telegram': {'scanned': 2, 'matched': 2, 'match_budget_blocked': 1}}
+    monkeypatch.setenv('SUBSCRIPTION_MAX_MATCHES', '3')
+    assert match_subscriptions(store)['blocked'] == 0
+    assert activity(store, token, sid) == {'telegram': {'scanned': 3, 'matched': 3, 'match_budget_blocked': 1}}
+    failure_event(store, kind, token)
+    assert match_subscriptions(store)['blocked'] == 1
+    assert activity(store, token, sid) == {'telegram': {'scanned': 3, 'matched': 3, 'match_budget_blocked': 1}}
+    monkeypatch.setenv('SUBSCRIPTION_MAX_MATCHES', '4')
+    match_subscriptions(store)
+    assert activity(store, token, sid) == {'telegram': {'scanned': 3, 'matched': 3, 'match_budget_blocked': 1,
+        'matched_failure': 1}}
+
+
+# spec: ANYM-824
+def test_one_upsert_puts_all_its_counts_on_one_utc_day_across_midnight(seeded):
+    from messaging_service.subscriptions import record_activity
+    store, _, _ = seeded
+    sid = create(store, key(store, 'activity-midnight'))['subscription_id']
+    # Synthetic clocks on the search path ahead of pg_catalog: the first call is before midnight, the rest after.
+    with store.pool.connection() as c:
+        c.execute('CREATE SCHEMA activity_clock')
+        c.execute('CREATE SEQUENCE activity_clock.calls')
+        for name in ('clock_timestamp', 'statement_timestamp', 'now'):
+            c.execute(sql_function(name))
+    try:
+        with store.pool.connection() as c:
+            c.execute('SET LOCAL search_path=activity_clock,public,pg_catalog')
+            record_activity(c, sid, 1, {('telegram', 'scanned'): 2, ('telegram', 'matched'): 1,
+                ('whatsapp', 'scanned'): 1, ('whatsapp', 'left_out_kind'): 1})
+        with store.pool.connection() as c:
+            days = {row['day'].isoformat() for row in c.execute(
+                'SELECT day FROM subscription_activity WHERE subscription=%s', (sid,)).fetchall()}
+        assert days == {'2026-11-08'}
+    finally:
+        with store.pool.connection() as c:
+            c.execute('DROP SCHEMA activity_clock CASCADE')
+
+
+def sql_function(name):
+    return ('CREATE FUNCTION activity_clock.' + name + """() RETURNS timestamptz LANGUAGE sql VOLATILE AS $$
+        SELECT CASE WHEN nextval('activity_clock.calls')=1 THEN timestamptz '2026-11-08 23:59:59.999+00'
+        ELSE timestamptz '2026-11-09 00:00:00.001+00' END $$""")
+
+
+# spec: ANYM-824
+def test_a_pass_writes_at_most_one_activity_upsert_per_definition(seeded, monkeypatch):
+    import psycopg
+    store, _, _ = seeded
+    token = key(store, 'activity-cost', accounts=['telegram-demo', 'whatsapp-demo-1'])
+    for _ in range(3):
+        create(store, token)
+    # A definition whose chat had no event this pass writes nothing.
+    store.create_subscription(token, ['whatsapp-demo-1-chat'])
+    for _ in range(5):
+        emit(store)
+    statements = []
+    execute = psycopg.Connection.execute
+    def counted(self, query, *args, **kwargs):
+        statements.append(str(query))
+        return execute(self, query, *args, **kwargs)
+    monkeypatch.setattr(psycopg.Connection, 'execute', counted)
+    # The worker's defaults (subscription_worker.py: 16 subscriptions, 200 events per pass).
+    assert match_subscriptions(store, batch_size=200, max_subscriptions=16)['matched'] == 15
+    assert sum('INSERT INTO subscription_activity' in statement for statement in statements) == 3
+    statements.clear()
+    assert match_subscriptions(store, batch_size=200, max_subscriptions=16)['matched'] == 0
+    assert sum('INSERT INTO subscription_activity' in statement for statement in statements) == 0
+
+
+# spec: ANYM-824
+def test_the_worker_role_writes_and_prunes_activity_with_its_named_grants(seeded):
+    from contextlib import contextmanager
+    from copy import copy
+    from pathlib import Path
+    from uuid import uuid4
+    import psycopg
+    from psycopg import sql
+    from messaging_service.subscriptions import retire_subscriptions
+    store, _, _ = seeded
+    role = 'test_subscription_activity_' + uuid4().hex
+    source = Path(__file__).resolve().parents[1] / 'services/messaging/messaging_service/subscription_role.sql'
+
+    class RestrictedPool:
+        @contextmanager
+        def connection(self):
+            with store.pool.connection() as connection:
+                connection.execute(sql.SQL('SET LOCAL ROLE {}').format(sql.Identifier(role)))
+                yield connection
+
+    worker = copy(store)
+    worker.pool = RestrictedPool()
+    token = key(store, 'activity-role')
+    sid = create(store, token)['subscription_id']
+    emit(store)
+    created = False
+    try:
+        with store.pool.connection() as c:
+            c.execute(source.read_text().replace('messaging_subscriptions', role))
+        created = True
+        assert match_subscriptions(worker)['activity_failed'] == 0
+        assert activity(store, token, sid) == {'telegram': {'scanned': 1, 'matched': 1}}
+        store.set_subscription_retention(True)
+        with store.pool.connection() as c:
+            c.execute('''INSERT INTO subscription_activity(subscription,day,platform,scope_version,metric,n)
+                VALUES(%s,(clock_timestamp() AT TIME ZONE 'UTC')::date-36,'telegram',1,'scanned',1)''', (sid,))
+        stats = retire_subscriptions(worker)
+        assert stats['activity_deleted'] == 1 and stats['retire_failed'] == 0
+        with store.pool.connection() as c:
+            assert c.execute('SELECT count(*) AS n FROM subscription_activity WHERE day<%s::date',
+                (utc_day(store),)).fetchone()['n'] == 0
+        # The table grant adds no right on the definitions themselves.
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            with worker.pool.connection() as c:
+                c.execute('DELETE FROM subscriptions WHERE id=%s', (sid,))
+    finally:
+        with store.pool.connection() as c:
+            c.execute("DELETE FROM probe_metadata WHERE name='subscription_retention'")
+            if created:
+                c.execute(sql.SQL('DROP OWNED BY {}').format(sql.Identifier(role)))
+                c.execute(sql.SQL('DROP ROLE {}').format(sql.Identifier(role)))
+
+
 SHAPES = ('plain', 'mention', 'reply', 'photo', 'document', 'voice', 'forwarded')
 WAKE_CASES = {
     # rule: the message shapes that wake it; media kinds and forwarding never change the result.

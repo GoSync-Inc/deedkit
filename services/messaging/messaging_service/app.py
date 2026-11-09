@@ -1176,6 +1176,9 @@ def register_subscription_tools(mcp, call, async_call, read, upload_write):
         delivery.lag: unfinished push hints, the oldest one's age and seconds to the next attempt.
         positions: acked_through, fetched_through (highest retained receipt), open_receipts,
         oldest_open_receipt_expires_at, expired_unacked; the server cannot know your local cursor.
+        activity.days: the last 7 UTC days, oldest first, per platform: scanned, matched, left_out_<reason>
+        (first rejecting rule), match_budget_blocked, matched_failure. Numbers only, current scope version only;
+        matched counts references kept, not model runs; no cost figure (compare equal periods).
         """
         return call(ctx,'get_subscription',subscription_id=subscription_id)
 

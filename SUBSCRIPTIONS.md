@@ -20,7 +20,7 @@ Python/npm client methods:
 | --- | --- | --- |
 | `create_subscription` | `chat_ids` or `sources`; optional `sender_ids`, `kinds`, `direction`, `origins`, `label`, `expires_at` | Freeze an authorized source set, or follow every chat the key can see ([dynamic sources](#dynamic-sources-all-visible-chats-schema-58)), from the committed journal head |
 | `list_subscriptions` | Optional `limit` (1–100) | List this exact credential's definitions; `has_more` is explicit |
-| `get_subscription` | `subscription_id` | Inspect lifecycle, match frontier and gap evidence |
+| `get_subscription` | `subscription_id` | Inspect lifecycle, match frontier, gap evidence and [per-day matcher activity](#matcher-activity-per-day-schema-70) |
 | `update_subscription` | `subscription_id`, current `version`, `action`; optional `resume_policy` | Pause, resume or close with optimistic concurrency |
 | `get_subscription_events` | `subscription_id`; optional `after`, `limit` (1–100) | Read immutable event references; return `next_after`, without ACK |
 
@@ -1613,6 +1613,52 @@ any older code is deployed: `--disable` moves every dynamic definition to `acces
 older code already masks in get, list and passive reads and refuses to resume or fetch, cancels
 its queued hints (`dynamic_sources_disabled`) under the fence and prints the definition and hint
 IDs. Agents recreate their definitions after a new `--enable`.
+
+## Matcher activity per day (schema 70)
+
+ANYM-824. `get_subscription` returns `activity`: what the matcher did with this definition on each
+of the last 7 UTC days, oldest first, per platform (the account's provider name, e.g. `telegram`,
+`whatsapp`), numbers only:
+
+```json
+{"activity": {"days": [{"day": "2026-11-08",
+  "platforms": {"telegram": {"scanned": 40, "matched": 6, "left_out_chat_type": 31, "left_out_wake_rule": 3},
+                "whatsapp": {"scanned": 12, "matched": 2, "left_out_chat_type": 10}}}]}}
+```
+
+| Metric | Counts |
+| --- | --- |
+| `scanned` | Message-bearing events in the chats the definition selects: its chat list (explicit), or the chats the key can see at that pass (dynamic). Events of other chats or accounts are counted nowhere, so the numbers say nothing about other chats' traffic |
+| `matched` | Scanned events the definition kept a reference to |
+| `left_out_<reason>` | Scanned events the FIRST rejecting rule left out, in the matcher's order: `kind`, `origin`, `chat_type` (`sources.chat_types`), `channel`, `bot`, `direction` (also when the event carries no direction), `sender` (also without a sender), `wake_rule` |
+| `match_budget_blocked` | Passes that stopped at `SUBSCRIPTION_MAX_MATCHES`; the event that hit the budget is not scanned yet |
+| `matched_failure` | `send.failed` and `source.health` events that matched by their own audience rule; never in `scanned` |
+
+So `scanned = matched + Σ left_out_*` per day and platform. A zero metric and a day without
+counts are omitted; `list_subscriptions` carries no `activity`. Later reasons use the same names
+(`left_out_excluded_chat`, ANYM-830; `reads_compact` with platform `all`, ANYM-826).
+
+What the numbers mean: `matched` counts references kept, not model runs. The server counts the
+hints it stages and delivers (`delivery.hint_counts`, unchanged) but cannot see whether the
+receiving host ran a model on a hint. No cost or saving figure is computed: to judge a change
+(chat types, wake rules), compare equal periods before and after it.
+
+Scope: counts carry the key's scope version at the pass. Only the current version's counts are
+shown, so after a scope change the earlier counts are never shown again, also when the scope is
+widened back (a dynamic definition survives the change, its counts do not). A key reads only its
+own definitions' activity.
+
+Storage and failure isolation: table `subscription_activity` (definition, UTC day, platform, scope
+version, metric, count; no chat, sender, message or account ID and no text). The matcher adds a
+pass's counts with one upsert per definition in the transaction that advances `matched_through`,
+inside a savepoint: a rolled-back pass counts nothing, a rerun counts once, and a failed write
+(e.g. before migration 70) logs `subscription_activity_failed` with the error code once per pass
+and changes no match, checkpoint, hint or ACK. Before migration 70 `get_subscription` answers
+without `activity`. Retention: with the operator's retention activation, the retention job deletes
+rows older than 35 days in bounded batches (a held definition keeps them), and the retirement of a
+closed definition (tombstone) deletes its rows. Rollout: migration 70 (expand: one table),
+`subscription_role.sql` (SELECT, INSERT, UPDATE, DELETE on this table only) and `gateway_role.sql`
+(SELECT, INSERT, UPDATE on it: the API adds read counts such as `reads_compact`, ANYM-826; no DELETE); no switch.
 
 ## Files of a named group or channel (ANYM-805)
 
