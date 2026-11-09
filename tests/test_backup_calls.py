@@ -4,6 +4,7 @@ Synthetic SQLite files only; no provider, no Docker (a fake runs the real helper
 The limits of the helper's container are Docker's; the pressure test stands in for them with process limits.
 """
 import copy
+from datetime import datetime, timezone
 import io
 import json
 import os
@@ -909,6 +910,52 @@ def test_a_busy_host_lock_skips_with_the_calls_code_after_cleaning_what_a_crash_
         os.close(fd)
     assert skip.value.code == 'calls_skipped_lock_busy' and skip.value.code in backup_runner.SAFE_ERRORS
     assert not list(runner.staging_root.iterdir())
+
+
+# spec: ANYM-782
+def test_a_busy_host_lock_schedules_one_retry_of_the_daily_unit_a_day_and_the_skip_stands(tmp_path, age_stub, monkeypatch,
+                                                                                            capsys):
+    # 11-09: automatic deploys held messaging's lock at 02:15 and 04:15; both calls runs skipped and nothing retried.
+    import fcntl
+    runner, _, _ = calls_runner(tmp_path, age_stub, monkeypatch)
+    config = tmp_path / 'runner.json'
+    config.write_text(json.dumps(runner.cfg))
+    config.chmod(0o600)
+    monkeypatch.setattr(backup_runner.sys, 'argv', ['backup_runner', '--config', str(config)])
+    monkeypatch.setattr(backup_runner.signal, 'signal', lambda *_: None)
+    unit: list[str | None] = [None]
+    scheduled = []
+    monkeypatch.setattr(backup_runner, 'own_unit', lambda profile: unit[0])
+    def systemd_run(argv):
+        scheduled.append(argv)
+        if scheduled.count(argv) > 1:
+            raise subprocess.CalledProcessError(1, argv)  # systemd refuses a second unit of that name
+    monkeypatch.setattr(backup_runner, 'systemd_run', systemd_run)
+    def main():
+        with pytest.raises(SystemExit) as stopped:
+            backup_runner.main()
+        return stopped.value.code, [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    fd = os.open(runner.cfg['host_lock'], os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        # A hand run (or a test) is in no backup unit: it schedules nothing.
+        assert main() == (0, [{'status': 'skipped', 'code': 'calls_skipped_lock_busy'}]) and scheduled == []
+        unit[0] = 'deedkit-calls-backup-catchup.service'
+        name = 'deedkit-calls-backup-retry-' + datetime.now(timezone.utc).strftime('%Y%m%d')
+        assert main() == (0, [{'retry': name, 'in_seconds': 1200}, {'status': 'skipped', 'code': 'calls_skipped_lock_busy'}])
+        assert scheduled == [['systemd-run', '--no-ask-password', '--quiet', '--unit', name, '--on-active=1200',
+                              '--timer-property=AccuracySec=1s', '--timer-property=RemainAfterElapse=yes',
+                              '--description=Retry of a calls backup run that found the host lock busy',
+                              '/usr/bin/systemctl', 'start', '--no-block', 'deedkit-calls-backup.service']]
+        # The same day the name exists: no second retry; the skip, its status and exit code are unchanged.
+        assert main() == (0, [{'retry': None, 'in_seconds': 1200}, {'status': 'skipped', 'code': 'calls_skipped_lock_busy'}])
+        assert len(scheduled) == 2 and read_json(Path(runner.cfg['directory']) / 'status.json')['error_code'] == \
+            'calls_skipped_lock_busy'
+    finally:
+        os.close(fd)
+    assert backup_runner.RETRY_DELAY_SECONDS == 1200 and backup_runner.RETRY_PROFILES == ('recordings', 'calls')
+    monkeypatch.setattr(backup_runner, 'own_unit', lambda profile: None)
+    assert backup_runner.schedule_retry('recordings') is None and len(scheduled) == 2
 
 
 # spec: ANYM-778
