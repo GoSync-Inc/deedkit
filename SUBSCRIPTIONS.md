@@ -1114,6 +1114,28 @@ guard: the chat's own sends are outgoing and never satisfy `incoming_message` or
 the reply wake rules, so subscribe the chat with `wake_rules` (for example
 `["incoming_message"]`).
 
+**Registry mode (ANYM-849).** The configuration lists one key file per agent
+principal (`keys`, set up once, not per chat) instead of `key_file` and `watches`; a
+file with both refuses to start (`watches_with_keys`). An agent registers its own chat
+with `register_wake_target` ([Wake targets](#wake-targets-pull-waker-rules-schema-73)),
+passing its `CODEX_THREAD_ID`. At the next poll the waker queues one fixed challenge
+to that thread naming the target ID and a one-use code; the chat answers it with
+`confirm_wake_target`, and only then do the target's bound subscriptions wake that
+thread, by the rules above. The waker keeps the code's SHA-256 only and sends one
+challenge per target and thread, inside the thread's hourly budget; a thread change
+starts a new one. Each poll reads every key's targets with `list_wake_targets`;
+server fields are untrusted, so an invalid target is dropped (`invalid_wake_target`)
+and only validated values reach the fixed argv. A paused, disabled, deleted or
+unbound target, or a moved thread, turns its held wakes into `dropped_config`
+(`rule_removed`); `delivery_disabled` stops a key's wakes until the switch lifts. The
+delivery switch, the owner's `deedkit admin wake-targets disable|enable` and a
+restore's quarantine act only in registry mode. `allowed_threads` per key (optional,
+unset by default) locks that key to the listed threads; its refusals show in
+`watch-status` as `thread_not_allowed`. A key whose session or registry read fails is
+skipped for that poll with a fixed code and keeps its held wakes; the other keys run.
+The challenge text and the target ID reach the model provider in the chat's turn, like
+the wake text. Setup: [the package README](packages/wake-relay/README.md#registry-mode-each-chat-sets-up-its-own-wake-anym-849).
+
 ## Event retention
 
 Status: acknowledged-event retention is implemented since **schema 40** (ANYM-446, the

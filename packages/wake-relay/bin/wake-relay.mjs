@@ -25,7 +25,8 @@ if(command==='status'){
 }else if(command==='watch'){
   let watcher;
   try{watcher=new Watcher({config,log});await watcher.check();}catch(error){watcher?.close();refuse(error);}
-  log({event:'watching',watches:watcher.config.watches.length,codex:watcher.config.codexPath?'configured':'missing'});
+  log({event:'watching',mode:watcher.config.mode,...(watcher.config.mode==='registry'?{keys:watcher.config.keys.length}:
+    {watches:watcher.config.watches.length}),codex:watcher.config.codexPath?'configured':'missing'});
   watcher.start();
   const stop=()=>watcher.close().then(()=>process.exit(0));
   process.once('SIGTERM',stop);process.once('SIGINT',stop);

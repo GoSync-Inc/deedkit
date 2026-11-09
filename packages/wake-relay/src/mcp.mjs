@@ -8,7 +8,8 @@ const PROTOCOL='2025-06-18',TOKEN=/^[\x21-\x7e]{1,4096}$/;
 // Server error codes the waker logs as they are; any other value (it is server-controlled) becomes `tool_error`.
 export const SERVER_CODES=new Set(['not_found','not_found_or_forbidden','forbidden','invalid_arguments','invalid_parameters',
   'invalid_version','invalid_subscription','invalid_subscription_state','subscription_closed','subscription_access_changed',
-  'service_busy','backend_unavailable','module_not_selected','unsupported_by_backend','tool_not_granted','rate_limited']);
+  'service_busy','backend_unavailable','module_not_selected','unsupported_by_backend','tool_not_granted','rate_limited',
+  'delivery_disabled']);
 
 export class DeedKitError extends Error{
   constructor(code){super(code);this.code=code;}
@@ -112,6 +113,8 @@ export function deedkitClient({url,keyFile,tool='messages_get_subscription_event
           const result=await send('tools/call',{name:tool,arguments:{subscription_id:subscriptionId,after,limit,detail:'compact'}});
           return toolResult(result);
         },
+        // ANYM-849: one other read-only tool (the key's own wake targets); the result is checked by the caller.
+        async call(name,args){return toolResult(await send('tools/call',{name,arguments:args}));},
       };
     },
   };
