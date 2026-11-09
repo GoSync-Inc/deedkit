@@ -19,7 +19,7 @@ into spaces and `«` `»` into `"`, and it is untrusted. In detail=full such a r
 `body_chars` bounds the sender's text and the label; the quote comes after that cap.
 `display_text_truncated` means the sender's text was cut, never only the label or the quote. A chat head still cuts the whole text at 160 characters.
 `kind` distinguishes text, photo, video, voice, audio, document, sticker,
-location, contact, poll, system, group_change and unknown. Files retain independent download,
+location, contact, poll, system, group_change, call and unknown. Files retain independent download,
 extraction and enrichment statuses. A pending transcript is not a missing file.
 
 Known system events are filtered **before** page/window limits by default.
@@ -49,6 +49,22 @@ newest `rename` or `joined_group`; an older one never overwrites it. Subscriptio
 are not woken by `group_change` rows, except `joined_group`, which wakes as a
 message does. Disappearing-message timer, announce and locked settings are not
 stored.
+
+WhatsApp calls to the owner (ANYM-923) are system events of kind `call` (label «Звонок»), one row per call in
+the caller's private chat (or the group of a group call), sender the caller. The default adapter writes the row
+when the call ends, or 2 hours after the offer when WhatsApp gives no end; a redelivered call event, a synced
+call-log message or a call log record of the same call maps to the same row (provider ID `call_<call ID>`). Its
+metadata `call` is `{call_id, direction, media, group, started_at, ended_at, outcome}`: `direction` is always
+`incoming` (outgoing calls are not stored); `media` is `audio`, `video` or null; `group` is true for a group call;
+`started_at` and `ended_at` are UTC instants (`ended_at` null when no end is known; for a synced call it is the
+start plus WhatsApp's duration); `outcome` is `missed` (ended with no accept seen), `rejected`, `answered` (an
+accept was seen, or WhatsApp's log says connected) or `unknown`. A call answered on the phone may not reach the
+linked device as an accept, so it can show as `missed`. DeedKit never answers or rejects a call. The conversation
+view hides call rows unless `include_system=true`. Missed calls per person: `search` with `sender`,
+`call_outcome=missed` and `include_system=true` (`call_outcome` alone implies `message_kinds=['call']`;
+`message_kinds` lists any kinds above). `get_updates` has no kind filter. A `call` row with outcome `missed` wakes
+only subscriptions whose `kinds` list `call`; no other call row and no default subscription is woken
+([SUBSCRIPTIONS.md](SUBSCRIPTIONS.md)).
 
 WhatsApp polls (ANYM-921) keep their options. A poll message (kind `poll`, its body the question) carries
 `poll` in the conversation view, `get_messages`, `get_context` and `search` results:

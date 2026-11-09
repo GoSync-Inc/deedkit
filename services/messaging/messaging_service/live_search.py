@@ -85,6 +85,8 @@ def unsupported(arguments):
     chats = arguments.get('chats')
     if chats is not None and (len(chats) != 1 or arguments.get('chat')): fields.append('chats')
     if arguments.get('direction'): fields.append('direction')
+    if arguments.get('message_kinds') is not None: fields.append('message_kinds')
+    if arguments.get('call_outcome'): fields.append('call_outcome')
     for name in ('from_time', 'to_time'):
         if arguments.get(name) and timestamp(arguments[name]) is None: fields.append(name)
     if not fields and parameters(arguments)[1] is None: fields.append('chat_types')

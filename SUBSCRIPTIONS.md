@@ -43,6 +43,11 @@ can include `backfill`, `reconcile` or synthetic `fixture`; historical matches
 are marked. Expiry is optional, timezone-aware, in the future and at most 366
 days ahead. No messages before the creation frontier are replayed.
 
+`call` (ANYM-923) is an opt-in kind: a WhatsApp call row with outcome `missed` is delivered as its
+`message.created` event only to a subscription whose `kinds` list `call`. Other call rows (answered, rejected,
+unknown) wake no subscription, and `message.created` alone never wakes on a call
+([CONVERSATION.md](CONVERSATION.md)).
+
 The live stream can lose a message (a reconnect, a capture overload restart;
 COLLECTORS.md, Availability of new messages). The next reconcile pass then stores
 it, minutes to hours after it was sent, and the journal records it with origin

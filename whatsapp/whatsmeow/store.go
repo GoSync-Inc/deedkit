@@ -98,6 +98,11 @@ func OpenCapture(c Config) (*CaptureStore, error) {
 		db.Close()
 		return nil, e
 	}
+	// ANYM-923: incoming calls waiting for their end (calls.go).
+	if e = ensureCallTable(db); e != nil {
+		db.Close()
+		return nil, e
+	}
 	// ANYM-814: also releases or marks uncertain the repair requests of a previous process.
 	if e = ensureRepairRequests(db); e != nil {
 		db.Close()
@@ -112,7 +117,7 @@ func (s *CaptureStore) Close() error { return s.db.Close() }
 // acknowledged and counted under its fixed code instead of stopping capture of
 // the whole account and being redelivered forever. Store, disk, spool and
 // identity failures are never in this set.
-var skippedCaptureCodes = map[string]bool{"invalid_provider_message": true, "unsupported_chat": true, "invalid_provider_media": true, "invalid_history_notification": true, "invalid_history_chat": true, "invalid_history_message": true, "skipped_group_change": true, "poll_vote_undecryptable": true, "poll_vote_unknown_option": true}
+var skippedCaptureCodes = map[string]bool{"invalid_provider_message": true, "unsupported_chat": true, "invalid_provider_media": true, "invalid_history_notification": true, "invalid_history_chat": true, "invalid_history_message": true, "skipped_group_change": true, "skipped_call_event": true, "poll_vote_undecryptable": true, "poll_vote_unknown_option": true}
 
 func skippableCapture(err error) bool { return err != nil && skippedCaptureCodes[err.Error()] }
 

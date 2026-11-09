@@ -1209,6 +1209,105 @@ def test_group_changes_wake_no_default_subscription_but_a_joined_group_and_other
     assert woke==[f'group_{WA_GROUP}_1700000500_joined_group','false_'+WA_GROUP+'_NOTE','false_'+WA_GROUP+'_TEXT']
 
 
+WA_CALLER='444444@c.us'
+
+
+def call_capture(call_id,at,outcome,*,chat=WA_CALLER,media='audio',ended=None,origin='live'):
+    """The whatsmeow call entry (calls.go callEnvelope), synthetic only."""
+    capture=wa_capture('call_'+call_id,at,kind='call',actor=WA_CALLER if chat.endswith('@g.us') else chat,chat=chat,origin=origin)
+    capture['event']['call']={'call_id':call_id,'direction':'incoming','media':media,'group':chat.endswith('@g.us'),
+        'started_at':at,'ended_at':ended,'outcome':outcome}
+    return capture
+
+
+def wa_call(store,provider_id,chat=WA_CALLER):
+    mid=stable_id('msg','wa-groups',chat,provider_id)
+    with store.pool.connection() as c:
+        return (c.execute('SELECT count(*) AS n,min(sender) AS sender FROM messages WHERE id=%s',(mid,)).fetchone(),
+            c.execute('SELECT metadata FROM message_metadata WHERE message=%s',(mid,)).fetchone(),
+            [(e['kind'],e['origin']) for e in c.execute('SELECT kind,origin FROM events WHERE message=%s ORDER BY id',(mid,))])
+
+
+# spec: ANYM-923
+def test_a_whatsapp_call_is_one_service_row_in_the_callers_chat_with_one_live_event(wa_groups):
+    state,store,key=wa_groups
+    capture=call_capture('CALL1',1700001000,'missed',ended=1700001030)
+    assert state.apply(capture)['outcome']=='created'
+    # A redelivered or replayed capture is a duplicate, never a second row or event.
+    assert state.apply(capture)['outcome']=='duplicate'
+    row,metadata,events=wa_call(store,'call_CALL1')
+    assert row['n']==1 and row['sender']==WA_CALLER and events==[('message.created','live')]
+    stored=metadata['metadata']
+    assert stored['message_kind']=='call' and stored['is_service'] is True
+    assert stored['call']=={'call_id':'CALL1','direction':'incoming','media':'audio','group':False,
+        'started_at':'2023-11-14T22:30:00+00:00','ended_at':'2023-11-14T22:30:30+00:00','outcome':'missed'}
+    # A group call sits in the group with its caller as sender; an unknown end and media stay null.
+    assert state.apply(call_capture('CALLG',1700001100,'unknown',chat=WA_GROUP,media=None))['outcome']=='created'
+    row,metadata,_=wa_call(store,'call_CALLG',WA_GROUP)
+    assert row['sender']==WA_CALLER and metadata['metadata']['call']['group'] is True
+    assert metadata['metadata']['call']['ended_at'] is None and metadata['metadata']['call']['media'] is None
+    chat_id=stable_id('chat','wa-groups',WA_CALLER)
+    # The conversation read hides it like other service rows unless include_system is set.
+    assert store.get_messages(key,chat_id,view='conversation')['items']==[]
+    shown=store.get_messages(key,chat_id,view='conversation',include_system=True)['items']
+    assert [m['message_kind'] for m in shown]==['call']
+
+
+# spec: ANYM-923
+def test_a_call_block_the_archive_cannot_accept_is_refused_before_storage():
+    from messaging_service.adapters import whatsapp_message
+    for bad in ({'outcome':'declined'},{'direction':'outgoing'},{'media':'screen'},{'group':'no'},{'started_at':'x'},
+            {'call_id':''},{'extra':1}):
+        capture=call_capture('CALLBAD',1700001000,'missed')
+        capture['event']['call'].update(bad)
+        with pytest.raises(ValueError):whatsapp_message('wa-groups',capture['event'])
+
+
+# spec: ANYM-923
+def test_search_counts_missed_calls_per_person_by_kind_and_outcome(wa_groups):
+    from messaging_service.store import APIError
+    state,store,key=wa_groups
+    for call_id,at,outcome in [('M1',1700002000,'missed'),('M2',1700002100,'missed'),('A1',1700002200,'answered'),
+            ('R1',1700002300,'rejected')]:
+        state.apply(call_capture(call_id,at,outcome,ended=at+30))
+    state.apply(call_capture('OTHER',1700002400,'missed',chat='555555@c.us'))
+    state.apply(wa_capture('false_'+WA_CALLER+'_TEXT',1700002500,body='перезвони',chat=WA_CALLER,actor=WA_CALLER))
+    missed=store.search(key,sender=WA_CALLER,message_kinds=['call'],call_outcome='missed')['items']
+    assert sorted(m['id'] for m in missed)==sorted(stable_id('msg','wa-groups',WA_CALLER,'call_'+i) for i in ('M1','M2'))
+    # call_outcome alone narrows to calls; message_kinds alone lists every kind named.
+    assert len(store.search(key,call_outcome='missed')['items'])==3
+    assert len(store.search(key,sender=WA_CALLER,message_kinds=['call'])['items'])==4
+    assert len(store.search(key,sender=WA_CALLER,message_kinds=['call','text'])['items'])==5
+    for bad in (dict(call_outcome='declined'),dict(message_kinds=['video_call']),dict(message_kinds=['text'],call_outcome='missed'),
+            dict(message_kinds='call')):
+        with pytest.raises(APIError) as error:store.search(key,**bad)
+        assert error.value.code=='invalid_filter'
+
+
+# spec: ANYM-923
+def test_a_missed_call_wakes_only_subscriptions_that_list_call(wa_groups):
+    from messaging_service.subscriptions import match_subscriptions
+    state,store,key=wa_groups
+    state.apply(wa_capture('false_'+WA_CALLER+'_HELLO',1700003000,body='привет',chat=WA_CALLER,actor=WA_CALLER))
+    chat_id=stable_id('chat','wa-groups',WA_CALLER)
+    default=store.create_subscription(key,[chat_id])['subscription_id']
+    calls=store.create_subscription(key,[chat_id],kinds=['call'])['subscription_id']
+    both=store.create_subscription(key,[chat_id],kinds=['message.created','call'])['subscription_id']
+    state.apply(call_capture('MISSED',1700003100,'missed',ended=1700003130))
+    state.apply(call_capture('ANSWERED',1700003200,'answered',ended=1700003300))
+    state.apply(wa_capture('false_'+WA_CALLER+'_TEXT',1700003400,body='перезвони',chat=WA_CALLER,actor=WA_CALLER))
+    match_subscriptions(store)
+    def woke(sid):
+        items=store.get_subscription_events(key,sid,limit=100)['items']
+        with store.pool.connection() as c:
+            return [c.execute('SELECT m.provider_id FROM events e JOIN messages m ON m.id=e.message WHERE e.id=%s',
+                (item['event_id'],)).fetchone()['provider_id'] for item in items]
+    text='false_'+WA_CALLER+'_TEXT'
+    assert woke(default)==[text]
+    assert woke(calls)==['call_MISSED']
+    assert woke(both)==['call_MISSED',text]
+
+
 WA_POLL='false_'+WA_GROUP+'_POLL1_444444@c.us'
 
 
