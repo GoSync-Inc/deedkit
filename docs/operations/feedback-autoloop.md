@@ -34,9 +34,12 @@ The loop builds and merges a card only when all hold:
   PR's exact head, renames and deletions included, hits neither the change-path signal grep nor
   the autoloop protected paths (both in docs/operations/review-protocol.md; that list is the one
   list, used as written);
-- required checks green, `Autoloop:` and `Spec:` lines present, and the controller's own Astra
-  review of that exact head and card text is APPROVE with no blocking or major finding (the
-  worker's review rounds do not count). Build workers never merge; the controller puts that head
+- required checks green, `Autoloop:` and `Spec:` lines present, and, when the diff touches a
+  review path (`REVIEW_PATHS` in `scripts/autoloop.py`: send, call and ACK code, collector and
+  provider-session code, keys, access policy, role SQL; owner review cut 11-09, D56), the
+  controller's own Astra review of that exact head and card text is APPROVE with no blocking or
+  major finding (the worker's review rounds do not count). Any other clean head is approved as it
+  stands, bound to that head and card text. Build workers never merge; the controller puts that head
   only into the merge queue.
 
 Anything else stays in the orchestrator queue; the item's note or the daily report says why.
@@ -156,7 +159,9 @@ writes no item note: its reason is in the orchestrator's queue of the daily repo
 worker and merged with no step of yours only when all of this holds at the PR's exact head: the
 change path is AUTO or AUTO+review, the real diff touches no change-path signal, protected path,
 existing test or path outside what the card reserved, the card text is unchanged, the
-controller's own Astra review of that head approves it, and both required checks are green. Then
+controller's own Astra review of that head approves it where the diff touches a review path
+(sends, calls, collector sessions, keys or access; none elsewhere, owner review cut 11-09), and
+both required checks are green. Then
 the PR goes into the merge queue and autodeploy ships it; nothing is enabled after deploy.
 Anything else is parked: it never merges and shows in the orchestrator's queue of the daily
 report. An OWNER path, grant or other owner item found while building ends the build with
@@ -213,11 +218,12 @@ someone else armed it, or when any check fails:
 - every changed name is inside the build's reserved paths and outside every other live build's
   reservation and every other open PR's files.
 
-Then the controller reviews the head itself. Each attempt (a new head, a changed card text, a
+Then, only when the diff touches a review path (`REVIEW_PATHS`), the controller reviews the head
+itself; any other clean head is approved at once, bound to that head and card digest. Each attempt (a new head, a changed card text, a
 restart) has its own ID and files under `~/.deedkit/autoloop/reviews/<intent>/`; a detached
 `autoloop.py review-run` checks that GitHub's PR ref is exactly that head and runs
-`review-codex.sh astra` on a clean checkout of it with the controller's own task (the card text as
-data). Its result counts only when head, attempt and card digest match the current attempt, so a
+`review-codex.sh astra --risk <fixed reason>` on a clean checkout of it with the controller's own
+task (the card text as data). Its result counts only when head, attempt and card digest match the current attempt, so a
 review that ends after a push or a card change approves nothing. Over the Codex line or a parallel
 review: a new attempt later. Round cap, no verdict, CHANGES REQUIRED, a blocking or major finding,
 or no result after 75 minutes: parked.
@@ -284,7 +290,7 @@ directory, Docker socket or login directory); the one mount is a read-only contr
   launcher on a child process (docker, gh, the attached build client) has a time bound; a child
   past it is killed and reaped for at most 5 s. There is no Codex in the image: the
   worker's own review rounds run as an Opus subagent (its prompt says so), and the controller's
-  Astra review of the head on the host (above) stays the review of record.
+  Astra review of a review-path head on the host (above) stays the review of record.
 - **Gate and ends.** Inside the container `autoloop.py gate|finish|decline|large` work through the
   control directory and an outbox file inside the container: `gate` reads the gate file, which
   the launcher rewrites from the host state every 30 s; a stop there (`PAUSE`, a held card, a
