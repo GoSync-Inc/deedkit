@@ -670,6 +670,108 @@ func TestNativeHistoryPollAndItsVotesMatchTheLiveEntriesWithoutDuplicates(t *tes
 	}
 }
 
+// spec: ANYM-921
+func TestNativeMalformedEncryptedPollVoteNeverStopsLiveOrHistoryCapture(t *testing.T) {
+	p, _, poll, _ := pollProvider(t)
+	key := &waCommon.MessageKey{RemoteJID: proto.String(groupJID.String()), ID: proto.String("POLL1"), Participant: proto.String("444444@s.whatsapp.net")}
+	bad := func(id string, vote *waE2E.PollEncValue) *waE2E.Message {
+		return &waE2E.Message{PollUpdateMessage: &waE2E.PollUpdateMessage{PollCreationMessageKey: key, Vote: vote, SenderTimestampMS: proto.Int64(1700000100000)}}
+	}
+	// The poll and its secret are present: a short nonce or no vote reached GCM open (Astra r1 B1).
+	for i, vote := range []*waE2E.PollEncValue{nil, {EncIV: []byte{1, 2, 3}, EncPayload: bytes.Repeat([]byte{9}, 32)}, {EncIV: bytes.Repeat([]byte{1}, 12)}} {
+		e := groupFixture(fmt.Sprintf("BADVOTE%d", i), bad("", vote))
+		e.Info.Chat, e.Info.Sender = groupJID, member("555555")
+		if err := p.handleMessage(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	history := &waHistorySync.HistorySync{Conversations: []*waHistorySync.Conversation{{ID: proto.String(groupJID.String()), Messages: []*waHistorySync.HistorySyncMsg{
+		{Message: &waWeb.WebMessageInfo{Key: &waCommon.MessageKey{RemoteJID: proto.String(groupJID.String()), ID: proto.String("BADVOTE9")}, Participant: proto.String("555555@s.whatsapp.net"),
+			MessageTimestamp: proto.Uint64(1700000100), Message: bad("", &waE2E.PollEncValue{EncIV: []byte{1}, EncPayload: bytes.Repeat([]byte{9}, 32)})}},
+		{Message: &waWeb.WebMessageInfo{Key: &waCommon.MessageKey{RemoteJID: proto.String(groupJID.String()), ID: proto.String("AFTER")}, Participant: proto.String("555555@s.whatsapp.net"),
+			MessageTimestamp: proto.Uint64(1700000101), Message: &waE2E.Message{Conversation: proto.String("synthetic after")}}},
+	}}}}
+	if err := p.captureHistory(history); err != nil {
+		t.Fatal(err)
+	}
+	if counts := skipCounts(t, p.Capture); counts["poll_vote_undecryptable"] != 4 || len(counts) != 1 {
+		t.Fatal(counts)
+	}
+	var bodies []string
+	for _, entry := range journalKinds(t, p.Capture) {
+		if event, ok := entry["event"].(map[string]any); ok {
+			bodies = append(bodies, event["messageType"].(string)+":"+event["body"].(string))
+		}
+	}
+	if strings.Join(bodies, ",") != "poll_creation:"+poll.Message.GetPollCreationMessageV3().GetName()+",chat:synthetic after" {
+		t.Fatal("capture after a malformed vote", bodies)
+	}
+}
+
+// spec: ANYM-921
+func TestNativePollVoteFindsItsPollUnderTheChatsOtherIdentity(t *testing.T) {
+	p := skipProvider(t)
+	owner := p.Capture.Owner
+	secrets := pollSecrets{}
+	p.Client = nativeClient(&store.Device{ID: &owner, MsgSecrets: secrets})
+	pn, lid := types.NewJID("444444", types.DefaultUserServer), types.NewJID("99990001", types.HiddenUserServer)
+	p.Capture.Alias = func(j types.JID) types.JID {
+		switch j {
+		case pn:
+			return lid
+		case lid:
+			return pn
+		}
+		return types.EmptyJID
+	}
+	// The owner's poll is journaled under the phone-number chat ...
+	poll := &events.Message{Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: pn, Sender: owner, IsFromMe: true}, ID: "DMPOLL", Timestamp: time.Unix(1700000000, 0)},
+		Message: &waE2E.Message{PollCreationMessageV3: &waE2E.PollCreationMessage{Name: proto.String("Когда?"), Options: []*waE2E.PollCreationMessage_Option{{OptionName: proto.String("Утром")}, {OptionName: proto.String("Вечером")}}}}}
+	// ... an unrelated message under the LID chat makes that chat known too (Astra r1 M1).
+	other := &events.Message{Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: lid, Sender: lid}, ID: "HELLO", Timestamp: time.Unix(1700000050, 0)}, Message: &waE2E.Message{Conversation: proto.String("synthetic")}}
+	for _, e := range []*events.Message{poll, other} {
+		if err := p.handleMessage(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	secret := bytes.Repeat([]byte{5}, 32)
+	_ = secrets.PutMessageSecret(context.Background(), lid, owner, "DMPOLL", secret)
+	voter := nativeClient(&store.Device{ID: &lid, MsgSecrets: secrets})
+	update, err := voter.EncryptPollVote(context.Background(), &types.MessageInfo{MessageSource: types.MessageSource{Chat: lid, Sender: owner}, ID: "DMPOLL"}, &waE2E.PollVoteMessage{SelectedOptions: whatsmeow.HashPollOptions([]string{"Вечером"})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	update.PollCreationMessageKey.RemoteJID = proto.String(owner.String()) // the voter's view: the poll's author is remote
+	vote := &events.Message{Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: lid, Sender: lid}, ID: "DMVOTE", Timestamp: time.Unix(1700000100, 0)}, Message: &waE2E.Message{PollUpdateMessage: update}}
+	if err := p.handleMessage(vote); err != nil {
+		t.Fatal(err)
+	}
+	entries := journalKinds(t, p.Capture)
+	last := entries[len(entries)-1]
+	if last["kind"] != "poll_vote" || last["poll_provider_id"] != "true_444444@c.us_DMPOLL" || last["chat"] != "444444@c.us" || fmt.Sprint(last["option_indices"]) != "[1]" {
+		t.Fatalf("vote under the LID chat: %#v %v", last, skipCounts(t, p.Capture))
+	}
+}
+
+// spec: ANYM-921
+func TestNativePollVoteMatchesItsCreatorWhenAnotherMemberUsedTheSameMessageID(t *testing.T) {
+	p, voter, poll, _ := pollProvider(t)
+	// Another member's later message with the same provider ID (Astra r1 M2).
+	same := groupFixture("POLL1", &waE2E.Message{Conversation: proto.String("synthetic same id")})
+	same.Info.Chat, same.Info.Sender, same.Info.Timestamp = groupJID, member("777777"), time.Unix(1700000050, 0)
+	if err := p.handleMessage(same); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.handleMessage(pollVote(t, voter, poll, "VOTE1", 1700000100000, pollOptionHash("Да"))); err != nil {
+		t.Fatal(err)
+	}
+	entries := journalKinds(t, p.Capture)
+	last := entries[len(entries)-1]
+	if last["kind"] != "poll_vote" || last["poll_provider_id"] != "false_120363000000000009@g.us_POLL1_444444@c.us" || fmt.Sprint(last["option_indices"]) != "[0]" {
+		t.Fatalf("vote matched another member's message: %#v %v", last, skipCounts(t, p.Capture))
+	}
+}
+
 // spec: ANYM-471
 func TestNativeBusinessMessagesKeepTheirVisibleText(t *testing.T) {
 	interactive := &waE2E.InteractiveMessage{Header: &waE2E.InteractiveMessage_Header{Title: proto.String("Invoice 42")}, Body: &waE2E.InteractiveMessage_Body{Text: proto.String("Your invoice is ready.")}, Footer: &waE2E.InteractiveMessage_Footer{Text: proto.String("Reply STOP")}}

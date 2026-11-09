@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"slices"
 	"time"
 
@@ -85,6 +87,8 @@ func pollOptionIndices(v *waE2E.PollCreationMessage, selected [][]byte) (indices
 // pollTarget finds the journaled poll a vote names: the chat it is kept under,
 // its capture ID and its creation message. The key's fromMe is the voter's
 // view (whatsmeow getOrigSenderFromKey): true means the voter created the poll.
+// The capture ID is matched exactly, creator included (a group ID carries the
+// sender), in the observed chat and creator form or their verified PN/LID alias.
 func (s *CaptureStore) pollTarget(e *events.Message, key *waCommon.MessageKey) (string, string, *waE2E.PollCreationMessage, error) {
 	if key.GetID() == "" {
 		return "", "", nil, errPollVote
@@ -101,29 +105,58 @@ func (s *CaptureStore) pollTarget(e *events.Message, key *waCommon.MessageKey) (
 		}
 		creator = j
 	}
-	// A journal read failure stays a failure; only a missing poll is skipped.
-	chat, err := s.readChat(e.Info.Chat)
-	if err != nil {
-		return "", "", nil, err
+	fromMe := ownedIdentity(creator, s.Owner, s.OwnerLID)
+	creators := s.pollIdentities(creator)
+	if fromMe {
+		creators = s.pollIdentities(append(creators, s.Owner, s.OwnerLID)...)
 	}
-	id := ""
-	if chat != "" {
-		if id, err = s.capturedMessage(chat, key.GetID(), ownedIdentity(creator, s.Owner, s.OwnerLID)); err != nil {
-			return "", "", nil, err
+	for _, chat := range s.pollIdentities(e.Info.Chat) {
+		candidates := []string{fmt.Sprintf("%t_%s_%s", fromMe, LegacyChatID(chat), key.GetID())}
+		if e.Info.IsGroup {
+			candidates = candidates[:0]
+			for _, c := range creators {
+				candidates = append(candidates, fmt.Sprintf("%t_%s_%s_%s", fromMe, LegacyChatID(chat), key.GetID(), LegacyChatID(c)))
+			}
+		}
+		for _, id := range candidates {
+			// A journal read failure stays a failure; only a missing poll is skipped.
+			var one int
+			err := s.db.QueryRow("SELECT 1 FROM capture WHERE chat=? AND message_id=? AND length(raw)>0 LIMIT 1", LegacyChatID(chat), id).Scan(&one)
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				return "", "", nil, err
+			}
+			m, err := s.Get(LegacyChatID(chat), id)
+			if err != nil {
+				return "", "", nil, errPollVote
+			}
+			if poll := pollCreation(unwrap(m).Message); poll != nil {
+				return LegacyChatID(chat), id, poll, nil
+			}
+			return "", "", nil, errPollVote
 		}
 	}
-	if id == "" {
-		return "", "", nil, errPollVote
+	return "", "", nil, errPollVote
+}
+
+// pollIdentities is each JID and its verified PN/LID alias, without devices,
+// empty entries or repeats, in the given order.
+func (s *CaptureStore) pollIdentities(ids ...types.JID) []types.JID {
+	out := []types.JID{}
+	add := func(j types.JID) {
+		if j = j.ToNonAD(); !j.IsEmpty() && !slices.Contains(out, j) {
+			out = append(out, j)
+		}
 	}
-	m, err := s.Get(chat, id)
-	if err != nil {
-		return "", "", nil, errPollVote
+	for _, j := range ids {
+		add(j)
+		if s.Alias != nil && !j.IsEmpty() {
+			add(s.Alias(j.ToNonAD()))
+		}
 	}
-	poll := pollCreation(unwrap(m).Message)
-	if poll == nil {
-		return "", "", nil, errPollVote
-	}
-	return chat, id, poll, nil
+	return out
 }
 
 // pollVoteEnvelope is the journal entry of one vote. The newest vote of a voter
@@ -190,14 +223,26 @@ func (p *Provider) pollVote(e *events.Message, origin string) error {
 	if err != nil {
 		return err
 	}
-	if p.Client == nil {
+	// whatsmeow's GCM open panics on a nonce that is not 12 bytes; such a vote is
+	// refused before decryption, and any other panic there is a skipped vote, so
+	// the history worker and the handler never stop on one (Astra r1 B1).
+	if enc := update.GetVote(); p.Client == nil || enc == nil || len(enc.GetEncIV()) != 12 || len(enc.GetEncPayload()) == 0 {
 		return errPollVote
 	}
-	vote, err := p.Client.DecryptPollVote(context.Background(), e)
+	vote, err := decryptPollVote(p.Client, e)
 	if err != nil {
 		return errPollVote
 	}
 	return p.Capture.putPollVote(chat, pollID, LegacyMessageID(e), poll, e.Info.Sender, e.Info.IsFromMe, vote.GetSelectedOptions(), pollVoteTime(update.GetSenderTimestampMS(), e.Info.Timestamp), origin)
+}
+
+func decryptPollVote(client *whatsmeow.Client, e *events.Message) (vote *waE2E.PollVoteMessage, err error) {
+	defer func() {
+		if recover() != nil {
+			vote, err = nil, errPollVote
+		}
+	}()
+	return client.DecryptPollVote(context.Background(), e)
 }
 
 // captureHistoryPollVotes journals the votes a history sync carries on a poll

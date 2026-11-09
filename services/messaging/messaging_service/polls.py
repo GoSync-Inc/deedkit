@@ -121,15 +121,21 @@ def attach(c,rows):
                 JOIN messages m ON m.id=r.message AND m.account=r.account WHERE r.message=ANY(%s)''',(ids,)):
             counts.setdefault(r['message'],{})[r['option_index']]=r['voters']
             as_of[r['message']]=max(as_of.get(r['message'],r['updated_at']),r['updated_at'])
-        for r in c.execute('''SELECT v.message,v.option_index,v.voter,v.from_me,nullif(sp.display_name,'') AS name
+        # Totals and the owner's choice are aggregates; at most 51 people per option leave the database (Astra r1 m1).
+        for r in c.execute('''SELECT v.message,count(DISTINCT v.voter) AS total,
+                coalesce(array_agg(DISTINCT v.option_index) FILTER (WHERE v.from_me),'{}') AS chosen
                 FROM poll_voters v JOIN messages m ON m.id=v.message AND m.account=v.account
-                LEFT JOIN sender_profiles sp ON sp.account=v.account AND sp.chat=m.chat AND sp.sender=v.voter
+                WHERE v.message=ANY(%s) GROUP BY v.message''',(ids,)):
+            voters[r['message']]=r['total'];chosen[r['message']]=r['chosen']
+        for r in c.execute('''SELECT x.message,x.option_index,x.voter,nullif(sp.display_name,'') AS name FROM (
+                SELECT v.message,v.option_index,v.voter,v.account,m.chat,row_number() OVER (PARTITION BY v.message,v.option_index
+                  ORDER BY v.updated_at DESC,v.voter) AS n
+                FROM poll_voters v JOIN messages m ON m.id=v.message AND m.account=v.account WHERE v.message=ANY(%s)) x
+                LEFT JOIN sender_profiles sp ON sp.account=x.account AND sp.chat=x.chat AND sp.sender=x.voter
                   AND EXISTS(SELECT 1 FROM messages source WHERE source.id=sp.source_message
-                    AND source.account=v.account AND source.chat=m.chat AND source.sender=v.voter AND NOT source.deleted)
-                WHERE v.message=ANY(%s) ORDER BY v.updated_at DESC,v.voter''',(ids,)):
+                    AND source.account=x.account AND source.chat=x.chat AND source.sender=x.voter AND NOT source.deleted)
+                WHERE x.n<=%s ORDER BY x.message,x.option_index,x.n''',(ids,MAX_VOTED_BY+1)):
             people.setdefault(r['message'],{}).setdefault(r['option_index'],[]).append({'sender':r['voter'],'name':r['name']})
-            voters.setdefault(r['message'],set()).add(r['voter'])
-            if r['from_me']:chosen.setdefault(r['message'],set()).add(r['option_index'])
     for mid,row in polls.items():
         block=row['poll'];options=[]
         for option in block.get('options',[]):
@@ -138,6 +144,6 @@ def attach(c,rows):
                 'voted_by':listed[:MAX_VOTED_BY],'voted_by_truncated':len(listed)>MAX_VOTED_BY})
         at=as_of.get(mid)
         row['poll']={'question':block.get('question'),'options':options,'selectable_count':block.get('selectable_count'),
-            'truncated':block.get('truncated',False),'total_voters':len(voters.get(mid,())),
+            'truncated':block.get('truncated',False),'total_voters':voters.get(mid,0),
             'results_as_of':at.isoformat() if at else None,'chosen':sorted(chosen.get(mid,()))}
     return rows

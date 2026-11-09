@@ -1,13 +1,17 @@
--- rollout: expand
--- Risk tier: non-critical (three new tables; no existing row, column or grant changes; grants only on these tables
--- in the role files; docs/operations/production.md "Migration risk tiers").
+-- rollout: manual
+-- Risk tier: non-critical (three new tables with row-level security and a policy on each; no existing row, column
+-- or grant changes; grants only on these tables in the role files; docs/operations/production.md "Migration risk
+-- tiers"). Manual only because the expand form names no row-level security or policy statement: released by hand
+-- at once (production.md "Migration releases" item 4), no backup needed.
 -- ANYM-921 (the tables of ANYM-920): a poll message's current results and who chose which option.
 -- poll_results: one row per option of the poll with its voter count. poll_voters: one row per voter and chosen
 -- option. poll_votes: the newest vote time of each voter, kept for a retracted (empty) vote too, so an older vote
 -- delivered late never wins. Voter IDs are the archive's sender IDs; no message text. A schema-81 runtime never
--- names these tables; purge (message_purge.py) deletes a purged poll's rows. A bound collector writes only its own
--- account's rows (the CHECK calls 037's binding function, as 057 does); reads keep a row only when its account is
--- the poll message's account.
+-- names these tables; purge (message_purge.py) deletes a purged poll's rows. A bound collector (037's binding
+-- function, for the current role and the login, as 057's CHECK) sees, updates and deletes only its own account's rows
+-- and writes a row only for a message of that account: row-level security on each new table, one policy for every
+-- role (USING: the old row, WITH CHECK: the new row). An unbound role (gateway, purge, a shared collector) passes the
+-- policy unchanged; reads also keep a row only when its account is the poll message's account.
 SET LOCAL lock_timeout='2s';
 CREATE TABLE IF NOT EXISTS poll_results (
  account text NOT NULL REFERENCES accounts(id),
@@ -39,3 +43,27 @@ CREATE TABLE IF NOT EXISTS poll_votes (
  CHECK(account=coalesce(public.collector_bound_account(current_user::text),account)
   AND account=coalesce(public.collector_bound_account(session_user::text),account))
 );
+ALTER TABLE poll_results ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS poll_results_account ON poll_results;
+CREATE POLICY poll_results_account ON poll_results
+ USING (account=coalesce(public.collector_bound_account(current_user::text),account)
+  AND account=coalesce(public.collector_bound_account(session_user::text),account))
+ WITH CHECK (account=coalesce(public.collector_bound_account(current_user::text),account)
+  AND account=coalesce(public.collector_bound_account(session_user::text),account)
+  AND EXISTS(SELECT FROM public.messages m WHERE m.id=poll_results.message AND m.account=poll_results.account));
+ALTER TABLE poll_voters ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS poll_voters_account ON poll_voters;
+CREATE POLICY poll_voters_account ON poll_voters
+ USING (account=coalesce(public.collector_bound_account(current_user::text),account)
+  AND account=coalesce(public.collector_bound_account(session_user::text),account))
+ WITH CHECK (account=coalesce(public.collector_bound_account(current_user::text),account)
+  AND account=coalesce(public.collector_bound_account(session_user::text),account)
+  AND EXISTS(SELECT FROM public.messages m WHERE m.id=poll_voters.message AND m.account=poll_voters.account));
+ALTER TABLE poll_votes ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS poll_votes_account ON poll_votes;
+CREATE POLICY poll_votes_account ON poll_votes
+ USING (account=coalesce(public.collector_bound_account(current_user::text),account)
+  AND account=coalesce(public.collector_bound_account(session_user::text),account))
+ WITH CHECK (account=coalesce(public.collector_bound_account(current_user::text),account)
+  AND account=coalesce(public.collector_bound_account(session_user::text),account)
+  AND EXISTS(SELECT FROM public.messages m WHERE m.id=poll_votes.message AND m.account=poll_votes.account));
