@@ -7,8 +7,9 @@
 -- ANYM-920: a Telegram poll message's provider state beside 083's poll_results and poll_voters. Telegram pushes a
 -- poll's counts by its poll ID and names options by opaque bytes, so each archived poll keeps the poll ID (indexed),
 -- the option keys in option order (hex), Telegram's own total_voters, the owner's chosen options, the observation
--- time of the stored counts (an older observation never wins), when the public voter list was last read, and the
--- display names Telegram returned with that list (bounded member-set text, no message text). A schema-83 runtime
+-- time of the stored counts (an older observation never wins), when the public voter list was last read, whether
+-- that read was complete (Telegram returned every vote within the 200 cap), and the display names Telegram returned
+-- with that list (bounded member-set text, no message text). A schema-83 runtime
 -- never names this table; purge (message_purge.py) deletes a purged poll's row. A bound collector sees, updates and
 -- writes only its own account's rows, for a message of that account, as 083.
 SET LOCAL lock_timeout='2s';
@@ -22,6 +23,7 @@ CREATE TABLE IF NOT EXISTS telegram_polls (
  chosen smallint[] NOT NULL DEFAULT '{}' CHECK(cardinality(chosen)<=12),
  results_at timestamptz NOT NULL,
  votes_read_at timestamptz,
+ voters_complete boolean NOT NULL DEFAULT false,
  voter_names jsonb NOT NULL DEFAULT '{}' CHECK(jsonb_typeof(voter_names)='object'),
  CHECK(account=coalesce(public.collector_bound_account(current_user::text),account)
   AND account=coalesce(public.collector_bound_account(session_user::text),account))

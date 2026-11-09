@@ -36,6 +36,8 @@ TELEGRAM_CHAT=re.compile(r'-?[0-9]{1,20}')
 # ANYM-920: the public voter list is read at most once per poll per 10 minutes, for polls younger than 30 days.
 VOTES_READ_EVERY=timedelta(minutes=10)
 VOTES_MAX_AGE=timedelta(days=30)
+# A message snapshot's counts replace stored ones only when this much newer (Astra r1 M2; a capture slot waits 30 s).
+SNAPSHOT_MARGIN=timedelta(minutes=2)
 MAX_POLL_VOTES=200
 MAX_VOTER_NAME=512
 
@@ -171,14 +173,15 @@ def split_capture_results(e):
     return e,{**results,'provider_poll_id':poll['provider_poll_id'],'public_voters':poll['public_voters']}
 
 
-def _apply_results(c,account,mid,*,voters,total,chosen,minimal,at,origin):
-    """Replace one archived Telegram poll's counts; an observation older than the stored one changes nothing. A change
-    of an option's count or of Telegram's total commits one `poll.updated` event."""
+def _apply_results(c,account,mid,*,voters,total,chosen,minimal,at,origin,margin=timedelta(0)):
+    """Replace one archived Telegram poll's counts; an observation older than the stored one (by `margin` for a
+    message snapshot) changes nothing. A change of an option's count or of Telegram's total commits one
+    `poll.updated` event."""
     from .store import Store
     row=c.execute('''SELECT results_at,total_voters,chosen FROM telegram_polls WHERE message=%s AND account=%s
         FOR UPDATE''',(mid,account)).fetchone()
     if row is None:return 'poll_unknown'
-    if row['results_at']>=at:return 'stale'
+    if row['results_at']+margin>=at:return 'stale'
     total=row['total_voters'] if total is None else total
     chosen=sorted(row['chosen']) if minimal else chosen
     c.execute('UPDATE telegram_polls SET results_at=%s,total_voters=%s,chosen=%s WHERE message=%s AND account=%s',
@@ -204,7 +207,13 @@ def _store_counts(c,account,mid,voters,at):
 def apply_capture_results(store,e,mid,results,lease):
     """A captured Telegram poll's results, after its message committed (archive.ingest). The first capture keeps the
     poll's ID, option keys and counts without an event (the message's own event announced it); a later one replaces
-    the counts. Never fails the message: an error is logged by class and the next observation repairs the counts."""
+    the counts only when it is more than SNAPSHOT_MARGIN newer than the stored observation: a snapshot is stamped when
+    normalized, so one that waited for a capture slot or behind its history page never undoes a newer pushed update
+    (Astra r1 M2). A database outage or a lost lease raises, so the capture stays journaled and its replay (a
+    duplicate receipt) applies the results (Astra r1 B2); any other error is logged by class and never fails the
+    message."""
+    import psycopg
+    from psycopg_pool import PoolTimeout
     from .archive import Archive
     account=e['account']
     try:
@@ -222,7 +231,12 @@ def apply_capture_results(store,e,mid,results,lease):
                 if results['voters'] is not None:_store_counts(c,account,mid,results['voters'],at)
                 return 'poll_recorded'
             return _apply_results(c,account,mid,voters=results['voters'],total=results['total_voters'],
-                chosen=results['chosen'],minimal=results['min'],at=at,origin=e['origin'])
+                chosen=results['chosen'],minimal=results['min'],at=at,origin=e['origin'],margin=SNAPSHOT_MARGIN)
+    except (psycopg.OperationalError,PoolTimeout):raise
+    except RuntimeError as exc:
+        if str(exc)=='collector_lease_lost':raise
+        logging.getLogger(__name__).warning('poll_results_skipped: %s',type(exc).__name__)
+        return 'poll_results_skipped'
     except Exception as exc:
         logging.getLogger(__name__).warning('poll_results_skipped: %s',type(exc).__name__)
         return 'poll_results_skipped'
@@ -289,7 +303,7 @@ def apply_telegram_update(state,capture):
         return {'outcome':outcome}
 
 
-VOTES_KEYS=frozenset(('kind','account','chat','message_id','votes','observed_at'))
+VOTES_KEYS=frozenset(('kind','account','chat','message_id','votes','complete','observed_at'))
 
 
 def validate_telegram_votes(value):
@@ -299,7 +313,7 @@ def validate_telegram_votes(value):
     if (not isinstance(value,dict) or set(value)!=VOTES_KEYS or not isinstance(value['account'],str)
             or not ACCOUNT_RE.fullmatch(value['account']) or not isinstance(value['chat'],str)
             or not TELEGRAM_CHAT.fullmatch(value['chat']) or type(value['message_id']) is not int
-            or not 0<value['message_id']<2**63
+            or not 0<value['message_id']<2**63 or type(value['complete']) is not bool
             or votes is not None and (not isinstance(votes,list) or len(votes)>MAX_POLL_VOTES or any(
                 not isinstance(v,dict) or set(v)!={'voter','name','options','from_me'} or not isinstance(v['voter'],str)
                 or not TELEGRAM_CHAT.fullmatch(v['voter']) or not _text(v['name'],MAX_VOTER_NAME,empty=True)
@@ -313,48 +327,62 @@ def validate_telegram_votes(value):
 
 
 def apply_telegram_votes(state,capture):
-    """Replace a public poll's voters with one complete read; an older read changes nothing. Only a poll Telegram marks
-    public has voters."""
+    """Replace a public poll's voters with one read, on every archived copy of that poll in a chat the policy still
+    allows (a forwarded poll keeps its ID; Astra r1 M3); an older read changes nothing. `complete` says Telegram
+    returned every vote within the cap (Astra r1 M4). Only a poll Telegram marks public has voters."""
     account=state.account
     with state.archive.store.pool.connection() as c:
         c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('archive:'+account,))
         policy=_telegram_policy(state,c)
         if not state.allows(policy,capture['chat']):return {'outcome':'excluded'}
-        row=c.execute('''SELECT t.message,t.public_voters,t.votes_read_at,cardinality(t.option_keys) AS options
-            FROM telegram_polls t JOIN messages m ON m.id=t.message AND m.account=t.account
-            JOIN chats ch ON ch.id=m.chat AND ch.account=m.account
-            WHERE t.account=%s AND ch.provider_chat=%s AND m.provider_id=%s AND NOT m.deleted AND NOT m.purged
-            FOR UPDATE OF t''',(account,capture['chat'],str(capture['message_id']))).fetchone()
-        if not row or not row['public_voters']:return {'outcome':'poll_unknown'}
+        source=c.execute('''SELECT t.provider_poll_id,t.public_voters FROM telegram_polls t
+            JOIN messages m ON m.id=t.message AND m.account=t.account JOIN chats ch ON ch.id=m.chat AND ch.account=m.account
+            WHERE t.account=%s AND ch.provider_chat=%s AND m.provider_id=%s AND NOT m.deleted AND NOT m.purged''',
+            (account,capture['chat'],str(capture['message_id']))).fetchone()
+        if not source or not source['public_voters']:return {'outcome':'poll_unknown'}
+        copies=[r for r in c.execute('''SELECT t.message,t.votes_read_at,cardinality(t.option_keys) AS options,
+                ch.provider_chat FROM telegram_polls t JOIN messages m ON m.id=t.message AND m.account=t.account
+                JOIN chats ch ON ch.id=m.chat AND ch.account=m.account
+                WHERE t.account=%s AND t.provider_poll_id=%s AND t.public_voters AND NOT m.deleted AND NOT m.purged
+                ORDER BY t.message FOR UPDATE OF t''',(account,source['provider_poll_id']))
+            if state.allows(policy,r['provider_chat'])]
         at=datetime.fromisoformat(capture['observed_at'])
-        if row['votes_read_at'] is not None and row['votes_read_at']>=at:return {'outcome':'stale'}
-        if capture['votes'] is None:
-            c.execute('UPDATE telegram_polls SET votes_read_at=%s WHERE message=%s AND account=%s',(at,row['message'],account))
-            return {'outcome':'poll_votes_refused'}
-        # Deletes: this public poll's previous voter rows, replaced by the newer complete read (ANYM-920 crit. 3).
-        c.execute('DELETE FROM poll_voters WHERE message=%s AND account=%s',(row['message'],account))
-        names={}
-        for vote in capture['votes']:
-            for index in vote['options']:
-                if index<row['options']:
-                    c.execute('''INSERT INTO poll_voters(account,message,option_index,voter,from_me,updated_at)
-                        VALUES(%s,%s,%s,%s,%s,%s)''',(account,row['message'],index,vote['voter'],vote['from_me'],at))
-            if vote['name']:names[vote['voter']]=vote['name']
-        c.execute('UPDATE telegram_polls SET votes_read_at=%s,voter_names=%s WHERE message=%s AND account=%s',
-            (at,Jsonb(names),row['message'],account))
+        if any(r['votes_read_at'] is not None and r['votes_read_at']>=at for r in copies):return {'outcome':'stale'}
+        for row in copies:
+            if capture['votes'] is None:
+                c.execute('UPDATE telegram_polls SET votes_read_at=%s WHERE message=%s AND account=%s',(at,row['message'],account))
+                continue
+            # Deletes: this public poll's previous voter rows, replaced by the newer read (ANYM-920 crit. 3).
+            c.execute('DELETE FROM poll_voters WHERE message=%s AND account=%s',(row['message'],account))
+            names={}
+            for vote in capture['votes']:
+                for index in vote['options']:
+                    if index<row['options']:
+                        c.execute('''INSERT INTO poll_voters(account,message,option_index,voter,from_me,updated_at)
+                            VALUES(%s,%s,%s,%s,%s,%s)''',(account,row['message'],index,vote['voter'],vote['from_me'],at))
+                if vote['name']:names[vote['voter']]=vote['name']
+            c.execute('''UPDATE telegram_polls SET votes_read_at=%s,voters_complete=%s,voter_names=%s
+                WHERE message=%s AND account=%s''',(at,capture['complete'],Jsonb(names),row['message'],account))
+        if capture['votes'] is None:return {'outcome':'poll_votes_refused'}
         _counted(state,'poll_votes_read')
         return {'outcome':'poll_voters_replaced'}
 
 
 def due_telegram_polls(state,limit=10):
-    """Public polls younger than 30 days whose voters were never read, or whose counts changed after a read at least
-    10 minutes old; newest counts first."""
+    """One message per public poll ID younger than 30 days whose voters were never read, or whose counts changed after
+    a read at least 10 minutes old, where no copy of the poll was read within those 10 minutes; newest counts first.
+    The caller filters by its current policy."""
     with state.archive.store.pool.connection() as c:
-        return c.execute('''SELECT t.message,t.option_keys,ch.provider_chat AS chat,m.provider_id FROM telegram_polls t
+        return c.execute('''SELECT * FROM (SELECT DISTINCT ON (t.provider_poll_id) t.message,t.provider_poll_id,
+                t.option_keys,t.results_at,ch.provider_chat AS chat,m.provider_id FROM telegram_polls t
             JOIN messages m ON m.id=t.message AND m.account=t.account JOIN chats ch ON ch.id=m.chat AND ch.account=m.account
             WHERE t.account=%s AND t.public_voters AND NOT m.deleted AND NOT m.purged AND m.sent_at>clock_timestamp()-%s
               AND (t.votes_read_at IS NULL OR (t.votes_read_at<=clock_timestamp()-%s AND t.results_at>t.votes_read_at))
-            ORDER BY t.results_at DESC,t.message LIMIT %s''',(state.account,VOTES_MAX_AGE,VOTES_READ_EVERY,limit)).fetchall()
+              AND NOT EXISTS(SELECT 1 FROM telegram_polls o WHERE o.account=t.account
+                AND o.provider_poll_id=t.provider_poll_id AND o.votes_read_at>clock_timestamp()-%s)
+            ORDER BY t.provider_poll_id,t.results_at DESC,t.message) due
+            ORDER BY results_at DESC,message LIMIT %s''',
+            (state.account,VOTES_MAX_AGE,VOTES_READ_EVERY,VOTES_READ_EVERY,limit)).fetchall()
 
 
 def attach(c,rows):
@@ -373,7 +401,7 @@ def attach(c,rows):
     readable=c.execute('''SELECT CASE WHEN to_regclass('public.poll_voters') IS NULL THEN false
         ELSE has_table_privilege('public.poll_results','SELECT') AND has_table_privilege('public.poll_voters','SELECT')
         END AS ok''').fetchone()['ok']
-    counts,as_of,people,voters,chosen,names={},{},{},{},{},{}
+    counts,as_of,people,voters,chosen,names,incomplete={},{},{},{},{},{},set()
     if readable:
         for r in c.execute('''SELECT r.message,r.option_index,r.voters,r.updated_at FROM poll_results r
                 JOIN messages m ON m.id=r.message AND m.account=r.account WHERE r.message=ANY(%s)''',(ids,)):
@@ -399,18 +427,24 @@ def attach(c,rows):
         if telegram:
             # Only the names of the listed people leave the database, as their profiles do.
             listed=sorted({p['sender'] for options in people.values() for group in options.values() for p in group})
-            for r in c.execute('''SELECT t.message,t.total_voters,t.chosen,coalesce((SELECT jsonb_object_agg(n.key,n.value)
+            for r in c.execute('''SELECT t.message,t.total_voters,t.chosen,t.results_at,t.public_voters,t.voters_complete,
+                    coalesce((SELECT jsonb_object_agg(n.key,n.value)
                     FROM jsonb_each_text(t.voter_names) n WHERE n.key=ANY(%s)),'{}') AS voter_names FROM telegram_polls t
                     JOIN messages m ON m.id=t.message AND m.account=t.account WHERE t.message=ANY(%s)''',(listed,ids)):
                 if r['total_voters'] is not None:voters[r['message']]=r['total_voters']
                 chosen[r['message']]=r['chosen'];names[r['message']]=r['voter_names']
+                # Telegram's observation time of the stored counts (Astra r1 m1); an unread or capped voter list of a
+                # public poll is incomplete, so an option with more voters than listed says so (Astra r1 M4).
+                as_of[r['message']]=r['results_at']
+                if r['public_voters'] and not r['voters_complete']:incomplete.add(r['message'])
     for mid,row in polls.items():
         block=row['poll'];options=[]
         for option in block.get('options',[]):
             index=option.get('index');listed=people.get(mid,{}).get(index,[])
             listed=[{**p,'name':p['name'] or names.get(mid,{}).get(p['sender'])} for p in listed]
-            options.append({'index':index,'text':option.get('text'),'voters':counts.get(mid,{}).get(index,0),
-                'voted_by':listed[:MAX_VOTED_BY],'voted_by_truncated':len(listed)>MAX_VOTED_BY})
+            count=counts.get(mid,{}).get(index,0)
+            options.append({'index':index,'text':option.get('text'),'voters':count,'voted_by':listed[:MAX_VOTED_BY],
+                'voted_by_truncated':len(listed)>MAX_VOTED_BY or (mid in incomplete and count>len(listed))})
         at=as_of.get(mid)
         flags=TELEGRAM_FLAGS if 'provider_poll_id' in block else ('selectable_count',)
         row['poll']={'question':block.get('question'),'options':options,**{k:block.get(k) for k in flags},

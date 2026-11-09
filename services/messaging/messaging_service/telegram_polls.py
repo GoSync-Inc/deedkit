@@ -6,12 +6,17 @@ ID. For a poll Telegram marks public, a background pass reads its voters through
 per 10 minutes, polls younger than 30 days, up to 200 votes) and journals them as one `telegram_poll_votes` capture;
 an anonymous poll is never read. Poll texts and names are member-controlled data, stored bounded, never instructions.
 Logs carry reason codes and counts only.
+
+Off until ANYMSG_CAPTURE_TELEGRAM_POLLS=1 (Astra r1 B4): a schema-83 collector, the release a rollback returns to,
+rejects a journaled message carrying the Telegram poll block and quarantines the whole message, as it does the two
+new capture kinds; the flag is turned on once that release is no rollback target.
 """
 import asyncio
 from contextlib import suppress
 from datetime import datetime,timezone
 import json
 import logging
+import os
 import time
 
 from .adapters import display_text
@@ -22,6 +27,13 @@ from .telegram_governor import BACKGROUND,ProviderRateLimited
 
 POLL_VOTES_PAGE=50
 POLL_VOTES_PASS=10
+# One governed voter-list page holds the shared non-send lane at most this long (Astra r1 B1).
+POLL_VOTES_TIMEOUT=30
+
+
+def telegram_poll_capture():
+    """ANYMSG_CAPTURE_TELEGRAM_POLLS=1 turns on the poll block, pushed counts and voter reads (Astra r1 B4)."""
+    return os.environ.get('ANYMSG_CAPTURE_TELEGRAM_POLLS')=='1'
 
 
 class PollVotesRefused(Exception):
@@ -44,7 +56,8 @@ def _results(results,keys):
     voters=None if results.results is None else [
         (by[k].voters if type(by[k].voters) is int and by[k].voters>=0 else 0) if k in by else 0 for k in keys]
     chosen=[i for i,k in enumerate(keys) if k in by and by[k].chosen is True]
-    return voters,total,results.min is True,chosen
+    # Without per-option results Telegram states no choice either: the stored one stays (Astra r1 M5).
+    return voters,total,results.min is True or results.results is None,chosen
 
 
 def telegram_poll(media):
@@ -103,17 +116,20 @@ class PollProvider:
 
     async def poll_votes(self,chat,message_id,*,limit=MAX_POLL_VOTES):
         """Up to `limit` votes of one public poll, paged, each page one governed BACKGROUND request: a FloodWait
-        raises ProviderRateLimited; any other refusal raises PollVotesRefused. Returns (peer ID, name, option bytes)."""
+        raises ProviderRateLimited; any other refusal raises PollVotesRefused; a page that takes longer than
+        POLL_VOTES_TIMEOUT is cancelled inside the governed call, so the lane is released, and raises TimeoutError.
+        Returns ([(peer ID, name, option bytes)], complete): complete when Telegram had no further page."""
         from telethon import types,utils
         from telethon.errors import FloodError,FloodWaitError,RPCError
         from telethon.tl.functions.messages import GetPollVotesRequest
-        votes,offset=[],None
+        votes,offset,complete=[],None,False
         while len(votes)<limit:
             async def read(offset=offset,size=min(POLL_VOTES_PAGE,limit-len(votes))):
                 try:
-                    peer=await self.client.get_input_entity(int(chat))
-                    return await self.client(GetPollVotesRequest(peer=peer,id=message_id,limit=size,offset=offset))
-                except (FloodWaitError,FloodError):raise
+                    async with asyncio.timeout(POLL_VOTES_TIMEOUT):
+                        peer=await self.client.get_input_entity(int(chat))
+                        return await self.client(GetPollVotesRequest(peer=peer,id=message_id,limit=size,offset=offset))
+                except (FloodWaitError,FloodError,TimeoutError):raise
                 except (RPCError,ValueError) as exc:raise PollVotesRefused(type(exc).__name__) from exc
             page=await self.rpc(read,'telegram_poll_votes',tier=BACKGROUND)
             names={utils.get_peer_id(x):_peer_name(x) for x in [*(page.users or []),*(page.chats or [])]}
@@ -124,8 +140,9 @@ class PollProvider:
                 peer=utils.get_peer_id(vote.peer)
                 votes.append((peer,names.get(peer,''),options))
             offset=page.next_offset
-            if not offset or not page.votes:break
-        return votes[:limit]
+            if not offset or not page.votes:
+                complete=True;break
+        return votes[:limit],complete and len(votes)<=limit
 
 
 class PollCollector:
@@ -135,7 +152,7 @@ class PollCollector:
     async def poll_update(self,update):
         # Taken before any await: the order Telegram delivered the updates in (the stored counts' order guard).
         observed=datetime.now(timezone.utc).isoformat()
-        if self.stopping.is_set() or self.failed.is_set():return
+        if self.stopping.is_set() or self.failed.is_set() or not telegram_poll_capture():return
         try:
             peer=getattr(update,'peer',None)
             if peer is not None:
@@ -155,16 +172,29 @@ class PollCollector:
         while not self.stopping.is_set():
             try:await self.poll_voters_pass()
             except asyncio.CancelledError:raise
-            except Exception as exc:logging.getLogger(__name__).warning('poll_votes_failed: %s',type(exc).__name__)
+            except Exception as exc:
+                with suppress(Exception):logging.getLogger(__name__).warning('poll_votes_failed: %s',type(exc).__name__)
+            self.poll_counts_report()
+            with suppress(TimeoutError):
+                async with asyncio.timeout(self.poll_votes_interval):await self.stopping.wait()
+
+    def poll_counts_report(self):
+        """The pass's counts as one stdout line; best effort, never an error of the loop (Astra r1 B3)."""
+        try:
             counts=getattr(self.state,'poll_counts',None)
             if counts:
                 self.state.poll_counts={}
                 print(json.dumps({'event':'telegram_polls',**counts},sort_keys=True),flush=True)
-            with suppress(TimeoutError):
-                async with asyncio.timeout(self.poll_votes_interval):await self.stopping.wait()
+        except Exception:pass
+
+    def poll_allowed(self,chat):
+        policy=self.policy
+        return bool(policy) and policy.get('enabled',True) is not False and self.state.allows(policy,chat)
 
     async def poll_voters_pass(self,limit=POLL_VOTES_PASS):
-        """Read the voters of the due public polls; a FloodWait stops the pass."""
+        """Read the voters of the due public polls the current policy allows (checked again before journaling; Astra
+        r1 M1), once per poll ID (Astra r1 M3); a FloodWait or a page timeout stops the pass."""
+        if not telegram_poll_capture():return
         due=await asyncio.to_thread(due_telegram_polls,self.state,limit)
         reads=self.__dict__.setdefault('_poll_reads',{})
         now=time.monotonic()
@@ -172,11 +202,11 @@ class PollCollector:
         me=getattr(getattr(self.provider,'verified_self',None),'id',None)
         for poll in due:
             if self.stopping.is_set() or self.failed.is_set():return
-            if poll['message'] in reads:continue
-            reads[poll['message']]=time.monotonic()
-            observed=datetime.now(timezone.utc).isoformat();message_id=int(poll['provider_id'])
-            try:found=await self.provider.poll_votes(poll['chat'],message_id,limit=MAX_POLL_VOTES)
-            except ProviderRateLimited:return
+            if poll['provider_poll_id'] in reads or not self.poll_allowed(poll['chat']):continue
+            reads[poll['provider_poll_id']]=time.monotonic()
+            observed=datetime.now(timezone.utc).isoformat();message_id=int(poll['provider_id']);complete=False
+            try:found,complete=await self.provider.poll_votes(poll['chat'],message_id,limit=MAX_POLL_VOTES)
+            except (ProviderRateLimited,TimeoutError):return
             except PollVotesRefused:votes=None
             else:
                 index={key:i for i,key in enumerate(poll['option_keys'])};votes,seen=[],set()
@@ -186,7 +216,8 @@ class PollCollector:
                     seen.add(voter)
                     chosen=sorted({index[k] for k in (bytes(o).hex() for o in options) if k in index})
                     votes.append({'voter':voter,'name':name,'options':chosen,'from_me':me is not None and peer==me})
+            if not self.poll_allowed(poll['chat']):continue
             capture={'kind':'telegram_poll_votes','account':self.account,'chat':poll['chat'],'message_id':message_id,
-                'votes':votes,'observed_at':observed}
+                'votes':votes,'complete':complete,'observed_at':observed}
             try:await asyncio.to_thread(self.spool.put,capture)
             except InvalidCapture as exc:self.reject(str(exc))

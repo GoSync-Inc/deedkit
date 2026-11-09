@@ -223,8 +223,9 @@ def telegram_message(account,message,*,chat_title='',origin='live',verified_self
     poll,poll_results=None,None
     if isinstance(shared,types.MessageMediaPoll):
         # The poll's question, options and Telegram's counts (ANYM-920); a poll it cannot read keeps only its kind.
-        from .telegram_polls import telegram_poll
-        poll,poll_results=telegram_poll(shared)
+        # Off until ANYMSG_CAPTURE_TELEGRAM_POLLS=1: the release a rollback returns to rejects the block (Astra r1 B4).
+        from .telegram_polls import telegram_poll,telegram_poll_capture
+        if telegram_poll_capture():poll,poll_results=telegram_poll(shared)
     data={'account':account,'platform':'telegram','chat':str(message.chat_id),
         'chat_title':(chat_title if chat_title and chat_title!=str(message.chat_id) else observed_title) or str(message.chat_id),
         'provider_id':str(message.id),

@@ -1315,7 +1315,8 @@ TG_POLL_CHAT='-500'
 
 
 @pytest.fixture
-def tg_polls(seeded,tmp_path):
+def tg_polls(seeded,tmp_path,monkeypatch):
+    monkeypatch.setenv('ANYMSG_CAPTURE_TELEGRAM_POLLS','1')
     store,_,_=seeded; archive=Archive(store)
     archive.register('tg-polls','telegram','Synthetic Telegram polls',discover=True)
     worker=TelegramCollector(archive,'tg-polls',FakeProvider(),CaptureSpool(tmp_path/'polls',reserve_bytes=0),
@@ -1335,13 +1336,13 @@ def tg_poll_results(voters,*,total=None,chosen=(),minimal=False):
 
 
 def tg_poll_message(mid=30,*,options=('Да','Нет','Может быть'),voters=(2,1,0),public=False,poll_id=777,
-        question='Кто в субботу?',chosen=(),results=None,sent=None):
+        question='Кто в субботу?',chosen=(),results=None,sent=None,group=500):
     """A synthetic Telegram group message carrying a MessageMediaPoll (Telethon 1.45.0 layer types)."""
     from telethon import types
     poll=types.Poll(id=poll_id,question=types.TextWithEntities(text=question,entities=[]),hash=0,
         answers=[types.PollAnswer(text=types.TextWithEntities(text=t,entities=[]),option=str(i).encode()) for i,t in enumerate(options)],
         public_voters=public or None,multiple_choice=None,quiz=None,closed=None)
-    return types.Message(id=mid,peer_id=types.PeerChat(500),from_id=types.PeerUser(42),
+    return types.Message(id=mid,peer_id=types.PeerChat(group),from_id=types.PeerUser(42),
         date=sent or datetime.now(timezone.utc).replace(microsecond=0),message='',
         media=types.MessageMediaPoll(poll=poll,results=results or tg_poll_results(voters,chosen=chosen)))
 
@@ -1433,12 +1434,12 @@ def test_telegram_poll_updates_replace_the_counts_and_an_older_observation_never
 
 class PollVotesProvider(FakeProvider):
     def __init__(self,pages=None,limited=()):
-        super().__init__();self.vote_reads=[];self.pages=pages;self.limited=set(limited)
+        super().__init__();self.vote_reads=[];self.pages=pages;self.limited=set(limited);self.complete=True
     async def poll_votes(self,chat,message_id,*,limit):
         from messaging_service.telegram_governor import ProviderRateLimited
         self.vote_reads.append((chat,message_id,limit))
         if message_id in self.limited:raise ProviderRateLimited(30)
-        return self.pages if self.pages is not None else [(42,'Синтетик А',[b'1']),(43,'Синтетик Б',[b'0',b'2'])]
+        return (self.pages if self.pages is not None else [(42,'Синтетик А',[b'1']),(43,'Синтетик Б',[b'0',b'2'])]),self.complete
 
 
 # spec: ANYM-920
@@ -1483,6 +1484,151 @@ def test_a_floodwait_stops_the_voter_pass_and_a_failed_pass_never_ends_the_colle
     w.poll_voters_pass=failing;w.poll_votes_interval=0
     asyncio.run(asyncio.wait_for(w.poll_voters_loop(),5))
     assert len(passes)==2 and not w.failed.is_set()
+
+
+# spec: ANYM-920
+def test_a_hung_poll_votes_page_is_cancelled_inside_the_governed_call_and_ends_only_the_pass(tg_polls,monkeypatch):
+    # Astra r1 B1: a page that never completes must release the shared non-send lane, not hold it.
+    from messaging_service import telegram_polls
+    from messaging_service.telegram_collector import TelethonProvider
+    monkeypatch.setattr(telegram_polls,'POLL_VOTES_TIMEOUT',0.05)
+    lane=[]
+    class Client:
+        async def get_input_entity(self,peer):return peer
+        async def __call__(self,request):await asyncio.Event().wait()
+    provider=TelethonProvider.__new__(TelethonProvider);provider.client=Client()
+    async def rpc(operation,phase,*,before=None,tier=None):
+        lane.append('held')
+        try:return await operation()
+        finally:lane.append('released')
+    provider.rpc=rpc
+    with pytest.raises(TimeoutError):
+        asyncio.run(asyncio.wait_for(provider.poll_votes(TG_POLL_CHAT,30,limit=200),2))
+    assert lane==['held','released']
+    w,store,_=tg_polls
+    class Hung(PollVotesProvider):
+        async def poll_votes(self,chat,message_id,*,limit):
+            self.vote_reads.append(message_id);raise TimeoutError
+    w.provider=Hung()
+    w.state.apply(tg_poll_capture(60,public=True,poll_id=960))
+    w.state.apply(tg_poll_capture(61,public=True,poll_id=961))
+    asyncio.run(w.poll_voters_pass())
+    assert w.provider.vote_reads==[61] and not w.failed.is_set() and list(w.spool.path.glob('*.json'))==[]
+
+
+# spec: ANYM-920
+def test_a_database_outage_while_applying_captured_poll_counts_keeps_the_capture_for_its_replay(tg_polls,monkeypatch):
+    # Astra r1 B2: the poll's mapping and counts must not be acknowledged as stored when their transaction failed.
+    import psycopg
+    from messaging_service import polls
+    w,store,_=tg_polls
+    real=polls._store_counts
+    def outage(*args):raise psycopg.OperationalError('synthetic outage')
+    monkeypatch.setattr(polls,'_store_counts',outage)
+    capture=tg_poll_capture()
+    with pytest.raises(psycopg.OperationalError):w.state.apply(capture)
+    assert tg_poll_state(store)[1] is None
+    monkeypatch.setattr(polls,'_store_counts',real)
+    # The drain keeps the item and replays it: a duplicate receipt, and the counts arrive.
+    assert w.state.apply(capture)['outcome']=='duplicate'
+    counts,row,_,_=tg_poll_state(store)
+    assert counts=={0:2,1:1,2:0} and row['provider_poll_id']=='777'
+
+
+# spec: ANYM-920
+def test_a_failing_poll_report_line_never_ends_the_voter_loop(tg_polls,monkeypatch):
+    # Astra r1 B3: the loop's own stdout line is best effort.
+    from messaging_service import telegram_polls
+    w,_,_=tg_polls
+    passes=[]
+    async def counting(limit=None):
+        passes.append(1);w.state.poll_counts={'poll_update_unknown':1}
+        if len(passes)==3:w.stopping.set()
+    def broken(*args,**kwargs):raise BrokenPipeError()
+    monkeypatch.setattr(telegram_polls,'print',broken,raising=False)
+    w.poll_voters_pass=counting;w.poll_votes_interval=0
+    asyncio.run(asyncio.wait_for(w.poll_voters_loop(),5))
+    assert len(passes)==3 and not w.failed.is_set()
+
+
+# spec: ANYM-920
+def test_telegram_poll_capture_stays_off_until_its_flag_so_a_rollback_target_never_quarantines_a_message(tg_polls,monkeypatch):
+    # Astra r1 B4: without ANYMSG_CAPTURE_TELEGRAM_POLLS=1 the envelope is the one a schema-83 collector accepts.
+    from telethon import types
+    from messaging_service.envelope import validate
+    w,store,_=tg_polls
+    monkeypatch.delenv('ANYMSG_CAPTURE_TELEGRAM_POLLS')
+    capture=tg_poll_capture(public=True)
+    metadata=capture['envelope']['metadata']
+    assert metadata['message_kind']=='poll' and 'poll' not in metadata and 'poll_results' not in metadata
+    assert validate(capture['envelope'])==capture['envelope']
+    asyncio.run(w.poll_update(types.UpdateMessagePoll(poll_id=777,results=tg_poll_results((1,0,0)))))
+    w.provider=PollVotesProvider()
+    asyncio.run(w.poll_voters_pass())
+    assert list(w.spool.path.glob('*.json'))==[] and w.provider.vote_reads==[]
+    monkeypatch.setenv('ANYMSG_CAPTURE_TELEGRAM_POLLS','1')
+    asyncio.run(w.poll_update(types.UpdateMessagePoll(poll_id=777,results=tg_poll_results((1,0,0)))))
+    assert len(list(w.spool.path.glob('*.json')))==1
+
+
+# spec: ANYM-920
+def test_voter_reads_follow_the_policy_and_one_read_serves_every_forwarded_copy(tg_polls):
+    # Astra r1 M1 (an excluded chat is never read) and M3 (the throttle is the poll ID's, not one message's).
+    from messaging_service.adapters import telegram_message
+    w,store,_=tg_polls
+    w.provider=PollVotesProvider()
+    w.state.apply(tg_poll_capture(public=True))
+    forwarded=tg_poll_message(70,public=True,group=600)
+    w.state.apply({'kind':'message','peer_kind':'chat','envelope':telegram_message('tg-polls',forwarded)})
+    asyncio.run(w.poll_voters_pass());w.spool.drain(w.state.apply,100)
+    assert len(w.provider.vote_reads)==1
+    copy=stable_id('msg','tg-polls','-600','70')
+    with store.pool.connection() as c:
+        assert sorted(r['voter'] for r in c.execute('SELECT DISTINCT voter FROM poll_voters WHERE message=%s',(copy,)))==['42','43']
+        assert c.execute('SELECT count(*) AS n FROM telegram_polls WHERE votes_read_at IS NOT NULL').fetchone()['n']==2
+        c.execute("UPDATE account_policies SET exclude_chats=ARRAY['-500','-600'] WHERE account='tg-polls'")
+        c.execute("UPDATE telegram_polls SET votes_read_at=now()-interval '11 minutes',results_at=now()")
+    w.policy=w.state.policy();w._poll_reads.clear()
+    asyncio.run(w.poll_voters_pass())
+    assert len(w.provider.vote_reads)==1 and list(w.spool.path.glob('*.json'))==[]
+
+
+# spec: ANYM-920
+def test_a_late_message_snapshot_never_undoes_a_newer_pushed_count_and_a_bare_one_keeps_the_owners_choice(tg_polls):
+    # Astra r1 M2 (a snapshot inside the margin is stale), M5 (results without options keep `chosen`), m1.
+    from datetime import timedelta
+    from telethon import types
+    w,store,key=tg_polls
+    w.state.apply(tg_poll_capture(chosen=(1,)))
+    pushed=datetime.now(timezone.utc)+timedelta(seconds=1)
+    assert w.state.apply(tg_poll_update((5,5,5),pushed))['outcome']=='poll_updated'
+    late=tg_poll_capture(voters=(0,0,1))
+    assert w.state.apply(late)['outcome'] in ('duplicate','unchanged') and tg_poll_state(store)[0]=={0:5,1:5,2:5}
+    from messaging_service import polls
+    bare=tg_poll_capture(results=types.PollResults(total_voters=16))
+    bare['envelope']['metadata']['poll_results']['observed_at']=(pushed+timedelta(minutes=5)).isoformat()
+    w.state.apply(bare)
+    counts,row,_,_=tg_poll_state(store)
+    assert counts=={0:5,1:5,2:5} and row['total_voters']==16 and row['chosen']==[1]
+    mid=stable_id('msg','tg-polls',TG_POLL_CHAT,'30')
+    poll=store.get_context(key,mid)['message']['poll']
+    assert datetime.fromisoformat(poll['results_as_of'])==pushed+timedelta(minutes=5) and polls.SNAPSHOT_MARGIN==timedelta(minutes=2)
+
+
+# spec: ANYM-920
+def test_an_unread_or_capped_public_voter_list_marks_options_with_unseen_voters_truncated(tg_polls):
+    # Astra r1 M4: 200 fetched voters of option 0 and unseen voters of option 1 are not a complete list.
+    w,store,key=tg_polls
+    w.provider=PollVotesProvider(pages=[(2000+n,f'Синтетик {n}',[b'0']) for n in range(200)])
+    w.provider.complete=False
+    w.state.apply(tg_poll_capture(public=True,voters=(200,7,0)))
+    mid=stable_id('msg','tg-polls',TG_POLL_CHAT,'30')
+    before=store.get_context(key,mid)['message']['poll']['options']
+    assert [o['voted_by_truncated'] for o in before]==[True,True,False]
+    asyncio.run(w.poll_voters_pass());w.spool.drain(w.state.apply,100)
+    options=store.get_context(key,mid)['message']['poll']['options']
+    assert [o['voted_by_truncated'] for o in options]==[True,True,False] and options[1]['voted_by']==[]
+    assert len(options[0]['voted_by'])==50
 
 
 # spec: ANYM-920
@@ -1564,7 +1710,7 @@ def test_the_telethon_provider_subscribes_poll_updates_and_pages_a_polls_votes_t
     provider.subscribe_polls(print)
     assert isinstance(handlers[0][1],events.Raw) and handlers[0][1].types is types.UpdateMessagePoll
     votes=asyncio.run(provider.poll_votes(TG_POLL_CHAT,30,limit=200))
-    assert votes==[(42,'Синтетик А',[b'1']),(43,'Синтетик',[b'0',b'2'])]
+    assert votes==([(42,'Синтетик А',[b'1']),(43,'Синтетик',[b'0',b'2'])],True)
     assert all(isinstance(r,GetPollVotesRequest) and r.limit<=50 and r.id==30 for r in requests)
     assert [r.offset for r in requests]==[None,'next'] and phases==[('telegram_poll_votes',2)]*2
 
