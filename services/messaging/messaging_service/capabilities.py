@@ -197,7 +197,7 @@ def capabilities(self, token, detail='full', sections=None):
                     'quiet_hours':'iana_timezone_weekday_windows_held_not_dropped',
                     'quiet_bypass':['incoming_message','owner_mention','reply_to_owner','reply_to_confirmed_send','silence'],
                     'silence_timer':'reply_to_send_subscriptions_only','silence_hint_kind':'silence',
-                    'key_budget':{'setting':'SUBSCRIPTION_MAX_HINTS_PER_HOUR','default':20,'bounds':[1,1000],
+                    'key_budget':{'setting':'SUBSCRIPTION_MAX_HINTS_PER_HOUR','default':200,'bounds':[1,1000],
                         'scope':'every_hint_of_the_key','applies_without_policy':True,'over_budget':'coalesced_never_dropped'},
                     'held_reasons':['debounce','batch','quiet_hours','budget'],'clock':'database_utc',
                     'idempotency':'one_hint_per_subscription_version_window'}},

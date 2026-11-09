@@ -474,7 +474,7 @@ def hint_budget(c, p):
     import psycopg
     from .subscriptions import _bound_setting
     try:
-        limit = _bound_setting('SUBSCRIPTION_MAX_HINTS_PER_HOUR', 20, 1, 1000)
+        limit = _bound_setting('SUBSCRIPTION_MAX_HINTS_PER_HOUR', 200, 1, 1000)
     except ValueError:
         return {'per_hour': None, 'remaining_this_hour': None, 'window': 'rolling_hour'}
     remaining = None

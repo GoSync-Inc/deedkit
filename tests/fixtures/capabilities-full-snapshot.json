@@ -682,7 +682,7 @@
      1,
      1000
     ],
-    "default": 20,
+    "default": 200,
     "over_budget": "coalesced_never_dropped",
     "scope": "every_hint_of_the_key",
     "setting": "SUBSCRIPTION_MAX_HINTS_PER_HOUR"
@@ -755,8 +755,8 @@
     "configured": false,
     "heartbeat_max_age_s": 120,
     "hint_budget": {
-     "per_hour": 20,
-     "remaining_this_hour": 20,
+     "per_hour": 200,
+     "remaining_this_hour": 200,
      "window": "rolling_hour"
     },
     "name": "webhook",
