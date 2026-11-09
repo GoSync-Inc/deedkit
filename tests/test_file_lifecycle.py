@@ -59,6 +59,26 @@ def test_backup_fence_remains_active_after_connection_closes(archive):
             api.begin_backup_fence(c,'synthetic-backup-1')
 
 
+# spec: ANYM-223
+def test_registering_an_original_reads_its_identity_through_an_index_under_the_residency_lock(archive):
+    # Regression (production 11-09): every attachment INSERT calls register_resident_original, which checks
+    # attachments by digest and bytes while it holds the global residency lock. Without an index that check read
+    # the whole table (56,523 rows, 7 ms) under the lock. enable_seqscan=off stands in for production's size: the
+    # planner still takes a sequential scan when no index can answer the check.
+    _,s,_,_=archive
+    _,blob=stored(archive)
+    # The backend's pending counters may still hold earlier transactions' scans: compare before and after.
+    count="SELECT seq_scan,idx_scan FROM pg_stat_xact_user_tables WHERE relid='public.attachments'::regclass"
+    with s.pool.connection() as c:
+        c.execute('SET LOCAL enable_seqscan=off')
+        before=c.execute(count).fetchone()
+        assert lifecycle().register_resident_original(c,blob.digest,blob.bytes)
+        after=c.execute(count).fetchone()
+        assert after['seq_scan']==before['seq_scan'] and after['idx_scan']>before['idx_scan']
+        index=c.execute("SELECT pg_get_indexdef('public.attachment_digest_bytes'::regclass) AS d").fetchone()['d']
+    assert index=='CREATE INDEX attachment_digest_bytes ON public.attachments USING btree (digest, bytes)'
+
+
 @pytest.fixture(autouse=True)
 def clear_lifecycle_state(database):
     with database.pool.connection() as c:
