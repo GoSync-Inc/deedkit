@@ -302,8 +302,7 @@ def test_a_real_no_acl_restore_with_its_role_files_keeps_collectors_working_and_
         try:
             with snapshot_restored(source, tmp_path) as restored:
                 backup.quarantine_restore(restored)
-                if version < 82:
-                    restored.migrate()
+                restored.migrate()  # an older backup reaches the runtime schema before its role files
                 group(restored)  # the role files, applied again after the --no-acl restore
                 collector = install(restored, 'collector_role.sql', 'messaging_collector', account=MINE)
                 new = 'anym936_holder_' + uuid4().hex[:10]

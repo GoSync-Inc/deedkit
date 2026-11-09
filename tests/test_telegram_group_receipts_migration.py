@@ -58,10 +58,10 @@ def at_schema(database, tmp_path):
 
 @pytest.fixture(autouse=True)
 def enricher_role(database):
-    """A release from PREVIOUS also appends 077's enricher and gateway grants (ANYM-851); every real database has
-    both roles."""
+    """A release from PREVIOUS also appends 077's enricher and gateway grants (ANYM-851) and 083's purge grants
+    (ANYM-921); every real database has these roles (purge_role.sql since the 045 release)."""
     with psycopg.connect(database.pool.conninfo, autocommit=True) as c:
-        for role in ('messaging_enricher', 'messaging_gateway'):
+        for role in ('messaging_enricher', 'messaging_gateway', 'messaging_purge'):
             c.execute("DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='" + role + "') THEN "
                       "CREATE ROLE " + role + " NOLOGIN; END IF; END $$")
 
