@@ -280,6 +280,9 @@ def whatsapp_message(account,event,*,origin='live',change='message',observed_at=
     if native_type in ('template','interactive','buttons','list','product','group_invite','list_response',
                        'buttons_response','template_reply','interactive_response') and not service and event.get('body'):
         kind='text'
+    # A pushed group change (ANYM-869, whatsmeow capture.go) keeps its own kind and details.
+    group=event.get('groupChange') if native_type=='group_change' else None
+    if group is not None:kind='group_change'
     if native_type is None and event.get('mediaKind'):
         kind='video' if event['mediaKind']=='animation' else event['mediaKind'] if event['mediaKind']!='other' else 'unknown'
     body=event.get('body') or ''
@@ -317,5 +320,6 @@ def whatsapp_message(account,event,*,origin='live',change='message',observed_at=
                     'forwarded':event.get('forwarded'),
                     **({'forward_origin':forward} if forward is not None else {}),
                     **({'contact':contact} if contact is not None else {}),
+                    **({'group_change':group} if group is not None else {}),
                     **({'sender_is_business_or_verified':True} if event.get('senderIsBusiness') is True else {}),
                     'media_kind':event.get('mediaKind')}})

@@ -60,7 +60,7 @@ def validate_capture(value):
         event=value['event']
         if not isinstance(event,dict) or set(event)-{'chatId','chatName','messageId','senderId','body',
                 'timestamp','timestampResolution','durationSeconds','fromMe','hasMedia','filename','mimetype','filesize','editedTimestampMs',
-                'senderName','senderUsername','replyToId','forwarded','forwardOrigin','mediaKind','mentionsOwner','replyToOwner','identityObservations','formatting','messageType','isService','isSelfChat','senderIsContact','senderIsBusiness','contactCard'}:
+                'senderName','senderUsername','replyToId','forwarded','forwardOrigin','mediaKind','mentionsOwner','replyToOwner','identityObservations','formatting','messageType','isService','isSelfChat','senderIsContact','senderIsBusiness','contactCard','groupChange'}:
             raise ValueError('invalid_whatsapp_event')
         envelope=whatsapp_message(value['account'],event,change=value['change'],
             observed_at=utc(value['observed_at']),origin=value['origin'])
@@ -416,8 +416,12 @@ class CollectorState:
             if row['peer_kind']!=peer_kind: raise PeerKindConflict()
             return row
 
-    def inventory(self,dialogs,history_since,*,discovery=False):
-        """Persist the catalog before any history fetch. Fence bounded batches."""
+    def inventory(self,dialogs,history_since,*,discovery=False,listed_at=None):
+        """Persist the catalog before any history fetch. Fence bounded batches.
+
+        listed_at: when the dialog list was read (ANYM-869 group titles); default: the read time the WhatsApp
+        pass recorded in dialogs_listed_at, else now."""
+        listed_at=listed_at or getattr(self,'dialogs_listed_at',None)
         for offset in range(0,len(dialogs),100):
             with self.archive.store.pool.connection() as c:
                 self.archive.fence(c,self.account,self.lease)
@@ -442,6 +446,10 @@ class CollectorState:
                         peer_kind=CASE WHEN %s AND collector_chats.peer_kind='chat' AND excluded.peer_kind='channel'
                             THEN 'channel' ELSE collector_chats.peer_kind END''',
                         (self.account,chat,kind,history_since,discovery))
+                    from .archive import group_title_kept
+                    from datetime import timezone
+                    if group_title_kept(c,self.account,stable_id('chat',self.account,chat),chat,title or chat,
+                            listed_at or datetime.now(timezone.utc)):title=chat
                     c.execute('''INSERT INTO chats(id,account,title,chat_type,provider_chat) VALUES(%s,%s,%s,%s,%s)
                         ON CONFLICT(id) DO UPDATE SET
                         title=CASE WHEN excluded.title<>%s AND excluded.title<>'' THEN excluded.title ELSE chats.title END,

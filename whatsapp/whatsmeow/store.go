@@ -111,7 +111,7 @@ func (s *CaptureStore) Close() error { return s.db.Close() }
 // acknowledged and counted under its fixed code instead of stopping capture of
 // the whole account and being redelivered forever. Store, disk, spool and
 // identity failures are never in this set.
-var skippedCaptureCodes = map[string]bool{"invalid_provider_message": true, "unsupported_chat": true, "invalid_provider_media": true, "invalid_history_notification": true, "invalid_history_chat": true, "invalid_history_message": true}
+var skippedCaptureCodes = map[string]bool{"invalid_provider_message": true, "unsupported_chat": true, "invalid_provider_media": true, "invalid_history_notification": true, "invalid_history_chat": true, "invalid_history_message": true, "skipped_group_change": true}
 
 func skippableCapture(err error) bool { return err != nil && skippedCaptureCodes[err.Error()] }
 
@@ -135,6 +135,113 @@ func (s *CaptureStore) putOrSkip(e *events.Message, origin string) error {
 		return s.skip(err)
 	}
 	return err
+}
+
+// PutGroupChanges journals a group notification's changes (ANYM-869). All are
+// checked before the first is written, so a malformed notification leaves no
+// partial entries. An entry whose provider ID is already journaled (a
+// redelivery, or the synced stub of a live change) is not written again.
+func (s *CaptureStore) PutGroupChanges(group types.JID, at time.Time, stamp string, changes []groupChange, origin string) error {
+	if origin != "live" && origin != "history" {
+		return errors.New("invalid_capture_origin")
+	}
+	type entry struct {
+		id       string
+		envelope map[string]any
+		title    *string
+	}
+	entries := make([]entry, 0, len(changes))
+	for _, c := range changes {
+		id, envelope, err := groupChangeEnvelope(s.Config.Account, group, at, stamp, c, s.Owner, origin, s.OwnerLID)
+		if err != nil {
+			return err
+		}
+		// Bounded fields can still add up past the journal limit (2048 long IDs): such a
+		// notification is unrepresentable, so it is skipped, never a capture failure.
+		// The margin covers a collision suffix on the provider ID.
+		if data, err := json.Marshal(envelope); err != nil || len(data) > maxCaptureEnvelopeBytes-1024 {
+			return errGroupChange
+		}
+		var title *string
+		if (c.change == "rename" || c.change == "joined_group") && origin == "live" && c.value != nil && *c.value != "" {
+			v := envelopeText(*c.value, maxEnvelopeSenderName)
+			title = &v
+		}
+		entries = append(entries, entry{id, envelope, title})
+	}
+	chat := LegacyChatID(group)
+	for _, e := range entries {
+		id, err := s.groupEntryID(chat, e.id, e.envelope)
+		if err != nil {
+			return err
+		}
+		if id == "" {
+			continue
+		}
+		if err := s.append(chat, id, at.Unix(), nil, e.envelope, origin == "history"); err != nil {
+			return err
+		}
+		// The dialog list feeds backfill and reconcile titles: it follows the newest live
+		// rename or join, never an older one delivered late.
+		if e.title != nil {
+			if _, err := s.db.Exec(`UPDATE chats SET title=? WHERE chat=? AND NOT EXISTS(SELECT 1 FROM capture
+				WHERE chat=? AND message_id<>? AND source_ts>? AND message_id LIKE 'group\_%' ESCAPE '\'
+				AND (message_id LIKE '%\_rename%' ESCAPE '\' OR message_id LIKE '%\_joined\_group%' ESCAPE '\'))`, *e.title, chat, chat, id, at.Unix()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// groupEntryID returns the provider ID to journal a group change under, or ""
+// when the same change is already journaled. The same change is the same
+// derived ID with the same participants and value (the actor may be in its
+// phone-number or LID form). A different change under the derived ID of the
+// same group, second and kind (two separate adds in one second, live or synced)
+// gets a suffix from its own content instead of being lost.
+func (s *CaptureStore) groupEntryID(chat, id string, envelope map[string]any) (string, error) {
+	stored := func(id string) ([]byte, error) {
+		var data []byte
+		err := s.db.QueryRow("SELECT envelope FROM capture WHERE chat=? AND message_id=? ORDER BY seq DESC LIMIT 1", chat, id).Scan(&data)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return data, err
+	}
+	type content struct {
+		Participants []string `json:"participants"`
+		Value        *string  `json:"value"`
+	}
+	key := func(raw []byte) string {
+		var v struct {
+			Event struct {
+				GroupChange content `json:"groupChange"`
+			} `json:"event"`
+		}
+		if json.Unmarshal(raw, &v) != nil {
+			return ""
+		}
+		b, _ := json.Marshal(v.Event.GroupChange)
+		return string(b)
+	}
+	data, err := stored(id)
+	if err != nil || data == nil {
+		return id, err
+	}
+	own, _ := json.Marshal(envelope)
+	change := key(own)
+	if key(data) == change {
+		return "", nil
+	}
+	event := envelope["event"].(map[string]any)
+	h := sha256.Sum256([]byte(change))
+	suffixed := id + "_" + hex.EncodeToString(h[:4])
+	if data, err = stored(suffixed); err != nil || data != nil {
+		return "", err
+	}
+	event["messageId"] = suffixed
+	return suffixed, nil
 }
 
 const maxOutgoingRetryBytes = 32 << 20

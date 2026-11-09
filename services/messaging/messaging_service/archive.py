@@ -202,6 +202,19 @@ def whatsapp_unreadable_shape(e):
 _SNAPSHOT=object()
 
 
+def group_title_kept(c,account,chat_id,provider_chat,title,observed_at):
+    """ANYM-869: a WhatsApp group title observed at `observed_at` (a page message's sent time, a dialog list's read
+    time) does not replace the stored one while a rename or join row newer than that observation exists: it was
+    read before that rename. A later observation names the group again, so a rename that was never captured
+    (session down) still reaches the title. Only a title that differs from the stored one pays for the lookup."""
+    if not provider_chat.endswith('@g.us') or title in ('',provider_chat):return False
+    stored=c.execute('SELECT title FROM chats WHERE id=%s',(chat_id,)).fetchone()
+    return bool(stored and stored['title']!=title and c.execute('''SELECT 1 FROM messages m
+        JOIN message_metadata md ON md.message=m.id WHERE m.account=%s AND m.chat=%s AND m.sent_at>%s
+        AND md.metadata->'group_change'->>'change' IN ('rename','joined_group') LIMIT 1''',
+        (account,chat_id,observed_at)).fetchone())
+
+
 def ingest_outcome(old,e,retained_snapshot,sender_alias=False,retained_buttons=_SNAPSHOT):
     """What ingest does with the validated candidate `e` against the retained message row `old` (None: a new message)
     and the retained revision's snapshot: (outcome, sender_completed, sender_device_only, unreadable, sent_at_jitter,
@@ -440,9 +453,12 @@ class Archive:
             # A WhatsApp observation that could not be read (kind `unknown`, no text, no attachment)
             # may create its chat but never rewrites the chat's title or type.
             unreadable_shape=whatsapp_unreadable_shape(e)
+            title=e['chat_title']
+            if e['platform']=='whatsapp' and 'group_change' not in e.get('metadata',{}) and group_title_kept(c,aid,cid,e['chat'],title,e['sent_at']):
+                title=e['chat']
             # So does a stored receipt's replay: the chat row may have moved on since (ANYM-796).
             if unreadable_shape or replay:c.execute('''INSERT INTO chats(id,account,title,provider_chat,chat_type)
-                VALUES(%s,%s,%s,%s,%s) ON CONFLICT(id) DO NOTHING''',(cid,aid,e['chat_title'],e['chat'],chat_type))
+                VALUES(%s,%s,%s,%s,%s) ON CONFLICT(id) DO NOTHING''',(cid,aid,title,e['chat'],chat_type))
             else:c.execute('''INSERT INTO chats(id,account,title,provider_chat,chat_type) VALUES(%s,%s,%s,%s,%s)
                 ON CONFLICT(id) DO UPDATE SET
                 title=CASE WHEN excluded.title<>%s AND excluded.title<>'' THEN excluded.title ELSE chats.title END,
@@ -450,7 +466,7 @@ class Archive:
                 WHERE (excluded.title<>%s AND excluded.title<>'' AND chats.title<>excluded.title)
                     OR chats.provider_chat IS DISTINCT FROM excluded.provider_chat
                     OR (excluded.chat_type IS NOT NULL AND chats.chat_type IS DISTINCT FROM excluded.chat_type)''',
-                      (cid,aid,e['chat_title'],e['chat'],chat_type,e['chat'],e['chat']))
+                      (cid,aid,title,e['chat'],chat_type,e['chat'],e['chat']))
             old=c.execute('SELECT * FROM messages WHERE id=%s FOR UPDATE',(mid,)).fetchone()
             # One WhatsApp sender in its phone-number and LID forms (a fenced pair this account recorded)
             # or an unknown (empty) candidate sender is the retained sender for every comparison below:
@@ -553,6 +569,15 @@ class Archive:
                         ELSE excluded.metadata END,
                     observed_at=clock_timestamp()''',
                     (Jsonb(e['metadata']),mid,updated))
+            group=(e.get('metadata') or {}).get('group_change')
+            if outcome=='created' and group and group['change'] in ('rename','joined_group') and group['value']:
+                # ANYM-869: the chat title follows the newest rename or join. An older one (a synced
+                # history stub) never overwrites it; a group the owner joined gets its name at once.
+                c.execute('''UPDATE chats SET title=%s,chat_type=coalesce(chat_type,'group') WHERE id=%s
+                    AND NOT EXISTS(SELECT 1 FROM messages m JOIN message_metadata md ON md.message=m.id
+                        WHERE m.account=%s AND m.chat=%s AND m.sent_at>%s AND m.id<>%s
+                        AND md.metadata->'group_change'->>'change' IN ('rename','joined_group'))''',
+                    (group['value'][:512],cid,aid,cid,e['sent_at'],mid))
             # Publish only after this observation's validated native metadata is
             # present. The event trigger snapshots this exact revision once.
             if outcome in ('created','edited','deleted'):

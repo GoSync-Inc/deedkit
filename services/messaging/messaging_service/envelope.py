@@ -99,6 +99,25 @@ def contact_block(value):
     return result
 
 
+GROUP_CHANGES=('rename','topic','join','leave','add','remove','promote','demote','joined_group')
+MAX_GROUP_CHANGE_PARTICIPANTS=2048
+
+
+def group_change(value):
+    """{change, actor, participants, value}: stored participant IDs; value is the new name or topic text."""
+    if not isinstance(value,dict) or set(value)!={'change','actor','participants','value'} or value['change'] not in GROUP_CHANGES:
+        raise ValueError('invalid_metadata')
+    member=lambda i: isinstance(i,str) and 0<len(i)<=160 and '\x00' not in i
+    if value['actor'] is not None and not member(value['actor']):raise ValueError('invalid_metadata')
+    participants=value['participants']
+    if (not isinstance(participants,list) or len(participants)>MAX_GROUP_CHANGE_PARTICIPANTS
+            or not all(member(i) for i in participants) or len(set(participants))!=len(participants)):
+        raise ValueError('invalid_metadata')
+    named=value['value']
+    if named is not None and (not isinstance(named,str) or '\x00' in named or len(named)>4096):raise ValueError('invalid_metadata')
+    return {'change':value['change'],'actor':value['actor'],'participants':list(participants),'value':named}
+
+
 def text(value, maximum, name, empty=False):
     if not isinstance(value, str) or '\x00' in value or len(value)>maximum or (not empty and not value):
         raise ValueError('invalid_'+name)
@@ -136,7 +155,7 @@ def validate(data):
         metadata=data['metadata']
         if not isinstance(metadata,dict) or set(metadata)-{'reply_to_provider_id','forwarded','media_kind','mentions_owner','reply_to_owner','sender_is_bot','chat_type','sender_identity_basis','is_service','is_self_chat','sender_is_contact','sender_is_business_or_verified',
                 'message_kind','provider_message_type','timestamp_resolution','media_duration_seconds','forward_origin','contact',
-                'web_preview_id','buttons'}:
+                'web_preview_id','buttons','group_change'}:
             raise ValueError('invalid_metadata')
         result['metadata']={}
         for key,value in metadata.items():
@@ -159,6 +178,10 @@ def validate(data):
                 if result['platform']!='telegram':raise ValueError('invalid_metadata')
                 from .message_buttons import validate_buttons
                 value=validate_buttons(value)
+            elif key=='group_change':
+                # A pushed WhatsApp group change (ANYM-869); names and topics are member-set data.
+                if metadata.get('message_kind')!='group_change' or result['platform']!='whatsapp':raise ValueError('invalid_metadata')
+                value=group_change(value)
             elif key=='web_preview_id':
                 # Telegram's link preview page ID in its unsigned 64-bit decimal form (ANYM-611).
                 if value is not None and (type(value) is not str or not re.fullmatch(r'[0-9]{1,20}',value)):
@@ -174,7 +197,7 @@ def validate(data):
                     raise ValueError('invalid_metadata')
                 if key=='sender_identity_basis' and value!='authenticated_self':
                     raise ValueError('invalid_metadata')
-                if key=='message_kind' and value not in ('text','photo','video','voice','audio','document','sticker','location','contact','poll','system','unknown'):
+                if key=='message_kind' and value not in ('text','photo','video','voice','audio','document','sticker','location','contact','poll','system','group_change','unknown'):
                     raise ValueError('invalid_metadata')
                 if key=='timestamp_resolution' and value not in ('second','unknown'):
                     raise ValueError('invalid_metadata')

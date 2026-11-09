@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	waWeb "go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -694,4 +696,225 @@ func captureEnvelope(account string, e *events.Message, owner types.JID, origin 
 		v["editedTimestampMs"] = envelopeEditStamp(editStamp, e.Info.Timestamp.Unix())
 	}
 	return map[string]any{"kind": "whatsapp_event", "account": account, "event": v, "change": change, "observed_at": at, "origin": origin}, nil
+}
+
+// Pushed group notifications (ANYM-869). whatsmeow reports a w:gp2 change as
+// events.GroupInfo and being added to a group as events.JoinedGroup; each named
+// change becomes one service entry in the group's chat. Timer, announce and
+// locked settings are not archived (card boundary).
+var groupChangeOrder = []string{"rename", "topic", "join", "leave", "add", "remove", "promote", "demote"}
+
+const (
+	maxGroupChangeValue        = 4096
+	maxGroupChangeParticipants = 2048
+)
+
+// errGroupChange is the one reason code of a notification the archive cannot
+// represent: it is acknowledged and counted, never redelivered.
+var errGroupChange = errors.New("skipped_group_change")
+
+type groupChange struct {
+	change       string
+	actor        types.JID
+	participants []types.JID
+	value        *string
+}
+
+// groupMembership splits whatsmeow's Join (added or joined) and Leave (removed
+// or left) lists: a member who is the actor, or who used an invite link,
+// joined or left by themselves.
+func groupMembership(self, other string, list []types.JID, actor, actorPN *types.JID, invite bool) []groupChange {
+	var own, by []types.JID
+	for _, j := range list {
+		if invite || actor == nil || ownedIdentity(j, *actor) || (actorPN != nil && ownedIdentity(j, *actorPN)) {
+			own = append(own, j)
+		} else {
+			by = append(by, j)
+		}
+	}
+	var out []groupChange
+	if len(own) > 0 {
+		out = append(out, groupChange{change: self, participants: own})
+	}
+	if len(by) > 0 {
+		out = append(out, groupChange{change: other, participants: by})
+	}
+	return out
+}
+
+func groupInfoChanges(e *events.GroupInfo) []groupChange {
+	found := map[string]groupChange{}
+	if e.Name != nil {
+		v := e.Name.Name
+		found["rename"] = groupChange{change: "rename", value: &v}
+	}
+	if e.Topic != nil {
+		v := ""
+		if !e.Topic.TopicDeleted {
+			v = e.Topic.Topic
+		}
+		found["topic"] = groupChange{change: "topic", value: &v}
+	}
+	members := append(groupMembership("join", "add", e.Join, e.Sender, e.SenderPN, e.JoinReason == "invite"), groupMembership("leave", "remove", e.Leave, e.Sender, e.SenderPN, false)...)
+	if len(e.Promote) > 0 {
+		members = append(members, groupChange{change: "promote", participants: e.Promote})
+	}
+	if len(e.Demote) > 0 {
+		members = append(members, groupChange{change: "demote", participants: e.Demote})
+	}
+	for _, c := range members {
+		found[c.change] = c
+	}
+	out := []groupChange{}
+	for _, name := range groupChangeOrder {
+		if c, ok := found[name]; ok {
+			if e.Sender != nil {
+				c.actor = *e.Sender
+			}
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// historyGroupChanges maps a synced group stub to the entries its live
+// notification produced, so both name the same archive message (card crit. 2).
+// ok is false for a stub that is no group change; it stays a notification.
+func historyGroupChanges(wm *waWeb.WebMessageInfo) (changes []groupChange, ok bool, err error) {
+	params := wm.GetMessageStubParameters()
+	var actor *types.JID
+	if raw := wm.GetParticipant(); raw != "" {
+		j, e := types.ParseJID(raw)
+		if e != nil {
+			return nil, true, errGroupChange
+		}
+		actor = &j
+	}
+	members := func() ([]types.JID, error) {
+		out := make([]types.JID, 0, len(params))
+		for _, raw := range params {
+			j, e := types.ParseJID(raw)
+			if e != nil {
+				return nil, errGroupChange
+			}
+			out = append(out, j)
+		}
+		return out, nil
+	}
+	switch wm.GetMessageStubType() {
+	case waWeb.WebMessageInfo_GROUP_CHANGE_SUBJECT, waWeb.WebMessageInfo_GROUP_CHANGE_DESCRIPTION:
+		if len(params) == 0 {
+			return nil, false, nil
+		}
+		v := params[0]
+		changes = []groupChange{{change: "rename", value: &v}}
+		if wm.GetMessageStubType() == waWeb.WebMessageInfo_GROUP_CHANGE_DESCRIPTION {
+			changes[0].change = "topic"
+		}
+	case waWeb.WebMessageInfo_GROUP_PARTICIPANT_ADD, waWeb.WebMessageInfo_GROUP_PARTICIPANT_INVITE, waWeb.WebMessageInfo_GROUP_PARTICIPANT_REMOVE, waWeb.WebMessageInfo_GROUP_PARTICIPANT_LEAVE:
+		list, e := members()
+		if e != nil {
+			return nil, true, e
+		}
+		switch wm.GetMessageStubType() {
+		case waWeb.WebMessageInfo_GROUP_PARTICIPANT_ADD, waWeb.WebMessageInfo_GROUP_PARTICIPANT_INVITE:
+			changes = groupMembership("join", "add", list, actor, nil, wm.GetMessageStubType() == waWeb.WebMessageInfo_GROUP_PARTICIPANT_INVITE)
+		case waWeb.WebMessageInfo_GROUP_PARTICIPANT_LEAVE:
+			changes = groupMembership("leave", "leave", list, nil, nil, false)
+		default:
+			changes = groupMembership("leave", "remove", list, actor, nil, false)
+		}
+	case waWeb.WebMessageInfo_GROUP_PARTICIPANT_PROMOTE, waWeb.WebMessageInfo_GROUP_PARTICIPANT_DEMOTE:
+		list, e := members()
+		if e != nil {
+			return nil, true, e
+		}
+		changes = []groupChange{{change: "promote", participants: list}}
+		if wm.GetMessageStubType() == waWeb.WebMessageInfo_GROUP_PARTICIPANT_DEMOTE {
+			changes[0].change = "demote"
+		}
+	default:
+		return nil, false, nil
+	}
+	for i := range changes {
+		if actor != nil {
+			changes[i].actor = *actor
+		}
+	}
+	if len(changes) == 0 {
+		return nil, true, errGroupChange
+	}
+	return changes, true, nil
+}
+
+// groupChangeEnvelope builds one archive entry. Its provider ID is derived from
+// the group, the change time and the change, so a redelivery or a synced stub
+// of the same change names the same message. Names and topics are member
+// controlled text: stored as data, bounded like any display text.
+func groupChangeEnvelope(account string, group types.JID, at time.Time, stamp string, c groupChange, owner types.JID, origin string, ownerAliases ...types.JID) (string, map[string]any, error) {
+	chat := LegacyChatID(group)
+	if group.Server != types.GroupServer || !chatPattern.MatchString(chat) || at.Unix() <= 0 || at.Unix() > maxEnvelopeUnix || len(c.participants) > maxGroupChangeParticipants {
+		return "", nil, errGroupChange
+	}
+	if stamp == "" {
+		stamp = strconv.FormatInt(at.Unix(), 10)
+	}
+	id := fmt.Sprintf("group_%s_%s_%s", chat, stamp, c.change)
+	var actor any
+	sender := ""
+	if !c.actor.IsEmpty() {
+		sender = LegacyChatID(c.actor)
+		if !envelopeIdentifier(sender, maxEnvelopeSender) {
+			return "", nil, errGroupChange
+		}
+		actor = sender
+	}
+	seen := map[string]bool{}
+	participants := []string{}
+	for _, j := range c.participants {
+		p := LegacyChatID(j)
+		if j.IsEmpty() || !envelopeIdentifier(p, maxEnvelopeSender) {
+			return "", nil, errGroupChange
+		}
+		if !seen[p] {
+			seen[p] = true
+			participants = append(participants, p)
+		}
+	}
+	slices.Sort(participants)
+	var value any
+	if c.value != nil {
+		value = envelopeText(*c.value, maxGroupChangeValue)
+	}
+	h := sha256.Sum256(nil)
+	formatting := map[string]any{"version": 1, "state": "wire_observed", "basis": "whatsapp_native_wire", "wire_sha256": hex.EncodeToString(h[:]), "entities": nil, "unsupported_entities": []any{}, "warnings": []string{"syntax_interpretation_unknown"}}
+	fromMe := !c.actor.IsEmpty() && ownedIdentity(c.actor, append(ownerAliases, owner)...)
+	event := map[string]any{"chatId": chat, "chatName": chat, "messageId": id, "messageType": "group_change", "timestampResolution": "second", "durationSeconds": nil, "isService": true, "isSelfChat": false, "senderId": sender, "senderName": "", "body": "", "timestamp": at.Unix(), "fromMe": fromMe, "hasMedia": false, "filename": nil, "mimetype": nil, "filesize": nil, "replyToId": nil, "mentionsOwner": nil, "replyToOwner": nil, "forwarded": nil, "mediaKind": nil, "editedTimestampMs": nil, "identityObservations": []any{}, "formatting": formatting,
+		"groupChange": map[string]any{"change": c.change, "actor": actor, "participants": participants, "value": value}}
+	if origin == "history" {
+		origin = "backfill"
+	}
+	return id, map[string]any{"kind": "whatsapp_event", "account": account, "event": event, "change": "message", "observed_at": time.Now().UTC().Format(time.RFC3339Nano), "origin": origin}, nil
+}
+
+// joinedGroupChange: the owner was added to a group. whatsmeow carries no
+// notification time, so the group's participant version names the join; the
+// entry is stamped with the time it was observed.
+func joinedGroupChange(e *events.JoinedGroup) (groupChange, string) {
+	c := groupChange{change: "joined_group"}
+	name := e.GroupName.Name
+	c.value = &name
+	if e.Sender != nil {
+		c.actor = *e.Sender
+	}
+	for _, part := range e.Participants {
+		c.participants = append(c.participants, part.JID)
+	}
+	stamp := ""
+	if v := e.ParticipantVersionID; v != "" && len(v) <= 64 && chatPattern.MatchString(v+"@g.us") {
+		stamp = v
+	} else if !e.GroupCreated.IsZero() && e.GroupCreated.Unix() > 0 {
+		stamp = strconv.FormatInt(e.GroupCreated.Unix(), 10)
+	}
+	return c, stamp
 }

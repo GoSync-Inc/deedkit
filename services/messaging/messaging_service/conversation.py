@@ -9,10 +9,10 @@ import re
 
 from .policy import scope_filter
 
-KINDS=frozenset(('text','photo','video','voice','audio','document','sticker','location','contact','poll','system','unknown'))
+KINDS=frozenset(('text','photo','video','voice','audio','document','sticker','location','contact','poll','system','group_change','unknown'))
 LABELS={'photo':'Фото','video':'Видео','voice':'Голосовое','audio':'Аудио','document':'Документ',
     'sticker':'Стикер','location':'Местоположение','contact':'Контакт','poll':'Опрос',
-    'system':'Служебное событие','unknown':'Сообщение неизвестного типа'}
+    'system':'Служебное событие','group_change':'Изменение группы','unknown':'Сообщение неизвестного типа'}
 # Every character str.splitlines breaks on: extracted text must not start a second line (ANYM-664).
 _LINE_BREAKS=re.compile('[\\n\\r\\v\\f\\x1c-\\x1e\\x85\\u2028\\u2029]+')
 

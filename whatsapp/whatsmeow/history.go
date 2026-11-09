@@ -284,6 +284,21 @@ func (p *Provider) captureHistory(data *waHistorySync.HistorySync) error {
 				}
 				continue
 			}
+			if wm.GetMessage() == nil && chat.Server == types.GroupServer {
+				// A synced group stub names the same entry as its live change (ANYM-869).
+				if changes, ok, err := historyGroupChanges(wm); ok {
+					if err == nil {
+						err = p.Capture.PutGroupChanges(chat, time.Unix(int64(wm.GetMessageTimestamp()), 0), "", changes, "history")
+					}
+					if skippableCapture(err) {
+						err = p.Capture.skip(err)
+					}
+					if err != nil {
+						return err
+					}
+					continue
+				}
+			}
 			var message *events.Message
 			if wm.GetMessage() == nil && wm.GetMessageStubType() != 0 {
 				message = &events.Message{SourceWebMsg: wm, Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: chat, IsGroup: chat.Server == types.GroupServer, IsFromMe: wm.GetKey().GetFromMe()}, ID: wm.GetKey().GetID(), Timestamp: time.Unix(int64(wm.GetMessageTimestamp()), 0)}}

@@ -55,6 +55,16 @@ def seen_origin(selected, origin, kind, sent_at, committed_at):
 
 def origin_selected(origin, selected):
     return not RECOVERED_SELECTORS.isdisjoint(selected) if origin == 'live_recovered' else origin in selected
+
+
+def quiet_group_change(snapshot):
+    """ANYM-869: a WhatsApp group change row (rename, join, add...) wakes no subscription; one 300-member group's
+    joins would wake every agent. Only `joined_group` (a new chat for the owner) wakes as a message does. The
+    opt-in for the other changes belongs to the service-kinds card (ANYM-857). Rows of any other kind are untouched."""
+    group = (snapshot.get('metadata') or {}).get('group_change')
+    return isinstance(group, dict) and group.get('change') != 'joined_group'
+
+
 WAKE_RULES = frozenset(('incoming_message', 'owner_mention', 'reply_to_owner', 'reply_to_confirmed_send',
     'reply_to_own_send'))
 # ANYM-522: the operator's switch for dynamic sources (set-dynamic-subscriptions); creation reads it under
@@ -968,6 +978,8 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                     matches = selected
                     if matches and event['kind'] not in selector['kinds'] and (
                             IMPLIED_KINDS.get(event['kind']) not in selector['kinds']):
+                        matches, metric = False, 'left_out_kind'
+                    if matches and quiet_group_change(snapshot):
                         matches, metric = False, 'left_out_kind'
                     if matches and not origin_selected(event['origin'], selector['origins']):
                         matches, metric = False, 'left_out_origin'

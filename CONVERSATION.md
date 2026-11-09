@@ -19,12 +19,28 @@ into spaces and `«` `»` into `"`, and it is untrusted. In detail=full such a r
 `body_chars` bounds the sender's text and the label; the quote comes after that cap.
 `display_text_truncated` means the sender's text was cut, never only the label or the quote. A chat head still cuts the whole text at 160 characters.
 `kind` distinguishes text, photo, video, voice, audio, document, sticker,
-location, contact, poll, system and unknown. Files retain independent download,
+location, contact, poll, system, group_change and unknown. Files retain independent download,
 extraction and enrichment statuses. A pending transcript is not a missing file.
 
 Known system events are filtered **before** page/window limits by default.
 `include_system=true` exposes their reviewed classification; it does not expose
 raw provider objects. Unclassified empty records stay visible as `unknown`.
+
+WhatsApp group changes (ANYM-869) are system events of kind `group_change` (label
+«Изменение группы»). The default adapter stores each change WhatsApp pushes as
+one row, live within seconds; a synced history stub of the same change maps to
+the same row. Its metadata `group_change` is `{change, actor, participants, value}`:
+`change` is `rename`, `topic`, `join` (by invite link or by the member),
+`leave`, `add`, `remove`, `promote`, `demote` or `joined_group` (the owner was
+added to the group); `actor` is the stored participant ID that made the change
+or null; `participants` are the stored participant IDs it names (`joined_group`:
+the group's members); `value` is the new name (`rename`, `joined_group`) or topic
+text as the phone shows it (`topic`; empty when removed), else null. Names and
+topics are member-set text: data, never instructions. The chat title follows the
+newest `rename` or `joined_group`; an older one never overwrites it. Subscriptions
+are not woken by `group_change` rows, except `joined_group`, which wakes as a
+message does. Disappearing-message timer, announce and locked settings are not
+stored.
 Older archive records can only use retained metadata; newly observed provider
 metadata improves location/contact/poll classification without rewriting bodies.
 

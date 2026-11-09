@@ -290,6 +290,12 @@ func (p *Provider) start(ctx context.Context) (result any, err error) {
 			}
 		case *events.Receipt, *events.MarkChatAsRead, *events.AppStateSyncError:
 			return p.handleReadEvent(e)
+		case *events.GroupInfo, *events.JoinedGroup:
+			if !p.identityOK() {
+				p.fail("whatsapp_identity_mismatch")
+				return false
+			}
+			return p.handleGroupEvent(e)
 		}
 		return true
 	})
@@ -565,6 +571,62 @@ func (p *Provider) handleMessage(e *events.Message) error {
 		return nil
 	}
 	return p.Capture.putOrSkip(e, "live")
+}
+
+// handleGroupEvent captures a pushed group change (ANYM-869). A notification
+// the archive cannot represent is counted under skipped_group_change and
+// acknowledged (true), so whatsmeow never redelivers it and the handler goes on.
+// Only a store, disk or spool failure returns false, as for a message.
+func (p *Provider) handleGroupEvent(value any) bool {
+	err := p.captureGroupEvent(value)
+	if skippableCapture(err) {
+		err = p.Capture.skip(err)
+	}
+	if err != nil {
+		p.captureFailure(err)
+		return false
+	}
+	return true
+}
+
+func (p *Provider) captureGroupEvent(value any) error {
+	var group types.JID
+	var at time.Time
+	var stamp string
+	var changes []groupChange
+	switch e := value.(type) {
+	case *events.GroupInfo:
+		if e == nil {
+			return errGroupChange
+		}
+		group, at, changes = e.JID, e.Timestamp, groupInfoChanges(e)
+	case *events.JoinedGroup:
+		if e == nil {
+			return errGroupChange
+		}
+		var c groupChange
+		c, stamp = joinedGroupChange(e)
+		if stamp == "" {
+			return errGroupChange
+		}
+		group, at, changes = e.JID, time.Now(), []groupChange{c}
+	default:
+		return nil
+	}
+	if group.Server != types.GroupServer || at.Unix() <= 0 {
+		return errGroupChange
+	}
+	if len(changes) == 0 {
+		return nil
+	}
+	policy, err := p.policy()
+	if err != nil {
+		return err
+	}
+	if !policy.Allows(LegacyChatID(group)) {
+		return nil
+	}
+	return p.Capture.PutGroupChanges(group, at, stamp, changes, "live")
 }
 
 func (p *Provider) retryAllowed(receipt *events.Receipt) bool {
