@@ -24,7 +24,7 @@ SPEC_REF = re.compile(r'ANYM-[1-9][0-9]{0,5}')
 # lists (the gateway checks those against its catalog), so another module's tool is accepted by shape alone.
 # ANYM-670: its own tools are the operation keys plus the risk-class tools of messenger_operations.OPERATION_TOOLS.
 GATEWAY_PREFIX = 'messages_'
-OTHER_MODULE_TOOL = re.compile(r'(calendar|calls|platform|recordings)_[a-z0-9_]{1,120}')
+OTHER_MODULE_TOOL = re.compile(r'(agents|calendar|calls|platform|recordings)_[a-z0-9_]{1,120}')
 UUID = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 # A submission transaction ends within this bound or is aborted, never committed late (ANYM-265). The export
 # overlap minimum (2 minutes) exceeds it plus the 5 s statements that authorize the key before it starts.

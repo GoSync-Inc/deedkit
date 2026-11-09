@@ -3,6 +3,7 @@ import json
 import pytest
 
 from deedkit_agent_runner import engines, journal
+from deedkit_agent_runner.runner import iso
 
 from support import auth, fields, make_runner, run_task
 
@@ -154,3 +155,29 @@ def test_a_bad_cursor_is_422_and_a_running_task_says_wait(tmp_path):
         assert client.get(f"/v1/tasks/{task['id']}/log?cursor=%%%", headers=auth("a_read")).status_code == 422
         runner.stop(task["id"])
     assert runner.join(30)
+
+
+# spec: ANYM-820
+def test_a_task_names_the_tasks_ahead_of_it_and_an_estimated_finish(client, runner, clock):
+    def get(task):
+        return client.get(f"/v1/tasks/{task['id']}", headers=auth("a_read")).json()
+
+    def at(seconds):
+        return iso(clock.now + seconds)
+
+    first = client.post("/v1/tasks", json=fields(), headers=auth("a_run")).json()
+    second = client.post("/v1/tasks", json=fields(max_minutes=30), headers=auth("a_run")).json()
+    other = client.post("/v1/tasks", json=fields("codex"), headers=auth("b_run")).json()
+    assert (first["ahead_of_you"], first["estimated_finish_by"]) == (0, at(45 * 60))
+    assert (second["ahead_of_you"], second["estimated_finish_by"]) == (1, at(45 * 60 + 30 * 60))
+    assert (other["ahead_of_you"], other["estimated_finish_by"]) == (0, at(45 * 60))  # its own engine's queue
+    assert second["expected_finish_by"] is None  # the existing field keeps its meaning: set once started
+    assert runner.store.claim(first["id"], "agent-task-" + first["id"]) and runner.store.commit_launch(
+        first["id"], lambda: False)
+    clock.advance(600)
+    running, waiting = get(first), get(second)
+    assert (running["ahead_of_you"], running["estimated_finish_by"]) == (0, running["expected_finish_by"])
+    assert (waiting["ahead_of_you"], waiting["estimated_finish_by"]) == (1, at(45 * 60 - 600 + 30 * 60))
+    runner.store.finish(second["id"], "stopped", "stop_requested")
+    assert (get(second)["ahead_of_you"], get(second)["estimated_finish_by"]) == (None, None)
+    runner.store.finish(first["id"], "stopped", "stop_requested")

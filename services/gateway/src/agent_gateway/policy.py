@@ -15,6 +15,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from .catalog import CATALOG, ACTIONS, routed
 
 
+# The deployable modules. ANYM-820: a build that knows `agents` must serve before a policy names it, and on a
+# rollback a policy without it goes back first: an older build refuses the whole policy (policy_unavailable).
+MODULES = frozenset({"calendar", "messaging", "calls", "recordings", "agents"})
+
+
 class Denied(Exception):
     def __init__(self, code="not_found_or_forbidden", status=403):
         self.code, self.status = code, status
@@ -122,7 +127,7 @@ class Policy:
             ):
                 raise ValueError
             modules = doc["deployment"]["modules"]
-            if set(modules) - {"calendar", "messaging", "calls", "recordings"} or len(modules) != len(set(modules)):
+            if set(modules) - MODULES or len(modules) != len(set(modules)):
                 raise ValueError
             if set(modules) - doc["deployment"]["backends"].keys():
                 raise ValueError
@@ -146,7 +151,7 @@ class Policy:
                         or download.fragment
                     ):
                         raise ValueError
-            ids, keys = set(), set()
+            ids, keys, runner_keys = set(), set(), set()
             for profile in doc["profiles"].values():
                 if set(profile["tools"]) - CATALOG.keys() or len(profile["tools"]) != len(
                     set(profile["tools"])
@@ -168,6 +173,13 @@ class Policy:
                     raise ValueError
                 if any(not Path(v["key_file"]).is_absolute() for v in agent["credentials"].values()):
                     raise ValueError
+                runner = agent["credentials"].get("agents")
+                if runner is not None:
+                    # ANYM-820: the runner takes the principal from its key, so two principals sharing one runner
+                    # key would see each other's tasks.
+                    if runner["key_sha256"] in runner_keys:
+                        raise ValueError
+                    runner_keys.add(runner["key_sha256"])
             self.revision, self.digest = doc["revision"], digest
             return doc
         except (OSError, ValueError, TypeError, ValidationError, KeyError):

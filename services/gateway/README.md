@@ -133,7 +133,7 @@ An agent that needs only some modules can load fewer tools. Selection only narro
 no tool, scope or action.
 
 - **Connection path.** `POST /mcp/modules/<m>[,<m>...]` with `m` from `messaging`, `calendar`, `calls`,
-  `recordings` is the same MCP endpoint as `/mcp`. Its `tools/list` and `tools/call` cover `platform_capabilities`,
+  `recordings`, `agents` is the same MCP endpoint as `/mcp`. Its `tools/list` and `tools/call` cover `platform_capabilities`,
   `platform_select_modules` (when the profile lists it) and the named modules' tools, intersected with
   everything that limits the key on `/mcp`. Order does not matter (`calendar,messaging` and
   `messaging,calendar` are one path, reported as the sorted form). An unknown or repeated name, an empty list
@@ -204,6 +204,40 @@ call. The detail moved to the property descriptions of the input schema.
 - **Transition.** A host that uses `messages_send_message`, `messages_preview_message`,
   `messages_get_send_status` or the low-level call tools has two choices. It can move to the twin, or it can
   change its connector URL to a path with `advanced`. A key without the twin sees no change.
+
+### The `agents` module (ANYM-820)
+
+Six tools in front of the agent runner (`services/agent-runner`, ANYM-819), over HTTP only:
+`agents_capabilities`, `agents_list_tasks`, `agents_get_task` and `agents_read_task_log` need `agents:read`;
+`agents_start_task` and `agents_stop_task` need `agents:run`. A tool is listed only when it is in the
+principal's profile, `deployment.modules` lists `agents`, the principal has an `agents` credential and its
+`grants.agents` hold the scope. Each principal's `agents` credential is its own runner key, from which the
+runner takes the principal; a policy in which two principals share one runner key is refused. Listing and
+admission ask the runner nothing (the runner checks its own key's read and run operations on every call), so
+`backend_states.agents` reads `ready` whenever the key file is valid; `agents_capabilities` reads the runner.
+
+- The runner's routes: `POST /v1/tasks`, `GET /v1/tasks?request_id=`, `GET /v1/tasks/{id}`,
+  `GET /v1/tasks/{id}/log`, `POST /v1/tasks/{id}/stop`, `GET /v1/capabilities`. Only UUIDs from the
+  arguments reach a path. Results keep only the fields `adapters/agents.py` names; no runner text is relayed.
+- Another principal's task, an unused `request_id` and a `continue_task_id` that is not the caller's finished
+  task with a branch are all `not_found_or_forbidden`.
+- Refusals: `runner_busy` (`retry_after_s`), `runner_paused`, `daily_cap_reached` (`next_slot_at`),
+  `request_id_conflict`, `engine_not_configured` and `host_check_failed`, each with a `next_action`. A task
+  that failed `login_required` or `host_busy` names its own `next_action`.
+- A start or stop the runner may have received (the connection broke after the request was written, a timeout,
+  or an answer of unknown shape) is `mutation_outcome_unknown` with `outcome: unknown`; a start names
+  `next_action: "agents_list_tasks with this request_id"`. The gateway never sends it again. A refused
+  connection is `backend_unavailable` with `operation_sent: false`.
+- No grants in code or in checked-in files: the enable (ANYM-821) grants the tools only to the owner's
+  assistant principals the owner names.
+
+Activation: the build with this module serves (`platform_capabilities.gateway.build` equals its SHA); then a
+policy with `agents` in `deployment.modules`, its backend and the named principals' credentials and grants
+passes `--check`, gets `revision` + 1 and replaces the live file atomically; then the gateway restarts (a new
+backend URL needs a restart). Rollback: first a policy without `agents` (`revision` + 1, restart), then any code
+rollback. A build without this module refuses a policy that names `agents` and answers every request
+`policy_unavailable`. While the runner is down the other modules keep working and `agents_*` return
+`backend_unavailable`.
 
 Module capabilities preserve the backend `principal` and add `backend_principal`
 and `gateway_principal`; platform `principal` remains the gateway identity.

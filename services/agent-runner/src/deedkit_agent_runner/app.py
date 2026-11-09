@@ -95,7 +95,7 @@ def create_app(runner, keys):
             task, created = await run_in_threadpool(runner.submit, key.principal, key.key_id, task_in.fields())
         except Refused as refusal:
             return error(refusal.status, refusal.code, **refusal.extra)
-        return JSONResponse(view(task, runner.clock), status_code=201 if created else 200)
+        return JSONResponse(view(task, runner.clock, await run_in_threadpool(runner.store.ahead, task)), status_code=201 if created else 200)
 
     @app.get("/v1/tasks")
     async def by_request(request: Request, request_id: str = ""):
@@ -107,7 +107,7 @@ def create_app(runner, keys):
         except ValueError:
             return error(422, "invalid_request", fields=["request_id"])
         task = await run_in_threadpool(runner.store.by_request, key.principal, request_id)
-        return JSONResponse(view(task, runner.clock)) if task else error(404, "not_found")
+        return JSONResponse(view(task, runner.clock, await run_in_threadpool(runner.store.ahead, task))) if task else error(404, "not_found")
 
     @app.get("/v1/tasks/{task_id}")
     async def get(request: Request, task_id: str):
@@ -115,7 +115,7 @@ def create_app(runner, keys):
         if key is None:
             return refused
         task = await run_in_threadpool(own, task_id, key)
-        return JSONResponse(view(task, runner.clock)) if task else error(404, "not_found")
+        return JSONResponse(view(task, runner.clock, await run_in_threadpool(runner.store.ahead, task))) if task else error(404, "not_found")
 
     @app.get("/v1/tasks/{task_id}/log")
     async def task_log(request: Request, task_id: str, cursor: str = "", raw: bool = False):
@@ -137,7 +137,7 @@ def create_app(runner, keys):
         if not task:
             return error(404, "not_found")
         task = await run_in_threadpool(runner.stop, task["id"], key.key_id)
-        return JSONResponse(view(task, runner.clock))
+        return JSONResponse(view(task, runner.clock, await run_in_threadpool(runner.store.ahead, task)))
 
     @app.get("/v1/capabilities")
     async def caps(request: Request):

@@ -1,4 +1,10 @@
 export type ToolName =
+  | 'agents_capabilities'
+  | 'agents_get_task'
+  | 'agents_list_tasks'
+  | 'agents_read_task_log'
+  | 'agents_start_task'
+  | 'agents_stop_task'
   | 'recordings_archive_status'
   | 'recordings_audio'
   | 'recordings_context'
