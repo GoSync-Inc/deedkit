@@ -248,20 +248,20 @@ def _alias_pairs(accounts,c,p,chats=None):
     return aliases,listed
 
 
-# ANYM-878: the activity page reads the newest qualifying messages in windows of this many rows per listed row,
-# growing 4x up to the row cap; past it, or past PAGE_CANDIDATE_CAP x (limit+1) candidates, the page falls back to the
-# per-chat plan.
+# ANYM-878: the activity page examines the newest messages in windows of this many rows per listed row, growing 4x up
+# to the cap, so a filter that recent messages rarely meet reads a bounded index range, not the archive. Past the cap,
+# or past PAGE_CANDIDATE_CAP x (limit+1) candidates, the page falls back to the per-chat plan.
 PAGE_WINDOW=4
-PAGE_WINDOW_CAP=16384
+PAGE_WINDOW_CAP=4096
 PAGE_CANDIDATE_CAP=4
 
 
 def _page_first(c,p,clauses,args,*,accounts,limit,last_sql,last_filter,pos,lower,upper,exclude_chats):
     """ANYM-878: an activity page's chats from the newest qualifying messages, not from a head read per catalog chat.
 
-    The window walks the newest messages that the page's own head filter (`last_filter`) and chat clauses keep. Floor
-    is the time at which its (limit+1)th distinct chat first appears; every chat with a qualifying message at or after
-    the floor (ties included) is a candidate. Each candidate's exact head is then read as the per-chat plan does. A chat
+    The window examines the newest `size` messages in scope and keeps those the page's own head filter (`last_filter`)
+    and chat clauses keep. Floor is the time at which its (limit+1)th distinct chat first appears; every chat with a
+    qualifying message at or after the floor (ties included) is a candidate. Each candidate's exact head is then read as the per-chat plan does. A chat
     outside the candidates has no qualifying message at or after the floor, so its head is older than every candidate's;
     a candidate list that still yields limit+1 rows after the cursor and the bounds is therefore exactly the page.
     Anything the window cannot prove (an exhausted archive, chats without messages, a deep cursor) returns None and the
@@ -277,9 +277,15 @@ def _page_first(c,p,clauses,args,*,accounts,limit,last_sql,last_filter,pos,lower
     if at is not None:bounds.append('m.sent_at<=%s');bound_args.append(at)
     if upper:bounds.append('m.sent_at<%s');bound_args.append(upper)
     if lower:bounds.append('m.sent_at>=%s');bound_args.append(lower)
-    window_from=(' FROM messages m JOIN chats c ON c.id=m.chat AND c.account=m.account LEFT JOIN message_metadata md'
-        ' ON md.message=m.id AND md.revision=m.revision WHERE '+' AND '.join([msg_scope,'NOT m.deleted',last_filter,*clauses,*bounds]))
-    window_args=[*msg_args,*args,*bound_args]
+    scoped=' AND '.join([msg_scope,'NOT m.deleted',*bounds])
+    kept=' JOIN chats c ON c.id=m.chat AND c.account=m.account LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision WHERE '+' AND '.join([last_filter,*clauses])
+    # The examined rows are the newest in scope (message_live_date); filters apply after the LIMIT, so they never widen it.
+    window_sql=('WITH examined AS MATERIALIZED (SELECT m.id,m.chat,m.account,m.sent_at,m.revision,m.body,m.deleted FROM messages m'
+        ' WHERE '+scoped+' ORDER BY m.sent_at DESC,m.id DESC LIMIT %s) SELECT e.n,e.oldest,q.chat,q.sent_at FROM'
+        ' (SELECT count(*) AS n,min(sent_at) AS oldest FROM examined) e LEFT JOIN LATERAL (SELECT m.chat,m.sent_at,m.id FROM examined m'+
+        kept+') q ON true ORDER BY q.sent_at DESC,q.id DESC')
+    window_args=[*msg_args,*bound_args]
+    tie_sql='SELECT DISTINCT m.chat FROM messages m'+kept+' AND '+scoped+' AND m.sent_at=%s'
     exact=[*clauses,'c.id=ANY(%s)','NOT c.id=ANY(%s)']
     exact_tail,exact_args=[],[]
     if pos is not None:
@@ -292,22 +298,22 @@ def _page_first(c,p,clauses,args,*,accounts,limit,last_sql,last_filter,pos,lower
     # need: distinct window chats the floor must cover. It starts at limit+1 and at least doubles while a candidate list
     # falls short (chats the cursor or a bound excludes, hidden pair chats): a deeper floor before a wider window, and at
     # most three tries before the fallback, so a deep cursor costs today's plan plus at most 7x(limit+1) head reads.
-    size,need,rows,first=PAGE_WINDOW*(limit+1),limit+1,None,{}
+    size,need,examined,first=PAGE_WINDOW*(limit+1),limit+1,None,{}
     while need<=PAGE_CANDIDATE_CAP*(limit+1):
         if len(first)<need:
-            if rows is not None and len(rows)<size:return None
-            if rows is not None:size*=4
+            if examined is not None and examined['n']<size:return None
+            if examined is not None:size*=4
             if size>PAGE_WINDOW_CAP:return None
-            rows=c.execute('SELECT m.chat,m.sent_at'+window_from+' ORDER BY m.sent_at DESC,m.id DESC LIMIT %s',[*window_args,size]).fetchall()
-            first={}
-            for row in rows:first.setdefault(row['chat'],row['sent_at'])
+            rows=c.execute(window_sql,[*window_args,size,*args]).fetchall()
+            examined=rows[0];first={}
+            for row in rows:
+                if row['chat'] is not None:first.setdefault(row['chat'],row['sent_at'])
             continue
         floor=list(first.values())[need-1]
         found=[chat for chat,t in first.items() if t>=floor]
-        if rows[-1]['sent_at']==floor:
+        if examined['oldest']==floor:
             # The window may end inside the floor's tie; the rest of the tie is one index range.
-            found+=[r['chat'] for r in c.execute('SELECT DISTINCT m.chat'+window_from+' AND m.sent_at=%s',
-                [*window_args,floor]) if r['chat'] not in first]
+            found+=[r['chat'] for r in c.execute(tie_sql,[*args,*msg_args,*bound_args,floor]) if r['chat'] not in first]
         aliases,listed=_alias_pairs(accounts,c,p,chats=[*found,*(exclude_chats or [])])
         # The listed chat of a pair hides the other one; an excluded hidden chat excludes its listed chat too.
         hidden={v['chat']['id']:shown for shown,v in listed.items()}

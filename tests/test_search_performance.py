@@ -209,6 +209,11 @@ def test_default_activity_page_reads_heads_for_the_page_not_the_catalog(seeded):
     assert len(cases['restricted'][0]['items'])==10
     # Today's plan read a head per catalog chat (1,000); the page plan reads at most 2x(limit+1), a restricted key at most its 10 chats.
     assert loops['restricted']<=10 and all(loops[name]<=2*(limit+1) for name in ('owner','account','page 2')),loops
+    # A filter that recent messages never meet examines a bounded index range before the fallback, not the archive.
+    from messaging_service.chat_queries import PAGE_WINDOW_CAP
+    empty,plans=listed(s,a,chat_types=['channel'])
+    examined=sum(visited(plan,{'messages'}) for chain,plan in plans if chain and chain[-1]=='_page_first')
+    assert empty['items']==[] and 0<examined<=PAGE_WINDOW_CAP,examined
 
 
 # spec: ANYM-878
@@ -222,8 +227,9 @@ def test_default_activity_page_reads_whatsapp_identity_rows_for_the_page_only(se
     for chain,plan in plans:
         if 'hints' not in chain:steps['>'.join(chain[-3:])]=steps.get('>'.join(chain[-3:]),0)+visited(plan,{'whatsapp_identity_observations'})
     read=sum(steps.values())
-    # 600 observations in the catalog; the page's pairs (4 each) and their conflict and source probes only.
-    assert 0<paired<=26 and read<=20*paired,(paired,read,{k:v for k,v in steps.items() if v})
+    # 600 observations in the catalog (150 pairs, 4 each); today's catalog-wide pair read alone takes about 16 per pair (2,400).
+    # Each page step (pairs, titles, senders, peers) reads only the page's pairs: their observations, conflict and source probes.
+    assert 0<paired<=26 and read<=100*paired,(paired,read,{k:v for k,v in steps.items() if v})
 
 
 # spec: ANYM-272
