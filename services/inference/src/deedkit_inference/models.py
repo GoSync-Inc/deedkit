@@ -23,6 +23,10 @@ REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
 KEY = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}/[a-z0-9_]{1,32}$")
 ARTIFACT = re.compile(r"^[a-z0-9_]{1,16}$")
+#: An artifact's folder inside its repository (`path`, ANYM-850): relative, plain names, at most 4 parts.
+REPO_PATH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}(/[A-Za-z0-9][A-Za-z0-9._-]{0,63}){0,3}$")
+#: A separate engine environment (`environments`, ANYM-850: Docling runs from its own venv).
+ENVIRONMENT = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 ALLOWED_SUFFIXES = (".safetensors", ".onnx", ".npz", ".json", ".txt", ".jinja")
 #: Configuration keys that make a loader execute code from the model directory or the network.
 CODE_KEYS = frozenset({"auto_map", "model_file", "custom_code", "trust_remote_code", "custom_pipelines", "code_revision"})
@@ -59,8 +63,14 @@ def parse_models(raw):
     try:
         doc = json.loads(raw, object_pairs_hook=_unique)
         packages, phases = doc["packages"], doc["phases"]
-        assert doc["version"] == 1 and set(doc) == {"version", "packages", "phases"}
+        environments = doc.get("environments", {})
+        assert doc["version"] == 1 and set(doc) - {"environments"} == {"version", "packages", "phases"}
         assert isinstance(packages, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in packages.items())
+        # The package pins of an engine that runs from its own venv (ANYM-850), apart from the service's own.
+        assert isinstance(environments, dict) and all(
+            isinstance(name, str) and ENVIRONMENT.fullmatch(name) and isinstance(pins, dict) and pins
+            and all(isinstance(k, str) and isinstance(v, str) for k, v in pins.items())
+            for name, pins in environments.items())
         assert isinstance(phases, dict) and phases
     except (ValueError, KeyError, TypeError, AssertionError):
         raise ModelError("models_invalid") from None
@@ -68,8 +78,11 @@ def parse_models(raw):
         if not KEY.fullmatch(key) or not isinstance(artifacts, dict) or not artifacts:
             raise ModelError("models_invalid", key)
         for name, entry in artifacts.items():
-            if not ARTIFACT.fullmatch(name) or not isinstance(entry, dict) or set(entry) != {"repo", "revision", "files"}:
+            if not ARTIFACT.fullmatch(name) or not isinstance(entry, dict) or set(entry) - {"path"} != {"repo", "revision", "files"}:
                 raise ModelError("models_invalid", key)
+            if "path" in entry and not (isinstance(entry["path"], str) and REPO_PATH.fullmatch(entry["path"])
+                                        and ".." not in entry["path"].split("/")):
+                raise ModelError("models_invalid", f"{key}/{name}/path")
             if not isinstance(entry["revision"], str) or not REVISION.fullmatch(entry["revision"]):
                 raise ModelError("revision_not_pinned", f"{key}/{name}")
             if not isinstance(entry["repo"], str) or not REPO.fullmatch(entry["repo"]):

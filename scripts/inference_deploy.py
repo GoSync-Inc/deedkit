@@ -13,7 +13,9 @@ A deploy never cuts a job. In this order, over ssh as the mini's admin account (
  2. take the deploy lock (a flock held by a process on the mini for the length of the ssh session: two deploys
     cannot run, and a dropped connection frees it);
  3. unpack `services/inference` of that commit into `releases/<sha>/` and `uv sync --locked --group engines` there,
-    while the running release keeps serving;
+    then `uv sync --locked --compile-bytecode` in its `docling/` (ANYM-850: the Docling engine's own venv; the bytecode
+    is compiled here because the service cannot write the release, and a cold child without it imports for about a
+    minute), while the running release keeps serving; `.ready` is written only after both;
  4. SIGTERM the service: admission closes at once, queued and running jobs finish, it exits 0 (ANYM-682). The
     script waits up to the drain limit and refuses to kill (`--force` kills after it). The LaunchDaemon's KeepAlive
     {SuccessfulExit: false} does not restart a clean exit; after the service's own drain limit it exits 3 and launchd
@@ -219,7 +221,9 @@ class SshMini:
 
     def sync(self, sha: str) -> None:
         directory = f'{self.home}/releases/{sha}'
-        script = f'cd {directory} && {UV} sync --locked --group engines --python {PYTHON} && touch {directory}/.ready'
+        script = (f'cd {directory} && {UV} sync --locked --group engines --python {PYTHON} && '
+                  f'cd {directory}/docling && {UV} sync --locked --compile-bytecode --python {PYTHON} && '
+                  f'touch {directory}/.ready')
         # An empty environment and no uv configuration file: uv runs unsandboxed as the service user, and every file in
         # that user's home (uv.toml, a proxy setting) is something the sandboxed service could once have written.
         command = sudo('env', '-i', f'HOME={self.home}', 'PATH=/opt/homebrew/bin:/usr/bin:/bin',

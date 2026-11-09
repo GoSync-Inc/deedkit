@@ -12,6 +12,7 @@ from .errors import ServiceError
 
 FIELD_LIMIT = 1024
 AUDIO_FIELDS = ("model", "language", "response_format")
+DOCUMENT_FIELDS = ("model",)
 
 
 def too_large():
@@ -47,6 +48,17 @@ async def stream_to_file(request, path, *, limit, declared, seconds):
 
 
 async def read_audio_form(request, directory, *, limit, declared, seconds):
+    return await read_file_form(request, directory, limit=limit, declared=declared, seconds=seconds,
+                                allowed=AUDIO_FIELDS, file_name="audio.bin")
+
+
+async def read_document_form(request, directory, *, limit, declared, seconds):
+    """ANYM-850: the same form with a `file` and a `model` only."""
+    return await read_file_form(request, directory, limit=limit, declared=declared, seconds=seconds,
+                                allowed=DOCUMENT_FIELDS, file_name="document.bin")
+
+
+async def read_file_form(request, directory, *, limit, declared, seconds, allowed, file_name):
     """Parse multipart/form-data while streaming: the `file` part goes to a fixed name in `directory` (its own
     file name is never used), the other parts are small strings. Returns (fields, file_path, total_bytes)."""
     content_type = request.headers.get("content-type", "")
@@ -56,7 +68,7 @@ async def read_audio_form(request, directory, *, limit, declared, seconds):
         raise ServiceError(415, "unsupported_media_type", "multipart/form-data is required", close=True)
     fields, state = {}, {"file": None, "sink": None, "name": None, "seen_file": False}
     headers = {"field": bytearray(), "value": bytearray(), "all": {}}
-    file_path = Path(directory) / "audio.bin"
+    file_path = Path(directory) / file_name
 
     def part_begin():
         headers.update(field=bytearray(), value=bytearray(), all={})
@@ -81,7 +93,7 @@ async def read_audio_form(request, directory, *, limit, declared, seconds):
             state["seen_file"] = True
             state["file"] = open_private(file_path)
             state["sink"] = "file"
-        elif name in AUDIO_FIELDS:
+        elif name in allowed:
             if name in fields:
                 raise invalid("duplicate field")
             fields[name] = bytearray()

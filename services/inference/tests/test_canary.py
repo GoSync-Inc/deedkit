@@ -82,6 +82,68 @@ def test_canary_loads_each_modality_once_before_the_timed_items_and_judges_the_c
     assert canary.score(fine, EXPECTED, TRUTH) == []
 
 
+DOCUMENTS = CANARY / "documents"
+DOC_TRUTH = json.loads((DOCUMENTS / "truth.json").read_text())
+
+
+def recorded():
+    """What `canary.documents` recorded from the real Docling venv on 11-09 (laptop, the pinned models, network
+    denied by the audit hook): every fixture a fresh child, 3.9 to 12.3 s, peak RSS 0.93 to 1.84 GB."""
+    return json.loads((DOCUMENTS / "recorded.json").read_text())
+
+
+# spec: ANYM-850
+def test_document_canary_passes_the_recorded_docling_run_and_fails_each_regression():
+    bound = EXPECTED["documents"]
+    assert bound["max_seconds"] == 120 and bound["max_rss_mb"] == 2560  # the card's 120 s and 2.5 GB
+    assert canary.score_documents(recorded(), DOC_TRUTH, bound) == []
+    bad = recorded()
+    table = bad["table.pdf"]
+    table["markdown"] = "\n".join(line for line in table["markdown"].splitlines() if "D-4007" not in line)
+    text = bad["text.pdf"]
+    text["markdown"] = text["markdown"].replace("## Обязанности сторон", "Обязанности сторон")
+    text["page_spans"][0], text["page_spans"][1] = text["page_spans"][1], text["page_spans"][0]
+    deck = bad["deck.pptx"]
+    deck["network_attempts"], deck["seconds"], deck["peak_rss_mb"] = 1, 121.0, 2561
+    docx = bad["doc.docx"]
+    docx["markdown"] = docx["markdown"].replace("маркер альфа", "marker").replace("маркер бета", "маркер альфа")
+    failures = "\n".join(canary.score_documents(bad, DOC_TRUTH, bound))
+    for fragment in ("table.pdf: table rows 7/8", "text.pdf: headings 2/3", "text.pdf: page spans out of order",
+                     "deck.pptx: 1 outbound attempts", "deck.pptx: 121.0 s > 120", "deck.pptx: peak RSS 2561 MB",
+                     "doc.docx: markers out of order"):
+        assert fragment in failures, fragment
+    lost = recorded()
+    lost["doc.docx"]["markdown"] = canary.CYRILLIC.sub("?", lost["doc.docx"]["markdown"])
+    assert any(f.startswith("doc.docx: Russian words kept") for f in canary.score_documents(lost, DOC_TRUTH, bound))
+    moved = recorded()  # a marker on the wrong slide although the spans are in order
+    spans = moved["deck.pptx"]["page_spans"]
+    spans[0]["end"], spans[1]["start"] = spans[0]["start"], spans[0]["start"]
+    assert any(f.startswith("deck.pptx: markers not on their pages") for f in canary.score_documents(moved, DOC_TRUTH, bound))
+    assert canary.score_documents({"text.pdf": {"error": "HTTP 503"}}, DOC_TRUTH, bound)[0] == "text.pdf: no answer: HTTP 503"
+
+
+# spec: ANYM-850
+def test_document_canary_posts_each_committed_fixture_to_the_document_route(monkeypatch):
+    calls = []
+
+    def fake_post(url, key, body, content_type, timeout=3600):
+        calls.append((url, body, timeout))
+        if b"deck.pptx" in body:
+            raise RuntimeError("HTTP 502 engine_failed")
+        got = recorded()[next(n for n in DOC_TRUTH if f'filename="{n}"'.encode() in body)]
+        return {"markdown": got["markdown"], "truncated": False, "page_spans": got["page_spans"], "coverage": got["coverage"],
+                "engine": {"name": "docling", "network_attempts": 0, "peak_rss_mb": 900}}, 5.0
+
+    monkeypatch.setattr(canary, "post", fake_post)
+    outputs = canary.documents("http://x", "k", DOCUMENTS, DOC_TRUTH, EXPECTED["documents"])
+    assert [url for url, _, _ in calls] == ["http://x/v1/documents/convert"] * 4
+    assert all(b'name="model"\r\n\r\ndocument-structure\r\n' in body and timeout == 180 for _, body, timeout in calls)
+    assert outputs["deck.pptx"] == {"error": "HTTP 502 engine_failed"}
+    assert outputs["table.pdf"]["peak_rss_mb"] == 900 and outputs["table.pdf"]["seconds"] == 5.0
+    failures = canary.score_documents(outputs, DOC_TRUTH, EXPECTED["documents"])
+    assert failures == ["deck.pptx: no answer: HTTP 502 engine_failed"]
+
+
 # spec: ANYM-683
 def test_canary_voice_notes_are_ogg_opus_not_vorbis():
     """Live install 11-02: ffmpeg 8.1 on the mini has libopus and no libvorbis; Ogg/Opus is also what Telegram voice

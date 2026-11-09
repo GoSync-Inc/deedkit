@@ -1804,6 +1804,18 @@ def test_deploy_never_touches_models_policy_or_ledger():
     assert all(allowed.match(p) for p in re.findall(r'/Users/_deedkitinf[\w./-]*', '\n'.join(recorder.commands)))
 
 
+# spec: ANYM-850
+def test_deploy_syncs_the_docling_venv_before_the_release_is_ready():
+    commands = SshRecorder().exercise_deploy()
+    sync = next(c for c in commands if 'uv sync' in c)
+    service = sync.index('sync --locked --group engines')
+    docling = sync.index(f'/Users/_deedkitinf/releases/{SHA}/docling && /opt/homebrew/bin/uv sync --locked --compile-bytecode')
+    ready = sync.index(f'touch /Users/_deedkitinf/releases/{SHA}/.ready')
+    # one `&&` chain: a failed Docling sync leaves no `.ready`, so the release is never pointed at
+    assert service < docling < ready
+    assert ';' not in sync[service:ready] and '||' not in sync[service:ready]
+
+
 # ---------------------------------------------------------------- criterion 8: probe from production
 
 class Handler(http.server.BaseHTTPRequestHandler):

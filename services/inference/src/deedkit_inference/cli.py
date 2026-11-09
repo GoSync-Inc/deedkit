@@ -99,6 +99,8 @@ def command_canary(args):
                                capture_output=True, text=True, timeout=60)
         print("egress", probe.stdout.strip() or probe.stderr.strip()[:200])
         code = probe.returncode
+    if args.documents:
+        return command_canary_documents(args, canary, code)
     if not args.key_file:
         return code
     directory = Path(args.set)
@@ -111,6 +113,23 @@ def command_canary(args):
     outputs = canary.run(args.url.rstrip("/"), key, directory, expected, (CANARY_DIR / "prompt.txt").read_text())
     failures = canary.score(outputs, expected, truth)
     print(json.dumps({"outputs": outputs, "failures": failures}, ensure_ascii=False, indent=1))
+    return 1 if failures else code
+
+
+def command_canary_documents(args, canary, code):
+    """ANYM-850: the committed document fixtures through `document-structure`; prints the figures, not the Markdown."""
+    if not args.key_file:
+        print("deedkit-inference canary --documents needs --key-file", file=sys.stderr)
+        return 2
+    directory = CANARY_DIR / "documents"
+    bound = json.loads((CANARY_DIR / "expected.json").read_text())["documents"]
+    truth = json.loads((directory / "truth.json").read_text())
+    key = Path(args.key_file).read_text().strip()
+    outputs = canary.documents(args.url.rstrip("/"), key, directory, truth, bound)
+    failures = canary.score_documents(outputs, truth, bound)
+    figures = {name: {k: v for k, v in got.items() if k != "markdown"} | ({"chars": len(got["markdown"])} if "markdown" in got else {})
+               for name, got in outputs.items()}
+    print(json.dumps({"documents": figures, "failures": failures}, ensure_ascii=False, indent=1))
     return 1 if failures else code
 
 
@@ -160,6 +179,8 @@ def main(argv=None):
     probe.add_argument("--set", default=str(Path.home() / "canary-set"), help="directory of the generated set")
     probe.add_argument("--generate", action="store_true", help="(re)generate the set (needs Pillow, say, ffmpeg)")
     probe.add_argument("--egress", action="store_true", help="run the egress probe as an engine child would")
+    probe.add_argument("--documents", action="store_true",
+                       help="run only the document-structure check on the committed fixtures (ANYM-850)")
     rec = sub.add_parser("recover", help="continue and kill engine groups a dead service left stopped")
     rec.add_argument("--state-dir", required=True)
     rec.add_argument("--check", action="store_true", help="only read the ledger and the process table")

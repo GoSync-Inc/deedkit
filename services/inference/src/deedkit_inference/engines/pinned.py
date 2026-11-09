@@ -76,17 +76,24 @@ class PinnedEngine(Engine):
             raise unavailable_service(message="the model files are missing or do not match their pins") from error
         scratch = self.context.work_root / f"w-{uuid.uuid4().hex}"
         scratch.mkdir(mode=0o700)
-        env = {"PATH": media.TOOL_PATH, "HOME": str(scratch), "LANG": "C.UTF-8", **OFFLINE}
+        env = {"PATH": media.TOOL_PATH, "HOME": str(scratch), "LANG": "C.UTF-8", **OFFLINE, **self.extra_env()}
         for name, sub in CACHE_DIRS.items():
             env[name] = str(scratch / sub)
             (scratch / sub).mkdir(parents=True, exist_ok=True, mode=0o700)
         spec = {"paths": {name: str(path) for name, path in paths.items()},
                 "options": {**self.runtime_options(phase_name), "scratch": str(scratch)}}
-        argv = [sys.executable, "-I", "-m", "deedkit_inference.engines.worker", self.runtime_module(phase_name),
+        argv = [str(self.interpreter()), "-I", "-m", "deedkit_inference.engines.worker", self.runtime_module(phase_name),
                 json.dumps(spec)]
         return WorkerLaunch(argv, env, scratch)
 
-    def revision(self):
+    def interpreter(self) -> str:
+        """The Python the worker runs on: the service's own, unless the engine has its own venv (ANYM-850)."""
+        return sys.executable
+
+    def extra_env(self):
+        return {}
+
+    def revision(self) -> str | None:
         phases = (self.context.models or {}).get("phases", {})
         parts = []
         for phase in self.context.spec.phases:

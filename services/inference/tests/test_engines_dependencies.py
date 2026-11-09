@@ -35,6 +35,30 @@ def test_engines_group_is_darwin_only_and_pinned():
     assert pins.load_models()["packages"] == {e.group(1): e.group(2) for e in entries}
 
 
+# spec: ANYM-850
+def test_docling_environment_is_its_own_darwin_only_wheels_only_lock():
+    docling = ROOT / "docling"
+    config = tomllib.loads((docling / "pyproject.toml").read_text())
+    lock = tomllib.loads((docling / "uv.lock").read_text())
+    own = {"deedkit-inference", "deedkit-inference-docling"}
+    assert config["project"]["dependencies"] == ["deedkit-inference", "docling==2.149.0"]
+    assert config["tool"]["uv"]["environments"] == [MARKER] and config["tool"]["uv"]["package"] is False
+    assert config["tool"]["uv"]["sources"]["deedkit-inference"] == {"path": "..", "editable": True}
+    locked = [package for package in lock["package"] if package["name"] not in own]
+    assert sorted(config["tool"]["uv"]["no-build-package"]) == sorted(package["name"] for package in locked)
+    assert not [package["name"] for package in locked if package["name"].startswith("nvidia")]  # CPU torch only
+    for package in locked:
+        assert set(package["source"]) == {"registry"}, package["name"]
+        assert package.get("wheels"), package["name"]
+        assert all(re.fullmatch(r"sha256:[0-9a-f]{64}", wheel["hash"]) for wheel in package["wheels"]), package["name"]
+    versions = {package["name"]: package["version"] for package in locked}
+    service = {package["name"]: package.get("version") for package in tomllib.loads((ROOT / "uv.lock").read_text())["package"]}
+    assert versions["torch"] == service["torch"]  # the same torch as the service's own lock
+    # models.json pins the versions this lock installs; the engine refuses a venv that differs (engines/docling.py).
+    assert pins.load_models()["environments"]["docling"] == {
+        name: versions[name] for name in pins.load_models()["environments"]["docling"]}
+
+
 # spec: ANYM-683
 def test_lock_for_engines_is_wheels_only():
     lock = tomllib.loads((ROOT / "uv.lock").read_text())

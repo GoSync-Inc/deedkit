@@ -346,6 +346,43 @@ plus inactive memory (before the speculative pages were counted, 11-02: the idle
 with 2.0 GiB more speculative, under the 7.5 GB a cold vision start needs). On 11-02 the vision worker held about 3.8 GB resident and free plus inactive memory read 8.9 to 9.1 GB
 at rest but fell to 7.6 to 7.7 GB when a request ended, under the 7.9 GB a vision phase needs (4.9 + `min_free_gb` 3.0).
 
+### 6c. Docling document structure (ANYM-850)
+
+The `document-structure` alias (`POST /v1/documents/convert`) runs Docling 2.149.0 from its own venv,
+`services/inference/docling/.venv` inside the release: Docling's `huggingface-hub<2` conflicts with the service's
+pin, so it cannot join the service venv. `scripts/inference_deploy.py` syncs it (`uv sync --locked --compile-bytecode`,
+same empty environment as the service sync) and refuses the release if that sync fails, so there is no install step of
+its own. The compiled bytecode matters: a cold child starts in 6 to 8 s with it and about 65 s without it. The
+sandbox profile needs no change (reads stay open, the venv sits in the read-only release). The alias is listed as
+available in `/v1/models` only when that venv's packages match the pins in `models.json` and both models verify;
+otherwise a request gets 503 `engine_unavailable` and nothing else changes.
+
+Models: two pinned artifacts, about 0.39 GB (`docling-layout-heron` 172 MB and TableFormer accurate 213 MB). Pull them
+with the pull block above, adding `--only document-structure` (the busy check first, as always), then run `verify`
+as the service user: two more `ok` lines.
+
+Canary: `--documents` sends the four committed synthetic fixtures (`tests/canary/documents/`, made by
+`make_documents.py`; no generated set is needed) to the alias. Each job runs in a fresh child, so every figure is a
+cold start. It passes when every fixture has 0 outbound attempts (the child's audit hook counts `socket.connect`,
+`getaddrinfo` and `urllib.Request` from the Docling import on), finishes under 120 s with a peak RSS under 2,560 MB,
+keeps at least 95% of its Russian words, and `table.pdf` has 8/8 table rows, `text.pdf` 3/3 headings, `deck.pptx` 3/3
+slide titles, and every marker sits on its own page. The bounds are in `tests/canary/expected.json` (`documents`).
+Run it in a quiet window (2.5 GB on top of the 3.0 GB floor):
+
+```bash
+MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
+ssh "$MINI" '/opt/homebrew/bin/python3.13 /usr/local/libexec/deedkit-busy-probe --once' &&
+ssh "$MINI" 'cd /; sudo -n -H -u _deedkitinf /Users/_deedkitinf/current/.venv/bin/deedkit-inference canary --documents --key-file /Users/_deedkitinf/keys/messaging-enrichment.key'
+```
+
+Then rerun the egress probe block above: it must still read 4 of 4 refused inside the profile.
+
+Rollback: take the alias out of the config. A config whose `aliases` table is empty serves every shipped alias, so
+write the shipped table without `document-structure` into `aliases` (`python -c 'import json; from
+deedkit_inference.aliases import shipped_aliases as s; a = s(); a.pop("document-structure"); print(json.dumps(a))'`
+with the release's python), then redeploy the current SHA (section 8: a release already on the mini is not unpacked
+again, the service drains and starts with the new config). The venv and the models then stay on disk, unused.
+
 ## 7. Start the jobs (busy probe first)
 
 Without a fresh `busy.json` the service closes admission (fail closed), so the probe starts first.

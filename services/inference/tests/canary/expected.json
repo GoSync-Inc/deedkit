@@ -61,5 +61,11 @@
     "file": "note_ru_long.ogg",
     "min_segments": 5
   },
-  "cold_max_seconds": 300
+  "cold_max_seconds": 300,
+  "documents": {
+    "max_seconds": 120,
+    "max_rss_mb": 2560,
+    "min_ru_word_recall": 0.95,
+    "headings": ["text.pdf", "doc.docx", "deck.pptx"]
+  }
 }
