@@ -80,6 +80,7 @@ def test_parameter_shape_is_rejected_before_any_provider_call(operation, paramet
     ('send_file', {'caption': 'x' * 1025}, {}, 'invalid_parameters'),
     ('add_contact', {'phone': '12', 'first_name': 'A'}, {}, 'invalid_parameters'),
     ('block_contact', {'user_id': '0'}, {}, 'invalid_parameters'),
+    ('get_contact', {'user_id': '0'}, {}, 'invalid_parameters'),
     ('list_contacts', {'limit': 101}, {}, 'invalid_parameters'),
     ('list_topics', {'offset': -1}, {}, 'invalid_parameters'),
     ('list_topics', {'offset': 5}, {}, 'unsupported_operation'),
@@ -100,7 +101,7 @@ def test_parameter_shape_is_rejected_before_any_provider_call(operation, paramet
     ('create_group', {'user_ids': ['5']}, {}, 'invalid_parameters'),
     ('check_chat_link', {'link': 'not a link'}, {}, 'invalid_parameters'),
     ('join_chat', {}, {}, 'invalid_parameters'),
-], ids=['text-too-long', 'caption-too-long', 'phone-too-short', 'user-id-zero', 'limit-over-100',
+], ids=['text-too-long', 'caption-too-long', 'phone-too-short', 'user-id-zero', 'contact-user-id-zero', 'limit-over-100',
         'offset-negative', 'topics-offset-not-zero', 'mute-seconds-zero', 'slow-mode-not-a-step',
         'slow-mode-bool', 'file-path-relative', 'reaction-with-space', 'reaction-missing', 'poll-question-over-255',
         'poll-one-option', 'poll-duplicate-options', 'vote-index-out-of-range', 'vote-duplicate-index',
@@ -134,6 +135,37 @@ def test_send_file_closes_the_descriptor_of_a_refused_attachment(tmp_path, monke
     with pytest.raises(Exception, match='attachment_unavailable'):
         run(Client(), 'send_file', {'mode': 'document'}, registered_file_path=str(pipe))
     assert len(opened) == 1 and opened[0].closed
+
+
+# spec: ANYM-168
+def test_a_failing_close_of_a_refused_attachment_escapes_unmapped(tmp_path, monkeypatch):
+    """`_execute`'s `finally` closes the stream outside its exception mapper, so a close error is not a rejection."""
+    pipe = tmp_path / 'pipe'
+    os.mkfifo(pipe)
+
+    class Stream:
+        def __init__(self, real):
+            self.real = real
+
+        def fileno(self):
+            return self.real.fileno()
+
+        def close(self):
+            self.real.close()
+            raise OSError('synthetic close failure')
+
+    class Proxy:
+        """The module's `os`, except that the opened stream fails to close."""
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        @staticmethod
+        def fdopen(fd, mode):
+            return Stream(os.fdopen(fd, mode))
+
+    monkeypatch.setattr(telegram_operations, 'os', Proxy())
+    with pytest.raises(OSError, match='synthetic close failure'):
+        run(Client(), 'send_file', {'mode': 'document'}, registered_file_path=str(pipe))
 
 
 # spec: ANYM-549
