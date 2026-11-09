@@ -586,7 +586,10 @@ def get_file_text(store, c, p, attachment_id, offset=0, limit=4000, *, content=N
         "CASE WHEN e.state='ready' THEN jsonb_build_object('coverage',e.metadata->'coverage'," +
         "'language',e.metadata->'language','duration_seconds',e.metadata->'duration_seconds'," +
         "'source_truncated',e.metadata->'source_truncated','has_timestamps'," +
-        "CASE WHEN jsonb_typeof(e.metadata->'segments')='array' THEN jsonb_array_length(e.metadata->'segments')>0 ELSE false END) ELSE '{}'::jsonb END AS enrichment_coverage " +
+        "CASE WHEN jsonb_typeof(e.metadata->'segments')='array' THEN jsonb_array_length(e.metadata->'segments')>0 ELSE false END)" +
+        # ANYM-912: a copied result says so; the source attachment id is operator evidence only.
+        "||CASE WHEN (e.metadata->>'reused')='true' THEN jsonb_build_object('reused',true) ELSE '{}'::jsonb END" +
+        " ELSE '{}'::jsonb END AS enrichment_coverage " +
         JOIN + ' ' + ENRICH_JOIN + ' WHERE a.id=%s AND ' + CURRENT + ' AND ' + scope,
         [offset + 1, limit, attachment_id, *args]).fetchone()
     if not row:
