@@ -79,7 +79,7 @@ def test_application_units_enforce_sandbox_resource_and_log_bounds():
         'indexer', 'enricher', 'enricher-local', 'enricher-mini', 'operator', 'subscriptions',
         'calendar-db', 'calendar-api', 'calendar-worker', 'recordings-api', 'recordings-omi-hint', 'recordings-omi-relay', 'gateway', 'calls',
         'file-lifecycle', 'file-understanding', 'cold-archive', 'cold-restore', 'message-purge', 'delivery',
-        'delivery-egress', 'event-router'}
+        'delivery-egress', 'event-router', 'negotiations'}
     for name, unit in applications.items():
         if name in {'db', 'calendar-db'}:
             continue
