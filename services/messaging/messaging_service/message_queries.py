@@ -51,6 +51,9 @@ META = '''nullif(sp.display_name,'') AS sender_name,nullif(sp.username,'') AS us
     CASE WHEN NOT m.deleted AND coalesce(mm.metadata,mr.snapshot->'metadata')->>'message_kind'='poll'
         AND jsonb_typeof(coalesce(mm.metadata,mr.snapshot->'metadata')->'poll')='object'
       THEN coalesce(mm.metadata,mr.snapshot->'metadata')->'poll' END AS poll,
+    CASE WHEN NOT m.deleted AND coalesce(mm.metadata,mr.snapshot->'metadata')->>'message_kind'='location'
+        AND jsonb_typeof(coalesce(mm.metadata,mr.snapshot->'metadata')->'location')='object'
+      THEN coalesce(mm.metadata,mr.snapshot->'metadata')->'location' END AS location,
     (SELECT platform FROM accounts WHERE id=m.account) AS platform,
     (SELECT observed_at FROM message_revisions WHERE message=m.id AND revision=1) AS first_observed_at,
     'archive_revision_observation'::text AS first_observed_at_basis'''

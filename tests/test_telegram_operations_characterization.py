@@ -74,6 +74,100 @@ def test_parameter_shape_is_rejected_before_any_provider_call(operation, paramet
     assert client.calls == []
 
 
+# spec: ANYM-171
+@pytest.mark.parametrize('operation, parameters, extra, code', [
+    ('edit_message', {'text': 'x' * 4001}, {}, 'invalid_parameters'),
+    ('send_file', {'caption': 'x' * 1025}, {}, 'invalid_parameters'),
+    ('add_contact', {'phone': '12', 'first_name': 'A'}, {}, 'invalid_parameters'),
+    ('block_contact', {'user_id': '0'}, {}, 'invalid_parameters'),
+    ('get_contact', {'user_id': '0'}, {}, 'invalid_parameters'),
+    ('list_contacts', {'limit': 101}, {}, 'invalid_parameters'),
+    ('list_topics', {'offset': -1}, {}, 'invalid_parameters'),
+    ('list_topics', {'offset': 5}, {}, 'unsupported_operation'),
+    ('mute_chat', {'seconds': 0}, {}, 'invalid_parameters'),
+    ('set_slow_mode', {'seconds': 15}, {'provider_chat': SUPERGROUP}, 'invalid_parameters'),
+    ('set_slow_mode', {'seconds': True}, {'provider_chat': SUPERGROUP}, 'invalid_parameters'),
+    ('send_file', {}, {'registered_file_path': 'relative.bin'}, 'attachment_unavailable'),
+    ('send_reaction', {'emoji': 'a b'}, {}, 'invalid_parameters'),
+    ('send_reaction', {}, {}, 'invalid_parameters'),
+    ('send_poll', {'question': 'Q' * 256, 'options': ['a', 'b']}, {}, 'invalid_parameters'),
+    ('send_poll', {'question': 'Q', 'options': ['a']}, {}, 'invalid_parameters'),
+    ('send_poll', {'question': 'Q', 'options': ['a', 'a']}, {}, 'invalid_parameters'),
+    ('vote_poll', {'option_indices': [10]}, {}, 'invalid_parameters'),
+    ('vote_poll', {'option_indices': [1, 1]}, {}, 'invalid_parameters'),
+    ('send_location', {'latitude': 91, 'longitude': 0}, {}, 'invalid_parameters'),
+    ('send_location', {'latitude': 0, 'longitude': float('nan')}, {}, 'invalid_parameters'),
+    ('create_group', {'title': 'G', 'user_ids': ['5', '5']}, {}, 'invalid_parameters'),
+    ('create_group', {'user_ids': ['5']}, {}, 'invalid_parameters'),
+    ('check_chat_link', {'link': 'not a link'}, {}, 'invalid_parameters'),
+    ('join_chat', {}, {}, 'invalid_parameters'),
+], ids=['text-too-long', 'caption-too-long', 'phone-too-short', 'user-id-zero', 'contact-user-id-zero', 'limit-over-100',
+        'offset-negative', 'topics-offset-not-zero', 'mute-seconds-zero', 'slow-mode-not-a-step',
+        'slow-mode-bool', 'file-path-relative', 'reaction-with-space', 'reaction-missing', 'poll-question-over-255',
+        'poll-one-option', 'poll-duplicate-options', 'vote-index-out-of-range', 'vote-duplicate-index',
+        'latitude-over-90', 'longitude-nan', 'group-duplicate-invitee', 'group-title-missing', 'link-malformed',
+        'link-missing'])
+def test_each_parameter_check_answers_its_code_before_any_provider_call(operation, parameters, extra, code):
+    """W5-5a pin: one row per check of the parameter table, with the code each answers today."""
+    client = Client()
+    with pytest.raises(Exception, match=code):
+        run(client, operation, parameters, **extra)
+    assert client.calls == []
+
+
+# spec: ANYM-170
+def test_send_file_closes_the_descriptor_of_a_refused_attachment(tmp_path, monkeypatch):
+    pipe = tmp_path / 'pipe'
+    os.mkfifo(pipe)
+    opened = []
+
+    class Proxy:
+        """The module's `os`, except that fdopen records each stream it opens."""
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        @staticmethod
+        def fdopen(fd, mode):
+            opened.append(os.fdopen(fd, mode))
+            return opened[-1]
+
+    monkeypatch.setattr(telegram_operations, 'os', Proxy())
+    with pytest.raises(Exception, match='attachment_unavailable'):
+        run(Client(), 'send_file', {'mode': 'document'}, registered_file_path=str(pipe))
+    assert len(opened) == 1 and opened[0].closed
+
+
+# spec: ANYM-170
+def test_a_failing_close_of_a_refused_attachment_escapes_unmapped(tmp_path, monkeypatch):
+    """`_execute`'s `finally` closes the stream outside its exception mapper, so a close error is not a rejection."""
+    pipe = tmp_path / 'pipe'
+    os.mkfifo(pipe)
+
+    class Stream:
+        def __init__(self, real):
+            self.real = real
+
+        def fileno(self):
+            return self.real.fileno()
+
+        def close(self):
+            self.real.close()
+            raise OSError('synthetic close failure')
+
+    class Proxy:
+        """The module's `os`, except that the opened stream fails to close."""
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        @staticmethod
+        def fdopen(fd, mode):
+            return Stream(os.fdopen(fd, mode))
+
+    monkeypatch.setattr(telegram_operations, 'os', Proxy())
+    with pytest.raises(OSError, match='synthetic close failure'):
+        run(Client(), 'send_file', {'mode': 'document'}, registered_file_path=str(pipe))
+
+
 # spec: ANYM-549
 def test_send_file_rejects_a_registered_path_that_is_not_a_regular_file(tmp_path):
     client = Client()

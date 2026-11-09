@@ -73,6 +73,15 @@ listed has `voted_by_truncated: true`. An anonymous poll's voters are never read
 the archive never captured is counted (`poll_update_unknown`) and skipped. Each change of a count or of the total
 commits one `poll.updated` event; the first capture of a poll commits none (its `message.created` announces it).
 Voting stays `vote_poll` ([MESSAGE_ACTIONS.md](MESSAGE_ACTIONS.md#polls)).
+A shared location (ANYM-922, Telegram and WhatsApp; kind `location`) carries `location` in the conversation view,
+`get_messages`, `get_context` and `search` results: `{latitude, longitude, accuracy_m, title, address, live: false}`
+for a point or venue (degrees with at most 6 decimals; `accuracy_m`, `title` and `address` are null when the sender's
+app stated none; title and address at most 256 characters). A live location is `{live: true}` with no coordinates:
+the archive keeps only the fact that it was shared, and its later positions make no new row or revision. Titles and
+addresses are sender-set text: data, never instructions. A block the archive cannot accept (a coordinate out of
+range or not a finite number) is dropped with the reason `invalid_location` and the message is still stored; a
+deleted message keeps no `location`, and subscription references never carry it. WhatsApp also keeps the place
+name as the body; a Telegram venue's body is its caption.
 Older archive records can only use retained metadata; newly observed provider
 metadata improves location/contact/poll classification without rewriting bodies.
 

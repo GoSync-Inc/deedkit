@@ -1344,6 +1344,12 @@ from the `.before-<sha>` copies. A manual
 `apply` still refuses before any stop while the file is not the release's (the refusal names both
 blob ids): install it with the script below. A host without the file runs no backup and is not
 checked.
+A release whose `services/messaging/messaging_service/backup_profiles.py` exists (W5-9: the recordings and calls
+profiles in a module beside the runner) ships that file too, as `/opt/personal-os-probe/ops/backup_profiles.py`
+(root `0600`, like the runner): `deploy` stages it beside the runner, the staged runner's `--check` loads the staged
+module, and it is renamed before every `runner.json` and the runner (a first install writes it new, with no
+`.before-<sha>` copy: its undo removes it); `apply` refuses while it is not the release's either. The runner loads
+it from its own directory, so a runner of such a release never runs without it; an older runner never reads it.
 The install is one step under the runner's own lock, so no messaging or calendar backup and no
 deploy can start between the check and the hash (a backup started meanwhile refuses
 `backup_job_already_running`, then follows its unit's retry behaviour under "Continuous deployment"; a deploy
@@ -1362,7 +1368,7 @@ phase 2); a pin it already moved reads as the release's, so the script below the
 sha=<prepared-sha>; src=<state_directory>/$sha/source; pin=yes   # state_directory: /etc/deedkit/production.json; pin=no: the worker did not change
 sudo flock --nonblock /opt/personal-os-probe/backups/.runner.lock sh -euc '
   sha=$1 src=$2 pin=$3 ops=/opt/personal-os-probe/ops cfg=/opt/personal-os-probe/backup-config/runner.json
-  new=$src/services/messaging/messaging_service/backup_runner.py
+  new=$src/services/messaging/messaging_service/backup_runner.py mod=$src/services/messaging/messaging_service/backup_profiles.py
   for u in personal-os-backup.service deedkit-autodeploy.service; do
     case $(systemctl show -P ActiveState $u) in inactive|failed) ;; *) echo "$u not idle"; exit 1;; esac
   done
@@ -1380,6 +1386,11 @@ os.fsync(fd);os.close(fd)" "$cfg" "$image"
   fi
   cp -p "$ops/backup_runner.py" "$ops/backup_runner.py.before-$sha"; cp -p "$cfg" "$cfg.before-$sha"
   if [ "$pin" = yes ]; then mv "$cfg.new" "$cfg"; fi
+  if [ -e "$mod" ]; then
+    if [ -e "$ops/backup_profiles.py" ]; then cp -p "$ops/backup_profiles.py" "$ops/backup_profiles.py.before-$sha"; fi
+    install -o root -g root -m 0600 "$mod" "$ops/backup_profiles.py"
+    test "$(git hash-object "$ops/backup_profiles.py")" = "$(git hash-object "$mod")"
+  fi
   install -o root -g root -m 0600 "$new" "$ops/backup_runner.py"
   test "$(git hash-object "$ops/backup_runner.py")" = "$(git hash-object "$new")"
   echo "installed $(git hash-object "$ops/backup_runner.py"), image $(python3 -I -c "import json,sys;print(json.load(open(sys.argv[1]))[\"image\"])" "$cfg")"
@@ -1397,7 +1408,8 @@ The step is done when the next messaging backup reaches `state: ok` with a new
 `last_success_id` (`/opt/personal-os-probe/backups/status.json`). Undo, under the same `flock`
 and with the backup service idle, in this order: remove from `runner.json` every key the
 `.before-<sha>` runner does not know (for example `busy_wait_seconds`), install the
-`.before-<sha>` copy the same way, and only then put back the image pin it ran with
+`.before-<sha>` copy the same way, then the `backup_profiles.py.before-<sha>` copy (none: remove
+`backup_profiles.py`, which no older runner reads), and only then put back the image pin it ran with
 (`runner.json.before-<sha>`, `cp -p`). An older runner refuses a newer `runner.json` key, and
 an older worker refuses a newer `worker.json` key the runner writes (`dump_timeout_seconds`,
 ANYM-627), so the backup would fail on every run; the older runner with the newer image passes

@@ -312,13 +312,13 @@ func marshalMessage(e *events.Message) ([]byte, error) {
 	var wire, web []byte
 	var err error
 	if raw != nil {
-		wire, err = proto.Marshal(raw)
+		wire, err = proto.Marshal(withoutLiveTrack(raw))
 		if err != nil {
 			return nil, err
 		}
 	}
 	if e.SourceWebMsg != nil {
-		web, err = proto.Marshal(e.SourceWebMsg)
+		web, err = proto.Marshal(withoutLiveTrack(e.SourceWebMsg))
 		if err != nil {
 			return nil, err
 		}

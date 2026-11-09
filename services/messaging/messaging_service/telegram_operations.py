@@ -1121,6 +1121,142 @@ GROUP_HANDLERS = {
 HANDLERS = {**READ_HANDLERS, **MESSAGE_HANDLERS, **GROUP_HANDLERS}
 
 
+def check_slow_mode(parameters, job, prepared):
+    if type(parameters.get('seconds')) is not int or parameters['seconds'] not in SLOW_MODE_SECONDS:
+        reject('invalid_parameters')
+
+
+def check_group_switch(parameters, job, prepared):
+    if type(parameters.get('enabled')) is not bool:
+        reject('invalid_parameters')
+
+
+def check_join_request_users(parameters, job, prepared):
+    users = parameters.get('user_ids')
+    if not isinstance(users, list) or not 1 <= len(users) <= 20 or len(set(map(str, users))) != len(users):
+        reject('invalid_parameters')
+    for value in users:
+        if not isinstance(value, str):
+            reject('invalid_parameters')
+        number_id(value)
+
+
+def check_send_file(parameters, job, prepared):
+    if parameters.get('mode', 'document') not in ('document', 'photo', 'video', 'audio', 'voice', 'video_note'):
+        reject('invalid_parameters')
+    original = job.get('registered_file_path')
+    if not isinstance(original, (str, Path)) or not Path(original).is_absolute():
+        reject('attachment_unavailable')
+    try:
+        fd = os.open(original, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        # Stored at once: `_execute`'s `finally` closes it, also when the checks below refuse the file.
+        prepared['stream'] = os.fdopen(fd, 'rb')
+        prepared['info'] = info = os.fstat(prepared['stream'].fileno())
+        if not stat.S_ISREG(info.st_mode):
+            reject('attachment_unavailable')
+        if info.st_size == 0 or info.st_size > MAX_ORIGINAL_BYTES:
+            reject('attachment_too_large')
+    except OSError:
+        reject('attachment_unavailable')
+
+
+def check_reaction(parameters, job, prepared):
+    bounded_text(parameters.get('emoji'), 64, empty=True)
+    if any(c.isspace() for c in parameters['emoji']):
+        reject('invalid_parameters')
+
+
+def check_poll(parameters, job, prepared):
+    bounded_text(parameters.get('question'), 255)
+    options = parameters.get('options')
+    if not isinstance(options, list) or not 2 <= len(options) <= 10:
+        reject('invalid_parameters')
+    for option in options:
+        bounded_text(option, 100)
+    if len(set(options)) != len(options):
+        reject('invalid_parameters')
+
+
+def check_vote(parameters, job, prepared):
+    choices = parameters.get('option_indices')
+    if (not isinstance(choices, list) or len(choices) > 10 or
+            any(type(i) is not int or not 0 <= i < 10 for i in choices) or
+            len(set(choices)) != len(choices)):
+        reject('invalid_parameters')
+
+
+def check_location(parameters, job, prepared):
+    for key, maximum in [('latitude', 90), ('longitude', 180)]:
+        value = parameters.get(key)
+        if type(value) not in (int, float) or not math.isfinite(value) or abs(value) > maximum:
+            reject('invalid_parameters')
+
+
+def check_create_group(parameters, job, prepared):
+    users = parameters.get('user_ids')
+    if not isinstance(users, list) or not 1 <= len(users) <= 20:
+        reject('invalid_parameters')
+    ids = [number_id(value) for value in users]
+    if len(ids) != len(set(ids)):
+        reject('invalid_parameters')
+    bounded_text(parameters.get('title'), 128)
+    prepared['ids'] = ids
+
+
+def check_topics_page(parameters, job, prepared):
+    if parameters.get('offset', 0) != 0:
+        reject('unsupported_operation')
+
+
+def check_link(parameters, job, prepared):
+    if not isinstance(parameters.get('link'), str) or not CHAT_LINK.fullmatch(parameters['link']):
+        reject('invalid_parameters')
+
+
+# W5-5a: the per-operation checks, run after the shared key checks; a check may store prepared values.
+PARAMETER_CHECKS = {
+    'set_slow_mode': check_slow_mode,
+    **{name: check_group_switch for name in GROUP_SETTERS if name != 'set_slow_mode'},
+    'approve_join_requests': check_join_request_users, 'reject_join_requests': check_join_request_users,
+    'send_file': check_send_file, 'send_reaction': check_reaction, 'send_poll': check_poll,
+    'vote_poll': check_vote, 'send_location': check_location, 'create_group': check_create_group,
+    'list_topics': check_topics_page, 'check_chat_link': check_link, 'join_chat': check_link,
+}
+
+
+def check_parameters(operation, parameters, job, prepared):
+    """Validate every parameter before the first provider read/mutation.
+
+    Stores the prepared values in the caller's `prepared`: `ids` (create_group), `stream` and `info`
+    (send_file). The stream is the caller's to close, also when a check refused the file.
+    """
+    text_keys = {'caption': (1024, True), 'question': (300, False),
+                 'first_name': (64, False), 'last_name': (64, True),
+                 'text': (MAX_SOURCE_UNITS if operation == 'edit_message' and job.get('edit_artifact') is not None
+                          else 4000, False), 'title': (128, False),
+                 'description': (255, True), 'bio': (139, True)}
+    for key, (maximum, empty) in text_keys.items():
+        if key in parameters:
+            bounded_text(parameters[key], maximum, empty=empty)
+    if 'phone' in parameters and (not isinstance(parameters['phone'], str) or
+            not re.fullmatch(r'\+?[1-9][0-9]{4,19}', parameters['phone'])):
+        reject('invalid_parameters')
+    if 'user_id' in parameters:
+        number_id(parameters['user_id'])
+    if 'limit' in parameters:
+        integer(parameters['limit'], 1, 100)
+    if 'offset' in parameters:
+        integer(parameters['offset'], 0, 100000)
+    if 'seconds' in parameters and operation != 'set_slow_mode':
+        integer(parameters['seconds'], 1, 2**31 - 1)
+    # Only send_poll accepts `multiple` (PARAMETERS), so this shared check keeps its place before check_poll.
+    if 'multiple' in parameters and type(parameters['multiple']) is not bool:
+        reject('invalid_parameters')
+    check = PARAMETER_CHECKS.get(operation)
+    if check is not None:
+        check(parameters, job, prepared)
+
+
 async def _execute(client, job, *, verified_self=None, governor=None):
     """Execute exactly one prepared, bounded operation without automatic retries.
 
@@ -1159,9 +1295,8 @@ async def _execute(client, job, *, verified_self=None, governor=None):
     if report is not None:
         # The shared rate gate and lookups may delay the first mutation.
         report('waiting')
-    stream = None
-    ids = None
-    info = source_chat = source_message = None
+    prepared = {}  # check_parameters fills it; `finally` closes its stream
+    source_chat = source_message = None
     referenced_peers = set()
 
     def collection_policy():
@@ -1273,94 +1408,8 @@ async def _execute(client, job, *, verified_self=None, governor=None):
         started_mutation = False  # A definite refusal: the provider joined nothing.
 
     try:
-        # Validate every parameter before the first provider read/mutation.
-        text_keys = {'caption': (1024, True), 'question': (300, False),
-                     'first_name': (64, False), 'last_name': (64, True),
-                     'text': (MAX_SOURCE_UNITS if operation == 'edit_message' and job.get('edit_artifact') is not None
-                              else 4000, False), 'title': (128, False),
-                     'description': (255, True), 'bio': (139, True)}
-        for key, (maximum, empty) in text_keys.items():
-            if key in parameters:
-                bounded_text(parameters[key], maximum, empty=empty)
-        if 'phone' in parameters and (not isinstance(parameters['phone'], str) or
-                not re.fullmatch(r'\+?[1-9][0-9]{4,19}', parameters['phone'])):
-            reject('invalid_parameters')
-        if 'user_id' in parameters:
-            number_id(parameters['user_id'])
-        if 'limit' in parameters:
-            integer(parameters['limit'], 1, 100)
-        if 'offset' in parameters:
-            integer(parameters['offset'], 0, 100000)
-        if 'seconds' in parameters and operation != 'set_slow_mode':
-            integer(parameters['seconds'], 1, 2**31 - 1)
-        if operation == 'set_slow_mode' and (type(parameters.get('seconds')) is not int or
-                parameters['seconds'] not in SLOW_MODE_SECONDS):
-            reject('invalid_parameters')
-        if operation in GROUP_SETTERS and operation != 'set_slow_mode' and type(parameters.get('enabled')) is not bool:
-            reject('invalid_parameters')
-        if operation in ('approve_join_requests', 'reject_join_requests'):
-            users = parameters.get('user_ids')
-            if not isinstance(users, list) or not 1 <= len(users) <= 20 or len(set(map(str, users))) != len(users):
-                reject('invalid_parameters')
-            for value in users:
-                if not isinstance(value, str):
-                    reject('invalid_parameters')
-                number_id(value)
-        if 'multiple' in parameters and type(parameters['multiple']) is not bool:
-            reject('invalid_parameters')
-        if operation == 'send_file':
-            if parameters.get('mode', 'document') not in ('document', 'photo', 'video', 'audio', 'voice', 'video_note'):
-                reject('invalid_parameters')
-            original = job.get('registered_file_path')
-            if not isinstance(original, (str, Path)) or not Path(original).is_absolute():
-                reject('attachment_unavailable')
-            try:
-                fd = os.open(original, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-                stream = os.fdopen(fd, 'rb')
-                info = os.fstat(stream.fileno())
-                if not stat.S_ISREG(info.st_mode):
-                    reject('attachment_unavailable')
-                if info.st_size == 0 or info.st_size > MAX_ORIGINAL_BYTES:
-                    reject('attachment_too_large')
-            except OSError:
-                reject('attachment_unavailable')
-        if operation == 'send_reaction':
-            bounded_text(parameters.get('emoji'), 64, empty=True)
-            if any(c.isspace() for c in parameters['emoji']):
-                reject('invalid_parameters')
-        if operation == 'send_poll':
-            bounded_text(parameters.get('question'), 255)
-            options = parameters.get('options')
-            if not isinstance(options, list) or not 2 <= len(options) <= 10:
-                reject('invalid_parameters')
-            for option in options:
-                bounded_text(option, 100)
-            if len(set(options)) != len(options):
-                reject('invalid_parameters')
-        if operation == 'vote_poll':
-            choices = parameters.get('option_indices')
-            if (not isinstance(choices, list) or len(choices) > 10 or
-                    any(type(i) is not int or not 0 <= i < 10 for i in choices) or
-                    len(set(choices)) != len(choices)):
-                reject('invalid_parameters')
-        if operation == 'send_location':
-            for key, maximum in [('latitude', 90), ('longitude', 180)]:
-                value = parameters.get(key)
-                if type(value) not in (int, float) or not math.isfinite(value) or abs(value) > maximum:
-                    reject('invalid_parameters')
-        if operation == 'create_group':
-            users = parameters.get('user_ids')
-            if not isinstance(users, list) or not 1 <= len(users) <= 20:
-                reject('invalid_parameters')
-            ids = [number_id(value) for value in users]
-            if len(ids) != len(set(ids)):
-                reject('invalid_parameters')
-            bounded_text(parameters.get('title'), 128)
-        if operation == 'list_topics' and parameters.get('offset', 0) != 0:
-            reject('unsupported_operation')
-        if operation in ('check_chat_link', 'join_chat') and (not isinstance(parameters.get('link'), str) or
-                not CHAT_LINK.fullmatch(parameters['link'])):
-            reject('invalid_parameters')
+        check_parameters(operation, parameters, job, prepared)
+        ids, stream, info = prepared.get('ids'), prepared.get('stream'), prepared.get('info')
 
         if operation == 'open_chat_by_username':
             return await open_by_username(client, job, parameters, rpc, collection_policy, allowed_provider_id)
@@ -1471,8 +1520,8 @@ async def _execute(client, job, *, verified_self=None, governor=None):
             return {'outcome': 'unknown', 'error': 'provider_result_unverified'}
         reject('provider_preflight_failed')
     finally:
-        if stream is not None:
-            stream.close()
+        if prepared.get('stream') is not None:
+            prepared['stream'].close()
 
 
 LIVE_FILTERS = {'documents': types.InputMessagesFilterDocument, 'photos': types.InputMessagesFilterPhotos,
