@@ -1,0 +1,2151 @@
+[
+ {
+  "id": "ru-tue-wed-agreed",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-tue-wed-agreed-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай во вторник после обеда созвонимся",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-10T13:00:00+00:00",
+       "2026-11-10T17:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-tue-wed-agreed-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "лучше в среду утром",
+    "expect": {
+     "state": "counter",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-11T09:00:00+00:00",
+       "2026-11-11T12:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-tue-wed-agreed-3",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "ок, среда 10:00",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-11T10:00:00+00:00",
+      "2026-11-11T11:00:00+00:00"
+     ],
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-decline-no-time",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-decline-no-time-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай встретимся во вторник",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-10T00:00:00+00:00",
+       "2026-11-11T00:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-decline-no-time-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "во вторник не могу",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "peer",
+     "current": [],
+     "agreed": null,
+     "declined": [
+      [
+       "2026-11-10T00:00:00+00:00",
+       "2026-11-11T00:00:00+00:00"
+      ]
+     ]
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-decline-and-counter",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-decline-and-counter-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай встретимся во вторник",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-10T00:00:00+00:00",
+       "2026-11-11T00:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-decline-and-counter-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "во вторник не могу, давай в среду",
+    "expect": {
+     "state": "counter",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-11T00:00:00+00:00",
+       "2026-11-12T00:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": [
+      [
+       "2026-11-10T00:00:00+00:00",
+       "2026-11-11T00:00:00+00:00"
+      ]
+     ]
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-msk-proposer-lisbon-owner",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-msk-proposer-lisbon-owner-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай созвонимся в среду в 15:00 мск",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-11T15:00:00+03:00",
+       "2026-11-11T15:30:00+03:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-msk-proposer-lisbon-owner-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ок, договорились",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-11T15:00:00+03:00",
+      "2026-11-11T15:30:00+03:00"
+     ],
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-reschedule-after-agreed",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-reschedule-after-agreed-1",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай завтра созвонимся в 10",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-10T10:00:00+00:00",
+       "2026-11-10T10:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-reschedule-after-agreed-2",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ок",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-10T10:00:00+00:00",
+      "2026-11-10T10:30:00+00:00"
+     ],
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-reschedule-after-agreed-3",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "давай перенесём на четверг в 11",
+    "expect": {
+     "state": "counter",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-12T11:00:00+00:00",
+       "2026-11-12T12:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-reschedule-after-agreed-4",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:30:00+00:00",
+    "text": "ок",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-12T11:00:00+00:00",
+      "2026-11-12T12:00:00+00:00"
+     ],
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-cancel-after-agreed",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-cancel-after-agreed-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай в пятницу в 12",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-cancel-after-agreed-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ок",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-13T12:00:00+00:00",
+      "2026-11-13T13:00:00+00:00"
+     ],
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-cancel-after-agreed-3",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "отменяем встречу",
+    "expect": {
+     "state": "cancelled",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-13T12:00:00+00:00",
+      "2026-11-13T13:00:00+00:00"
+     ],
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-group-two-arrange-with-each-other",
+  "chat_type": "group",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-group-two-arrange-with-each-other-1",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "всем привет",
+    "expect": {
+     "state": null
+    }
+   },
+   {
+    "message_id": "ru-group-two-arrange-with-each-other-2",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "давай созвонимся завтра в 10",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "others",
+     "current": [
+      [
+       "2026-11-10T10:00:00+00:00",
+       "2026-11-10T10:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-group-two-arrange-with-each-other-3",
+    "sender": "boris",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "ок",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-10T10:00:00+00:00",
+      "2026-11-10T10:30:00+00:00"
+     ],
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-availability-question",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-availability-question-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "когда тебе удобно созвониться?",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-availability-question-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "давай в пятницу в 12",
+    "expect": {
+     "state": "counter",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-availability-question-3",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "отлично",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-13T12:00:00+00:00",
+      "2026-11-13T13:00:00+00:00"
+     ],
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-repeated-identical-times",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-repeated-identical-times-1",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай в пятницу в 12",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-repeated-identical-times-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "давай в пятницу в 12",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-repeated-identical-times-3",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "ок",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-13T12:00:00+00:00",
+      "2026-11-13T13:00:00+00:00"
+     ],
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-stale-after-a-week",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-stale-after-a-week-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай созвонимся в четверг в 16",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-12T16:00:00+00:00",
+       "2026-11-12T16:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   }
+  ],
+  "final": {
+   "now": "2026-11-16T10:00:01+00:00",
+   "expect": {
+    "state": "stale",
+    "awaiting": "none",
+    "current": [
+     [
+      "2026-11-12T16:00:00+00:00",
+      "2026-11-12T16:30:00+00:00"
+     ]
+    ],
+    "agreed": null,
+    "declined": []
+   }
+  }
+ },
+ {
+  "id": "ru-stale-when-the-time-passed",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-stale-when-the-time-passed-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай во вторник в 10",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-10T10:00:00+00:00",
+       "2026-11-10T11:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   }
+  ],
+  "final": {
+   "now": "2026-11-10T11:00:00+00:00",
+   "expect": {
+    "state": "stale",
+    "awaiting": "none",
+    "current": [
+     [
+      "2026-11-10T10:00:00+00:00",
+      "2026-11-10T11:00:00+00:00"
+     ]
+    ],
+    "agreed": null,
+    "declined": []
+   }
+  }
+ },
+ {
+  "id": "ru-several-times-plain-ok-is-ambiguous",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-several-times-plain-ok-is-ambiguous-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "можно в пятницу в 12 или в 14",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ],
+      [
+       "2026-11-13T14:00:00+00:00",
+       "2026-11-13T15:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-several-times-plain-ok-is-ambiguous-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ок",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ],
+      [
+       "2026-11-13T14:00:00+00:00",
+       "2026-11-13T15:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-several-times-one-named",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-several-times-one-named-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "можно в пятницу в 12 или в 14",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ],
+      [
+       "2026-11-13T14:00:00+00:00",
+       "2026-11-13T15:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-several-times-one-named-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ок, в пятницу в 14",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-13T14:00:00+00:00",
+      "2026-11-13T15:00:00+00:00"
+     ],
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-same-sender-adds-a-time",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-same-sender-adds-a-time-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай в пятницу в 12",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-same-sender-adds-a-time-2",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "давай в понедельник в 12",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ],
+      [
+       "2026-11-16T12:00:00+00:00",
+       "2026-11-16T13:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-same-sender-adds-a-time-3",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "хорошо, в пятницу в 12",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-13T12:00:00+00:00",
+      "2026-11-13T13:00:00+00:00"
+     ],
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-ping-pong-counters",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-ping-pong-counters-1",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай созвонимся в четверг в 16",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-12T16:00:00+00:00",
+       "2026-11-12T16:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-ping-pong-counters-2",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "давай лучше в пятницу в 11",
+    "expect": {
+     "state": "counter",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-13T11:00:00+00:00",
+       "2026-11-13T12:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-ping-pong-counters-3",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "в четверг в 18 можно?",
+    "expect": {
+     "state": "counter",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-12T18:00:00+00:00",
+       "2026-11-12T19:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-ping-pong-counters-4",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:30:00+00:00",
+    "text": "отлично",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-12T18:00:00+00:00",
+      "2026-11-12T19:00:00+00:00"
+     ],
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-decline-after-agreed",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-decline-after-agreed-1",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай встретимся в среду в 19:00",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-11T19:00:00+00:00",
+       "2026-11-11T20:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-decline-after-agreed-2",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ок",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-11T19:00:00+00:00",
+      "2026-11-11T20:00:00+00:00"
+     ],
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-decline-after-agreed-3",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "мне не подходит",
+    "expect": {
+     "state": "counter",
+     "awaiting": "owner",
+     "current": [],
+     "agreed": null,
+     "declined": [
+      [
+       "2026-11-11T19:00:00+00:00",
+       "2026-11-11T20:00:00+00:00"
+      ]
+     ]
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-new-after-cancel",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-new-after-cancel-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай в пятницу в 12",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-new-after-cancel-2",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "отменяем встречу",
+    "expect": {
+     "state": "cancelled",
+     "awaiting": "none",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-new-after-cancel-3",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "давай встретимся во вторник",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-10T00:00:00+00:00",
+       "2026-11-11T00:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-new-after-a-past-agreement",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-new-after-a-past-agreement-1",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай завтра созвонимся в 10",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-10T10:00:00+00:00",
+       "2026-11-10T10:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-new-after-a-past-agreement-2",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ок",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-10T10:00:00+00:00",
+      "2026-11-10T10:30:00+00:00"
+     ],
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-new-after-a-past-agreement-3",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-11T10:31:00+00:00",
+    "text": "давай созвонимся в четверг в 16",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-12T16:00:00+00:00",
+       "2026-11-12T16:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-a-plain-ok-or-no-opens-nothing",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-a-plain-ok-or-no-opens-nothing-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "ок",
+    "expect": {
+     "state": null
+    }
+   },
+   {
+    "message_id": "ru-a-plain-ok-or-no-opens-nothing-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "не могу",
+    "expect": {
+     "state": null
+    }
+   },
+   {
+    "message_id": "ru-a-plain-ok-or-no-opens-nothing-3",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "как дела?",
+    "expect": {
+     "state": null
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-group-addressed-to-the-owner",
+  "chat_type": "group",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-group-addressed-to-the-owner-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": true,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай во вторник в 10",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-10T10:00:00+00:00",
+       "2026-11-10T11:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-group-addressed-to-the-owner-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "лучше в среду утром",
+    "expect": {
+     "state": "counter",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-11T09:00:00+00:00",
+       "2026-11-11T12:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-group-addressed-to-the-owner-3",
+    "sender": "boris",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "привет",
+    "expect": {
+     "state": "counter",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-11T09:00:00+00:00",
+       "2026-11-11T12:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-group-addressed-to-the-owner-4",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": true,
+    "sent_at": "2026-11-09T10:30:00+00:00",
+    "text": "ок, среда 10:00",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-11T10:00:00+00:00",
+      "2026-11-11T11:00:00+00:00"
+     ],
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-group-a-third-person-declines",
+  "chat_type": "group",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-group-a-third-person-declines-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай встретимся во вторник",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "others",
+     "current": [
+      [
+       "2026-11-10T00:00:00+00:00",
+       "2026-11-11T00:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-group-a-third-person-declines-2",
+    "sender": "boris",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "во вторник не могу",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "others",
+     "current": [],
+     "agreed": null,
+     "declined": [
+      [
+       "2026-11-10T00:00:00+00:00",
+       "2026-11-11T00:00:00+00:00"
+      ]
+     ]
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-utc-fallback-owner",
+  "chat_type": "private",
+  "owner_zone": null,
+  "messages": [
+   {
+    "message_id": "ru-utc-fallback-owner-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай созвонимся в четверг в 16",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-12T16:00:00+00:00",
+       "2026-11-12T16:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-utc-fallback-owner-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ок",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-12T16:00:00+00:00",
+      "2026-11-12T16:30:00+00:00"
+     ],
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-reschedule-within-a-day-of-a-past-agreement",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-reschedule-within-a-day-of-a-past-agreement-1",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай сегодня созвонимся в 11",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-09T11:00:00+00:00",
+       "2026-11-09T11:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-reschedule-within-a-day-of-a-past-agreement-2",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ок",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-09T11:00:00+00:00",
+      "2026-11-09T11:30:00+00:00"
+     ],
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-reschedule-within-a-day-of-a-past-agreement-3",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-10T09:00:00+00:00",
+    "text": "давай созвонимся в четверг в 16",
+    "expect": {
+     "state": "counter",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-12T16:00:00+00:00",
+       "2026-11-12T16:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-accept-naming-two-times-is-ambiguous",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-accept-naming-two-times-is-ambiguous-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "можно в пятницу в 12 или в 14",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ],
+      [
+       "2026-11-13T14:00:00+00:00",
+       "2026-11-13T15:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "ru-accept-naming-two-times-is-ambiguous-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ок, в пятницу в 12 или в 14",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ],
+      [
+       "2026-11-13T14:00:00+00:00",
+       "2026-11-13T15:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "ru-far-proposal-goes-stale-after-a-week-of-silence",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-far-proposal-goes-stale-after-a-week-of-silence-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай созвонимся 30 ноября в 10",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-30T10:00:00+00:00",
+       "2026-11-30T10:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   }
+  ],
+  "final": {
+   "now": "2026-11-16T10:00:01+00:00",
+   "expect": {
+    "state": "stale",
+    "awaiting": "none",
+    "current": [
+     [
+      "2026-11-30T10:00:00+00:00",
+      "2026-11-30T10:30:00+00:00"
+     ]
+    ],
+    "agreed": null,
+    "declined": []
+   }
+  }
+ },
+ {
+  "id": "ru-far-proposal-still-open-after-six-days",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "ru-far-proposal-still-open-after-six-days-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "давай созвонимся 30 ноября в 10",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-30T10:00:00+00:00",
+       "2026-11-30T10:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   }
+  ],
+  "final": {
+   "now": "2026-11-15T10:00:00+00:00",
+   "expect": {
+    "state": "proposed",
+    "awaiting": "owner",
+    "current": [
+     [
+      "2026-11-30T10:00:00+00:00",
+      "2026-11-30T10:30:00+00:00"
+     ]
+    ],
+    "agreed": null,
+    "declined": []
+   }
+  }
+ },
+ {
+  "id": "en-call-counter-agreed",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "en-call-counter-agreed-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "let's have a call on Tuesday at 3pm",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-10T15:00:00+00:00",
+       "2026-11-10T15:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "en-call-counter-agreed-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "how about Wednesday at 10am instead?",
+    "expect": {
+     "state": "counter",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-11T10:00:00+00:00",
+       "2026-11-11T11:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "en-call-counter-agreed-3",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "sounds good",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-11T10:00:00+00:00",
+      "2026-11-11T11:00:00+00:00"
+     ],
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "en-owner-proposal-declined",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "en-owner-proposal-declined-1",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "let's meet on Friday",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-13T00:00:00+00:00",
+       "2026-11-14T00:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "en-owner-proposal-declined-2",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "can't make it on Friday",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [],
+     "agreed": null,
+     "declined": [
+      [
+       "2026-11-13T00:00:00+00:00",
+       "2026-11-14T00:00:00+00:00"
+      ]
+     ]
+    }
+   }
+  ]
+ },
+ {
+  "id": "en-decline-and-counter",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "en-decline-and-counter-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "let's have a call on Tuesday at 3pm",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-10T15:00:00+00:00",
+       "2026-11-10T15:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "en-decline-and-counter-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "can't make it on Tuesday, how about Wednesday at 10am?",
+    "expect": {
+     "state": "counter",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-11T10:00:00+00:00",
+       "2026-11-11T11:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": [
+      [
+       "2026-11-10T15:00:00+00:00",
+       "2026-11-10T15:30:00+00:00"
+      ]
+     ]
+    }
+   }
+  ]
+ },
+ {
+  "id": "en-cancel",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "en-cancel-1",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "let's have a call on Tuesday at 3pm",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-10T15:00:00+00:00",
+       "2026-11-10T15:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "en-cancel-2",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "sounds good",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-10T15:00:00+00:00",
+      "2026-11-10T15:30:00+00:00"
+     ],
+     "declined": []
+    }
+   },
+   {
+    "message_id": "en-cancel-3",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "let's cancel the meeting",
+    "expect": {
+     "state": "cancelled",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-10T15:00:00+00:00",
+      "2026-11-10T15:30:00+00:00"
+     ],
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "en-reschedule-after-agreed",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "en-reschedule-after-agreed-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "let's meet on Friday",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-13T00:00:00+00:00",
+       "2026-11-14T00:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "en-reschedule-after-agreed-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ok, Friday at 2pm works",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-13T14:00:00+00:00",
+      "2026-11-13T15:00:00+00:00"
+     ],
+     "declined": []
+    }
+   },
+   {
+    "message_id": "en-reschedule-after-agreed-3",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "can we reschedule to Thursday at 11am?",
+    "expect": {
+     "state": "counter",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-12T11:00:00+00:00",
+       "2026-11-12T12:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "en-reschedule-after-agreed-4",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:30:00+00:00",
+    "text": "deal",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-12T11:00:00+00:00",
+      "2026-11-12T12:00:00+00:00"
+     ],
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "en-availability-question",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "en-availability-question-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "when are you free for a call?",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "en-availability-question-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "let's have a call on Thursday at 4pm",
+    "expect": {
+     "state": "counter",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-12T16:00:00+00:00",
+       "2026-11-12T16:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "en-availability-question-3",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "ok",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-12T16:00:00+00:00",
+      "2026-11-12T16:30:00+00:00"
+     ],
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "en-group-addressed",
+  "chat_type": "group",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "en-group-addressed-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": true,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "@Egor let's have a call on Tuesday at 3pm",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-10T15:00:00+00:00",
+       "2026-11-10T15:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "en-group-addressed-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "sounds good",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-10T15:00:00+00:00",
+      "2026-11-10T15:30:00+00:00"
+     ],
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "en-group-three-senders",
+  "chat_type": "group",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "en-group-three-senders-1",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "hi all",
+    "expect": {
+     "state": null
+    }
+   },
+   {
+    "message_id": "en-group-three-senders-2",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "let's have a call on Thursday at 4pm",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "others",
+     "current": [
+      [
+       "2026-11-12T16:00:00+00:00",
+       "2026-11-12T16:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "en-group-three-senders-3",
+    "sender": "boris",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "let's do Friday at 11am instead",
+    "expect": {
+     "state": "counter",
+     "awaiting": "others",
+     "current": [
+      [
+       "2026-11-13T11:00:00+00:00",
+       "2026-11-13T12:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "en-group-three-senders-4",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:30:00+00:00",
+    "text": "deal",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-13T11:00:00+00:00",
+      "2026-11-13T12:00:00+00:00"
+     ],
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "en-several-times-ambiguous",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "en-several-times-ambiguous-1",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "can we do Friday at 12pm or 2pm?",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ],
+      [
+       "2026-11-13T14:00:00+00:00",
+       "2026-11-13T15:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "en-several-times-ambiguous-2",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ok",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [
+      [
+       "2026-11-13T12:00:00+00:00",
+       "2026-11-13T13:00:00+00:00"
+      ],
+      [
+       "2026-11-13T14:00:00+00:00",
+       "2026-11-13T15:00:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   }
+  ]
+ },
+ {
+  "id": "en-stale-after-a-week",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "en-stale-after-a-week-1",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "let's have a call on Thursday at 4pm",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "peer",
+     "current": [
+      [
+       "2026-11-12T16:00:00+00:00",
+       "2026-11-12T16:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   }
+  ],
+  "final": {
+   "now": "2026-11-16T10:00:01+00:00",
+   "expect": {
+    "state": "stale",
+    "awaiting": "none",
+    "current": [
+     [
+      "2026-11-12T16:00:00+00:00",
+      "2026-11-12T16:30:00+00:00"
+     ]
+    ],
+    "agreed": null,
+    "declined": []
+   }
+  }
+ },
+ {
+  "id": "en-bare-decline-after-agreed",
+  "chat_type": "private",
+  "owner_zone": "Europe/Lisbon",
+  "messages": [
+   {
+    "message_id": "en-bare-decline-after-agreed-1",
+    "sender": "anna",
+    "is_owner": false,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:00:00+00:00",
+    "text": "let's have a call on Thursday at 4pm",
+    "expect": {
+     "state": "proposed",
+     "awaiting": "owner",
+     "current": [
+      [
+       "2026-11-12T16:00:00+00:00",
+       "2026-11-12T16:30:00+00:00"
+      ]
+     ],
+     "agreed": null,
+     "declined": []
+    }
+   },
+   {
+    "message_id": "en-bare-decline-after-agreed-2",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:10:00+00:00",
+    "text": "ok",
+    "expect": {
+     "state": "agreed",
+     "awaiting": "none",
+     "current": [],
+     "agreed": [
+      "2026-11-12T16:00:00+00:00",
+      "2026-11-12T16:30:00+00:00"
+     ],
+     "declined": []
+    }
+   },
+   {
+    "message_id": "en-bare-decline-after-agreed-3",
+    "sender": "owner",
+    "is_owner": true,
+    "addressed": false,
+    "sent_at": "2026-11-09T10:20:00+00:00",
+    "text": "sorry, I can't make it",
+    "expect": {
+     "state": "counter",
+     "awaiting": "peer",
+     "current": [],
+     "agreed": null,
+     "declined": [
+      [
+       "2026-11-12T16:00:00+00:00",
+       "2026-11-12T16:30:00+00:00"
+      ]
+     ]
+    }
+   }
+  ]
+ }
+]
