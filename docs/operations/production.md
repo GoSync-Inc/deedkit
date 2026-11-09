@@ -1542,12 +1542,29 @@ read-only first).
 3. Apply the heartbeat migration: the item 4 route (`prepare`, the runner lock wrapper, `migrate`), together with
    any other pending migration. Undo: none needed for a compatible older runtime (it writes no `negotiations`
    row); the CHECK and the policy stay.
-4. Start the service. `/etc/deedkit/production.json` (backup first): add `"negotiations": "runtime"` to the
-   messaging project's `services`, whose `files` already hold `compose.subscriptions.yaml`. Then apply the next
-   green `main` SHA under the pause file (`prepare --sha S`, `apply --sha S`). The worker's start fence exits
-   `not_ready` and writes nothing while a grant of step 1 or a table of 076 is missing. Its first start backfills
-   the journal's events of the last 14 days. Undo: remove the service from `services` and `docker compose $F
-   stop negotiations`; the tables keep what it wrote (a later start resumes from its cursor).
+4. Start the service, under the pause file and both tool locks (the global `/var/lib/deedkit-production/deploy.lock`
+   and the state directory's `deploy.lock`) for each host edit. Prerequisite: the project's env file holds
+   `ANYMSG_OWNER_TIMEZONE=<IANA zone>` (the owner's zone; the api reads the same line, compose.yaml). Check it
+   first with the worker's own read-only `docker compose $F run --rm --no-deps -T negotiations python -m
+   messaging_service.negotiation_worker --status`; `UTC_fallback` stops here. The production `files` are host
+   copies (compose.subscriptions-live.yaml holds `subscriptions` only), so:
+   1. Overlay: copy the `negotiations` block of `deploy/compose.subscriptions.yaml` at the current release into
+      `/opt/personal-os-probe/compose.negotiations.yaml` (0600 root), its `image` pinned to that release's
+      `runtime` image id, and append it to the messaging project's `files` in the active configuration (backup
+      first). `docker compose $F config --hash '*'` of every other service reads the same before and after.
+   2. First start by hand: `docker compose $F up -d --no-build --pull never --no-deps negotiations` (`$F`: the
+      project's files and env files as `production.py` passes them). `prepare` refuses a selected service
+      without exactly one running container, so the start comes before step 3.
+   3. Add `"negotiations": "runtime"` to the project's `services` (backup first).
+   4. Apply the next green `main` SHA by hand under the pause (`prepare`, `apply`, then `seamless_release.py
+      prepare` and `promote`): steps 1, 3 and the env line change the recorded configuration digests, so
+      autodeploy halts with `configuration_drift` until a release is applied by hand. A range that changes
+      `backup_runner.py` needs `deploy` (a manual `apply` refuses it), so let autodeploy carry such a SHA before
+      the pause. Then remove the pause; `deploy --dry-run` reads current.
+   The worker's start fence exits `not_ready` and writes nothing while a grant of step 1 or a table of 076 is
+   missing. Its first start backfills the journal's events of the last 14 days. Undo: restore the configuration
+   backups (`services` first), `docker compose $F stop negotiations`, remove the container and the overlay; the
+   tables keep what it wrote (a later start resumes from its cursor).
 5. Check: `production.py status` prints `negotiation worker: heartbeat <version> at <time>, owner zone <label>`.
    The label must not be `UTC_fallback`: `ANYMSG_OWNER_TIMEZONE` comes from the project's env file. The start
    log line `negotiation_worker_started owner_zone=<label>` says the same. Skipped events log
