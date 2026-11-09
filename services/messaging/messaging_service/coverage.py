@@ -40,12 +40,16 @@ def exclusion_sets(withheld):
 
     `withheld` is media_policy.recognition_withheld(c): the on-request rule, or 'false' for a login that cannot
     read its columns (then no chat is on request, as for the claims)."""
-    from .media_policy import ON_REQUEST_CHATS
+    from .media_policy import DESCRIPTION_SKIPPED, ON_REQUEST_CHATS
     chats = ('SELECT DISTINCT orc.chat FROM (' + ON_REQUEST_CHATS + ') orc' if withheld != 'false'
              else 'SELECT NULL::text AS chat WHERE false')
+    # Owner 11-09: images whose description waits for a request (old ones and stickers), by attachment id.
+    skipped = ('SELECT a.id FROM attachments a JOIN messages m ON m.id=a.message WHERE ' + DESCRIPTION_SKIPPED
+               if withheld != 'false' else 'SELECT NULL::text AS id WHERE false')
     return ('on_request_chats AS MATERIALIZED (' + chats.replace('%', '%%') + '),'
             '\n    evicted_originals AS MATERIALIZED (SELECT a.digest,a.bytes FROM attachment_residency a WHERE '
-            + EVICTED.replace('%', '%%') + ')')
+            + EVICTED.replace('%', '%%') + '),'
+            '\n    description_skipped AS MATERIALIZED (' + skipped.replace('%', '%%') + ')')
 
 
 def policy_sets(withheld):
@@ -59,11 +63,13 @@ def policy_sets(withheld):
 # digest, profile key), so no row is counted twice.
 EXCLUSION_JOINS = ('\n        LEFT JOIN on_request_chats orq ON orq.chat=m.chat'
                    '\n        LEFT JOIN media_jobs wj ON wj.id=a.id'
-                   '\n        LEFT JOIN evicted_originals eo ON eo.digest=a.digest AND eo.bytes=a.bytes')
+                   '\n        LEFT JOIN evicted_originals eo ON eo.digest=a.digest AND eo.bytes=a.bytes'
+                   '\n        LEFT JOIN description_skipped dsk ON dsk.id=a.id')
 POLICY_JOINS = (EXCLUSION_JOINS
                 + '\n        LEFT JOIN configured_kinds ck ON ck.account=m.account AND ck.kind=' + KIND)
 WITHHELD_ROW = '(orq.chat IS NOT NULL AND wj.id IS NOT NULL AND wj.request_key_digest IS NULL)'
 EVICTED_ROW, CONFIGURED_ROW = 'eo.digest IS NOT NULL', 'ck.kind IS NOT NULL'
+SKIPPED_ROW = 'dsk.id IS NOT NULL'
 
 
 # enrichment.FINAL_LIMIT_CODES: a failure the same profile never retries (a test keeps the two equal, so the API
@@ -83,6 +89,7 @@ def recognition_bucket():
         WHEN ''' + WITHHELD_ROW + ''' THEN 'withheld'
         WHEN ''' + EVICTED_ROW + ''' THEN 'evicted'
         WHEN NOT ''' + CONFIGURED_ROW + ''' THEN 'recognition_off'
+        WHEN ''' + SKIPPED_ROW + ''' THEN 'skipped'
         WHEN ''' + KIND + "='document' AND NOT coalesce(" + DOCUMENT_TEXT + ''',false) THEN 'no_text'
         WHEN e.state='failed' THEN 'failed_retry'
         ELSE 'due' END''')
@@ -101,7 +108,8 @@ def extraction_bucket():
 # was reported queued splits into due work, work waiting for a request and work no worker can do.
 RECOGNITION_FILES = {'unknown': 'unknown', 'ready': 'ready', 'failed_final': 'failed', 'failed_retry': 'failed',
                      'unsupported': 'unsupported', 'leased': 'leased', 'withheld': 'available_on_request',
-                     'evicted': 'available_on_request', 'recognition_off': 'unconfigured',
+                     'evicted': 'available_on_request', 'skipped': 'available_on_request',
+                     'recognition_off': 'unconfigured',
                      'no_text': 'not_recognizable', 'due': 'queued'}
 EXTRACTION_FILES = {'unknown': 'unknown', 'ready': 'ready', 'unsupported': 'unsupported', 'failed': 'failed',
                     'leased': 'leased', 'withheld': 'available_on_request', 'evicted': 'available_on_request',
@@ -182,7 +190,7 @@ def block(row, platform, files, tally, eligibility, health_codes, lease_live):
     reasons = {reason: sum(queued.get(reason, {}).values()) for reason in ON_REQUEST_DOWNLOADS}
     likely_expired = sum(expired.get(reason, 0) for reason in ON_REQUEST_DOWNLOADS) if platform == 'whatsapp' else 0
     not_downloaded = {reason: n for reason, n in reasons.items() if n}
-    stored_waiting = total('withheld', 'evicted')
+    stored_waiting = total('withheld', 'evicted', 'skipped')
     due = {'to_download': eligible_waiting + downloads.get('leased', 0),
            'to_index': sum(ext.get(b, 0) for b in EXTRACTION_DUE),
            'to_recognize': to_recognize,

@@ -4,8 +4,8 @@ import time
 
 from . import telemetry
 from .file_lifecycle import PROCESSABLE_ORIGINAL
-from .media_policy import RECOGNITION_WITHHELD
-from .coverage import DOCUMENT_TEXT, EVICTED_ROW, EXCLUSION_JOINS, KIND, WITHHELD_ROW, exclusion_sets
+from .media_policy import DESCRIPTION_SKIPPED, RECOGNITION_WITHHELD
+from .coverage import DOCUMENT_TEXT, EVICTED_ROW, EXCLUSION_JOINS, KIND, SKIPPED_ROW, WITHHELD_ROW, exclusion_sets
 
 MINI_PROVIDER = 'deedkit_inference'
 CHECK_PERIOD_S = 300
@@ -32,6 +32,7 @@ SCOPES_SQL = 'WITH '+exclusion_sets(RECOGNITION_WITHHELD)+''',
         WHERE e.state='queued' AND e.provider=%(provider)s AND e.kind IS NOT NULL AND e.profile_hash IS NOT NULL
             AND a.active AND NOT m.deleted AND e.source_digest=a.digest AND e.source_revision=m.revision
             AND '''+PROCESSABLE_ORIGINAL.replace('%', '%%')+''' AND NOT '''+RECOGNITION_WITHHELD.replace('%', '%%')+'''
+            AND NOT '''+DESCRIPTION_SKIPPED+'''
         GROUP BY 1,2,3),
     ready AS (
         SELECT m.account,e.kind,e.profile_hash,max(e.updated_at) AS newest
@@ -54,7 +55,7 @@ SCOPES_SQL = 'WITH '+exclusion_sets(RECOGNITION_WITHHELD)+''',
         JOIN attachment_enrichment e ON e.attachment=a.id AND e.source_digest=a.digest AND e.source_revision=m.revision
         LEFT JOIN attachment_text f ON f.attachment=a.id'''+EXCLUSION_JOINS+'''
         WHERE e.state='unconfigured' AND a.active AND NOT m.deleted
-            AND NOT '''+WITHHELD_ROW+''' AND NOT '''+EVICTED_ROW+'''
+            AND NOT '''+WITHHELD_ROW+''' AND NOT '''+EVICTED_ROW+''' AND NOT '''+SKIPPED_ROW+'''
             AND ('''+KIND+"""<>'document' OR coalesce("""+DOCUMENT_TEXT+''',false))
         GROUP BY 1,2),
     waiting_ready AS (

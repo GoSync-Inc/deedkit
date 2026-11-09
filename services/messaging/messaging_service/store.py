@@ -1064,7 +1064,7 @@ class Store:
             targets(p,[row['id']])
             fields=attachment_fields(row,original_present=True)
             # Policy inputs (ANYM-805), not fields: attachment_fields has turned them into the reason it shows.
-            row.pop('recognition_withheld',None);row.pop('recognition_reason',None)
+            row.pop('recognition_withheld',None);row.pop('recognition_reason',None);row.pop('enrichment_reason',None)
             return {**serial(row),**serial(fields), 'status': 'ready', 'message_id':row['message'],
                     **self.dataset(c,p),
                     'download_url': f'{self.public_url}/v1/download/{grant}',

@@ -4,7 +4,7 @@ from contextvars import ContextVar
 
 from .attachment_metadata import attachment_fields
 from .file_extract import ocr_quality
-from .media_policy import ELIGIBILITY_JOIN, RECOGNITION_REASON, RECOGNITION_WITHHELD
+from .media_policy import DESCRIPTION_WAITS, ELIGIBILITY_JOIN, ENRICHMENT_REASON, RECOGNITION_REASON, RECOGNITION_WITHHELD
 
 # Set by Store.access; without it no excerpt is shown (the presence rule cannot run).
 FILES_ROOT:ContextVar=ContextVar('files_root',default=None)
@@ -130,8 +130,9 @@ def decorate(c,rows,*,order_key=None,with_body=False):
         m.provider_id AS provider_message_id,ch.provider_chat AS provider_chat_id,
         j.state AS job_state,j.error_code AS download_error_code,el.occurrence AS download_eligibility,
         '''+RECOGNITION_WITHHELD+''' AS recognition_withheld,'''+RECOGNITION_REASON+''' AS recognition_reason,
+        '''+ENRICHMENT_REASON+''',
         coalesce(a.filename,j.descriptor->>'filename') AS source_name,
-        coalesce(f.state,'unknown') AS extraction_state,f.extractor,jsonb_strip_nulls(jsonb_build_object('ocr_words',f.extraction_metadata->'ocr_words','ocr_confidence',f.extraction_metadata->'ocr_confidence')) AS ocr_metadata,CASE WHEN coalesce(e.state,'unconfigured')='unconfigured' AND EXISTS(SELECT FROM processing_profiles pp WHERE pp.account=m.account AND pp.enabled AND pp.kind=CASE WHEN a.mime LIKE 'audio/%%' OR a.mime='application/ogg' THEN 'audio' WHEN a.mime LIKE 'image/%%' THEN 'image' ELSE 'document' END) THEN 'queued' ELSE coalesce(e.state,'unconfigured') END AS enrichment_state
+        coalesce(f.state,'unknown') AS extraction_state,f.extractor,jsonb_strip_nulls(jsonb_build_object('ocr_words',f.extraction_metadata->'ocr_words','ocr_confidence',f.extraction_metadata->'ocr_confidence')) AS ocr_metadata,CASE WHEN '''+DESCRIPTION_WAITS+''' THEN 'available_on_request' WHEN coalesce(e.state,'unconfigured')='unconfigured' AND EXISTS(SELECT FROM processing_profiles pp WHERE pp.account=m.account AND pp.enabled AND pp.kind=CASE WHEN a.mime LIKE 'audio/%%' OR a.mime='application/ogg' THEN 'audio' WHEN a.mime LIKE 'image/%%' THEN 'image' ELSE 'document' END) THEN 'queued' ELSE coalesce(e.state,'unconfigured') END AS enrichment_state
         '''+EXCERPT_COLUMNS+'''
         FROM media_jobs j JOIN messages m ON m.id=j.message
         JOIN chats ch ON ch.id=m.chat AND ch.account=m.account
@@ -150,7 +151,8 @@ def decorate(c,rows,*,order_key=None,with_body=False):
         m.provider_id AS provider_message_id,ch.provider_chat AS provider_chat_id,
         'ready' AS job_state,NULL AS download_error_code,a.filename AS source_name,
         '''+RECOGNITION_WITHHELD+''' AS recognition_withheld,'''+RECOGNITION_REASON+''' AS recognition_reason,
-        coalesce(f.state,'unknown') AS extraction_state,f.extractor,jsonb_strip_nulls(jsonb_build_object('ocr_words',f.extraction_metadata->'ocr_words','ocr_confidence',f.extraction_metadata->'ocr_confidence')) AS ocr_metadata,CASE WHEN coalesce(e.state,'unconfigured')='unconfigured' AND EXISTS(SELECT FROM processing_profiles pp WHERE pp.account=m.account AND pp.enabled AND pp.kind=CASE WHEN a.mime LIKE 'audio/%%' OR a.mime='application/ogg' THEN 'audio' WHEN a.mime LIKE 'image/%%' THEN 'image' ELSE 'document' END) THEN 'queued' ELSE coalesce(e.state,'unconfigured') END AS enrichment_state
+        '''+ENRICHMENT_REASON+''',
+        coalesce(f.state,'unknown') AS extraction_state,f.extractor,jsonb_strip_nulls(jsonb_build_object('ocr_words',f.extraction_metadata->'ocr_words','ocr_confidence',f.extraction_metadata->'ocr_confidence')) AS ocr_metadata,CASE WHEN '''+DESCRIPTION_WAITS+''' THEN 'available_on_request' WHEN coalesce(e.state,'unconfigured')='unconfigured' AND EXISTS(SELECT FROM processing_profiles pp WHERE pp.account=m.account AND pp.enabled AND pp.kind=CASE WHEN a.mime LIKE 'audio/%%' OR a.mime='application/ogg' THEN 'audio' WHEN a.mime LIKE 'image/%%' THEN 'image' ELSE 'document' END) THEN 'queued' ELSE coalesce(e.state,'unconfigured') END AS enrichment_state
         '''+EXCERPT_COLUMNS+'''
         FROM attachments a JOIN messages m ON m.id=a.message
         JOIN chats ch ON ch.id=m.chat AND ch.account=m.account

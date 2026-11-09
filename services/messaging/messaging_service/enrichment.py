@@ -290,6 +290,9 @@ class EnrichmentWorker:
 
         The SELECT has no ORDER BY, LIMIT or lock: claim() adds them under its locks; due() reads it with none."""
         from .file_lifecycle import PROCESSABLE_ORIGINAL
+        from .media_policy import description_skipped
+        # Owner 11-09: an old image or a sticker is described when an agent asks (media_policy.DESCRIPTION_SKIPPED).
+        skipped=description_skipped(withheld)
         account_used={r['account']:r['n'] for r in c.execute('''SELECT account,sum(attempts) n
             FROM processing_budget WHERE day=current_date GROUP BY account''').fetchall()}
         for kind,profile in self.config['profiles'].items():
@@ -301,7 +304,7 @@ class EnrichmentWorker:
             eligible=[account for account in self.config['accounts'] if account_used.get(account,0)<
                 self.config.get('account_max_jobs_per_day',{}).get(account,10000)]
             if not eligible:continue
-            condition={'audio':"(a.mime LIKE 'audio/%%' OR a.mime='application/ogg')",'image':"a.mime LIKE 'image/%%'",
+            condition={'audio':"(a.mime LIKE 'audio/%%' OR a.mime='application/ogg')",'image':"a.mime LIKE 'image/%%' AND NOT "+skipped,
                 'document':"a.mime NOT LIKE 'audio/%%' AND a.mime<>'application/ogg' AND a.mime NOT LIKE 'image/%%' AND f.state='ready' AND f.source_revision=m.revision AND f.source_digest=a.digest AND length(f.text_content)>0"}[kind]
             # A note downloaded on request today is as fresh as one sent today (ANYM-455).
             fresh="m.sent_at>=clock_timestamp()-interval '1 day'"+(" OR r.updated_at>=clock_timestamp()-interval '1 day'" if kind=='audio' else '')
