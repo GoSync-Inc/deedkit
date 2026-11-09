@@ -4672,6 +4672,27 @@ def test_a_failed_fetch_changes_nothing_and_only_the_third_in_a_row_pauses(tmp_p
     assert stopped.value.code == 1 and json.loads(capsys.readouterr().out)["status"] == "fetch_failed"
 
 
+# spec: ANYM-407
+def test_a_successful_fetch_ends_the_git_failure_count_for_every_later_write_of_the_run(tmp_path, monkeypatch):
+    # Astra r1 on #791: the cleared count lived on in the run's receipt, so a GHCR count or its reset wrote it back.
+    host = Deployer(tmp_path, monkeypatch)
+    host.git_failures["ls-remote"] = "fatal: unable to access 'https://github.com/GoSync-Inc/deedkit.git/'\n"
+    assert [host.deploy()["failures"] for _ in range(2)] == [1, 2]
+    del host.git_failures["ls-remote"]
+    host.unreached.add(NEWEST)
+    assert host.deploy()["status"] == "error"
+    receipt = p.read(host.state / "deploy.json")
+    assert "fetch_failures" not in receipt and receipt["unreachable"]["count"] == 1
+    host.unreached.clear()
+    host.green = set()
+    assert host.deploy()["status"] == "waiting"
+    receipt = p.read(host.state / "deploy.json")
+    assert "fetch_failures" not in receipt and "unreachable" not in receipt
+    # A new git failure starts a new count: it never pauses as the third of the earlier two.
+    host.git_failures["ls-remote"] = "fatal: unable to access 'https://github.com/GoSync-Inc/deedkit.git/'\n"
+    assert host.deploy()["failures"] == 1 and host.paused() is None
+
+
 def test_an_unchanged_main_after_failed_fetches_resets_the_count(tmp_path, monkeypatch):
     host = Deployer(tmp_path, monkeypatch, history=())
     host.git_failures["ls-remote"] = p.Refused("git failed (exit 128): fatal: synthetic; production was not accepted")

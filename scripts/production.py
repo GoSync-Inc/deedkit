@@ -5545,8 +5545,12 @@ def deploy_fetch_main(state, base, serving, last, failures, dry_run, halt):
         if not dry_run:
             write(state / "deploy.json", {**rest, "fetch_failures": {"count": failures, "at": now(), "reason": message}})
         return {"status": "fetch_failed", "reason": message, "failures": failures}, None
-    if "fetch_failures" in last and not dry_run:
-        write(state / "deploy.json", {key: value for key, value in last.items() if key != "fetch_failures"})
+    if "fetch_failures" in last:
+        # From the caller's receipt too: a later write of it in this run (a GHCR count, a deploy record) must never
+        # restore the count this successful fetch ended.
+        del last["fetch_failures"]
+        if not dry_run:
+            write(state / "deploy.json", last)
     return None, mirror
 
 
