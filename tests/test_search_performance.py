@@ -89,7 +89,7 @@ def test_related_chat_check_reads_bounded_messages_in_a_200k_archive(seeded,monk
     from datetime import datetime,timezone
     from messaging_service import related_chats
     s,a,b=seeded
-    # This test bounds the rows the check reads, not the host's speed; the 1.0 s budget has its own test below.
+    # This test bounds the rows the check reads, not the host's speed; the hint budget (0.3 s, ANYM-878) has its own test below.
     monkeypatch.setattr(related_chats,'DEADLINE_SECONDS',120.0)
     class Explained:
         def __init__(self,connection):self.connection=connection;self.plans=[]
@@ -141,6 +141,89 @@ def test_related_chat_check_returns_no_hint_when_its_deadline_is_spent(seeded,mo
     with caplog.at_level('WARNING',logger=related_chats.log.name):
         assert check()=={}
     assert [r.getMessage() for r in caplog.records if r.name==related_chats.log.name]==['related_chats_abandoned Deadline']
+
+
+def seed_catalog(s):
+    """1,000 chats: 700 Telegram chats with interleaved histories, 150 verified WhatsApp LID/PN pairs (4 observations each)."""
+    with s.pool.connection() as c:
+        c.execute("SET LOCAL statement_timeout='120s'")
+        c.execute("""INSERT INTO chats(id,account,provider_chat,title,chat_type)
+            SELECT 'pf-'||n,'telegram-demo','pf-'||n,'Synthetic '||n,CASE WHEN n%5=0 THEN 'group' ELSE 'private' END FROM generate_series(0,699) n
+            UNION ALL SELECT 'pf-lid-'||n,'whatsapp-demo-1',(910000+n)::text||'@lid',(910000+n)::text||'@lid','private' FROM generate_series(0,149) n
+            UNION ALL SELECT 'pf-pn-'||n,'whatsapp-demo-1',(710000+n)::text||'@c.us','Peer '||n,'private' FROM generate_series(0,149) n""")
+        # Message k of chat n is k*1000+n minutes old, so every chat keeps older messages below every later chat's head.
+        c.execute("""INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
+            SELECT 'pf-m-'||n||'-'||k,'telegram-demo','pf-'||n,(n*10+k)::text,CASE WHEN k%2=0 THEN 'peer' ELSE 'owner' END,
+              'synthetic text '||n,now()-((k*1000+n*1.4)::int)*interval '1 minute',CASE WHEN k%2=0 THEN 'incoming' ELSE 'outgoing' END
+            FROM generate_series(0,699) n,generate_series(0,5) k
+            UNION ALL SELECT 'pf-w-'||n||'-'||k,'whatsapp-demo-1',CASE WHEN k<4 THEN 'pf-lid-'||n ELSE 'pf-pn-'||n END,'wamid-'||n||'-'||k,
+              CASE WHEN k<4 THEN (910000+n)::text||'@lid' ELSE 'owner' END,'synthetic text '||n,
+              now()-((k*1000+n*7+3)::int)*interval '1 minute',CASE WHEN k<4 THEN 'incoming' ELSE 'outgoing' END
+            FROM generate_series(0,149) n,generate_series(0,5) k""")
+        c.execute("""INSERT INTO whatsapp_identity_observations(account,source_message,identity_id,pn,lid,provenance,first_observed_at,observed_at)
+            SELECT 'whatsapp-demo-1','pf-w-'||n||'-'||k,(910000+n)::text||'@lid',(710000+n)::text||'@c.us',(910000+n)::text||'@lid',
+              'webjs_contact_cache_v1',now(),now() FROM generate_series(0,149) n,generate_series(0,3) k""")
+        for table in ('messages','chats','whatsapp_identity_observations'):c.execute('ANALYZE '+table)
+
+
+class Plans:
+    """EXPLAIN (ANALYZE) of every read a list_chats call makes, with the function that issued it."""
+    def __init__(self,connection):self.connection=connection;self.plans=[]
+    def execute(self,sql,args=None):
+        import traceback
+        if sql.lstrip().startswith(('SELECT','WITH')):
+            chain=[f.name for f in traceback.extract_stack()[:-1] if '/messaging_service/' in f.filename]
+            plan=self.connection.execute('EXPLAIN (ANALYZE,FORMAT JSON) '+sql,args).fetchone()['QUERY PLAN'][0]['Plan']
+            self.plans.append((chain,plan))
+        return self.connection.execute(sql,args)
+    def __getattr__(self,name):return getattr(self.connection,name)
+
+
+def head_loops(plans):
+    """The most times any one messages scan ran in the page's own statements (a per-chat head read runs once per chat)."""
+    own=[plan for chain,plan in plans if chain and chain[-1] in ('list_chats','_page_first','_alias_pairs')]
+    return max((node.get('Actual Loops',1) for plan in own for node in nodes(plan) if node.get('Relation Name')=='messages'),default=0)
+
+
+def listed(s,token,indexed=False,**kw):
+    from messaging_service.chat_queries import list_chats
+    with s.authorized(token,'list_chats') as (c,p):
+        # A 600-row table legitimately favours a sequential scan; exercise the indexed path a large archive relies on.
+        if indexed:c.execute('SET LOCAL enable_seqscan=off')
+        measured=Plans(c)
+        result=list_chats(s,measured,p,kw.pop('after',''),25,order='activity',view='conversation',include_coverage=False,**kw)
+    return result,measured.plans
+
+
+# spec: ANYM-878
+def test_default_activity_page_reads_heads_for_the_page_not_the_catalog(seeded):
+    s,a,b=seeded
+    seed_catalog(s)
+    limit=25
+    restricted=s.issue_key('page-first-ten',['telegram-demo'],chats=['pf-'+str(n) for n in range(0,100,10)])
+    cases={'owner':listed(s,a),'restricted':listed(s,restricted),'account':listed(s,a,accounts=['telegram-demo'])}
+    first,_=cases['owner']
+    cases['page 2']=listed(s,a,after=first['next_cursor'])
+    loops={name:head_loops(plans) for name,(_,plans) in cases.items()}
+    assert first['items'][0]['id']=='pf-0',first['items'][:3]
+    assert len(cases['restricted'][0]['items'])==10
+    # Today's plan read a head per catalog chat (1,000); the page plan reads at most 2x(limit+1), a restricted key at most its 10 chats.
+    assert loops['restricted']<=10 and all(loops[name]<=2*(limit+1) for name in ('owner','account','page 2')),loops
+
+
+# spec: ANYM-878
+def test_default_activity_page_reads_whatsapp_identity_rows_for_the_page_only(seeded):
+    s,a,b=seeded
+    seed_catalog(s)
+    result,plans=listed(s,a,indexed=True)
+    paired=sum(1 for r in result['items'] if r['id'].startswith('pf-lid-') or r['id'].startswith('pf-pn-'))
+    # The related-chat hint keeps its corpus-wide alias set (ANYM-656) inside its own 0.3 s budget; it is not page work.
+    steps={}
+    for chain,plan in plans:
+        if 'hints' not in chain:steps['>'.join(chain[-3:])]=steps.get('>'.join(chain[-3:]),0)+visited(plan,{'whatsapp_identity_observations'})
+    read=sum(steps.values())
+    # 600 observations in the catalog; the page's pairs (4 each) and their conflict and source probes only.
+    assert 0<paired<=26 and read<=20*paired,(paired,read,{k:v for k,v in steps.items() if v})
 
 
 # spec: ANYM-272

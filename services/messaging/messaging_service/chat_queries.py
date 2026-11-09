@@ -212,16 +212,17 @@ def read_state_sql(c):
     return read_sources,fresh,unread
 
 
-def _alias_pairs(accounts,c,p):
+def _alias_pairs(accounts,c,p,chats=None):
     # ANYM-278: a peer's private PN chat and LID chat, joined by a verified visible
     # link, are one conversation. The chat with the newest meaningful message is
     # listed; the other one names it in alias_chats. Second-resolution WhatsApp
     # times cannot order a tie, so a tie lists the chat with an incoming message
     # at that time (its reply hint stays visible), otherwise the LID chat.
+    # `chats` limits the pairs to those touching these chats (ANYM-878: a page's candidates).
     from .whatsapp_identity import chat_links
     whatsapp=c.execute("SELECT EXISTS(SELECT 1 FROM accounts WHERE id=ANY(%s) AND platform='whatsapp') AS x",
         (p['accounts'] if accounts is None else [a for a in accounts if a in p['accounts']],)).fetchone()['x']
-    links=chat_links(c,p,accounts,paired_only=True) if whatsapp else [];aliases={};listed={}
+    links=chat_links(c,p,accounts,chats=chats,paired_only=True) if whatsapp and chats!=[] else [];aliases={};listed={}
     pairs=[link for link in links if link['pn_chat']]
     if pairs:
         head_sql=f"""SELECT m.sent_at,m.id,{number('m')} AS numeric_id FROM messages m
@@ -245,6 +246,76 @@ def _alias_pairs(accounts,c,p):
                 'title':other['title'],'last_activity':other['at'],'unread_count':other['unread_count']},
                 'provenance':link['provenance']}
     return aliases,listed
+
+
+# ANYM-878: the activity page reads the newest qualifying messages in windows of this many rows per listed row,
+# growing 4x up to the row cap; past it, or past PAGE_CANDIDATE_CAP x (limit+1) candidates, the page falls back to the
+# per-chat plan.
+PAGE_WINDOW=4
+PAGE_WINDOW_CAP=16384
+PAGE_CANDIDATE_CAP=4
+
+
+def _page_first(c,p,clauses,args,*,accounts,limit,last_sql,last_filter,pos,lower,upper,exclude_chats):
+    """ANYM-878: an activity page's chats from the newest qualifying messages, not from a head read per catalog chat.
+
+    The window walks the newest messages that the page's own head filter (`last_filter`) and chat clauses keep. Floor
+    is the time at which its (limit+1)th distinct chat first appears; every chat with a qualifying message at or after
+    the floor (ties included) is a candidate. Each candidate's exact head is then read as the per-chat plan does. A chat
+    outside the candidates has no qualifying message at or after the floor, so its head is older than every candidate's;
+    a candidate list that still yields limit+1 rows after the cursor and the bounds is therefore exactly the page.
+    Anything the window cannot prove (an exhausted archive, chats without messages, a deep cursor) returns None and the
+    caller runs today's per-chat plan. Returns (page chat ids, aliases, listed) otherwise.
+    """
+    at=cid=None
+    if pos is not None:
+        if pos['at'] is None:return None
+        at=position_date(pos['at']);cid=position_text(pos.get('id'))
+    msg_scope,msg_args=scope_filter(p,'m')
+    bounds,bound_args=[],[]
+    if accounts is not None:bounds.append('m.account=ANY(%s)');bound_args.append(accounts)
+    if at is not None:bounds.append('m.sent_at<=%s');bound_args.append(at)
+    if upper:bounds.append('m.sent_at<%s');bound_args.append(upper)
+    if lower:bounds.append('m.sent_at>=%s');bound_args.append(lower)
+    window_from=(' FROM messages m JOIN chats c ON c.id=m.chat AND c.account=m.account LEFT JOIN message_metadata md'
+        ' ON md.message=m.id AND md.revision=m.revision WHERE '+' AND '.join([msg_scope,'NOT m.deleted',last_filter,*clauses,*bounds]))
+    window_args=[*msg_args,*args,*bound_args]
+    exact=[*clauses,'c.id=ANY(%s)','NOT c.id=ANY(%s)']
+    exact_tail,exact_args=[],[]
+    if pos is not None:
+        exact_tail.append("(coalesce(last.sent_at,'-infinity'),c.id)<(coalesce(%s::timestamptz,'-infinity'),%s)");exact_args.extend([at,cid])
+    for bound,op in [(lower,'>='),(upper,'<')]:
+        if bound:exact_tail.append('last.sent_at'+op+'%s');exact_args.append(bound)
+    exact_sql=('SELECT c.id FROM chats c JOIN accounts a ON a.id=c.account LEFT JOIN LATERAL ('+
+        latest_sql(last_sql,both_directions=True)+') last ON true WHERE '+' AND '.join([*exact,*exact_tail])+
+        " ORDER BY coalesce(last.sent_at,'-infinity') DESC,c.id DESC LIMIT %s")
+    # need: distinct window chats the floor must cover. It starts at limit+1 and at least doubles while a candidate list
+    # falls short (chats the cursor or a bound excludes, hidden pair chats): a deeper floor before a wider window, and at
+    # most three tries before the fallback, so a deep cursor costs today's plan plus at most 7x(limit+1) head reads.
+    size,need,rows,first=PAGE_WINDOW*(limit+1),limit+1,None,{}
+    while need<=PAGE_CANDIDATE_CAP*(limit+1):
+        if len(first)<need:
+            if rows is not None and len(rows)<size:return None
+            if rows is not None:size*=4
+            if size>PAGE_WINDOW_CAP:return None
+            rows=c.execute('SELECT m.chat,m.sent_at'+window_from+' ORDER BY m.sent_at DESC,m.id DESC LIMIT %s',[*window_args,size]).fetchall()
+            first={}
+            for row in rows:first.setdefault(row['chat'],row['sent_at'])
+            continue
+        floor=list(first.values())[need-1]
+        found=[chat for chat,t in first.items() if t>=floor]
+        if rows[-1]['sent_at']==floor:
+            # The window may end inside the floor's tie; the rest of the tie is one index range.
+            found+=[r['chat'] for r in c.execute('SELECT DISTINCT m.chat'+window_from+' AND m.sent_at=%s',
+                [*window_args,floor]) if r['chat'] not in first]
+        aliases,listed=_alias_pairs(accounts,c,p,chats=[*found,*(exclude_chats or [])])
+        # The listed chat of a pair hides the other one; an excluded hidden chat excludes its listed chat too.
+        hidden={v['chat']['id']:shown for shown,v in listed.items()}
+        excluded=[*hidden,*(hidden[i] for i in (exclude_chats or []) if i in hidden)]
+        page=c.execute(exact_sql,[*args,found,excluded,*exact_args,limit+1]).fetchall()
+        if len(page)>limit:return [r['id'] for r in page],aliases,listed
+        need=max(2*need,len(found)+limit+1-len(page))
+    return None
 
 
 def _page_cursor(binding,limit,order,rows,score_at,waits):
@@ -402,7 +473,12 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     lower,upper=date_bound(from_time),date_bound(to_time)
     if lower and upper and lower>=upper:raise date_range_refusal()
     scope,args=scope_filter(p,'c',chat_column='id');clauses=[scope]
-    aliases,listed=_alias_pairs(accounts,c,p)
+    # ANYM-878: a catalog page in activity order is found from the newest messages (_page_first), and the WhatsApp
+    # pairs are read for its candidates only. A principal with no more chats than the first window keeps the per-chat
+    # plan: it reads no more heads than the window would.
+    page_first=(order=='activity' and not (awaiting_reply or only_questions or only_unread or awaiting_their_reply or query
+        or selected_chat) and exclude_senders is None and (p['chat_ids'] is None or len(p['chat_ids'])>PAGE_WINDOW*(limit+1)))
+    aliases,listed=({},{}) if page_first else _alias_pairs(accounts,c,p)
     hidden={v['chat']['id']:shown for shown,v in listed.items()}
     if hidden and not selected_chat:clauses.append('NOT c.id=ANY(%s)');args.append(list(hidden))
     if selected_chat:clauses.append('c.id=%s');args.append(selected_chat)
@@ -457,6 +533,23 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         if set(pos)!={'id','at','score','as_of'} or type(pos['score']) is not int:raise cursor_refusal()
         score_at=position_date(pos['as_of'])
         if score_at is None or score_at>now:raise cursor_refusal()
+    last_filter=meaningful() if view=='conversation' else 'NOT m.deleted'
+    last_sql=f'''SELECT m.sent_at,m.id,m.direction,left(m.body,160) AS snippet,
+        CASE WHEN a.platform='telegram' THEN {number('m')} ELSE 0::bigint END AS numeric_id FROM messages m
+        LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision
+        WHERE m.account=c.account AND m.chat=c.id AND {last_filter}'''
+    if page_first:
+        found=_page_first(c,p,clauses,args,accounts=accounts,limit=limit,last_sql=last_sql,last_filter=last_filter,
+            pos=pos,lower=lower,upper=upper,exclude_chats=exclude_chats)
+        if found:
+            page_ids,aliases,listed=found;clauses.append('c.id=ANY(%s)');args.append(page_ids)
+        else:
+            # Today's per-chat plan, with the catalog's WhatsApp pairs.
+            aliases,listed=_alias_pairs(accounts,c,p)
+            hidden={v['chat']['id']:shown for shown,v in listed.items()}
+            if hidden:clauses.append('NOT c.id=ANY(%s)');args.append(list(hidden))
+            partners=[hidden[i] for i in exclude_chats or () if i in hidden]
+            if partners:clauses.append('NOT c.id=ANY(%s)');args.append(partners)
     age='true' if not awaiting_reply_days else f"attention.sent_at>=CURRENT_TIMESTAMP-interval '{awaiting_reply_days} days'"
     attention_age='true' if not awaiting_reply_days else f"m.sent_at>=CURRENT_TIMESTAMP-interval '{awaiting_reply_days} days'"
     # ANYM-281: the key's snoozes and the principal's mutes. Literals, because the
@@ -577,11 +670,6 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     attention_after=after_owner
     if view=='conversation':
         attention_after=f"(c.chat_type='private' AND {after_owner})"
-    last_filter=meaningful() if view=='conversation' else 'NOT m.deleted'
-    last_sql=f'''SELECT m.sent_at,m.id,m.direction,left(m.body,160) AS snippet,
-        CASE WHEN a.platform='telegram' THEN {number('m')} ELSE 0::bigint END AS numeric_id FROM messages m
-        LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision
-        WHERE m.account=c.account AND m.chat=c.id AND {last_filter}'''
     owner_sql=f'''SELECT m.sent_at,m.id,{number('m')} AS numeric_id FROM messages m
         LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision
         WHERE m.account=c.account AND m.chat=c.id AND m.direction='outgoing' AND {meaningful()}'''
