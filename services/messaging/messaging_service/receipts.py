@@ -49,11 +49,12 @@ def validate_capture(value):
     chat=value['chat']
     if value['provider_at'] is not None:raise ValueError('unsupported_receipt_provider_time')
     if value['platform']=='telegram':
-        if not isinstance(chat,str) or not re.fullmatch(r'[1-9][0-9]{0,18}',chat) or int(chat)>=2**63:
+        # A private peer's positive user ID, or a group's stored marked (negative) chat ID (ANYM-868).
+        if not isinstance(chat,str) or not re.fullmatch(r'-?[1-9][0-9]{0,18}',chat) or abs(int(chat))>=2**63:
             raise ValueError('invalid_receipt_chat')
         if (value['provider_id'] is not None or type(value['max_id']) is not int or not 0<value['max_id']<2**63
                 or value['state']!='read' or value['basis']!='telegram_outbox_boundary'
-                or value['audience']!='private_peer'):
+                or value['audience']!=('provider_aggregate' if chat.startswith('-') else 'private_peer')):
             raise ValueError('invalid_receipt_reference')
     elif value['platform']=='whatsapp':
         if not isinstance(chat,str) or not WA_CHAT_RE.fullmatch(chat):
@@ -104,9 +105,19 @@ def unknown_evidence():
     return _evidence([])
 
 
+# ANYM-868: an aggregate Telegram boundary is recorded only for a chat stored as a group. A broadcast channel's
+# reader is one of its subscribers and tells the owner nothing; a chat of no known type may be one.
+GROUP_SKIPS={'channel':'receipt_broadcast_channel'}
+
+
 def record(c,raw):
     """Caller holds the account's archive lock and fenced collector lease."""
     value=validate_capture(raw)
+    if value['platform']=='telegram' and value['audience']=='provider_aggregate':
+        found=c.execute('SELECT chat_type FROM chats WHERE account=%s AND provider_chat=%s',
+            (value['account'],value['chat'])).fetchone()
+        kind=found['chat_type'] if found else None
+        if kind!='group':return {'outcome':'receipt_skipped','reason':GROUP_SKIPS.get(kind,'receipt_chat_type_unknown')}
     digest=hashlib.sha256(canonical({k:v for k,v in value.items() if k!='observed_at'})).hexdigest()
     previous=c.execute('''SELECT max(max_id) AS max_id FROM message_receipts
         WHERE account=%s AND provider_chat=%s AND platform='telegram' ''',

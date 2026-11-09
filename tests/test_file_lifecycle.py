@@ -101,7 +101,7 @@ def test_migration_068_refuses_an_unusable_index_of_its_name_and_builds_it_once_
             c.execute('DROP INDEX attachment_digest_bytes')
         store.migrate();store.migrate()
         with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='71'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='72'
             assert c.execute('''SELECT i.indisvalid,pg_get_indexdef(i.indexrelid) AS d FROM pg_index i
                 WHERE i.indexrelid='attachment_digest_bytes'::regclass''').fetchone()=={'indisvalid':True,
                 'd':'CREATE INDEX attachment_digest_bytes ON public.attachments USING btree (digest, bytes)'}

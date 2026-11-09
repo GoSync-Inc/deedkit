@@ -73,12 +73,13 @@ Telegram live capture follows the same rule. Exactly three rejections of a
 live message, deletion, read receipt or owner read are skipped, because a
 restart would meet the same input again: the message adapter's `ValueError`
 (an unsupported peer kind included), a malformed-input error from the receipt
-or read parser, and a rejection by the spool validator or canonical
+or read parser (an outbox boundary of an unknown peer type included), and a rejection by the spool validator or canonical
 serialisation. A skipped item is not written, not quarantined and not retried,
 and it does not stop the collector. `live_capture.rejected_live_captures`
 counts skipped items, cumulatively, by a code from a fixed vocabulary: the
 validators' own codes (for example `invalid_deleted_ids`),
-`invalid_provider_message`, `receipt_parse_failed` and `read_parse_failed`.
+`invalid_provider_message`, `receipt_parse_failed`, `read_parse_failed` and
+`receipt_peer_unsupported` (an outbox read boundary with an unknown peer type, ANYM-868).
 Any other text becomes the generic `invalid_capture`. `invalid_provider_message`
 is the live counterpart of `invalid_provider_messages`: the same message counts
 once in each. For a skipped message, `rejected_live_messages` keeps the chat,

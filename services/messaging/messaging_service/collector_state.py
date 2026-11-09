@@ -118,7 +118,7 @@ LIVE_REJECT_CODES=frozenset({'invalid_capture','invalid_capture_kind','invalid_c
     'invalid_identity_observations','identity_source_mismatch','invalid_read_capture','invalid_read_observation',
     'invalid_receipt','invalid_receipt_account','invalid_receipt_chat','invalid_receipt_platform',
     'invalid_receipt_reference','unsupported_receipt_provider_time','invalid_whatsapp_event',
-    'invalid_provider_message','receipt_parse_failed','read_parse_failed'})
+    'invalid_provider_message','receipt_parse_failed','read_parse_failed','receipt_peer_unsupported'})
 # Stop codes of live capture itself; the fixed causes of a fail-closed write are CAPTURE_STOP_DETAILS.
 CAPTURE_STOPS={'durable_capture_failed','capture_overload'}
 

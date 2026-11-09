@@ -216,6 +216,7 @@ def peer_kind(message):
 class TelethonProvider:
     supports_receipts=True
     supports_owner_reads=True
+    supports_group_receipts=True
     def __init__(self,cfg,auth,*,receive_updates=True):
         from telethon import TelegramClient
         # Do not let library diagnostics log payloads or credentials.
@@ -399,7 +400,7 @@ class TelethonProvider:
         if before is not None:await before()
         return await operation()
 
-    def subscribe(self,capture,deleted,receipts=None,*,owner_reads=None):
+    def subscribe(self,capture,deleted,receipts=None,*,owner_reads=None,group_receipts=None):
         from telethon import events,types
         self.client.add_event_handler(capture,events.NewMessage())
         self.client.add_event_handler(capture,events.MessageEdited())
@@ -408,6 +409,9 @@ class TelethonProvider:
             self.client.add_event_handler(receipts,events.Raw(types.UpdateReadHistoryOutbox))
         if owner_reads is not None:
             self.client.add_event_handler(owner_reads,events.Raw([types.UpdateReadHistoryInbox,types.UpdateReadChannelInbox]))
+        if group_receipts is not None:
+            # ANYM-868: a basic group's boundary shares the private one's update type; each handler takes its own peers.
+            self.client.add_event_handler(group_receipts,events.Raw([types.UpdateReadHistoryOutbox,types.UpdateReadChannelOutbox]))
 
     async def connect(self):
         self.verified_self=None
@@ -795,15 +799,16 @@ class TelegramCollector:
         finally:
             if pending:self.release_capture()
 
-    async def receipt(self,event):
+    async def receipt(self,event,*,normalize=None):
         if self.stopping.is_set() or self.failed.is_set(): return
         pending=False
         try:
-            from .telegram_receipts import telegram_receipt
+            from .telegram_receipts import UnsupportedReceiptPeer,telegram_receipt
             try:
-                capture=telegram_receipt(self.account,event,
+                capture=(normalize or telegram_receipt)(self.account,event,
                     verified_self=getattr(self.provider,'verified_self',None),
                     expected_user_id=getattr(self.provider,'expected_user_id',None))
+            except UnsupportedReceiptPeer as exc:self.reject(exc.code);return
             except PARSE_ERRORS as exc:
                 if isinstance(exc,OSError): raise
                 self.reject('receipt_parse_failed'); return
@@ -818,6 +823,11 @@ class TelegramCollector:
         except Exception as exc: self.capture_failed(exc)
         finally:
             if pending:self.release_capture()
+
+    async def group_receipt(self,event):
+        """A group's outbox boundary (ANYM-868) through the private receipt's own spool, policy and capture slot."""
+        from .telegram_receipts import telegram_group_receipt
+        await self.receipt(event,normalize=telegram_group_receipt)
 
     async def commit_page(self,messages,chat,title,kind,origin):
         ids=[]
@@ -1262,7 +1272,8 @@ class TelegramCollector:
                 with suppress(OSError):await asyncio.to_thread(sweep)
             if hasattr(self.provider,'bind_state'):self.provider.bind_state(self.state)
             if getattr(self.provider,'supports_owner_reads',False) is True:
-                self.provider.subscribe(self.capture,self.deleted,self.receipt,owner_reads=self.owner_read)
+                groups={'group_receipts':self.group_receipt} if getattr(self.provider,'supports_group_receipts',False) is True else {}
+                self.provider.subscribe(self.capture,self.deleted,self.receipt,owner_reads=self.owner_read,**groups)
             elif getattr(self.provider,'supports_receipts',False) is True:
                 self.provider.subscribe(self.capture,self.deleted,self.receipt)
             else:self.provider.subscribe(self.capture,self.deleted)
