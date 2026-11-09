@@ -332,7 +332,7 @@ Result (research doc-extract-11-09, owner 2026-11-09): on the synthetic set Docl
 today's text keeps 0 of 8, so it runs beside today's path, never instead of it. ANYM-850 adds the conversion route on
 the owner's Mac mini (`POST /v1/documents/convert`, alias `document-structure`: CPU torch, pinned versions and model
 hashes, OCR off, no outbound network, one job of at most 120 s and 2.5 GB). ANYM-851 sends each PDF, DOCX and PPTX
-of the configured accounts there and stores the Markdown in `attachment_structure` (schema 76) next to today's
+of the configured accounts there and stores the Markdown in `attachment_structure` (schema 77) next to today's
 text; the enricher-mini worker does it (ENRICHMENT.md, "Structured documents"). Today's extracted text, its search
 index, `search_files`, `text_excerpt` and the message excerpt are not read or written by this work, and search does
 not read the Markdown.

@@ -139,7 +139,7 @@ bytes it needs. The original always stays in the archive; the metadata says what
   oversized output ends the job with `invalid_image` and nothing is sent. The ffmpeg run takes a fixed list of image
   demuxers, `-protocol_whitelist file,pipe`, no stdin, the worker's time and file-size limits.
 
-## Structured documents (ANYM-851, schema 76)
+## Structured documents (ANYM-851, schema 77)
 
 A top-level `structure` key in the enricher-mini config (not one of `profiles`) turns on Markdown versions of PDF,
 DOCX and PPTX files (FILE_INDEX.md, "Docling evaluation boundary"):
@@ -486,6 +486,8 @@ caps read the same sums. Fresh work done first therefore does not use up the bac
 share is a whole number of jobs per cap: rounded down, at least 1, and below the cap when the share
 is under 1, so fresh work keeps at least one slot of any cap of 2 or more. The backlog drains in any
 hour with no fresh work due, up to its share. `1` restores the old shared cap and `0` stops old work.
+The share and the caps count model calls only: a duplicate whose ready result is copied (ANYM-912) spends no
+attempt, so an old duplicate is still copied after the backlog's share is spent.
 The worker compares candidates across modalities instead of always
 exhausting the first configured modality. This does not yet introduce a public
 on-demand job-priority API. Local native children exit after every file; Ollama

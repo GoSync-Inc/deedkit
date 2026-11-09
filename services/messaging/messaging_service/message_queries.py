@@ -226,10 +226,11 @@ def chat_titles(c, items, *, cap=64, p=None):
     return items
 
 
-def enrich(c, rows, p, *, titles=None, order_key=None, with_body=False, media=False):
+def enrich(c, rows, p, *, titles=None, order_key=None, with_body=False, media=False, groups=None):
     """Rows were individually authorized; metadata comes from the same chat.
 
     A missing sender name falls back only to names the caller can read (sender_names).
+    groups: rows split into results that are decorated each as its own call (result_evidence.decorate).
     """
     if not rows:
         return rows
@@ -242,7 +243,8 @@ def enrich(c, rows, p, *, titles=None, order_key=None, with_body=False, media=Fa
     for row in rows:
         row.update(by_id.get(row['id'],{}))
     from .result_evidence import decorate
-    decorate(c,[r for r in rows if 'revision' in r],order_key=order_key,with_body=with_body,media=media)
+    decorate(c,[r for r in rows if 'revision' in r],order_key=order_key,with_body=with_body,media=media,
+        groups=None if groups is None else [[r for r in part if 'revision' in r] for part in groups])
     return rows
 
 

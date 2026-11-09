@@ -7,7 +7,7 @@
 -- a message purge or an attachment delete removes it, and a write after a purge fails its foreign key (ANYM-511).
 -- `day_attempts` on `attempt_day` is the daily attempt count the worker's cap sums. structure_profiles is the
 -- enricher-mini worker's publication that the structure work is configured for an account (the processing kinds'
--- CHECKs of 018 and 020 admit audio, image and document only), with a pause it set. A schema-75 runtime never names
+-- CHECKs of 018 and 020 admit audio, image and document only), with a pause it set. A schema-76 runtime never names
 -- either table. Grants: enrichment_role.sql (the worker) and gateway_role.sql (reads). No column default calls a
 -- function other than now() (the expand grammar). IF NOT EXISTS keeps a rerun over a rewound ledger idempotent.
 SET LOCAL lock_timeout='2s';

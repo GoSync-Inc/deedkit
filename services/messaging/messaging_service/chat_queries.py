@@ -7,7 +7,7 @@ from .field_errors import cursor_refusal,date_range_refusal,refusal
 from .policy import scope_filter,targets
 from .search_query import coverage,cursor_binding,decode_cursor,encode_cursor,filter_values,position_date,position_text,valid_text
 from .conversation import meaningful_sql,metadata_sql,options
-from .conversation_state import conversation_state,group_thread_query
+from .conversation_state import conversation_states,group_thread_query
 from .time_references import owner_zone,passed_reference
 
 CHAT_TYPES=('private','group','channel','unknown')
@@ -370,8 +370,10 @@ def _enrich_page(aliases,c,group_attention_age,include_dismissed,items,p,score_a
     if waits:
         from .receipts import for_rows
         receipts=for_rows(c,[{'id':row['_wait_last_id']} for row in items])
+    # ANYM-889: the page's conversation view in a fixed number of statements, equal to the per-chat function's.
+    states=conversation_states(c,p,[(row['account'],row['id']) for row in items],titles=titles) if view=='conversation' or waits else None
     # Compute run counts only for the returned page, never for every chat.
-    for row in items:
+    for n,row in enumerate(items):
         if waits:row['_wait_count']=owner_waits.run_count(c,row,aliases)
         if row['awaiting_reply'] and row.get('awaiting_reply_snoozed_until'):
             # The agent asked to be reminded; the row is back for that reason (ANYM-281).
@@ -407,7 +409,7 @@ def _enrich_page(aliases,c,group_attention_age,include_dismissed,items,p,score_a
             if row.get(key) is None:row.pop(key,None)
         if not include_dismissed:row.pop('_incoming_head',None)
         if view=='conversation':
-            state=conversation_state(c,p,row['account'],row['id'],titles=titles)
+            state=states[n]
             row['conversation']=state
             latest=state['latest_known_meaningful_message']
             if latest is None:
@@ -416,7 +418,7 @@ def _enrich_page(aliases,c,group_attention_age,include_dismissed,items,p,score_a
             if row['awaiting_reply'] and state['suggested_action']=='unclear':
                 row['awaiting_reply_confidence']=state['basis']['code']
         if waits:
-            outcome=owner_waits.finish(row,state if view=='conversation' else conversation_state(c,p,row['account'],row['id'],titles=titles),receipts)
+            outcome=owner_waits.finish(row,states[n],receipts)
             if outcome:
                 # Changed since the page query: left out, counted as the head now reads (ANYM-537).
                 waits['totals']['listed']-=1;waits['totals']['uncertain']+=outcome=='uncertain';row['_wait_dropped']=True

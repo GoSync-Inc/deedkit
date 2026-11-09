@@ -379,14 +379,16 @@ def test_a_head_that_changes_during_the_read_leaves_the_row_out(waits,monkeypatc
     import messaging_service.chat_queries as chat_queries
     s,ar,key,now,add,listed,rows=waits
     add('changed','1',30,body=QUESTION);add('kept','1',29,body=QUESTION)
-    real=chat_queries.conversation_state
-    def raced(c,p,account,chat,**kwargs):
-        state=real(c,p,account,chat,**kwargs)
-        if c.execute('SELECT provider_chat FROM chats WHERE id=%s',(chat,)).fetchone()['provider_chat']=='changed':
-            if change=='peer_wrote':state.update(last_turn='peer',suggested_action='review_incoming')
-            else:state.update(last_turn='unknown',suggested_action='unclear',basis={**state['basis'],'code':change})
-        return state
-    monkeypatch.setattr(chat_queries,'conversation_state',raced)
+    # The page reads its heads with one batch (ANYM-889); the race changes one chat's answer in it.
+    real=chat_queries.conversation_states
+    def raced(c,p,pairs,**kwargs):
+        states=real(c,p,pairs,**kwargs)
+        for state in states:
+            if c.execute('SELECT provider_chat FROM chats WHERE id=%s',(state['chat_id'],)).fetchone()['provider_chat']=='changed':
+                if change=='peer_wrote':state.update(last_turn='peer',suggested_action='review_incoming')
+                else:state.update(last_turn='unknown',suggested_action='unclear',basis={**state['basis'],'code':change})
+        return states
+    monkeypatch.setattr(chat_queries,'conversation_states',raced)
     for view in ('archive','conversation'):
         page=listed(view=view)
         assert [r['provider_chat_id'] for r in page['items']]==['kept'],view
@@ -409,12 +411,12 @@ def test_totals_and_page_come_from_one_snapshot_so_a_late_change_never_goes_belo
     import messaging_service.chat_queries as chat_queries
     s,ar,key,now,add,listed,rows=waits
     # A question backfilled while the list is read, then answered before its head state is read.
-    real=chat_queries.conversation_state
-    def answered(c,p,account,chat,**kwargs):
-        state=real(c,p,account,chat,**kwargs)
-        state.update(last_turn='peer',suggested_action='review_incoming')
-        return state
-    monkeypatch.setattr(chat_queries,'conversation_state',answered)
+    real=chat_queries.conversation_states
+    def answered(c,p,pairs,**kwargs):
+        states=real(c,p,pairs,**kwargs)
+        for state in states:state.update(last_turn='peer',suggested_action='review_incoming')
+        return states
+    monkeypatch.setattr(chat_queries,'conversation_states',answered)
     with s.authorized(key,'list_chats') as (c,p):
         page=chat_queries.list_chats(s,Arriving(c,lambda:add('late','1',30,body=QUESTION)),p,include_coverage=False,**QUEUE)
     assert page['awaiting_their_reply_total']>=0 and page['awaiting_their_reply_total']==len(page['items'])

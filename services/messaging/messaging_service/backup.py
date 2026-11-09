@@ -79,9 +79,13 @@ V69_TABLES={'media_recovery':'job'}
 V70_TABLES={'subscription_activity':'subscription,day,platform,scope_version,metric'}
 # ANYM-848: an agent's own wake targets and their bindings (thread IDs, labels, states; no secret).
 V73_TABLES={'wake_targets':'id','wake_target_subscriptions':'wake_target,subscription'}
+# ANYM-907: each chat's negotiation, its source references, times, transitions, the rebuild queue and the worker's
+# cursor (states, times, zones and message IDs derived from messages; no message text).
+V76_TABLES={'negotiations':'id','negotiation_sources':'message,negotiation','negotiation_times':'negotiation,ord',
+    'negotiation_transitions':'negotiation,version','negotiation_rebuild':'account,chat','negotiation_cursor':'id'}
 # ANYM-851: a document's stored Markdown version (Docling on the mini) and the worker's per-account publication.
-V76_TABLES={'attachment_structure':'attachment','structure_profiles':'account'}
-SCHEMAS=range(2,77)
+V77_TABLES={'attachment_structure':'attachment','structure_profiles':'account'}
+SCHEMAS=range(2,78)
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
 V17_TABLES={'message_conflicts':'receipt_digest'}
@@ -105,7 +109,7 @@ def database_manifest(c):
                        **(V35_TABLES if version>=35 else {}),
                        **(V37_TABLES if version>=37 else {}),
                        **(V38_TABLES if version>=38 else {}),**(V41_TABLES if version>=41 else {}),**(V42_TABLES if version>=42 else {}),**(V43_TABLES if version>=43 else {}),
-                       **(V44_TABLES if version>=44 else {}),**(V45_TABLES if version>=45 else {}),**(V48_TABLES if version>=48 else {}),**(V49_TABLES if version>=49 else {}),**(V50_TABLES if version>=50 else {}),**(V51_TABLES if version>=51 else {}),**(V53_TABLES if version>=53 else {}),**(V56_TABLES if version>=56 else {}),**(V57_TABLES if version>=57 else {}),**(V58_TABLES if version>=58 else {}),**(V61_TABLES if version>=61 else {}),**(V69_TABLES if version>=69 else {}),**(V70_TABLES if version>=70 else {}),**(V73_TABLES if version>=73 else {}),**(V76_TABLES if version>=76 else {})}.items():
+                       **(V44_TABLES if version>=44 else {}),**(V45_TABLES if version>=45 else {}),**(V48_TABLES if version>=48 else {}),**(V49_TABLES if version>=49 else {}),**(V50_TABLES if version>=50 else {}),**(V51_TABLES if version>=51 else {}),**(V53_TABLES if version>=53 else {}),**(V56_TABLES if version>=56 else {}),**(V57_TABLES if version>=57 else {}),**(V58_TABLES if version>=58 else {}),**(V61_TABLES if version>=61 else {}),**(V69_TABLES if version>=69 else {}),**(V70_TABLES if version>=70 else {}),**(V73_TABLES if version>=73 else {}),**(V76_TABLES if version>=76 else {}),**(V77_TABLES if version>=77 else {})}.items():
         query=sql.SQL('SELECT row_to_json(t) AS record FROM {} t ORDER BY {}').format(
             sql.Identifier(name),sql.SQL(',').join(sql.Identifier(part) for part in order.split(',')))
         sha=hashlib.sha256(); count=0

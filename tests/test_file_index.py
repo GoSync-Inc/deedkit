@@ -410,7 +410,7 @@ def test_a_structure_lookup_error_leaves_the_default_read_as_it_was(seeded, monk
         patch.setattr(document_structure, 'read_state', lambda c, attachment: None)
         before = text(s, a, 'struct-isolated')
 
-    def missing(c, attachment):  # a database before schema 76, or any error in the lookup
+    def missing(c, attachment):  # a database before schema 77, or any error in the lookup
         c.execute('SELECT * FROM attachment_structure_absent_table')
     monkeypatch.setattr(document_structure, 'read_state', missing)
     assert text(s, a, 'struct-isolated') == before

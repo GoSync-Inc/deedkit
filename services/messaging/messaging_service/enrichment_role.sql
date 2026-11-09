@@ -41,6 +41,6 @@ GRANT SELECT(account,provider_chat,peer_kind) ON collector_chats TO messaging_en
 GRANT SELECT(subscription,account,chat) ON subscription_sources TO messaging_enricher;
 GRANT SELECT(id,state,expires_at,closed_at) ON subscriptions TO messaging_enricher;
 GRANT SELECT(id,request_key_digest) ON media_jobs TO messaging_enricher;
--- Schema 76 (ANYM-851): a document's structured (Markdown) version, which this worker discovers, converts on the
+-- Schema 77 (ANYM-851): a document's structured (Markdown) version, which this worker discovers, converts on the
 -- mini and stores, and its per-account publication; no DELETE (rows go with their attachment_text row).
 GRANT SELECT,INSERT,UPDATE ON attachment_structure,structure_profiles TO messaging_enricher;

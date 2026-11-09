@@ -54,7 +54,7 @@ def test_a_restored_schema72_backup_quarantines_and_migrates_to_the_wake_tables(
             restored.migrate()
             restored.migrate()
             with restored.pool.connection() as c:
-                assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='76'
+                assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='77'
                 assert schema_ready(c) is True
                 assert c.execute('SELECT count(*) AS n FROM wake_targets').fetchone()['n']==0
 
@@ -81,27 +81,67 @@ def test_schema73_snapshot_round_trips_the_wake_targets(database,tmp_path):
                 assert {name:manifest[name] for name in before}==before
 
 
+# spec: ANYM-907
+def test_schema76_snapshot_round_trips_the_negotiations_and_restores_their_grants(database,tmp_path):
+    from datetime import datetime,timedelta,timezone
+    from messaging_service.backup import V76_TABLES,database_manifest
+    from messaging_service.backup_restore_worker import restore_roles_sql
+    from messaging_service.negotiation_store import apply
+    from test_subscription_retention import restore_database,snapshot_restored
+    now=datetime.now(timezone.utc)
+    with restore_database(database,tmp_path/'source') as source:
+        with source.pool.connection() as c:
+            c.execute("INSERT INTO accounts(id,platform,label) VALUES('neg-backup','telegram','Synthetic')")
+            c.execute("INSERT INTO chats(id,account,provider_chat,title,chat_type) VALUES('neg-chat','neg-backup','5','Synthetic','private')")
+            c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
+                VALUES('neg-m1','neg-backup','neg-chat','1','fixture-anna','давай созвонимся завтра в 10',%s,'incoming')''',
+                (now-timedelta(hours=1),))
+        with source.pool.connection() as c:
+            assert apply(c,'neg-backup','neg-chat',now)==1
+        with source.pool.connection() as c:
+            manifest=database_manifest(c)
+            before={name:manifest[name] for name in V76_TABLES}
+        assert before['negotiations']['rows']==1 and before['negotiation_transitions']['rows']==1
+        # snapshot_restored verifies the bundle before and the restored database after pg_restore.
+        with snapshot_restored(source,tmp_path) as restored:
+            # As the restore worker: every RESTORE_ROLES role first, then migrate re-applies 076's grants (a restore
+            # runs without ACLs).
+            with restored.pool.connection() as c:c.execute(restore_roles_sql())
+            restored.migrate()
+            with restored.pool.connection() as c:
+                manifest=database_manifest(c)
+                assert {name:manifest[name] for name in before}==before
+                has=lambda role,table,privilege: c.execute('''SELECT CASE WHEN EXISTS (SELECT FROM pg_roles
+                    WHERE rolname=%s) THEN has_table_privilege(%s,%s,%s) ELSE NULL END AS ok''',
+                    (role,role,table,privilege)).fetchone()['ok']
+                for table in V76_TABLES:
+                    assert has('messaging_negotiations',table,'DELETE') is True
+                    assert has('messaging_purge',table,'SELECT') is False
+                for table in ('negotiations','negotiation_sources','negotiation_times'):
+                    assert has('messaging_gateway',table,'SELECT') is True and has('messaging_gateway',table,'INSERT') is False
+
+
 # spec: ANYM-851
-def test_a_restored_schema75_backup_migrates_to_the_structure_tables(database,tmp_path):
+def test_a_restored_schema76_backup_migrates_to_the_structure_tables(database,tmp_path):
     from messaging_service.backup import database_manifest
     from test_subscription_retention import acked_subscription,restore_database,snapshot_restored
-    with restore_database(database,tmp_path/'source',through=75) as source:
+    with restore_database(database,tmp_path/'source',through=76) as source:
         acked_subscription(source,name='structure-old-snapshot')
         with source.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='75'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='76'
             before=database_manifest(c)
         assert 'attachment_structure' not in before and 'structure_profiles' not in before
         with snapshot_restored(source,tmp_path) as restored:
             quarantine_restore(restored)
             restored.migrate()
             with restored.pool.connection() as c:
-                assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='76'
+                assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='77'
                 assert c.execute('SELECT count(*) AS n FROM attachment_structure').fetchone()['n']==0
                 assert c.execute('SELECT count(*) AS n FROM structure_profiles').fetchone()['n']==0
 
 
 # spec: ANYM-851
-def test_schema76_backup_carries_the_structured_versions_and_a_schema75_receiver_refuses_it(database,tmp_path,monkeypatch):
+def test_schema77_backup_carries_the_structured_versions_and_a_schema76_receiver_refuses_it(database,tmp_path,monkeypatch):
     from messaging_service import backup
     from messaging_service.backup import database_manifest,verify_bundle
     from test_document_structure import add_document
@@ -117,12 +157,12 @@ def test_schema76_backup_carries_the_structured_versions_and_a_schema75_receiver
         capture=tmp_path/'capture'
         create_snapshot(source,capture,[sys.executable,'-c','print("SYNTHETIC_DUMP")'])
         with monkeypatch.context() as old:
-            # A receiver on a schema-75 runtime names the refusal; it never reads a schema-76 backup silently.
-            old.setattr(backup,'SCHEMAS',range(2,76))
+            # A receiver on a schema-76 runtime names the refusal; it never reads a schema-77 backup silently.
+            old.setattr(backup,'SCHEMAS',range(2,77))
             with pytest.raises(ValueError,match='unsupported_backup'):verify_bundle(capture)
             with source.pool.connection() as c,pytest.raises(ValueError,match='unsupported_backup_schema'):
                 database_manifest(c)
-        assert verify_bundle(capture)['schema_version']==76
+        assert verify_bundle(capture)['schema_version']==77
         with snapshot_restored(source,tmp_path/'restore') as restored:
             with restored.pool.connection() as c:
                 manifest=database_manifest(c)
@@ -136,7 +176,7 @@ def test_schema70_snapshot_restores_the_activity_counts(database,tmp_path):
     with restore_database(database,tmp_path/'source') as source:
         acked_subscription(source,name='activity-snapshot')
         with source.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='76'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='77'
             before=database_manifest(c)['subscription_activity']
             rows=c.execute('SELECT * FROM subscription_activity ORDER BY metric').fetchall()
         assert before['rows']==2 and [row['metric'] for row in rows]==['matched','scanned']

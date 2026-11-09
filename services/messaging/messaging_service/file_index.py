@@ -660,7 +660,7 @@ def get_file_text(store, c, p, attachment_id, offset=0, limit=4000, *, content=N
             found = document_structure.read_text(c, row['attachment_id'], offset, limit) if state and state['state'] == 'ready' else None
             response = document_structure.structured_response(response, state, found, offset)
         elif document_structure.document_kind(row):
-            # Only a PDF, DOCX or PPTX pays for this lookup. In a savepoint: a database without schema 76 (or any
+            # Only a PDF, DOCX or PPTX pays for this lookup. In a savepoint: a database without schema 77 (or any
             # error here) leaves the read exactly as before.
             try:
                 with c.transaction():

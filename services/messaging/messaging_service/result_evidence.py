@@ -121,7 +121,12 @@ def _readable(c,file):
     root=FILES_ROOT.get()
     if root is None or not file.get('digest'):return False
     row={'sha256':file['digest'],'bytes':file['bytes']}
-    return _available(root,row) or (_absent(root,row) and is_managed_evicted(c,file['digest'],file['bytes']))
+    if _available(root,row):return True
+    if not _absent(root,row):return False
+    # A decorate row carries is_managed_evicted's answer from its own read (EXCERPT_COLUMNS, original_residency),
+    # so an absent original costs no statement per file (ANYM-889).
+    if 'original_residency' in file:return file['original_residency']=='evicted'
+    return is_managed_evicted(c,file['digest'],file['bytes'])
 
 
 def text_excerpt(c,file,budget):
@@ -148,7 +153,9 @@ def text_excerpt(c,file,budget):
         'read_more':None if len(head)==total else {**pointer,'offset':len(head)}}
 
 
-def decorate(c,rows,*,order_key=None,with_body=False,media=False):
+def decorate(c,rows,*,order_key=None,with_body=False,media=False,groups=None):
+    """groups (ANYM-889): rows split into results, each decorated as its own call would (its own excerpt budget,
+    row order and attachment items), while every read runs once over all of them. None is one result."""
     if not rows:return rows
     ids=list({r['id'] for r in rows})
     files=c.execute('SELECT '+JOB_FILE_COLUMNS+EXCERPT_COLUMNS+JOB_FILE_FROM+'''
@@ -172,27 +179,32 @@ def decorate(c,rows,*,order_key=None,with_body=False,media=False):
             AND e.source_revision=m.revision AND e.state<>'superseded'
         WHERE a.message=ANY(%s) AND a.active AND NOT m.deleted
         AND NOT EXISTS(SELECT 1 FROM media_jobs j WHERE j.id=a.id) ORDER BY a.id''',(EXCERPT_CHARS+1,ids)).fetchall()
-    grouped={}
-    for file in files:
-        # A database download receipt is not a fresh filesystem presence check.
-        # get_attachment verifies the original before issuing any bearer URL.
-        item=attachment_fields(file)
-        if media:item['media']=media_fields(file,item)  # ANYM-866: get_context's files, as the event stream shows them
-        grouped.setdefault(file['message'],[]).append(item)
-        file['item']=item
+    built=[]
+    for part in [rows] if groups is None else groups:
+        wanted={r['id'] for r in part};grouped={};items=[]
+        for file in files:
+            if file['message'] not in wanted:continue
+            # A database download receipt is not a fresh filesystem presence check.
+            # get_attachment verifies the original before issuing any bearer URL.
+            item=attachment_fields(file)
+            if media:item['media']=media_fields(file,item)  # ANYM-866: get_context's files, as the event stream shows them
+            grouped.setdefault(file['message'],[]).append(item)
+            items.append((file,item))
+        built.append((part,grouped,items))
     current={r['id']:r['revision'] for r in c.execute('SELECT id,revision FROM messages WHERE id=ANY(%s)',(ids,))}
-    # One budget per decorated result, spent in the caller's row order; rows whose revision
-    # changed during the read lose their attachments below and spend nothing.
-    budget=EXCERPT_BUDGET
-    order={}
-    # The caller's final order when it sorts after decoration (get_context's conversation view).
-    for n,r in enumerate(sorted(rows,key=order_key) if order_key else rows):
-        if current.get(r['id'])==r['revision']:order.setdefault(r['id'],n)
-    for file in sorted((f for f in files if f['message'] in order),key=lambda f:order[f['message']]):
-        excerpt=text_excerpt(c,file,budget)
-        if excerpt:
-            file['item']['text_excerpt']=excerpt
-            budget-=excerpt.get('excerpt_chars',0)
+    for part,_,items in built:
+        # One budget per decorated result, spent in the caller's row order; rows whose revision
+        # changed during the read lose their attachments below and spend nothing.
+        budget=EXCERPT_BUDGET
+        order={}
+        # The caller's final order when it sorts after decoration (get_context's conversation view).
+        for n,r in enumerate(sorted(part,key=order_key) if order_key else part):
+            if current.get(r['id'])==r['revision']:order.setdefault(r['id'],n)
+        for file,item in sorted((fi for fi in items if fi[0]['message'] in order),key=lambda fi:order[fi[0]['message']]):
+            excerpt=text_excerpt(c,file,budget)
+            if excerpt:
+                item['text_excerpt']=excerpt
+                budget-=excerpt.get('excerpt_chars',0)
     conflicts={r['message']:r for r in c.execute('''SELECT message,
         count(*) FILTER(WHERE resolved_at IS NULL) AS active_conflicts,
         count(*) FILTER(WHERE resolved_at IS NOT NULL) AS historical_conflicts,
@@ -209,7 +221,7 @@ def decorate(c,rows,*,order_key=None,with_body=False,media=False):
     send_provenance(c,rows)
     delivery_evidence(c,rows)
     formatting_evidence(c,rows,with_body=with_body)
-    for row in rows:
+    for row,grouped in ((row,grouped) for part,grouped,_ in built for row in part):
         # Some query paths truncate before decoration; never imply these spans
         # address the shortened response body. Do not mutate stored snapshots.
         row['formatting']={**row['formatting'],'offsets_reference':'full_provider_body_utf16'}

@@ -214,7 +214,8 @@ def present_message(row,position,*,lost=()):
     return row
 
 
-def decorate_messages(c,p,rows,*,include_system=False):
+def decorate_messages(c,p,rows,*,include_system=False,groups=None):
+    """groups (ANYM-889): rows split into results, each numbered from 1 as its own call; one tie read for all."""
     if not rows:return rows
     scope,args=scope_filter(p,'m')
     scope=scope.replace('m.','s.')
@@ -234,7 +235,7 @@ def decorate_messages(c,p,rows,*,include_system=False):
     from .result_evidence import original_present
     lost={f['attachment_id'] for r in rows for f in r.get('attachments') or []
         if _preparing(f) and f.get('original_residency')!='evicted' and not original_present(f)}
-    for position,row in enumerate(rows,1):
+    for position,row in ((position,row) for part in ([rows] if groups is None else groups) for position,row in enumerate(part,1)):
         tied=ties.get((row['account'],row['chat'],row['sent_at']))
         platform=(tied or {}).get('platform',row.get('platform'))
         provider=str(row.get('provider_id',''))
