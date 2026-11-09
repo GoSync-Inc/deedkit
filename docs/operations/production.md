@@ -115,6 +115,13 @@ the currently running application services to replace. Obtain those paths from
 `com.docker.compose.project.*` container labels, including existing private
 overlays. Do not replace the host's Compose topology with the example.
 
+`production.json` is only the default name. The production host has no
+`/etc/deedkit/production.json`; its plan A file is
+`/etc/deedkit/release-20261018-r7.json`, the file the autodeploy unit's
+configuration names and `status` prints as `config`. Where this document writes
+`/etc/deedkit/production.json`, read that file, and on the host pass
+`--config /etc/deedkit/release-20261018-r7.json` to every action but `status`.
+
 Available build targets are `runtime` (API, Telegram, subscriptions), `indexer`,
 `enricher-local`, `whatsapp-native`, `gateway`, `calendar`, `recordings`, `calls` and `backup`.
 The backup target supplies the producer and isolated restore helper; building it
