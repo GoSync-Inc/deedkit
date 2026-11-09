@@ -83,7 +83,9 @@ def pull(models, store, *, fetch=hub_fetch, only=None, min_free_gb=15.0, log=Non
                 target.mkdir(parents=True)
                 for file_name, pinned in entry["files"].items():
                     log(f"{alias}/{phase}/{name}: {file_name}")
-                    fetch(entry["repo"], entry["revision"], file_name, target / file_name, pinned["size"])
+                    # An artifact may live in a folder of its repository (ANYM-850); the store keeps its files flat.
+                    remote = f"{entry['path']}/{file_name}" if "path" in entry else file_name
+                    fetch(entry["repo"], entry["revision"], remote, target / file_name, pinned["size"])
                     os.chmod(target / file_name, 0o644)
                 os.chmod(target, 0o755)
             os.chmod(work, 0o755)

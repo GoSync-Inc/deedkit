@@ -13,7 +13,9 @@ A deploy never cuts a job. In this order, over ssh as the mini's admin account (
  2. take the deploy lock (a flock held by a process on the mini for the length of the ssh session: two deploys
     cannot run, and a dropped connection frees it);
  3. unpack `services/inference` of that commit into `releases/<sha>/` and `uv sync --locked --group engines` there,
-    while the running release keeps serving;
+    then `uv sync --locked --compile-bytecode` in its `docling/` (ANYM-850: the Docling engine's own venv; the bytecode
+    is compiled here because the service cannot write the release, and a cold child without it imports for about a
+    minute), while the running release keeps serving; `.ready` is written only after both;
  4. SIGTERM the service: admission closes at once, queued and running jobs finish, it exits 0 (ANYM-682). The
     script waits up to the drain limit and refuses to kill (`--force` kills after it). The LaunchDaemon's KeepAlive
     {SuccessfulExit: false} does not restart a clean exit; after the service's own drain limit it exits 3 and launchd
@@ -52,6 +54,14 @@ UNLOAD_TIMEOUT = 1100                # `launchctl bootout --wait` is graceful: S
 PORT = 8090
 PYTHON = '/opt/homebrew/bin/python3.13'
 UV = '/opt/homebrew/bin/uv'
+# `UV_NO_CONFIG=1` (the sync below) also drops the project's own `[tool.uv]` settings, its wheel-only
+# `no-build-package` list included (ANYM-850 Astra r1, reproduced with uv 0.9.26). So the sync writes that list from
+# the release's pyproject.toml into a uv.toml-format file and passes it with `--config-file`; a missing or malformed
+# list stops the `&&` chain before any install, so the release is never marked ready.
+WHEEL_ONLY = ('import json, re, sys, tomllib; '
+              'names = tomllib.load(open(sys.argv[1], "rb")).get("tool", {}).get("uv", {}).get("no-build-package"); '
+              'ok = isinstance(names, list) and names and all(isinstance(n, str) and re.fullmatch(r"[a-z0-9][a-z0-9._-]*", n) for n in names); '
+              'sys.exit("no wheel-only list in " + sys.argv[1]) if not ok else print("no-build-package = " + json.dumps(names))')
 DRAIN_SECONDS = 900                  # the service's own limit (ANYM-682 drain_seconds)
 DRAIN_LIMIT = DRAIN_SECONDS + 60     # how long this script waits for the exit
 MAX_RESTARTS = 3                     # launchd restarts of the old release one deploy will drain before it gives up
@@ -219,7 +229,12 @@ class SshMini:
 
     def sync(self, sha: str) -> None:
         directory = f'{self.home}/releases/{sha}'
-        script = f'cd {directory} && {UV} sync --locked --group engines --python {PYTHON} && touch {directory}/.ready'
+        wheel_only = f'{PYTHON} -I -c {shlex.quote(WHEEL_ONLY)} pyproject.toml > .wheel-only.toml'
+        script = (f'cd {directory} && {wheel_only} && '
+                  f'{UV} sync --locked --group engines --python {PYTHON} --config-file .wheel-only.toml && '
+                  f'cd {directory}/docling && {wheel_only} && '
+                  f'{UV} sync --locked --compile-bytecode --python {PYTHON} --config-file .wheel-only.toml && '
+                  f'touch {directory}/.ready')
         # An empty environment and no uv configuration file: uv runs unsandboxed as the service user, and every file in
         # that user's home (uv.toml, a proxy setting) is something the sandboxed service could once have written.
         command = sudo('env', '-i', f'HOME={self.home}', 'PATH=/opt/homebrew/bin:/usr/bin:/bin',

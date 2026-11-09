@@ -27,20 +27,22 @@ class WorkerFailed(Exception):
 
 
 class Worker:
-    def __init__(self, proc, scratch, key, resident_gb):
+    def __init__(self, proc, scratch, key, resident_gb, rss_limit_gb=None):
         self.proc, self.scratch, self.key, self.resident_gb = proc, scratch, key, resident_gb
+        self.rss_limit_gb = rss_limit_gb  # ANYM-850: the phase's hard limit, else MEMORY_SHARE_FACTOR applies
         self.job = None  # the Job it is running now, so a memory kill can name its reason
         self.stopped = False
         self.paused = False  # ANYM-691: its group is stopped by the yielder; alive() and stopped keep their meaning
         self.killed = False  # SIGKILL sent: its memory is already coming back
+        self.kill_reason = None  # why the supervisor killed it (memory_limit, memory_share, memory_hard_cap)
         self.cold = True
 
     @classmethod
-    async def spawn(cls, argv, env, scratch, key, resident_gb):
+    async def spawn(cls, argv, env, scratch, key, resident_gb, rss_limit_gb=None):
         proc = await asyncio.create_subprocess_exec(
             *argv, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
             cwd=scratch, env=env, start_new_session=True, limit=MAX_LINE_BYTES)
-        return cls(proc, scratch, key, resident_gb)
+        return cls(proc, scratch, key, resident_gb, rss_limit_gb)
 
     def alive(self):
         return not self.stopped and self.proc.returncode is None

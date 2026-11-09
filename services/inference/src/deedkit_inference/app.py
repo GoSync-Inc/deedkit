@@ -27,8 +27,9 @@ from .policy import PolicyStore, bearer
 from .probe import StaticProbe, SystemProbe
 from .quota import Quota
 from .scheduler import Job, Scheduler
-from .schemas import ChatRequest, TranscriptionForm, audio_response, chat_response
-from .uploads import read_audio_form, stream_to_file
+from .schemas import (DOCUMENT_MAX_BYTES, ChatRequest, DocumentForm, TranscriptionForm, audio_response, chat_response,
+                      document_response)
+from .uploads import read_audio_form, read_document_form, stream_to_file
 from .yielder import Yielder, YieldSettings
 from .workdir import WorkDir
 
@@ -167,12 +168,13 @@ class Service:
                                retry_after=cfg.retry_after_seconds, close=True)
         auth = self.authenticate(request)
         ctx.principal = auth.id
-        wanted = {"audio"} if kind == "audio" else {"image", "document"}
+        wanted = {"audio": {"audio"}, "document": {"document"}}.get(kind, {"image", "document"})
         if not auth.scopes & wanted:
             raise ServiceError(403, "scope_denied", "the key has no scope for this route", close=True)
         deadline = parse_deadline(request)
         request.state.deadline = deadline
-        limit = cfg.audio_body_max_bytes if kind == "audio" else cfg.chat_body_max_bytes
+        limit = {"audio": cfg.audio_body_max_bytes, "document": cfg.document_body_max_bytes}.get(
+            kind, cfg.chat_body_max_bytes)
         declared = parse_length(request, limit)
         principal = auth.principal
         if self.quota.concurrency_exhausted(principal):
@@ -181,7 +183,7 @@ class Service:
         if self.quota.daily_exhausted(principal):
             raise ServiceError(429, "quota_exceeded", "the daily job limit is reached",
                                retry_after=Scheduler.until_utc_midnight(), close=True)
-        factor = 1 if kind == "audio" else 2
+        factor = 2 if kind == "chat" else 1
         full = ServiceError(503, "upload_capacity", "too many uploads in flight",
                             retry_after=cfg.retry_after_seconds, close=True)
         if self.pool_used + declared > cfg.max_inflight_upload_bytes:
@@ -287,6 +289,8 @@ def endpoint(counts_job=False):
                 response, status, ctx.refusal = error.response(), error.status, error.code
                 if error.headers.get("X-Admission-Reason"):
                     ctx.refusal += ":" + error.headers["X-Admission-Reason"]
+                if error.headers.get("X-Engine-Kill-Reason"):
+                    ctx.refusal += ":" + error.headers["X-Engine-Kill-Reason"]
             except ClientDisconnect:
                 response = ServiceError(499, "client_disconnected", "the client went away").response()
                 status, ctx.refusal = 499, "client_disconnected"
@@ -361,12 +365,14 @@ def create_app(config, probe=None, wall=time.time, yield_settings=None, sampler=
     async def models(request, service, ctx):
         auth = service.authenticate(request)
         ctx.principal = auth.id
-        data = [
-            {"id": name, "object": "model", "scopes": spec.scopes, "engine": spec.engine,
-             "revision": service.engines[name].revision()}
-            for name, spec in sorted(config.aliases.items())
-            if auth.scopes & set(spec.scopes)
-        ]
+        data = []
+        for name, spec in sorted(config.aliases.items()):
+            if auth.scopes & set(spec.scopes):
+                engine = service.engines[name]
+                # ANYM-850: false while the engine cannot serve (a venv, a package or a tool missing or off its pin;
+                # for Docling also model files that have not passed a full check). In a thread: that check hashes.
+                data.append({"id": name, "object": "model", "scopes": spec.scopes, "engine": spec.engine,
+                             "revision": engine.revision(), "available": await asyncio.to_thread(engine.available)})
         return JSONResponse({
             "object": "list",
             "data": data,
@@ -397,6 +403,34 @@ def create_app(config, probe=None, wall=time.time, yield_settings=None, sampler=
             task = service.scheduler.admit(job, reservation.auth.principal, service.quota)
             result = await service.await_job(request, task)
             return JSONResponse(audio_response(result, form.response_format == "verbose_json"))
+        finally:
+            reservation.close()
+
+    @app.post("/v1/documents/convert")
+    @endpoint(counts_job=True)
+    async def documents(request, service, ctx):
+        """ANYM-850: a PDF, DOCX or PPTX to Markdown with page spans (`document-structure`)."""
+        reservation, limit, declared = service.preflight(request, ctx, "document")
+        try:
+            directory = reservation.make_directory()
+            fields, path, total = await read_document_form(
+                request, directory, limit=limit, declared=declared, seconds=config.upload_seconds)
+            ctx.bytes_in = total
+            reservation.upload_done()
+            try:
+                form = DocumentForm.model_validate(fields)
+            except ValidationError as error:
+                raise invalid(validation_message(error)) from None
+            if path.stat().st_size > DOCUMENT_MAX_BYTES:
+                raise ServiceError(413, "payload_too_large", "the document is larger than 32 MiB")
+            spec, engine = service.resolve_alias(form.model, "document", reservation.auth, ctx)
+            job_input = JobInput("document", directory, [path], path, {})
+            await service.precheck(engine, job_input.paths)
+            job = await service.new_job(ctx, reservation.auth, spec, engine, job_input, request.state.deadline)
+            ctx.job = job
+            task = service.scheduler.admit(job, reservation.auth.principal, service.quota)
+            result = await service.await_job(request, task)
+            return JSONResponse(document_response(result))
         finally:
             reservation.close()
 

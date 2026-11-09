@@ -45,7 +45,7 @@ async def test_models_lists_only_scoped_aliases_and_the_callers_key_expiry(env, 
         assert [m["id"] for m in image["data"]] == ["vision-default"]
         assert image["key_expires_at"] == "2097-06-01T12:30:00Z"
         for entry in audio["data"] + image["data"]:
-            assert set(entry) == {"id", "object", "scopes", "engine", "revision"}
+            assert set(entry) == {"id", "object", "scopes", "engine", "revision", "available"}  # available: ANYM-850
             assert entry["object"] == "model" and entry["engine"] == "fake" and entry["revision"] is None
         assert image["data"][0]["scopes"] == ["image"] and audio["data"][0]["scopes"] == ["audio"]
         everything = [(await s.get("/v1/models", key=k)).json() for k in (KEY, KEY2)]

@@ -86,6 +86,15 @@ class Slot:
     queue: deque = field(default_factory=deque)
 
 
+def engine_failed(job):
+    """502 for a child that died, was killed or answered nothing; a memory kill names its reason in the log line
+    (`refusal=engine_failed:memory_limit`), never anything about the input."""
+    if job.kill_reason in ("memory_limit", "memory_share", "memory_hard_cap"):
+        return ServiceError(502, "engine_failed", "the engine went over its memory limit",
+                            headers={"X-Engine-Kill-Reason": job.kill_reason})
+    return ServiceError(502, "engine_failed", "the engine failed")
+
+
 def slot_busy(retry_after, message="the job waited past its deadline in the queue"):
     return ServiceError(503, "slot_busy", message, retry_after=retry_after)
 
@@ -371,11 +380,16 @@ class Scheduler:
 
     async def _execute(self, job, index, phase, left):
         ctx = PhaseContext(index, index + left, phase.name, phase.slot, job.input, job.state)
-        stdout = await (self._call_worker(job, ctx, phase) if job.engine.worker else self._run_child(job, ctx))
         try:
-            result = job.engine.parse(ctx, stdout)
-        except BadOutput:
-            raise ServiceError(502, "engine_failed", "the engine returned an invalid answer") from None
+            stdout = await (self._call_worker(job, ctx, phase) if job.engine.worker else self._run_child(job, ctx))
+            try:
+                result = job.engine.parse(ctx, stdout)
+            except BadOutput:
+                raise ServiceError(502, "engine_failed", "the engine returned an invalid answer") from None
+        finally:
+            if job.engine.worker and job.engine.stop_after_job:
+                # ANYM-850: a worker for one job only; whatever the outcome it goes, and with it its memory.
+                self._discard_worker(job.engine, phase.name, job.engine.workers.get(phase.name))
         if ctx.last:
             job.result = result
 
@@ -408,7 +422,7 @@ class Scheduler:
                 await asyncio.shield(proc.wait())
             job.proc = job.phase_timeout = job.timeout_left = None
         if job.kill_reason or proc.returncode != 0 or stdout is None:
-            raise ServiceError(502, "engine_failed", "the engine failed")
+            raise engine_failed(job)
         return stdout
 
     def _discard_worker(self, engine, phase_name, worker):
@@ -457,7 +471,7 @@ class Scheduler:
                     launch = await self._prepare(engine, phase.name)
                     try:
                         worker = await Worker.spawn(launch.argv, launch.env, launch.scratch, (job.alias, phase.name),
-                                                    phase.resident_gb)
+                                                    phase.resident_gb, rss_limit_gb=phase.rss_limit_gb)
                     except OSError:
                         shutil.rmtree(launch.scratch, ignore_errors=True)
                         raise ServiceError(502, "engine_failed", "the engine could not start") from None
@@ -474,7 +488,9 @@ class Scheduler:
             raise ServiceError(504, "engine_timeout", "the engine did not answer in time") from None
         except (WorkerFailed, ValueError):
             self._discard_worker(engine, phase.name, worker)
-            raise ServiceError(502, "engine_failed", "the engine failed") from None
+            if worker is not None and job.kill_reason is None:
+                job.kill_reason = worker.kill_reason  # killed while it loaded, before it took this job
+            raise engine_failed(job) from None
         except BaseException:
             self._discard_worker(engine, phase.name, worker)
             raise
@@ -523,7 +539,12 @@ class Scheduler:
         for job in self.children():
             if job.proc is not None:
                 seen.add(job.proc.pid)
-                sizes.append((await asyncio.to_thread(self.probe.rss_gb, job.proc.pid), ("job", job)))
+                size = await asyncio.to_thread(self.probe.rss_gb, job.proc.pid)
+                limit = self.rss_limit(job)
+                if limit is not None and size > limit:
+                    self._kill_victim(("job", job), "memory_limit")  # ANYM-850: this child alone, not the largest
+                else:
+                    sizes.append((size, ("job", job)))
         for engine in list(self.engines):
             for name, worker in list(engine.workers.items()):
                 if worker.alive():
@@ -531,7 +552,9 @@ class Scheduler:
                     size = await asyncio.to_thread(self.probe.rss_gb, worker.proc.pid)
                     victim = ("worker", engine, name, worker)
                     self.admission.note_resident(worker.key, size)
-                    if size > MEMORY_SHARE_FACTOR * worker.resident_gb:
+                    if worker.rss_limit_gb is not None and size > worker.rss_limit_gb:
+                        self._kill_victim(victim, "memory_limit")
+                    elif size > MEMORY_SHARE_FACTOR * worker.resident_gb:
                         self._kill_victim(victim, "memory_share")
                     else:
                         sizes.append((size, victim))
@@ -543,6 +566,14 @@ class Scheduler:
                 size = await asyncio.to_thread(self.probe.rss_gb, worker.proc.pid)
                 sizes.append((size, ("retiring", worker)))
         return sizes
+
+    @staticmethod
+    def rss_limit(job):
+        """The `rss_limit_gb` of the phase a one-shot child runs now (ANYM-850), or None."""
+        for phase in job.spec.phases:
+            if phase.name == job.last_phase:
+                return phase.rss_limit_gb
+        return None
 
     def _kill_victim(self, victim, reason):
         if victim[0] == "retiring":
@@ -556,6 +587,7 @@ class Scheduler:
             return
         _, engine, name, worker = victim
         idle = worker.job is None
+        worker.kill_reason = reason  # a worker still loading has no job yet: its starter reads it there
         if worker.job is not None:
             worker.job.kill_reason = reason
         self._discard_worker(engine, name, worker)

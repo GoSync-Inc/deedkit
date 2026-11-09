@@ -28,10 +28,10 @@ class BadOutput(Exception):
 
 @dataclass
 class JobInput:
-    kind: str  # "audio" | "chat"
+    kind: str  # "audio" | "chat" | "document"
     directory: Path
-    paths: list  # the uploaded audio file, or the decoded images (may be empty for a text-only chat)
-    primary: Path  # a file that always exists: the audio file, the first image, or prompt.txt
+    paths: list  # the uploaded audio file or document, or the decoded images (may be empty for a text-only chat)
+    primary: Path  # a file that always exists: the audio file, the document, the first image, or prompt.txt
     params: dict = field(default_factory=dict)
 
 
@@ -67,11 +67,14 @@ class Engine:
 
     id = "base"
     worker = False  # True: one warm worker child per phase (see workers.py)
+    # True: the worker is started for one job and stopped when it ends (ANYM-850: Docling holds no RAM between jobs,
+    # but its models are verified off the event loop and its RSS is supervised like any worker's).
+    stop_after_job = False
 
     def __init__(self, kind, options):
         self.kind, self.options = kind, options
         # True for an engine that keeps a warm worker between jobs: it stays in the resident book while idle.
-        self.persistent = bool(options.get("persistent", False)) or self.worker
+        self.persistent = bool(options.get("persistent", False)) or (self.worker and not self.stop_after_job)
         self.workers = {}  # phase name -> Worker (worker engines)
         # Workers told to exit or killed whose process is not reaped yet: their memory still counts.
         self.retiring = set()
@@ -96,6 +99,10 @@ class Engine:
     def unavailable(self) -> str | None:
         """A reason (machine code) when this engine cannot serve now: packages missing, tools missing."""
         return None
+
+    def available(self) -> bool:
+        """What /v1/models advertises; runs in a thread, so an engine may check more than `unavailable` does."""
+        return self.unavailable() is None
 
     def argv(self, ctx):
         raise NotImplementedError
@@ -152,13 +159,14 @@ class WorkerLaunch:
 
 
 def build_engine(spec, env=None):
+    from .docling import DoclingEngine
     from .fake import FakeEngine
     from .speech import SpeechEngine
     from .vision import VisionEngine
 
     if spec.engine == "fake":
         return FakeEngine(spec.kind, spec.engine_options)
-    cls = {"speech": SpeechEngine, "vision": VisionEngine}.get(spec.engine)
+    cls = {"speech": SpeechEngine, "vision": VisionEngine, "docling": DoclingEngine}.get(spec.engine)
     if cls is None or env is None or spec.kind != cls.kind:
         return None
     return cls(spec.kind, spec.engine_options, env)

@@ -7,6 +7,17 @@
   "onnxruntime": "1.31.1",
   "huggingface-hub": "2.4.0"
  },
+ "environments": {
+  "docling": {
+   "docling": "2.149.0",
+   "docling-slim": "2.149.0",
+   "docling-core": "2.106.0",
+   "docling-ibm-models": "4.0.4",
+   "docling-parse": "7.25.0",
+   "torch": "2.15.0",
+   "transformers": "5.22.2"
+  }
+ },
  "phases": {
   "vision-default/vlm": {
    "model": {
@@ -122,6 +133,41 @@
      "weights.safetensors": {
       "size": 1613977612,
       "sha256": "951ed3fc1203e6a62467abb2144a96ce7eafca8fa77e3704fdb8635ff3e7f8a6"
+     }
+    }
+   }
+  },
+  "document-structure/docling": {
+   "layout": {
+    "repo": "docling-project/docling-layout-heron",
+    "revision": "8f39ad3c0b4c58e9c2d2c84a38465abf757272d8",
+    "files": {
+     "config.json": {
+      "size": 3268,
+      "sha256": "fdea30805ce2f5666b147fca941dcdd27ad468e27d6ed21902207d3da056a97d"
+     },
+     "model.safetensors": {
+      "size": 171658996,
+      "sha256": "00333a43451945aaf89db8ca9c0a17e75d1537c17db60fdb91aa95f4c7929e0c"
+     },
+     "preprocessor_config.json": {
+      "size": 444,
+      "sha256": "cd38cd59999e7a95d68e487fbe5132df3d4e5c32a0836add57e6126ba0c4eaf1"
+     }
+    }
+   },
+   "tableformer": {
+    "repo": "docling-project/docling-models",
+    "revision": "2199320848bb9a8a519d22e4b528185a4f9a6f64",
+    "path": "model_artifacts/tableformer/accurate",
+    "files": {
+     "tableformer_accurate.safetensors": {
+      "size": 212758388,
+      "sha256": "2a7d6c924b3cd12fb99a09280ca9c33a89c5d60b93253617d2e088c1a40374d9"
+     },
+     "tm_config.json": {
+      "size": 7060,
+      "sha256": "984e122ceb8ccf84d84c9d2882f6f2302a44b4f1e577babd6289892c36f3cffd"
      }
     }
    }

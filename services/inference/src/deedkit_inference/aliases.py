@@ -32,6 +32,17 @@ SHIPPED = {
         "default_max_tokens": 2000,
         "phases": [{"name": "vlm", "slot": "gpu", "resident_gb": 4.5, "share": 1.0}],
     },
+    # ANYM-850: Docling 2.149.0 (layout heron + TableFormer accurate, OCR off), one child per job from its own venv.
+    # Peak RSS 1.80-1.95 GB measured on an M5 Pro 11-09 (three cold runs of the four synthetic fixtures), research
+    # doc-extract-11-09 1.4-2.0 GB -> 2.5, also its hard limit. On the gpu slot, so Russian ASR on the cpu slot never
+    # waits behind it.
+    "document-structure": {
+        "kind": "document",
+        "scope": "document",
+        "engine": "docling",
+        "timeout_seconds": 120,
+        "phases": [{"name": "docling", "slot": "gpu", "resident_gb": 2.5, "share": 1.0, "rss_limit_gb": 2.5}],
+    },
 }
 
 
