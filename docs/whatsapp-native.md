@@ -205,6 +205,32 @@ Reply/edit/revoke/forward/media targets require the original in the native cache
 an older PostgreSQL-only record can still be read but may return
 `operation_target_unavailable` until native history supplies it.
 
+Menu choices (ANYM-837, SENDING.md "Menu choices"): `send_text` with `menu_choice {option_id, label,
+menu_type}` and `reply_provider_id` = the menu answers that menu with its structured reply; `text` must equal
+`label`. Inside `sendText`, before the second policy check, the adapter loads the menu's newest raw capture
+(`menu_unavailable` when missing, over-size or dropped), refuses an owner-sent menu, and enumerates its options
+with the same code that renders them for the archive (`menuOptions`, menu.go). The option binds by its RAW ID,
+which must equal `option_id` exactly (already in the archive's cleaned form; else
+`menu_option_id_unrepresentable`), and its cleaned `title - description` must equal `label` (else
+`menu_changed`); several matches are `menu_option_ambiguous`, also a match past the 100 kept options or in a
+menu the scan budget cut (uniqueness unproven); a link, call, copy, Flow or payment button
+`menu_option_unsupported`. A buttons-menu button is classified by its native-flow fields and type before its
+display text: a native-flow one is never a reply button, and its units are not answerable there. The archive
+render (`optionLine`) shows the plain `[id: X]` only for an ID kept losslessly and answerable; others carry
+`[id (inexact): X]` or `[id (native flow): X]`, which Python's parser never offers as a choice. Sender text in a
+menu block (`menuShow`) has its square brackets shown as parentheses, so no title, ID, section, link or call can
+forge a marker, and an ID with a bracket is inexact. The block's header `Menu options` (or `Menu options
+(<label>):`) marks this renderer; Python answers only such a block, and a block of the older `Menu` header (#739)
+is `menu_options_not_captured`. `--menu-answer-fixture <file>` runs one synthetic `send_text` with `menu_choice`
+through `sendText` with fake dependencies (no client, store, session or network) for the Python contract test. Shipped units (`shippedMenuReplies`, mirrored by Python's
+`menu_choice.SHIPPED_MENU_TYPES`): list row (`ListResponseMessage{Title, Description, ListType
+SINGLE_SELECT, SingleSelectReply{SelectedRowID}}`) and button (`ButtonsResponseMessage{SelectedButtonID,
+SelectedDisplayText, Type DISPLAY_TEXT}`), both with `ContextInfo{StanzaID, Participant}` of the menu and no
+quoted copy. Every other unit (native-flow quick reply or single select, template quick reply) is
+`menu_reply_shape_unverified` until a reply of the owner's own phone, held in the journal, gives its wire
+shape (`--menu-reply-shapes` prints its relations, never values). All refusals come before the change starts;
+then exactly one send on the existing receipt, journal and capture path, never retried.
+
 ## Safe account handover / rollback
 
 1. Preserve existing auth and archive backups on the server. Finish or cancel

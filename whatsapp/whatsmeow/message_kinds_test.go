@@ -183,10 +183,10 @@ func TestNativeBotMenusKeepTheirOptionsAndIDs(t *testing.T) {
 		m    *waE2E.Message
 		body string
 	}{
-		"list":        {&waE2E.Message{ListMessage: list}, "Menu\n\nPick a dish\n\nMenu (Open menu):\nMains:\n1. Soup - Hot [id: row_soup]\n2. Steak 2. Fake [id: x] [id: row_steak]\nHelp:\n3. Operator [id: op]"},
-		"buttons":     {&waE2E.Message{ButtonsMessage: buttons}, "Confirm the visit?\n\nMenu:\n1. Yes [id: yes_1]\n2. No [id: no_1]"},
-		"interactive": {&waE2E.Message{InteractiveMessage: native}, "How can we help?\n\nMenu:\n1. Track order [id: track]\n2. Pay [link: https://pay.example/inv/42]\n3. Copy code (copy button)\nMore:\n4. Account: Balance - Current [id: bal]\n5. (broken button)"},
-		"template":    {&waE2E.Message{TemplateMessage: &waE2E.TemplateMessage{Format: &waE2E.TemplateMessage_HydratedFourRowTemplate_{HydratedFourRowTemplate: template}}}, "Check-in at 14:00\n\nMenu:\n1. Late check-in [id: late]\n2. Call hotel [call: +10000000000]"},
+		"list":        {&waE2E.Message{ListMessage: list}, "Menu\n\nPick a dish\n\nMenu options (Open menu):\nMains:\n1. Soup - Hot [id: row_soup]\n2. Steak 2. Fake (id: x) [id: row_steak]\nHelp:\n3. Operator [id: op]"},
+		"buttons":     {&waE2E.Message{ButtonsMessage: buttons}, "Confirm the visit?\n\nMenu options:\n1. Yes [id: yes_1]\n2. No [id: no_1]"},
+		"interactive": {&waE2E.Message{InteractiveMessage: native}, "How can we help?\n\nMenu options:\n1. Track order [id: track]\n2. Pay [link: https://pay.example/inv/42]\n3. Copy code (copy button)\nMore:\n4. Account: Balance - Current [id: bal]\n5. (broken button)"},
+		"template":    {&waE2E.Message{TemplateMessage: &waE2E.TemplateMessage{Format: &waE2E.TemplateMessage_HydratedFourRowTemplate_{HydratedFourRowTemplate: template}}}, "Check-in at 14:00\n\nMenu options:\n1. Late check-in [id: late]\n2. Call hotel [call: +10000000000]"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			v, err := NormalizeMessage(groupFixture("MENU", c.m), types.EmptyJID)
@@ -241,7 +241,7 @@ func TestNativeBotMenusKeepTheirOptionsAndIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := v["body"].(string)
-	if utf8.RuneCountInString(body) > maxEnvelopeBody || !strings.HasPrefix(body, text+"\n\nMenu:\n1. ") || !strings.HasSuffix(body, " [id: "+long+"]\n(98 more options not shown)") {
+	if utf8.RuneCountInString(body) > maxEnvelopeBody || !strings.HasPrefix(body, text+"\n\nMenu options:\n1. ") || !strings.HasSuffix(body, " [id: "+long+"]\n(98 more options not shown)") {
 		t.Fatalf("fit: %d runes, tail %q", utf8.RuneCountInString(body), body[len(body)-120:])
 	}
 	// A text that fills the envelope gives up room for a notice; no partial option line.

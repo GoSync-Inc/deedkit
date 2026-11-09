@@ -1,0 +1,13 @@
+{
+  "chat": "15550001111@c.us",
+  "text": "Cardiology - Adults",
+  "link_preview": false,
+  "send_id": "synthetic",
+  "reply_provider_id": "false_15550001111@c.us_MENU1",
+  "expires_at": 1,
+  "menu_choice": {
+    "option_id": "card_1",
+    "label": "Cardiology - Adults",
+    "menu_type": "list"
+  }
+}

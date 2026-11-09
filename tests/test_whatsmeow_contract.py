@@ -317,6 +317,47 @@ def test_actual_go_album_photo_and_template_are_archived_with_content(native_fix
     assert archive.ingest(envelope)['outcome'] == 'created'
 
 
+# spec: ANYM-837
+def test_actual_go_menu_render_offers_only_exact_ids_to_the_python_menu_parser(native_fixture_binary, tmp_path):
+    from messaging_service import menu_choice
+    _, menu = _normalize_fixture(native_fixture_binary, tmp_path, {'kind': 'menu_list', 'text': 'Choose', 'rows': [
+        {'id': 'dept_cardio', 'title': 'Cardiology'}, {'id': 'dept\tneuro', 'title': 'Neurology'},
+        {'id': 'x' * 300, 'title': 'Long'}]})
+    envelope = menu['envelope']
+    assert envelope['metadata']['provider_message_type'] == 'list'
+    # The tab and the cut ID are shown for reading but never offered as a choice.
+    assert menu_choice.options(envelope['body']) == [(1, 'Cardiology', 'dept_cardio'),
+        (2, 'Neurology [id (inexact): dept neuro]', None), (3, 'Long [id (inexact): ' + 'x' * 256 + ']', None)]
+
+
+def _menu_answer(binary, tmp_path, rows):
+    params = json.loads((Path(__file__).resolve().parent / 'fixtures/menu-send-text.json').read_text())
+    # The collector's own send_id and expiry forms; the fixture file keeps placeholders for them.
+    params.update(send_id='send_' + '0' * 32, expires_at=time.time() + 3600)
+    source = _private_json(tmp_path / 'menu-answer.json', {'synthetic': True, 'owner': '999@c.us',
+        'chat': params['chat'], 'menu_id': 'MENU1', 'rows': rows, 'params': params})
+    answer = subprocess.run([str(binary), '--menu-answer-fixture', str(source)], text=True, capture_output=True, timeout=10)
+    assert answer.returncode == 0, answer.stderr
+    return json.loads(answer.stdout)
+
+
+# spec: ANYM-837
+def test_actual_go_send_path_answers_the_collectors_menu_choice_or_refuses_with_no_send(native_fixture_binary, tmp_path):
+    # The params are the Python collector's own send_text payload (tests/test_menu_choice.py asserts it).
+    sent = _menu_answer(native_fixture_binary, tmp_path, [{'id': 'dent_2', 'title': 'Dentistry'},
+        {'id': 'card_1', 'title': 'Cardiology', 'description': 'Adults'}])
+    reply = sent['reply']['listResponseMessage']
+    assert sent['sends'] == 1 and sent['error'] is None
+    assert reply['singleSelectReply'] == {'selectedRowID': 'card_1'} and reply['title'] == 'Cardiology'
+    assert reply['description'] == 'Adults' and reply['listType'] == 'SINGLE_SELECT'
+    assert reply['contextInfo']['stanzaID'] == 'MENU1' and 'quotedMessage' not in reply['contextInfo']
+    for rows, code in (([{'id': 'card_1\t', 'title': 'Cardiology', 'description': 'Adults'}], 'menu_option_id_unrepresentable'),
+                       ([{'id': 'card_1', 'title': 'Cardiology', 'description': 'Pay 500'}], 'menu_changed'),
+                       ([{'id': 'card_1', 'title': 'Cardiology', 'description': 'Adults'}] * 2, 'menu_option_ambiguous')):
+        refused = _menu_answer(native_fixture_binary, tmp_path, rows)
+        assert (refused['sends'], refused['error'], refused['reply']) == (0, code, None), code
+
+
 # spec: ANYM-471
 def test_actual_go_document_after_sender_key_event_is_created_without_conflict(native_fixture_binary, tmp_path, seeded):
     from messaging_service.archive import Archive

@@ -253,11 +253,11 @@ func rawMenu(m *waE2E.Message) (string, []rawMenuOption) {
 		}
 		return kind, out
 	case m.GetInteractiveMessage() != nil:
-		return "interactive", interactiveOptions(m.GetInteractiveMessage())
+		return "interactive", rawInteractiveOptions(m.GetInteractiveMessage())
 	case m.GetTemplateMessage() != nil:
 		t := m.GetTemplateMessage()
 		if i := t.GetInteractiveMessageTemplate(); i != nil {
-			return "template_interactive", interactiveOptions(i)
+			return "template_interactive", rawInteractiveOptions(i)
 		}
 		h := t.GetHydratedFourRowTemplate()
 		if h == nil {
@@ -276,7 +276,7 @@ func rawMenu(m *waE2E.Message) (string, []rawMenuOption) {
 	return "not_a_menu", nil
 }
 
-func interactiveOptions(v *waE2E.InteractiveMessage) []rawMenuOption {
+func rawInteractiveOptions(v *waE2E.InteractiveMessage) []rawMenuOption {
 	var out []rawMenuOption
 	for _, b := range v.GetNativeFlowMessage().GetButtons() {
 		out = append(out, nativeFlowOptions(b.GetName(), b.GetButtonParamsJSON())...)

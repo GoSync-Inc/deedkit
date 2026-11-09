@@ -1,0 +1,214 @@
+[
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "Render an authorized draft without sending or queuing.\n\nPass exactly one recipient: chat_id (archive ID), phone (native WhatsApp: E.164\nwith or without +, or a @c.us/@s.whatsapp.net JID) or username (Telegram: @name of a\nperson, not a bot, channel or group). A chat_id preview contacts no\nprovider and requires read permission for the account/chat and any reply target,\nwith no sending-policy or connected-collector requirement. A phone preview\ncontacts the provider: it does one open_chat_by_phone lookup (send key, full\naccount, the operation enabled; shared hourly quota), writes no chat and returns\non_whatsapp, verified_name, chat_existed, chats_on_other_accounts and a digest\nbound to the number and its WhatsApp identity, valid 10 minutes. A username preview\nlikewise does one open_chat_by_username lookup at Telegram (own hourly quota) and returns\nusername, user_id, name, chat_existed and a digest bound to the resolved user ID, valid\n10 minutes. Returns visible/wire text,\nstructured entities, warnings, link destinations, UTF-16 lengths, renderer\nversion and a preview_digest bound to this principal, scope and exact payload.\nThe digest is not owner approval. Explicitly review lossy conversions before\nallowing them. To send rich content, use these SAME source/format/policy/target\nvalues and digest after obtaining exact owner confirmation. No automatic splitting.\n",
+    "inputSchema": {
+      "properties": {
+        "account": {
+          "title": "Account",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "chat_id": {
+          "default": "",
+          "title": "Chat Id",
+          "type": "string"
+        },
+        "phone": {
+          "default": "",
+          "title": "Phone",
+          "type": "string"
+        },
+        "username": {
+          "default": "",
+          "title": "Username",
+          "type": "string"
+        },
+        "reply_to": {
+          "default": "",
+          "title": "Reply To",
+          "type": "string"
+        },
+        "format": {
+          "default": "plain",
+          "enum": [
+            "plain",
+            "markdown",
+            "html"
+          ],
+          "title": "Format",
+          "type": "string"
+        },
+        "link_preview": {
+          "default": false,
+          "title": "Link Preview",
+          "type": "boolean"
+        },
+        "allow_lossy": {
+          "default": false,
+          "title": "Allow Lossy",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "account",
+        "text"
+      ],
+      "type": "object",
+      "title": "preview_messageArguments",
+      "additionalProperties": false
+    },
+    "name": "messages_preview_message",
+    "outputSchema": {
+      "type": "object",
+      "additionalProperties": true,
+      "title": "preview_messageDictOutput"
+    },
+    "module": "messaging",
+    "operation": "preview_message",
+    "scopes": [
+      "read"
+    ]
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Send exact confirmed content using this account's existing collector.\n\nFor rich formatting or nondefault policies, call preview_message first and\npass its matching preview_digest. Show account, recipient, visible text,\nformatting, warnings, link destinations and reply target to the owner and\nobtain explicit confirmation. Digest is not approval. Requires send permission\nand operator opt-in. plain remains the default and native WhatsApp delimiters\ncan still be interpreted by WhatsApp.\nchat_id/reply_to are archive IDs; account must be explicit. request_id is a\nunique 8\u2013128 character key for this approved action; reuse it after network\nfailure with the SAME payload. queued is not sent. Poll get_send_status.\nsent means provider accepted, not recipient read/delivered; a sent result adds\nmessenger_reports (receipt levels this chat can report) and receipt_state. unknown must be\nchecked against history before any newly approved send. Text only, provider\npayload at most 4000 UTF-16 units; source at most 16000 units subject to the\n16384-byte HTTP JSON envelope. No splitting or server human-approval gate.\nPass exactly one recipient, chat_id, phone or username. A new WhatsApp number: messages_preview_message\nwith phone, then messages_send_message with the same phone and that preview_digest; it opens\nor reuses the chat with no second lookup and returns chat_id, chat_existed and\nverified_name. status opening_chat: repeat with the same request_id. A changed\nidentity or expired digest asks for a new preview. Opening the chat without a message\nstays messages_execute_messenger_operation operation open_chat_by_phone. A Telegram @username\nwith no chat: messages_preview_message with username, then messages_send_message with the same username\nand that preview_digest; the send resolves the username again and refuses a different\nperson (identity_changed), then returns chat_id, chat_existed, user_id and name.\nOptional guard, chat_id sends with read on the chat: expected_last_message_id is the archive ID of the\nnewest message you actually read (never one from a preview). If newer eligible messages reached the archive,\nnothing is queued and the call is refused chat_changed_since_seen (409) with newer_count,\nnewer_outgoing_count, first_newer_message_id, newest_message_id and a next_call that reads them: read, then\ndecide again. guard any_message (default) counts any newer visible message, your own earlier send included;\noutgoing_only counts only the owner's. A retry with the same request_id returns the first result. The guard\nsees only the archive at that moment and cannot close the race\nbefore the provider send. An unknown ID or a phone/username\nrecipient is invalid_parameters expected_message_unknown; chat_guard_unavailable (503) queued nothing.\nAfter a lost response use messages_get_send_status with request_id.\nSame content to the same chat while your earlier send is queued, dispatching or unknown (60 min):\nduplicate_send_unresolved (409); see allow_duplicate.\n",
+    "inputSchema": {
+      "properties": {
+        "account": {
+          "title": "Account",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "chat_id": {
+          "default": "",
+          "title": "Chat Id",
+          "type": "string"
+        },
+        "phone": {
+          "default": "",
+          "title": "Phone",
+          "type": "string"
+        },
+        "username": {
+          "default": "",
+          "title": "Username",
+          "type": "string"
+        },
+        "reply_to": {
+          "default": "",
+          "title": "Reply To",
+          "type": "string"
+        },
+        "format": {
+          "default": "plain",
+          "enum": [
+            "plain",
+            "markdown",
+            "html"
+          ],
+          "title": "Format",
+          "type": "string"
+        },
+        "preview_digest": {
+          "default": "",
+          "title": "Preview Digest",
+          "type": "string"
+        },
+        "link_preview": {
+          "default": false,
+          "title": "Link Preview",
+          "type": "boolean"
+        },
+        "allow_lossy": {
+          "default": false,
+          "title": "Allow Lossy",
+          "type": "boolean"
+        },
+        "wait_s": {
+          "default": 0,
+          "maximum": 25,
+          "minimum": 0,
+          "title": "Wait S",
+          "type": "number"
+        },
+        "expected_last_message_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Expected Last Message Id"
+        },
+        "guard": {
+          "anyOf": [
+            {
+              "enum": [
+                "any_message",
+                "outgoing_only"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Guard"
+        },
+        "allow_duplicate": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "chat_id sends: true sends even while your earlier send of the same text, format, link_preview, allow_lossy and reply target to this chat is still queued, dispatching or unknown and under 60 minutes old; otherwise that call is refused duplicate_send_unresolved (409) with earlier_request_id, earlier_status and a messages_get_send_status next_call, and nothing is queued. Not exactly-once delivery: changed text, an elapsed window or a sent or failed earlier send passes; phone and username sends, messages_send and its steps are not covered.",
+          "title": "Allow Duplicate"
+        }
+      },
+      "required": [
+        "account",
+        "text",
+        "request_id"
+      ],
+      "type": "object",
+      "title": "send_messageArguments",
+      "additionalProperties": false
+    },
+    "name": "messages_send_message",
+    "outputSchema": {
+      "type": "object",
+      "additionalProperties": true,
+      "title": "send_messageDictOutput"
+    },
+    "module": "messaging",
+    "operation": "send_message",
+    "scopes": [
+      "send"
+    ]
+  }
+]
