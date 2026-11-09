@@ -151,6 +151,9 @@ def _tombstone(c, negotiation, now, trigger=None):
         WHERE id=%s AND state<>'removed' RETURNING version''', (now, negotiation)).fetchone()
     if row:
         c.execute('DELETE FROM negotiation_times WHERE negotiation=%s', (negotiation,))
+        # Every link left keeps only ids: a tombstone has no live source.
+        c.execute('''UPDATE negotiation_sources SET removed_at=%s,intent=NULL,confidence=NULL,medium=NULL,cue_start=NULL,
+            cue_end=NULL WHERE negotiation=%s AND removed_at IS NULL''', (now, negotiation))
         _transition(c, negotiation, row['version'], 'removed', trigger, 'removed', None, now)
 
 
@@ -202,15 +205,14 @@ def _write(c, account, chat, now, result, sources):
         # The target's sources that no longer feed it: gone from the archive, or read in the window and left out.
         _blank_sources(c, negotiation, {m for m in active.get(negotiation, set()) - feeding
                                         if m not in alive or m in fetched}, now)
-    # Every other negotiation: a source whose message is deleted, carries no signal any more, or now feeds the current
-    # negotiation keeps only ids, its link kept (a link never moves to another negotiation, so a purge finds both).
-    # One with no source left, or one the current negotiation took a source from, becomes removed.
+    # Every other negotiation is one evaluate no longer folds, so it is never refolded: when it loses a source (its
+    # message deleted, no scheduling signal any more, or now feeding the current negotiation), or has none, what it
+    # holds is out of date and it becomes removed. Its links stay, blanked to ids (a link never moves to another
+    # negotiation, so a purge finds both).
     for n in stored:
         if target is not None and n['id'] == target['id']:continue
         messages = active.get(n['id'], set())
-        dropped = (messages - alive) | (messages & silent) | (messages & feeding)
-        _blank_sources(c, n['id'], dropped, now)
-        if messages & feeding or not messages - dropped:
+        if not messages or (messages - alive) | (messages & silent) | (messages & feeding):
             _tombstone(c, n['id'], now)
             changed += 1
     return changed
@@ -312,8 +314,10 @@ class Checkpoint:
     def __call__(self, c, now):
         at = self.clock()
         if self.last is not None and at - self.last < self.interval:return 0
-        first, self.last = self.last is None, at
-        return cleanup(c, now, budget=None if first else SWEEP)
+        # The time counts only after a cleanup that finished: a failed first call keeps the full lap for its retry.
+        count = cleanup(c, now, budget=None if self.last is None else SWEEP)
+        self.last = at
+        return count
 
 
 def take_rebuild(c, limit=BATCH):
