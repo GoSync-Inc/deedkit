@@ -564,6 +564,41 @@ def test_old_backlog_leaves_a_daily_reserve_for_fresh_images(configured,tmp_path
 
 
 # spec: ANYM-69
+@pytest.mark.parametrize('limit',['max_jobs_per_day','profile_max_jobs_per_day','account_max_jobs_per_day'])
+def test_fresh_spending_does_not_use_up_the_backlog_share(configured,tmp_path,limit):
+    """Astra r1 M1: old work counts only its own attempts, so fresh work done first leaves the backlog its share."""
+    s,make,_=configured
+    for n in range(2):add_file(s,f'fresh-{n}','demo-tg-2',mime='image/png')
+    for n in range(3):add_file(s,f'old-{n}','demo-tg-1',mime='image/png')
+    age(s,'demo-tg-1','1 year');age(s,'demo-tg-2','1 hour')
+    cap={'max_jobs_per_day':4,'profile_max_jobs_per_day':{'image':4},'account_max_jobs_per_day':{'telegram-demo':4}}[limit]
+    w=make({'image':cloud_profile(tmp_path)},backlog_share=0.5,**{limit:cap})
+    claimed=[]
+    for _ in range(4):
+        row,_=w.claim();claimed.append(row['attachment']);assert w.finish(row,normalize_result({'title':'x'}))
+    assert sorted(claimed[:2])==['fresh-0','fresh-1']
+    assert all(name.startswith('old-') for name in claimed[2:])  # two old jobs after two fresh ones: the share of 4
+    assert w.claim() is None  # the hard cap
+
+
+# spec: ANYM-69
+@pytest.mark.parametrize('cap,share,old_jobs',[(3,0.7,2),(2,0.7,1),(1,0.7,1),(10,0.29,2),(10,0.01,1),(10,0,0)])
+def test_backlog_allowance_is_whole_and_leaves_fresh_a_slot(configured,tmp_path,cap,share,old_jobs):
+    """Astra r1 M2: a fractional share is rounded down to whole jobs, at least one (old work is never shut out) and
+    below the cap (fresh work keeps a slot of any cap of 2 or more)."""
+    s,make,_=configured
+    for n in range(cap+1):add_file(s,f'old-{n}','demo-tg-1',mime='image/png')
+    age(s,'demo-tg-1','1 year')
+    w=make({'image':cloud_profile(tmp_path)},backlog_share=share,profile_max_jobs_per_day={'image':cap})
+    for _ in range(old_jobs):
+        row,_=w.claim();assert w.finish(row,normalize_result({'title':'old'}))
+    assert w.claim() is None
+    if cap>1:
+        add_file(s,'fresh-image','demo-tg-2',mime='image/png');age(s,'demo-tg-2','1 hour')
+        row,_=w.claim();assert row['attachment']=='fresh-image'
+
+
+# spec: ANYM-69
 def test_backlog_share_one_keeps_the_whole_cap_for_old_work(configured,tmp_path):
     s,make,_=configured
     for n in range(3):add_file(s,f'old-{n}','demo-tg-1',mime='image/png')
