@@ -210,6 +210,10 @@ def session_lock(session):
     finally: os.close(fd)
 
 
+# ANYM-877: account cooldowns kept in collector_health.operations.cooldowns.
+COOLDOWN_RING=20
+
+
 class CollectorState:
     def __init__(self,archive,account,lease): self.archive,self.account,self.lease=archive,account,lease
 
@@ -560,6 +564,18 @@ class CollectorState:
                 ON CONFLICT(account) DO UPDATE SET status='degraded',detail_code='rate_limited',
                 cooldown_until=greatest(collector_health.cooldown_until,excluded.cooldown_until),
                 updated_at=clock_timestamp()''',(self.account,seconds))
+
+    def record_cooldown(self,seconds,phase):
+        """ANYM-877: append an account cooldown (start, seconds, governor phase) to the ring of the last
+        COOLDOWN_RING in operations; counts and times only, inside the row's 16 KiB budget."""
+        if type(seconds) is not int or not 1<=seconds<2**31 or not isinstance(phase,str) or \
+                not re.fullmatch(r'[a-z_]{1,32}',phase):raise ValueError('invalid_cooldown')
+        with self.archive.store.pool.connection() as c:
+            row=self._operations(c);value=row['operations']
+            ring=[e for e in value.get('cooldowns') or () if isinstance(e,dict)] if isinstance(value.get('cooldowns'),list) else []
+            value['cooldowns']=ring[-(COOLDOWN_RING-1):]+[
+                {'started_at':row['observed'].isoformat(),'seconds':seconds,'phase':phase}]
+            self._save_operations(c,value)
 
     def discovery_started(self):
         with self.archive.store.pool.connection() as c:

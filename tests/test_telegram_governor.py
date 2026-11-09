@@ -65,6 +65,170 @@ def test_shared_gate_blocks_media_until_history_flood_is_recorded():
     asyncio.run(scenario())
 
 
+def tiered(clock,state=None):
+    return RequestGovernor(state or State(clock),clock=clock,sleep=clock.sleep)
+
+
+def busy(gate,clock,log,name,tier,phase='telegram_history'):
+    """A caller that always waits again at once: an endless reconcile, media or live queue."""
+    async def loop():
+        async def request():log.append((name,clock()))
+        while True:await gate.call(request,phase,tier=tier)
+    return asyncio.create_task(loop())
+
+
+async def admitted(log,name,count):
+    while sum(1 for entry in log if entry[0]==name)<count:await asyncio.sleep(0.001)
+
+
+async def stop(*tasks):
+    for task in tasks:task.cancel()
+    await asyncio.gather(*tasks,return_exceptions=True)
+
+
+# spec: ANYM-877
+def test_a_one_chunk_live_file_finishes_in_two_intervals_while_reconcile_always_waits():
+    from messaging_service.telegram_governor import BACKGROUND,LIVE_MEDIA
+    async def scenario():
+        clock=Clock();gate=tiered(clock);log=[]
+        reconcile=[busy(gate,clock,log,'reconcile',BACKGROUND) for _ in range(3)]
+        await admitted(log,'reconcile',6)
+        async def media():log.append(('media',clock()))
+        start=clock()
+        for _ in range(2):await gate.call(media,'telegram_media',tier=LIVE_MEDIA)  # get_messages, the one chunk
+        assert [at for name,at in log if name=='media'][-1]<=start+2
+        await stop(*reconcile)
+        assert not gate.lock.locked()
+    asyncio.run(scenario())
+
+
+# spec: ANYM-877
+def test_an_agent_read_during_a_twenty_file_burst_is_admitted_at_the_next_interval():
+    from messaging_service.telegram_governor import BACKGROUND,LIVE_MEDIA
+    async def scenario():
+        clock=Clock();gate=tiered(clock);log=[]
+        reconcile=busy(gate,clock,log,'reconcile',BACKGROUND)
+        async def burst():
+            async def part():log.append(('media',clock()))
+            for _ in range(21):await gate.call(part,'telegram_media',tier=LIVE_MEDIA)
+        media=asyncio.create_task(burst())
+        await admitted(log,'media',8)
+        async def read():log.append(('agent',clock()));return 'page'
+        arrived=clock()
+        assert await gate.scoped_call(read,'live_search','search')=='page'
+        # The next slot, or the one after it when that slot is reconcile's due floor slot.
+        at=[at for name,at in log if name=='agent'][0]
+        assert at<=arrived+1 or at==arrived+2 and ('reconcile',arrived+1) in log,(arrived,log)
+        await media;await stop(reconcile)
+    asyncio.run(scenario())
+
+
+# spec: ANYM-877
+@pytest.mark.parametrize('flood,callers',[('live',100),('live_media',100),('live',1)],
+    ids=['live','live_media','one_live_loop'])
+def test_with_a_hundred_queued_live_calls_lower_tiers_get_one_admission_in_every_five(flood,callers):
+    from messaging_service.telegram_governor import BACKGROUND,LIVE,LIVE_MEDIA
+    async def scenario():
+        clock=Clock();gate=tiered(clock);log=[]
+        lower=['reconcile']+(['media'] if flood=='live' else [])
+        tasks=[busy(gate,clock,log,'reconcile',BACKGROUND)]
+        if flood=='live':tasks.append(busy(gate,clock,log,'media',LIVE_MEDIA,'telegram_media'))
+        top=LIVE if flood=='live' else LIVE_MEDIA
+        tasks+=[busy(gate,clock,log,'flood',top,'provider_command' if flood=='live' else 'telegram_media')
+            for _ in range(callers)]
+        await admitted(log,'flood',200)
+        await stop(*tasks)
+        names=[name for name,_ in log]
+        times=[at for _,at in log]
+        assert times==sorted(times) and len(set(times))==len(times)  # one admission per interval, all tiers
+        for start in range(len(names)-4):
+            window=names[start:start+5]
+            for name in lower:assert name in window,(start,window)
+        assert names.count('flood')>=len(names)//2  # the top tier still goes first
+    asyncio.run(scenario())
+
+
+# spec: ANYM-877
+@pytest.mark.parametrize('granted',[False,True])
+@pytest.mark.parametrize('tier',[0,1,2])
+def test_a_cancelled_waiter_in_any_tier_leaves_no_slot_taken(tier,granted):
+    from messaging_service.telegram_governor import BACKGROUND
+    async def scenario():
+        clock=Clock();gate=tiered(clock);entered=asyncio.Event();release=asyncio.Event();calls=[]
+        async def holding():entered.set();await release.wait()
+        holder=asyncio.create_task(gate.call(holding,'telegram_history'))
+        await entered.wait()
+        async def cancelled():calls.append('cancelled')
+        waiter=asyncio.create_task(gate.call(cancelled,'telegram_media',tier=tier))
+        await asyncio.sleep(0)
+        if granted:
+            # The holder hands the lane to this waiter, which is cancelled before it runs.
+            release.set()
+            while gate.lock.holder!=tier or not holder.done():await asyncio.sleep(0)
+            waiter.cancel()
+        else:
+            waiter.cancel();await asyncio.sleep(0);release.set()
+        await asyncio.gather(holder,waiter,return_exceptions=True)
+        async def later():calls.append('later')
+        await gate.call(later,'telegram_history',tier=BACKGROUND)
+        assert calls==['later'] and not gate.lock.locked()
+        assert not any(gate.lock.waiters)
+    asyncio.run(scenario())
+
+
+# spec: ANYM-877
+def test_an_account_cooldown_or_flood_wait_stops_every_tier():
+    from messaging_service.telegram_governor import BACKGROUND,LIVE,LIVE_MEDIA
+    async def scenario():
+        clock=Clock();state=State(clock);gate=tiered(clock,state);calls=[]
+        async def flooded():raise FloodWaitError(None,capture=30)
+        with pytest.raises(ProviderRateLimited):await gate.call(flooded,'telegram_media',tier=LIVE_MEDIA)
+        assert state.until==30
+        async def read():raise AssertionError('no provider request during the pause')
+        with pytest.raises(ProviderRateLimited):await gate.scoped_call(read,'live_search','search')
+        for tier in (LIVE,LIVE_MEDIA,BACKGROUND):
+            async def request(tier=tier):calls.append((tier,clock()))
+            await gate.call(request,'telegram_history',tier=tier)
+        assert calls==[(LIVE,30),(LIVE_MEDIA,31),(BACKGROUND,32)]
+    asyncio.run(scenario())
+
+
+# spec: ANYM-877
+def test_every_account_cooldown_is_appended_to_the_cooldown_ring_with_its_phase():
+    from telethon.errors import FloodError
+    from messaging_service.telegram_governor import SCOPED_FLOOD_MAX_SECONDS
+    async def scenario():
+        clock=Clock();state=State(clock);ring=[]
+        state.record_cooldown=lambda seconds,phase:ring.append((seconds,phase))
+        gate=tiered(clock,state)
+        async def flood_wait():raise FloodWaitError(None,capture=20)
+        with pytest.raises(ProviderRateLimited):await gate.call(flood_wait,'telegram_history')
+        clock.now+=20
+        async def unknown():raise FloodError(None,'FLOOD')
+        with pytest.raises(ProviderRateLimited):await gate.scoped_call(unknown,'live_search','search')
+        clock.now+=60
+        async def short():raise FloodWaitError(None,capture=5)
+        with pytest.raises(ProviderRateLimited):await gate.scoped_call(short,'live_search','chat_history')
+        async def long():raise FloodWaitError(None,capture=SCOPED_FLOOD_MAX_SECONDS+1)
+        with pytest.raises(ProviderRateLimited):await gate.scoped_call(long,'live_search','inspect_buttons')
+        # A scope-only wait is no account cooldown, so the ring has three entries.
+        assert ring==[(20,'telegram_history'),(60,'live_search'),(SCOPED_FLOOD_MAX_SECONDS+1,'live_search')]
+    asyncio.run(scenario())
+
+
+# spec: ANYM-877
+def test_a_failing_cooldown_ring_write_never_changes_the_cooldown():
+    async def scenario():
+        clock=Clock();state=State(clock)
+        def broken(seconds,phase):raise RuntimeError('synthetic')
+        state.record_cooldown=broken
+        gate=tiered(clock,state)
+        async def flooded():raise ProviderRateLimited(40)
+        with pytest.raises(ProviderRateLimited):await gate.call(flooded,'telegram_history')
+        assert state.until==40 and not gate.lock.locked()
+    asyncio.run(scenario())
+
+
 def test_cancelled_cooldown_never_calls_provider():
     async def scenario():
         clock=Clock();state=State(clock);state.defer(3600)
