@@ -315,6 +315,12 @@ func TestRepairStalledJournalReadIsAStatusCodeAndCaptureContinues(t *testing.T) 
 	s := openTestStore(t)
 	journalUnknown(t, s, repairFixtures()[1].msg, nil)
 	p := newRepairPass(s)
+	// The progress row is written under the production statement bound first: its
+	// synchronous commits are what a loaded host's fsync stretches past 100 ms
+	// (repair_storage, CI 2026-11-09). Only the stalled row read below is short.
+	if code := p.load(context.Background()); code != "" {
+		t.Fatalf("load: %q", code)
+	}
 	p.stmt = 100 * time.Millisecond
 	p.row = func(ctx context.Context, seq int64) (repairRow, bool, error) {
 		// A stalled row read past its statement bound; capture is not held behind it.
