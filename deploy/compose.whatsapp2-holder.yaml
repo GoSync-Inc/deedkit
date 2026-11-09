@@ -22,6 +22,7 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     mem_limit: ${PROBE_WHATSAPP_HOLDER_MEMORY:-512m}
+    cpu_shares: ${PROBE_WHATSAPP_HOLDER_CPU_SHARES:-1024}
     pids_limit: 64
     # ANYM-914: above the 15 s disconnect bound; the holder releases its claim after the provider disconnect.
     stop_grace_period: 25s

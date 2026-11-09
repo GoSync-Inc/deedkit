@@ -18,16 +18,22 @@ ROOT = Path(__file__).resolve().parents[1]
 HOLDERS = ['compose.whatsapp1-holder.yaml', 'compose.whatsapp2-holder.yaml']
 
 
+# reads: whatsapp/whatsmeow/Dockerfile
+# reads: services/messaging/Dockerfile
 def go_image(dockerfile):
     return re.search(r'^ARG GO_IMAGE=(\S+)$', (ROOT / dockerfile).read_text(), re.M).group(1)
 
 
+# reads: whatsapp/whatsmeow/Dockerfile
+# reads: services/messaging/Dockerfile
 def labels(dockerfile, kind):
     text = (ROOT / dockerfile).read_text()
     return tuple(int(re.search(rf'io\.deedkit\.{kind}\.protocol\.{end}="([0-9]+)"', text).group(1))
                  for end in ('min', 'max'))
 
 
+# reads: whatsapp/whatsmeow/Dockerfile
+# reads: services/messaging/Dockerfile
 # spec: ANYM-937
 def test_the_holder_image_is_a_python_free_build_of_whatsmeow_with_its_protocol_range_labels():
     context, dockerfile, stage, smoke = p.BUILDS['whatsapp-holder']
@@ -45,6 +51,8 @@ def test_the_holder_image_is_a_python_free_build_of_whatsmeow_with_its_protocol_
     assert 'whatsapp-holder' not in p.PUBLISHED and 'whatsapp-holder' not in p.MESSAGING_TARGETS
 
 
+# reads: whatsapp/whatsmeow/Dockerfile
+# reads: services/messaging/Dockerfile
 # spec: ANYM-937
 def test_a_messaging_service_only_change_keeps_the_holder_digest_and_changes_the_collectors():
     entries = p.tree_entries(ROOT)
