@@ -408,6 +408,71 @@ def test_unauthenticated_work_remains_bounded_per_peer_before_database_access():
     assert called == ['/v1/download/' + 'a'*43]*5
 
 
+# spec: ANYM-25
+def test_rejected_traffic_from_a_shared_peer_never_locks_out_a_recently_authenticated_key():
+    revoked, authenticated = set(), []
+    class Store:
+        public_url = 'http://testserver'
+        def authenticate(self, token):
+            authenticated.append(token)
+            if token in revoked or token.startswith('wrong'): raise APIError('unauthorized', 401)
+            return token
+        def audit_boundary(self, code): pass
+    async def handler(scope, receive, send):
+        await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+        await send({'type': 'http.response.body', 'body': b'{}'})
+    boundary = Boundary(handler, Store(), ['testserver'])
+    async def request(token, scheme=b'Bearer '):
+        sent = []
+        scope = {**_scope(), 'headers': [(b'host', b'testserver'), (b'authorization', scheme + token.encode())]}
+        async def receive(): return {'type': 'http.request', 'body': b'{}', 'more_body': False}
+        async def send(message): sent.append(message)
+        await boundary(scope, receive, send)
+        return sent[0]['status']
+    async def run():
+        assert await request('agent-0') == 200
+        # Anyone on the internet behind the same router address fills the peer's budget with wrong keys.
+        assert [await request(f'wrong-{n}') for n in range(600)] == [401]*600
+        authenticated.clear()
+        assert await request('wrong-again') == 429
+        assert await request('agent-1') == 429
+        assert authenticated == []
+        # The key that authenticated a moment ago keeps working, and is still authenticated each time.
+        assert await request('agent-0') == 200
+        assert authenticated == ['agent-0']
+        # Any spelling of the scheme the boundary accepts is the same key.
+        assert await request('agent-0', b'bearer ') == 200
+        # A revoked key loses the exemption at once, whichever spelling was refused.
+        revoked.add('agent-0')
+        assert await request('agent-0', b'BEARER ') == 401
+        assert await request('agent-0') == 429
+        assert await request('agent-0', b'bearer ') == 429
+    asyncio.run(run())
+
+
+# spec: ANYM-25
+@pytest.mark.parametrize('method', ['POST', 'PUT'])
+def test_keyless_download_path_refuses_a_body_before_reading_it(method):
+    sent, reads, called = [], [], []
+    class Store:
+        public_url = 'http://testserver'
+        def authenticate(self, token): raise AssertionError('a download carries no key')
+        def audit_boundary(self, code): pass
+    async def handler(*args): called.append('handler')
+    async def receive():
+        reads.append(method)
+        await asyncio.Event().wait()
+    async def send(message): sent.append(message)
+    path = '/v1/download/' + 'a'*43
+    scope = {**_scope(), 'method': method, 'path': path, 'raw_path': path.encode(),
+             'headers': [(b'host', b'testserver'), (b'content-length', b'1024')]}
+    # A slow body from anyone on the internet must not hold one of the server's 32 slots for 10 s.
+    asyncio.run(asyncio.wait_for(Boundary(handler, Store(), ['testserver'])(scope, receive, send), 2))
+    assert reads == [] and called == []
+    assert sent[0]['status'] == 405
+    assert json.loads(sent[1]['body'])['error'] == 'method_not_allowed'
+
+
 @pytest.mark.parametrize('request_id', ['', 'short', 'x'*129, 'bad/request', True])
 def test_command_action_id_is_bounded_before_persistence(operator, request_id):
     store, _, token, _ = operator
