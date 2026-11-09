@@ -682,7 +682,8 @@ class Client:
         return self.call('list_subscriptions',{'limit':limit})
 
     def get_subscription(self, *, subscription_id):
-        """Read lifecycle and archive matcher frontier; this does not prove provider freshness."""
+        """Read lifecycle and archive matcher frontier; this does not prove provider freshness.
+        positions: acked_through, fetched_through, open_receipts, oldest_open_receipt_expires_at, expired_unacked."""
         return self.call('get_subscription',{'subscription_id':subscription_id})
 
     def update_subscription(self, *, subscription_id, version, action, resume_policy='catch_up'):
@@ -698,7 +699,8 @@ class Client:
 
     def fetch_subscription_events(self, *, subscription_id, limit=50, detail=None, include=None):
         """Read an unacknowledged page; an explicit ACK grant may issue a short-lived receipt.
-        detail='compact' returns the same items, cursors and receipt with fewer fields."""
+        detail='compact' returns the same items, cursors and receipt with fewer fields; positions names the server's
+        ACKed and fetched boundaries and open or expired receipts."""
         return self.call('fetch_subscription_events',_page_view(dict(subscription_id=subscription_id,limit=limit),
             detail,include))
 

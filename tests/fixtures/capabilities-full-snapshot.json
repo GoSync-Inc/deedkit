@@ -96,6 +96,13 @@
    "metadata",
    "reply_evidence"
   ],
+  "positions": [
+   "acked_through",
+   "fetched_through",
+   "open_receipts",
+   "oldest_open_receipt_expires_at",
+   "expired_unacked"
+  ],
   "test": "test_subscription",
   "wait": "wait_for_subscription_events",
   "wait_max_seconds": 25
