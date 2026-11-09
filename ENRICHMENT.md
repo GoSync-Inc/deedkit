@@ -444,6 +444,8 @@ caps read the same sums. Fresh work done first therefore does not use up the bac
 share is a whole number of jobs per cap: rounded down, at least 1, and below the cap when the share
 is under 1, so fresh work keeps at least one slot of any cap of 2 or more. The backlog drains in any
 hour with no fresh work due, up to its share. `1` restores the old shared cap and `0` stops old work.
+The share and the caps count model calls only: a duplicate whose ready result is copied (ANYM-912) spends no
+attempt, so an old duplicate is still copied after the backlog's share is spent.
 The worker compares candidates across modalities instead of always
 exhausting the first configured modality. This does not yet introduce a public
 on-demand job-priority API. Local native children exit after every file; Ollama
