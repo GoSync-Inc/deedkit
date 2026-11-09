@@ -233,6 +233,24 @@ def test_a_range_that_does_not_qualify_pauses_with_todays_text(tmp_path, monkeyp
     assert host.migration() is None and "marker" not in outcome["reason"]
 
 
+# spec: ANYM-936
+def test_the_session_holder_role_change_set_pauses_for_its_hand_release(tmp_path, monkeypatch):
+    # The exact ANYM-936 change: its migration (declared manual, non-critical, so migrate-expand may run it: its policy calls no function)
+    # and a new role file, which alone sends the range to the hand release.
+    root = Path(__file__).resolve().parents[1]
+    text = root.joinpath("services/messaging/messaging_service/migrations/082_session_holder.sql").read_bytes()
+    role = root.joinpath("services/messaging/messaging_service/session_holder_role.sql").read_bytes()
+    assert rollout.risk_class(text.decode())[0] == "non-critical" and rollout.unattended_class(text.decode()) == "expand"
+    host = MigrationHost(tmp_path, monkeypatch, {"051_session_holder.sql": text}, others=[PACKAGE + "session_holder_role.sql"])
+    host.trees[NEWEST, PACKAGE].add("session_holder_role.sql")
+    host.contents[f"{NEWEST}:{PACKAGE}session_holder_role.sql"] = role
+    assert host.plan() is None
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and host.steps == [] and host.events == []
+    assert outcome["reason"].startswith("the SQL inventory changed (") and "session_holder_role.sql" in outcome["reason"]
+    assert host.migration() is None
+
+
 # spec: ANYM-743
 @pytest.mark.parametrize("case", ["check-widening-pair", "index-on-existing", "manual-header", "calendar-index"])
 def test_a_non_critical_range_qualifies_whatever_its_header_class(tmp_path, monkeypatch, case):
