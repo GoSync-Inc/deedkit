@@ -348,12 +348,122 @@ def test_a_timed_out_evaluation_leaves_the_cursor_unmoved_is_retried_and_then_sk
     worker = started(make, sleep=lambda seconds: waits.append((seconds, cursor(c))))
     with caplog.at_level(logging.INFO, logger=nw.__name__):
         worker.run_pass()
-    assert waits == [(1, start), (4, start), (16, start)]  # nothing committed while it was retried
+    # The retries after 1, 4 and 16 s, in one-second steps; nothing committed while it was retried.
+    assert waits == [(1, start)] * 21
     assert worker.skipped == 1 and rows(c, 'negotiations', chat=stalled) == [] and len(visible(c, ACCOUNT, fine)) == 1
     assert cursor(c) == c.execute('SELECT max(id) AS m FROM events').fetchone()['m']
     skipped = [r.getMessage() for r in caplog.records if 'negotiation_event_skipped' in r.getMessage()]
     assert skipped == [f'negotiation_event_skipped message={message} error=TransactionTimeout']
     assert not any(PROPOSAL in r.getMessage() for r in caplog.records)
+
+
+# spec: ANYM-908
+def test_a_crash_while_applying_a_chat_replays_all_its_events_with_their_scope_evidence(login, monkeypatch):
+    """A1 (a group proposal that mentions the owner), B2 (another chat), A3 (an unaddressed group message): a crash
+    while A is applied leaves the cursor before A1, so the restart still sees the mention and folds A."""
+    s, c, make, dsn = login
+    start = cursor(c)
+    group, private = new_chat(c, 'group'), new_chat(c)
+    a1 = post(c, group, PROPOSAL, 60)
+    c.execute('INSERT INTO message_metadata(message,revision,metadata) VALUES(%s,1,%s)',
+              (a1, json.dumps({'mentions_owner': True})))
+    post(c, private, PROPOSAL, 50)
+    post(c, group, 'и ещё вопрос', 40)
+    apply, crashed = store_module.apply, []
+
+    def crash(c, account, chat, *rest):
+        if chat == group and not crashed:
+            crashed.append(chat)
+            raise SystemExit('injected process crash')
+        return apply(c, account, chat, *rest)
+    monkeypatch.setattr(store_module, 'apply', crash)
+    worker = started(make)
+    with pytest.raises(SystemExit):worker.run_pass()
+    worker.close()
+    assert cursor(c) == start  # never past A1
+    started(make).run_pass()
+    assert len(visible(c, ACCOUNT, group)) == 1 and len(visible(c, ACCOUNT, private)) == 1
+
+
+# spec: ANYM-908
+def test_a_lost_worker_session_takes_the_lock_again_before_any_write_or_writes_nothing(login):
+    s, c, make, dsn = login
+    first = started(make)
+    pid = first.c.info.backend_pid
+    c.execute('SELECT pg_terminate_backend(%s)', (pid,))
+    deadline = time.monotonic() + 5
+    while c.execute('SELECT 1 FROM pg_stat_activity WHERE pid=%s', (pid,)).fetchone() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    second = make()
+    second.sleep = lambda seconds: second.stop.set()
+    assert second.start() is None  # the lock went with the session that held it
+    chat = new_chat(c)
+    post(c, chat, PROPOSAL, 60)
+    with pytest.raises(psycopg.OperationalError):first.run_pass()
+    with pytest.raises(nw.LockLost):first.run_pass()  # its reconnect finds the lock held: no write
+    assert rows(c, 'negotiations', chat=chat) == []
+    second.run_pass()
+    assert len(visible(c, ACCOUNT, chat)) == 1
+
+
+# spec: ANYM-908
+def test_a_failed_cleanup_stops_the_pass_before_any_apply_and_the_next_pass_retries_it(login, monkeypatch):
+    s, c, make, dsn = login
+    start = cursor(c)
+    chat = new_chat(c)
+    post(c, chat, PROPOSAL, 60)
+    cleanup, calls = store_module.cleanup, []
+
+    def failing(*a, **k):
+        calls.append(k.get('budget', 'lap'))
+        if len(calls) == 1:raise psycopg.errors.QueryCanceled('injected cleanup timeout')
+        return cleanup(*a, **k)
+    monkeypatch.setattr(store_module, 'cleanup', failing)
+    worker = started(make)
+    with pytest.raises(psycopg.errors.QueryCanceled):worker.run_pass()
+    assert rows(c, 'negotiations', chat=chat) == [] and cursor(c) == start
+    worker.run_pass()
+    assert calls[:2] == [None, None]  # the retry is the same startup lap
+    assert len(visible(c, ACCOUNT, chat)) == 1
+
+
+# spec: ANYM-908
+def test_a_16_second_backoff_runs_the_cleanup_checkpoint_between_one_second_steps(login, monkeypatch):
+    s, c, make, dsn = login
+    post(c, new_chat(c), PROPOSAL, 60)
+    steps = []
+    cleanup = store_module.cleanup
+    monkeypatch.setattr(store_module, 'cleanup', lambda *a, **k: steps.append('cleanup') or cleanup(*a, **k))
+    monkeypatch.setattr(store_module, 'hook', lambda stage: (_ for _ in ()).throw(RuntimeError('injected')))
+    worker = started(make, sleep=lambda seconds: steps.append(seconds))
+    worker.checkpoint = Checkpoint(interval=0)
+    worker.journal()
+    waits = [step for step in steps if step != 'cleanup']
+    assert waits == [1] * 21 and worker.skipped == 1
+    assert all(steps[at + 1] == 'cleanup' for at, step in enumerate(steps) if step != 'cleanup')
+
+
+# spec: ANYM-908
+def test_a_fence_due_in_the_middle_of_a_pass_stops_it_before_the_next_mutation(login, monkeypatch):
+    s, c, make, dsn = login
+    clock = [1000.0]
+    first, second = new_chat(c), new_chat(c)
+    post(c, first, PROPOSAL, 60)
+    later = post(c, second, PROPOSAL, 50)
+    scope, calls = nw.in_scope, []
+
+    def revoke_after_the_first_chat(*a):
+        calls.append(a[2])
+        if len(calls) == 2:  # ten minutes into the pass, a grant goes
+            c.execute('REVOKE SELECT(created_at) ON events FROM messaging_negotiations')
+            clock[0] += nw.PERIOD_S
+        return scope(*a)
+    monkeypatch.setattr(nw, 'in_scope', revoke_after_the_first_chat)
+    worker = started(make, clock=lambda: clock[0])
+    with pytest.raises(nw.Fenced):worker.journal()
+    assert len(visible(c, ACCOUNT, first)) == 1 and rows(c, 'negotiations', chat=second) == []
+    event = c.execute("SELECT id FROM events WHERE message=%s", (later,)).fetchone()['id']
+    assert cursor(c) < event
 
 
 # spec: ANYM-908

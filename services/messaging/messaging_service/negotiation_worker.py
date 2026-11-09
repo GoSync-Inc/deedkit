@@ -81,6 +81,10 @@ class Stopped(Exception):
     """A stop signal during a pass: it ends there, the cursor stays where the last commit put it, nothing skips."""
 
 
+class Fenced(Exception):
+    """A grant the fence checks is missing: the pass stops before its next cleanup or mutation and writes nothing."""
+
+
 def connect(dsn):
     return psycopg.connect(dsn, autocommit=True, row_factory=dict_row, prepare_threshold=None, connect_timeout=5,
                            options='-c statement_timeout=10000 -c timezone=UTC')
@@ -140,16 +144,22 @@ class Worker:
         self.stop = stop or threading.Event()
         self.sleep = sleep or self.stop.wait
         self.clock, self.now = clock, now
-        self.c = self.lock_c = None
+        self.c = None
         self.checkpoint = negotiation_store.Checkpoint()
         self.processed = self.skipped = 0
         self.last_sweep = self.last_fence = self.last_beat = self.fence_reason = None
 
     # Connections -------------------------------------------------------------------------------------------------
     def open(self):
+        """The work connection, which also holds the worker lock, so a write only ever runs on the session that holds
+        it. A reconnect (a timeout ends the session) takes the lock again before anything else, else LockLost."""
         if self.c is None or self.c.closed or self.c.broken:
             self.close_work()
-            self.c = connect(self.dsn)
+            c = connect(self.dsn)
+            if not c.execute('SELECT pg_try_advisory_lock(%s) AS ok', (LOCK_KEY,)).fetchone()['ok']:
+                c.close()
+                raise LockLost('held_by_another_instance')
+            self.c = c
         return self.c
 
     def close_work(self):
@@ -160,15 +170,14 @@ class Worker:
 
     def close(self):
         self.close_work()
-        if self.lock_c is not None:
-            try:self.lock_c.close()
-            except psycopg.Error:pass
-        self.lock_c = None
 
     def try_lock(self):
-        """Take the worker lock on a session of its own; False while another instance holds it."""
-        if self.lock_c is None or self.lock_c.closed or self.lock_c.broken:self.lock_c = connect(self.dsn)
-        return bool(self.lock_c.execute('SELECT pg_try_advisory_lock(%s) AS ok', (LOCK_KEY,)).fetchone()['ok'])
+        """Open the work connection with the worker lock; False while another instance holds it."""
+        try:
+            self.open()
+            return True
+        except LockLost:
+            return False
 
     def acquire(self):
         """Wait for the worker lock; returns False when stopped first."""
@@ -180,18 +189,14 @@ class Worker:
             self.sleep(IDLE_S)
         return False
 
-    def lock_alive(self):
-        try:self.lock_c.execute('SELECT 1')
-        except (psycopg.Error, AttributeError) as error:raise LockLost(type(error).__name__) from None
-
     # Start -------------------------------------------------------------------------------------------------------
     def start(self):
         """The start fence, then the lock, then the first cursor. Returns None, or the fence's reason with nothing
         written."""
-        c = self.open()
-        reason = fence(c)
+        with connect(self.dsn) as probe:reason = fence(probe)
         if reason is not None:return reason
         if not self.acquire():return 'stopped'
+        c = self.open()
         self.init_cursor(c)
         self.last_fence = self.clock()
         version = c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()
@@ -209,12 +214,26 @@ class Worker:
                 log.info('negotiation_backfill_started from_event=%d', max(start, 0))
 
     # One pass ----------------------------------------------------------------------------------------------------
+    def guard(self):
+        """Before each cleanup and mutation: the fence once its 10 minutes are up; a missing grant stops the pass."""
+        if self.fenced():raise Fenced(self.fence_reason)
+
     def check(self):
-        """The ANYM-907 cleanup checkpoint; a failure is logged, and its next call retries it."""
-        try:return self.checkpoint(self.open(), self.now())
-        except Exception as error:  # noqa: BLE001 - a failed cleanup never stops apply; reads hide purges anyway
-            log.warning('negotiation_cleanup_failed error=%s', type(error).__name__)
-            return 0
+        """The fence when due, then the ANYM-907 cleanup checkpoint. A cleanup failure propagates: the pass stops
+        before any further apply or publish, and the next pass retries the same checkpoint."""
+        self.guard()
+        return self.checkpoint(self.open(), self.now())
+
+    def wait(self, seconds):
+        """A backoff in stop-aware steps of at most a second, the checkpoint (and fence) between steps, so cleanup
+        checks stay about a second apart during a 16 s wait too."""
+        left = seconds
+        while left > 0:
+            step = min(1, left)
+            self.sleep(step)
+            if self.stop.is_set():raise Stopped()
+            left -= step
+            if left > 0:self.check()
 
     def change(self, work, message=None):
         """One chat change in its own bounded transaction, retried after 1, 4 and 16 s; when the third retry fails
@@ -229,13 +248,11 @@ class Worker:
                 return True
             except Exception as error:  # noqa: BLE001 - one chat never stops the journal
                 name = type(error).__name__
+                if c.closed or c.broken:self.close_work()
                 if failure <= len(BACKOFF_S):
                     log.warning('negotiation_apply_failed message=%s error=%s attempt=%d', message, name, failure)
-                    if c.closed or c.broken:self.close_work()
-                    self.sleep(BACKOFF_S[failure - 1])
-                    if self.stop.is_set():raise Stopped() from None
+                    self.wait(BACKOFF_S[failure - 1])
                     continue
-                if c.closed or c.broken:self.close_work()
                 self.skipped += 1
                 log.warning('negotiation_event_skipped message=%s error=%s', message, name)
         return False
@@ -245,8 +262,9 @@ class Worker:
                   (event_id, now))
 
     def journal(self):
-        """One batch of at most BATCH events: each affected chat's apply moves the cursor to that chat's last event,
-        chats in the order of their last event, so a stop never moves the cursor past a chat not yet applied."""
+        """One batch of at most BATCH events, chats in the order of their first event. Each chat's apply moves the
+        cursor only to just before the next chat's first event: the cursor never passes an event of a chat not yet
+        done, so a stop or crash replays all of that chat's events, its scope and deletion evidence included."""
         c = self.open()
         row = c.execute('SELECT event_id FROM negotiation_cursor WHERE id=1').fetchone()
         events = c.execute(EVENTS_SQL, (row['event_id'], BATCH)).fetchall()
@@ -254,20 +272,22 @@ class Worker:
         chats = {}
         for e in events:
             if e['kind'] not in KINDS or e['chat'] is None:continue
-            item = chats.setdefault((e['account'], e['chat']), {'last': 0, 'messages': [], 'deletion': False})
-            item['last'], item['message'] = e['id'], e['message']
+            item = chats.setdefault((e['account'], e['chat']), {'first': e['id'], 'messages': [], 'deletion': False})
+            item['message'] = e['message']
             item['messages'].append(e['message'])
             item['deletion'] = item['deletion'] or e['kind'] == 'message.deleted' or e['purged']
             self.processed += 1
-        for (account, chat), item in sorted(chats.items(), key=lambda pair: pair[1]['last']):
+        order = sorted(chats.items(), key=lambda pair: pair[1]['first'])
+        last = events[-1]['id']
+        for at, ((account, chat), item) in enumerate(order):
             if self.stop.is_set():raise Stopped()
+            upto = order[at + 1][1]['first'] - 1 if at + 1 < len(order) else last
             # Deletions refold before the scope check, also in a chat that is now out of scope.
             if not item['deletion'] and not in_scope(self.open(), account, chat, item['messages'], self.now()):continue
-            def work(c, now, account=account, chat=chat, last=item['last']):
+            def work(c, now, account=account, chat=chat, upto=upto):
                 negotiation_store.apply(c, account, chat, now, self.zone)
-                self.move(c, last, now)
+                self.move(c, upto, now)
             self.change(work, item['message'])
-        last = events[-1]['id']
         self.change(lambda c, now: self.move(c, last, now))
         return len(events)
 
@@ -366,7 +386,6 @@ class Worker:
                 return 3
             while not self.stop.is_set():
                 try:
-                    self.lock_alive()
                     if self.fenced():
                         self.sleep(IDLE_S)
                         continue
@@ -378,6 +397,8 @@ class Worker:
                     if not self.busy(result):self.sleep(IDLE_S)
                 except Stopped:
                     break
+                except Fenced:
+                    self.sleep(IDLE_S)
                 except LockLost:
                     log.warning('negotiation_worker_lock_lost')
                     self.close()
