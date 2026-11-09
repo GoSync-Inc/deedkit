@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
+import sys
 from types import SimpleNamespace
 
 from messaging_service import backup_runner
@@ -536,6 +537,67 @@ def test_the_calls_units_run_the_host_runner_with_their_config_recover_with_it_a
         assert set(service['ReadWritePaths'][0].split()) == {str(Path(cfg['directory']).parent), str(Path(cfg['host_lock']).parent)}
         assert all(key in service for key in ('NoNewPrivileges', 'PrivateTmp', 'ProtectHome', 'ProtectSystem'))
     assert 'ExecCondition' not in unit_lines(CALLS_UNITS[0])['Service']
+
+
+def host_program(tmp_path, *files):
+    """`files` as (name, package module) in a fresh `ops` directory, the way production.py installs or stages them."""
+    ops, package = tmp_path / 'ops', Path(backup_runner.__file__).parent
+    ops.mkdir()
+    for name, module in files:
+        (ops / name).write_bytes((package / module).read_bytes())
+    return ops
+
+
+def check_run(tmp_path, program, example):
+    config = tmp_path / example  # its host paths below tmp_path: no host's /opt or /etc is read
+    config.write_text(re.sub(r'"/(opt|etc)/', lambda m: f'"{tmp_path}{m[0][1:]}', (DEPLOY / example).read_text()))
+    config.chmod(0o600)
+    return subprocess.run([sys.executable, '-I', str(program), '--config', str(config), '--check'], cwd=tmp_path,
+                          capture_output=True, text=True, timeout=60)
+
+
+EXAMPLES = ('backup-runner-calls.example.json', 'backup-runner-recordings.example.json',
+            'backup-runner-calendar.example.json', 'backup-runner.example.json')
+
+
+# spec: ANYM-782
+@pytest.mark.parametrize('suffix', ['', '.' + 'f' * 40 + '.tmp'], ids=['installed', 'staged'])
+def test_the_host_program_loads_its_profiles_module_from_its_own_directory_under_isolated_mode(tmp_path, suffix):
+    # W5-9: the units run `python3 -I <ops>/backup_runner.py`, which keeps <ops> off sys.path; production.py runs the
+    # staged `.backup_runner.py.<sha>.tmp` beside `.backup_profiles.py.<sha>.tmp` before it renames either.
+    lead = '.' if suffix else ''
+    names = (lead + 'backup_runner.py' + suffix, lead + 'backup_profiles.py' + suffix)
+    ops = host_program(tmp_path, (names[0], 'backup_runner.py'), (names[1], 'backup_profiles.py'))
+    for example in EXAMPLES:
+        done = check_run(tmp_path, ops / names[0], example)
+        assert done.returncode == 0, done.stderr
+        assert json.loads(done.stdout) == {'status': 'idle', 'profile': json.loads((DEPLOY / example).read_text()).get(
+            'profile', 'messaging')}
+    # Compiled in memory: nothing (no __pycache__) is written beside the program.
+    assert sorted(path.name for path in ops.iterdir()) == sorted(names)
+
+
+# spec: ANYM-782
+@pytest.mark.parametrize('name', ['backup_runner.py', 'runner.py'], ids=['module-absent', 'program-renamed'])
+def test_the_host_program_without_its_profiles_module_fails_before_reading_any_config(tmp_path, name):
+    ops = host_program(tmp_path, (name, 'backup_runner.py'))
+    done = check_run(tmp_path, ops / name, EXAMPLES[0])
+    assert done.returncode != 0 and done.stdout == ''
+    assert ('backup_profiles.py' if name == 'backup_runner.py' else 'backup_profiles_unnamed') in done.stderr
+    assert [path.name for path in ops.iterdir()] == [name]
+
+
+# spec: ANYM-778
+def test_the_profile_names_backup_runner_keeps_are_backup_profiles_own_objects():
+    from messaging_service import backup_profiles
+    assert backup_profiles.runner is backup_runner and issubclass(backup_runner.Runner, backup_profiles.StagedProfile)
+    for name in ('CALLS_SNAPSHOT_HELPER', 'CALLS_STEP_PAGES', 'GUARD_SECONDS', 'REAP_SECONDS', 'RECORDINGS_DEFAULTS',
+                 'CALLS_DEFAULTS', 'CLEANUP_CODES', 'admission_bound', 'worst_case', 'staged_options', 'timer_starts',
+                 'timer_delay', 'next_start', 'recordings_config', 'calls_config'):
+        assert getattr(backup_runner, name) is getattr(backup_profiles, name), name
+    # What both share is defined once, in backup_runner, and read from it at call time.
+    for name in ('Skip', 'read_json', 'write_json', 'path_valid', 'nested', 'mounts_under', 'MOUNTINFO'):
+        assert name not in vars(backup_profiles), name
 
 
 # spec: ANYM-782
