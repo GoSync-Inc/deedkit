@@ -193,10 +193,9 @@ def test_a_group_whose_only_message_is_its_creation_notice_is_listed_after_the_n
                          message='Synthetic text', from_id=types.PeerUser(42), out=False)
     assert len(registered_events(types.UpdateNewMessage(message=text, pts=2, pts_count=1))) == 1
     # ... but none from the creation notice: Telethon 1.45.0 NewMessage skips MessageService updates.
-    for built in registered_events(types.UpdateNewMessage(message=creation_notice(7), pts=1, pts_count=1)):
-        asyncio.run(w.capture(built))
+    assert registered_events(types.UpdateNewMessage(message=creation_notice(7), pts=1, pts_count=1)) == []
     w.spool.drain(w.state.apply)
-    assert chat_id not in chats()
+    assert chat_id not in chats() and not w.failed.is_set()
     # The next dialog discovery pass lists the group, as far as the account's policy allows it.
     async def dialogs(limit):
         return [(GROUP, 'chat', 'Synthetic team', 'group')]
