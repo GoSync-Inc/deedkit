@@ -935,7 +935,7 @@ endpoint's `delivery_health` and `last_error`, the owning `principal`, `key_id` 
 principal's `key_label` from the private admin labels file, and `endpoints_by_state` counts
 the listed endpoints by health state.
 
-## Wake targets (pull waker rules, schema 72)
+## Wake targets (pull waker rules, schema 73)
 
 ANYM-848. A wake target is an agent's own rule: "when any of these subscriptions of mine has new events, wake this
 chat of mine". It is the pull-side sibling of a self-service endpoint: DeedKit stores the rule and returns it to the

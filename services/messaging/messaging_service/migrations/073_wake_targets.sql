@@ -5,8 +5,8 @@
 -- ID or session name) that a host waker on the owner's machine wakes when one of the key's own bound subscriptions has
 -- new events (packages/wake-relay, ANYM-849). DeedKit never contacts the chat. `confirmation` is the one-use code the
 -- chat returned from the waker's challenge; DeedKit only stores and returns it. A subscription wakes at most one chat.
--- The audit CHECK gains the five tool operations (the widening pair; it stays NOT VALID as 036 left it). A schema-71
--- runtime never names the tables; a schema-72 runtime on a schema-71 database answers the tools delivery_disabled and
+-- The audit CHECK gains the five tool operations (the widening pair; it stays NOT VALID as 036 left it). A schema-72
+-- runtime never names the tables; a schema-73 runtime on a schema-72 database answers the tools delivery_disabled and
 -- shows every subscription with wake_target_id null. Grants: the API role only (gateway_role.sql). No column default
 -- calls a function (the expand grammar takes literals only): wake_targets.py writes id and both times.
 SET LOCAL lock_timeout='2s';

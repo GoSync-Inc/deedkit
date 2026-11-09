@@ -246,7 +246,7 @@ def digest(value: str) -> str:
 
 
 KEY_OPERATION_SCHEMA=44  # api_key_operations (ANYM-495)
-RUNTIME_SCHEMA=72  # the newest schema this runtime knows; migrate() refuses a newer database
+RUNTIME_SCHEMA=73  # the newest schema this runtime knows; migrate() refuses a newer database
 
 
 def revocable_token(value):
@@ -1276,7 +1276,7 @@ class Store:
 
     # ANYM-848: an agent's own wake targets, read by a host waker (packages/wake-relay); DeedKit never contacts them.
     def wake_authorized(self, token, operation):
-        # Before schema 72 (rolling upgrade) the audit CHECK has no wake operation: the denial is audited as
+        # Before schema 73 (rolling upgrade) the audit CHECK has no wake operation: the denial is audited as
         # http_boundary for the caller, as endpoint_authorized does before schema 49, and answers delivery_disabled.
         from .wake_targets import schema_ready
         with self.pool.connection() as c:

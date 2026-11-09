@@ -41,7 +41,7 @@ def test_migration_046_adds_nullable_role_columns_and_repeats_over_schema45_rows
         assert schema(store)=='45' and role_columns(store)=={}
         with store.pool.connection() as c:before=c.execute('SELECT * FROM chats WHERE id=%s',(chat,)).fetchone()
         store.migrate();store.migrate()
-        assert schema(store)=='72' and role_columns(store)==COLUMNS
+        assert schema(store)=='73' and role_columns(store)==COLUMNS
         with store.pool.connection() as c:
             after=c.execute('SELECT * FROM chats WHERE id=%s',(chat,)).fetchone()
             assert c.execute('SELECT count(*) AS n FROM archive_migrations WHERE version=46').fetchone()['n']==1
@@ -99,7 +99,7 @@ def test_prepared_chat_queries_survive_migration_046_on_a_serving_connection(dat
                 commands._chat(c,p,'roles-tg',chat);outgoing.target(c,p,'roles-tg',chat,'')
             c.commit()
             store.migrate()  # another pool connection
-            assert schema(store)=='72'
+            assert schema(store)=='73'
             assert commands._chat(c,p,'roles-tg',chat)['provider_chat']=='-1001'
             assert outgoing.target(c,p,'roles-tg',chat,'')[0]['platform']=='telegram'
 
@@ -119,7 +119,7 @@ def test_real_schema45_dump_restores_verifies_and_quarantines_before_migration_0
                 assert not c.execute('SELECT 1 FROM account_policies WHERE enabled OR send_enabled').fetchone()
                 assert not c.execute('SELECT 1 FROM api_keys WHERE NOT revoked').fetchone()
             restored.migrate()
-            assert schema(restored)=='72' and role_columns(restored)==COLUMNS
+            assert schema(restored)=='73' and role_columns(restored)==COLUMNS
             with restored.pool.connection() as c:
                 row=c.execute('SELECT provider_chat,my_role,can_post FROM chats WHERE id=%s',(chat,)).fetchone()
             assert row=={'provider_chat':'-1001','my_role':None,'can_post':None}

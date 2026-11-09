@@ -45,7 +45,7 @@ def _invalid(errors):
 
 
 def schema_ready(c):
-    """Migration 072 is applied and this role may read the tables; before it (rolling upgrade) every path is off."""
+    """Migration 073 is applied and this role may read the tables; before it (rolling upgrade) every path is off."""
     return c.execute("""SELECT to_regclass('public.wake_target_subscriptions') IS NOT NULL
         AND has_table_privilege('public.wake_target_subscriptions','SELECT') AS ready""").fetchone()['ready']
 

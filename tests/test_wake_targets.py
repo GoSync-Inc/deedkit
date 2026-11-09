@@ -300,8 +300,8 @@ def test_a_bound_target_changes_neither_hints_nor_push_delivery(gate):
 
 
 # spec: ANYM-848
-def test_a_schema_71_database_answers_the_tools_delivery_disabled_and_every_read_as_before(database, tmp_path):
-    """A genuine schema-71 database (the real schema_ready guard, no stub): the new code refuses the five tools with a
+def test_a_schema_72_database_answers_the_tools_delivery_disabled_and_every_read_as_before(database, tmp_path):
+    """A genuine schema-72 database (the real schema_ready guard, no stub): the new code refuses the five tools with a
     boundary audit and answers get, events, fetch and wait with a null wake target; a snapshot of it captures, verifies
     and quarantines without the new tables; migrating it then adds them."""
     from starlette.testclient import TestClient
@@ -310,9 +310,9 @@ def test_a_schema_71_database_answers_the_tools_delivery_disabled_and_every_read
     from messaging_service.subscriptions import match_subscriptions
     from messaging_service.wake_targets import schema_ready
     from test_subscription_retention import emit, restore_database
-    with restore_database(database, tmp_path / 'old', through=71) as old:
+    with restore_database(database, tmp_path / 'old', through=72) as old:
         with old.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '71'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '72'
             assert schema_ready(c) is False
         old.set_delivery_features(True)
         token = identity(old)
@@ -340,13 +340,13 @@ def test_a_schema_71_database_answers_the_tools_delivery_disabled_and_every_read
             rows = c.execute("""SELECT operation,outcome,error_code FROM audit_log WHERE operation='http_boundary'
                 ORDER BY occurred_at""").fetchall()
         assert rows == [{'operation': 'http_boundary', 'outcome': 'denied', 'error_code': 'delivery_disabled'}] * 6
-        # A schema-71 backup: captured, verified and quarantined by this runtime without the new tables.
+        # A schema-72 backup: captured, verified and quarantined by this runtime without the new tables.
         old.set_delivery_features(False)
-        snapshot = tmp_path / 'snapshot71'
+        snapshot = tmp_path / 'snapshot72'
         create_snapshot(old, snapshot, [sys.executable, '-c', 'print("unit-dump-stub")'])
         assert verify_snapshot(old, snapshot)['status'] == 'verified'
         manifest = json.loads((snapshot / 'manifest.json').read_text())
-        assert manifest['schema_version'] == 71 and 'wake_targets' not in manifest['tables']
+        assert manifest['schema_version'] == 72 and 'wake_targets' not in manifest['tables']
         quarantine_restore(old)
         # Migrating the old database adds the tables; a second migrate changes nothing.
         old.migrate()

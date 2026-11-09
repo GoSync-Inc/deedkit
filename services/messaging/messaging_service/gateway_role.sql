@@ -127,7 +127,7 @@ GRANT SELECT ON media_recovery TO messaging_gateway;
 GRANT SELECT,INSERT,UPDATE ON subscription_activity TO messaging_gateway;
 -- Schema 71 (ANYM-837): a send_message menu choice names its menu in outgoing_messages.menu_choice.
 GRANT INSERT(menu_choice) ON outgoing_messages TO messaging_gateway;
--- Schema 72 (ANYM-848): an agent's own wake targets and their subscription bindings. No DELETE on targets (a delete
+-- Schema 73 (ANYM-848): an agent's own wake targets and their subscription bindings. No DELETE on targets (a delete
 -- is a soft one); bindings are replaced and removed by the owning key's calls.
 GRANT SELECT,INSERT ON wake_targets TO messaging_gateway;
 GRANT UPDATE(thread,state,disabled_reason,confirmation,version,updated_at) ON wake_targets TO messaging_gateway;
