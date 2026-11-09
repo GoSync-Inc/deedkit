@@ -714,7 +714,8 @@ class Archive:
         exhausted="""state='leased' AND attempts>=%(max)s AND lease_until<clock_timestamp()
             AND NOT starts_with(coalesce(lease_owner,''),'recovery:')"""
         with self.store.pool.connection() as c:
-            rows=c.execute('SELECT id,account,message FROM media_jobs WHERE '+exhausted+
+            # The retry_exhausted sweep's own scan (no selective index, MEDIA_SWEEP_SECONDS above), as before ANYM-867.
+            rows=c.execute('/* retry_exhausted sweep */ SELECT id,account,message FROM media_jobs WHERE '+exhausted+
                 ' AND (%(account)s::text IS NULL OR account=%(account)s) ORDER BY id LIMIT %(limit)s',
                 {'max':MEDIA_MAX_ATTEMPTS,'account':account,'limit':MEDIA_SWEEP_LIMIT}).fetchall()
         groups={}
