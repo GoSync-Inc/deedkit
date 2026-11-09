@@ -1666,8 +1666,13 @@ Memory budget (measured on prod 2026-11-09, read-only). `max_connections` 100, `
 | 8 parallel workers × (10 MB + 2 × 2 × 4 MB) | 208 |
 
 At sb = 128 MB that is 1,796 MB: already above 75% of 2 GiB (1,536 MB), so shared_buffers stays at 128 MB and the
-card's 512 MB (2,180 MB) does not fit. The synthetic peak run ([PEAK]) bounds the real peak. Raising shared_buffers
-needs a larger `mem_limit` or fewer idle sessions (smaller pools): each is its own card.
+card's 512 MB (2,180 MB) does not fit. A synthetic peak run (2026-11-09, disposable PostgreSQL 18 under the same
+2 GiB limit and these settings; 600k messages, 150k attachments, 2.4 GB; 35 sessions, 14 running the media claim, the
+enrichment claim, sync status, search and a parallel join for 180 s, up to 7 parallel workers) peaked at 798 MiB
+anonymous plus shared memory, 593 MiB above its idle 205 MiB, with no OOM kill. Prod's long-lived sessions already
+hold 954 MB (anonymous 736, shared 162, kernel 56), so the same burst there reaches about 1,550 MB at 128 MB and
+about 1,930 MB at 512 MB. Raising shared_buffers needs a larger `mem_limit` or fewer idle sessions (smaller pools):
+each is its own card.
 
 The change is not `production.py`'s: the tool never promotes `db` (and runs Compose with `--no-deps`, so no deploy
 recreates it). It is one reviewed production operation, none of it during an active call:
