@@ -869,8 +869,10 @@ Phases, each a pause or a wait before any production write:
    passes; `probe_metadata` only by `schema_version`;
    `archive_migrations` only by the pending versions; and no other existing table may show a write in
    `pg_stat_user_tables` or a changed exact row count (a TRUNCATE moves no write counter; ANYM-743) or column number (a column dropped and added again). Its transaction takes at most
-   `rehearsal_limit_ms`: `migrate-expand` times it on a monotonic clock from before its connection opens to its
-   commit's return (every lock released) and prints `{"transaction_ms": N}` on the line before its answer (a reader
+   `rehearsal_limit_ms`: `migrate-expand` times it on a monotonic clock from before its first pending statement to
+   its commit's return (every lock a migration statement takes, its wait included, until its release; the connection,
+   session setup and ledger reads before it hold only ACCESS SHARE on the ledger and catalogs and do not count since
+   fix-rehearsal-timer-11-09: 068's 764 ms left only 236 ms of margin on the loaded host) and prints `{"transaction_ms": N}` on the line before its answer (a reader
    of the last line alone ignores it); a rehearsal without that line pauses. The container's exit and the reads after
    it do not count: until 11-09 the window ran to the first read after the container ended, and that part was most of
    it (068's 40 ms index read 1100 to 4681 ms on the loaded host). Else the run pauses "not unattended: <first difference>" or "too slow

@@ -174,6 +174,40 @@ def test_the_transaction_time_runs_to_the_commit_s_return_while_its_locks_are_he
     assert ledger(dsn) == (NEXT, 1, 1)
 
 
+# spec: ANYM-449
+def test_the_transaction_time_starts_at_the_first_pending_statement_not_at_the_connection(db, tmp_path, monkeypatch):
+    # fix-rehearsal-timer-11-09: the connection, session setup and ledger reads hold no lock an application waits
+    # for, yet counted in 068's 764 ms (236 ms margin). Astra r1 F1: a clock only this test moves gives each part its
+    # own time: 8 s while connecting and before the first pending statement (left out), 0.5 s in that statement and
+    # 0.25 s in the commit (both counted), so a start after the connection or after the batch fails too.
+    _, dsn = db
+    root = package(tmp_path)
+    now, phase = [0.0], ['preflight']
+    class Clock:
+        def __getattr__(self, name): return getattr(time, name)
+        def monotonic(self): return now[0]
+    monkeypatch.setattr(store_module, 'time', Clock())
+    opened = store_module.expand_connection
+    def charged_connection(*args):
+        now[0] += 4
+        c = opened(*args)
+        execute, commit = c.execute, c.commit
+        def charged_execute(query, *rest, **kwargs):
+            if phase[0] == 'preflight' and query == NOTE: phase[0] = 'batch'; now[0] += 0.5
+            elif phase[0] == 'preflight': now[0] += 4 / 64
+            return execute(query, *rest, **kwargs)
+        def charged_commit():
+            commit()
+            now[0] += 0.25
+        c.execute, c.commit = charged_execute, charged_commit
+        return c
+    monkeypatch.setattr(store_module, 'expand_connection', charged_connection)
+    timing = {}
+    found = store_module.migrate_expand(dsn, plan_for(root, RUNTIME_SCHEMA, NEXT), root=root, timing=timing)
+    assert found == {'schema_version': NEXT} and ledger(dsn) == (NEXT, 1, 1) and phase == ['batch'] and now[0] >= 4.75
+    assert timing['transaction_ms'] == 750
+
+
 # spec: ANYM-596
 def test_the_entry_point_opens_one_connection_under_the_budgets_and_no_pool(db, tmp_path, monkeypatch):
     # Astra r1 F5: no application pool beside the bounded connection.

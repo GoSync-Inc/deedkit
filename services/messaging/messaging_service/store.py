@@ -132,8 +132,11 @@ def migrate_expand(dsn, plan, *, root=None, before_commit=None, application_name
     connection, or nothing (ANYM-596). Never schema.sql, lock_replay_tables or the ACL repair of migrate().
     A plan `identity` (EXPAND_IDENTITY of the database deploy copied) must be what this connection reached before
     anything else runs (ANYM-449). Raises ExpandError with a fixed code; `before_commit(c)` is a test hook.
-    A `timing` dict gets `transaction_ms` after the commit: monotonic milliseconds, rounded up, from before the
-    connection opens to the commit's return, so it covers every lock the transaction held until its release."""
+    A `timing` dict gets `transaction_ms` after the commit: monotonic milliseconds, rounded up, from before the first
+    pending statement to the commit's return, so it covers every lock a migration statement or role grant takes, its
+    wait included, until the commit releases it. The connection, session setup, identity, advisory lock and ledger and
+    catalog reads before it are left out: they hold only ACCESS SHARE on probe_metadata, archive_migrations and the
+    catalogs, which no application read or write waits for (fix-rehearsal-timer-11-09)."""
     from . import migration_rollout as rollout
     root=Path(root) if root else Path(__file__).parent
     files={int(p.name[:3]):p for p in root.joinpath('migrations').glob('[0-9][0-9][0-9]_*.sql')}
@@ -158,7 +161,6 @@ def migrate_expand(dsn, plan, *, root=None, before_commit=None, application_name
     pending=[(v,files[v].read_bytes()) for v in sorted(files) if base<v<=target]
 
     def run():
-        started=time.monotonic()
         c=expand_connection(dsn,application_name)
         try:
             if identity is not None and c.execute(EXPAND_IDENTITY).fetchone()['identity']!=identity:
@@ -187,6 +189,7 @@ def migrate_expand(dsn, plan, *, root=None, before_commit=None, application_name
                 created=following
             for old,new in appended.values():
                 if rollout.role_class(old,new,created,tables=inventory)!='additive': raise ExpandError('role_not_additive')
+            started=time.monotonic()
             for version,data in pending:
                 c.execute(data.decode())
                 c.execute('INSERT INTO archive_migrations(version,sha256) VALUES(%s,%s)',(version,hashlib.sha256(data).hexdigest()))
@@ -243,7 +246,7 @@ def digest(value: str) -> str:
 
 
 KEY_OPERATION_SCHEMA=44  # api_key_operations (ANYM-495)
-RUNTIME_SCHEMA=72  # the newest schema this runtime knows; migrate() refuses a newer database
+RUNTIME_SCHEMA=73  # the newest schema this runtime knows; migrate() refuses a newer database
 
 
 def revocable_token(value):
@@ -1441,7 +1444,7 @@ class Store:
             c.execute(Path(__file__).with_name('schema.sql').read_text())
             version=int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
             if version>RUNTIME_SCHEMA: raise RuntimeError('database_newer_than_runtime')
-            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql'),(43,'043_person_links.sql'),(44,'044_key_operation_id.sql'),(45,'045_message_purge.sql'),(46,'046_chat_roles.sql'),(47,'047_contact_search.sql'),(48,'048_dispatcher_heartbeat.sql'),(49,'049_delivery_endpoints.sql'),(50,'050_component_heartbeats.sql'),(51,'051_send_intents.sql'),(52,'052_host_admission_index.sql'),(53,'053_person_preferences.sql'),(54,'054_conflict_classes.sql'),(55,'055_failure_events.sql'),(56,'056_module_events.sql'),(57,'057_conflict_reevaluation.sql'),(58,'058_module_router.sql'),(59,'059_endpoint_refusal_indexes.sql'),(60,'060_dynamic_subscription_sources.sql'),(61,'061_delivery_attempts.sql'),(62,'062_subscription_tombstones.sql'),(63,'063_send_terminal_events.sql'),(64,'064_bot_press_permission.sql'),(65,'065_call_failed_provider_error.sql'),(66,'066_media_attempt_budget.sql'),(67,'067_recording_module_source.sql'),(68,'068_attachment_digest_index.sql'),(69,'069_media_recovery.sql'),(70,'070_subscription_activity.sql'),(71,'071_menu_choice.sql'),(72,'072_telegram_group_receipts.sql')]:
+            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql'),(43,'043_person_links.sql'),(44,'044_key_operation_id.sql'),(45,'045_message_purge.sql'),(46,'046_chat_roles.sql'),(47,'047_contact_search.sql'),(48,'048_dispatcher_heartbeat.sql'),(49,'049_delivery_endpoints.sql'),(50,'050_component_heartbeats.sql'),(51,'051_send_intents.sql'),(52,'052_host_admission_index.sql'),(53,'053_person_preferences.sql'),(54,'054_conflict_classes.sql'),(55,'055_failure_events.sql'),(56,'056_module_events.sql'),(57,'057_conflict_reevaluation.sql'),(58,'058_module_router.sql'),(59,'059_endpoint_refusal_indexes.sql'),(60,'060_dynamic_subscription_sources.sql'),(61,'061_delivery_attempts.sql'),(62,'062_subscription_tombstones.sql'),(63,'063_send_terminal_events.sql'),(64,'064_bot_press_permission.sql'),(65,'065_call_failed_provider_error.sql'),(66,'066_media_attempt_budget.sql'),(67,'067_recording_module_source.sql'),(68,'068_attachment_digest_index.sql'),(69,'069_media_recovery.sql'),(70,'070_subscription_activity.sql'),(71,'071_menu_choice.sql'),(72,'072_attachment_message_index.sql'),(73,'073_telegram_group_receipts.sql')]:
                 migration=Path(__file__).with_name('migrations')/name
                 sha=hashlib.sha256(migration.read_bytes()).hexdigest()
                 if version<target:

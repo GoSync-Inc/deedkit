@@ -38,7 +38,7 @@ def test_schema70_snapshot_restores_the_activity_counts(database,tmp_path):
     with restore_database(database,tmp_path/'source') as source:
         acked_subscription(source,name='activity-snapshot')
         with source.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='72'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='73'
             before=database_manifest(c)['subscription_activity']
             rows=c.execute('SELECT * FROM subscription_activity ORDER BY metric').fetchall()
         assert before['rows']==2 and [row['metric'] for row in rows]==['matched','scanned']

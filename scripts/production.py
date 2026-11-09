@@ -4041,7 +4041,7 @@ def expand_run(name, image, network, dsn_file, plan_file, *, label=None, status=
     and the plan mounted read-only, at most MIGRATE_TIMEOUT seconds; its last JSON line, or None when the answer is
     lost (a deadline kills the container). Its output holds a version or a fixed code, never PostgreSQL's message.
     `timed` (the rehearsal) adds `transaction_ms` to a version: the line before the answer, {"transaction_ms": N},
-    the migrator's own monotonic time from its connection to its commit's return; None when the image printed none."""
+    the migrator's own monotonic time from its first pending statement to its commit's return; None when the image printed none."""
     mounts = [] if status else ["--mount", f"type=bind,src={plan_file},dst=/run/deedkit/plan.json,readonly"]
     before = []
     found = container_json(name, image, network, dsn_file, ["python", "-m", "messaging_service", "migrate-expand",
@@ -4236,7 +4236,7 @@ def rehearse(copied, plan, image, limit):
     label = "deedkit-copy=" + copy["id"]
     answer = calendar_expand(container, image, network, str(secret), plan_file, label=label) if calendar else \
         expand_run(container, image, network, str(secret), plan_file, label=label, timed=True)
-    # The migrator's own time, from its connection to its commit's return (every lock released), never a later
+    # The migrator's own time, from its first pending statement to its commit's return (every lock released), never a later
     # read: that counted the container's exit, its removal and a new docker exec, which on the loaded host read
     # 068's 40 ms index as 1100 to 4681 ms (fix-migration-rehearsal-11-09).
     reported = answer.pop("transaction_ms", None) if isinstance(answer, dict) and not calendar else None

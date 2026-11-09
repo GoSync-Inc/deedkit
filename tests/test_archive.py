@@ -709,7 +709,7 @@ def test_migration_checksum_and_restart_preserve_revisions(archive):
     ar.ingest(event()); s.migrate(); s.migrate()
     assert len(s.get_updates(key,'main')['items'])==1
     with s.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='72'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='73'
         saved=c.execute('SELECT sha256 FROM archive_migrations WHERE version=2').fetchone()['sha256']
         c.execute("UPDATE archive_migrations SET sha256='wrong' WHERE version=2")
     try:
@@ -1399,6 +1399,39 @@ def test_text_ingest_without_attachment_rows_does_not_wait_for_the_residency_loc
     with s.pool.connection() as c:
         active=[r['active'] for r in c.execute('SELECT active FROM attachments WHERE message=%s',(result['message'],))]
     assert active==([False] if case.startswith('attachment') else [])
+
+
+# spec: ANYM-852
+@pytest.mark.parametrize('case',['text_edit','active_flip'])
+def test_ingest_reads_a_message_s_attachment_rows_through_an_index(archive,monkeypatch,case):
+    # The active-flag update (archive.py: WHERE message=) and ANYM-839's attachment-row check of a stored message
+    # read attachments by message. enable_seqscan=off stands in for production's size (as 068's test): the
+    # planner still takes a sequential scan when no index can answer. Counted inside each ingest transaction.
+    from contextlib import contextmanager
+    ar,s,_,_=archive
+    if case=='text_edit':ar.ingest(event(provider_id='by-message'))
+    else:with_original(ar,s,'by-message')
+    count="SELECT seq_scan,idx_scan FROM pg_stat_xact_user_tables WHERE relid='public.attachments'::regclass"
+    scans,connection=[],s.pool.connection
+    @contextmanager
+    def watched(*args,**kwargs):
+        with connection(*args,**kwargs) as c:
+            c.execute('SET LOCAL enable_seqscan=off')
+            before=c.execute(count).fetchone()
+            try:yield c
+            finally:
+                after=c.execute(count).fetchone()
+                scans.append((after['seq_scan']-before['seq_scan'],after['idx_scan']-before['idx_scan']))
+    monkeypatch.setattr(s.pool,'connection',watched)
+    result=ar.ingest(event(provider_id='by-message',body='Edited text',updated_at='2026-10-01T12:05:00+00:00'))
+    monkeypatch.undo()
+    assert result['outcome']=='edited'
+    # The text edit runs in one transaction; a stored message with attachment rows retries under the lifecycle lock.
+    assert len(scans)==(1 if case=='text_edit' else 2)
+    assert all(seq==0 for seq,_ in scans) and all(idx>0 for _,idx in scans)
+    with s.pool.connection() as c:
+        active=[r['active'] for r in c.execute('SELECT active FROM attachments WHERE message=%s',(result['message'],))]
+    assert active==([] if case=='text_edit' else [False])
 
 
 # spec: ANYM-559
