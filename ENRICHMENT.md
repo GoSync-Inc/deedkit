@@ -439,6 +439,17 @@ on-demand job-priority API. Local native children exit after every file; Ollama
 requests already use `keep_alive=0`. No model, cloud profile or autoscaler is
 enabled by this change.
 
+Audio lane (ANYM-838): a worker configured for audio and at least one other kind,
+none of them a local heavy profile (`faster_whisper`, `ollama`), claims audio in a
+second thread, so a voice note never waits behind an image or document job (on the
+Mac mini, speech and vision run on separate slots). At most two jobs run at once, one
+per lane; budgets are counted in the same claim transaction as before, and only the
+main lane publishes and unpublishes the profiles. The idle audio lane reads the newest
+`attachment.ready` event id every second and runs its lock-free candidate read only
+when that id moved, after a job, or every 10 seconds; it takes the residency and
+admission locks only to claim what that read found. A stop requeues the jobs of both
+lanes; an error in either lane ends the worker through the same stop path.
+
 ### On-request chats (ANYM-805)
 
 Owner 2026-11-06: files of personal chats are recognized by themselves; files of groups and channels
