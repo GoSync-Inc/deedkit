@@ -134,9 +134,13 @@ response) with the menu it quotes, when the journal still holds it, and prints o
 relations per unit (menu kind / reply kind): the names of the fields that are set, the response name
 and version, which field holds the chosen option's ID, how a template's selected index relates to the
 menu (its explicit `Index` or a position), whether the reply text is the option's title, and whether
-the menu is quoted. It prints no ID, label, text, chat or message identifier. Each journal page of 200
-rows is one statement bounded to 200 ms; a slower page ends the scan with `incomplete: true`. Without
-a journal it exits with `menu_shapes_unavailable` and creates nothing.
+the menu is quoted. It prints no ID, label, text, chat or message identifier, and no word or number a
+message chose: response names, parameter keys, versions and enum values are printed only from a fixed
+list of protocol words, anything else as `other`. It reads one journal row per statement, each bounded
+to 200 ms (the driver's interrupt covers a statement only until its first row), up to the journal's
+newest row when it started, at most 500,000 rows and 2 minutes; a slower row or a spent budget ends the
+scan with `incomplete: true` and its cause. Without a journal it exits with `menu_shapes_unavailable`
+and creates nothing.
 
 The account-specific operation manifest reflects the selected provider after
 an identity-verified connection; platform counts are legacy defaults only.

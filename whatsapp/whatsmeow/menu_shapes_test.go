@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -107,7 +110,7 @@ func TestMenuReplyShapesPrintsRelationsOfTheOwnersRepliesAndNoValues(t *testing.
 		t.Fatalf("counts: %s", out.String())
 	}
 	want := map[string][]string{
-		"list/list_response":                           {"selected_id=source_raw_id", "text=source_title", "list_type=1", "quoted_message=absent"},
+		"list/list_response":                           {"selected_id=source_raw_id", "text=source_title", "list_type=SINGLE_SELECT", "quoted_message=absent"},
 		"interactive/interactive_response:quick_reply": {"selected_id=source_raw_id", "params_keys=id", "params_key_holding_source_id=id", "version=3", "text=source_title"},
 		"template_hydrated/template_reply":             {"selected_id=source_raw_id", "selected_index=explicit_index", "text=source_title", "context_participant=set"},
 		"no_source/buttons_response":                   {"source_menu=not_in_journal"},
@@ -149,5 +152,89 @@ func TestMenuReplyShapesPrintsRelationsOfTheOwnersRepliesAndNoValues(t *testing.
 	requireError(t, serveMenuReplyShapes(emptyPath, &out), "menu_shapes_unavailable")
 	if _, err := os.Stat(filepath.Join(empty.SessionDirectory, "capture.sqlite")); !os.IsNotExist(err) {
 		t.Fatal("menu shapes created a journal")
+	}
+}
+
+// spec: ANYM-837
+func TestMenuReplyShapesPrintsOnlyKnownProtocolWordsAndBoundsItsScan(t *testing.T) {
+	config := testConfig(t)
+	s, err := OpenCapture(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	s.Owner = types.NewJID("123456", types.DefaultUserServer)
+	interactive := &waE2E.Message{InteractiveMessage: &waE2E.InteractiveMessage{InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{Buttons: []*waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton{
+		{Name: proto.String("quick_reply"), ButtonParamsJSON: proto.String(`{"display_text":"A","id":"opt_a"}`)},
+		{Name: proto.String("quick_reply"), ButtonParamsJSON: proto.String(`{"display_text":"B","id":"opt_b"}`)}}}}}}
+	template := &waE2E.Message{TemplateMessage: &waE2E.TemplateMessage{HydratedTemplate: &waE2E.TemplateMessage_HydratedFourRowTemplate{
+		HydratedButtons: []*waE2E.HydratedTemplateButton{{HydratedButton: &waE2E.HydratedTemplateButton_QuickReplyButton{QuickReplyButton: &waE2E.HydratedTemplateButton_HydratedQuickReplyButton{DisplayText: proto.String("T"), ID: proto.String("tpl_a")}}}}}}}
+	msgs := []*events.Message{
+		menuShapeEvent("MENU1", 1700000001, false, interactive),
+		menuShapeEvent("MENU2", 1700000002, false, template),
+		// Message-controlled lowercase words and numbers in every printed position.
+		menuShapeEvent("REPLY1", 1700000011, true, &waE2E.Message{InteractiveResponseMessage: &waE2E.InteractiveResponseMessage{
+			InteractiveResponseMessage: &waE2E.InteractiveResponseMessage_NativeFlowResponseMessage_{NativeFlowResponseMessage: &waE2E.InteractiveResponseMessage_NativeFlowResponseMessage{
+				Name: proto.String("private_word"), ParamsJSON: proto.String(`{"secret_key":"x","id":"opt_a","title":"opt_b"}`), Version: proto.Int32(987654)}},
+			ContextInfo: quoting("MENU1")}}),
+		menuShapeEvent("REPLY2", 1700000012, true, &waE2E.Message{ListResponseMessage: &waE2E.ListResponseMessage{ListType: waE2E.ListResponseMessage_ListType(424242).Enum(), ContextInfo: quoting("NONE")}}),
+		// The template button has no explicit Index; the reply's index 0 is not evidence of one.
+		menuShapeEvent("REPLY3", 1700000013, true, &waE2E.Message{TemplateButtonReplyMessage: &waE2E.TemplateButtonReplyMessage{SelectedID: proto.String("tpl_a"), SelectedIndex: proto.Uint32(0), ContextInfo: quoting("MENU2")}}),
+	}
+	for _, m := range msgs {
+		if err := s.Put(m, "live"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := filepath.Join(filepath.Dir(config.SessionDirectory), "config.json")
+	if err := os.WriteFile(path, mustJSON(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// The scan runs while the owning adapter keeps writing; no capture write fails.
+	done := make(chan error, 1)
+	var out bytes.Buffer
+	go func() { done <- serveMenuReplyShapes(path, &out) }()
+	for i := 0; i < 50; i++ {
+		if err := s.Put(fixtureMessage("W"+strings.Repeat("x", i%5)+string(rune('a'+i%26))+strconv.Itoa(i), 1700001000+int64(i)), "live"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	for _, leak := range []string{"private_word", "secret_key", "987654", "424242", "opt_a", "opt_b", "tpl_a"} {
+		if strings.Contains(out.String(), leak) {
+			t.Fatalf("report holds %q: %s", leak, out.String())
+		}
+	}
+	var report struct {
+		Units map[string]struct{ Relations map[string]int }
+	}
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	flow := report.Units["interactive/interactive_response:other"].Relations
+	if flow["params_selection=ambiguous"] != 1 || flow["version=other"] != 1 || flow["params_keys=id,title,other"] != 1 || flow["selected_id=source_raw_id"] != 0 {
+		t.Fatalf("flow relations %v", flow)
+	}
+	if report.Units["no_source/list_response"].Relations["list_type=other"] != 1 {
+		t.Fatalf("list relations %v", report.Units)
+	}
+	tpl := report.Units["template_hydrated/template_reply"].Relations
+	if tpl["selected_index=explicit_index"] != 0 || tpl["source_index=absent"] != 1 || tpl["selected_index=position0_all"] != 1 {
+		t.Fatalf("template relations %v", tpl)
+	}
+	// A journal that keeps growing ends the scan at its budget, reported as incomplete.
+	defer func(budget int) { menuShapeRowBudget = budget }(menuShapeRowBudget)
+	menuShapeRowBudget = 10
+	endless := func(_ context.Context, after, _ int64) (menuShapeRow, int64, bool, error) {
+		return menuShapeRow{chat: operationsChat, raw: []byte("{}")}, after + 1, true, nil
+	}
+	if r := menuReplyShapes(endless, nil, 1<<62); !r.Incomplete || r.IncompleteCause != "scan_budget" || r.RowsScanned != 10 {
+		t.Fatalf("unbounded scan: %+v", r)
+	}
+	// The CLI's stderr names the missing journal.
+	if safeError(errors.New("menu_shapes_unavailable")) != "menu_shapes_unavailable" {
+		t.Fatal("menu_shapes_unavailable is not a safe error")
 	}
 }

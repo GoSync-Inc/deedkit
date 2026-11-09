@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,21 +28,36 @@ import (
 // option's ID, how a template index relates to the menu, and whether texts or the
 // quoted menu are copied. No ID, label, text, chat or message identifier is printed.
 
-// One journal page per statement, each bounded like a media_keys lookup.
-const menuShapePage = 200
-
+// One journal row per statement, each bounded like a media_keys lookup: the
+// SQLite interrupt of modernc's driver covers a statement only until its first
+// row, so a statement never returns more than one.
 var menuShapeTimeout = 200 * time.Millisecond
 
-// A protocol name is printed only in this form; anything else is "other".
-var protocolName = regexp.MustCompile(`^[a-z_]{1,32}$`)
+// The whole scan stops at the journal's newest row when it started, after this
+// many rows or after this long, and then says it is incomplete.
+var (
+	menuShapeRowBudget = 500000
+	menuShapeDeadline  = 2 * time.Minute
+)
+
+// Only these protocol words are printed; anything else is "other", so no
+// message-controlled spelling or number reaches the report.
+var (
+	knownFlowNames  = map[string]bool{"quick_reply": true, "single_select": true}
+	knownParamKeys  = map[string]bool{"id": true, "title": true, "description": true, "display_text": true, "header": true}
+	knownVersions   = map[int32]bool{1: true, 2: true, 3: true}
+	knownListTypes  = map[waE2E.ListResponseMessage_ListType]bool{waE2E.ListResponseMessage_UNKNOWN: true, waE2E.ListResponseMessage_SINGLE_SELECT: true}
+	knownButtonType = map[waE2E.ButtonsResponseMessage_Type]bool{waE2E.ButtonsResponseMessage_UNKNOWN: true, waE2E.ButtonsResponseMessage_DISPLAY_TEXT: true}
+)
 
 type menuShapeRow struct {
 	chat string
 	raw  []byte
 }
 
-// menuShapePager returns journal rows with a raw message after seq, in order.
-type menuShapePager func(ctx context.Context, after int64) (rows []menuShapeRow, last int64, err error)
+// menuShapePager returns the next journal row with a raw message after seq and
+// at most upto (ok false when there is none).
+type menuShapePager func(ctx context.Context, after, upto int64) (row menuShapeRow, seq int64, ok bool, err error)
 
 type menuShapeUnit struct {
 	Count     int            `json:"count"`
@@ -76,46 +90,50 @@ func serveMenuReplyShapes(path string, out io.Writer) error {
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(1)
-	report := menuReplyShapes(journalShapePager(db), journalKeyLookup(db))
+	ctx, cancel := context.WithTimeout(context.Background(), menuShapeTimeout)
+	var upto sql.NullInt64
+	e = db.QueryRowContext(ctx, "SELECT max(seq) FROM capture").Scan(&upto)
+	cancel()
+	if e != nil {
+		return errors.New("menu_shapes_unavailable")
+	}
+	report := menuReplyShapes(journalShapePager(db), journalKeyLookup(db), upto.Int64)
 	return json.NewEncoder(out).Encode(report)
 }
 
 func journalShapePager(db *sql.DB) menuShapePager {
-	return func(ctx context.Context, after int64) ([]menuShapeRow, int64, error) {
-		rows, e := db.QueryContext(ctx, "SELECT seq,chat,raw FROM capture WHERE seq>? AND length(raw)>0 ORDER BY seq LIMIT ?", after, menuShapePage)
-		if e != nil {
-			return nil, after, e
+	return func(ctx context.Context, after, upto int64) (menuShapeRow, int64, bool, error) {
+		var r menuShapeRow
+		var seq int64
+		e := db.QueryRowContext(ctx, "SELECT seq,chat,raw FROM capture WHERE seq>? AND seq<=? AND length(raw)>0 ORDER BY seq LIMIT 1", after, upto).Scan(&seq, &r.chat, &r.raw)
+		if errors.Is(e, sql.ErrNoRows) {
+			return r, after, false, nil
 		}
-		defer rows.Close()
-		var page []menuShapeRow
-		last := after
-		for rows.Next() {
-			var r menuShapeRow
-			if e = rows.Scan(&last, &r.chat, &r.raw); e != nil {
-				return nil, after, e
-			}
-			page = append(page, r)
-		}
-		return page, last, rows.Err()
+		return r, seq, e == nil, e
 	}
 }
 
-func menuReplyShapes(page menuShapePager, lookup mediaKeyLookup) *menuShapeReport {
+func menuReplyShapes(page menuShapePager, lookup mediaKeyLookup, upto int64) *menuShapeReport {
 	report := &menuShapeReport{Units: map[string]*menuShapeUnit{}}
 	after := int64(0)
+	stop := time.Now().Add(menuShapeDeadline)
 	for {
+		if report.RowsScanned >= menuShapeRowBudget || time.Now().After(stop) {
+			report.Incomplete, report.IncompleteCause = true, "scan_budget"
+			break
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), menuShapeTimeout)
-		rows, last, e := page(ctx, after)
+		r, seq, ok, e := page(ctx, after, upto)
 		cancel()
 		if e != nil {
 			report.Incomplete, report.IncompleteCause = true, "journal_read_timeout"
 			break
 		}
-		if len(rows) == 0 {
+		if !ok {
 			break
 		}
-		after = last
-		for _, r := range rows {
+		after = seq
+		{
 			report.RowsScanned++
 			m, e := unmarshalMessage(r.raw)
 			if e != nil || m.Message == nil {
@@ -156,7 +174,7 @@ func menuReplyOf(m *waE2E.Message) (string, *waE2E.ContextInfo) {
 		return "template_reply", m.GetTemplateButtonReplyMessage().GetContextInfo()
 	case m.GetInteractiveResponseMessage() != nil:
 		name := m.GetInteractiveResponseMessage().GetNativeFlowResponseMessage().GetName()
-		if !protocolName.MatchString(name) {
+		if !knownFlowNames[name] {
 			name = "other"
 		}
 		return "interactive_response:" + name, m.GetInteractiveResponseMessage().GetContextInfo()
@@ -195,6 +213,7 @@ func menuSource(lookup mediaKeyLookup, chat string, group bool, c *waE2E.Context
 type rawMenuOption struct {
 	id, title, description string
 	index                  uint32 // a hydrated template button's explicit Index
+	hasIndex               bool   // whether the button sets Index at all
 	positionAll            int    // position among all buttons of its menu (template)
 	positionQuick          int    // position among quick replies only (template)
 	name                   string // native-flow button name
@@ -241,7 +260,7 @@ func rawMenu(m *waE2E.Message) (string, []rawMenuOption) {
 		quick := 0
 		for i, b := range h.GetHydratedButtons() {
 			if q := b.GetQuickReplyButton(); q != nil {
-				out = append(out, rawMenuOption{id: q.GetID(), title: q.GetDisplayText(), index: b.GetIndex(), positionAll: i, positionQuick: quick})
+				out = append(out, rawMenuOption{id: q.GetID(), title: q.GetDisplayText(), index: b.GetIndex(), hasIndex: b.Index != nil, positionAll: i, positionQuick: quick})
 				quick++
 			}
 		}
@@ -296,11 +315,19 @@ func menuShapeAdd(report *menuShapeReport, m *waE2E.Message, reply string, c *wa
 	case m.GetListResponseMessage() != nil:
 		v := m.GetListResponseMessage()
 		selected, text, description = v.GetSingleSelectReply().GetSelectedRowID(), v.GetTitle(), v.GetDescription()
-		rel("list_type=" + strconv.Itoa(int(v.GetListType())))
+		if t := v.GetListType(); knownListTypes[t] {
+			rel("list_type=" + t.String())
+		} else {
+			rel("list_type=other")
+		}
 	case m.GetButtonsResponseMessage() != nil:
 		v := m.GetButtonsResponseMessage()
 		selected, text = v.GetSelectedButtonID(), v.GetSelectedDisplayText()
-		rel("buttons_type=" + strconv.Itoa(int(v.GetType())))
+		if t := v.GetType(); knownButtonType[t] {
+			rel("buttons_type=" + t.String())
+		} else {
+			rel("buttons_type=other")
+		}
 	case m.GetTemplateButtonReplyMessage() != nil:
 		v := m.GetTemplateButtonReplyMessage()
 		selected, text, index, hasIndex = v.GetSelectedID(), v.GetSelectedDisplayText(), v.GetSelectedIndex(), v.SelectedIndex != nil
@@ -308,24 +335,41 @@ func menuShapeAdd(report *menuShapeReport, m *waE2E.Message, reply string, c *wa
 		v := m.GetInteractiveResponseMessage()
 		nf := v.GetNativeFlowResponseMessage()
 		text = v.GetBody().GetText()
-		rel("version=" + strconv.Itoa(int(nf.GetVersion())))
+		if v := nf.GetVersion(); knownVersions[v] {
+			rel("version=" + strconv.Itoa(int(v)))
+		} else {
+			rel("version=other")
+		}
 		var params map[string]any
 		if len(nf.GetParamsJSON()) <= maxMenuParams && json.Unmarshal([]byte(nf.GetParamsJSON()), &params) == nil {
-			keys := make([]string, 0, len(params))
-			for k := range params {
-				if protocolName.MatchString(k) {
-					keys = append(keys, k)
-				} else {
-					keys = append(keys, "other")
+			keys := []string{}
+			others := false
+			var holders []string
+			for k, v := range params {
+				if !knownParamKeys[k] {
+					others = true
+					continue
+				}
+				keys = append(keys, k)
+				if s, ok := v.(string); ok {
+					if o := optionWithID(options, s); o != nil {
+						holders = append(holders, k)
+						selected = s
+					}
 				}
 			}
 			sort.Strings(keys)
+			if others {
+				keys = append(keys, "other")
+			}
 			rel("params_keys=" + strings.Join(keys, ","))
-			for k, v := range params {
-				if s, ok := v.(string); ok && protocolName.MatchString(k) && optionWithID(options, s) != nil {
-					rel("params_key_holding_source_id=" + k)
-					selected = s
-				}
+			switch {
+			case len(holders) == 1:
+				rel("params_key_holding_source_id=" + holders[0])
+			case len(holders) > 1:
+				// Several keys name source options: no derivation is claimed.
+				rel("params_selection=ambiguous")
+				selected = ""
 			}
 		} else {
 			rel("params_unreadable")
@@ -345,11 +389,15 @@ func menuShapeAdd(report *menuShapeReport, m *waE2E.Message, reply string, c *wa
 			rel("description=" + relation(description, o.description, ""))
 		}
 		if hasIndex {
+			if !o.hasIndex {
+				rel("source_index=absent")
+			}
 			for _, h := range []struct {
 				name  string
 				value int
-			}{{"explicit_index", int(o.index)}, {"position0_all", o.positionAll}, {"position1_all", o.positionAll + 1}, {"position0_quick", o.positionQuick}, {"position1_quick", o.positionQuick + 1}} {
-				if int(index) == h.value {
+				set   bool
+			}{{"explicit_index", int(o.index), o.hasIndex}, {"position0_all", o.positionAll, true}, {"position1_all", o.positionAll + 1, true}, {"position0_quick", o.positionQuick, true}, {"position1_quick", o.positionQuick + 1, true}} {
+				if h.set && int(index) == h.value {
 					rel("selected_index=" + h.name)
 				}
 			}
