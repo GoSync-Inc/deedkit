@@ -244,6 +244,30 @@ def test_transcript_and_understanding_finishers_after_purge_publish_nothing(purg
     assert leaks(s,'sentinel-a')=={} and leaks(s,'Полная расшифровка')=={}
 
 
+# spec: ANYM-851
+def test_a_purge_deletes_the_structured_version_and_a_late_write_is_refused(purge,tmp_path):
+    from messaging_service.enrichment_providers import normalize_document
+    from test_document_structure import RESULTS,add_document,make,write_config
+    _,s,_,p=purge
+    add_document(s,'purge-structure',message='demo-tg-2',data=b'synthetic sentinel-a structure')
+    worker=make(s,write_config(tmp_path))
+    worker.structure.sweep();lease=worker.structure.claim()
+    assert lease['attachment']=='purge-structure'
+    with s.pool.connection() as c:
+        c.execute("UPDATE messages SET deleted=true WHERE id='demo-tg-2'")
+    assert p.apply()['purged']==1
+    with s.pool.connection() as c:
+        # The row went with its attachment_text row (ON DELETE CASCADE).
+        assert c.execute("SELECT count(*) AS n FROM attachment_structure WHERE attachment='purge-structure'").fetchone()['n']==0
+    late={**RESULTS['table.pdf'],'markdown':'sentinel-a late markdown','page_spans':[]}
+    assert worker.structure.store(lease,normalize_document(late)) is False
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        with s.pool.connection() as c:
+            c.execute("""INSERT INTO attachment_structure(attachment,source_digest,state,markdown,indexed_at)
+                SELECT id,digest,'ready','sentinel-a raw insert',clock_timestamp() FROM attachments WHERE id='purge-structure'""")
+    assert leaks(s,'sentinel-a')=={}
+
+
 # spec: ANYM-511
 def test_media_lease_taken_before_purge_cannot_publish(purge):
     ar,s,key,p=purge
@@ -732,7 +756,7 @@ def test_migration_refuses_an_unusable_events_message_index(database,tmp_path,in
             c.execute('DROP INDEX events_message');c.execute('CREATE INDEX events_message ON events(message)')
         store.migrate()
         with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='76'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='77'
             # A small database also gets the visibility probe's index in place (production: release step 2).
             assert c.execute("SELECT to_regclass('messages_unpurged') IS NOT NULL AS ok").fetchone()['ok']
 
@@ -781,7 +805,7 @@ def test_migration_045_never_holds_a_table_while_it_waits_for_another(database,t
         assert errors==[] and migrate_errors==[] and outcome==['migrated']
         assert max(waits)<0.5,waits
         with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='76'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='77'
 
 
 # spec: ANYM-511

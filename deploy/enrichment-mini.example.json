@@ -42,5 +42,14 @@
   },
   "account_max_jobs_per_day": {
     "replace-with-account-id": 20
+  },
+  "structure": {
+    "provider": "deedkit_inference",
+    "local_inference": true,
+    "model": "document-structure",
+    "base_url": "https://deedkit-inference.example-tailnet.ts.net/v1",
+    "api_key_file": "/run/secrets/inference/inference.key",
+    "timeout_seconds": 150,
+    "max_jobs_per_day": 1000
   }
 }

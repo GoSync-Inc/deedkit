@@ -29,7 +29,7 @@ from .inference_confinement import ConfinementLost
 def configuration(path):
     raw=json.loads(private_text(path,65536))
     if not isinstance(raw,dict) or set(raw)-{'enabled','profiles','max_jobs_per_day','accounts',
-            'profile_max_jobs_per_day','account_max_jobs_per_day','backlog_share','confinement_blocked'}:
+            'profile_max_jobs_per_day','account_max_jobs_per_day','backlog_share','confinement_blocked','structure'}:
         raise ValueError('invalid_enrichment_config')
     if raw.get('enabled') is not True:raise ValueError('enrichment_disabled')
     profiles=raw.get('profiles')
@@ -48,7 +48,11 @@ def configuration(path):
     share=raw.get('backlog_share',BACKLOG_SHARE)
     if type(share) not in (int,float) or not 0<=share<=1:raise ValueError('invalid_enrichment_budget')
     if 'confinement_blocked' in raw:inference_confinement.parse_targets(raw['confinement_blocked'])
-    return {**raw,'max_jobs_per_day':maximum,'profiles':{k:validate_profile(v,k) for k,v in profiles.items()}}
+    out={**raw,'max_jobs_per_day':maximum,'profiles':{k:validate_profile(v,k) for k,v in profiles.items()}}
+    if 'structure' in raw:  # ANYM-851: its own key, budget and pause, apart from the processing kinds
+        from .document_structure import validate_config
+        out['structure']=validate_config(raw['structure'])
+    return out
 
 
 def verified_copy(files,row,directory,maximum):
@@ -179,7 +183,8 @@ def process(files,row,profile):
     with tempfile.TemporaryDirectory(prefix='archive-enrich-') as directory:
         path=verified_copy(files,row,directory,profile['max_input_bytes'])
         payload={'profile':profile,'kind':row['kind'],'path':str(path),'mime':row['mime'],
-                 'source_text':row.get('source_text','')[:profile['max_text_chars']]}
+                 'source_text':row.get('source_text','')[:profile['max_text_chars']],
+                 'document_kind':row.get('document_kind')}  # ANYM-851: pdf, docx or pptx for a structure job
         input_truncated=len(row.get('source_text',''))>profile['max_text_chars']
         env={k:v for k,v in os.environ.items() if k in ('PATH','LANG','SSL_CERT_FILE')}
         env.update(HOME=directory,TMPDIR=directory,HF_HUB_OFFLINE='1',TOKENIZERS_PARALLELISM='false',
@@ -236,7 +241,8 @@ def audio_lane(config):
     waits behind an image or document job (the mini runs speech and vision on separate slots). Never for a local heavy
     profile: those share one machine-wide slot (resource_admission), so a second lane would only wait for it."""
     profiles=config['profiles']
-    return ('audio' in profiles and len(profiles)>1
+    # ANYM-851: structure jobs run in the main lane, so a worker with them and audio splits as with a second kind.
+    return ('audio' in profiles and (len(profiles)>1 or 'structure' in config)
             and not any(resource_admission.local_heavy(profile) for profile in profiles.values()))
 
 
@@ -248,6 +254,10 @@ class EnrichmentWorker:
         self.kinds=frozenset(config['profiles'] if kinds is None else kinds)
         self.requeueing=False
         self.lock_directory=lock_directory or os.environ.get('PROCESSING_LOCK_DIR','/processing-locks')
+        # ANYM-851: the main lane (never the audio lane) also serves structure jobs, alternating with its own kinds.
+        from .document_structure import StructureWork
+        self.structure=StructureWork(self) if 'structure' in config and kinds is None else None
+        self.structure_turn=False
     def connection(self):
         return psycopg.connect(self.dsn,row_factory=dict_row,connect_timeout=5,
             options='-c statement_timeout=5000 -c timezone=UTC')
@@ -269,11 +279,13 @@ class EnrichmentWorker:
                     [(account,kind,profile['provider'],model,enabled,profile['timeout_seconds']+120,
                       account,kind,profile_hash(profile))
                      for account in self.config['accounts']])
+            if self.structure:self.structure.publication(c,lambda:self.structure.publish(c,enabled=enabled))
     def unpublish_profiles(self):
         # Shutdown path: one statement, so the time does not grow with accounts x profiles.
         with self.connection() as c:
             c.execute('''UPDATE processing_profiles SET enabled=false,observed_at=clock_timestamp()
                 WHERE account=ANY(%s) AND kind=ANY(%s)''',(self.config['accounts'],list(self.config['profiles'])))
+            if self.structure:self.structure.publication(c,lambda:self.structure.unpublish(c))
     def _expire_leases(self):
         # Account/row locks must all precede the publication counter. End this
         # bounded transaction before a claim examines any other account's rows.
@@ -589,6 +601,15 @@ class EnrichmentWorker:
             lease=row.get('_resource_lease')
             if lease:lease.close()
     def once(self):
+        """One job of this lane. ANYM-851: with structure jobs, the main lane alternates between its kinds and a
+        structure job when both are due, so it has one request at the mini at a time; a structure step never raises
+        but for a stop or a lost confinement (StructureWork.step)."""
+        if not self.structure:return self.enrichment_once()
+        first,second=((self.structure.step,self.enrichment_once) if self.structure_turn
+                      else (self.enrichment_once,self.structure.step))
+        self.structure_turn=not self.structure_turn
+        return first() or (not STOP.is_set() and second())
+    def enrichment_once(self):
         claim=self.claim()
         if not claim:return False
         row,profile=claim
@@ -687,7 +708,10 @@ def main():
         try:
             payload=json.loads(sys.stdin.buffer.read(2*1024**2))
             child_limits(payload['profile'])
-            result=infer(payload['profile'],payload['kind'],payload['path'],payload['mime'],payload.get('source_text',''))
+            if payload['kind']=='structure':
+                from .enrichment_providers import convert_document
+                result=convert_document(payload['profile'],payload['path'],payload['document_kind'])
+            else:result=infer(payload['profile'],payload['kind'],payload['path'],payload['mime'],payload.get('source_text',''))
             encoded=json.dumps(result,ensure_ascii=False).encode()
             if len(encoded)>MAX_RESULT_BYTES:raise ModelError('model_response_too_large')
             sys.stdout.buffer.write(encoded)

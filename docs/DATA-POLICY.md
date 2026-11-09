@@ -149,6 +149,11 @@ volume) (owner 11-03, see Data egress).
     subscription names are downloaded and go to the Mac mini only after an agent's
     `request_file_download` (ANYM-805; owner 11-06 «только излички разбирать, а группы только по
     запросу. И группы, и, и каналы только по запросу»; MEDIA_STORAGE.md).
+    Structured documents (ANYM-851; owner 2026-11-09 «Да ... док ... ставим, давай. Давай ставим.»): with the
+    worker's `structure` key, the originals of PDF, DOCX and PPTX files (at most 32 MiB), not only their text, go
+    the same way to the mini for Docling conversion, under the same rules (eligibility in ENRICHMENT.md,
+    "Structured documents"). Markdown with page spans returns and is stored beside the extracted text
+    (`attachment_structure`, deleted with it on a purge); search never reads it.
   - Cloud model providers for enrichment (ENRICHMENT.md: OpenAI, Anthropic, Gemini endpoints; Codex not
     deployed) stay off; media understanding uses the local models above (owner 11-01 «2 b»). Enabling a
     cloud endpoint is a `user-data` ask.

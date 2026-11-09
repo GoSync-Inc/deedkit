@@ -51,6 +51,16 @@ def at_schema(database, tmp_path):
         yield lambda version: stack.enter_context(old_schema_store(database, tmp_path, version))
 
 
+@pytest.fixture(autouse=True)
+def enricher_role(database):
+    """A release from PREVIOUS also appends 077's enricher and gateway grants (ANYM-851); every real database has
+    both roles."""
+    with psycopg.connect(database.pool.conninfo, autocommit=True) as c:
+        for role in ('messaging_enricher', 'messaging_gateway'):
+            c.execute("DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='" + role + "') THEN "
+                      "CREATE ROLE " + role + " NOLOGIN; END IF; END $$")
+
+
 @pytest.fixture
 def runtime_index(database):
     """072's attachment_message index as the runtime schema has it."""
