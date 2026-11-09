@@ -10,8 +10,9 @@ For each open, non-draft, same-repository pull request into `main` that carries 
   1. An approval must be recorded for the full head SHA by an account whose effective repository permission is
      write, maintain or admin (collaborators/<login>/permission): an APPROVE review on that commit, or an unedited
      comment, posted after the head arrived, with the line `Diff read: <orchestrator session> <40-hex sha>` (or
-     the older `Review: orchestrator diff read <40-hex sha>`). The
-     description is never read for it. An approval of an older SHA: no enqueue, one comment.
+     the older `Review: orchestrator diff read <40-hex sha>`). An approval of an older SHA: no enqueue, one
+     comment. A no-review pull request (description line `Review record: none (...)`, owner review cut 11-09)
+     needs no approval when its diff is clean under the change-path signal grep; a hit holds it with one comment.
   2. Every required check of the live `main` rules (name and app) has its newest run on the head completed: `CI
      gate` success, the others success or skipped (`CI gate` validates their skip; never all skipped).
   3. The new migrations must take the next free numbers on `main`; otherwise one comment with the exact rename.
@@ -48,6 +49,14 @@ MIGRATION = re.compile(r'^(\d{3})_[A-Za-z0-9_]+\.sql$')
 APPROVAL_LINE = re.compile(r'^\s*(?:Review:\s*orchestrator diff read\s+([0-9a-f]{7,40})'
                            r'|Diff read:\s*\S+\s+([0-9a-f]{7,40}))\b', re.I | re.M)
 KEEPER_BOT = 'github-actions[bot]'
+# A no-review pull request (owner review cut 11-09; small fix, AGENTS.md section 3) says so in its description. It
+# approves the head only when the diff is clean under the change-path signal grep (docs/operations/review-protocol.md):
+# the line is author-written, so the grep, not the line, keeps a risk-path change from merging without its review.
+REVIEW_NONE_LINE = re.compile(r'^\s*Review record:\s*none\b(?:\s*\([^)\n]*\))?\s*$', re.I | re.M)
+SIGNAL_PATH = re.compile(r'^\.github/workflows/|main-ruleset\.json|\.sql$|migrations/|gitleaks|compose|^deploy/modules/'
+                         r'|\.claude/settings\.json|^AGENTS\.md$|^docs/operations/feedback-autoloop\.md$', re.I)
+SIGNAL_LINE = re.compile(r'^[-+].*(secret|permissions|: *write|write-all|\b(GRANT|REVOKE|DROP|TRUNCATE|DELETE FROM|RENAME)\b'
+                         r'|ALTER )', re.I | re.M)
 RETRY_AFTER = 3  # minutes a failed-checks removal waits before the keeper re-enqueues
 # Off until the harness wait-merge.sh skips its re-enqueue for `ship` pull requests: one retry actor per queue.
 RETRY_FAILED_CHECKS = False
@@ -87,6 +96,8 @@ class Facts:
     added_migrations: tuple = ()  # file names this pull request adds under MIGRATIONS
     main_migrations: tuple = ()  # file names on main
     failing_jobs: list = field(default_factory=list)  # jobs of the last failed group run: 'name <url>'
+    review_none: bool = False  # the description carries `Review record: none (...)`
+    signals: tuple = ()  # change-path signal grep hits of the head's diff ('path: why'); unknown diff = a hit
 
 
 @dataclass
@@ -113,6 +124,28 @@ def approved_shas(facts, authorizing=True):
         if c.get('user') in facts.writers and (fresh or not authorizing):
             shas += [(old or new).lower() for old, new in APPROVAL_LINE.findall(c.get('body') or '')]
     return shas
+
+
+def signal_hits(files, changed_files):
+    """The change-path signal grep over the pull request's files (REST `pulls/<n>/files`). A file whose patch the API
+    omits (too large, binary) or a listing shorter than `changed_files` is a hit: an unread diff is never clean."""
+    hits = []
+    for f in files:
+        name = f.get('filename') or ''
+        names = [name, f.get('previous_filename') or '']
+        if any(n and SIGNAL_PATH.search(n) for n in names):
+            hits.append(f'{name}: change-path')
+        elif f.get('patch') is None and f.get('changes'):
+            hits.append(f'{name}: diff not readable')
+        elif (m := SIGNAL_LINE.search(f.get('patch') or '')):
+            hits.append(f'{name}: `{m.group(1).strip()}`')
+    if changed_files > len(files):
+        hits.append(f'{changed_files - len(files)} files not listed')
+    return tuple(hits)
+
+
+def review_none_approved(facts):
+    return facts.review_none and not facts.signals
 
 
 def head_approved(facts):
@@ -224,7 +257,15 @@ def decide(facts):
             'Rebase onto main, rerun the local checks, push.']))
     if conflicts and (facts.main_at or '') < conflicts[-1]['at']:
         return Decision('hold', 'queue conflict: waits for main to move past the entry ahead')
-    if not head_approved(facts):
+    if facts.review_none and facts.signals and not head_approved(facts):
+        return Decision('hold', 'Review record: none on a risk path', f'risk:{facts.head}', '\n'.join([
+            MARK.format(f'risk:{facts.head}'),
+            f'Merge keeper: not enqueued. The description says `Review record: none`, but head `{facts.head[:12]}` '
+            'hits the change-path signal grep (docs/operations/review-protocol.md):',
+            *(f'- {hit}' for hit in facts.signals[:20]), '',
+            'A risk path needs its review (Astra r1) and an approval on the head: an APPROVE, or a comment '
+            f'`Diff read: <session> {facts.head}`.']))
+    if not head_approved(facts) and not review_none_approved(facts):
         historical = [sha for sha in approved_shas(facts, authorizing=False) if not facts.head.startswith(sha)]
         if historical:
             old = ', '.join(sorted({s[:12] for s in historical}))
@@ -333,6 +374,7 @@ def collect(gh, pr, required, main_at=''):
             latest = max(runs, key=lambda r: r['id'])
             checks[name] = {k: latest.get(k) for k in ('status', 'conclusion', 'started_at')}
     files = gh.api(gh.repo(f'pulls/{number}/files?per_page=100'), paginate=True)
+    review_none = bool(REVIEW_NONE_LINE.search(pr.get('body') or ''))
     added = tuple(Path(f['filename']).name for f in files if f['status'] in ('added', 'renamed', 'copied')
                   and str(Path(f['filename']).parent) == MIGRATIONS)
     on_main = tuple(item['name'] for item in gh.api(gh.repo(f'contents/{MIGRATIONS}?ref={BASE}'))) if added else ()
@@ -350,7 +392,8 @@ def collect(gh, pr, required, main_at=''):
         mergeable=detail.get('mergeable'), main_at=main_at, now=github_time(now()),
         head_at=min((s['created_at'] for s in suites), default=github_time(now())), removals=removals,
         labeled_at=max(labeled, default=''), required=tuple(name for name, _ in required), checks=checks, added_migrations=added,
-        main_migrations=on_main)
+        main_migrations=on_main, review_none=review_none,
+        signals=signal_hits(files, detail.get('changed_files') or 0) if review_none else ())
     facts.writers = frozenset(login for login in {c['user'] for c in facts.comments}
                               | {r['user'] for r in facts.reviews if r['state'] == 'APPROVED'}
                               if login and gh.can_write(login))

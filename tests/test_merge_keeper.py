@@ -63,6 +63,41 @@ def test_forged_edited_abbreviated_or_pre_head_approval_comments_do_not_approve(
 
 
 # spec: ANYM-625
+def test_review_record_none_approves_a_clean_diff_and_holds_a_risk_path_with_one_comment():
+    clean = facts(comments=[], review_none=True, signals=())
+    assert mk.decide(clean).action == 'enqueue'
+    risky = facts(comments=[], review_none=True, signals=('.github/workflows/ci.yml: change-path',))
+    decision = mk.decide(risky)
+    assert (decision.action, decision.comment_key) == ('hold', f'risk:{HEAD}')
+    assert '.github/workflows/ci.yml' in decision.comment and f'Diff read: <session> {HEAD}' in decision.comment
+    assert mk.decide(facts(review_none=True, signals=('x.sql: change-path',))).action == 'enqueue'  # Diff read on the head
+    assert mk.decide(facts(comments=[], review_none=False, signals=())).reason == 'no approval recorded for the head'
+
+
+# spec: ANYM-625
+def test_review_record_none_line_forms():
+    for body in ('Review record: none (owner review cut 11-09)', 'Review record: none (small fix)',
+                 'x\nReview record: none\ny'):
+        assert mk.REVIEW_NONE_LINE.search(body), body
+    for body in ('Review record: Astra r1 APPROVE', 'Review record: none yet, Astra running', 'see Review record: none'):
+        assert not mk.REVIEW_NONE_LINE.search(body), body
+
+
+# spec: ANYM-625
+def test_signal_grep_flags_risk_paths_risk_lines_and_unreadable_diffs():
+    def f(name, patch='+x = 1', **extra):
+        return {'filename': name, 'patch': patch, 'changes': 1, **extra}
+    assert mk.signal_hits([f('scripts/a.py'), f('docs/b.md', '+plain text\n-old')], 2) == ()
+    hits = mk.signal_hits([f('.github/workflows/x.yml'), f('services/m/migrations/075_a.sql'),
+                           f('deploy/compose.yml'), f('scripts/a.py', '+    permissions: read'),
+                           f('scripts/b.py', ' context GRANT\n+ok'), f('s/c.py', '+c.execute("DROP TABLE t")'),
+                           f('big.bin', None), f('docs/new.md', previous_filename='AGENTS.md')], 10)
+    named = {hit.split(':')[0] for hit in hits}
+    assert named == {'.github/workflows/x.yml', 'services/m/migrations/075_a.sql', 'deploy/compose.yml',
+                     'scripts/a.py', 's/c.py', 'big.bin', 'docs/new.md', '2 files not listed'}
+
+
+# spec: ANYM-625
 def test_approval_of_an_older_head_holds_and_comments_once():
     stale = facts(comments=[approval(OLD)])
     decision = mk.decide(stale)
@@ -225,14 +260,17 @@ approvals = st.sampled_from([approval(), approval(HEAD[:9]), approval(OLD), appr
        checks=st.dictionaries(st.sampled_from(['checks / verify', 'CI gate']), check),
        removals=st.lists(removal, max_size=3), mergeable=st.sampled_from([True, False, None]),
        queued=st.booleans(), draft=st.booleans(), main_at=st.sampled_from(['2026-11-09T00:00:00Z', '2026-11-09T02:00:00Z']),
-       added=st.sampled_from([(), ('073_x.sql',), ('074_x.sql',), ('075_x.sql',)]))
-def test_enqueue_only_when_every_gate_holds(comments, checks, removals, mergeable, queued, draft, main_at, added):
+       added=st.sampled_from([(), ('073_x.sql',), ('074_x.sql',), ('075_x.sql',)]),
+       review_none=st.booleans(), signals=st.sampled_from([(), ('x.sql: change-path',)]))
+def test_enqueue_only_when_every_gate_holds(comments, checks, removals, mergeable, queued, draft, main_at, added,
+                                            review_none, signals):
     f = facts(comments=comments, checks=checks, removals=removals, mergeable=mergeable, queued=queued, draft=draft,
-              main_at=main_at, added_migrations=added)
+              main_at=main_at, added_migrations=added, review_none=review_none, signals=signals)
     if mk.decide(f).action != 'enqueue':
         return
     since = [r for r in removals if r['at'] >= f.head_at]
-    assert approval() in comments and not queued and not draft and mergeable is True
+    assert approval() in comments or (review_none and not signals)
+    assert not queued and not draft and mergeable is True
     assert checks.get('CI gate', {}).get('conclusion') == 'success'
     assert all(c['status'] == 'completed' and c['conclusion'] in ('success', 'skipped') for c in checks.values())
     assert set(checks) == set(f.required) and added in ((), ('074_x.sql',))
