@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -18,8 +19,6 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-import math
-
 from .enrichment_providers import ModelBackpressure, ModelError, infer, private_text, profile_hash, validate_profile
 from . import resource_admission
 from . import processing_events
@@ -30,7 +29,7 @@ from .inference_confinement import ConfinementLost
 def configuration(path):
     raw=json.loads(private_text(path,65536))
     if not isinstance(raw,dict) or set(raw)-{'enabled','profiles','max_jobs_per_day','accounts',
-            'profile_max_jobs_per_day','account_max_jobs_per_day','confinement_blocked'}:
+            'profile_max_jobs_per_day','account_max_jobs_per_day','backlog_share','confinement_blocked'}:
         raise ValueError('invalid_enrichment_config')
     if raw.get('enabled') is not True:raise ValueError('enrichment_disabled')
     profiles=raw.get('profiles')
@@ -46,6 +45,8 @@ def configuration(path):
         if (not isinstance(limits,dict) or set(limits)-set(allowed)
                 or any(type(value) is not int or not 1<=value<=10000 for value in limits.values())):
             raise ValueError('invalid_enrichment_budget')
+    share=raw.get('backlog_share',BACKLOG_SHARE)
+    if type(share) not in (int,float) or not 0<=share<=1:raise ValueError('invalid_enrichment_budget')
     if 'confinement_blocked' in raw:inference_confinement.parse_targets(raw['confinement_blocked'])
     return {**raw,'max_jobs_per_day':maximum,'profiles':{k:validate_profile(v,k) for k,v in profiles.items()}}
 
@@ -111,6 +112,23 @@ IDLE_SECONDS=10
 LANE_PROBE_SECONDS=1
 LANE_FULL_PROBE_SECONDS=10
 LANE_JOIN_SECONDS=REQUEUE_SECONDS+15
+# Old work (not fresh: see _candidate_queries) may spend only this share of each daily cap (the shared one, the kind's
+# and the account's); fresh work may spend the rest. Prod 11-06..08: the image backlog spent the whole cap of 1,500 by
+# mid-afternoon every day, and images sent later waited for midnight UTC. Config `backlog_share`; 1 = the old behaviour.
+BACKLOG_SHARE=0.7
+# An old job's attempt is counted in processing_budget under this key instead of its profile hash, so old spending is
+# read apart from fresh spending without a schema change. Every attempt is still in exactly one row, so the sums per
+# kind and per account (the hard caps) are unchanged. 64 hex digits, as the column's CHECK requires.
+BACKLOG_BUDGET_KEY=hashlib.sha256(b'deedkit:enrichment-backlog-share').hexdigest()
+
+
+def backlog_allowance(cap,share):
+    """How many old jobs a daily cap admits: a whole number, at least one, and below the cap for a share under 1, so
+    fresh work keeps a slot of any cap of 2 or more and old work is never shut out. A cap of 1 has no room for both."""
+    if share>=1:return cap
+    if share<=0:return 0
+    if cap<=1:return cap
+    return max(1,min(cap-1,math.floor(share*cap+1e-9)))
 DB_TRANSIENT=(psycopg.errors.QueryCanceled,psycopg.errors.LockNotAvailable,psycopg.errors.DeadlockDetected,
     psycopg.errors.SerializationFailure,psycopg.errors.AdminShutdown,psycopg.errors.CrashShutdown,
     psycopg.errors.CannotConnectNow,psycopg.errors.IdleSessionTimeout,psycopg.errors.TooManyConnections,
@@ -295,15 +313,27 @@ class EnrichmentWorker:
         skipped=description_skipped(withheld)
         account_used={r['account']:r['n'] for r in c.execute('''SELECT account,sum(attempts) n
             FROM processing_budget WHERE day=current_date GROUP BY account''').fetchall()}
+        share=self.config.get('backlog_share',BACKLOG_SHARE)
+        # Old attempts today, per (account, kind): counted apart from fresh ones (BACKLOG_BUDGET_KEY).
+        old_used={(r['account'],r['kind']):r['attempts'] for r in c.execute('''SELECT account,kind,attempts
+            FROM processing_budget WHERE day=current_date AND profile_hash=%s''',(BACKLOG_BUDGET_KEY,)).fetchall()}
+        old_account=lambda account:sum(n for (a,_),n in old_used.items() if a==account)
+        account_cap=lambda account:self.config.get('account_max_jobs_per_day',{}).get(account,10000)
+        old_open=sum(old_used.values())<backlog_allowance(self.config['max_jobs_per_day'],share)
         for kind,profile in self.config['profiles'].items():
             if kind not in self.kinds:continue
             used_profile=c.execute('''SELECT coalesce(sum(attempts),0) n FROM processing_budget
                 WHERE day=current_date AND kind=%s''',(kind,)).fetchone()['n']
-            if used_profile>=self.config.get('profile_max_jobs_per_day',{}).get(kind,10000):continue
+            profile_cap=self.config.get('profile_max_jobs_per_day',{}).get(kind,10000)
+            if used_profile>=profile_cap:continue
             ph=profile_hash(profile)
-            eligible=[account for account in self.config['accounts'] if account_used.get(account,0)<
-                self.config.get('account_max_jobs_per_day',{}).get(account,10000)]
+            eligible=[account for account in self.config['accounts'] if account_used.get(account,0)<account_cap(account)]
             if not eligible:continue
+            # Old work only while its own spending is below its share of all three caps (the hard caps above still
+            # hold); an empty list keeps this kind to fresh work.
+            old_kind=sum(n for (_,k),n in old_used.items() if k==kind)
+            backlog=[account for account in eligible if old_account(account)<backlog_allowance(account_cap(account),share)
+                ] if old_open and old_kind<backlog_allowance(profile_cap,share) else []
             condition={'audio':"(a.mime LIKE 'audio/%%' OR a.mime='application/ogg')",'image':"a.mime LIKE 'image/%%' AND NOT (e.state IN ('unconfigured','queued') AND "+skipped+")",
                 'document':"a.mime NOT LIKE 'audio/%%' AND a.mime<>'application/ogg' AND a.mime NOT LIKE 'image/%%' AND f.state='ready' AND f.source_revision=m.revision AND f.source_digest=a.digest AND length(f.text_content)>0"}[kind]
             # A note downloaded on request today is as fresh as one sent today (ANYM-455).
@@ -321,12 +351,12 @@ class EnrichmentWorker:
                 LEFT JOIN attachment_text f ON f.attachment=a.id'''+residency+'''
                 LEFT JOIN processing_control pc ON pc.account=m.account AND pc.kind=%s AND pc.profile_hash=%s
                 WHERE '''+PROCESSABLE_ORIGINAL+''' AND NOT '''+withheld+''' AND (pc.pause_reason IS NULL OR pc.paused_until<=clock_timestamp()) AND a.active AND NOT m.deleted AND e.source_digest=a.digest AND e.source_revision=m.revision
-                AND m.account=ANY(%s) AND '''+condition+''' AND e.next_due<=clock_timestamp()
+                AND m.account=ANY(%s) AND (('''+fresh+''') OR m.account=ANY(%s)) AND '''+condition+''' AND e.next_due<=clock_timestamp()
                 AND ((e.state IN ('unconfigured','queued','failed') AND (e.attempts<3 OR e.profile_hash IS DISTINCT FROM %s)
                         AND NOT (e.state='failed' AND coalesce(e.error_code,'')=ANY(%s) AND e.profile_hash IS NOT DISTINCT FROM %s))
                     OR (e.state='leased' AND e.lease_until<clock_timestamp() AND e.attempts<3)
                     OR (e.state='unsupported' AND e.profile_hash IS DISTINCT FROM %s))
-                ''',(kind,ph,eligible,ph,list(FINAL_LIMIT_CODES),ph,ph)
+                ''',(kind,ph,eligible,backlog,ph,list(FINAL_LIMIT_CODES),ph,ph)
 
     def ready_mark(self):
         """ANYM-838: the newest attachment.ready event id, the usual sign that a new file may be due."""
@@ -379,9 +409,10 @@ class EnrichmentWorker:
                         WHERE attachment=%s''',(kind,ph,profile['provider'],profile['model'],ph,token,ttl,row['attachment']))
                     claim_day=c.execute('SELECT current_date AS day').fetchone()['day']
                     c.execute('UPDATE enrichment_budget SET attempts=attempts+1 WHERE day=current_date')
+                    budget_key=ph if row['fresh'] else BACKLOG_BUDGET_KEY
                     c.execute('''INSERT INTO processing_budget(day,account,kind,profile_hash,attempts)
                         VALUES(current_date,%s,%s,%s,1) ON CONFLICT(day,account,kind,profile_hash)
-                        DO UPDATE SET attempts=processing_budget.attempts+1''',(row['account'],kind,ph))
+                        DO UPDATE SET attempts=processing_budget.attempts+1''',(row['account'],kind,budget_key))
                     c.execute('''INSERT INTO processing_control(account,kind,profile_hash,last_started_at)
                         VALUES(%s,%s,%s,clock_timestamp()) ON CONFLICT(account,kind,profile_hash)
                         DO UPDATE SET last_started_at=excluded.last_started_at,updated_at=clock_timestamp()''',
@@ -391,7 +422,7 @@ class EnrichmentWorker:
                     raise
                 return {**row,'kind':kind,'provider':profile['provider'],'model':profile['model'],
                     'attempts':1 if row['profile_hash']!=ph else row['attempts']+1,
-                    'lease_token':token,'profile_hash':ph,'_resource_lease':resource_lease,'_claim_day':claim_day,
+                    'lease_token':token,'profile_hash':ph,'_resource_lease':resource_lease,'_claim_day':claim_day,'_budget_key':budget_key,
                     '_lease_end':lease_end},profile
         return None
     def finish(self,row,result=None,error=None):
@@ -505,7 +536,7 @@ class EnrichmentWorker:
                 c.execute('UPDATE enrichment_budget SET attempts=greatest(attempts-1,0) WHERE day=coalesce(%s::date,current_date)',(day,))
                 c.execute('''UPDATE processing_budget SET attempts=greatest(attempts-1,0)
                     WHERE day=coalesce(%s::date,current_date) AND account=%s AND kind=%s AND profile_hash=%s''',
-                    (day,row['account'],row['kind'],row['profile_hash']))
+                    (day,row['account'],row['kind'],row.get('_budget_key',row['profile_hash'])))
                 resource_admission.defer_profile(c,row['account'],row['kind'],row['profile_hash'],seconds)
             resource_admission.release(c,row.get('_resource_lease'))
     def defer(self,row,profile,retry_after=None):

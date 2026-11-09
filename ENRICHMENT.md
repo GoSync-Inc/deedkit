@@ -433,7 +433,18 @@ request cancellation limits: worker subprocess limits do not bound that daemon.
 Within each modality, fresh messages from the last 24 hours precede historical
 backlog (audio also counts a note whose original became resident or was touched in
 the last 24 hours as fresh, so an old note downloaded on request is not starved, ANYM-455); least-recently-started account/profile scopes alternate before older
-work. The worker compares candidates across modalities instead of always
+work. Historical backlog may spend only `backlog_share` (a number from 0 to 1, default
+0.7) of each daily cap: `max_jobs_per_day`, the modality's `profile_max_jobs_per_day` and the
+account's `account_max_jobs_per_day`. Fresh work may spend the rest of the cap, so a large backlog
+cannot use up the day before newer files arrive (production 11-06..08: the image backlog used the
+whole image cap by mid-afternoon each day, and newer images waited for midnight UTC). Old attempts
+are counted apart from fresh ones: in `processing_budget` an old job's attempt is stored under a
+fixed backlog key in place of its profile hash, so every attempt is still in one row and the hard
+caps read the same sums. Fresh work done first therefore does not use up the backlog's share. The
+share is a whole number of jobs per cap: rounded down, at least 1, and below the cap when the share
+is under 1, so fresh work keeps at least one slot of any cap of 2 or more. The backlog drains in any
+hour with no fresh work due, up to its share. `1` restores the old shared cap and `0` stops old work.
+The worker compares candidates across modalities instead of always
 exhausting the first configured modality. This does not yet introduce a public
 on-demand job-priority API. Local native children exit after every file; Ollama
 requests already use `keep_alive=0`. No model, cloud profile or autoscaler is
