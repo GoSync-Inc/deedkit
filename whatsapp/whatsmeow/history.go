@@ -311,7 +311,13 @@ func (p *Provider) captureHistory(data *waHistorySync.HistorySync) error {
 					continue
 				}
 			}
-			if err = p.Capture.putOrSkip(message, "history"); err != nil {
+			// A vote is journaled as a poll_vote entry; a poll's synced votes follow it (ANYM-921).
+			if message.Message.GetPollUpdateMessage() != nil {
+				err = p.capturePollVote(unwrap(message), "history")
+			} else if err = p.Capture.putOrSkip(message, "history"); err == nil {
+				err = p.captureHistoryPollVotes(message, wm.GetPollUpdates())
+			}
+			if err != nil {
 				return err
 			}
 		}

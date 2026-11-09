@@ -570,6 +570,9 @@ func (p *Provider) handleMessage(e *events.Message) error {
 	if !policy.Allows(LegacyChatID(e.Info.Chat)) {
 		return nil
 	}
+	if unwrapped.Message.GetPollUpdateMessage() != nil {
+		return p.capturePollVote(unwrapped, "live")
+	}
 	return p.Capture.putOrSkip(e, "live")
 }
 

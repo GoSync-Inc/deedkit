@@ -1818,6 +1818,14 @@ it fails (a held lock, a slow plan), the page and its receipt come back without 
 `lookup_failed`. A page reads at most 200 files; items past that carry no `attachments` (`page_file_limit`). A deleted message's wait ends with its `message.deleted` event
 ([Deleted messages](#deleted-messages-schema-45)).
 
+## A poll's counts changed (ANYM-921)
+
+When a vote changes the counts of an archived poll ([CONVERSATION.md](CONVERSATION.md)), the archive commits
+one `poll.updated` event on the poll message in the same transaction. A vote that changes no count (the same
+choice again, a replay, an older vote) commits none. The item is the poll message; read its `poll` block with
+`get_context`. Matching follows the `message.created` rules, but only a subscription whose `kinds` names
+`poll.updated` receives it: default subscriptions are never woken by votes. `get_updates` does not return it.
+
 ## A download that failed for good (ANYM-867)
 
 When a file's download ends for good, the archive commits one `attachment.failed` event on the message. It is

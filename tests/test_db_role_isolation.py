@@ -395,6 +395,89 @@ def test_collector_bound_to_one_account_ingests_it_but_cannot_write_another(arch
         remove(s, role)
 
 
+# spec: ANYM-921
+def test_a_bound_collector_writes_only_its_own_accounts_poll_rows_and_reads_skip_a_forged_one(archive):  # noqa: F811
+    from messaging_service.polls import attach
+    ar, s, _, _ = archive
+    other, _ = other_account(ar, s)
+    mine = ar.ingest(media_event(provider_id='31'))['message']
+    role = install(s, 'collector_role.sql', 'messaging_collector', account='archive-test')
+    try:
+        with as_role(s, role) as c:
+            c.execute("""INSERT INTO poll_voters(account,message,option_index,voter,from_me,updated_at)
+                VALUES('archive-test',%s,0,'555555@c.us',false,now())""", (mine,))
+            c.execute("INSERT INTO poll_votes(account,message,voter,voted_at) VALUES('archive-test',%s,'555555@c.us',now())", (mine,))
+            c.execute("INSERT INTO poll_results(account,message,option_index,voters,updated_at) VALUES('archive-test',%s,0,1,now())", (mine,))
+        # Under its own account name on another account's poll: refused by the row policy (Astra r1 B2).
+        refused(s, role, """INSERT INTO poll_voters(account,message,option_index,voter,from_me,updated_at)
+            VALUES('archive-test',%s,0,'forged@c.us',false,now())""", (other,))
+        with s.pool.connection() as c:
+            # Written as the owner (no policy applies): reads still skip it.
+            c.execute("""INSERT INTO poll_voters(account,message,option_index,voter,from_me,updated_at)
+                VALUES('archive-test',%s,0,'forged@c.us',false,now())""", (other,))
+        for table, columns, values in [('poll_voters', 'account,message,option_index,voter,from_me,updated_at', "%s,0,'x@c.us',false,now()"),
+                                       ('poll_votes', 'account,message,voter,voted_at', "%s,'x@c.us',now()"),
+                                       ('poll_results', 'account,message,option_index,voters,updated_at', '%s,0,1,now()')]:
+            with pytest.raises((psycopg.errors.CheckViolation, FORBIDDEN)):
+                with as_role(s, role) as c:
+                    c.execute(f"INSERT INTO {table}({columns}) VALUES('archive-other',{values})", (other,))
+        with s.pool.connection() as c:
+            block = {'question': 'q', 'options': [{'index': 0, 'text': 'a'}], 'selectable_count': 0, 'truncated': False}
+            rows = attach(c, [{'id': mine, 'poll': dict(block)}, {'id': other, 'poll': dict(block)}])
+        assert [r['poll']['options'][0]['voted_by'] for r in rows] == [[{'sender': '555555@c.us', 'name': None}], []]
+        assert [r['poll']['total_voters'] for r in rows] == [1, 0]
+    finally:
+        remove(s, role)
+
+
+# spec: ANYM-921
+def test_a_bound_collector_can_neither_delete_nor_take_over_another_accounts_poll_rows(archive):  # noqa: F811
+    ar, s, _, _ = archive
+    other, _ = other_account(ar, s)
+    with s.pool.connection() as c:
+        c.execute("INSERT INTO poll_results(account,message,option_index,voters,updated_at) VALUES('archive-other',%s,0,1,now())", (other,))
+        c.execute("""INSERT INTO poll_voters(account,message,option_index,voter,from_me,updated_at)
+            VALUES('archive-other',%s,0,'555555@c.us',false,now())""", (other,))
+        c.execute("INSERT INTO poll_votes(account,message,voter,voted_at) VALUES('archive-other',%s,'555555@c.us',now())", (other,))
+    bound = install(s, 'collector_role.sql', 'messaging_collector', account='archive-test')
+    shared = install(s, 'collector_role.sql', 'messaging_collector')
+    login, password = 'anym254_login_' + uuid4().hex[:10], uuid4().hex
+    with s.pool.connection() as c:
+        c.execute(sql.SQL('CREATE ROLE {} LOGIN INHERIT PASSWORD {}').format(sql.Identifier(login), sql.Literal(password)))
+        c.execute(sql.SQL('GRANT {} TO {}').format(sql.Identifier(shared), sql.Identifier(login)))
+        c.execute('INSERT INTO collector_account_roles(role_name,account) VALUES(%s,%s)', (login, 'archive-test'))
+
+    def no_effect(c, statement):
+        """Refused, or a statement that reaches no row (Astra r1 B2: CHECK never sees a DELETE or the old row)."""
+        try:
+            assert c.execute(statement, (other,)).rowcount == 0, statement
+        except FORBIDDEN:
+            pass
+        c.rollback()
+    try:
+        statements = [f"{verb} {table} {tail}" for table in ('poll_results', 'poll_voters', 'poll_votes')
+                      for verb, tail in (('DELETE FROM', 'WHERE message=%s'),
+                                         ('UPDATE', "SET account='archive-test' WHERE message=%s"))]
+        for statement in statements:
+            with s.pool.connection() as c:
+                c.execute(sql.SQL('SET ROLE {}').format(sql.Identifier(bound)))
+                no_effect(c, statement)
+        # A bound login that switches to a shared, unbound collector role is still bound.
+        for statement in statements:
+            with psycopg.connect(login_conninfo(s, login, password)) as c:
+                c.execute(sql.SQL('SET ROLE {}').format(sql.Identifier(shared)))
+                no_effect(c, statement)
+        with s.pool.connection() as c:
+            for table in ('poll_results', 'poll_voters', 'poll_votes'):
+                assert c.execute(f"SELECT account FROM {table} WHERE message=%s", (other,)).fetchall() == [{'account': 'archive-other'}]
+    finally:
+        with s.pool.connection() as c:
+            c.execute('DELETE FROM collector_account_roles WHERE role_name=%s', (login,))
+        drop_role(s, login)
+        remove(s, shared)
+        remove(s, bound)
+
+
 # spec: ANYM-867
 def test_a_bound_collector_publishes_attachment_failed_with_its_existing_grants(archive):  # noqa: F811
     from messaging_service import attachment_failures
@@ -579,7 +662,7 @@ def test_upgrade_and_rollback_keep_feed_order_and_cursors(schema36_store, monkey
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '82'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '83'
         assert c.execute('SELECT * FROM archive_migrations WHERE version<=36 ORDER BY version').fetchall() == migrations
     assert feed_state(store) == before
     try:
@@ -996,7 +1079,8 @@ def test_activity_grants_add_only_the_new_table_to_each_role(seeded, template, b
         # reads; schema 78 (ANYM-914) its read of session_claims; those blocks' too.
         assert {grant for grant in after if grant[0] not in ('subscription_activity', 'wake_targets',
             'wake_target_subscriptions', 'negotiations', 'negotiation_sources', 'negotiation_times',
-            'attachment_structure', 'structure_profiles', 'session_claims')} - later == before
+            'attachment_structure', 'structure_profiles', 'session_claims', 'poll_results', 'poll_voters',
+            'poll_votes')} - later == before
         assert {grant[2] for grant in after if grant[0] == 'subscription_activity' and grant[1] == ''} == added
         token = store.issue_key('activity-acl', ['telegram-demo'], permissions=['read', 'subscription-write'],
             key_permissions=['read', 'subscription-write'])

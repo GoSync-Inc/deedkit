@@ -3623,11 +3623,12 @@
                     "file.processing.failed",
                     "send.failed",
                     "source.health",
-                    "attachment.failed"
+                    "attachment.failed",
+                    "poll.updated"
                   ],
                   "type": "string"
                 },
-                "maxItems": 12,
+                "maxItems": 13,
                 "minItems": 1,
                 "type": "array"
               },

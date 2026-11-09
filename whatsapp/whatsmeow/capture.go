@@ -380,7 +380,7 @@ func NormalizeMessage(e *events.Message, owner types.JID, ownerAliases ...types.
 	m := e.Message
 	body, kind, media := "", "unknown", ""
 	var filename, mime, size, duration, reply, mentions, replyOwner, forwarded, edited any
-	var forwardOrigin, contactCard map[string]any
+	var forwardOrigin, contactCard, poll map[string]any
 	if e.IsEdit && e.Info.MsgBotInfo.EditSenderTimestampMS.UnixMilli() > 0 {
 		edited = envelopeEditStamp(e.Info.MsgBotInfo.EditSenderTimestampMS.UnixMilli(), e.Info.Timestamp.Unix())
 	}
@@ -471,15 +471,8 @@ func NormalizeMessage(e *events.Message, owner types.JID, ownerAliases ...types.
 		case m.GetLocationMessage() != nil:
 			kind = "location"
 			body = m.GetLocationMessage().GetName()
-		case m.GetPollCreationMessage() != nil:
-			kind = "poll_creation"
-			body = m.GetPollCreationMessage().GetName()
-		case m.GetPollCreationMessageV2() != nil:
-			kind = "poll_creation"
-			body = m.GetPollCreationMessageV2().GetName()
-		case m.GetPollCreationMessageV3() != nil:
-			kind = "poll_creation"
-			body = m.GetPollCreationMessageV3().GetName()
+		case pollCreation(m) != nil: // V1-V3 keep their options (ANYM-921, polls.go)
+			kind, body, poll = "poll_creation", pollCreation(m).GetName(), pollBlock(pollCreation(m))
 		// Business messages keep their visible text; header media is not fetched.
 		case m.GetTemplateMessage() != nil:
 			// A menu's options follow its text (menu.go).
@@ -608,6 +601,9 @@ func NormalizeMessage(e *events.Message, owner types.JID, ownerAliases ...types.
 	if contactCard != nil {
 		value["contactCard"] = contactCard
 	}
+	if poll != nil {
+		value["poll"] = poll
+	}
 	// Only a stated certificate is captured; no VerifiedName is unknown, never "not a business".
 	if providerFlagsCapture() && !e.Info.IsFromMe && e.Info.VerifiedName != nil {
 		value["senderIsBusiness"] = true
@@ -656,6 +652,9 @@ func nilString(v string) any {
 
 func captureEnvelope(account string, e *events.Message, owner types.JID, origin string, ownerAliases ...types.JID) (map[string]any, error) {
 	e = unwrap(e)
+	if e.Message.GetPollUpdateMessage() != nil { // a vote is never a chat message (polls.go)
+		return nil, errPollVote
+	}
 	if origin == "history" {
 		origin = "backfill"
 	}

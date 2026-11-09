@@ -60,7 +60,7 @@ def validate_capture(value):
         event=value['event']
         if not isinstance(event,dict) or set(event)-{'chatId','chatName','messageId','senderId','body',
                 'timestamp','timestampResolution','durationSeconds','fromMe','hasMedia','filename','mimetype','filesize','editedTimestampMs',
-                'senderName','senderUsername','replyToId','forwarded','forwardOrigin','mediaKind','mentionsOwner','replyToOwner','identityObservations','formatting','messageType','isService','isSelfChat','senderIsContact','senderIsBusiness','contactCard','groupChange'}:
+                'senderName','senderUsername','replyToId','forwarded','forwardOrigin','mediaKind','mentionsOwner','replyToOwner','identityObservations','formatting','messageType','isService','isSelfChat','senderIsContact','senderIsBusiness','contactCard','groupChange','poll'}:
             raise ValueError('invalid_whatsapp_event')
         envelope=whatsapp_message(value['account'],event,change=value['change'],
             observed_at=utc(value['observed_at']),origin=value['origin'])
@@ -69,6 +69,9 @@ def validate_capture(value):
         identity=observations(event['identityObservations'],envelope) if 'identityObservations' in event else None
         return {'kind':'message','peer_kind':kind,'envelope':envelope,'captured_at':utc(value['observed_at']),
             **({'identity_observations':identity} if identity is not None else {})}
+    if value.get('kind')=='poll_vote':
+        from .polls import validate_vote
+        return validate_vote(value)
     if value.get('kind') in ('telegram_delete','whatsapp_delete'):
         if set(value)!={'kind','account','chat','ids','observed_at'}: raise ValueError('invalid_capture')
         if not isinstance(value['account'],str) or not ACCOUNT_RE.fullmatch(value['account']):
@@ -119,7 +122,7 @@ LIVE_REJECT_CODES=frozenset({'invalid_capture','invalid_capture_kind','invalid_c
     'invalid_receipt','invalid_receipt_account','invalid_receipt_chat','invalid_receipt_platform',
     'invalid_receipt_reference','unsupported_receipt_provider_time','invalid_whatsapp_event',
     'invalid_provider_message','receipt_parse_failed','read_parse_failed','receipt_peer_unsupported',
-    'receipt_deferred_full'})
+    'receipt_deferred_full','invalid_poll_vote'})
 # Stop codes of live capture itself; the fixed causes of a fail-closed write are CAPTURE_STOP_DETAILS.
 CAPTURE_STOPS={'durable_capture_failed','capture_overload'}
 
@@ -367,7 +370,8 @@ class CollectorState:
                     'capture_to_commit_seconds':round(max(0,(now-observed).total_seconds()),3) if observed else None,
                     'provider_age_at_capture_seconds':round((observed-sent).total_seconds(),3) if sent and observed else None,
                     'origin':envelope['origin'] if envelope else
-                        'receipt' if capture['kind']=='message_receipt' else 'owner_read_state' if capture['kind']=='owner_read_state' else 'deletion',
+                        'receipt' if capture['kind']=='message_receipt' else 'owner_read_state' if capture['kind']=='owner_read_state'
+                        else 'poll_vote' if capture['kind']=='poll_vote' else 'deletion',
                     'mcp_available_after_commit':True,'measurement':'upper_bound_after_archive_commit' if observed else 'capture_time_not_recorded'}
             # ANYM-813: the first live message committed under the native WhatsApp provider (the drain keeps the
             # batch's first one, not only its last item); written once. Diagnostics only: a bad candidate is ignored.
@@ -633,6 +637,9 @@ class CollectorState:
         if capture['kind']=='read_state_gap':
             self.update_gap(capture['observed_at'])
             return {'outcome':'read_state_gap_recorded'}
+        if capture['kind']=='poll_vote':
+            from .polls import apply_vote
+            return apply_vote(self,capture)
         chat=capture['chat']
         if chat and not self.allows(self.policy(),chat): return {'outcome':'excluded'}
         if capture['kind']=='owner_read_state':

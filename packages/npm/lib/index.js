@@ -171,7 +171,7 @@ const FEEDBACK_FIELDS = Object.freeze({
 });
 const SUBSCRIPTION_KINDS = new Set(['message.created','message.edited','message.deleted',
   'message.status','attachment.ready','file.text.ready','file.transcript.ready',
-  'file.description.ready','file.processing.failed','send.failed','source.health','attachment.failed']);
+  'file.description.ready','file.processing.failed','send.failed','source.health','attachment.failed','poll.updated']);
 const SUBSCRIPTION_ORIGINS = new Set(['live','live_recovered','backfill','reconcile','fixture']);
 const WAKE_RULES = new Set(['incoming_message','owner_mention','reply_to_owner','reply_to_confirmed_send',
   'reply_to_own_send']);

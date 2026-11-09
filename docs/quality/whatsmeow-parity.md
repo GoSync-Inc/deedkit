@@ -209,6 +209,13 @@ rollback instructions. The repository migration may proceed independently.
 - Consider explicitly configured, rate-limited `SendMediaRetryReceipt` for expired
   files later. It asks the phone to reupload and must not be a hidden infinite
   retry or clear an unavailable state before new evidence arrives.
+- Polls in the archive (ANYM-921): a V1-V3 poll creation keeps its options
+  (`polls.go` `pollBlock`); a `PollUpdateMessage` is decrypted with
+  `DecryptPollVote` against the secret whatsmeow stored for the poll, its option
+  hashes are matched to the journaled poll's options, and it is journaled as one
+  `poll_vote` entry, never a message. History syncs carry the poll's already
+  decrypted `pollUpdates`. A missing poll or secret is `poll_vote_undecryptable`;
+  an unknown option hash is `poll_vote_unknown_option` (counts only).
 - Newsletter/community management, join requests and poll voting are useful
   future features but require new scoped contracts. Raw `DangerousInternals`,
   arbitrary RPC, automatic logout, payment/business-commerce methods and arbitrary

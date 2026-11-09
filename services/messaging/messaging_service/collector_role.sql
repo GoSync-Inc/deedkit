@@ -66,3 +66,8 @@ GRANT SELECT,UPDATE(state,attempts,next_due,lease_until,refusal_reason,last_code
 -- Schema 78 (ANYM-914): the account's provider-session claim. The collector acquires, refreshes and releases its own
 -- row by compare-and-set (session_claim.py); it never deletes one.
 GRANT SELECT,INSERT,UPDATE ON session_claims TO messaging_collector;
+-- Schema 83 (ANYM-921): a WhatsApp poll's results, voters and each voter's newest vote time. Ingest upserts the counts
+-- and the vote time and replaces a voter's rows (the only DELETE); a bound role reaches only its own account's rows
+-- (the tables' row-level security).
+GRANT SELECT,INSERT,UPDATE ON poll_results,poll_votes TO messaging_collector;
+GRANT SELECT,INSERT,DELETE ON poll_voters TO messaging_collector;

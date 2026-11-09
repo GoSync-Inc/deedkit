@@ -17,7 +17,7 @@ from psycopg.types.json import Jsonb
 
 from .policy import effective_permissions, lock_principal, targets
 
-EVENT_KINDS = frozenset(('message.created', 'message.edited', 'message.deleted',
+EVENT_KINDS = frozenset(('message.created', 'message.edited', 'message.deleted', 'poll.updated',
     'message.status', 'attachment.ready', 'file.text.ready', 'file.transcript.ready',
     'file.description.ready', 'file.processing.failed', 'send.failed', 'source.health', 'attachment.failed'))
 # ANYM-867: a kind a selector receives without naming it, because it ends the same wait as a kind it names.

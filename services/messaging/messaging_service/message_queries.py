@@ -48,6 +48,9 @@ META = '''nullif(sp.display_name,'') AS sender_name,nullif(sp.username,'') AS us
       THEN coalesce(mm.metadata,mr.snapshot->'metadata')->'contact' END AS contact,
     CASE WHEN NOT m.deleted AND jsonb_typeof(coalesce(mm.metadata,mr.snapshot->'metadata')->'buttons')='object'
       THEN coalesce(mm.metadata,mr.snapshot->'metadata')->'buttons' END AS buttons,
+    CASE WHEN NOT m.deleted AND coalesce(mm.metadata,mr.snapshot->'metadata')->>'message_kind'='poll'
+        AND jsonb_typeof(coalesce(mm.metadata,mr.snapshot->'metadata')->'poll')='object'
+      THEN coalesce(mm.metadata,mr.snapshot->'metadata')->'poll' END AS poll,
     (SELECT platform FROM accounts WHERE id=m.account) AS platform,
     (SELECT observed_at FROM message_revisions WHERE message=m.id AND revision=1) AS first_observed_at,
     'archive_revision_observation'::text AS first_observed_at_basis'''
@@ -242,6 +245,8 @@ def enrich(c, rows, p, *, titles=None, order_key=None, with_body=False, media=Fa
     by_id={r['id']:r for r in metadata}
     for row in rows:
         row.update(by_id.get(row['id'],{}))
+    from .polls import attach
+    attach(c,rows)
     from .result_evidence import decorate
     decorate(c,[r for r in rows if 'revision' in r],order_key=order_key,with_body=with_body,media=media,
         groups=None if groups is None else [[r for r in part if 'revision' in r] for part in groups])
@@ -493,6 +498,8 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
     # The flags are read before the rows are shaped; the internal columns leave with the other internals below.
     flags={r['id']:(r['hit_body'],r['hit_contact'],r.get('hit_media',False)) for r in rows[:limit]} if plan.query else {}
     items=reply_context(c,p,resolve(c,p,forward_presence(rows[:limit])))
+    from .polls import attach
+    attach(c,items)
     if collapsing:attach_copies(items)
     retitle(c,p,items)
     next_cursor=None
