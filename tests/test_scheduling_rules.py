@@ -1,7 +1,9 @@
 """ANYM-892: fixed ru/en scheduling rules (scheduling_rules.signals), checked against synthetic fixtures."""
 import json
-from datetime import datetime, timedelta, timezone
+import re
+from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 from zoneinfo import ZoneInfo, available_timezones
 
 import pytest
@@ -103,11 +105,90 @@ def test_base_day_is_the_send_day_in_the_resolved_zone():
 # spec: ANYM-892
 @pytest.mark.parametrize('text,zone', [('Давай в 10 МСК', 'Europe/Moscow'), ('Давай в 10 по московскому', 'Europe/Moscow'),
     ('call at 10 MSK', 'Europe/Moscow'), ('call at 10 UTC-5', 'Etc/GMT+5'), ('call at 10 GMT+1', 'Etc/GMT-1'),
-    ('call at 10 UTC−2', 'Etc/GMT+2'), ('call at 10 UTC+14', 'Etc/GMT-14'), ('call at 10 WET', 'WET'), ('call at 10 BST', 'Europe/London'),
-    ('call at 10 PT', 'America/Los_Angeles'), ('давай в 10 по Лиссабону', 'Europe/Lisbon'), ('call at 10 Lisbon time', 'Europe/Lisbon')])
+    ('call at 10 UTC−2', 'Etc/GMT+2'), ('call at 10 UTC+14', 'Etc/GMT-14'), ('call at 10 WET', 'UTC'), ('call at 10 BST', 'Etc/GMT-1'),
+    ('call at 10 CET', 'Etc/GMT-1'), ('call at 10 CEST', 'Etc/GMT-2'), ('call at 10 EEST', 'Etc/GMT-3'), ('call at 10 EST', 'Etc/GMT+5'),
+    ('call at 10 PDT', 'Etc/GMT+7'), ('call at 10 PT', 'America/Los_Angeles'), ('call at 10 ET', 'America/New_York'), ('давай в 10 по Лиссабону', 'Europe/Lisbon'), ('call at 10 Lisbon time', 'Europe/Lisbon')])
 def test_explicit_zone_markers(text, zone):
     (time,) = signals(text, MONDAY, 'in', LISBON)['times']
     assert (time['zone'], time['zone_source']) == (zone, 'explicit')
+
+
+# spec: ANYM-892
+def test_summer_abbreviation_keeps_its_own_offset_in_winter():
+    (time,) = signals('Thursday 3pm CEST works for you?', MONDAY, 'in', LISBON)['times']
+    assert time['start'] == '2026-11-12T15:00:00+02:00'
+
+
+# spec: ANYM-892
+def test_each_time_takes_its_own_zone_marker_and_base_day():
+    got = signals('Call tomorrow at 10 ET or Friday at 10 PT', MONDAY, 'in', LISBON)
+    assert [(t['start'], t['zone']) for t in got['times']] == [('2026-11-10T10:00:00-05:00', 'America/New_York'),
+        ('2026-11-13T10:00:00-08:00', 'America/Los_Angeles')]
+
+
+# spec: ANYM-892
+@pytest.mark.parametrize('text', ['call at 10 Lİsbon time', 'call at 10 lısbon time', 'how about ſep 12', 'давай 12 ſентября',
+    'call at 10 по Лİссабону'])
+def test_case_folding_lookalikes_never_raise(text):
+    got = signals(text, MONDAY, 'in', LISBON)
+    assert all(t['zone'] in ZONES for t in got['times'])
+
+
+# spec: ANYM-892
+@pytest.mark.parametrize('text', ['Давай в 24:30', 'Call at 24pm', 'Call at 00pm', 'Call at 13pm', 'давай в 15 вечера', 'с 25 до 26',
+    'Call at 10:75'])
+def test_impossible_clock_values_yield_no_time(text):
+    assert signals(text, MONDAY, 'in', LISBON)['times'] == []
+
+
+# spec: ANYM-892
+@pytest.mark.parametrize('sent_at,expected', [(datetime(2027, 11, 15, 10, tzinfo=timezone.utc), ['2028-02-29T00:00:00+00:00']),
+    (datetime(2024, 11, 15, 10, tzinfo=timezone.utc), []), (datetime(2028, 2, 28, 10, tzinfo=timezone.utc), ['2028-02-29T00:00:00+00:00'])])
+def test_leap_day_rolls_into_the_right_year(sent_at, expected):
+    assert [t['start'] for t in signals('давай 29.02', sent_at, 'in', LISBON)['times']] == expected
+
+
+# spec: ANYM-892
+@pytest.mark.parametrize('text,sent_at', [('давай 31.12.9999', MONDAY), ('давай 12.11.2031', MONDAY),
+    ('давай завтра в 23:30', datetime(9999, 12, 31, 12, tzinfo=timezone.utc)), ('на следующей неделе', datetime(9999, 12, 28, tzinfo=timezone.utc)),
+    ('давай сегодня в 10', datetime(1, 1, 1, tzinfo=timezone.utc))])
+def test_dates_far_from_the_send_day_or_at_the_calendar_edge_yield_no_time(text, sent_at):
+    for zone in (LISBON, owner_zone({'ANYMSG_OWNER_TIMEZONE': 'Pacific/Pago_Pago'}), owner_zone({'ANYMSG_OWNER_TIMEZONE': 'Pacific/Kiritimati'})):
+        got = signals(text, sent_at, 'in', zone)
+        assert all(datetime.fromisoformat(t['start']).year in (sent_at.year, sent_at.year + 1) for t in got['times'])
+    assert signals('давай 31.12.9999', MONDAY, 'in', LISBON)['times'] == []
+
+
+# spec: ANYM-892
+@pytest.mark.parametrize('text', ['Call https://zoom.us/j/tomorrow/SECRET/15:00', 'call https://zoom.us/j/secret?cancel=true',
+    'Давай завтра https://zoom.us/j/15:00 в обед', 'https://meet.google.com/x?at=10:30 tomorrow'])
+def test_link_paths_and_queries_are_never_parsed_or_spanned(text):
+    got = signals(text, MONDAY, 'in', LISBON)
+    link = re.search(r'https?://\S+', text).span()
+    assert got['intent'] != 'cancel'
+    assert all(e <= link[0] or s >= link[1] for s, e in spans(got))
+    assert 'SECRET' not in json.dumps(got) and 'secret' not in json.dumps(got)
+
+
+# spec: ANYM-892
+@pytest.mark.parametrize('text', ['https://zoom.us.evil.test/j/1', 'https://zoom.us@evil.test/j/1', 'https://notzoom.us/j/1'])
+def test_lookalike_meeting_hosts_are_not_kept(text):
+    assert signals(text, MONDAY, 'in', LISBON)['links'] == []
+
+
+# spec: ANYM-892
+@pytest.mark.parametrize('text,intent', [('Не получится, перенесём?', 'reschedule'), ('Can we reschedule?', 'reschedule'),
+    ('Давай перенесём файлы на диск', 'none')])
+def test_rescheduling_word_stands_alone_only_when_unambiguous(text, intent):
+    assert signals(text, MONDAY, 'in', LISBON)['intent'] == intent
+
+
+# spec: ANYM-892
+@pytest.mark.parametrize('text,expected', [('Отменяем встречу в пятницу', ['rejected']),
+    ('Отменим созвон в пятницу, давай в понедельник', ['rejected', 'offered']), ("Let's cancel Friday, let's do Monday", ['rejected', 'offered'])])
+def test_cancelled_times_are_rejected(text, expected):
+    got = signals(text, MONDAY, 'in', LISBON)
+    assert got['intent'] == 'cancel' and [t['polarity'] for t in got['times']] == expected
 
 
 # spec: ANYM-892
@@ -181,7 +262,8 @@ FRAGMENTS = ['давай', 'во вторник', 'не могу', 'в 3', 'в 1
     '10:30-11:30', "doesn't work", 'next week', 'next Monday', 'the 31st', 'Feb 30', '29.02', 'Lisbon time', 'по Лиссабону',
     'созвон', 'zoom', 'https://zoom.us/j/1', 'перенесём', 'отмена', 'last Friday', '> ', '\n', ', ', '. ', '?', 'с 23 до 1']
 TEXT = st.lists(st.one_of(st.sampled_from(FRAGMENTS), st.text(max_size=12)), max_size=24).map(' '.join)
-SENT = st.datetimes(min_value=datetime(2000, 1, 1), max_value=datetime(2090, 12, 31), timezones=st.just(timezone.utc))
+SENT = st.one_of(st.datetimes(timezones=st.just(timezone.utc)),
+    st.datetimes(min_value=datetime(2020, 1, 1), max_value=datetime(2040, 12, 31), timezones=st.just(timezone.utc)))
 OWNER = st.sampled_from([time_references.UTC_FALLBACK, LISBON, owner_zone({'ANYMSG_OWNER_TIMEZONE': 'Pacific/Kiritimati'}),
     owner_zone({'ANYMSG_OWNER_TIMEZONE': 'Pacific/Pago_Pago'}), owner_zone({'ANYMSG_OWNER_TIMEZONE': 'Europe/Moscow'})])
 DIRECTION = st.sampled_from(['in', 'out'])
@@ -204,6 +286,8 @@ def test_property_never_raises_and_is_deterministic(text, sent_at, direction, zo
 def test_property_spans_lie_inside_the_input_and_zones_are_iana(text, sent_at, zone):
     got = signals(text, sent_at, 'in', zone)
     assert all(0 <= start < end <= min(len(text), MAX_CHARS) for start, end in spans(got))
+    links = [m.span() for m in re.finditer(r'https?://\S+', text[:MAX_CHARS], re.I)]
+    assert all(e <= ls or s >= le for s, e in spans(got) for ls, le in links)
     assert all(t['zone'] in ZONES for t in got['times'])
     assert all(datetime.fromisoformat(t['start']) < datetime.fromisoformat(t['end']) for t in got['times'])
 
@@ -229,7 +313,10 @@ def test_property_input_is_truncated_before_matching(head, sent_at, zone):
 
 
 # spec: ANYM-892
-def test_long_input_stays_fast():
-    start = datetime.now()
-    signals('давай в 10 во вторник, не могу в 3. ' * 2000, MONDAY, 'in', LISBON)
-    assert datetime.now() - start < timedelta(seconds=2)
+@pytest.mark.parametrize('unit', ['давай в 10 во вторник, не могу в 3. ', 'today 1pm. ', 'today 1pm ', 'в 10 ', 'завтра ',
+    'с 1 до 2 ', '12.11 ', 'https://zoom.us/j/1 ', 'по Москве в 10 '])
+def test_dense_input_stays_fast(unit):
+    text = unit * (MAX_CHARS // len(unit) + 1)
+    start = perf_counter()
+    signals(text, MONDAY, 'in', LISBON)
+    assert perf_counter() - start < 1.0
