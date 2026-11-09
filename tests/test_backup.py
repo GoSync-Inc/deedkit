@@ -32,6 +32,34 @@ def test_snapshot_rejects_changed_database_and_source_quarantine(seeded,tmp_path
 
 
 # spec: ANYM-848
+def test_a_restored_schema71_backup_quarantines_and_migrates_to_the_wake_tables(database,tmp_path):
+    from messaging_service.backup import database_manifest
+    from messaging_service.wake_targets import schema_ready
+    from test_subscription_retention import acked_subscription,restore_database,snapshot_restored
+    with restore_database(database,tmp_path/'source',through=71) as source:
+        acked_subscription(source,name='wake-old-snapshot')
+        with source.pool.connection() as c:
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='71'
+            before=database_manifest(c)
+        assert 'wake_targets' not in before
+        # snapshot_restored verifies the schema-71 bundle before and the restored database after pg_restore.
+        with snapshot_restored(source,tmp_path) as restored:
+            with restored.pool.connection() as c:
+                after=database_manifest(c)
+                # The capture's own fence row is the one difference (attachment_backup_fences); the rest is the source.
+                assert set(after)==set(before) and after['subscriptions']==before['subscriptions']
+                assert schema_ready(c) is False
+            # This runtime's quarantine skips the wake step on a schema-71 restore; migrating then adds the tables.
+            quarantine_restore(restored)
+            restored.migrate()
+            restored.migrate()
+            with restored.pool.connection() as c:
+                assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='72'
+                assert schema_ready(c) is True
+                assert c.execute('SELECT count(*) AS n FROM wake_targets').fetchone()['n']==0
+
+
+# spec: ANYM-848
 def test_schema72_snapshot_round_trips_the_wake_targets(database,tmp_path):
     from messaging_service.backup import database_manifest
     from test_subscription_retention import acked_subscription,restore_database,snapshot_restored
