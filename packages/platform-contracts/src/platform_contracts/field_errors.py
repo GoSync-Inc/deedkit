@@ -28,6 +28,8 @@ HINT_TEXTS = frozenset((
     "8–128 characters: letters, digits and _ . : -", "no control characters except newline and tab",
     # ANYM-519: unsafe_endpoint on a self-service webhook URL.
     "https on port 443, a public address, a host the operator allows",
+    # ANYM-837: a menu_choice of send_message and preview_message.
+    "{message_id, option_id}", "a chat_id send_message", "chat_id, plain format, reply_to empty or the menu",
 ))
 HINT_PATTERNS = tuple(re.compile(pattern) for pattern in (
     r"[0-9]{1,6}–[0-9]{1,6} characters",
