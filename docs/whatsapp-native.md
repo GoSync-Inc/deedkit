@@ -127,6 +127,16 @@ where the row could not be read or decoded. Each lookup is bounded to 200 ms, so
 SQLite lock never outlasts the capture writer's 5 s busy timeout; a slower one answers
 `unknown`. An invalid line answers `invalid_request`. Without a journal it exits with
 `media_keys_unavailable` and creates nothing.
+`anymsg-whatsmeow --config <file> --menu-reply-shapes` (ANYM-837) is the reference check for menu
+replies: with the same read-only, query-only journal access and no provider client, device store or
+session owner lock, it pairs every menu reply the owner sent (list, buttons, template or interactive
+response) with the menu it quotes, when the journal still holds it, and prints one JSON report of
+relations per unit (menu kind / reply kind): the names of the fields that are set, the response name
+and version, which field holds the chosen option's ID, how a template's selected index relates to the
+menu (its explicit `Index` or a position), whether the reply text is the option's title, and whether
+the menu is quoted. It prints no ID, label, text, chat or message identifier. Each journal page of 200
+rows is one statement bounded to 200 ms; a slower page ends the scan with `incomplete: true`. Without
+a journal it exits with `menu_shapes_unavailable` and creates nothing.
 
 The account-specific operation manifest reflects the selected provider after
 an identity-verified connection; platform counts are legacy defaults only.
