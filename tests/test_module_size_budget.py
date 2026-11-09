@@ -119,6 +119,24 @@ def test_the_archive_tools_live_in_their_app_tools_module_not_in_app_py():
 
 
 # spec: ANYM-949
+def test_the_subscription_and_delivery_tools_live_in_their_app_tools_module_not_in_app_py():
+    package = ROOT / "services/messaging/messaging_service"
+    def tools(path):
+        return {node.name for node in ast.walk(ast.parse(path.read_text()))
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+                and any(ast.unparse(d).startswith("mcp.tool(") for d in node.decorator_list)}
+    moved = {"create_subscription", "list_subscriptions", "get_subscription", "update_subscription",
+             "get_subscription_events", "fetch_subscription_events", "ack_subscription_events",
+             "wait_for_subscription_events", "configure_subscription_delivery", "test_subscription",
+             "register_delivery_endpoint", "list_delivery_endpoints", "update_delivery_endpoint",
+             "list_delivery_attempts", "delete_delivery_endpoint", "test_delivery_endpoint", "register_wake_target",
+             "list_wake_targets", "update_wake_target", "delete_wake_target", "confirm_wake_target"}
+    assert len(moved) == 21
+    assert tools(package / "app_tools/subscriptions.py") == moved
+    assert not tools(package / "app.py") & moved
+
+
+# spec: ANYM-949
 def test_ratchet_flags_growth_a_new_large_file_and_a_stale_entry_but_not_a_shrink(tmp_path):
     def write(name, text):
         Path(tmp_path, name).parent.mkdir(parents=True, exist_ok=True)

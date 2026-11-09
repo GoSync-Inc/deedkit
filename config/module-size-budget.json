@@ -13,7 +13,7 @@
     "services/calendar/family_calendar/service/migration_rollout.py": {"lines": 1228, "longest_function": 60},
     "services/calendar/family_calendar/service/schedule.py": {"lines": 905, "longest_function": 98},
     "services/calls/core.py": {"lines": 1391, "longest_function": 65},
-    "services/messaging/messaging_service/app.py": {"lines": 1478, "longest_function": 281},
+    "services/messaging/messaging_service/app.py": {"lines": 1223, "longest_function": 281},
     "services/messaging/messaging_service/archive.py": {"lines": 1079, "longest_function": 232},
     "services/messaging/messaging_service/backup_r2_follow.py": {"lines": 1170, "longest_function": 86},
     "services/messaging/messaging_service/backup_r2_receiver.py": {"lines": 1593, "longest_function": 69},
