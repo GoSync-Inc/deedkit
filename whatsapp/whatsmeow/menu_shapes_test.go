@@ -175,7 +175,7 @@ func TestMenuReplyShapesPrintsOnlyKnownProtocolWordsAndBoundsItsScan(t *testing.
 		// Message-controlled lowercase words and numbers in every printed position.
 		menuShapeEvent("REPLY1", 1700000011, true, &waE2E.Message{InteractiveResponseMessage: &waE2E.InteractiveResponseMessage{
 			InteractiveResponseMessage: &waE2E.InteractiveResponseMessage_NativeFlowResponseMessage_{NativeFlowResponseMessage: &waE2E.InteractiveResponseMessage_NativeFlowResponseMessage{
-				Name: proto.String("private_word"), ParamsJSON: proto.String(`{"secret_key":"x","id":"opt_a","title":"opt_b"}`), Version: proto.Int32(987654)}},
+				Name: proto.String("private_word"), ParamsJSON: proto.String(`{"secret_key":"x","id":"opt_a","response_id":"opt_b"}`), Version: proto.Int32(987654)}},
 			ContextInfo: quoting("MENU1")}}),
 		menuShapeEvent("REPLY2", 1700000012, true, &waE2E.Message{ListResponseMessage: &waE2E.ListResponseMessage{ListType: waE2E.ListResponseMessage_ListType(424242).Enum(), ContextInfo: quoting("NONE")}}),
 		// The template button has no explicit Index; the reply's index 0 is not evidence of one.
@@ -214,7 +214,7 @@ func TestMenuReplyShapesPrintsOnlyKnownProtocolWordsAndBoundsItsScan(t *testing.
 		t.Fatal(err)
 	}
 	flow := report.Units["interactive/interactive_response:other"].Relations
-	if flow["params_selection=ambiguous"] != 1 || flow["version=other"] != 1 || flow["params_keys=id,title,other"] != 1 || flow["selected_id=source_raw_id"] != 0 {
+	if flow["params_selection=ambiguous"] != 1 || flow["version=other"] != 1 || flow["params_keys=id,other"] != 1 || flow["selected_id=source_raw_id"] != 0 {
 		t.Fatalf("flow relations %v", flow)
 	}
 	if report.Units["no_source/list_response"].Relations["list_type=other"] != 1 {
@@ -236,5 +236,63 @@ func TestMenuReplyShapesPrintsOnlyKnownProtocolWordsAndBoundsItsScan(t *testing.
 	// The CLI's stderr names the missing journal.
 	if safeError(errors.New("menu_shapes_unavailable")) != "menu_shapes_unavailable" {
 		t.Fatal("menu_shapes_unavailable is not a safe error")
+	}
+}
+
+// spec: ANYM-837
+func TestMenuReplyShapesEndsAtASlowLaterRowWhileCaptureKeepsWriting(t *testing.T) {
+	config := testConfig(t)
+	s, err := OpenCapture(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	s.Owner = types.NewJID("123456", types.DefaultUserServer)
+	s.MaxEntries = 1 << 30
+	// A fast first row, then a long run of rows without raw evidence that a later
+	// statement must step over before it finds the next row.
+	if err := s.Put(menuShapeEvent("REPLY1", 1700000011, true, &waE2E.Message{ListResponseMessage: &waE2E.ListResponseMessage{ContextInfo: quoting("NONE")}}), "live"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 100000; i++ {
+		if _, err := tx.Exec("INSERT INTO capture(digest,chat,message_id,source_ts,raw,envelope,published,created_at) VALUES(?,?,?,?,x'',x'7b7d',1,0)", "slow"+strconv.Itoa(i), "111111@c.us", "m"+strconv.Itoa(i), i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(filepath.Dir(config.SessionDirectory), "config.json")
+	if err := os.WriteFile(path, mustJSON(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	defer func(d time.Duration) { menuShapeTimeout = d }(menuShapeTimeout)
+	menuShapeTimeout = 3 * time.Millisecond
+	done := make(chan error, 1)
+	var out bytes.Buffer
+	started := time.Now()
+	go func() { done <- serveMenuReplyShapes(path, &out) }()
+	// The owning adapter writes while the scan steps over the slow rows.
+	for i := 0; i < 20; i++ {
+		if err := s.Put(fixtureMessage("LIVE"+strconv.Itoa(i), 1700002000+int64(i)), "live"); err != nil {
+			t.Fatalf("a capture write failed beside the scan: %v", err)
+		}
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(started) > 5*time.Second {
+		t.Fatalf("scan held on for %v", time.Since(started))
+	}
+	var report menuShapeReport
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if !report.Incomplete || report.IncompleteCause != "journal_read_timeout" || report.OwnerReplies != 1 {
+		t.Fatalf("the slow later row did not end the scan: %s", out.String())
 	}
 }

@@ -345,15 +345,18 @@ func menuShapeAdd(report *menuShapeReport, m *waE2E.Message, reply string, c *wa
 			keys := []string{}
 			others := false
 			var holders []string
+			// Every string value is compared with the source options, under any key;
+			// an unknown key is printed only as "other".
 			for k, v := range params {
-				if !knownParamKeys[k] {
-					others = true
-					continue
+				name := k
+				if knownParamKeys[k] {
+					keys = append(keys, k)
+				} else {
+					others, name = true, "other"
 				}
-				keys = append(keys, k)
 				if s, ok := v.(string); ok {
 					if o := optionWithID(options, s); o != nil {
-						holders = append(holders, k)
+						holders = append(holders, name)
 						selected = s
 					}
 				}
