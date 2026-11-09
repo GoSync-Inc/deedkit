@@ -756,6 +756,77 @@ def test_music_in_an_unsubscribed_group_keeps_the_group_reason(seeded,tmp_path):
     assert item['enrichment_status']=='available_on_request' and item['recognition_reason']=='group_chat_on_request'
 
 
+def described_twice(s,tmp_path,copy_message='demo-tg-1',accounts=('telegram-demo',)):
+    """enrich-image described by the model, then a second attachment of the same file; returns the worker and its calls."""
+    sha=add_image(s);calls=[]
+    def processor(files,row,profile):
+        calls.append(row['attachment'])
+        return {'title':'Чек','summary':'Кассовый чек на 120 рублей','text':'ИТОГО 120','metadata':{'document_type':'receipt'}}
+    cfg={'accounts':list(accounts),'max_jobs_per_day':20,'profiles':{'image':profile(tmp_path,kind='image')}}
+    w=EnrichmentWorker(s.pool.conninfo,s.files,cfg,processor=processor)
+    with s.pool.connection() as c:c.execute('TRUNCATE enrichment_budget')
+    assert w.once() and calls==['enrich-image']
+    with s.pool.connection() as c:
+        c.execute("UPDATE messages SET sent_at=clock_timestamp() WHERE id=%s",(copy_message,))
+        c.execute("INSERT INTO attachments(id,message,digest,filename,mime,bytes) VALUES('enrich-copy',%s,%s,'copy.png','image/png',%s)",
+            (copy_message,sha,len(PNG_1X1)))
+    return w,calls
+
+
+def spent(s):
+    with s.pool.connection() as c:
+        return c.execute('''SELECT (SELECT coalesce(sum(attempts),0) FROM enrichment_budget)+
+            (SELECT coalesce(sum(attempts),0) FROM processing_budget) AS n''').fetchone()['n']
+
+
+# spec: ANYM-912
+def test_a_second_attachment_of_a_described_file_reuses_its_result(seeded,tmp_path):
+    s,_,_=seeded;w,calls=described_twice(s,tmp_path);before=spent(s)
+    assert w.once() and calls==['enrich-image']  # no second model call
+    with s.pool.connection() as c:
+        rows={r['attachment']:r for r in c.execute('''SELECT attachment,state,title,summary,text_content,metadata,attempts
+            FROM attachment_enrichment WHERE attachment IN ('enrich-image','enrich-copy')''')}
+        events=c.execute('''SELECT count(*) n FROM events WHERE kind='file.description.ready'
+            AND snapshot->'processing'->>'attachment_id'='enrich-copy' ''').fetchone()['n']
+    source,copy=rows['enrich-image'],rows['enrich-copy']
+    assert copy['state']=='ready' and (copy['title'],copy['summary'],copy['text_content'])==(
+        source['title'],source['summary'],source['text_content'])
+    assert copy['metadata']['document_type']=='receipt' and copy['metadata']['reused'] is True
+    assert copy['attempts']==0 and spent(s)==before  # no model attempt or budget
+    assert events==1
+
+
+# spec: ANYM-912
+def test_reuse_needs_the_same_profile(seeded,tmp_path):
+    s,_,_=seeded;w,calls=described_twice(s,tmp_path)
+    with s.pool.connection() as c:
+        c.execute("UPDATE attachment_enrichment SET profile_hash='an-older-profile' WHERE attachment='enrich-image'")
+    assert w.once() and calls==['enrich-image','enrich-copy']
+    with s.pool.connection() as c:
+        meta=c.execute("SELECT metadata FROM attachment_enrichment WHERE attachment='enrich-copy'").fetchone()['metadata']
+    assert 'reused' not in meta and 'reused_from' not in meta
+
+
+# spec: ANYM-912
+def test_a_reused_result_names_its_source_only_to_operators(seeded,tmp_path):
+    s,key,_=seeded;w,_=described_twice(s,tmp_path);w.once()
+    with s.pool.connection() as c:
+        meta=c.execute("SELECT metadata FROM attachment_enrichment WHERE attachment='enrich-copy'").fetchone()['metadata']
+    assert meta['reused_from']=='enrich-image'  # operator evidence (SQL)
+    text=s.get_file_text(key,'enrich-copy')
+    assert text['enrichment_coverage']['reused'] is True
+    seen=json.dumps([text,s.get_attachment(key,'enrich-copy')],default=str)
+    assert 'reused_from' not in seen and '"enrich-image"' not in seen
+    assert 'reused' not in s.get_file_text(key,'enrich-image')['enrichment_coverage']
+
+
+# spec: ANYM-912
+def test_reuse_stays_within_the_account(seeded,tmp_path):
+    s,_,_=seeded
+    w,calls=described_twice(s,tmp_path,copy_message='demo-wa-1',accounts=('telegram-demo','whatsapp-demo-1'))
+    assert w.once() and calls==['enrich-image','enrich-copy']
+
+
 def test_enrichment_budget_fencing_and_deletion(seeded,tmp_path):
     s,_,_=seeded;add_audio(s);w=worker(s,tmp_path,1)
     with s.pool.connection() as c:c.execute('TRUNCATE enrichment_budget')
