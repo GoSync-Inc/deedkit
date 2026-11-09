@@ -106,10 +106,5 @@ CREATE TABLE IF NOT EXISTS negotiation_cursor (
 );
 GRANT SELECT,INSERT,UPDATE,DELETE ON negotiations,negotiation_sources,negotiation_times,negotiation_transitions,
  negotiation_rebuild,negotiation_cursor TO messaging_negotiations;
--- ANYM-909: agents read negotiations through the API role. Guarded: a database without the role (a fresh test
--- cluster) gets it from gateway_role.sql, and store.migrate re-applies it.
-DO $$ BEGIN
- IF EXISTS (SELECT FROM pg_roles WHERE rolname='messaging_gateway') THEN
-  GRANT SELECT ON negotiations,negotiation_sources,negotiation_times TO messaging_gateway;
- END IF;
-END $$;
+-- ANYM-909: the API role's SELECT on negotiations, negotiation_sources and negotiation_times is gateway_role.sql's
+-- "Schema 76" block, which the release appends like every gateway grant; store.migrate re-applies it after a restore.
