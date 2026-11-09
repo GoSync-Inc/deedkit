@@ -667,14 +667,23 @@ budget starts after the staging work, not at the journal's creation. Disk: free 
 the expected archive size (`expected_archive_bytes`, default 1 GiB, or the last recorded `archive_bytes` of the status
 file when larger), else `recordings_skipped_disk`.
 
-Locks and cleanup: the recordings run never waits for the host lock (`recordings_skipped_lock_busy`), but when it gives
-up it first empties what a crashed earlier job left in staging, under the runner's own lock alone. `--recover-stop`
+Locks and cleanup: the recordings run never waits for the host lock (`recordings_skipped_lock_busy`; see the retry
+below), but when it gives up it first empties what a crashed earlier job left in staging, under the runner's own lock alone. `--recover-stop`
 takes only the runner's own lock (it touches nothing of messaging or calendar), so it is never blocked by another
 profile. A `docker exec` that hits its deadline is not trusted to have stopped the snapshot producer: the runner finds
 the processes in the container whose arguments carry this job's snapshot path (`docker top`), kills them and checks that
 none is left (`recordings_exec_unverified` otherwise; staging is then not emptied under a live writer, and the recovery
 looks again). A cleanup that fails is an error (`staging_cleanup_failed`, exit 1), also after a skip. A skipped job
 leaves the freshness clock alone, so the catch-up timer decides.
+
+Retry on a busy lock (11-09: automatic deploys held the lock over both calls slots and the calls state went 37 hours
+without a backup): a recordings or calls run that skips with `_skipped_lock_busy` inside its own unit (its cgroup names
+`deedkit-<profile>-backup[-catchup].service`; a hand run schedules nothing) asks systemd for one transient timer,
+`deedkit-<profile>-backup-retry-<UTC date>`, that starts `deedkit-<profile>-backup.service` 1200 s later and prints
+`{"retry":<name or null>,"in_seconds":1200}` before its skip line. The retry is an ordinary run (same admission, lock
+and unit time limit). The timer stays loaded after it fires (`RemainAfterElapse=yes`), so systemd refuses a second one
+that UTC day; a failure to schedule changes nothing about the skip. No unit file changes. Undo: `systemctl stop
+'deedkit-*-backup-retry-*.timer'` (a reboot also drops them); the runner change itself rolls back with the release.
 
 ### Recordings archive: freshness and size (ANYM-728)
 
@@ -741,7 +750,7 @@ digests), `voice_events_max_seq`, `bytes` and `sha256`. Any other member is refu
 worker runs in the pinned backup image with no network and sees only staging read-only.
 
 Exclusion: the same as recordings: the profile's own `.runner.lock`, then messaging's `host_lock` with no wait
-(`calls_skipped_lock_busy`), the other profiles' timer files read at every start (`calls_skipped_window`,
+(`calls_skipped_lock_busy`, with the one retry a day of "Retry on a busy lock" above), the other profiles' timer files read at every start (`calls_skipped_window`,
 `calls_skipped_schedule_unknown`, `calls_skipped_yielded`), `calls_skipped_disk`, and a deadline per phase. Its unsettled
 marker is `<state_directory>/.unsettled`. A failure at any phase ends with a fixed code, removes staging and leaves the
 previous protected point, the other profiles' journals and the calls container untouched; the next run takes a new snapshot.
@@ -806,8 +815,9 @@ and undo: `docs/operations/production.md`, "Backup alerts".
   hand-written pause raises nothing; removing the pause ends the episode. Only the code leaves the host
   (TELEMETRY.md, Autodeploy halts).
 - **Limits**, measured from capture, are policy rather than every timeout's worst case: messaging 30 h, calendar 32 h,
-  recordings 30 h, calls 36 h. A slow verification inside its budgets can raise one `backup_unverified` event;
-  resolve it.
+  recordings 30 h, calls 30 h (36 h until 11-09, when a missed night would have shown only at 14:15 the next day;
+  the calls freshness command keeps its own 36 h default). A slow verification inside its budgets can raise one
+  `backup_unverified` event; resolve it.
 - **Episodes**: one event per code per episode, and again every 24 h while it lasts, kept in
   `/var/lib/deedkit-backup-health/state.json`. A send that fails stays due for the next hour. The event carries only
   the code (TELEMETRY.md); details stay in the host's files and journal.

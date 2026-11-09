@@ -41,8 +41,9 @@ HALT_CODES = ('attempt_unresolved', 'call_wait_exhausted', 'configuration_drift'
               'tool_switch_failed', 'tool_update_stopped', 'tool_update_unresolved', 'other')
 DEPLOY_CODES = frozenset(f'deploy_halted.{code}' for code in HALT_CODES)
 PAUSE_FILE = '/etc/deedkit/autodeploy.pause'
-# Policy limits from capture, the normal day plus margin (ANYM-807 criterion 6); BACKUP.md, Backup alerts.
-LIMIT_HOURS = {'messaging': 30, 'calendar': 32, 'recordings': 30, 'calls': 36}
+# Policy limits from capture, the normal day plus margin (ANYM-807 criterion 6); BACKUP.md, Backup alerts. Calls 30 h, not
+# 36 (11-09): a missed night shows the next morning; the 04:15 catch-up plus 2 h of verification is 29.5 h.
+LIMIT_HOURS = {'messaging': 30, 'calendar': 32, 'recordings': 30, 'calls': 30}
 # The proof of these profiles carries the capture time; messaging's and calendar's take the backup ID's job time.
 PROOF_CAPTURE = frozenset({'recordings', 'calls'})
 FUTURE_GRACE_S = 300

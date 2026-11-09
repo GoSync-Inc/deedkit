@@ -1559,6 +1559,38 @@ def hold_locks(cfg,wait=HOST_LOCK_WAIT_SECONDS,busy=None,host=True):
         for fd in reversed(fds):os.close(fd)
 
 
+# A recordings or calls run that finds the host lock busy (a deploy, another profile) asks systemd for ONE retry of the
+# profile's daily unit a day, RETRY_DELAY_SECONDS later (11-09: automatic deploys held the lock over both calls slots and
+# the calls state went 37 hours without a backup). The retry is an ordinary run: same admission, same unit time limit.
+RETRY_PROFILES=('recordings','calls')
+RETRY_DELAY_SECONDS=1200
+
+
+def own_unit(profile):
+    """The profile's backup unit this process runs in (its cgroup), else None: a hand run schedules nothing."""
+    try:text=Path('/proc/self/cgroup').read_text()
+    except (OSError,ValueError):return None
+    found=re.search(r'/(deedkit-'+profile+r'-backup(?:-catchup)?\.service)$',text,re.M)
+    return found.group(1) if found else None
+
+
+def systemd_run(argv):
+    subprocess.run(argv,check=True,timeout=30,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+
+
+def schedule_retry(profile):
+    """The transient retry unit's name, or None: not in a backup unit, already scheduled today (systemd refuses a second
+    unit of the day's name: RemainAfterElapse keeps it loaded) or any failure. Never raises: the skip stands either way."""
+    if own_unit(profile) is None:return None
+    name=f'deedkit-{profile}-backup-retry-{datetime.now(timezone.utc):%Y%m%d}'
+    try:systemd_run(['systemd-run','--no-ask-password','--quiet','--unit',name,f'--on-active={RETRY_DELAY_SECONDS}',
+                     '--timer-property=AccuracySec=1s','--timer-property=RemainAfterElapse=yes',
+                     f'--description=Retry of a {profile} backup run that found the host lock busy',
+                     '/usr/bin/systemctl','start','--no-block',f'deedkit-{profile}-backup.service'])
+    except Exception:return None
+    return name
+
+
 def rotation_admission(cfg):
     """A calendar run waits for scripts/calendar_rotate.py (ANYM-784): while its marker exists, only the tool's own run
     in phase `verifying` (the token the marker holds) starts. Doubt refuses. The catch-up timer starts it again later."""
@@ -1620,6 +1652,13 @@ def main():
         # A skip whose cleanup failed is a failure: plaintext may remain.
         if isinstance(exc,Skip) and not (runner.staged_profile and unrecovered is not None):
             try:runner.status('skipped',exc.code)
+            except Exception:pass
+            profile=runner.cfg.get('profile')
+            try:
+                if (profile in RETRY_PROFILES and exc.code==profile+'_skipped_lock_busy' and not args.recover_stop and
+                        own_unit(profile)):
+                    print(json.dumps({'retry':schedule_retry(profile),'in_seconds':RETRY_DELAY_SECONDS},
+                                     separators=(',',':')),flush=True)
             except Exception:pass
             print(json.dumps({'status':'skipped','code':exc.code},separators=(',',':')),flush=True)
             raise SystemExit(0) from None

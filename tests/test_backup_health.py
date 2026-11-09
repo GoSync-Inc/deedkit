@@ -216,8 +216,16 @@ def test_stale_is_just_over_the_profiles_limit_and_not_just_under(tmp_path, prof
 
 
 # spec: ANYM-807
+def test_a_calls_state_that_missed_its_night_raises_backup_stale_the_next_morning(tmp_path):
+    # 11-09: both calls runs skipped on a busy lock; at 36 h the alert would have come only at 14:15 the next day.
+    cfg = config(tmp_path, 'producer', ['calls'])
+    good_status(tmp_path, 'calls', captured=NOW - timedelta(hours=30, minutes=22))  # 02:15 the day before, read 08:37
+    assert 'backup_stale' in readings(cfg)['calls']['raised']
+
+
+# spec: ANYM-807
 def test_the_limits_are_named_with_the_card_values():
-    assert h.LIMIT_HOURS == {'messaging': 30, 'calendar': 32, 'recordings': 30, 'calls': 36}
+    assert h.LIMIT_HOURS == {'messaging': 30, 'calendar': 32, 'recordings': 30, 'calls': 30}
     assert (h.REPEAT_S, h.FUTURE_GRACE_S, h.PROBE_TIMEOUT_S, h.SEND_TIMEOUT_S, h.SEND_DEADLINE_S) == (86400, 300, 10, 5, 45)
 
 
