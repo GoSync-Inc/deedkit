@@ -48,6 +48,71 @@ def test_telegram_non_file_media_types_are_observed(media_kind, type_name):
     assert result['metadata']['message_kind'] == media_kind
 
 
+# spec: ANYM-922
+def test_a_shared_telegram_point_or_venue_keeps_its_coordinates_title_and_address():
+    from telethon import types
+    geo = types.GeoPoint(long=37.61729999, lat=55.75582612, access_hash=1, accuracy_radius=15)
+    point = telegram_message('tg-fixture', telegram(media=types.MessageMediaGeo(geo=geo)))
+    assert point['metadata']['message_kind'] == 'location'
+    assert point['metadata']['location'] == {'latitude': 55.755826, 'longitude': 37.6173, 'accuracy_m': 15,
+        'title': None, 'address': None, 'live': False}
+    venue = telegram_message('tg-fixture', telegram(media=types.MessageMediaVenue(
+        geo=types.GeoPoint(long=-0.1276, lat=51.5072, access_hash=1), title='Кафе\x00 «Встреча»' + 'я' * 300,
+        address='Main St 1', provider='foursquare', venue_id='synthetic', venue_type='')))
+    location = venue['metadata']['location']
+    assert (location['latitude'], location['longitude'], location['accuracy_m'], location['address'], location['live']) == \
+        (51.5072, -0.1276, None, 'Main St 1', False)
+    assert location['title'].startswith('Кафе  «Встреча»') and len(location['title']) == 256
+    live = telegram_message('tg-fixture', telegram(media=types.MessageMediaGeoLive(geo=geo, period=900)))
+    assert live['metadata']['message_kind'] == 'location' and live['metadata']['location'] == {'live': True}
+    # No point stated: the kind stays, no block is guessed.
+    empty = telegram_message('tg-fixture', telegram(media=types.MessageMediaGeo(geo=types.GeoPointEmpty())))
+    assert empty['metadata']['message_kind'] == 'location' and 'location' not in empty['metadata']
+    # A deleted message keeps no place.
+    assert 'location' not in validate({**point, 'deleted': True})['metadata']
+
+
+# spec: ANYM-922
+def test_a_whatsapp_location_event_keeps_the_same_block_and_a_live_one_only_the_fact():
+    block = {'latitude': 55.7558, 'longitude': 37.6173, 'accuracy_m': None, 'title': 'Парк', 'address': 'ул. Синтетическая 1',
+        'live': False}
+    point = whatsapp_message('wa-fixture', whatsapp(messageType='location', body='Парк', location=block))
+    assert point['metadata']['message_kind'] == 'location' and point['metadata']['location'] == block
+    live = whatsapp_message('wa-fixture', whatsapp(messageType='location', location={'live': True}))
+    assert live['metadata']['location'] == {'live': True}
+    # Only a location message carries a place, and a delete keeps none.
+    assert 'location' not in whatsapp_message('wa-fixture', whatsapp(messageType='chat', body='x', location=block))['metadata']
+    gone = whatsapp_message('wa-fixture', whatsapp(messageType='location', location=block), change='delete',
+        observed_at=1791000100)
+    assert 'location' not in gone['metadata']
+
+
+# spec: ANYM-922
+@pytest.mark.parametrize('block', [
+    {'latitude': 91, 'longitude': 0, 'accuracy_m': None, 'title': None, 'address': None, 'live': False},
+    {'latitude': 0, 'longitude': -180.5, 'accuracy_m': None, 'title': None, 'address': None, 'live': False},
+    {'latitude': float('nan'), 'longitude': 0, 'accuracy_m': None, 'title': None, 'address': None, 'live': False},
+    {'latitude': 0, 'longitude': float('inf'), 'accuracy_m': None, 'title': None, 'address': None, 'live': False},
+    {'latitude': True, 'longitude': 0, 'accuracy_m': None, 'title': None, 'address': None, 'live': False},
+    {'latitude': '55.7', 'longitude': 0, 'accuracy_m': None, 'title': None, 'address': None, 'live': False},
+    {'latitude': 1, 'longitude': 1, 'accuracy_m': -1, 'title': None, 'address': None, 'live': False},
+    {'latitude': 1, 'longitude': 1, 'accuracy_m': None, 'title': 'x' * 257, 'address': None, 'live': False},
+    {'latitude': 1, 'longitude': 1, 'accuracy_m': None, 'title': None, 'address': 'a\x00b', 'live': False},
+    {'latitude': 1, 'longitude': 1, 'accuracy_m': None, 'title': None, 'address': None, 'live': False, 'url': 'x'},
+    {'latitude': 1, 'longitude': 1, 'live': True},
+    {'longitude': 1, 'live': False},
+    {'live': 'yes'},
+    [55.7, 37.6],
+])
+def test_an_invalid_location_block_is_dropped_and_the_message_is_still_stored(block, caplog):
+    for result in (whatsapp_message('wa-fixture', whatsapp(messageType='location', body='Парк', location=block)),
+                   validate({**whatsapp_message('wa-fixture', whatsapp(messageType='location', body='Парк')),
+                       'metadata': {'message_kind': 'location', 'location': block}})):
+        assert result['body'] == 'Парк' and result['metadata']['message_kind'] == 'location'
+        assert 'location' not in result['metadata']
+    assert 'invalid_location' in caplog.text and '55.7' not in caplog.text
+
+
 def test_telegram_voice_duration_is_observed_without_changing_body_or_revision_hash():
     result = telegram_message('tg-fixture', telegram(message='caption', voice=True,
         file=SimpleNamespace(name='voice.ogg', ext='.ogg', mime_type='audio/ogg',
