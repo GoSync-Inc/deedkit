@@ -101,10 +101,107 @@ def test_migration_068_refuses_an_unusable_index_of_its_name_and_builds_it_once_
             c.execute('DROP INDEX attachment_digest_bytes')
         store.migrate();store.migrate()
         with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='71'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='72'
             assert c.execute('''SELECT i.indisvalid,pg_get_indexdef(i.indexrelid) AS d FROM pg_index i
                 WHERE i.indexrelid='attachment_digest_bytes'::regclass''').fetchone()=={'indisvalid':True,
                 'd':'CREATE INDEX attachment_digest_bytes ON public.attachments USING btree (digest, bytes)'}
+
+
+MESSAGE_INDEX='CREATE INDEX attachment_message ON public.attachments USING btree (message)'
+
+
+def migration_072():
+    from messaging_service import store as store_module
+    return Path(store_module.__file__).with_name('migrations')/'072_attachment_message_index.sql'
+
+
+def seed_attachments(store, messages, *, inactive=0, per_message=1):
+    """`messages` synthetic messages with `per_message` attachments each (the first `inactive` rows inactive), about
+    41,040 distinct digests as production had on 2026-11-09 (#747's read)."""
+    from messaging_service.archive import Archive
+    Archive(store).register('shape','telegram','Synthetic shape',include_chats=['1'])
+    with store.pool.connection() as c:
+        c.execute("SET LOCAL statement_timeout='600s'")
+        c.execute("INSERT INTO chats(id,account,title,provider_chat) VALUES('chat_shape','shape','S','1')")
+        c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at)
+            SELECT 'msg_shape_'||n,'shape','chat_shape','p'||n,'42','',now()-n*interval '1 minute'
+            FROM generate_series(1,%s) n''',(messages,))
+        c.execute('''INSERT INTO attachments(id,message,digest,filename,mime,bytes,active)
+            SELECT 'file_shape_'||n||'_'||k,'msg_shape_'||n,md5('d'||(n*%s+k)%%41040)||md5('e'||(n*%s+k)%%41040),
+                'synthetic.bin','application/octet-stream',100+(n*%s+k)%%41040,n>%s
+            FROM generate_series(1,%s) n,generate_series(1,%s) k''',
+            (per_message,per_message,per_message,inactive,messages,per_message))
+
+
+# spec: ANYM-852
+def test_migration_072_is_a_manual_non_critical_file_that_migrate_expand_still_runs_unattended():
+    # As 068: classify refuses an index on a table the file does not create, so the header says manual; the
+    # unattended release still admits it as expand.
+    from messaging_service import migration_rollout as rollout
+    text=migration_072().read_text()
+    assert rollout.rollout_class(text)=='manual'
+    assert rollout.unattended_class(text)=='expand'
+    assert rollout.risk_class(text)==('non-critical',None,None)
+
+
+# spec: ANYM-852
+@pytest.mark.parametrize('shape',['invalid','partial','other_keys','two_keys','hash','collation','opclass',
+    'descending','unique','exclusion'])
+def test_migration_072_refuses_an_unusable_index_of_its_name_and_builds_it_once_dropped(database,tmp_path,shape):
+    # IF NOT EXISTS keeps any relation of that name; the ledger may advance only over an ordinary index. A unique
+    # or exclusion one would refuse a message's second attachment.
+    import psycopg
+    from test_extend_key import old_schema_store
+    with old_schema_store(database,tmp_path,71) as store:
+        with store.pool.connection() as c:
+            if shape=='exclusion':
+                c.execute('ALTER TABLE attachments ADD CONSTRAINT attachment_message EXCLUDE USING btree (message WITH =)')
+            else:
+                c.execute(('CREATE UNIQUE INDEX' if shape=='unique' else 'CREATE INDEX')+' attachment_message ON attachments '+{
+                    'invalid':'(message)','partial':'(message) WHERE active','other_keys':'(digest)','two_keys':'(message,id)',
+                    'hash':'USING hash (message)','collation':'(message COLLATE "C")','opclass':'(message text_pattern_ops)',
+                    'descending':'(message DESC)','unique':'(message)'}[shape])
+            # What an interrupted CREATE INDEX CONCURRENTLY leaves behind.
+            if shape=='invalid':
+                c.execute("UPDATE pg_index SET indisvalid=false WHERE indexrelid='attachment_message'::regclass")
+        with pytest.raises(psycopg.errors.RaiseException,match='not a valid btree index on attachments\\(message\\): '
+                'DROP INDEX CONCURRENTLY public.attachment_message'):store.migrate()
+        with store.pool.connection() as c:
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='71'
+            assert c.execute('SELECT max(version) AS v FROM archive_migrations').fetchone()['v']==71
+            c.execute('ALTER TABLE attachments DROP CONSTRAINT attachment_message' if shape=='exclusion'
+                else 'DROP INDEX attachment_message')
+        store.migrate();store.migrate()
+        with store.pool.connection() as c:
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='72'
+            assert c.execute('''SELECT i.indisvalid,pg_get_indexdef(i.indexrelid) AS d FROM pg_index i
+                WHERE i.indexrelid='attachment_message'::regclass''').fetchone()=={'indisvalid':True,'d':MESSAGE_INDEX}
+        seed_attachments(store,1,per_message=2)
+        with store.pool.connection() as c:
+            assert c.execute("SELECT count(*) AS n FROM attachments WHERE message='msg_shape_1'").fetchone()['n']==2
+
+
+# spec: ANYM-852
+def test_migration_072_builds_on_a_production_sized_table_in_one_expand_transaction(database,tmp_path,record_property):
+    # Recorded, never asserted: CI timing does not predict production's margin under rehearsal_limit_ms (068: about
+    # 40 ms locally, 0.2-0.3 s left of the 1000 ms limit under production load). migrate_expand's own clock.
+    import hashlib
+    from messaging_service import store as store_module
+    from test_extend_key import old_schema_store
+    root=Path(store_module.__file__).parent
+    roles={p.name:{'bytes':len(p.read_bytes()),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+        for p in sorted(root.glob('*_role.sql'))}
+    with old_schema_store(database,tmp_path,71) as store:
+        seed_attachments(store,56523,inactive=1220)
+        with store.pool.connection() as c:
+            assert c.execute('SELECT count(*) AS n FROM attachments').fetchone()['n']==56523
+        timing={}
+        found=store_module.migrate_expand(store.pool.conninfo,{'base':71,'target':72,'roles':roles},timing=timing)
+        record_property('transaction_ms',timing['transaction_ms'])
+        assert found=={'schema_version':72}
+        with store.pool.connection() as c:
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='72'
+            assert c.execute("SELECT pg_get_indexdef('public.attachment_message'::regclass) AS d").fetchone()['d']==MESSAGE_INDEX
 
 
 @pytest.fixture(autouse=True)
