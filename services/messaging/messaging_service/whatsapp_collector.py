@@ -646,8 +646,9 @@ def provider_for_config(cfg,path,lock_fd,claim_fd=None):
 
 
 def claims_on(cfg):
-    """ANYM-914: claims are on wherever the canonical lock directory is mounted (every Compose overlay mounts it)."""
-    return Path(cfg.get('session_lock_directory') or session_claim.LOCK_DIRECTORY).exists()
+    """ANYM-914: claims are on wherever the canonical lock directory is mounted (every Compose overlay mounts it) or
+    a configured one exists; an override never hides the canonical mount."""
+    return any(Path(p).exists() for p in (session_claim.LOCK_DIRECTORY,cfg.get('session_lock_directory')) if p)
 
 
 def refuse_unclaimed_browser(cfg):
@@ -880,11 +881,14 @@ async def run_config(path):
     with (session_claim.host_lock(cfg['account'],cfg.get('session_lock_directory')) if native else nullcontext()) as host,\
             session_lock(session) as lock_fd:
         if not native:clear_browser_runtime_locks(session)
-        store=Store(Path(os.environ['DATABASE_URL_FILE']).read_text().strip(),Path(os.environ['PROBE_FILES']),'http://collector.invalid')
-        try:
+        def open_store():
+            return Store(Path(os.environ['DATABASE_URL_FILE']).read_text().strip(),Path(os.environ['PROBE_FILES']),'http://collector.invalid')
+        def check(store):
             with store.pool.connection() as c:
                 row=c.execute('SELECT platform,synthetic FROM accounts WHERE id=%s',(cfg['account'],)).fetchone()
                 if not row or row['platform']!='whatsapp' or row['synthetic']:raise RuntimeError('live_account_required')
+        store=await session_claim.open_waiting(open_store,check,cfg['account'])  # a database outage at start waits
+        try:
             claim=await session_claim.acquire_waiting(store.pool,host,'collector') if native else None
             live_writer=(BlobWriter(store.files,max_bytes=cfg['media_live_max_bytes'],
                 reserve_bytes=cfg['media_live_disk_reserve_bytes'])
@@ -899,14 +903,15 @@ async def run_config(path):
                 live_window_seconds=cfg['media_live_window_seconds'],
                 gap_repair=cfg['whatsapp_gap_repair'],
                 writer=BlobWriter(store.files,max_bytes=cfg['max_media_bytes'],reserve_bytes=cfg['media_disk_reserve_bytes']))
-            if claim is not None: worker.session_claim=(store.pool,claim)
+            if claim is not None:
+                worker.session_claim=(store.pool,claim)
+                async def release_claim():
+                    # Only after the child was reaped and a fresh descriptor proves no descendant holds the lock.
+                    if session_claim.descendants_gone(host): await session_claim.release_bounded(store.pool,claim)
+                worker.release_claim=release_claim
             loop=asyncio.get_running_loop()
             for sig in [signal.SIGTERM,signal.SIGINT]: loop.add_signal_handler(sig,worker.stopping.set)
-            try: await worker.run()
-            finally:
-                # Release only after the child was reaped and a fresh descriptor proves no descendant holds the lock.
-                if claim is not None and worker.disconnect_verified and session_claim.descendants_gone(host):
-                    await asyncio.to_thread(session_claim.release,store.pool,claim)
+            await worker.run()
         finally:store.close()
 
 

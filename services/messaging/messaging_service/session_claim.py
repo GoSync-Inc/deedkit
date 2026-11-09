@@ -10,20 +10,21 @@ error never stops a connection; only a positive answer that the row changed is `
 The statements are string constants here, never a `.sql` file: a `.sql` path is a hand-applied change to the
 release planner (scripts/production.py SQL_INVENTORY). ANYM-898's Go caller uses the same text.
 """
-import asyncio,fcntl,logging,os,re,secrets,stat,time
+import asyncio,fcntl,logging,os,re,secrets,stat,threading,time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 from .collector_state import private_session_directory
+from .identifiers import ACCOUNT_RE
 
 LOCK_DIRECTORY=Path('/run/deedkit/session-locks')  # inside the /run/deedkit mount root (production.py MOUNT_ROOTS)
 BOOT_ID=Path('/proc/sys/kernel/random/boot_id')
 CLAIM_FD_ENV='ANYMSG_SESSION_CLAIM_FD'
 REFRESH_SECONDS=60
+RELEASE_WAIT_S,RELEASE_BOUND_S=2,5  # shutdown release: pool wait and statement each, and the whole call
 BACKOFF=(5,300)  # seconds: first wait, ceiling
 LOG_EVERY=3600
-ACCOUNT=re.compile(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}')
 HEX32=re.compile(r'[0-9a-f]{32}')
 KINDS=('collector','pair','holder')
 CODES=('session_already_owned','session_claimed_elsewhere','session_claim_restore_hold','session_claim_lost',
@@ -86,7 +87,9 @@ class Claim:
 
 
 def account_name(account):
-    if not isinstance(account,str) or not ACCOUNT.fullmatch(account): raise RuntimeError('live_account_required')
+    # The canonical account form; a leading dot would name `.`, `..` or a hidden file as the lock.
+    if not isinstance(account,str) or not ACCOUNT_RE.fullmatch(account) or account.startswith('.'):
+        raise RuntimeError('live_account_required')
     return account
 
 
@@ -190,12 +193,32 @@ def refresh(pool,claim):
 
 
 def release(pool,claim):
-    """Call only after verified disconnect. Best effort: a failure keeps the row (the same kernel reacquires)."""
+    """Call only after verified disconnect. Best effort: a failure keeps the row (the same kernel reacquires).
+    Bounded for the shutdown grace: at most RELEASE_WAIT_S for a pool connection and as much for the statement."""
     try:
-        with pool.connection() as c:
+        with pool.connection(timeout=RELEASE_WAIT_S) as c:
+            c.execute(f"SET LOCAL statement_timeout='{int(RELEASE_WAIT_S*1000)}ms'")
             return c.execute(RELEASE_SQL,(claim.account,claim.generation,claim.holder_id)).rowcount==1
     except Exception:
         log.warning('session_claim.release_failed account=%s generation=%s',claim.account,claim.generation)
+        return False
+
+
+async def release_bounded(pool,claim,*,seconds=None):
+    """The shutdown's release (criterion 6): right after the verified disconnect and before any other cleanup, never
+    longer than RELEASE_BOUND_S (15 s disconnect + this stays inside the 25 s stop grace). A timeout keeps the row.
+    The call runs in a daemon thread, not the loop's executor, so a hung database never holds the process exit."""
+    loop=asyncio.get_running_loop(); done=loop.create_future()
+    def settle(result):
+        if not done.done(): done.set_result(result)
+    def work():
+        result=release(pool,claim)
+        try: loop.call_soon_threadsafe(settle,result)
+        except RuntimeError: pass  # the loop already ended: the bound had passed
+    threading.Thread(target=work,name='session-claim-release',daemon=True).start()
+    try: return await asyncio.wait_for(done,seconds or RELEASE_BOUND_S)
+    except asyncio.TimeoutError:
+        log.warning('session_claim.release_timeout account=%s generation=%s',claim.account,claim.generation)
         return False
 
 
@@ -208,6 +231,27 @@ def database_error(exc):
     import psycopg
     from psycopg_pool import PoolTimeout
     return isinstance(exc,(psycopg.Error,PoolTimeout))
+
+
+async def open_waiting(open_store,check,account,*,sleep=asyncio.sleep,clock=time.monotonic):
+    """The collector's store and its account check before any claim or session store (criterion 3): a database outage
+    at start waits in-process with the same backoff, never a crash loop; any other error (live_account_required)
+    raises at once. A store whose check failed is closed before the next try."""
+    delay,logged=BACKOFF[0],None
+    while True:
+        store=None
+        try:
+            store=await asyncio.to_thread(open_store)
+            await asyncio.to_thread(check,store)
+            return store
+        except Exception as exc:
+            if store is not None: store.close()
+            if not database_error(exc): raise
+            error=type(exc).__name__
+        now=clock()
+        if logged is None or now-logged>=LOG_EVERY:
+            log.warning('session_claim.store_waiting account=%s error=%s',account,error); logged=now
+        await sleep(delay); delay=min(BACKOFF[1],delay*2)
 
 
 async def acquire_waiting(pool,lock,kind,*,sleep=asyncio.sleep,clock=time.monotonic):

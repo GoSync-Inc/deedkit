@@ -2139,6 +2139,76 @@ def test_the_session_services_and_containers_without_a_session_store_pass_the_op
 
 
 # spec: ANYM-914
+@pytest.mark.parametrize("case", ["no_lock_mount", "short_grace", "installed"])
+def test_a_claim_release_onto_host_compose_files_without_the_lock_mount_or_the_grace_refuses_before_any_stop(
+        tmp_path, monkeypatch, case):
+    host = SessionHost(tmp_path, monkeypatch)
+    host.files[p.SESSION_CLAIM] = ("100644", "CLAIMS = 1\n")  # the release carries the claim
+    for service in KEEP_COLLECTORS:
+        unit = host.units[service]
+        unit["stop_grace_period"] = "10s" if case == "short_grace" else "25s"
+        if case == "no_lock_mount":  # the host's pre-claim Compose files: a release never edits them
+            unit["volumes"] = [volume for volume in unit["volumes"] if volume["target"] != p.SESSION_LOCKS]
+    host.write_compose()
+    if case == "installed":
+        assert host.release(RELEASES[0])["status"] == "applied"
+        return
+    host.main = RELEASES[0]
+    with pytest.raises(p.Refused, match="session_locks_unmounted: session service"):
+        p.prepare(host.settings, RELEASES[0])
+    assert host.stopped() == [] and not (host.state / RELEASES[0] / "prepared.json").exists()
+
+
+# spec: ANYM-914
+@pytest.mark.parametrize("case", ["named_volume", "deep_copy", "too_large"])
+def test_a_foreign_container_with_a_session_store_in_a_volume_deeper_down_or_unsearchable_refuses_the_release(
+        tmp_path, monkeypatch, case):
+    host = SessionHost(tmp_path, monkeypatch)
+    monkeypatch.setattr(p, "SESSION_SCAN_ENTRIES", 8)
+    if case == "named_volume":  # a legacy container whose named volume holds a copied session
+        volume = tmp_path / "volumes" / "legacy_tg" / "_data"
+        volume.mkdir(parents=True)
+        (volume / "copied.session").write_text("")
+        host.others.append({"Id": "other-volume", "Name": "/other-volume", "Image": OLD_IMAGE, "State": {"Running": True},
+                            "Config": {"Labels": {}}, "Mounts": [{"Type": "volume", "Name": "legacy_tg",
+                                                                  "Source": str(volume), "Destination": "/data"}]})
+    elif case == "deep_copy":  # three levels down, past the two levels a configured service's mount is searched
+        (host.private / "backup" / "2026" / "tg").mkdir(parents=True)
+        (host.private / "backup" / "2026" / "tg" / "copied.session").write_text("")
+        host.other("other-deep", host.private / "backup")
+    else:  # more entries than the search may read: ownership cannot be established, so it refuses
+        (host.private / "bulk").mkdir()
+        for n in range(20):
+            (host.private / "bulk" / f"{n}.bin").write_text("")
+        host.other("other-bulk", host.private / "bulk")
+    host.main = RELEASES[0]
+    p.prepare(host.settings, RELEASES[0])
+    with pytest.raises(p.Refused, match="foreign_session_opener: container " + host.others[0]["Id"]):
+        p.apply(host.settings, RELEASES[0])
+    assert host.stopped() == [] and not (host.state / RELEASES[0] / "attempted.json").exists()
+
+
+# spec: ANYM-914
+def test_a_large_foreign_mount_passes_when_exempted_and_a_configured_services_data_path_is_not_searched(
+        tmp_path, monkeypatch):
+    host = SessionHost(tmp_path, monkeypatch)
+    monkeypatch.setattr(p, "SESSION_SCAN_ENTRIES", 8)
+    for name in ("bulk", "files"):
+        (host.private / name).mkdir()
+        for n in range(20):
+            (host.private / name / f"{n}.bin").write_text("")
+    host.other("other-bulk", host.private / "bulk")
+    host.other("other-files", host.private / "files")  # e.g. a file-lifecycle worker on the archive's files volume
+    service = next(service for service in KEEP_SERVICES if service not in KEEP_COLLECTORS)
+    host.units[service].setdefault("volumes", []).append(
+        {"type": "bind", "source": str(host.private / "files"), "target": "/data"})
+    host.write_compose()
+    host.settings["session_scan_exempt"] = [str(host.private / "bulk")]
+    assert host.release(RELEASES[0])["status"] == "applied"
+    assert sorted(host.stopped()) == sorted(KEEP_SERVICES)
+
+
+# spec: ANYM-914
 def test_after_a_claim_release_ran_healthy_a_rollback_to_a_tree_without_claims_is_refused_unless_a_reason_is_given(
         tmp_path, monkeypatch):
     host = KeepHost(tmp_path, monkeypatch)

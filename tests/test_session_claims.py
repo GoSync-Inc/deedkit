@@ -178,6 +178,19 @@ def test_database_down_at_acquire_refuses_and_while_held_never_stops(locks):
 
 
 # spec: ANYM-914
+def test_the_shutdown_release_is_bounded_and_a_timeout_keeps_the_row(seeded,locks):
+    import time
+    store,*_=seeded; directory,boot=locks
+    with held(directory,boot) as lock: claim=sc.acquire(store.pool,lock,'collector')
+    class Hung:
+        def connection(self,timeout=None): time.sleep(3); raise psycopg.OperationalError('synthetic')
+    started=time.monotonic()
+    assert asyncio.run(sc.release_bounded(Hung(),claim,seconds=0.3)) is False
+    assert time.monotonic()-started<2 and claims(store)[0]['released_at'] is None
+    assert asyncio.run(sc.release_bounded(store.pool,claim)) is True and claims(store)[0]['released_by']=='holder'
+
+
+# spec: ANYM-914
 def test_positive_change_is_session_claim_lost(seeded,locks):
     store,*_=seeded; directory,boot=locks
     with held(directory,boot) as lock: claim=sc.acquire(store.pool,lock,'collector')
@@ -225,6 +238,128 @@ def test_telegram_run_config_with_a_foreign_row_opens_no_session_store(seeded,lo
     assert claims(store)[0]['waiting_host_id'] is not None
 
 
+def telegram_entry(monkeypatch,tmp_path,directory,boot,store_factory,module='telegram_collector'):
+    """A Telegram opener (`run_config` or `pair_config`) on a private synthetic session; the provider fails the test."""
+    import importlib
+    tc=importlib.import_module('messaging_service.'+module)
+    sessions=tmp_path/'sessions'; sessions.mkdir(mode=0o700,exist_ok=True)
+    session=sessions/'telegram.session'; session.write_bytes(b'FAKE'); session.chmod(0o600)
+    monkeypatch.setattr(tc,'configuration',lambda _:({'account':ACCOUNT,'session_file':str(session),
+        'session_lock_directory':str(directory)},{}))
+    monkeypatch.setattr(sc,'BOOT_ID',boot)
+    monkeypatch.setattr(tc,'Store',store_factory)
+    monkeypatch.setattr(tc,'TelethonProvider',lambda *_,**__: pytest.fail('session store opened'))
+    if module=='telegram_pair': monkeypatch.setattr(tc,'require_owner_terminal',lambda: None)
+    dsn=tmp_path/'synthetic.dsn'; dsn.write_text('unused')
+    monkeypatch.setenv('DATABASE_URL_FILE',str(dsn)); monkeypatch.setenv('PROBE_FILES','/unused')
+    return tc,session
+
+
+# spec: ANYM-914
+def test_database_down_at_start_waits_before_the_claim_and_never_crash_loops(locks,tmp_path,monkeypatch):
+    from psycopg_pool import PoolTimeout
+    directory,boot=locks; opened=[]
+    def outage(*_): opened.append(1); raise PoolTimeout('synthetic outage')
+    tc,_=telegram_entry(monkeypatch,tmp_path,directory,boot,outage)
+    real,delays=sc.open_waiting,[]
+    monkeypatch.setattr(sc,'open_waiting',lambda *a: real(*a,sleep=stopping_sleep(3,delays)))
+    with pytest.raises(Stop): asyncio.run(tc.run_config('/unused/synthetic.json'))
+    # Three waits inside one process (no exit for Compose to restart), no claim and no session store opened.
+    assert delays==[5,10,20] and len(opened)==3
+    # A store whose account check fails on the outage is closed before the next try; a refusal is not waited out.
+    closed,checks=[],[]
+    def check(store):
+        checks.append(1)
+        raise psycopg.OperationalError('synthetic') if len(checks)==1 else RuntimeError('live_account_required')
+    with pytest.raises(RuntimeError,match='live_account_required'):
+        asyncio.run(real(lambda: NS(close=lambda: closed.append(1)),check,ACCOUNT,sleep=stopping_sleep(9,[])))
+    assert len(closed)==2 and len(checks)==2
+
+
+# spec: ANYM-914
+def test_telegram_pairing_with_a_foreign_row_is_refused_at_once_and_opens_no_session_store(seeded,locks,tmp_path,
+                                                                                          monkeypatch):
+    store,*_=seeded; directory,boot=locks
+    other=tmp_path/'other-host'; other.mkdir(mode=0o700)
+    with held(other,boot) as lock: sc.acquire(store.pool,lock,'collector')
+    with store.pool.connection() as c: c.execute("UPDATE accounts SET synthetic=false WHERE id=%s",(ACCOUNT,))
+    tc,_=telegram_entry(monkeypatch,tmp_path,directory,boot,lambda *_: NS(pool=store.pool,close=lambda:None),
+                        module='telegram_pair')
+    with pytest.raises(RuntimeError,match='session_claimed_elsewhere'): asyncio.run(tc.pair_config('/unused/synthetic.json'))
+    row=claims(store)[0]
+    assert row['generation']==1 and row['holder_kind']=='collector' and row['released_at'] is None
+
+
+# spec: ANYM-914
+@pytest.mark.parametrize('entry',['collector','pair'])
+def test_native_whatsapp_openers_with_a_foreign_row_spawn_no_child(seeded,locks,tmp_path,monkeypatch,entry):
+    from messaging_service import whatsapp_collector as wa, whatsapp_pair as wp
+    store,*_=seeded; directory,boot=locks; account='whatsapp-demo-1'
+    other=tmp_path/'other-host'; other.mkdir(mode=0o700)
+    with held(other,boot,account) as lock: sc.acquire(store.pool,lock,'collector')
+    with store.pool.connection() as c: c.execute("UPDATE accounts SET synthetic=false WHERE id=%s",(account,))
+    sessions=tmp_path/'wa'; sessions.mkdir(mode=0o700)
+    session=sessions/'whatsapp'; session.mkdir(mode=0o700)
+    (session/'auth.sqlite').write_bytes(b'FAKE'); (session/'auth.sqlite').chmod(0o600)
+    cfg={'account':account,'provider':'whatsmeow','session_directory':str(session),'native_executable':'/bin/false',
+         'session_lock_directory':str(directory)}
+    module=wa if entry=='collector' else wp
+    monkeypatch.setattr(module,'configuration',lambda _: cfg)
+    monkeypatch.setattr(sc,'BOOT_ID',boot)
+    monkeypatch.setattr(module,'Store',lambda *_: NS(pool=store.pool,close=lambda:None))
+    async def spawn(*args,**kwargs): pytest.fail('native child spawned')
+    monkeypatch.setattr(asyncio,'create_subprocess_exec',spawn)
+    dsn=tmp_path/'synthetic.dsn'; dsn.write_text('unused')
+    monkeypatch.setenv('DATABASE_URL_FILE',str(dsn)); monkeypatch.setenv('PROBE_FILES','/unused')
+    if entry=='collector':
+        real=sc.acquire_waiting
+        monkeypatch.setattr(sc,'acquire_waiting',lambda pool,lock,kind: real(pool,lock,kind,sleep=stopping_sleep(1,[])))
+        with pytest.raises(Stop): asyncio.run(wa.run_config('/unused/synthetic.json'))
+    else:
+        monkeypatch.setattr(wp,'require_owner_terminal',lambda: None)
+        with pytest.raises(RuntimeError,match='session_claimed_elsewhere'): asyncio.run(wp.pair_config('/unused/synthetic.json'))
+    row=claims(store)[0]
+    assert row['account']==account and row['generation']==1 and row['released_at'] is None
+
+
+# spec: ANYM-914
+@pytest.mark.parametrize('first',['old','new'])
+def test_an_old_opener_with_only_the_directory_flock_and_a_new_opener_never_both_open_the_store(seeded,locks,tmp_path,
+                                                                                                monkeypatch,first):
+    from messaging_service.collector_state import session_lock
+    store,*_=seeded; directory,boot=locks
+    with store.pool.connection() as c: c.execute("UPDATE accounts SET synthetic=false WHERE id=%s",(ACCOUNT,))
+    tc,session=telegram_entry(monkeypatch,tmp_path,directory,boot,lambda *_: NS(pool=store.pool,close=lambda:None))
+    if first=='old':  # a pre-claim collector: the per-directory flock only, no canonical lock, no row
+        with session_lock(session):
+            with pytest.raises(RuntimeError,match='session_already_owned'): asyncio.run(tc.run_config('/unused/x.json'))
+        assert claims(store)==[]
+    else:  # a new opener holds both locks and the row; an old one meets the directory flock
+        with held(directory,boot) as lock, session_lock(session):
+            sc.acquire(store.pool,lock,'collector')
+            with pytest.raises(RuntimeError,match='session_already_owned'):
+                with session_lock(session): pytest.fail('old opener on a held directory')
+
+
+# spec: ANYM-914
+def test_a_restored_database_holds_a_new_opener_while_the_original_client_keeps_its_claim(seeded,locks,tmp_path,
+                                                                                          monkeypatch):
+    store,*_=seeded; directory,boot=locks
+    original=tmp_path/'original-host'; original.mkdir(mode=0o700)
+    with store.pool.connection() as c: c.execute("UPDATE accounts SET synthetic=false WHERE id=%s",(ACCOUNT,))
+    with held(original,boot) as lock:  # the original environment's client stays connected throughout
+        claim=sc.acquire(store.pool,lock,'collector')
+        # This database is now the restored copy: quarantine_restore marked every row.
+        with store.pool.connection() as c: c.execute('UPDATE session_claims SET restore_hold=true')
+        tc,_=telegram_entry(monkeypatch,tmp_path,directory,boot,lambda *_: NS(pool=store.pool,close=lambda:None))
+        real=sc.acquire_waiting
+        monkeypatch.setattr(sc,'acquire_waiting',lambda pool,lock,kind: real(pool,lock,kind,sleep=stopping_sleep(1,[])))
+        with pytest.raises(Stop): asyncio.run(tc.run_config('/unused/synthetic.json'))
+        row=claims(store)[0]
+        assert row['holder_id']==claim.holder_id and row['generation']==claim.generation and row['restore_hold']
+        assert row['released_at'] is None and row['waiting_host_id'] is not None
+
+
 # spec: ANYM-914
 def test_whatsapp_browser_fallback_refuses_while_claims_are_on(tmp_path,monkeypatch):
     from messaging_service import whatsapp_collector as wa
@@ -237,6 +372,15 @@ def test_whatsapp_browser_fallback_refuses_while_claims_are_on(tmp_path,monkeypa
     wa.refuse_unclaimed_browser({'provider':'whatsmeow','session_lock_directory':str(directory)})
     wa.refuse_unclaimed_browser({'provider':'webjs','session_lock_directory':str(tmp_path/'not-mounted')})
     assert spawned==[]
+
+
+# spec: ANYM-914
+def test_an_override_never_hides_the_canonical_lock_mount_from_the_browser_refusal(tmp_path,monkeypatch):
+    from messaging_service import whatsapp_collector as wa
+    canonical=tmp_path/'run-deedkit-session-locks'; canonical.mkdir(mode=0o700)
+    monkeypatch.setattr(sc,'LOCK_DIRECTORY',canonical)  # the overlay's mount is present
+    with pytest.raises(RuntimeError,match='session_claim_unsupported'):
+        wa.refuse_unclaimed_browser({'provider':'webjs','session_lock_directory':str(tmp_path/'does-not-exist')})
 
 
 # spec: ANYM-914
@@ -272,5 +416,5 @@ def test_sync_status_shows_the_session_owner_only_to_full_detail(seeded,locks):
 # spec: ANYM-914
 def test_collectors_table_names_every_claim_code():
     table=(Path(__file__).parents[1]/'COLLECTORS.md').read_text()
-    for code in (*sc.CODES,'foreign_session_opener','pre_claim_rollback_refused','session_locks_unsafe'):
+    for code in (*sc.CODES,'foreign_session_opener','pre_claim_rollback_refused','session_locks_unsafe','session_locks_unmounted'):
         assert f'| `{code}` |' in table, code

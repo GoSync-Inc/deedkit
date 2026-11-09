@@ -748,6 +748,7 @@ class TelegramCollector:
         self.state=None; self.stopping=asyncio.Event(); self.failed=asyncio.Event()
         # ANYM-914: (pool, Claim) kept by run(); released by run_config only after a verified disconnect.
         self.session_claim=None; self.disconnect_verified=False
+        self.release_claim=None  # ANYM-914: run_config's bounded release, awaited right after a verified disconnect
         self.capture_count=0; self.failure_code=None; self.policy=None
         self.capture_waiters=deque(); self.capture_wait_seconds=CAPTURE_WAIT_SECONDS
         self._dialog_cache=None; self._next_discovery=0; self._history_spool=None
@@ -1449,6 +1450,9 @@ class TelegramCollector:
             try:
                 await asyncio.wait_for(self.provider.disconnect(),15); self.disconnect_verified=True
             except Exception: pass  # an uncertain disconnect keeps the claim row (ANYM-914)
+            if self.disconnect_verified and self.release_claim is not None:
+                # First, before the status and lease cleanup below, so the stop grace covers it (ANYM-914).
+                with suppress(Exception): await self.release_claim()
             if failure is None:
                 with suppress(Exception):
                     gate=await asyncio.to_thread(self.state.connection_gate)
@@ -1770,13 +1774,16 @@ async def run_config(path):
     # File ownership spans client construction, which opens the SQLite session. ANYM-914: the canonical host lock
     # first, then the session flock, then the claim, and only then the TelegramClient (it opens the session store).
     with session_claim.host_lock(cfg.get('account'),cfg.get('session_lock_directory')) as host,session_lock(session):
-        store=Store(Path(os.environ['DATABASE_URL_FILE']).read_text().strip(),
-                    Path(os.environ['PROBE_FILES']),'http://collector.invalid')
-        try:
-            archive=Archive(store)
+        def open_store():
+            return Store(Path(os.environ['DATABASE_URL_FILE']).read_text().strip(),
+                         Path(os.environ['PROBE_FILES']),'http://collector.invalid')
+        def check(store):
             with store.pool.connection() as c:
                 row=c.execute('SELECT platform,synthetic FROM accounts WHERE id=%s',(cfg['account'],)).fetchone()
                 if not row or row['platform']!='telegram' or row['synthetic']: raise RuntimeError('live_account_required')
+        store=await session_claim.open_waiting(open_store,check,cfg['account'])
+        try:
+            archive=Archive(store)
             claim=await session_claim.acquire_waiting(store.pool,host,'collector')
             spool=CaptureSpool(cfg['spool_directory'],reserve_bytes=cfg['disk_reserve_bytes'])
             live_writer=(BlobWriter(store.files,max_bytes=cfg['media_live_max_bytes'],
@@ -1789,12 +1796,11 @@ async def run_config(path):
                 media_backfill=cfg['media_backfill'],
                 writer=BlobWriter(store.files,max_bytes=cfg['max_media_bytes'],reserve_bytes=cfg['media_disk_reserve_bytes']))
             worker.session_claim=(store.pool,claim)
+            # Only a verified disconnect releases (run's finally); a failed or timed-out one keeps the row for this kernel.
+            worker.release_claim=lambda: session_claim.release_bounded(store.pool,claim)
             loop=asyncio.get_running_loop()
             for sig in [signal.SIGTERM,signal.SIGINT]: loop.add_signal_handler(sig,worker.stopping.set)
-            try: await worker.run()
-            finally:
-                # Only a verified disconnect releases; a failed or timed-out one keeps the row for this kernel.
-                if worker.disconnect_verified: await asyncio.to_thread(session_claim.release,store.pool,claim)
+            await worker.run()
         finally: store.close()
 
 

@@ -5,9 +5,15 @@ import fs from 'node:fs';
 import pkg from 'whatsapp-web.js';
 import qr from 'qrcode-terminal';
 process.umask(0o077);
+const SESSION_LOCKS='/run/deedkit/session-locks';
 if(!process.stderr.isTTY)process.exit(1);
 console.log=console.warn=console.error=()=>{};
 const cfg=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
+// ANYM-914: the browser fallback is not claimed; it never starts where the canonical session lock directory (or
+// the configured one) exists, also when run directly rather than through the Python parent's refusal.
+if([SESSION_LOCKS,cfg.session_lock_directory].some(p=>typeof p==='string'&&fs.existsSync(p))){
+  process.stderr.write('session_claim_unsupported\n');process.exit(1);
+}
 const pairing=createPairingCoordinator({expectedWid:cfg.expected_wid,
   createClient:()=>recoverNavigation(new pkg.Client({
     authStrategy:new pkg.LocalAuth({dataPath:cfg.session_directory}),

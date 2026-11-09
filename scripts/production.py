@@ -1539,7 +1539,9 @@ def prepare(settings, sha):
         snapshots.append({"project": project, "before": document, "reference": reference, "running": running,
                           "labels": labels})
     # ANYM-914: the lock directory exists before the inputs below are hashed and before apply stops anything.
-    provide_session_locks(item["before"]["services"][service] for item in snapshots for service in item["project"]["services"])
+    provide_session_locks(((service, item["before"]["services"][service]) for item in snapshots
+                           for service in item["project"]["services"]),
+                          required=(source / SESSION_CLAIM).is_file())
     images = {}
     targets = sorted({target for project in settings["projects"] for target in project["services"].values()})
     # Every CI-published target is resolved and attested before the first pull.
@@ -1933,6 +1935,8 @@ def check_kept(release, sha, receipt, evidence, touched, project, item):
 SESSION_LOCKS = "/run/deedkit/session-locks"
 SESSION_OWNER = (10001, 10001)  # deploy/compose.collectors.yaml and compose.whatsapp.yaml `user: "10001:10001"`
 SESSION_CLAIM = MESSAGING_PACKAGE + "/session_claim.py"
+SESSION_GRACE_S = 20  # above the collectors' 15 s disconnect bound; the overlays set 25 s
+SESSION_SCAN_DEPTH, SESSION_SCAN_ENTRIES = 4, 20000  # foreign_session_opener: levels and entries per foreign mount
 CLAIM_RECORD = "session-claims.json"  # the first release carrying SESSION_CLAIM that this state recorded `applied`
 
 
@@ -1941,9 +1945,14 @@ def binds(unit):
             if isinstance(volume, dict) and volume.get("type") == "bind" and str(volume.get("source", "")).startswith("/")]
 
 
-def session_store(path, depth=2):
+class ScanBudget(Exception):
+    """A foreign mount too large to search within SESSION_SCAN_ENTRIES: ownership cannot be established."""
+
+
+def session_store(path, depth=2, budget=None):
     """Whether a host path holds a session store: it or an entry at most `depth` levels below is a Telegram `*.session`
-    file, a WhatsApp `auth.sqlite` or a whatsapp-web.js profile directory (`session`, `session-*`). Unreadable counts."""
+    file, a WhatsApp `auth.sqlite` or a whatsapp-web.js profile directory (`session`, `session-*`). Unreadable counts.
+    `budget`, a one-item list, counts the entries left; it raises ScanBudget when it runs out."""
     name = os.path.basename(path)
     if name.endswith(".session") or name == "auth.sqlite" or name != "session-locks" and re.fullmatch(r"session(-.*)?", name):
         return True
@@ -1956,7 +1965,15 @@ def session_store(path, depth=2):
         return False
     except OSError:
         return True
-    return any(session_store(entry, depth - 1) for entry in found)
+    if budget is not None:
+        budget[0] -= len(found)
+        if budget[0] < 0:
+            raise ScanBudget(path)
+    return any(session_store(entry, depth - 1, budget) for entry in found)
+
+
+def under(path, roots):
+    return any(path == root or path.startswith(root.rstrip("/") + "/") for root in roots)
 
 
 def started_units(settings, receipt, documents):
@@ -1968,40 +1985,95 @@ def started_units(settings, receipt, documents):
 
 def check_session_openers(settings, documents, started):
     """`foreign_session_opener` (ANYM-914 criterion 6): before a release starts a session service, no running, paused or
-    restarting container mounts a configured session directory, or any bind source holding a session store, unless it is
-    that directory's Compose service container (not a one-off `run`, not another project, not a copied directory)."""
+    restarting container mounts a configured session directory, or any mount source (bind or volume) holding a session
+    store, unless it is that directory's Compose service container (not a one-off `run`, not another project, not a
+    copied directory). A configured service's own mounts are DeedKit's data paths (searched two levels, as before); every
+    other container's mounts are searched SESSION_SCAN_DEPTH levels outside those paths, and one too large to search
+    within SESSION_SCAN_ENTRIES refuses too (fail closed) unless `session_scan_exempt` in the production settings names
+    it: absolute host paths an agent read and found to hold no session store."""
     if not any(os.path.basename(source).endswith("-session") for _, _, unit in started for source, _ in binds(unit)):
         return
-    owners = {}
+    owners, configured = {}, set()
     for project in settings["projects"]:
         for service, unit in documents[project["name"]]["services"].items():
+            configured.add((project["name"], service))
             for source, _ in binds(unit):
                 if os.path.basename(source).endswith("-session"):
                     owners.setdefault(os.path.realpath(source), set()).add((project["name"], service))
+    exempt = [os.path.realpath(path) for path in settings.get("session_scan_exempt") or []
+              if isinstance(path, str) and path.startswith("/")]
     containers = run(["docker", "ps", "--all", "--quiet", "--no-trunc"]).split()
-    for actual in json.loads(run(["docker", "inspect", *containers])) if containers else []:
-        condition, labels = actual.get("State") or {}, (actual.get("Config") or {}).get("Labels") or {}
-        if not (condition.get("Running") or condition.get("Paused") or condition.get("Restarting")):
-            continue
-        who = (None if labels.get("com.docker.compose.oneoff") == "True" else
-               (labels.get("com.docker.compose.project"), labels.get("com.docker.compose.service")))
+    found = [actual for actual in (json.loads(run(["docker", "inspect", *containers])) if containers else [])
+             if any((actual.get("State") or {}).get(key) for key in ("Running", "Paused", "Restarting"))]
+    def who(actual):
+        labels = (actual.get("Config") or {}).get("Labels") or {}
+        return (None if labels.get("com.docker.compose.oneoff") == "True" else
+                (labels.get("com.docker.compose.project"), labels.get("com.docker.compose.service")))
+    # DeedKit's data paths: what the configured services' own containers mount, but a session directory.
+    data = {os.path.realpath(mount.get("Source")) for actual in found if who(actual) in configured
+            for mount in actual.get("Mounts") or [] if mount.get("Source")} - set(owners)
+    for actual in found:
+        owner, name = who(actual), str(actual.get("Name", "")).lstrip("/")
+        condition = "paused" if (actual.get("State") or {}).get("Paused") else "running"
         for mount in actual.get("Mounts") or []:
-            source = os.path.realpath(mount.get("Source") or "/")
-            if mount.get("Type") != "bind" or who in owners.get(source, ()) or (
-                    source not in owners and not session_store(source)):
+            if not mount.get("Source") or mount.get("Type") not in ("bind", "volume"):
                 continue
-            what = "a configured session directory" if source in owners else "a session store"
-            raise Refused(f"foreign_session_opener: container {str(actual.get('Name', '')).lstrip('/')} "
-                          f"({str(actual.get('Id', ''))[:12]}, {'paused' if condition.get('Paused') else 'running'}) "
+            source = os.path.realpath(mount["Source"])
+            if source in owners:
+                if owner in owners[source]:
+                    continue
+                what = "a configured session directory"
+            elif owner in configured:
+                if mount.get("Type") != "bind" or not session_store(source):
+                    continue
+                what = "a session store"
+            else:
+                if under(source, data) or under(source, exempt):
+                    continue
+                try:
+                    if not session_store(source, SESSION_SCAN_DEPTH, [SESSION_SCAN_ENTRIES]):
+                        continue
+                    what = "a session store"
+                except ScanBudget:
+                    what = (f"a mount too large to search for a session store (over {SESSION_SCAN_ENTRIES} entries "
+                            f"within {SESSION_SCAN_DEPTH} levels; read it, then list it in session_scan_exempt)")
+            raise Refused(f"foreign_session_opener: container {name} ({str(actual.get('Id', ''))[:12]}, {condition}) "
                           f"mounts {source}, {what}, and is not that directory's Compose service container; stop or "
                           "remove it before the release (two clients on one session break it)")
 
 
-def provide_session_locks(units):
+def grace_seconds(value):
+    """Compose's `stop_grace_period` (`25s`, `1m30s`, or a number of seconds) in seconds; None when absent or unread."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    parts = re.findall(r"(\d+(?:\.\d+)?)(ms|us|ns|h|m|s)", str(value or ""))
+    if not parts or "".join(a + b for a, b in parts) != str(value):
+        return None
+    scale = {"h": 3600, "m": 60, "s": 1, "ms": 1e-3, "us": 1e-6, "ns": 1e-9}
+    return sum(float(a) * scale[b] for a, b in parts)
+
+
+def provide_session_locks(named, required=False):
     """ANYM-914 criterion 3: the host directory these units mount at SESSION_LOCKS exists. Created once 0700 for
     SESSION_OWNER, by prepare before it hashes the inputs (a directory that appears changes them) and checked again by
     apply before its first stop; an existing one is never changed: refused unless it is that owner's private directory
-    (no symlink, no group or other access)."""
+    (no symlink, no group or other access). `required` (the release carries SESSION_CLAIM): every unit with a session
+    directory bind also binds SESSION_LOCKS and stops with a grace above the 15 s disconnect bound, else
+    `session_locks_unmounted` before anything stops (the host's Compose files are its own; a release never edits them)."""
+    named = list(named)
+    units = [unit for _, unit in named]
+    if required:
+        for service, unit in named:
+            if not any(os.path.basename(source).endswith("-session") for source, _ in binds(unit)):
+                continue
+            if not any(posixpath.normpath(target) == SESSION_LOCKS for _, target in binds(unit)):
+                raise Refused(f"session_locks_unmounted: session service {service} "
+                              f"does not bind {SESSION_LOCKS}; install the host Compose change of this release first "
+                              "(production.md, Session claim guards); nothing was stopped")
+            if (grace_seconds(unit.get("stop_grace_period")) or 0) < SESSION_GRACE_S:
+                raise Refused(f"session_locks_unmounted: session service {service} "
+                              f"has stop_grace_period {unit.get('stop_grace_period')!r}, below {SESSION_GRACE_S}s; "
+                              "install the host Compose change of this release first; nothing was stopped")
     for path in sorted({source for unit in units for source, target in binds(unit)
                         if posixpath.normpath(target) == SESSION_LOCKS}):
         try:
@@ -2111,7 +2183,7 @@ def apply(settings, sha, *, backup_waited=0, pre_claim=None):
     # ANYM-914: no other opener holds a session this release starts, and the lock directory exists before any stop.
     started = started_units(settings, receipt, documents)
     check_session_openers(settings, documents, started)
-    provide_session_locks(unit for _, _, unit in started)
+    provide_session_locks(((service, unit) for _, service, unit in started), required=(release / "source" / SESSION_CLAIM).is_file())
     write(release / "attempted.json", {"sha": sha, "ci": evidence, "status": "applying"})
     started, touched = {}, []
     for project, item in zip(settings["projects"], receipt["projects"], strict=True):

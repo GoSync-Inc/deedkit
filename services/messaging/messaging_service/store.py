@@ -340,7 +340,10 @@ class Store:
                     'keepalives': 1, 'keepalives_idle': 30, 'keepalives_interval': 10,
                     'keepalives_count': 3, 'tcp_user_timeout': 30000,
                     'options': '-c statement_timeout=5000 -c timezone=UTC'})
-        self.pool.wait(timeout=10)
+        try: self.pool.wait(timeout=10)
+        except BaseException:
+            self.pool.close()  # ANYM-914: a caller that retries the start never leaks the pool's workers
+            raise
 
     def close(self):
         self.pool.close()
