@@ -553,6 +553,15 @@ class Archive:
                         ELSE excluded.metadata END,
                     observed_at=clock_timestamp()''',
                     (Jsonb(e['metadata']),mid,updated))
+            group=(e.get('metadata') or {}).get('group_change')
+            if outcome=='created' and group and group['change'] in ('rename','joined_group') and group['value']:
+                # ANYM-869: the chat title follows the newest rename or join. An older one (a synced
+                # history stub) never overwrites it; a group the owner joined gets its name at once.
+                c.execute('''UPDATE chats SET title=%s,chat_type=coalesce(chat_type,'group') WHERE id=%s
+                    AND NOT EXISTS(SELECT 1 FROM messages m JOIN message_metadata md ON md.message=m.id
+                        WHERE m.account=%s AND m.chat=%s AND m.sent_at>%s AND m.id<>%s
+                        AND md.metadata->'group_change'->>'change' IN ('rename','joined_group'))''',
+                    (group['value'][:512],cid,aid,cid,e['sent_at'],mid))
             # Publish only after this observation's validated native metadata is
             # present. The event trigger snapshots this exact revision once.
             if outcome in ('created','edited','deleted'):

@@ -1040,6 +1040,126 @@ def test_session_whose_parent_is_a_file_fails_with_the_privacy_code(tmp_path,mon
     assert parent.read_bytes()==b'FAKE'
 
 
+WA_GROUP='120363000000000009@g.us'
+
+
+def wa_capture(mid,at,*,body='',kind='chat',group=None,actor='333333@c.us',origin='live'):
+    """The whatsmeow adapter's envelope (capture.go groupChangeEnvelope / NormalizeMessage), synthetic only."""
+    import hashlib
+    event={'chatId':WA_GROUP,'chatName':WA_GROUP,'messageId':mid,'messageType':kind,'timestampResolution':'second',
+        'durationSeconds':None,'isService':kind!='chat','isSelfChat':False,'senderId':actor or '','senderName':'','body':body,
+        'timestamp':at,'fromMe':False,'hasMedia':False,'filename':None,'mimetype':None,'filesize':None,'replyToId':None,
+        'mentionsOwner':None,'replyToOwner':None,'forwarded':None,'mediaKind':None,'editedTimestampMs':None,
+        'identityObservations':[],'formatting':{'version':1,'state':'wire_observed','basis':'whatsapp_native_wire',
+            'wire_sha256':hashlib.sha256(body.encode()).hexdigest(),'entities':None,'unsupported_entities':[],
+            'warnings':['syntax_interpretation_unknown']}}
+    if group is not None:event['groupChange']={'actor':actor,'participants':[],'value':None,**group}
+    return {'kind':'whatsapp_event','account':'wa-groups','event':event,'change':'message',
+        'observed_at':'2026-11-09T10:00:00+00:00','origin':origin}
+
+
+def group_capture(change,at,origin='live',**group):
+    return wa_capture(f'group_{WA_GROUP}_{at}_{change}',at,kind='group_change',group={'change':change,**group},origin=origin)
+
+
+@pytest.fixture
+def wa_groups(seeded):
+    store,_,_=seeded; archive=Archive(store)
+    archive.register('wa-groups','whatsapp','Synthetic WhatsApp',discover=True)
+    epoch=archive.acquire('wa-groups','fixture-owner')
+    state=CollectorState(archive,'wa-groups',('fixture-owner',epoch))
+    key=store.issue_key('wa-groups-reader',['wa-groups'],permissions=['read','subscription-write'],
+        key_permissions=['read','subscription-write'])
+    return state,store,key
+
+
+def wa_chat(store):
+    with store.pool.connection() as c:
+        return c.execute('SELECT title,chat_type FROM chats WHERE id=%s',(stable_id('chat','wa-groups',WA_GROUP),)).fetchone()
+
+
+def wa_rows(store,provider_id):
+    mid=stable_id('msg','wa-groups',WA_GROUP,provider_id)
+    with store.pool.connection() as c:
+        return (c.execute('SELECT count(*) AS n FROM messages WHERE id=%s',(mid,)).fetchone()['n'],
+            c.execute('SELECT metadata FROM message_metadata WHERE message=%s',(mid,)).fetchone(),
+            [(e['kind'],e['origin']) for e in c.execute('SELECT kind,origin FROM events WHERE message=%s ORDER BY id',(mid,))])
+
+
+# spec: ANYM-869
+def test_each_whatsapp_group_change_is_one_service_row_with_one_live_event(wa_groups):
+    state,store,key=wa_groups
+    members=[f'{700000+i}@c.us' for i in range(3)]
+    changes=[('rename',{'value':'Родители 5Б'}),('topic',{'value':'Собрание в пятницу'}),
+        ('join',{'actor':members[0],'participants':members[:1]}),('leave',{'actor':members[0],'participants':members[:1]}),
+        ('add',{'participants':members}),('remove',{'participants':members[1:2]}),
+        ('promote',{'participants':members[2:]}),('demote',{'participants':members[2:]})]
+    for i,(change,group) in enumerate(changes):
+        capture=group_capture(change,1700000100+i,**group)
+        assert state.apply(capture)['outcome']=='created'
+        # A redelivered or replayed capture is a duplicate, never a second row or event.
+        assert state.apply(capture)['outcome']=='duplicate'
+        n,metadata,events=wa_rows(store,capture['event']['messageId'])
+        assert n==1 and events==[('message.created','live')]
+        stored=metadata['metadata']
+        assert stored['message_kind']=='group_change' and stored['is_service'] is True
+        assert stored['group_change']=={'change':change,'actor':group.get('actor','333333@c.us'),
+            'participants':group.get('participants',[]),'value':group.get('value')}
+    chat_id=stable_id('chat','wa-groups',WA_GROUP)
+    # The conversation read hides them like other service rows unless include_system is set.
+    assert store.get_messages(key,chat_id,view='conversation')['items']==[]
+    shown=store.get_messages(key,chat_id,view='conversation',include_system=True)['items']
+    assert len(shown)==len(changes) and {m['message_kind'] for m in shown}=={'group_change'}
+    assert wa_chat(store)['title']=='Родители 5Б'
+
+
+# spec: ANYM-869
+def test_an_older_synced_rename_never_overwrites_the_newer_group_title(wa_groups):
+    state,store,_=wa_groups
+    assert state.apply(group_capture('rename',1700000200,value='Новое имя'))['outcome']=='created'
+    assert wa_chat(store)['title']=='Новое имя'
+    # A history stub of an earlier rename arrives later: its row is kept, the title is not rolled back.
+    assert state.apply(group_capture('rename',1700000100,origin='backfill',value='Старое имя'))['outcome']=='created'
+    assert wa_chat(store)['title']=='Новое имя'
+    assert state.apply(group_capture('rename',1700000300,value='Ещё новее'))['outcome']=='created'
+    assert wa_chat(store)['title']=='Ещё новее'
+
+
+# spec: ANYM-869
+def test_a_joined_group_lists_the_chat_with_its_title_and_members_at_once(wa_groups):
+    state,store,key=wa_groups
+    assert wa_chat(store) is None
+    members=sorted(f'{800000+i}@c.us' for i in range(5))
+    capture=group_capture('joined_group',1700000400,value='Кружок робототехники',participants=members)
+    assert state.apply(capture)['outcome']=='created'
+    chat=wa_chat(store)
+    assert chat['title']=='Кружок робототехники' and chat['chat_type']=='group'
+    _,metadata,events=wa_rows(store,capture['event']['messageId'])
+    assert metadata['metadata']['group_change']['participants']==members and events==[('message.created','live')]
+
+
+# spec: ANYM-869
+def test_group_changes_wake_no_default_subscription_but_a_joined_group_and_other_rows_still_do(wa_groups):
+    from messaging_service.subscriptions import match_subscriptions
+    state,store,key=wa_groups
+    state.apply(wa_capture('false_'+WA_GROUP+'_HELLO',1700000000,body='первое сообщение'))
+    chat_id=stable_id('chat','wa-groups',WA_GROUP)
+    sid=store.create_subscription(key,[chat_id])['subscription_id']
+    members=[f'{900000+i}@c.us' for i in range(300)]
+    state.apply(group_capture('joined_group',1700000500,value='Школа',participants=members))
+    for i in range(50):
+        state.apply(group_capture('add',1700000600+i,participants=[f'{910000+i}@c.us']))
+    # Rows that are no group change keep today's behaviour: a bare notification and a text message wake as before.
+    state.apply(wa_capture('false_'+WA_GROUP+'_NOTE',1700000700,kind='notification'))
+    state.apply(wa_capture('false_'+WA_GROUP+'_TEXT',1700000701,body='второе сообщение'))
+    match_subscriptions(store)
+    items=store.get_subscription_events(key,sid,limit=100)['items']
+    with store.pool.connection() as c:
+        woke=[c.execute('''SELECT m.provider_id FROM events e JOIN messages m ON m.id=e.message WHERE e.id=%s''',
+            (item['event_id'],)).fetchone()['provider_id'] for item in items]
+    assert woke==[f'group_{WA_GROUP}_1700000500_joined_group','false_'+WA_GROUP+'_NOTE','false_'+WA_GROUP+'_TEXT']
+
+
 def test_whatsapp_session_directory_with_shared_parent_is_rejected(tmp_path,monkeypatch):
     from messaging_service import whatsapp_collector as wa
     parent=tmp_path/'sessions'; parent.mkdir(mode=0o700)

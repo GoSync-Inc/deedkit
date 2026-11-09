@@ -246,6 +246,19 @@ func TestNativeGroupInfoChangesAreJournaledOnceEachWithActorAndParticipants(t *t
 	if !p.handleGroupEvent(&settings) || len(groupEntries(t, p.Capture)) != len(cases)+4 || len(skipCounts(t, p.Capture)) != 0 {
 		t.Fatal("settings change archived or counted")
 	}
+	// Two separate adds in one second share the derived ID; the second is kept under its own suffix, once.
+	first := events.GroupInfo{JID: groupJID, Timestamp: time.Unix(1700000400, 0), Sender: &admin, Join: []types.JID{alice}}
+	second := first
+	second.Join = []types.JID{bob}
+	for _, e := range []*events.GroupInfo{&first, &second, &second, &first} {
+		if !p.handleGroupEvent(e) {
+			t.Fatal("handler refused")
+		}
+	}
+	same := groupEntries(t, p.Capture)[len(cases)+4:]
+	if len(same) != 2 || participantsOf(groupChangeOf(t, same[1])) != "555555@c.us" || !strings.HasPrefix(same[1]["event"].(map[string]any)["messageId"].(string), "group_120363000000000009@g.us_1700000400_add_") {
+		t.Fatalf("same-second adds: %d entries", len(same))
+	}
 }
 
 // spec: ANYM-869
@@ -318,8 +331,8 @@ func TestNativeMalformedGroupChangeIsCountedAndTheNextMessageIsCaptured(t *testi
 	p := skipProvider(t)
 	admin := member("333333")
 	for _, bad := range []any{
-		&events.GroupInfo{JID: groupJID, Sender: &admin, Name: &types.GroupName{Name: "x"}},                                                     // no time
-		&events.GroupInfo{JID: member("777777"), Timestamp: time.Unix(1700000600, 0), Sender: &admin, Name: &types.GroupName{Name: "x"}},        // not a group
+		&events.GroupInfo{JID: groupJID, Sender: &admin, Name: &types.GroupName{Name: "x"}},                                                    // no time
+		&events.GroupInfo{JID: member("777777"), Timestamp: time.Unix(1700000600, 0), Sender: &admin, Name: &types.GroupName{Name: "x"}},       // not a group
 		&events.GroupInfo{JID: groupJID, Timestamp: time.Unix(1700000600, 0), Sender: &admin, Join: []types.JID{types.NewJID("bad\x00", "x")}}, // unusable member ID
 		&events.JoinedGroup{},
 	} {
