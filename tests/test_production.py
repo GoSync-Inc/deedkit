@@ -1740,6 +1740,18 @@ def dockerfile_copy_sources(text, target):
     return sources
 
 
+# reads: services/messaging/Dockerfile
+# reads: services/gateway/Dockerfile
+# reads: services/gateway/Dockerfile.dockerignore
+# reads: services/gateway/.dockerignore
+# reads: services/calendar/Dockerfile
+# reads: services/calendar/.dockerignore
+# reads: services/recordings/Dockerfile
+# reads: services/recordings/.dockerignore
+# reads: services/calls/Dockerfile
+# reads: services/calls/.dockerignore
+# reads: services/release-router/Dockerfile
+# reads: .dockerignore
 # spec: ANYM-895
 def test_every_build_target_stage_chain_is_covered_by_the_input_digest():
     entries = p.tree_entries(ROOT)
