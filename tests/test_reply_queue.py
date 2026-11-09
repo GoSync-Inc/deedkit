@@ -233,7 +233,7 @@ def test_owner_read_telegram_subscription_is_optional_and_no_rpc():
     provider.client=SimpleNamespace(add_event_handler=lambda cb,ev:registered.append((cb,ev)))
     owner_read=object()
     provider.subscribe(object(),object(),object(),owner_reads=owner_read)
-    assert len(registered)==5 and registered[-1][0] is owner_read
+    assert len(registered)==6 and registered[-1][0] is owner_read  # 6: with the ANYM-847 service-message handler
     assert types.UpdateReadHistoryInbox in registered[-1][1].types
     assert types.UpdateReadChannelInbox in registered[-1][1].types
 
