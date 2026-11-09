@@ -260,7 +260,8 @@ def test_an_admission_gate_waits_or_pauses_with_no_copy_container_or_production_
         host.calls = ["synthetic-call"]
     elif gate in ("behind", "ahead"):
         host.version = 49 if gate == "behind" else 51
-        host.applied.pop("50") if gate == "behind" else host.applied.update(host.pending)
+        # Ahead of the base but not the candidate's own 051: no hand route explains it.
+        host.applied.pop("50") if gate == "behind" else host.applied.update({"51": sha(b"-- another 051\n")})
     else:
         host.contents[f"{BASE}:{p.STORE_SOURCE}"] = STORE.replace("None", "0").encode()
     outcome = host.deploy()
@@ -272,6 +273,46 @@ def test_an_admission_gate_waits_or_pauses_with_no_copy_container_or_production_
         assert outcome["reason"] == ("the running release would fail on the new columns: deploy #352 first"
                                      if gate == "store" else
                                      "the live messaging ledger is not the base's schema 50; migrate by hand (production.md)")
+
+
+def migrated_by_hand(host):
+    """A person ran the range's migration (production.md "Migration releases" item 4): the live ledger is the target's."""
+    host.version, host.applied = host.target, {**host.applied, **host.pending}
+
+
+# spec: ANYM-449
+def test_a_range_already_migrated_by_hand_releases_with_no_copy_or_migration(tmp_path, monkeypatch):
+    host = MigrationHost(tmp_path, monkeypatch, {"051_synthetic_note.sql": NOTE})
+    migrated_by_hand(host)
+    outcome = host.deploy()
+    assert outcome["status"] == "deployed" and host.paused() is None and host.migration() is None
+    # Admission's one ledger read tells it; the producer pin still follows the target.
+    assert phases(host) == ["live ledger", "producer", "prepare", "apply", "seamless prepare", "seamless promote"]
+
+
+# spec: ANYM-449
+def test_a_copy_refusal_then_a_hand_migration_lets_the_next_run_release_without_a_second_copy(tmp_path, monkeypatch):
+    # 2026-11-09: the 075 copy refused on disk_reserve, 075 was migrated by hand, and the next run halted again.
+    host = MigrationHost(tmp_path, monkeypatch, {"051_synthetic_note.sql": NOTE})
+    host.copy_failure = "disk_reserve"
+    assert host.deploy()["status"] == "halted" and host.migration()["status"] == "refused"
+    migrated_by_hand(host)
+    p.PAUSE.unlink()
+    outcome = host.deploy()
+    assert outcome["status"] == "deployed" and host.paused() is None
+    assert host.events.count("copy") == 1 and "migrate" not in host.events
+    assert [name for name, _ in host.steps].count("prepare") == 1 and ("apply", NEWEST) in host.steps
+
+
+# spec: ANYM-449
+def test_a_hand_migrated_ledger_still_pauses_when_the_range_changes_a_role_file(tmp_path, monkeypatch):
+    host = MigrationHost(tmp_path, monkeypatch, {"051_synthetic_marks.sql": TABLE}, roles={"gateway_role.sql": GRANT})
+    migrated_by_hand(host)
+    outcome = host.deploy()
+    # The ledger shows no grants, so a role change keeps today's pause.
+    assert outcome["status"] == "halted" and host.paused() == outcome["reason"] and host.steps == []
+    assert not {"copy", "migrate", "status"} & set(host.events)
+    assert outcome["reason"] == "the live messaging ledger is not the base's schema 50; migrate by hand (production.md)"
 
 
 # spec: ANYM-449
