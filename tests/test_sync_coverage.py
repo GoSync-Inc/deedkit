@@ -430,6 +430,13 @@ def grow(s):
     """BULK stored originals, half in the group chat, each with its media job; triggers queue their rows."""
     with s.pool.connection() as c:
         c.execute("SET LOCAL statement_timeout='600s'")
+        # register_resident_original() looks attachments up by digest and bytes, which no index covers: each of
+        # the BULK inserts would scan the table (quadratic, over 600 s on a loaded runner). A transaction-local
+        # index turns the setup linear; it is dropped before commit, so the measured plans never see it. The
+        # triggers' cached plans are made from whatever statistics earlier tests left (a one-row attachments
+        # table picks a scan), so the setup also pins index access; the measured transaction keeps the defaults.
+        c.execute('CREATE INDEX grow_attachment_digest ON attachments(digest,bytes)')
+        c.execute("SET LOCAL enable_seqscan=off")
         for provider_chat in ('100', '200'):
             c.execute('''INSERT INTO chats(id,account,title,provider_chat) VALUES(%s,%s,'Fixture room',%s)
                 ON CONFLICT DO NOTHING''', (stable_id('chat', ACCOUNT, provider_chat), ACCOUNT, provider_chat))
@@ -445,6 +452,7 @@ def grow(s):
             SELECT 'bulk-att-'||n,'bulk-msg-'||n,md5(n::text)||md5('x'||n),'bulk-'||n||'.bin',
                 (ARRAY['image/jpeg','audio/ogg','application/pdf'])[1+n%%3],4
             FROM generate_series(1,%s) n''', (BULK,))
+        c.execute('DROP INDEX grow_attachment_digest')
         for table in ('messages', 'media_jobs', 'attachments', 'attachment_text', 'attachment_enrichment',
                       'attachment_residency', 'processing_profiles', 'chats', 'collector_chats'):
             c.execute('ANALYZE ' + table)
