@@ -50,7 +50,9 @@ discovered or typed stays outside the archive, in the collector's
 `deferred-receipts` spool beside the live spool. The drain tries it again at
 most every 10 seconds: it is recorded and its `message.status` is published once
 the chat is stored as a group, dropped if the chat is a channel, and dropped
-after 7 days otherwise. An outbox
+after 7 days otherwise. The spool holds at most 500 boundaries, one retry pass,
+so each pass tries every one; a boundary that finds it full is dropped and
+counted as `receipt_deferred_full`, and collection goes on. An outbox
 update with an unknown peer type is skipped and counted as
 `receipt_peer_unsupported` in `live_capture.rejected_live_captures`. Inbox read
 updates and Saved Messages are excluded. `messenger_reports` below keeps its

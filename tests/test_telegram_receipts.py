@@ -360,6 +360,50 @@ def test_a_deferred_group_boundary_is_kept_retried_and_dropped_after_its_week(tm
     assert len(worker.state.applied) == 4 and deferred() == [] and not worker.failed.is_set()
 
 
+def fresh_group(channel_id):
+    from messaging_service.telegram_receipts import telegram_group_receipt
+    return telegram_group_receipt('tg-fixture', types.UpdateReadChannelOutbox(channel_id, 23),
+        verified_self=types.User(id=42, is_self=True), expected_user_id=42, observed_at=datetime.now(timezone.utc))
+
+
+# spec: ANYM-868
+def test_a_full_deferred_spool_drops_and_counts_the_boundary_and_the_drain_goes_on(tmp_path, monkeypatch):
+    """Sol r3 #1: a put into a full deferred spool never stops the live drain (and with it collection and sends)."""
+    monkeypatch.setattr(telegram_collector, 'DEFERRED_RECEIPT_BATCH', 1)
+    worker = collector(tmp_path)
+    worker.state.apply = lambda item: worker.state.applied.append(item) or {'outcome': 'receipt_deferred'}
+    worker._next_deferred_retry = float('inf')  # no retry pass frees a place in between
+    health = []; worker.state.capture_progress = lambda last, count, pending, **extra: health.append(extra)
+    for channel in (100, 101): worker.spool.put(fresh_group(channel))
+    worker.spool.put(normalize(update()))  # a later private boundary in the same drain
+    asyncio.run(worker.drain_captures([worker.spool]))
+    assert not worker.failed.is_set() and not list(worker.spool.path.glob('*.json'))
+    assert len(list(worker.deferred_receipts.path.glob('*.json'))) == 1
+    assert [item['chat'] for item in worker.state.applied] == ['-1000000000100', '-1000000000101', '100']
+    assert health[-1]['rejected'] == {'receipt_deferred_full': 1}
+
+
+# spec: ANYM-868
+def test_every_retry_pass_visits_every_deferred_boundary(tmp_path, monkeypatch):
+    """Sol r3 #2: the deferred spool holds at most one pass, so a boundary whose chat became a group never waits
+    behind older unresolved ones."""
+    monkeypatch.setattr(telegram_collector, 'DEFERRED_RECEIPT_BATCH', 3)
+    worker = collector(tmp_path); ready = set(); passes = []
+    def apply(item):
+        worker.state.applied.append(item['chat'])
+        return {'outcome': 'receipt_recorded'} if item['chat'] in ready else {'outcome': 'receipt_deferred'}
+    worker.state.apply = apply
+    for channel in (100, 101, 102, 103): worker.spool.put(fresh_group(channel))
+    asyncio.run(worker.drain_captures([worker.spool]))
+    kept = len(list(worker.deferred_receipts.path.glob('*.json')))
+    assert kept == worker.deferred_receipts.max_entries == 3
+    ready.add('-1000000000102'); del worker.state.applied[:]
+    worker._next_deferred_retry = 0; asyncio.run(worker.drain_captures([worker.spool]))
+    passes.append(sorted(worker.state.applied))
+    assert passes == [['-1000000000100', '-1000000000101', '-1000000000102']]
+    assert len(list(worker.deferred_receipts.path.glob('*.json'))) == 2
+
+
 # spec: ANYM-868
 def test_group_receipts_honor_the_chat_policy(tmp_path):
     worker = collector(tmp_path); worker.policy['exclude_chats'] = ['-1000000000100']

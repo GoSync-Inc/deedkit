@@ -79,7 +79,8 @@ and it does not stop the collector. `live_capture.rejected_live_captures`
 counts skipped items, cumulatively, by a code from a fixed vocabulary: the
 validators' own codes (for example `invalid_deleted_ids`),
 `invalid_provider_message`, `receipt_parse_failed`, `read_parse_failed` and
-`receipt_peer_unsupported` (an outbox read boundary with an unknown peer type, ANYM-868).
+`receipt_peer_unsupported` (an outbox read boundary with an unknown peer type, ANYM-868) and
+`receipt_deferred_full` (a group read boundary dropped because the deferred-receipts spool was full).
 Any other text becomes the generic `invalid_capture`. `invalid_provider_message`
 is the live counterpart of `invalid_provider_messages`: the same message counts
 once in each. For a skipped message, `rejected_live_messages` keeps the chat,

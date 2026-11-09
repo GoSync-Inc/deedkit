@@ -696,8 +696,9 @@ class TelegramCollector:
         if getattr(self,'_deferred_receipts',None) is None:
             from .spool import DurableSpool
             live=self.spool
+            # Capacity equals one retry pass, so every pass visits every kept file (no boundary starves another).
             self._deferred_receipts=DurableSpool(live.path/'deferred-receipts',validator=live.validator,
-                max_bytes=live.max_bytes,max_entries=live.max_entries,reserve_bytes=live.reserve_bytes)
+                max_bytes=live.max_bytes,max_entries=DEFERRED_RECEIPT_BATCH,reserve_bytes=live.reserve_bytes)
         return self._deferred_receipts
 
     @property
@@ -1070,8 +1071,12 @@ class TelegramCollector:
                 self.first_live=item
         def defer(item,result):
             # Kept durably before the drain removes the item from its own spool (ANYM-868); an expired one is dropped.
+            # A full deferred spool (or the disk reserve) drops this boundary and counts it: it never stops the drain.
             if isinstance(result,dict) and result.get('outcome')=='receipt_deferred' and not deferred_expired(item):
-                self.deferred_receipts.put(item)
+                try:self.deferred_receipts.put(item)
+                except RuntimeError as exc:
+                    if str(exc) not in ('spool_full','disk_reserve'):raise
+                    self.reject('receipt_deferred_full')
         gap_lock=getattr(getattr(self,'provider',None),'read_gap_lock',None) or nullcontext()
         async with gap_lock:await self.flush_read_gap()
         for spool in spools:await asyncio.to_thread(spool.drain,apply,100)
