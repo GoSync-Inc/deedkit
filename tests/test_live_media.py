@@ -209,6 +209,11 @@ def test_live_claims_go_private_then_small_then_a_recent_burst_oldest_first(arch
     with s.pool.connection() as c:
         c.execute("UPDATE media_jobs SET requested_until=clock_timestamp()+interval '1 hour' WHERE message=%s",
             (order['requested'],))
+        group=c.execute("SELECT id FROM chats WHERE account='archive-test' AND provider_chat='200'").fetchone()['id']
+    # A subscription naming the group keeps its files live instead of on request (ANYM-805).
+    token=s.issue_key('media-watcher',['archive-test'],permissions=['read','subscription-write'],
+        key_permissions=['read','subscription-write'])
+    s.create_subscription(token,[group])
     background,live=burst_writers(s);capacity(monkeypatch,10**13)
     claimed=[]
     while (job:=ar.claim_media('worker',writer=background,live_writer=live)):claimed.append(job['message'])

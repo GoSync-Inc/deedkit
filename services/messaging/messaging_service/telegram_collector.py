@@ -621,9 +621,10 @@ class TelethonProvider:
                     except StopAsyncIteration:break
                     received+=len(chunk)
                     yield chunk
-                    # ANYM-877: Telethon ends the stream after a short part without a request, so that last
-                    # __anext__ takes no admission; a short or long total still fails in the writer.
-                    if len(chunk)<MEDIA_REQUEST_BYTES or expected is not None and received>=expected:break
+                    # ANYM-877: the call after the last part makes no request (Telethon ends after a short part),
+                    # so it takes no admission: the stream ends at the descriptor's size or, size unknown, after a
+                    # short part. A short or long total still fails in the writer.
+                    if received>=expected if expected is not None else len(chunk)<MEDIA_REQUEST_BYTES:break
             finally: await stream.close()
         except FloodWaitError as exc: raise ProviderRateLimited(exc.seconds) from None
         except (FileReferenceExpiredError,FilerefUpgradeNeededError):
