@@ -491,7 +491,7 @@ def test_upgrade_and_rollback_keep_feed_order_and_cursors(schema36_store, monkey
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '69'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '70'
         assert c.execute('SELECT * FROM archive_migrations WHERE version<=36 ORDER BY version').fetchall() == migrations
     assert feed_state(store) == before
     try:
@@ -876,6 +876,51 @@ def test_gateway_role_writes_endpoint_secrets_and_headers_but_never_reads_them(s
             c.execute(sql.SQL('DROP ROLE IF EXISTS {}').format(sql.Identifier(member)))
         remove(store, api_role)
         remove(store, dispatcher_role)
+
+
+def role_grants(store, role):
+    """Every table, column and function privilege the role holds directly."""
+    with store.pool.connection() as c:
+        return {tuple(row.values()) for row in c.execute('''
+            SELECT table_name AS object,'' AS part,privilege_type FROM information_schema.role_table_grants WHERE grantee=%(r)s
+            UNION ALL SELECT table_name,column_name,privilege_type FROM information_schema.column_privileges WHERE grantee=%(r)s
+            UNION ALL SELECT routine_name,specific_name,privilege_type FROM information_schema.routine_privileges
+                WHERE grantee=%(r)s''', {'r': role}).fetchall()}
+
+
+# spec: ANYM-824
+@pytest.mark.parametrize(('template', 'base', 'added'), [
+    ('subscription_role.sql', 'messaging_subscriptions', {'SELECT', 'INSERT', 'UPDATE', 'DELETE'}),
+    ('gateway_role.sql', 'messaging_gateway', {'SELECT'})])
+def test_activity_grants_add_only_the_new_table_to_each_role(seeded, template, base, added):
+    store, _, _ = seeded
+    previous = 'anym824_' + uuid4().hex[:10]
+    with store.pool.connection() as c:
+        c.execute(SOURCE.joinpath(template).read_text().split('-- Schema 70 (ANYM-824)')[0].replace(base, previous))
+    role = install(store, template, base)
+    try:
+        before, after = role_grants(store, previous), role_grants(store, role)
+        # Existing ACLs are unchanged; the only addition is this table, with exactly the named privileges.
+        assert {grant for grant in after if grant[0] != 'subscription_activity'} == before
+        assert {grant[2] for grant in after if grant[0] == 'subscription_activity' and grant[1] == ''} == added
+        token = store.issue_key('activity-acl', ['telegram-demo'], permissions=['read', 'subscription-write'],
+            key_permissions=['read', 'subscription-write'])
+        sid = store.create_subscription(token, ['telegram-demo-chat'])['subscription_id']
+        with as_role(store, role) as c:
+            assert c.execute('SELECT count(*) AS n FROM subscription_activity').fetchone()['n'] == 0
+        writes = [('''INSERT INTO subscription_activity(subscription,day,platform,scope_version,metric,n)
+            VALUES(%s,current_date,'telegram',1,'scanned',1)''', (sid,)),
+            ('UPDATE subscription_activity SET n=n+1', ()), ('DELETE FROM subscription_activity', ())]
+        for statement, params in writes:
+            if base == 'messaging_gateway':
+                # The API reads the counts and never writes them.
+                refused(store, role, statement, params)
+            else:
+                with as_role(store, role) as c:
+                    c.execute(statement, params)
+    finally:
+        remove(store, role)
+        remove(store, previous)
 
 
 # spec: ANYM-519

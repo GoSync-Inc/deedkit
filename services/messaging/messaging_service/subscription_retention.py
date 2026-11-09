@@ -159,7 +159,7 @@ def retire_subscriptions(store, *, max_subscriptions=16):
     from psycopg import errors
     from .store import bounded
     bounded(max_subscriptions, 128)
-    stats = {'hints_deleted': 0, 'rows_deleted': 0, 'tombstoned': 0, 'retire_skipped': 0, 'retire_failed': 0,
+    stats = {'hints_deleted': 0, 'rows_deleted': 0, 'tombstoned': 0, 'retire_skipped': 0, 'retire_failed': 0, 'activity_deleted': 0,
         'more': False}
     gates = ['subscription_retention', _subs.TOMBSTONE_GATE]
     try:
@@ -197,7 +197,37 @@ def retire_subscriptions(store, *, max_subscriptions=16):
         stats['rows_deleted'] += result['rows']
         stats['tombstoned'] += result['tombstoned']
         stats['more'] = stats['more'] or result['more']
+    try:
+        with store.pool.connection() as c:
+            deleted = _prune_activity(c)
+    except errors.UndefinedTable:
+        deleted = None  # Schema before 70: nothing to delete.
+    except Exception as error:
+        from .telemetry import capture
+        capture(error, 'subscription_retention_failed')
+        print(json.dumps({'error': 'subscription_retention_failed', 'class': type(error).__name__}), flush=True)
+        stats['retire_failed'] += 1
+        deleted = None
+    if deleted:
+        stats['activity_deleted'] = deleted
+        stats['more'] = stats['more'] or deleted >= _subs.RETENTION_BATCH
     return stats
+
+
+ACTIVITY_RETENTION_DAYS = 35
+
+
+def _prune_activity(c):
+    """ANYM-824: one bounded batch of per-day matcher counts older than 35 UTC days; a held (quarantine-restored)
+    definition keeps its rows. Same activation, lock and bounds as the other batches; None when retention is off."""
+    if not _subs._retention_batch(c):
+        return None
+    return c.execute('''DELETE FROM subscription_activity a USING (SELECT x.subscription,x.day,x.platform,
+            x.scope_version,x.metric FROM subscription_activity x JOIN subscriptions s ON s.id=x.subscription
+            WHERE NOT s.retention_hold AND x.day<(clock_timestamp() AT TIME ZONE 'UTC')::date-%s LIMIT %s) old
+        WHERE a.subscription=old.subscription AND a.day=old.day AND a.platform=old.platform
+            AND a.scope_version=old.scope_version AND a.metric=old.metric''',
+        (ACTIVITY_RETENTION_DAYS, _subs.RETENTION_BATCH)).rowcount
 
 
 def _delete_hints(c, row, limit, *, days=None):
@@ -288,6 +318,12 @@ def _retire_definition(c, candidate):
             c.execute('''UPDATE subscription_module_streams SET retention_floor=greatest(retention_floor,%s)
                 WHERE subscription=%s''', (max(seqs), row['id']))
         budget -= len(seqs)
+    if budget > 0 and _subs.activity_ready(c):
+        # ANYM-824: the tombstone keeps no per-day counts; the parent row stays, so they go explicitly.
+        budget -= c.execute('''DELETE FROM subscription_activity a USING (SELECT day,platform,scope_version,metric
+            FROM subscription_activity WHERE subscription=%s LIMIT %s) old WHERE a.subscription=%s AND a.day=old.day
+            AND a.platform=old.platform AND a.scope_version=old.scope_version AND a.metric=old.metric''',
+            (row['id'], budget, row['id'])).rowcount
     result['rows'] = _subs.RETENTION_BATCH - budget
     # Each DELETE took up to the budget left, so a batch with budget left drained both reference tables.
     # Receipts (at most 128 per definition) and consumption count toward the batch too; a fresh batch takes them.

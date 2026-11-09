@@ -3511,7 +3511,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "Read your definition, lifecycle/version and archive matcher boundary.\n\nmatcher_caught_up covers committed archive events, not live-provider freshness,\ncomplete history, downloaded originals or completed file processing. Use chat\nget_sync_status and file tools for those independent states. No ACK or push.\ndelivery.lag: unfinished push hints, the oldest one's age and seconds to the next attempt.\npositions: acked_through, fetched_through (highest retained receipt), open_receipts,\noldest_open_receipt_expires_at, expired_unacked; the server cannot know your local cursor.\n",
+      "description": "Read your definition, lifecycle/version and archive matcher boundary.\n\nmatcher_caught_up covers committed archive events, not live-provider freshness,\ncomplete history, downloaded originals or completed file processing. Use chat\nget_sync_status and file tools for those independent states. No ACK or push.\ndelivery.lag: unfinished push hints, the oldest one's age and seconds to the next attempt.\npositions: acked_through, fetched_through (highest retained receipt), open_receipts,\noldest_open_receipt_expires_at, expired_unacked; the server cannot know your local cursor.\nactivity.days: the last 7 UTC days, oldest first, per platform: scanned, matched, left_out_<reason>\n(first rejecting rule), match_budget_blocked, matched_failure. Numbers only, current scope version only;\nmatched counts references kept, not model runs; no cost figure (compare equal periods).\n",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {

@@ -66,3 +66,6 @@ GRANT SELECT(principal,key_id,status,account,chat,provider_chat,provider_message
     ON outgoing_messages TO messaging_subscriptions;
 GRANT SELECT(account,chat,provider_id,sender,direction,deleted) ON messages TO messaging_subscriptions;
 GRANT SELECT(id,platform) ON accounts TO messaging_subscriptions;
+-- Schema 70 (ANYM-824): the matcher adds per-day counts (numbers, platform names, UTC days); retention deletes old and
+-- retired rows. Only this table.
+GRANT SELECT,INSERT,UPDATE,DELETE ON subscription_activity TO messaging_subscriptions;

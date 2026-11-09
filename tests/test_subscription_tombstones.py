@@ -294,9 +294,13 @@ def test_injected_failure_mid_batch_rolls_back_and_bounded_batches_resume(seeded
     # A reader between batches gets the gap up to the moved floor, never a hole.
     assert store.get_subscription_events(token, sid)['subscription']['gap']['through'] == events[1]
     assert retire_subscriptions(store)['rows_deleted'] == 2 and floor(store, sid) == events[3]
-    # The receipt and the consumption row count toward the bound: they wait for a fresh batch.
+    # The last reference and one of the two per-day activity rows (ANYM-824: today's scanned and matched) fill
+    # this batch; the other activity row the next one.
     fourth = retire_subscriptions(store)
-    assert (fourth['rows_deleted'], fourth['tombstoned'], fourth['more']) == (1, 0, True)
+    assert (fourth['rows_deleted'], fourth['tombstoned'], fourth['more']) == (2, 0, True)
+    # The receipt and the consumption row count toward the bound: they wait for a fresh batch.
+    fifth = retire_subscriptions(store)
+    assert (fifth['rows_deleted'], fifth['tombstoned'], fifth['more']) == (1, 0, True)
     last = retire_subscriptions(store)
     assert (last['rows_deleted'], last['tombstoned'], last['more']) == (2, 1, False)
     assert counts(store, sid) == dict.fromkeys(KEPT[1:], 0) and floor(store, sid) == events[-1]
