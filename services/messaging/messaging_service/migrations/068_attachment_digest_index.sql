@@ -1,5 +1,6 @@
 -- rollout: manual
--- Risk tier: non-critical (docs/operations/production.md "Migration risk tiers": CREATE INDEX and SET LOCAL only).
+-- Risk tier: non-critical (docs/operations/production.md "Migration risk tiers": CREATE INDEX, SET LOCAL and a DO
+-- block that only checks a precondition).
 -- An original's identity lookup gets an index. register_resident_original (033), which the attachments INSERT
 -- trigger calls for every new file, checks `attachments WHERE digest=? AND bytes=?`, and lock_lifecycle_sources
 -- (033) reads `attachments WHERE digest=?`; both run while they hold the global 'attachment-residency-v1'
@@ -12,3 +13,18 @@
 SET LOCAL lock_timeout='2s';
 CREATE INDEX IF NOT EXISTS attachment_digest_bytes ON attachments(digest,bytes);
 SET LOCAL lock_timeout=DEFAULT;
+-- IF NOT EXISTS keeps any relation of that name: an interrupted concurrent build (INVALID), a partial index or other
+-- keys. Only a valid, ready, plain btree on exactly (digest,bytes) lets the ledger advance.
+DO $$ BEGIN
+ IF NOT EXISTS(SELECT FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class x ON x.oid=i.indexrelid
+   WHERE i.indexrelid=to_regclass('public.attachment_digest_bytes') AND i.indrelid='public.attachments'::regclass
+    AND i.indisvalid AND i.indisready AND i.indpred IS NULL AND i.indexprs IS NULL
+    AND i.indnatts=2 AND i.indnkeyatts=2
+    AND x.relam=(SELECT a.oid FROM pg_catalog.pg_am a WHERE a.amname='btree')
+    AND i.indkey[0]=(SELECT t.attnum FROM pg_catalog.pg_attribute t
+     WHERE t.attrelid='public.attachments'::regclass AND t.attname='digest')
+    AND i.indkey[1]=(SELECT t.attnum FROM pg_catalog.pg_attribute t
+     WHERE t.attrelid='public.attachments'::regclass AND t.attname='bytes')) THEN
+  RAISE EXCEPTION 'attachment_digest_bytes is not a valid btree index on attachments(digest,bytes): DROP INDEX CONCURRENTLY public.attachment_digest_bytes, then migrate again';
+ END IF;
+END $$;
