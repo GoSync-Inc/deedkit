@@ -84,6 +84,16 @@ def test_whatsapp_business_messages_with_text_are_text_and_masked_ones_stay_unkn
         assert service['metadata']['message_kind'] == 'system'
 
 
+# spec: ANYM-471
+def test_whatsapp_bot_menu_replies_are_text_with_the_chosen_option():
+    for native in ('list_response', 'buttons_response', 'template_reply', 'interactive_response'):
+        result = whatsapp_message('wa-fixture', whatsapp(messageType=native, body='Chose menu option: Soup [id: row_soup]'))
+        assert result['metadata']['message_kind'] == 'text'
+        assert result['metadata']['provider_message_type'] == native
+        assert result['body'] == 'Chose menu option: Soup [id: row_soup]'
+        assert whatsapp_message('wa-fixture', whatsapp(messageType=native))['metadata']['message_kind'] == 'unknown'
+
+
 def test_whatsapp_missing_type_and_empty_body_stays_unknown():
     result = whatsapp_message('wa-fixture', whatsapp())
     assert result['metadata']['message_kind'] == 'unknown'

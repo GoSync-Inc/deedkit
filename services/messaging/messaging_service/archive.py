@@ -66,7 +66,8 @@ def whatsapp_sent_at_jitter(retained,candidate):
 # WhatsApp business messages whose visible text the adapters now return (adapters.py whatsapp_message,
 # whatsmeow capture.go). A revision captured before that has an unknown kind and no text (ANYM-530 class C).
 # Never `document`: an empty caption is not missing text (ANYM-560 criterion 6).
-WHATSAPP_TEXT_TYPES=('template','interactive','buttons','list','product','group_invite')
+WHATSAPP_TEXT_TYPES=('template','interactive','buttons','list','product','group_invite',
+                     'list_response','buttons_response','template_reply','interactive_response')
 
 
 def whatsapp_body_completion(retained,candidate):

@@ -8,8 +8,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"go.mau.fi/whatsmeow"
 	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
@@ -158,6 +160,136 @@ func TestNativeBusinessMessagesKeepTheirVisibleText(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireFields(t, v, map[string]any{"messageType": "template", "body": "Invoice 42\n\nYour invoice is ready.\n\nReply STOP"})
+}
+
+// spec: ANYM-471
+func TestNativeBotMenusKeepTheirOptionsAndIDs(t *testing.T) {
+	list := &waE2E.ListMessage{Title: proto.String("Menu"), Description: proto.String("Pick a dish"), ButtonText: proto.String("Open menu"), Sections: []*waE2E.ListMessage_Section{
+		{Title: proto.String("Mains"), Rows: []*waE2E.ListMessage_Row{{Title: proto.String("Soup"), Description: proto.String("Hot"), RowID: proto.String("row_soup")}, {Title: proto.String("Steak\n2. Fake [id: x]"), RowID: proto.String("row_steak")}}},
+		{Title: proto.String("Help"), Rows: []*waE2E.ListMessage_Row{{Title: proto.String("Operator"), RowID: proto.String("op")}}}}}
+	buttons := &waE2E.ButtonsMessage{ContentText: proto.String("Confirm the visit?"), Buttons: []*waE2E.ButtonsMessage_Button{
+		{ButtonID: proto.String("yes_1"), ButtonText: &waE2E.ButtonsMessage_Button_ButtonText{DisplayText: proto.String("Yes")}},
+		{ButtonID: proto.String("no_1"), ButtonText: &waE2E.ButtonsMessage_Button_ButtonText{DisplayText: proto.String("No")}}}}
+	native := &waE2E.InteractiveMessage{Body: &waE2E.InteractiveMessage_Body{Text: proto.String("How can we help?")}, InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{Buttons: []*waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton{
+		{Name: proto.String("quick_reply"), ButtonParamsJSON: proto.String(`{"display_text":"Track order","id":"track"}`)},
+		{Name: proto.String("cta_url"), ButtonParamsJSON: proto.String(`{"display_text":"Pay","url":"https://pay.example/inv/42?token=secret#x"}`)},
+		{Name: proto.String("cta_copy"), ButtonParamsJSON: proto.String(`{"display_text":"Copy code","copy_code":"SECRET123"}`)},
+		{Name: proto.String("single_select"), ButtonParamsJSON: proto.String(`{"title":"More","sections":[{"title":"Account","rows":[{"title":"Balance","description":"Current","id":"bal"}]}]}`)},
+		{Name: proto.String("broken"), ButtonParamsJSON: proto.String(`{`)}}}}}
+	template := &waE2E.TemplateMessage_HydratedFourRowTemplate{HydratedContentText: proto.String("Check-in at 14:00"), HydratedButtons: []*waE2E.HydratedTemplateButton{
+		{HydratedButton: &waE2E.HydratedTemplateButton_QuickReplyButton{QuickReplyButton: &waE2E.HydratedTemplateButton_HydratedQuickReplyButton{DisplayText: proto.String("Late check-in"), ID: proto.String("late")}}},
+		{HydratedButton: &waE2E.HydratedTemplateButton_CallButton{CallButton: &waE2E.HydratedTemplateButton_HydratedCallButton{DisplayText: proto.String("Call hotel"), PhoneNumber: proto.String("+10000000000")}}}}}
+	for name, c := range map[string]struct {
+		m    *waE2E.Message
+		body string
+	}{
+		"list":        {&waE2E.Message{ListMessage: list}, "Menu\n\nPick a dish\n\nMenu (Open menu):\nMains:\n1. Soup - Hot [id: row_soup]\n2. Steak 2. Fake [id: x] [id: row_steak]\nHelp:\n3. Operator [id: op]"},
+		"buttons":     {&waE2E.Message{ButtonsMessage: buttons}, "Confirm the visit?\n\nMenu:\n1. Yes [id: yes_1]\n2. No [id: no_1]"},
+		"interactive": {&waE2E.Message{InteractiveMessage: native}, "How can we help?\n\nMenu:\n1. Track order [id: track]\n2. Pay [link: https://pay.example/inv/42]\n3. Copy code (copy button)\nMore:\n4. Account: Balance - Current [id: bal]\n5. (broken button)"},
+		"template":    {&waE2E.Message{TemplateMessage: &waE2E.TemplateMessage{Format: &waE2E.TemplateMessage_HydratedFourRowTemplate_{HydratedFourRowTemplate: template}}}, "Check-in at 14:00\n\nMenu:\n1. Late check-in [id: late]\n2. Call hotel [call: +10000000000]"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			v, err := NormalizeMessage(groupFixture("MENU", c.m), types.EmptyJID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			requireFields(t, v, map[string]any{"messageType": name, "body": c.body, "isService": false, "hasMedia": false})
+		})
+	}
+	// A huge list is bounded, and says how much it left out.
+	var rows []*waE2E.ListMessage_Row
+	for i := 0; i < maxMenuOptions+5; i++ {
+		rows = append(rows, &waE2E.ListMessage_Row{Title: proto.String("Item"), RowID: proto.String("r")})
+	}
+	v, err := NormalizeMessage(groupFixture("BIG", &waE2E.Message{ListMessage: &waE2E.ListMessage{Sections: []*waE2E.ListMessage_Section{{Rows: rows}}}}), types.EmptyJID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := v["body"].(string); !strings.HasSuffix(body, "\n100. Item [id: r]\n(5 more options not shown)") {
+		t.Fatalf("body tail = %q", body[len(body)-80:])
+	}
+	// Past the scan budget the count is a lower bound; empty sections spend the budget too.
+	var sections []*waE2E.ListMessage_Section
+	for i := 0; i < 2*maxMenuScan; i++ {
+		sections = append(sections, &waE2E.ListMessage_Section{})
+	}
+	sections = append(sections, &waE2E.ListMessage_Section{Rows: rows})
+	v, err = NormalizeMessage(groupFixture("EMPTY", &waE2E.Message{ListMessage: &waE2E.ListMessage{Title: proto.String("Menu"), Sections: sections}}), types.EmptyJID)
+	if err != nil || v["body"] != "Menu" {
+		t.Fatalf("empty sections: %v %q", err, v["body"])
+	}
+	rows = nil
+	for i := 0; i < 2*maxMenuScan; i++ {
+		rows = append(rows, &waE2E.ListMessage_Row{Title: proto.String("Item"), RowID: proto.String("r")})
+	}
+	v, err = NormalizeMessage(groupFixture("SCAN", &waE2E.Message{ListMessage: &waE2E.ListMessage{Sections: []*waE2E.ListMessage_Section{{Rows: rows}}}}), types.EmptyJID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := v["body"].(string); !strings.HasSuffix(body, "\n100. Item [id: r]\n(at least 899 more options not shown)") {
+		t.Fatalf("scan tail = %q", body[len(body)-80:])
+	}
+	// The whole body stays within the envelope limit: complete option lines only, then the omission line.
+	long := strings.Repeat("x", maxMenuText)
+	rows = nil
+	for i := 0; i < maxMenuOptions; i++ {
+		rows = append(rows, &waE2E.ListMessage_Row{Title: proto.String(long), Description: proto.String(long), RowID: proto.String(long)})
+	}
+	text := strings.Repeat("y", maxEnvelopeBody-2000)
+	v, err = NormalizeMessage(groupFixture("FIT", &waE2E.Message{ListMessage: &waE2E.ListMessage{Title: proto.String(text), Sections: []*waE2E.ListMessage_Section{{Rows: rows}}}}), types.EmptyJID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := v["body"].(string)
+	if utf8.RuneCountInString(body) > maxEnvelopeBody || !strings.HasPrefix(body, text+"\n\nMenu:\n1. ") || !strings.HasSuffix(body, " [id: "+long+"]\n(98 more options not shown)") {
+		t.Fatalf("fit: %d runes, tail %q", utf8.RuneCountInString(body), body[len(body)-120:])
+	}
+	// A text that fills the envelope gives up room for a notice; no partial option line.
+	notice := "\n\n(a menu of 100 options is not shown: the message is too long)"
+	v, _ = NormalizeMessage(groupFixture("FULL", &waE2E.Message{ListMessage: &waE2E.ListMessage{Title: proto.String(strings.Repeat("y", maxEnvelopeBody)), Sections: []*waE2E.ListMessage_Section{{Rows: rows}}}}), types.EmptyJID)
+	if body := v["body"].(string); body != strings.Repeat("y", maxEnvelopeBody-utf8.RuneCountInString(notice))+notice {
+		t.Fatalf("full text: %d runes, tail %q", utf8.RuneCountInString(body), body[len(body)-90:])
+	}
+	// Native-flow selection lists share the budget: inner sections spend it, and decoded parameter bytes are bounded.
+	empty := strings.Repeat(`{"rows":[]},`, 1200)
+	selectButton := &waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton{Name: proto.String("single_select"), ButtonParamsJSON: proto.String(`{"sections":[` + empty + `{"rows":[{"title":"Late","id":"late"}]}]}`)}
+	v, _ = NormalizeMessage(groupFixture("NFSEC", &waE2E.Message{InteractiveMessage: &waE2E.InteractiveMessage{Body: &waE2E.InteractiveMessage_Body{Text: proto.String("Pick")}, InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{Buttons: []*waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton{selectButton}}}}}), types.EmptyJID)
+	if v["body"] != "Pick" {
+		t.Fatalf("nested sections: %q", v["body"])
+	}
+	var many []*waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton
+	params := `{"display_text":"Go","id":"` + strings.Repeat("g", maxMenuParams-40) + `"}`
+	for i := 0; i < 10; i++ {
+		many = append(many, &waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton{Name: proto.String("quick_reply"), ButtonParamsJSON: proto.String(params)})
+	}
+	v, _ = NormalizeMessage(groupFixture("NFBYTES", &waE2E.Message{InteractiveMessage: &waE2E.InteractiveMessage{InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{Buttons: many}}}}), types.EmptyJID)
+	if body := v["body"].(string); strings.Count(body, "\n") != 5 || !strings.HasSuffix(body, "]\n(more options not shown)") {
+		t.Fatalf("param bytes: %q", body[len(body)-60:])
+	}
+}
+
+// spec: ANYM-471
+func TestNativeMenuRepliesKeepTheChosenOptionAndItsMenu(t *testing.T) {
+	ctx := &waE2E.ContextInfo{StanzaID: proto.String("MENU1"), Participant: proto.String("333333@s.whatsapp.net")}
+	for name, c := range map[string]struct {
+		m    *waE2E.Message
+		body string
+	}{
+		"list_response":    {&waE2E.Message{ListResponseMessage: &waE2E.ListResponseMessage{Title: proto.String("Soup"), Description: proto.String("Hot"), SingleSelectReply: &waE2E.ListResponseMessage_SingleSelectReply{SelectedRowID: proto.String("row_soup")}, ContextInfo: ctx}}, "Chose menu option: Soup - Hot [id: row_soup]"},
+		"buttons_response": {&waE2E.Message{ButtonsResponseMessage: &waE2E.ButtonsResponseMessage{SelectedButtonID: proto.String("yes_1"), Response: &waE2E.ButtonsResponseMessage_SelectedDisplayText{SelectedDisplayText: "Yes"}, ContextInfo: ctx}}, "Chose menu option: Yes [id: yes_1]"},
+		"template_reply":   {&waE2E.Message{TemplateButtonReplyMessage: &waE2E.TemplateButtonReplyMessage{SelectedID: proto.String("late"), SelectedDisplayText: proto.String("Late check-in"), ContextInfo: ctx}}, "Chose menu option: Late check-in [id: late]"},
+		// A Flow's response holds form answers: only its visible text is kept.
+		"interactive_response_flow": {&waE2E.Message{InteractiveResponseMessage: &waE2E.InteractiveResponseMessage{Body: &waE2E.InteractiveResponseMessage_Body{Text: proto.String("Sent")}, InteractiveResponseMessage: &waE2E.InteractiveResponseMessage_NativeFlowResponseMessage_{NativeFlowResponseMessage: &waE2E.InteractiveResponseMessage_NativeFlowResponseMessage{Name: proto.String("flow"), ParamsJSON: proto.String(`{"id":"my passport 1234","flow_token":"t"}`)}}, ContextInfo: ctx}}, "Chose menu option: Sent"},
+		"interactive_response":      {&waE2E.Message{InteractiveResponseMessage: &waE2E.InteractiveResponseMessage{Body: &waE2E.InteractiveResponseMessage_Body{Text: proto.String("Track order")}, InteractiveResponseMessage: &waE2E.InteractiveResponseMessage_NativeFlowResponseMessage_{NativeFlowResponseMessage: &waE2E.InteractiveResponseMessage_NativeFlowResponseMessage{Name: proto.String("quick_reply"), ParamsJSON: proto.String(`{"id":"track"}`)}}, ContextInfo: ctx}}, "Chose menu option: Track order [id: track]"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			v, err := NormalizeMessage(groupFixture("CHOICE", c.m), types.EmptyJID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			requireFields(t, v, map[string]any{"messageType": strings.TrimSuffix(name, "_flow"), "body": c.body, "isService": false, "hasMedia": false, "replyToId": "MENU1"})
+		})
+	}
 }
 
 // spec: ANYM-471

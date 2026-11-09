@@ -317,6 +317,14 @@ func messageContext(m *waE2E.Message) *waE2E.ContextInfo {
 		return m.GetDocumentMessage().GetContextInfo()
 	case m.GetStickerMessage() != nil:
 		return m.GetStickerMessage().GetContextInfo()
+	case m.GetListResponseMessage() != nil:
+		return m.GetListResponseMessage().GetContextInfo()
+	case m.GetButtonsResponseMessage() != nil:
+		return m.GetButtonsResponseMessage().GetContextInfo()
+	case m.GetTemplateButtonReplyMessage() != nil:
+		return m.GetTemplateButtonReplyMessage().GetContextInfo()
+	case m.GetInteractiveResponseMessage() != nil:
+		return m.GetInteractiveResponseMessage().GetContextInfo()
 	}
 	return nil
 }
@@ -464,19 +472,22 @@ func NormalizeMessage(e *events.Message, owner types.JID, ownerAliases ...types.
 			body = m.GetPollCreationMessageV3().GetName()
 		// Business messages keep their visible text; header media is not fetched.
 		case m.GetTemplateMessage() != nil:
+			// A menu's options follow its text (menu.go).
 			kind = "template"
-			body = templateText(m.GetTemplateMessage())
+			body = templateMenu(templateText(m.GetTemplateMessage()), m.GetTemplateMessage())
 		case m.GetInteractiveMessage() != nil:
 			kind = "interactive"
-			body = interactiveText(m.GetInteractiveMessage())
+			body = interactiveMenu(interactiveText(m.GetInteractiveMessage()), m.GetInteractiveMessage())
 		case m.GetButtonsMessage() != nil:
 			v := m.GetButtonsMessage()
 			kind = "buttons"
-			body = joinText(v.GetText(), v.GetContentText(), v.GetFooterText())
+			body = buttonsMenu(joinText(v.GetText(), v.GetContentText(), v.GetFooterText()), v)
 		case m.GetListMessage() != nil:
 			v := m.GetListMessage()
 			kind = "list"
-			body = joinText(v.GetTitle(), v.GetDescription(), v.GetFooterText())
+			body = listMenu(joinText(v.GetTitle(), v.GetDescription(), v.GetFooterText()), v)
+		case m.GetListResponseMessage() != nil, m.GetButtonsResponseMessage() != nil, m.GetTemplateButtonReplyMessage() != nil, m.GetInteractiveResponseMessage() != nil:
+			kind, body, _ = menuReply(m)
 		case m.GetProductMessage() != nil:
 			v := m.GetProductMessage()
 			kind = "product"
