@@ -11,6 +11,7 @@ from time import monotonic
 from psycopg.types.json import Jsonb
 
 from .identifiers import ACCOUNT_RE
+from . import attachment_failures
 from .media_retry import MEDIA_ATTEMPT_CAPS,MEDIA_MAX_ATTEMPTS,MEDIA_PERMANENT_CODES,MEDIA_RATE_LIMIT_FREE_DAYS,retry_delay
 from .envelope import canonical, fingerprint, stable_id, validate
 from .store import serial as serial
@@ -19,6 +20,7 @@ from .incoming_formatting import credential_link, known as known_formatting, unk
 # The retry-exhausted sweep has no selective index: one Archive (a collector)
 # runs it on its first media claim for an account, then at most once per this.
 MEDIA_SWEEP_SECONDS = 60
+MEDIA_SWEEP_LIMIT = 100
 # Out-of-window originals the background backfill fetches by itself: voice notes, then
 # small files. Larger ones stay available on an explicit request.
 BACKFILL_VOICE_MIMES = ('audio/ogg','audio/opus')
@@ -645,10 +647,16 @@ class Archive:
                 if sweep:
                     # Attachment status already reports an expired last-attempt lease as
                     # retry_exhausted until this sweep rewrites it.
-                    c.execute("""UPDATE media_jobs SET state='failed',error_code='retry_exhausted',lease_until=NULL
-                        WHERE state='leased' AND attempts>=%s AND lease_until<clock_timestamp()
-                        AND NOT starts_with(coalesce(lease_owner,''),'recovery:')
-                        AND (%s::text IS NULL OR account=%s)""",(MEDIA_MAX_ATTEMPTS,account,account))
+                    # ANYM-867: at most MEDIA_SWEEP_LIMIT jobs per sweep (the rest wait for the next one), so the
+                    # events written below hold the claim's locks for a bounded time.
+                    swept=c.execute("""UPDATE media_jobs SET state='failed',error_code='retry_exhausted',lease_until=NULL
+                        WHERE id IN (SELECT id FROM media_jobs WHERE state='leased' AND attempts>=%s
+                        AND lease_until<clock_timestamp() AND NOT starts_with(coalesce(lease_owner,''),'recovery:')
+                        AND (%s::text IS NULL OR account=%s) ORDER BY id LIMIT %s FOR UPDATE SKIP LOCKED)
+                        RETURNING id,account,message,attempts""",
+                        (MEDIA_MAX_ATTEMPTS,account,account,MEDIA_SWEEP_LIMIT)).fetchall()
+                    # The jobs this statement moved to failed: one event per message, in this transaction.
+                    if swept:attachment_failures.publish(c,[{**r,'reason':'retry_exhausted'} for r in swept])
                 recovery=False
                 if pick is None:
                     # ANYM-816: an operator recovery job only when no other job of the account is claimable.
@@ -672,9 +680,13 @@ class Archive:
                     try:reservation=StorageAdmission(selected_writer).reserve(c,job,expires)
                     except ValueError as exc:
                         if str(exc)!='media_size_limit':raise
-                        if recovery:media_recovery.held_back(c,job,size_limit=True);return None
+                        if recovery:
+                            media_recovery.held_back(c,job,size_limit=True)
+                            attachment_failures.publish(c,[{**job,'reason':'size_limit'}])
+                            return None
                         c.execute("UPDATE media_jobs SET state='failed',error_code='size_limit',lease_until=NULL WHERE id=%s",
                             (job['id'],))
+                        attachment_failures.publish(c,[{**job,'reason':'size_limit'}])
                         return None
                     if reservation is None:
                         if recovery:media_recovery.held_back(c,job);return None
@@ -970,8 +982,11 @@ class Archive:
             from .storage_admission import StorageAdmission
             from . import media_recovery
             if media_recovery.recovery_lease(row):
-                media_recovery.failed(c,job,code,permanent=permanent,retry_after=retry_after,
+                ended=media_recovery.failed(c,job,code,permanent=permanent,retry_after=retry_after,
                     local=code in {'disk_reserve','paused_storage'}|LOCAL_STORAGE_ERRORS)
+                # ANYM-867: an operator recovery that ends failing again is a new terminal episode of the job.
+                if ended in media_recovery.FAILING_STATES:
+                    attachment_failures.publish(c,[{**row,'reason':attachment_failures.reason_of(code)}])
                 StorageAdmission.release(c,job)
                 return
             local_pause=code in ('disk_reserve','paused_storage')
@@ -991,5 +1006,8 @@ class Archive:
             c.execute('''UPDATE media_jobs SET state=%s,error_code=%s,lease_until=NULL,attempts=%s,
                 next_due=clock_timestamp()+%s*interval '1 second' WHERE id=%s''',
                 ('failed' if terminal else 'queued',stored,attempts,wait,job['id']))
+            # ANYM-867: job_fence held the lease under a row lock, so this is the job's one move to failed.
+            if terminal:attachment_failures.publish(c,[{**row,'attempts':attempts,
+                'reason':attachment_failures.reason_of(stored)}])
             from .storage_admission import StorageAdmission
             StorageAdmission.release(c,job)

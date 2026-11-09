@@ -43,7 +43,8 @@ def get_updates(store,c,p,consumer,limit=20,*,accounts=None,chats=None,senders=N
     for name,values in [('accounts',accounts),('chats',chats),('senders',senders),('origins',origins),('kinds',kinds)]:
         values=filter_values(values)
         allowed={'origins':{'live','backfill','reconcile','fixture'},
-            'kinds':{'message.created','message.edited','message.deleted','message.status','attachment.ready'}}
+            'kinds':{'message.created','message.edited','message.deleted','message.status','attachment.ready',
+                'attachment.failed'}}
         if values is not None and name in allowed and set(values)-allowed[name]:raise APIError('invalid_filter')
         if values is not None:filters[name]=values
     if exclude_channels:filters['exclude_channels']=True

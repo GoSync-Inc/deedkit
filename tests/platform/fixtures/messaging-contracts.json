@@ -2963,7 +2963,8 @@
                     "message.edited",
                     "message.deleted",
                     "message.status",
-                    "attachment.ready"
+                    "attachment.ready",
+                    "attachment.failed"
                   ],
                   "type": "string"
                 },
@@ -3417,11 +3418,12 @@
                     "file.description.ready",
                     "file.processing.failed",
                     "send.failed",
-                    "source.health"
+                    "source.health",
+                    "attachment.failed"
                   ],
                   "type": "string"
                 },
-                "maxItems": 11,
+                "maxItems": 12,
                 "minItems": 1,
                 "type": "array"
               },

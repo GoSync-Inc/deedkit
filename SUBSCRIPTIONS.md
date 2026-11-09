@@ -1786,7 +1786,7 @@ name the group.
 
 ## Each file's state in the stream (ANYM-866)
 
-Items of kind `message.created`, `message.edited` and `attachment.ready` carry `attachments`, in full and
+Items of kind `message.created`, `message.edited`, `attachment.ready` and `attachment.failed` carry `attachments`, in full and
 compact pages. Each entry is `{attachment_id, mime, bytes, media_state, next_action, processing}`, plus `reason`
 when the file is `blocked`. `attachment.ready` lists its own file. A message event lists the files of its own revision.
 The state is read when the page is read, not when the event was written. One function computes it for the event and
@@ -1817,6 +1817,36 @@ logs one `attachment_media_state_unavailable` line with it. The lookup runs unde
 it fails (a held lock, a slow plan), the page and its receipt come back without `attachments` and the code is
 `lookup_failed`. A page reads at most 200 files; items past that carry no `attachments` (`page_file_limit`). A deleted message's wait ends with its `message.deleted` event
 ([Deleted messages](#deleted-messages-schema-45)).
+
+## A download that failed for good (ANYM-867)
+
+When a file's download ends for good, the archive commits one `attachment.failed` event on the message. It is
+written in the same transaction that marks the job failed. There are three ways a download ends: the expiry sweep
+of a last attempt whose lease ran out (`retry_exhausted`), a size refusal before the lease (`size_limit`), and a
+terminal `fail_media` (a permanent refusal or the last allowed attempt, `retry_exhausted`). An operator recovery
+(ANYM-816) that ends `still_failing` or `provider_unavailable` commits a new event. A retry that is not terminal
+commits nothing.
+
+The item's `processing` is `{stage: original, state: failed, failed: [{attachment, reason, next_action}],
+attempts}`. `reason` is `retry_exhausted` or `size_limit`. `next_action` is `request_file_download` when a stored
+original exists (this was a re-download), otherwise null. `attempts` is the highest attempt count of the listed
+jobs. The item also carries `attachments` with each listed file's current state (see the section above). It
+includes no file name or content. All files of one message that fail in one sweep share one event: ten files of
+an album give one event.
+
+Identity: the event key is the message, the job IDs and each job's terminal episode, where the episode is 1 plus
+the earlier `attachment.failed` events that name the job. A replay, a sweep racing a finish, or a crash and retry
+commit no second event, because only the statement that moves the job to failed publishes it. A recovery that
+then succeeds commits `attachment.ready` as before.
+
+Matching follows the `message.created` rules: chat, direction, senders and the key's scope. A subscription
+receives `attachment.failed` when its `kinds` names `attachment.failed` or `attachment.ready`. The failure ends
+the same wait, so existing `attachment.ready` subscriptions get it without a change. `get_updates` keeps its
+five default kinds and returns `attachment.failed` only when `kinds` names it.
+
+Failure isolation: each message's event is written in a savepoint and tried 3 times. If all 3 tries fail, the
+jobs stay failed without an event (set aside). The service counts them by reason code and logs one
+`attachment_failed_event_set_aside` line. The sweep, the media loop and the collector keep running.
 
 ## Remaining extensions and verification boundaries
 

@@ -264,6 +264,49 @@ def test_budget_exhaustion_ends_still_failing_on_the_schedule(wa):
     assert claim(ar) is None
 
 
+def failure_events(s, fid):
+    with s.pool.connection() as c:
+        return c.execute('''SELECT e.event_key,e.snapshot->'processing' AS processing FROM events e
+            JOIN media_jobs j ON j.message=e.message WHERE j.id=%s AND e.kind='attachment.failed' ORDER BY e.id''',
+            (fid,)).fetchall()
+
+
+def failed_for_good(ar, s, mid):
+    # A job that failed for good through the archive's own sweep: its first attachment.failed episode.
+    fid = failed(ar, s, mid)
+    with s.pool.connection() as c:
+        c.execute("""UPDATE media_jobs SET state='leased',lease_owner='worker',lease_until=now()-interval '1 second'
+            WHERE id=%s""", (fid,))
+    ar._media_sweeps.clear()
+    claim(ar)
+    assert job(s, fid)['state'] == 'failed' and len(failure_events(s, fid)) == 1
+    return fid
+
+
+# spec: ANYM-867
+def test_an_operator_requeue_that_fails_again_commits_a_new_failure_and_one_that_succeeds_commits_ready(wa):
+    ar, s = wa
+    fid = failed_for_good(ar, s, '1')
+    recover(s)
+    ar.fail_media(claim(ar), 'media_unavailable', permanent=True)
+    assert recovery(s, fid)['state'] == 'provider_unavailable'
+    first, second = failure_events(s, fid)
+    assert first['event_key'] != second['event_key']
+    assert second['processing']['failed'] == [{'attachment': fid, 'reason': 'retry_exhausted', 'next_action': None}]
+    # A retry inside the recovery budget is not terminal: nothing more is published.
+    other = failed_for_good(ar, s, '2')
+    recover(s)
+    ar.fail_media(claim(ar), 'media_network_error')
+    assert recovery(s, other)['state'] == 'queued' and len(failure_events(s, other)) == 1
+    due(s, other)
+    writer = BlobWriter(s.files, reserve_bytes=0)
+    ar.finish_media(claim(ar), writer.write([b'data'], expected_bytes=4), writer)
+    assert recovery(s, other)['state'] == 'recovered' and len(failure_events(s, other)) == 1
+    with s.pool.connection() as c:
+        assert c.execute('''SELECT count(*) AS n FROM events e JOIN media_jobs j ON j.message=e.message
+            WHERE j.id=%s AND e.kind='attachment.ready' ''', (other,)).fetchone()['n'] == 1
+
+
 # spec: ANYM-816
 @pytest.mark.parametrize('status', ['403', '404', '410'])
 def test_a_cdn_refusal_ends_provider_unavailable(wa, status):

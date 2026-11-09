@@ -370,6 +370,23 @@ def test_collector_bound_to_one_account_ingests_it_but_cannot_write_another(arch
         remove(s, role)
 
 
+# spec: ANYM-867
+def test_a_bound_collector_publishes_attachment_failed_with_its_existing_grants(archive):  # noqa: F811
+    from messaging_service import attachment_failures
+    ar, s, key, _ = archive
+    role = install(s, 'collector_role.sql', 'messaging_collector', account='archive-test')
+    try:
+        bound = Archive(NS(pool=RolePool(s, role), append_event=s.append_event, files=s.files))
+        bound.ingest(media_event())
+        before = sum(attachment_failures.SET_ASIDE.values())
+        bound.fail_media(bound.claim_media('bound-worker', account='archive-test'), 'unavailable', permanent=True)
+        assert sum(attachment_failures.SET_ASIDE.values()) == before
+        assert [i['kind'] for i in s.get_updates(key, 'bound-failed', kinds=['attachment.failed'])['items']] == [
+            'attachment.failed']
+    finally:
+        remove(s, role)
+
+
 # spec: ANYM-254
 def test_unbound_collector_role_keeps_its_current_rights_for_a_rolling_upgrade(archive):  # noqa: F811
     ar, s, _, _ = archive

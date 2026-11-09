@@ -169,6 +169,78 @@ def test_a_download_that_failed_for_good_shows_failed_and_no_action_in_the_strea
     assert read_state(store, key, mid, 'pending_attachments') == state_of(file)
 
 
+def fail_for_good(ar, store, *messages):
+    # The last attempt's lease expired: the next claim's sweep fails the jobs and publishes attachment.failed.
+    with store.pool.connection() as c:
+        c.execute('''UPDATE media_jobs SET state='leased',attempts=8,lease_owner='synthetic-worker',
+            lease_until=now()-interval '1 second' WHERE message=ANY(%s)''', (list(messages),))
+    ar._media_sweeps.clear()
+    ar.claim_media('synthetic-worker')
+
+
+def matched(store, token, sid):
+    from messaging_service.subscriptions import match_subscriptions
+    match_subscriptions(store)
+    return [(item['kind'], item.get('message')) for item in
+            store.get_subscription_events(token, sid, limit=50)['items'] if item['kind'] == 'attachment.failed']
+
+
+# spec: ANYM-867
+def test_attachment_failed_reaches_every_wait_for_the_file_under_the_message_rules(watched):
+    from messaging_service.store import APIError
+    ar, store, key, token, ready = watched
+    ar.register('archive-test', 'telegram', 'Synthetic archive', include_chats=['100', '200'])
+    sent = recent()
+    mid = ar.ingest(media_event(sent_at=sent, updated_at=sent))['message']
+    elsewhere = ar.ingest(media_event(chat='200', chat_title='Other room', provider_id='synthetic-200',
+        sent_at=sent, updated_at=sent))['message']
+    ar.ingest(event(provider_id='synthetic-43', sender='43', sent_at=sent, updated_at=sent))  # a known other sender
+    with store.pool.connection() as c:
+        chat = c.execute('SELECT chat FROM messages WHERE id=%s', (mid,)).fetchone()['chat']
+    every = {'all_visible_chats': True}
+    subs = {name: store.create_subscription(token, chat_ids, sources=sources, **options)['subscription_id']
+        for name, chat_ids, sources, options in [
+            ('failed_only', None, every, {'kinds': ['attachment.failed']}),
+            ('created_only', None, every, {'kinds': ['message.created']}),
+            ('this_chat', [chat], None, {'kinds': ['attachment.ready']}),
+            ('outgoing', None, every, {'kinds': ['attachment.ready'], 'direction': 'outgoing'}),
+            ('its_sender', [chat], None, {'kinds': ['attachment.ready'], 'sender_ids': ['42']}),
+            ('other_sender', [chat], None, {'kinds': ['attachment.ready'], 'sender_ids': ['43']})]}
+    fail_for_good(ar, store, mid, elsewhere)
+    both = [('attachment.failed', mid), ('attachment.failed', elsewhere)]
+    # A subscription that waits for attachment.ready gets the failure with no change on its side.
+    assert sorted(matched(store, token, ready)) == sorted(both)
+    assert sorted(matched(store, token, subs['failed_only'])) == sorted(both)
+    assert matched(store, token, subs['created_only']) == []
+    assert matched(store, token, subs['this_chat']) == [('attachment.failed', mid)]
+    assert matched(store, token, subs['outgoing']) == []
+    assert matched(store, token, subs['its_sender']) == [('attachment.failed', mid)]
+    assert matched(store, token, subs['other_sender']) == []
+    [item] = [i for i in store.get_subscription_events(token, ready, limit=50)['items']
+        if i['kind'] == 'attachment.failed' and i['message'] == mid]
+    [file] = item['attachments']
+    assert item['processing']['failed'] == [{'attachment': file['attachment_id'], 'reason': 'retry_exhausted',
+        'next_action': None}]
+    assert state_of(file) == {'media_state': 'failed', 'next_action': None,
+        'processing': {'text': 'failed', 'transcript': 'not_applicable', 'description': 'not_applicable'}}
+    assert 'private' not in json.dumps(item, default=str)
+    # get_updates keeps its five default kinds and returns the failure only when asked by name.
+    assert 'attachment.failed' not in [i['kind'] for i in store.get_updates(key, 'defaults')['items']]
+    assert {i['message'] for i in store.get_updates(key, 'failures', kinds=['attachment.failed'])['items']} == {
+        mid, elsewhere}
+    # A chat-restricted key no longer receives the other chat's failures; a revoked key reads nothing.
+    store.set_access('media-state-watcher', chats=[chat])
+    later = ar.ingest(media_event(chat='200', chat_title='Other room', provider_id='synthetic-201',
+        sent_at=sent, updated_at=sent))['message']
+    here = ar.ingest(media_event(provider_id='synthetic-101', sent_at=sent, updated_at=sent))['message']
+    fail_for_good(ar, store, later, here)
+    assert ('attachment.failed', later) not in matched(store, token, ready)
+    assert ('attachment.failed', here) in matched(store, token, ready)
+    store.revoke(token)
+    with pytest.raises(APIError):
+        store.get_subscription_events(token, ready)
+
+
 # spec: ANYM-866
 def test_a_downloaded_voice_note_of_an_on_request_group_without_an_audio_profile_expects_no_transcript(watched):
     from test_media_policy import set_kind

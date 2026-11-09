@@ -22,6 +22,8 @@ from .media_retry import MEDIA_MAX_ATTEMPTS, MEDIA_PERMANENT_CODES, MEDIA_PROVID
 RECOVERY_BUDGET = 3
 RECOVERY_LIMIT = 50
 STATES = RECOVERY_STATES
+# A recovery that ends in one of these failed again: a new attachment.failed episode (ANYM-867).
+FAILING_STATES = frozenset({'provider_unavailable', 'still_failing'})
 # A rerun never touches these; a refused job is checked again (its reason may be gone, e.g. a storage pause).
 FINAL_STATES = frozenset({'recovered', 'provider_unavailable', 'still_failing'})
 REFUSALS = ('lease_running', 'message_deleted', 'collection_disabled', 'chat_not_collected', 'on_request_chat',
@@ -158,6 +160,8 @@ def next_job(c, account):
         if row['_recovery_attempts'] >= RECOVERY_BUDGET:
             # Its last attempt's lease expired: the collector stopped or lost it mid-transfer.
             _settle(c, row['id'], 'still_failing', code='lease_expired', leased=leased)
+            from . import attachment_failures
+            attachment_failures.publish(c, [{**row, 'reason': 'retry_exhausted'}])
             continue
         return row
     return None
@@ -211,11 +215,12 @@ def failed(c, job, code, *, permanent=False, retry_after=None, local=False):
     row = c.execute("SELECT attempts FROM media_recovery WHERE job=%s AND state='running' FOR UPDATE",
         (job['id'],)).fetchone()
     c.execute("UPDATE media_jobs SET state='failed',lease_until=NULL WHERE id=%s", (job['id'],))
-    if not row: return
+    if not row: return None
     state, attempts, wait = outcome(row['attempts'], code, permanent=permanent, retry_after=retry_after, local=local)
     c.execute('''UPDATE media_recovery SET state=%s,attempts=%s,last_code=%s,lease_until=NULL,
         next_due=clock_timestamp()+%s*interval '1 second',updated_at=clock_timestamp() WHERE job=%s''',
         (state, attempts, code, wait, job['id']))
+    return state
 
 
 def counts(c, accounts):
