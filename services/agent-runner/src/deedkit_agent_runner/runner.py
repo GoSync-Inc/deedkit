@@ -498,7 +498,7 @@ def stop_unreconciled(store, docker):
     return left
 
 
-def view(task, clock):
+def view(task, clock, ahead=None):
     progress = json.loads(task["progress"] or "{}")
     progress["last_activity_at"] = iso(progress.get("last_activity_at"))
     progress.pop("host_wait_since", None)
@@ -515,7 +515,25 @@ def view(task, clock):
         "exit_code": task["exit_code"], "summary": task["summary"], "progress": progress,
         "publish_state": task["publish_state"], "publish_reason": task["publish_reason"], "branch": task["branch"],
         "compare_url": task["compare_url"], "next_action": "tell_owner" if settled else "wait",
+        **queue_estimate(task, clock, ahead),
     }
+
+
+def queue_estimate(task, clock, ahead):
+    """ANYM-820, additive: `ahead_of_you` (the same engine's tasks that run before this one) and
+    `estimated_finish_by` (a started task's expected_finish_by; a queued task's sum of the remaining minutes ahead
+    and its own max_minutes, without host waits). Both null for a terminal task, or a queued one without `ahead`."""
+    started = task["started_at"]
+    if task["state"] in TERMINAL or task["state"] == "queued" and ahead is None:
+        return {"ahead_of_you": None, "estimated_finish_by": None}
+    if task["state"] != "queued":
+        return {"ahead_of_you": 0,
+                "estimated_finish_by": iso(started + task["max_minutes"] * 60) if started else
+                iso(clock() + task["max_minutes"] * 60)}
+    now = clock()
+    remaining = sum(max(0, at + minutes * 60 - now) if state == "running" and at else minutes * 60
+                    for state, at, minutes in ahead)
+    return {"ahead_of_you": len(ahead), "estimated_finish_by": iso(now + remaining + task["max_minutes"] * 60)}
 
 
 def log_page(runner, task_id, cursor, raw):

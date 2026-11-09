@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .adapters import agents
 from .catalog import CATALOG
 from .recordings_errors import failure as recordings_failure
 from .policy import Denied
@@ -187,14 +188,19 @@ class Clients:
             "waits": (self.wait_budgets, self.waits), "metadata": (self.budgets, self.metadata),
         }[pool]
         budget, client = budget[module], client[module]
+        # ANYM-820: the agent runner has REST routes; every other module takes POST /v1/<operation>.
+        method, path, query, payload = (agents.request(operation, arguments) if module == agents.MODULE
+                                     else ("POST", "/v1/" + operation, None, arguments))
         async with budget.slot():
             try:
                 async with (
                     asyncio.timeout(10 if uploading else 35),
                     client.stream(
-                        "POST", "/v1/" + operation, headers={"Authorization": "Bearer " + key}, json=arguments
+                        method, path, headers={"Authorization": "Bearer " + key}, params=query, json=payload
                     ) as response,
                 ):
+                    if module == agents.MODULE:
+                        return await agents_answer(response)
                     failed = response.status_code >= 500 or response.status_code in (301, 302, 303, 307, 308)
                     body = bytearray()
                     maximum = 65536 if failed else 8 * 1024 * 1024
@@ -240,4 +246,37 @@ class Clients:
                     "gateway_timeout" if isinstance(failure, (TimeoutError, httpx.TimeoutException))
                     else "invalid_backend_response" if isinstance(failure, ValueError)
                     else "backend_connection_failed"}
+                # ANYM-820: only a failure before the connection carried any byte proves the request was not sent.
+                error.sent = not isinstance(failure, NOT_SENT)
                 raise error from None
+
+
+# Failures raised before a request byte is written: no connection, or no free connection in the pool.
+NOT_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+
+
+async def agents_answer(response):
+    """One agent-runner answer: a JSON object on 2xx; a refusal the adapter knows as its fixed error; anything else
+    backend_unavailable with `sent`, so a start or stop is reported as an unknown outcome and never resent."""
+    body = bytearray()
+    maximum = 8 * 1024 * 1024 if response.status_code < 300 else 65536
+    async for chunk in response.aiter_bytes(65536):
+        if len(body) + len(chunk) > maximum:
+            error = Denied("backend_response_too_large", 503)
+            error.sent = True
+            raise error
+        body.extend(chunk)
+    try:
+        value = json.loads(body)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        value = None
+    if 200 <= response.status_code < 300 and isinstance(value, dict):
+        return value
+    known = agents.refusal(response.status_code, value) if response.status_code >= 400 else None
+    if known is not None:
+        raise known
+    error = Denied("backend_unavailable", 503)
+    error.detail = {"error": "backend_unavailable", "reason": "invalid_backend_response",
+                    "backend_status": response.status_code}
+    error.sent = True
+    raise error

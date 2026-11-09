@@ -126,6 +126,18 @@ class Store:
                              (principal, request_id)).fetchone()
         return dict(row) if row else None
 
+    def ahead(self, task):
+        """ANYM-820: the same engine's tasks that run before a queued `task` (starting, running, earlier queued),
+        as (state, started_at, max_minutes); none for a task that is no longer queued."""
+        if task["state"] != "queued":
+            return []
+        with self.connect() as db:
+            return [tuple(r) for r in db.execute(
+                "SELECT state, started_at, max_minutes FROM tasks WHERE engine = ? AND id != ? AND "
+                "(state IN ('starting', 'running') OR (state = 'queued' AND (created_at < ? OR (created_at = ? AND "
+                "rowid < (SELECT rowid FROM tasks WHERE id = ?)))))",
+                (task["engine"], task["id"], task["created_at"], task["created_at"], task["id"]))]
+
     def rows(self, *states):
         with self.connect() as db:
             marks = ",".join("?" * len(states))

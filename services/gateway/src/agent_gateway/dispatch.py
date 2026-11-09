@@ -9,6 +9,7 @@ import re  # noqa: F401
 from platform_contracts import Capability, safe_error
 from platform_contracts.agent import MAX_CANDIDATES, PLACEHOLDER_REQUEST_ID, validate_candidate  # noqa: F401
 from .adapters.calls import receipt_reference  # noqa: F401
+from .adapters import agents
 
 from .catalog import arguments, CATALOG, InvalidArguments, routed
 from .diagnostics import (FAILURE_FIELDS, discovery, gateway_build, manifest_lacks, manifest_summary, module_conditions,
@@ -43,6 +44,7 @@ MODULE_PURPOSES = {
     "calendar": "Family calendar agenda and free slots with planned event changes",
     "calls": "Voice calls with briefs and preflight plus placed calls and their records",
     "messaging": "Messenger chats with search and the reply queue plus files and sending",
+    "agents": "Agent sessions on the Mac mini that work on a task and return a branch for review",
 }
 
 
@@ -278,6 +280,9 @@ class Dispatch:
             raise Denied("backend_configuration_requires_restart", 503)
         binding = agent["credentials"][module]
         credential = key_from_file(binding["key_file"], binding["key_sha256"])
+        if module == agents.MODULE:
+            # ANYM-820: admission asks the runner nothing (adapters/agents.py); agents_capabilities reads it.
+            return dict(agents.ADMISSION_CAPABILITIES)
         try:
             async with asyncio.timeout(timeout):
                 result = await self.full_capabilities(module, credential)
@@ -517,6 +522,21 @@ class Dispatch:
             raise Denied()
         return allowed_actions
 
+    @staticmethod
+    def agents_failure(error, tool, args):
+        """ANYM-820: a runner refusal keeps its fixed body; a start or stop the runner may have received is an
+        unknown outcome to read back, never resent; anything else is backend_unavailable, saying whether it was sent."""
+        if error.code not in {"backend_unavailable", "backend_response_too_large"} or (
+                getattr(error, "detail", {}).get("reason") == "runner_key_refused"):
+            return error
+        sent = getattr(error, "sent", False)
+        if sent and tool["operation"] in agents.MUTATIONS:
+            return agents.unknown_outcome(tool["operation"], args)
+        error.detail = unavailable(tool["operation"], getattr(error, "detail", None), phase="operation",
+                                   read_only=tool["operation"] not in agents.MUTATIONS)
+        error.detail["operation_sent"] = sent
+        return error
+
     def guard_readable(self, snapshot, agent, caps, account):
         """Whether this caller may run the get_context call a guard refusal names, on this account."""
         tool = CATALOG.get(GUARD_CONTEXT_TOOL)
@@ -713,10 +733,12 @@ class Dispatch:
         try:
             result = (
                 caps
-                if tool["operation"] == "capabilities"
+                if tool["operation"] == "capabilities" and module != agents.MODULE
                 else await self.clients.call(module, operation, credential, args)
             )
         except Denied as error:
+            if module == agents.MODULE:
+                raise self.agents_failure(error, tool, args) from None
             if error.code == "backend_busy" and module == "messaging" and tool["operation"] == "wait_for_subscription_events":
                 # ANYM-518: a full wait pool is a wait outcome, not a bare 503.
                 return {"wait_status": "busy", "retry_after_s": WAIT_RETRY_AFTER_S, "wait_pool": WAIT_POOL}
@@ -755,6 +777,12 @@ class Dispatch:
                         visible, module, current, principal, caps):
                     error.detail["next"] = upload
             raise
+        if module == agents.MODULE:
+            result = agents.shape(tool["operation"], result)
+            if tool["operation"] == "capabilities":
+                result["gateway_tools"] = [n for n in self.policy.visible(current, principal)
+                                           if CATALOG[n]["module"] == agents.MODULE]
+            return result
         return shape_result(
             self, result, tool=tool, module=module, snapshot=snapshot, agent=agent, caps=caps, current=current,
             principal=principal, allowed_actions=allowed_actions, rules_ceiling=rules_ceiling,

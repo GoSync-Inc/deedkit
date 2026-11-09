@@ -1,4 +1,10 @@
 [
+  {"name": "agents_capabilities", "read_only": true},
+  {"name": "agents_get_task", "read_only": true},
+  {"name": "agents_list_tasks", "read_only": true},
+  {"name": "agents_read_task_log", "read_only": true},
+  {"name": "agents_start_task", "read_only": false},
+  {"name": "agents_stop_task", "read_only": false},
   {"name": "calendar_agenda", "read_only": true},
   {"name": "calendar_apply", "read_only": false},
   {"name": "calendar_assignment", "read_only": false},
