@@ -4456,6 +4456,25 @@ def live_ledger(source):
         raise MigrationRefused(f"the live {AUTO_DATABASE} ledger could not be read") from exc
 
 
+def at_target(plan, version, applied):
+    """A messaging range a person already migrated (production.md "Migration releases" item 4): the live ledger is
+    exactly the target's (its version, the base's and the range's own checksums), so the release copies and migrates
+    nothing. Never with a role file change, whose grants the ledger does not show, and never for calendar."""
+    return (plan["database"] == AUTO_DATABASE and not plan["roles_changed"] and version == plan["target"]
+            and applied == {**plan["ledger"], **plan["pending"]})
+
+
+def migrated_by_hand(settings, plan):
+    """`at_target` from a read of its own, for a run that finds an earlier run's refusal; a read that fails is False,
+    so that refusal stands."""
+    if plan["database"] != AUTO_DATABASE or plan["roles_changed"]:
+        return False
+    try:
+        return at_target(plan, *live_ledger(copy_source(settings, AUTO_DATABASE)[0]))
+    except Exception:
+        return False
+
+
 def calendar_ledger(source):
     """(max version, {version: checksum}) of the live calendar ledger, fcs.migrations."""
     try:
@@ -5172,23 +5191,31 @@ def install_backup_runner(settings, candidate, release):
     print(f"backup runner: installed {expected[:12]}, image {image[:19]}", file=sys.stderr, flush=True)
 
 
-def migration_gate(settings, http, plan, mirror, base, serving):
+def migration_gate(settings, http, plan, mirror, base, serving, *, admission=False):
     """M2's read-only gates, at admission and again as the final gate: no active or unknown call, nothing
     unfinished, the base release's Store without server-side prepared statements (#352) and the live ledger exactly
     the base's. The backup receiver's schema (`receiver_schema_max`) holds no release (owner 11-04): a receiver that
-    does not read the target yet is a backup follow-up."""
+    does not read the target yet is a backup follow-up. At admission of a messaging-only range a ledger exactly at the
+    target marks the plan `by_hand` (`at_target`): the base already runs on that schema and `migrate` skips the
+    database, unless a release's migration ended uncertain or diverged and nobody settled it (Astra r1 F1)."""
     wait_for_calls(settings, time.monotonic() + CALL_POLL)
     if reason := unresolved(Path(settings["state_directory"]), Path(http["state_directory"]), lambda: mirror, serving):
         raise MigrationRefused(reason)
     if plan["database"] == CALENDAR:
         return calendar_gate(settings, plan, mirror, base)
+    version, applied = live_ledger(copy_source(settings, AUTO_DATABASE)[0])
+    if admission and at_target(plan, version, applied):
+        if held := unsettled_outcomes(Path(settings["state_directory"])):
+            raise MigrationRefused(f"the migration of {held[0]} ended uncertain or diverged; inspect its migration.json "
+                                   "before any release (production.md)")
+        plan["by_hand"] = True
+        return
     try:
         store = run(["git", "-C", str(mirror), "cat-file", "blob", f"{base}:{STORE_SOURCE}"])
     except Refused:
         store = ""
     if not UNPREPARED.search(store):
         raise MigrationRefused("the running release would fail on the new columns: deploy #352 first")
-    version, applied = live_ledger(copy_source(settings, AUTO_DATABASE)[0])
     if version != plan["base"] or applied != plan["ledger"]:
         raise MigrationRefused(f"the live {AUTO_DATABASE} ledger is not the base's schema {plan['base']}; "
                                "migrate by hand (production.md)")
@@ -5340,6 +5367,9 @@ def resumed_migration(settings, plans, candidate, release):
     status = record.get("status")
     if status == "migrated":
         return True
+    if status in ("refused", "not-applied") and plans and all(migrated_by_hand(settings, plan) for plan in plans):
+        # That run wrote nothing to production, and a person migrated the range since: admission reads it again.
+        return False
     if status != "planned" or plans is None:
         raise MigrationRefused(f"the unattended migration of {candidate} ended {status}; inspect "
                                f"{release / 'migration.json'} and migrate by hand (production.md)")
@@ -5375,6 +5405,20 @@ def resumed_migration(settings, plans, candidate, release):
             raise MigrationRefused(f"calendar migrated to {plan['target']}; roles: interrupted")
     progress.record("migrated")
     return True
+
+
+def unsettled_outcomes(state):
+    """Releases whose unattended migration ended `uncertain` or `diverged` and whose plan A never ran: the ledger may be
+    at the target while the catalog is not what its rehearsal proved. An unreadable receipt counts."""
+    found = []
+    for path in sorted(Path(state).glob("*/migration.json")):
+        try:
+            status = read(path).get("status")
+        except Exception:
+            status = None
+        if status not in ("migrated", "planned", "refused", "not-applied") and not (path.parent / "attempted.json").exists():
+            found.append(path.parent.name)
+    return found
 
 
 def unsettled_migrations(state):
@@ -5478,11 +5522,16 @@ def migrate(settings, http, plans, mirror, base, serving, candidate, release):
     """M2 after preparation, M3 and M4 for each database of the range (K3): the producer check, every copy and its
     rehearsal before any production write, the final gates, then one production `migrate-expand` per database,
     calendar first and then its db-roles and db-roles --check. Returns when every database is at its target with its
-    rehearsal's effect; raises MigrationWait or CallActive/CallsUnknown (nothing changed), or MigrationRefused."""
+    rehearsal's effect; raises MigrationWait or CallActive/CallsUnknown (nothing changed), or MigrationRefused. A
+    database migrated by hand gets only the producer check: no copy, rehearsal or migrate-expand."""
     messaging = [plan for plan in plans if plan["database"] == AUTO_DATABASE]
     limit = rehearsal_limit(settings)
     if messaging:
         follow_producer(settings, mirror, messaging[0], candidate, release)
+    plans = [plan for plan in plans if not plan.get("by_hand")]
+    messaging = [plan for plan in plans if plan["database"] == AUTO_DATABASE]
+    if not plans:
+        return
     images ={plan["database"]: migration_image(release, candidate, plan["database"]) for plan in plans}
     progress = Progress(release, plans)
     def refused(name, reason, phase):
@@ -6157,7 +6206,8 @@ def deploy_plan_a(settings, http, plans, mirror, base, serving, candidate, relea
         # M2 admission (read-only) before preparation; a run that finds migration.json resumes from it (M4).
         if plans and not (migrated := resumed_migration(settings, plans, candidate, release)):
             for plan in plans:
-                migration_gate(settings, http, plan, mirror, base, serving["sha"])
+                # A range that also touches calendar never skips messaging (Astra r1 F2: its recovery reads both).
+                migration_gate(settings, http, plan, mirror, base, serving["sha"], admission=len(plans) == 1)
         if not (release / "prepared.json").exists():
             if release.exists():
                 return finish(**halt(f"an earlier preparation of {candidate} did not finish; inspect {release}",
