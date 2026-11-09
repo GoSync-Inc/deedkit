@@ -28,6 +28,52 @@ SOURCE = Path(store_module.__file__).parent
 FORBIDDEN = psycopg.errors.InsufficientPrivilege
 
 
+# spec: ANYM-848
+def test_gateway_role_runs_the_wake_target_tools_and_other_roles_never_read_them(seeded):
+    from copy import copy
+    from messaging_service.wake_targets import schema_ready, subscription_wake_target
+    store, _, _ = seeded
+    permissions = ['read', 'subscription-write', 'delivery-write']
+    token = store.issue_key('wake-role-agent', ['telegram-demo'], permissions=permissions, key_permissions=permissions)
+    sid = store.create_subscription(token, ['telegram-demo-chat'])['subscription_id']
+    store.set_delivery_features(True)
+    api_role = install(store, 'gateway_role.sql', 'messaging_gateway')
+    worker_role = install(store, 'subscription_role.sql', 'messaging_subscriptions')
+    try:
+        api = copy(store)
+        api.pool = RolePool(store, api_role)
+        # The API role's real calls: register, list, confirm, change, delete.
+        target = api.register_wake_target(token, 'wake-role-1', 'codex_thread', 'Role chat', [sid])
+        tid = target['wake_target_id']
+        assert [item['wake_target_id'] for item in api.list_wake_targets(token)['items']] == [tid]
+        assert api.confirm_wake_target(token, tid, 'c' * 32)['confirmation'] == 'c' * 32
+        assert api.update_wake_target(token, tid, 2, 'set_thread', thread='Role chat 2')['confirmation'] is None
+        assert api.get_subscription(token, sid)['delivery']['wake_target_id'] == tid
+        refused(store, api_role, 'DELETE FROM wake_targets')
+        refused(store, api_role, "UPDATE wake_targets SET principal='x'")
+        refused(store, api_role, "UPDATE wake_targets SET key_id=key_id")
+        assert api.delete_wake_target(token, tid, 3)['deleted'] is True
+        # A role without the grant reads nothing, and the subscription view's lookup under it answers null, also for
+        # the dispatcher role.
+        live = api.register_wake_target(token, 'wake-role-2', 'codex_thread', 'Role chat', [sid])['wake_target_id']
+        with as_role(store, api_role) as c:
+            assert subscription_wake_target(c, sid) == live
+        dispatcher_role = install(store, 'delivery_role.sql', 'messaging_event_delivery')
+        try:
+            for role in (worker_role, dispatcher_role):
+                with as_role(store, role) as c:
+                    assert schema_ready(c) is False and subscription_wake_target(c, sid) is None
+                refused(store, role, 'SELECT * FROM wake_targets')
+        finally:
+            remove(store, dispatcher_role)
+        refused(store, worker_role, 'SELECT * FROM wake_targets')
+        refused(store, worker_role, 'SELECT * FROM wake_target_subscriptions')
+    finally:
+        store.set_delivery_features(False)
+        remove(store, api_role)
+        remove(store, worker_role)
+
+
 def install(store, template, base, account=None):
     role = 'anym254_' + base.removeprefix('messaging_') + '_' + uuid4().hex[:10]
     with store.pool.connection() as c:
@@ -491,7 +537,7 @@ def test_upgrade_and_rollback_keep_feed_order_and_cursors(schema36_store, monkey
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '72'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '73'
         assert c.execute('SELECT * FROM archive_migrations WHERE version<=36 ORDER BY version').fetchall() == migrations
     assert feed_state(store) == before
     try:
@@ -903,7 +949,9 @@ def test_activity_grants_add_only_the_new_table_to_each_role(seeded, template, b
         # Existing ACLs are unchanged; the only addition is this table, with exactly the named privileges.
         # A later schema's block (71, ANYM-837: the gateway's INSERT of outgoing_messages.menu_choice) is not this one's.
         later = {('outgoing_messages', 'menu_choice', 'INSERT')} if base == 'messaging_gateway' else set()
-        assert {grant for grant in after if grant[0] != 'subscription_activity'} - later == before
+        # Schema 73 (ANYM-848) adds the gateway's wake target tables; they are that block's, not this one's.
+        assert {grant for grant in after if grant[0] not in ('subscription_activity', 'wake_targets',
+            'wake_target_subscriptions')} - later == before
         assert {grant[2] for grant in after if grant[0] == 'subscription_activity' and grant[1] == ''} == added
         token = store.issue_key('activity-acl', ['telegram-demo'], permissions=['read', 'subscription-write'],
             key_permissions=['read', 'subscription-write'])

@@ -413,6 +413,10 @@ def _delivery_view(c, row, p=None):
         'hint_counts': {state: live.get(state, 0) + deleted.get(state, 0) for state in sorted({*live, *deleted})},
         'deleted_hint_counts': deleted, 'hints_deleted_at': row.get('hints_deleted_at'), 'lag': _lag(c, states),
         **(delivery_state(c, row) if binding else UNBOUND)}
+    # ANYM-848: the agent's own wake target bound to this subscription; null before schema 73 or for a role without
+    # the grant, and never a change to push delivery.
+    from .wake_targets import subscription_wake_target
+    view['wake_target_id'] = subscription_wake_target(c, row['id'])
     if binding and binding.get('endpoint'):
         # ANYM-519: a deleted endpoint leaves the subscription pull-only; a paused one names its state.
         endpoint = c.execute('SELECT state FROM delivery_endpoints WHERE id=%s', (binding['endpoint'],)).fetchone()

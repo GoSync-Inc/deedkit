@@ -3468,6 +3468,8 @@ Only lines of exactly that shape count; any other output, also one that starts l
 Docker's log rotation for the container bounds how far back `--since` reaches.
 services/gateway/tests/test_call_duration_log.py runs this program on captured lines.
 
+`deedkit admin wake-targets list [--principal P]` (ANYM-848) prints every agent's chat wake targets (principal, key ID, kind, thread, label, state, hourly budget, subscription IDs, whether a challenge code came back) with counts by state and `unbound`; it runs the messaging `wake-targets-list` operator command. `deedkit admin wake-targets disable ID` and `enable ID` run `disable-wake-target --id` / `enable-wake-target --id`; `enable --all [--principal P]` (`enable-wake-target --all`) lifts every `operator_disabled` target, the step after a restore (SUBSCRIPTIONS.md "Wake targets").
+
 ## Record the production release
 
 After a successful `apply`, the release owner records the release in Tiden from

@@ -64,7 +64,7 @@ def main():
         'principal-info','delivery-endpoints-list','disable-delivery-endpoint','enable-delivery-endpoint',
         'reload-delivery-policy','set-delivery-features','migrate-expand','set-module-cursor','abandon-module-gap',
         'module-router-status','set-dynamic-subscriptions','set-source-filters',
-        'set-source-exclusions'])
+        'set-source-exclusions','wake-targets-list','disable-wake-target','enable-wake-target'])
     parser.add_argument('--principal')
     parser.add_argument('--accounts',nargs='+')
     parser.add_argument('--key-file',type=Path)
@@ -73,7 +73,7 @@ def main():
     parser.add_argument('--operation-id',help='issue-key, key-info: 1-128 of [A-Za-z0-9._/-]; the same request again replays')
     parser.add_argument('--check',action='store_true',
         help='issue-key, extend-key, revoke-key, list-keys, key-info, principal-info: validate and report the schema, write nothing')
-    parser.add_argument('--all',action='store_true',dest='all_keys',help='list-keys: every key of every principal')
+    parser.add_argument('--all',action='store_true',dest='all_keys',help='list-keys: every key of every principal; enable-wake-target: every operator-disabled target (with --principal, its own)')
     group=parser.add_mutually_exclusive_group()
     group.add_argument('--chats',nargs='*',default=UNSET)
     group.add_argument('--all-chats',action='store_true')
@@ -104,7 +104,8 @@ def main():
     parser.add_argument('--discover-chats',action='store_true')
     parser.add_argument('--synthetic',action='store_true')
     parser.add_argument('--id',nargs='+',dest='feedback_ids',
-        help='set-feedback-status: 1-100 feedback UUIDs; disable-/enable-delivery-endpoint: one endpoint UUID')
+        help='set-feedback-status: 1-100 feedback UUIDs; disable-/enable-delivery-endpoint: one endpoint UUID; '
+        'disable-/enable-wake-target: one wake target UUID')
     parser.add_argument('--status',nargs='?',const='ledger',
         help='set-feedback-status: received, accepted, declined, duplicate, fixed or verify_requested; migrate-expand: alone, read the ledger only')
     parser.add_argument('--plan',type=Path,help='migrate-expand: JSON {base, target, roles: {file: {bytes, sha256}}}')
@@ -345,6 +346,17 @@ def main():
             if not args.feedback_ids or len(args.feedback_ids)!=1:parser.error(args.command+' requires one --id')
             print(json.dumps(store.set_delivery_endpoint_operator_state(args.feedback_ids[0],
                 args.command=='enable-delivery-endpoint')))
+        elif args.command=='wake-targets-list':
+            # ANYM-848: every agent's wake targets with counts by state; whether a code came back, never the code.
+            print(json.dumps(store.list_wake_targets_admin(args.principal)))
+        elif args.command=='enable-wake-target' and args.all_keys:
+            # ANYM-848: the step after a restore, which disables every target.
+            if args.feedback_ids:parser.error('enable-wake-target takes --id or --all, not both')
+            print(json.dumps(store.enable_all_wake_targets(args.principal)))
+        elif args.command in ('disable-wake-target','enable-wake-target'):
+            if not args.feedback_ids or len(args.feedback_ids)!=1:parser.error(args.command+' requires one --id')
+            print(json.dumps(store.set_wake_target_operator_state(args.feedback_ids[0],
+                args.command=='enable-wake-target')))
         elif args.command in ('set-module-cursor','abandon-module-gap','module-router-status'):
             # ANYM-575: owner steps for the module router; recorded in its cursor and gap rows.
             from . import event_router
