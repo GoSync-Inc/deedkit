@@ -9,7 +9,8 @@ so the token source is the caller's choice.
 For each open, non-draft, same-repository pull request into `main` that carries the label `ship`:
   1. An approval must be recorded for the full head SHA by an account whose effective repository permission is
      write, maintain or admin (collaborators/<login>/permission): an APPROVE review on that commit, or an unedited
-     comment, posted after the head arrived, with the line `Review: orchestrator diff read <40-hex sha>`. The
+     comment, posted after the head arrived, with the line `Diff read: <orchestrator session> <40-hex sha>` (or
+     the older `Review: orchestrator diff read <40-hex sha>`). The
      description is never read for it. An approval of an older SHA: no enqueue, one comment.
   2. Every required check of the live `main` rules (name and app) has its newest run on the head completed: `CI
      gate` success, the others success or skipped (`CI gate` validates their skip; never all skipped).
@@ -42,7 +43,10 @@ LABEL = 'ship'
 GATE = 'CI gate'
 MIGRATIONS = 'services/messaging/messaging_service/migrations'
 MIGRATION = re.compile(r'^(\d{3})_[A-Za-z0-9_]+\.sql$')
-APPROVAL_LINE = re.compile(r'^\s*Review:\s*orchestrator diff read\s+([0-9a-f]{7,40})\b', re.I | re.M)
+# The orchestrator's diff-read line, in the old form and the harness 0.80.0 form `Diff read: <session> <head SHA>`.
+# One group each; only a full 40-hex SHA equal to the head ever approves (head_approved).
+APPROVAL_LINE = re.compile(r'^\s*(?:Review:\s*orchestrator diff read\s+([0-9a-f]{7,40})'
+                           r'|Diff read:\s*\S+\s+([0-9a-f]{7,40}))\b', re.I | re.M)
 KEEPER_BOT = 'github-actions[bot]'
 RETRY_AFTER = 3  # minutes a failed-checks removal waits before the keeper re-enqueues
 # Off until the harness wait-merge.sh skips its re-enqueue for `ship` pull requests: one retry actor per queue.
@@ -107,7 +111,7 @@ def approved_shas(facts, authorizing=True):
     for c in facts.comments:
         fresh = c.get('updated_at') == c.get('created_at') and (c.get('created_at') or '') >= (facts.head_at or '')
         if c.get('user') in facts.writers and (fresh or not authorizing):
-            shas += [sha.lower() for sha in APPROVAL_LINE.findall(c.get('body') or '')]
+            shas += [(old or new).lower() for old, new in APPROVAL_LINE.findall(c.get('body') or '')]
     return shas
 
 

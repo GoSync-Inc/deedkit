@@ -46,8 +46,9 @@ It acts only on an open, non-draft, same-repository pull request into `main` tha
 1. **Approval on the full head SHA, by an account with write access**: its effective repository permission
    (`collaborators/<login>/permission`) is write, maintain or admin. An organization member with read or triage
    access does not count. Either an APPROVE review on the head commit, or a comment
-   `Review: orchestrator diff read <40-hex head sha>` that was posted after the head arrived and was never
-   edited. The description is not read: its author can edit it after a push. When the approval names an older
+   `Diff read: <orchestrator session> <40-hex head sha>` (harness 0.80.0; the older
+   `Review: orchestrator diff read <40-hex head sha>` also counts) that was posted after the head arrived and was
+   never edited. The description is not read: its author can edit it after a push. When the approval names an older
    SHA, the keeper does not enqueue and comments once. The trust boundary is write access, which can already arm
    `gh pr merge --auto` directly, so the keeper adds no authority.
 2. **Green with no required job skipped.** Each required check of the live `main` rules, matched by name and app,
@@ -94,7 +95,7 @@ heartbeat-check` from any checkout to get the same answer (exit 1 when stale). T
 `~/Library/Logs/deedkit-merge-keeper.log` on the mini.
 
 **Workers.** Add the label (`gh pr edit <n> --add-label ship`) once the review passed on the head. The
-orchestrator records its diff read as a comment with the full head SHA. Arming `gh pr merge <n> --squash --auto`
+orchestrator records its diff read as a comment `Diff read: <session> <full head SHA>`. Arming `gh pr merge <n> --squash --auto`
 yourself still works, and the keeper then leaves the pull request alone. A push after approval needs a new
 approval comment or review.
 

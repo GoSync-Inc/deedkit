@@ -45,6 +45,16 @@ def test_trusted_approve_review_on_the_head_counts_and_an_outsider_does_not():
 
 
 # spec: ANYM-625
+def test_the_harness_diff_read_line_approves_only_the_full_head_under_the_same_provenance_rules():
+    line = f'Diff read: pollen-observation-f06af0bb-db {HEAD}'
+    assert mk.decide(facts(comments=[comment(line)])).action == 'enqueue'
+    for rejected in (comment(f'Diff read: pollen-observation-f06af0bb-db {HEAD[:12]}'),
+                     comment(line, user='read-only-member'), comment(line, updated='2026-11-09T00:20:00Z'),
+                     comment(line, created='2026-11-08T23:00:00Z'), comment(f'Diff read: {HEAD}')):
+        assert not mk.head_approved(facts(comments=[rejected])), rejected
+
+
+# spec: ANYM-625
 def test_forged_edited_abbreviated_or_pre_head_approval_comments_do_not_approve():
     for forged in (approval(user='read-only-member'), approval(user='outsider'),
                    approval(updated='2026-11-09T00:20:00Z'), approval(sha=HEAD[:12]),
