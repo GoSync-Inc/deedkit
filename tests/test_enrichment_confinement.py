@@ -296,28 +296,43 @@ def test_two_lanes_claiming_at_once_share_one_proof_made_after_both_asked():
 # spec: ANYM-838
 def test_the_background_monitor_never_queues_a_second_proof_in_front_of_a_waiting_lane():
     import threading
-    g = guard(fresh=0.0, interval=0.15)
-    probes, entered = [], threading.Event()
-    def slow_probe():
+    g = guard(fresh=0.0, interval=0.05)
+    probes, entered, release = [], threading.Event(), threading.Event()
+    waiting, served = set(), {}
+    def held_probe():
         probes.append(threading.current_thread().name)
         entered.set()
-        time.sleep(0.6)
+        assert release.wait(10)          # the first proof lasts until the monitor and the audio lane both wait
         return []
-    g.probe = slow_probe
+    g.probe = held_probe
+    real_verify = g.verify
+    def verify(since=None):
+        name = threading.current_thread().name
+        waiting.add(name)
+        real_verify(since=since)
+        served.setdefault(name, len(probes))   # proofs made when this caller's first request was served
+    g.verify = verify
     first = threading.Thread(target=g.ensure, name='main-lane')
     first.start()
-    assert entered.wait(5)
-    g.start_monitor(lambda: None)    # wakes during the main lane's proof and waits for the guard
+    assert entered.wait(10)
+    g.start_monitor(lambda: None)
+    audio = threading.Thread(target=g.ensure, name='audio-lane')
+    audio.start()
     try:
-        time.sleep(0.25)
-        started = time.monotonic()
-        g.ensure()                   # the audio lane: asked during that proof too
-        waited, proved = time.monotonic() - started, list(probes)
+        deadline = time.monotonic() + 10
+        while not {'confinement-monitor', 'audio-lane'} <= waiting and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert {'confinement-monitor', 'audio-lane'} <= waiting
+        release.set()
+        audio.join(10)
+        first.join(10)
+        while 'confinement-monitor' not in served and time.monotonic() < deadline:
+            time.sleep(0.01)
     finally:
+        release.set()
         g.stop_monitor()
-        first.join(5)
-    # One proof served the main lane, the monitor and the audio lane; a second full proof would be two names here.
-    assert proved == ['main-lane'] and waited < 0.6
+    # Both requests asked during the main lane's proof and were served by it: no second full proof before them.
+    assert served['audio-lane'] == 1 and served['confinement-monitor'] == 1
 
 
 # spec: ANYM-838
