@@ -3205,12 +3205,17 @@ def write_record(path, value):
     fsync_directory(path.parent)
 
 
-def copies_root(state, *, create=False):
-    """`<state>/migration-copies`, None when there is none."""
-    root = Path(state) / COPIES
+def copies_root(state, *, create=False, root=None):
+    """`<state>/migration-copies` (or `root`, `migration.copy_root`), None when there is none. A configured root is
+    created only below a parent that exists: a missing mount never becomes a directory on the root filesystem."""
+    root = Path(root) if root is not None else Path(state) / COPIES
     if create:
-        with suppress(FileExistsError):
+        try:
             root.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        except FileNotFoundError as exc:
+            raise Refused(f"the parent of {root} does not exist; no database is copied") from exc
     try:
         found = os.lstat(root)
     except FileNotFoundError:
@@ -3218,6 +3223,29 @@ def copies_root(state, *, create=False):
     if not stat.S_ISDIR(found.st_mode) or found.st_uid != os.geteuid() or found.st_mode & 0o077:
         raise Refused(f"{root} must be a private operator-owned directory")
     return root
+
+
+def copy_root(settings):
+    """`migration.copy_root`, the directory new copies go to (2026-11-09: the root filesystem was too small for the
+    dump and the restore of messaging), or None for `<state>/migration-copies`."""
+    section = settings.get("migration")
+    named = section.get("copy_root") if isinstance(section, dict) else None
+    if named is None:
+        return None
+    if not isinstance(named, str) or not named.startswith("/") or posixpath.normpath(named) != named or named == "/":
+        raise Refused("migration.copy_root must be an absolute normalized directory path")
+    return Path(named)
+
+
+def copy_roots(settings):
+    """Every copy root that exists: the configured one and the state's own, whose older copies are still released and
+    expired after a move."""
+    state, roots, seen = Path(settings["state_directory"]), [], set()
+    for root in (copies_root(state, root=copy_root(settings)), copies_root(state)):
+        if root is not None and root.resolve() not in seen:
+            seen.add(root.resolve())
+            roots.append(root)
+    return roots
 
 
 def copy_directories(root):
@@ -3232,6 +3260,24 @@ def copy_directories(root):
 def copy_exec(copy, step, container, *argv):
     """A helper session of the copy: its application name starts with the copy's prefix (C4)."""
     return ["docker", "exec", "-i", "-e", f"PGAPPNAME={copy['application_name']}-{step}", container, *argv]
+
+
+def copy_room(copy, paths, database_bytes):
+    """Before the first dump: the copy's filesystem (`paths[0]`) holds the dumps and the restore, so it needs twice the
+    database and the reserve; the live data's filesystem, when another one (`migration.copy_root`), only the reserve:
+    there the copy adds no file, only the WAL its snapshot keeps, which the reserve check during each step watches."""
+    for path in paths:
+        free, size = filesystem(path)
+        if free < (2 * database_bytes if same_filesystem(path, paths[0]) else 0) + copy_reserve(size):
+            raise CopyFailed(copy["id"], "disk_reserve")
+
+
+def same_filesystem(path, other):
+    """Whether two paths share a filesystem; one that cannot be read counts as shared, so the larger need applies."""
+    try:
+        return os.stat(path).st_dev == os.stat(other).st_dev
+    except OSError:
+        return True
 
 
 def check_reserve(copy, paths):
@@ -3423,10 +3469,7 @@ def copy_dumps(copy, keeper, timeout, catalog, container, owner, database, direc
             or not all(SQL_NAME.fullmatch(found[key] or "") for key in ("owner", "bootstrap"))
             or not all(LOCALE.fullmatch(found[key]) for key in ("encoding", "collate", "ctype"))):
         raise CopyFailed(copy["id"], "dump_failed")
-    for path in paths:
-        free, size = filesystem(path)
-        if free < 2 * found["bytes"] + copy_reserve(size):
-            raise CopyFailed(copy["id"], "disk_reserve")
+    copy_room(copy, paths, found["bytes"])
     reference = counts(copy, keeper.query(COUNTS), "dump_failed")
     shape = keeper.query(catalog) if catalog else None
     snapshot = "--snapshot=" + found["snapshot"]
@@ -3683,13 +3726,14 @@ def owned_copy(directory):
     return {**copy, "directory": str(directory)}
 
 
-def reconcile_copies(state):
+def reconcile_copies(state, roots=None):
     """C4: release every copy a crashed or killed run left without `released.json`, each on its own: (the ids released,
     the ids that could not be). A container that appeared after its copy was released (a start a crash left in
-    flight) carries the label of a released copy and is removed too."""
-    root = copies_root(state)
+    flight) carries the label of a released copy and is removed too. `roots`: copy_roots, else the state's own."""
+    roots = [copies_root(state)] if roots is None else roots
     released, stuck, done = [], [], set()
-    for directory in copy_directories(root):
+    found = {directory.name: directory for root in roots for directory in copy_directories(root)}
+    for directory in found.values():
         if not (directory / "owner.json").exists():
             continue
         if (directory / "released.json").exists():
@@ -3719,29 +3763,30 @@ def reconcile_copies(state):
         try:
             if copy_id not in late:
                 raise Refused("the copy's containers could not be listed")
-            release_copy(owned_copy(root / copy_id))
+            release_copy(owned_copy(found[copy_id]))
         except Exception:
             with suppress(FileNotFoundError):
-                (root / copy_id / "released.json").unlink()
+                (found[copy_id] / "released.json").unlink()
             stuck.append(copy_id)
             if copy_id in released:
                 released.remove(copy_id)
     return released, stuck
 
 
-def settle_copies(state):
+def settle_copies(state, roots=None):
     """Reconcile, then expire whatever happened (C6 never waits for a stuck copy); a stuck copy then refuses."""
-    _, stuck = reconcile_copies(state)
-    expire_copies(state)
+    _, stuck = reconcile_copies(state, roots)
+    expire_copies(state, roots=roots)
     if stuck:
         raise CopyStuck(stuck[0])
 
 
-def expire_copies(state, *, at=None):
+def expire_copies(state, *, at=None, roots=None):
     """C6: delete every copy older than COPY_RETENTION, whatever its state. Only the `owner.json` of a copy whose
     resources are not confirmed released stays, so a later run can still stop them."""
     at, expired = at or datetime.now(timezone.utc), []
-    for directory in copy_directories(copies_root(state)):
+    roots = [copies_root(state)] if roots is None else roots
+    for directory in [directory for root in roots for directory in copy_directories(root)]:
         stamp = COPY_ID.fullmatch(directory.name)
         made = datetime.strptime(stamp[1] if stamp else "", "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
         if (at - made).total_seconds() <= COPY_RETENTION:
@@ -3766,9 +3811,9 @@ def database_copy(settings, name, sha, *, keep=False, catalog=None):
     if not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
         raise Refused("an exact lowercase 40-character commit SHA is required")
     state = Path(settings["state_directory"])
-    root = copies_root(state, create=True)
+    root = copies_root(state, create=True, root=copy_root(settings))
     assert root
-    settle_copies(state)
+    settle_copies(state, copy_roots(settings))
     copy_id = f"{sha[:12]}-{name}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
     directory = root / copy_id
     directory.mkdir(mode=0o700)
@@ -3785,7 +3830,7 @@ def database_copy(settings, name, sha, *, keep=False, catalog=None):
 def tend_copies(settings, *, locked):
     """`deploy`'s copy housekeeping (C4, C6). Unlocked (a paused run) it takes the plan A lock only when it is free."""
     state = Path(settings["state_directory"])
-    if copies_root(state) is None:
+    if not (roots := copy_roots(settings)):
         return
     with ExitStack() as held:
         if not locked:
@@ -3793,7 +3838,7 @@ def tend_copies(settings, *, locked):
                 held.enter_context(lock(state))
             except Busy:
                 return
-        settle_copies(state)
+        settle_copies(state, roots)
 
 
 # Continuous deployment (production.md "Continuous deployment"): one command that deploys the newest green main

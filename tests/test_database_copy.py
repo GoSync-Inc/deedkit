@@ -643,6 +643,77 @@ def test_an_expired_copy_whose_resources_are_unconfirmed_keeps_only_its_owner_re
     assert [path.name for path in directory.iterdir()] == ["owner.json"]
 
 
+def rooted(tmp_path, root):
+    """Docker-free settings whose copies go to `root` (`migration.copy_root`)."""
+    (tmp_path / "state").mkdir(mode=0o700, exist_ok=True)
+    return {"version": 1, "state_directory": str(tmp_path / "state"), "migration": {
+        "databases": {"main": {"container": "db", "owner": "probe", "database": "probe"}}, "copy_root": str(root)}}
+
+
+# spec: ANYM-588
+def test_a_configured_copy_root_takes_new_copies_and_the_states_older_ones_are_still_settled(tmp_path, monkeypatch):
+    # 2026-11-09: the root filesystem was too small for messaging's dump and restore; another disk holds the copies.
+    FakeDocker(monkeypatch)
+    (tmp_path / "volume").mkdir()
+    settings = rooted(tmp_path, tmp_path / "volume" / "copies")
+    left, old = unreleased(tmp_path / "state", stamp(1)), unreleased(tmp_path / "state", stamp(50))
+    p.write_record(old / "released.json", {"id": old.name})
+    made = []
+    monkeypatch.setattr(p, "snapshot_copy", lambda copy, timeout, keep, catalog=None: made.append(copy) or {"verified": True})
+    with p.database_copy(settings, "main", SHA) as found:
+        assert found == {"verified": True}
+    directory = Path(made[0]["directory"])
+    assert directory.parent == tmp_path / "volume" / "copies" and (directory / "owner.json").exists()
+    assert (directory.parent.stat().st_mode & 0o777) == 0o700 and (directory / "released.json").exists()
+    # The copy a crash left in the state's own root is released, the expired one deleted, by the same pass.
+    assert (left / "released.json").exists() and not old.exists()
+    assert [root.name for root in p.copy_roots(settings)] == ["copies", p.COPIES]
+
+
+# spec: ANYM-588
+@pytest.mark.parametrize("root", ["relative/copies", "/srv/../copies", "/srv/copies/", "/", 7])
+def test_a_copy_root_that_is_not_an_absolute_normalized_path_is_refused_before_any_record(tmp_path, root):
+    settings = rooted(tmp_path, "unused")
+    settings["migration"]["copy_root"] = root
+    with pytest.raises(p.Refused, match="migration.copy_root must be an absolute normalized directory path"):
+        with p.database_copy(settings, "main", SHA):
+            pass
+    assert list((tmp_path / "state").iterdir()) == []
+
+
+# spec: ANYM-588
+def test_a_copy_root_below_a_missing_mount_is_refused_and_never_created(tmp_path):
+    settings = rooted(tmp_path, tmp_path / "unmounted" / "copies")
+    with pytest.raises(p.Refused, match="does not exist; no database is copied"):
+        with p.database_copy(settings, "main", SHA):
+            pass
+    assert not (tmp_path / "unmounted").exists() and list((tmp_path / "state").iterdir()) == []
+
+
+# spec: ANYM-588
+@pytest.mark.parametrize("live_free_gib, copy_free_gib, same, refused", [
+    (11, 30, False, False),  # another live filesystem needs only the reserve
+    (9, 30, False, True),
+    (11, 30, True, True),  # one filesystem: twice the database and the reserve, as before
+    (30, 18, False, False),
+    (30, 17, False, True)])
+def test_twice_the_database_is_needed_only_where_the_copy_is_written(tmp_path, monkeypatch, live_free_gib, copy_free_gib,
+                                                                       same, refused):
+    gib, copy_dir, live = 1 << 30, tmp_path / "copy", tmp_path / "live"
+    free = {str(copy_dir): copy_free_gib * gib, str(live): live_free_gib * gib}
+    monkeypatch.setattr(p, "filesystem", lambda path: (free[str(path)], 76 * gib))
+    real = os.stat
+    devices = {str(copy_dir): 1, str(live): 1 if same else 2}
+    monkeypatch.setattr(p.os, "stat", lambda path, *args, **kwargs: os.stat_result(
+        (0, 0, devices[str(path)], 0, 0, 0, 0, 0, 0, 0)) if str(path) in devices else real(path, *args, **kwargs))
+    copy, paths = {"id": "synthetic"}, [str(copy_dir), str(live)]
+    if refused:
+        with pytest.raises(p.CopyFailed, match="disk_reserve"):
+            p.copy_room(copy, paths, 4 * gib)
+    else:
+        p.copy_room(copy, paths, 4 * gib)
+
+
 # spec: ANYM-588
 def test_a_planted_symlink_is_never_followed_or_removed_through(tmp_path):
     target = tmp_path / "elsewhere"
