@@ -115,6 +115,30 @@ def test_decorations_same_chat_and_live_profile_source_only(seeded):
     assert s.search(b,'visible text')['items'][0]['sender_name'] is None
 
 
+# spec: ANYM-831
+def test_compact_context_anchor_carries_chat_title_and_type_in_both_views(seeded):
+    from messaging_service.archive import Archive
+    from messaging_service.presentation import render
+    from test_archive import event
+    s,*_=seeded;ar=Archive(s)
+    ar.register('tg-chats','telegram','Synthetic chat fields',discover=True)
+    key=s.issue_key('tg-chats-reader',['tg-chats'])
+    def say(n,chat,chat_type,title):
+        at=f'2026-10-05T12:{n:02}:00+00:00'
+        return ar.ingest(event(account='tg-chats',chat=chat,chat_title=title,provider_id=str(n),body=f'chat item {n}',
+            sent_at=at,updated_at=at,metadata={'chat_type':chat_type},sender_profile={'display_name':'Synthetic Dana'}))['message']
+    say(1,'p1','private','Synthetic Dana');private=say(2,'p1','private','Synthetic Dana')
+    say(3,'g1','group','G'*100);group=say(4,'g1','group','G'*100)
+    for view in ('conversation','archive'):
+        for mid,kind,title in ((private,'private','Synthetic Dana'),(group,'group','G'*64)):
+            full=s.get_context(key,mid,limit=2,view=view)
+            compact=render('get_context',full,'compact')
+            assert (compact['message']['chat_type'],compact['message']['chat_title'])==(kind,title),(view,kind)
+            assert full['message']['chat_title'][:64]==title
+            if view=='conversation':
+                assert all('chat_title' not in r and 'chat_type' not in r for r in compact['context'])
+
+
 # spec: ANYM-398
 def test_search_row_ignores_other_chat_profile_and_stale_revision_metadata(seeded):
     s,a,b=seeded

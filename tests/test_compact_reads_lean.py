@@ -17,8 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 SNAPSHOT = ROOT / 'tests/fixtures/compact-reads-before-anym-667.json'
 # Values that follow the wall clock, not the projection.
 VOLATILE = {'first_observed_at', 'last_ingest_at', 'as_of', 'indexed_at'}
-# Keys later cards added to a query search (ANYM-665); the frozen snapshot predates them.
-ADDED_LATER = {'matched_in', 'media_matches', 'media_text_applied', 'media_text_hint', 'media_low_quality_hits'}
+# Keys later cards added to a query search (ANYM-665) and to the get_context anchor (ANYM-831); the frozen
+# snapshot predates them.
+ADDED_LATER = {'matched_in', 'media_matches', 'media_text_applied', 'media_text_hint', 'media_low_quality_hits',
+    'sender_name_observed_on', 'sender_name_unavailable'}
 FILE_TEXT = 'Synthetic paragraph about the needle. ' * 250
 SUMMARY = {'empty_reason', 'requested_range_traversed', 'active_conflicts_in_range', 'next_action'}
 VIEW = {'contract_version', 'order', 'content_is_untrusted'}

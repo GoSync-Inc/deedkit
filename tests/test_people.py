@@ -435,3 +435,176 @@ def test_conversation_views_keep_the_fallback_basis(wa_names):
     lean=[r for r in render('list_chats',s.list_chats(key,view='conversation',include_coverage=False),'compact')['items']
         if r['id']==chat][0]
     assert lean['last_message']['sender_name_basis']=='seen_elsewhere'
+
+
+NAME_AID=('sender_name','username','sender_name_basis','sender_name_observed_on')
+
+
+@pytest.fixture()
+def tg_names(seeded):
+    """ANYM-831: one Telegram sender ID seen in several chats of one account (synthetic names only)."""
+    from messaging_service.presentation import render
+    s,*_=seeded;ar=Archive(s)
+    ar.register('tg-names','telegram','Synthetic Telegram names',discover=True)
+    ar.register('tg-names-2','telegram','Synthetic second Telegram',discover=True)
+    key=s.issue_key('tg-names-reader',['tg-names','tg-names-2'])
+    serial=iter(range(1,10000))
+    def say(chat,*,sender='4242',name='',username='',chat_type='group',direction='incoming',account='tg-names',day=1,title=None):
+        n=next(serial);at=f'2026-10-{day:02}T12:{n%60:02}:00+00:00'
+        profile={k:v for k,v in (('display_name',name),('username',username)) if v}
+        return ar.ingest(event(account=account,chat=chat,chat_title=title or 'Synthetic chat '+chat,provider_id=str(n),
+            sender=sender,body=f'tg item {n}',direction=direction,sent_at=at,updated_at=at,metadata={'chat_type':chat_type},
+            **({'sender_profile':profile} if profile else {})))['message']
+    def anchor(mid,detail='full',view='conversation',limit=1):
+        return render('get_context',s.get_context(key,mid,limit=limit,view=view),detail)
+    return s,key,say,anchor
+
+
+# spec: ANYM-831
+def test_telegram_anchor_is_named_from_another_readable_chat_of_the_account(tg_names):
+    s,key,say,anchor=tg_names
+    say('g1',name='Synthetic Carol',username='carol_s',day=2)
+    say('p1',chat_type='private',day=4)
+    mid=say('p1',chat_type='private',day=5)
+    full=anchor(mid)['message']
+    assert {k:full.get(k) for k in NAME_AID}=={'sender_name':'Synthetic Carol','username':'carol_s',
+        'sender_name_basis':'seen_elsewhere','sender_name_observed_on':'2026-10-02'}
+    assert 'sender_name_unavailable' not in full
+    for view in ('conversation','archive'):
+        compact=anchor(mid,'compact',view)['message']
+        assert (compact['sender_name'],compact['sender_name_basis'],compact['sender_name_observed_on'])==(
+            'Synthetic Carol','seen_elsewhere','2026-10-02'),view
+        # Compact keeps each view's rule: the conversation view shows a username only without a name.
+        assert ('username' in compact)==(view=='archive') and 'sender_name_unavailable' not in compact
+    # Only the anchor: a context row of the same sender in the same response keeps the same-chat rule.
+    result=anchor(mid,'full',limit=3)
+    assert [r.get('sender_name') for r in result['context'] if r['id']!=mid]==[None]
+    assert s.search(key,'tg item 2')['items'][0]['sender_name'] is None
+
+
+# spec: ANYM-831
+def test_telegram_anchor_prefers_the_newest_usable_name_over_a_newer_username_only_row(tg_names):
+    s,key,say,anchor=tg_names
+    say('g1',name='Synthetic Old',day=1)
+    say('g2',name='Synthetic New',day=3)
+    say('g3',username='newest_only',day=4)
+    mid=say('p1',chat_type='private',day=6)
+    full=anchor(mid)['message']
+    assert {k:full.get(k) for k in NAME_AID}=={'sender_name':'Synthetic New','username':None,
+        'sender_name_basis':'seen_elsewhere','sender_name_observed_on':'2026-10-03'}
+
+
+# spec: ANYM-831
+def test_telegram_anchor_with_only_usernames_elsewhere_gets_the_newest_username(tg_names):
+    s,key,say,anchor=tg_names
+    say('g1',username='older_user',day=2)
+    say('g2',name='4242',username='raw_name_user',day=3)  # a name that only repeats the sender ID is no name
+    mid=say('p1',chat_type='private',day=6)
+    full=anchor(mid)['message']
+    assert {k:full.get(k) for k in NAME_AID}=={'sender_name':None,'username':'raw_name_user',
+        'sender_name_basis':'seen_elsewhere','sender_name_observed_on':'2026-10-03'}
+    compact=anchor(mid,'compact')['message']
+    assert {k:compact.get(k) for k in NAME_AID}=={'sender_name':None,'username':'raw_name_user',
+        'sender_name_basis':'seen_elsewhere','sender_name_observed_on':'2026-10-03'}
+    assert 'sender_name_unavailable' not in compact
+
+
+# spec: ANYM-831
+@pytest.mark.parametrize('case',['hidden_chat','deleted_source','outgoing_source','other_account','profile_mismatch',
+    'source_by_other_sender_same_chat','source_in_other_chat_same_sender','hidden_profile_readable_source'])
+def test_telegram_anchor_never_takes_a_name_the_key_may_not_read(tg_names,case):
+    s,key,say,anchor=tg_names
+    source=say('g1',name='Synthetic Hidden',username='hidden_user',day=2,
+        direction='outgoing' if case=='outgoing_source' else 'incoming',account='tg-names-2' if case=='other_account' else 'tg-names')
+    mid=say('p1',chat_type='private',day=5)
+    with s.pool.connection() as c:
+        if case=='deleted_source':c.execute('UPDATE messages SET deleted=true WHERE id=%s',(source,))
+        if case=='profile_mismatch':
+            # The profile row points at a message of another sender: the source does not name 4242.
+            other=say('g2',sender='777',day=3)
+            c.execute("UPDATE sender_profiles SET source_message=%s WHERE source_message=%s",(other,source))
+        if case=='source_by_other_sender_same_chat':
+            # Same chat, another sender: only the sender guard rejects it.
+            other=say('g1',sender='777',day=3)
+            c.execute("UPDATE sender_profiles SET source_message=%s WHERE source_message=%s",(other,source))
+        if case in ('source_in_other_chat_same_sender','hidden_profile_readable_source'):
+            # Same sender, another readable chat: only the chat guard rejects it.
+            other=say('g2',day=3)
+            c.execute("UPDATE sender_profiles SET source_message=%s WHERE source_message=%s",(other,source))
+    if case=='hidden_chat':s.set_access('tg-names-reader',chats=[anchor(mid)['message']['chat']])
+    if case=='hidden_profile_readable_source':
+        # The profile's own chat is hidden; the message it points at is readable.
+        with s.pool.connection() as c:
+            readable=[r['chat'] for r in c.execute('SELECT chat FROM messages WHERE id=ANY(%s)',([mid,other],))]
+        s.set_access('tg-names-reader',chats=readable)
+    for detail in ('full','compact'):
+        row=anchor(mid,detail)['message']
+        assert {k:row.get(k) for k in NAME_AID if k!='sender_name_basis'}=={'sender_name':None,'username':None,
+            'sender_name_observed_on':None},(case,detail)
+        assert row.get('sender_name_basis') in (None,'message') and row['sender_name_unavailable']=='not_observed',(case,detail)
+        assert 'Synthetic Hidden' not in str(row) and 'hidden_user' not in str(row)
+
+
+# spec: ANYM-831
+def test_unnamed_anchor_says_not_observed_except_for_a_chat_that_is_its_own_author(tg_names):
+    s,key,say,anchor=tg_names
+    private_peer=say('4242',chat_type='private')  # a private chat's peer ID equals the sender
+    channel_post=say('-1001',sender='-1001',chat_type='channel')
+    anonymous_admin=say('-1002',sender='-1002',chat_type='group')
+    named=say('g1',sender='3131',name='Synthetic Named')
+    outgoing=say('p9',sender='99',direction='outgoing',chat_type='private')
+    for detail in ('full','compact'):
+        assert anchor(private_peer,detail)['message']['sender_name_unavailable']=='not_observed'
+        for mid in (channel_post,anonymous_admin,named,outgoing):
+            row=anchor(mid,detail)['message']
+            assert 'sender_name_unavailable' not in row,(mid,detail)
+            assert row.get('sender_name_basis') in (None,'message') and 'sender_name_observed_on' not in row
+
+
+# spec: ANYM-831
+def test_unnamed_private_whatsapp_lid_anchor_says_not_observed(wa_names):
+    from messaging_service.presentation import render
+    s,key,say,named=wa_names
+    mid=say(1,'555@lid','555@lid')
+    for detail in ('full','compact'):
+        row=render('get_context',s.get_context(key,mid,limit=1,view='conversation'),detail)['message']
+        assert row.get('sender_name') is None and row['sender_name_unavailable']=='not_observed'
+
+
+# spec: ANYM-831
+def test_anchor_name_lookup_is_one_statement_and_only_for_an_unnamed_telegram_anchor(tg_names,wa_names,monkeypatch):
+    from messaging_service import sender_names
+    s,key,say,anchor=tg_names
+    original=sender_names._elsewhere;calls=[]
+    class Counting:
+        def __init__(self,c):self.c=c;self.statements=0
+        def execute(self,*a,**k):self.statements+=1;return self.c.execute(*a,**k)
+    def counted(c,p,row):
+        proxy=Counting(c);result=original(proxy,p,row);calls.append(proxy.statements);return result
+    monkeypatch.setattr(sender_names,'_elsewhere',counted)
+    say('g1',name='Synthetic Carol',day=2)
+    named=say('g1',day=3)
+    unnamed=say('p1',chat_type='private',day=4)
+    anchor(named)
+    assert calls==[]
+    anchor(unnamed)
+    assert calls==[1]
+    ws,wkey,wsay,_=wa_names
+    ws.get_context(wkey,wsay(1,'555@lid','555@lid'),limit=1,view='conversation')
+    assert calls==[1]
+
+
+# spec: ANYM-831
+def test_anchor_name_aid_and_chat_fields_stay_small(tg_names):
+    import json
+    s,key,say,anchor=tg_names
+    added=('chat_title','chat_type','sender_name','username','sender_name_basis','sender_name_observed_on','sender_name_unavailable')
+    def size(mid):
+        row=anchor(mid,'compact')['message']
+        return len(json.dumps({k:row[k] for k in added if k in row},ensure_ascii=False,separators=(',',':')))
+    say('g1',name='N'*20,username='u'*12,day=2)
+    assert size(say('p1',chat_type='private',title='T'*30,day=3))<=200
+    say('g2',sender='5151',name='Н'*200,day=2)
+    assert size(say('p2',sender='5151',chat_type='private',title='Т'*200,day=3))<=270
+    say('g3',sender='6161',username='u'*64,day=2)
+    assert size(say('p3',sender='6161',chat_type='private',title='Т'*200,day=3))<=270

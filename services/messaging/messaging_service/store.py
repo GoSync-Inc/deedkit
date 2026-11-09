@@ -858,6 +858,8 @@ class Store:
             anchor,snapshot=self._context_anchor(c,p,message_id,conversation,include_system,body_format)
             scans=self._context_scans(c,anchor,conversation,include_system,explicit,limit,before_count,after_count)
             rows,older,newer=self._context_rows(c,p,anchor,scans,conversation,include_system,explicit,limit,compact,cap,body_format)
+            from .sender_names import anchor as name_anchor
+            name_anchor(c,p,anchor)  # ANYM-831: the anchor only, after its enrichment
             files=[f for f in anchor['attachments'] if f['download_status']=='ready']
             jobs=[f for f in anchor['attachments'] if f['download_status']!='ready']
             from .reviews import list_reviews
