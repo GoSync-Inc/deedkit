@@ -144,7 +144,9 @@ def assert_bounded(plans, indexes):
 def selection_is_indexed(plans):
     query,plan=next((q,p) for q,p in plans if 'FOR UPDATE OF j SKIP LOCKED' in q)
     text=json.dumps(plan)
-    assert 'media_requested' in text and 'message_scope_date' in text and 'media_message' in text
+    # The whole plan in the message: pytest truncates the compared JSON, and a plan that skips an index is
+    # rare enough (one CI run in many) that the failure report must carry it.
+    assert 'media_requested' in text and 'message_scope_date' in text and 'media_message' in text,outline(plan)
     return query
 
 
