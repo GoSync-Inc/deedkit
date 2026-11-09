@@ -44,7 +44,10 @@ def derivatives(archive, tmp_path):
         {'accounts':['archive-test'],'max_jobs_per_day':10000,'profiles':{'image':profile}},
         processor=lambda *_:normalize_result({'title':'Synthetic document',
             'summary':'A synthetic search fixture','text':MODEL_TEXT,'document_type':'fixture'}))
-    with s.pool.connection() as c:c.execute('TRUNCATE enrichment_budget')
+    with s.pool.connection() as c:
+        c.execute('TRUNCATE enrichment_budget')
+        # The fixture photo is weeks old: an agent's request lets it be described (ANYM-887).
+        c.execute("UPDATE media_jobs SET request_key_digest='synthetic-request' WHERE id=%s", (media['id'],))
     assert enrichment.once()
     return ar, s, key, other, raw, mid, media['id'], indexer, enrichment
 

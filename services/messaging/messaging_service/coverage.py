@@ -8,6 +8,7 @@ The workers' claims keep their own order, caps and leases (tests/test_sync_cover
 from datetime import datetime, timedelta, timezone
 
 from .file_lifecycle import PROCESSABLE_ORIGINAL
+from .media_policy import description_skipped_row
 
 # WhatsApp publishes no media retention; integrators report about 30 days (an estimate, not a provider guarantee).
 WHATSAPP_MEDIA_RETENTION_DAYS = 30
@@ -64,6 +65,9 @@ POLICY_JOINS = (EXCLUSION_JOINS
                 + '\n        LEFT JOIN configured_kinds ck ON ck.account=m.account AND ck.kind=' + KIND)
 WITHHELD_ROW = '(orq.chat IS NOT NULL AND wj.id IS NOT NULL AND wj.request_key_digest IS NULL)'
 EVICTED_ROW, CONFIGURED_ROW = 'eo.digest IS NOT NULL', 'ck.kind IS NOT NULL'
+# Owner 11-09: an image whose description waits for a request (media_policy.DESCRIPTION_SKIPPED), read on the job
+# joined above: no extra pass over attachments; a sticker probes message_metadata by its key.
+SKIPPED_ROW = description_skipped_row('wj')
 
 
 # enrichment.FINAL_LIMIT_CODES: a failure the same profile never retries (a test keeps the two equal, so the API
@@ -83,6 +87,7 @@ def recognition_bucket():
         WHEN ''' + WITHHELD_ROW + ''' THEN 'withheld'
         WHEN ''' + EVICTED_ROW + ''' THEN 'evicted'
         WHEN NOT ''' + CONFIGURED_ROW + ''' THEN 'recognition_off'
+        WHEN e.state IN ('unconfigured','queued') AND ''' + SKIPPED_ROW + ''' THEN 'skipped'
         WHEN ''' + KIND + "='document' AND NOT coalesce(" + DOCUMENT_TEXT + ''',false) THEN 'no_text'
         WHEN e.state='failed' THEN 'failed_retry'
         ELSE 'due' END''')
@@ -101,7 +106,8 @@ def extraction_bucket():
 # was reported queued splits into due work, work waiting for a request and work no worker can do.
 RECOGNITION_FILES = {'unknown': 'unknown', 'ready': 'ready', 'failed_final': 'failed', 'failed_retry': 'failed',
                      'unsupported': 'unsupported', 'leased': 'leased', 'withheld': 'available_on_request',
-                     'evicted': 'available_on_request', 'recognition_off': 'unconfigured',
+                     'evicted': 'available_on_request', 'skipped': 'available_on_request',
+                     'recognition_off': 'unconfigured',
                      'no_text': 'not_recognizable', 'due': 'queued'}
 EXTRACTION_FILES = {'unknown': 'unknown', 'ready': 'ready', 'unsupported': 'unsupported', 'failed': 'failed',
                     'leased': 'leased', 'withheld': 'available_on_request', 'evicted': 'available_on_request',
@@ -182,7 +188,7 @@ def block(row, platform, files, tally, eligibility, health_codes, lease_live):
     reasons = {reason: sum(queued.get(reason, {}).values()) for reason in ON_REQUEST_DOWNLOADS}
     likely_expired = sum(expired.get(reason, 0) for reason in ON_REQUEST_DOWNLOADS) if platform == 'whatsapp' else 0
     not_downloaded = {reason: n for reason, n in reasons.items() if n}
-    stored_waiting = total('withheld', 'evicted')
+    stored_waiting = total('withheld', 'evicted', 'skipped')
     due = {'to_download': eligible_waiting + downloads.get('leased', 0),
            'to_index': sum(ext.get(b, 0) for b in EXTRACTION_DUE),
            'to_recognize': to_recognize,
