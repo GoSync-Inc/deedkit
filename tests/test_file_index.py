@@ -318,6 +318,22 @@ def test_structured_reads_page_the_markdown_with_its_page_spans_and_provenance(s
 
 
 # spec: ANYM-851
+def test_a_structured_read_outside_the_key_scope_is_not_found(seeded):
+    from test_document_structure import add_document
+    s, a, _ = seeded
+    add_document(s, 'struct-scope')
+    stored_structure(s, 'struct-scope')
+    # In scope: the stored Markdown, and the default read points to it.
+    assert text(s, a, 'struct-scope', content='structured')['text'] == STRUCTURED_MD
+    assert text(s, a, 'struct-scope')['structured_text']['state'] == 'ready'
+    # The same key without the file's chat: the structured read is refused exactly as the default read is.
+    s.set_access('agent-a', chats=['whatsapp-demo-1-chat'])
+    for content in ('structured', None):
+        with pytest.raises(APIError, match='not_found'):
+            text(s, a, 'struct-scope', content=content)
+
+
+# spec: ANYM-851
 def test_a_truncated_or_mixed_scan_structured_version_says_so(seeded):
     from test_document_structure import add_document
     s, a, _ = seeded
