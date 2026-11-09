@@ -190,17 +190,35 @@ func TestMenuReplyShapesPrintsOnlyKnownProtocolWordsAndBoundsItsScan(t *testing.
 	if err := os.WriteFile(path, mustJSON(config), 0600); err != nil {
 		t.Fatal(err)
 	}
-	// The scan runs while the owning adapter keeps writing; no capture write fails.
-	done := make(chan error, 1)
-	var out bytes.Buffer
-	go func() { done <- serveMenuReplyShapes(path, &out) }()
-	for i := 0; i < 50; i++ {
-		if err := s.Put(fixtureMessage("W"+strings.Repeat("x", i%5)+string(rune('a'+i%26))+strconv.Itoa(i), 1700001000+int64(i)), "live"); err != nil {
-			t.Fatal(err)
+	// The scan is bounded by work only here: the journal's newest row when it starts, and the
+	// row budget below. Its wall-time limits are what a loaded host exceeds (the journal's
+	// rollback-mode commits hold readers out for an fsync; two CI flakes 2026-11-09), and
+	// TestMenuReplyShapesEndsAtASlowLaterRowWhileCaptureKeepsWriting covers them, calibrated.
+	defer func(d, deadline time.Duration) { menuShapeTimeout, menuShapeDeadline = d, deadline }(menuShapeTimeout, menuShapeDeadline)
+	menuShapeTimeout, menuShapeDeadline = time.Hour, time.Hour
+	// The owning adapter keeps writing during the scan, 10 rows before each journal statement
+	// until 50 are written; no capture write fails and none changes what the scan reports.
+	written, statements := 0, 0
+	var writeErr error
+	defer func() { menuShapeBeforeRow = nil }()
+	menuShapeBeforeRow = func(int) {
+		statements++
+		for n := 0; n < 10 && written < 50 && writeErr == nil; n++ {
+			i := written
+			writeErr = s.Put(fixtureMessage("W"+strings.Repeat("x", i%5)+string(rune('a'+i%26))+strconv.Itoa(i), 1700001000+int64(i)), "live")
+			written++
 		}
 	}
-	if err := <-done; err != nil {
+	var out bytes.Buffer
+	if err := serveMenuReplyShapes(path, &out); err != nil {
 		t.Fatal(err)
+	}
+	menuShapeBeforeRow = nil
+	if writeErr != nil {
+		t.Fatalf("a capture write during the scan failed: %v", writeErr)
+	}
+	if statements < 5 || written != 50 {
+		t.Fatalf("%d capture writes over %d journal statements", written, statements)
 	}
 	for _, leak := range []string{"private_word", "secret_key", "987654", "424242", "opt_a", "opt_b", "tpl_a"} {
 		if strings.Contains(out.String(), leak) {
