@@ -426,7 +426,7 @@ class Dispatch:
             ],
             "connection_guidance": {
                 "frequent_work": "Use a modules_available.path connection with the same key for direct domain tools; cache their schemas.",
-                "occasional_work": "/mcp/compact exposes three discovery/invocation tools. Search once, reuse the returned schemas.",
+                "occasional_work": "/mcp/compact exposes three discovery/invocation tools. Search once and reuse the returned schemas.",
                 "combined_example": "/mcp/modules/android,messaging",
             },
             "tool_paths": tool_paths(usable, {path: modules for (principal, path), modules in self.selections.items()
