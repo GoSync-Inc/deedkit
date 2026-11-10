@@ -90,3 +90,15 @@ def test_typed_parameters_validate_through_the_legacy_backend(tmp_path):
             'parameters': {'COUNT': 3, 'ENABLED': True}})
         assert response.status_code == 200
         assert response.json()['commands'] == [{'inputText': '3 True'}]
+
+
+# spec: ANYM-954
+def test_uiautomator_yaml_validation_keeps_the_repair_hint():
+    import pytest
+    from deedkit_android.app_maps import load
+    from deedkit_android.config import Refused
+
+    with pytest.raises(Refused, match='invalid_flow_yaml') as failure:
+        load('appId: example.shop\n---\n- back')
+    assert 'one YAML document' in failure.value.hint
+    assert 'steps' in failure.value.hint

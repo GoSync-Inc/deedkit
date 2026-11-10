@@ -75,7 +75,9 @@ def load(source):
             raise Refused('invalid_flow_value', 422)
         return literal(yaml.safe_load(source))
     except (yaml.YAMLError, RecursionError):
-        raise Refused('invalid_flow_yaml', 422) from None
+        error = Refused('invalid_flow_yaml', 422)
+        error.hint = 'Use one YAML document. Use a command list such as - back, or a scenario with map and steps. Omit the Maestro appId/--- header.'
+        raise error from None
 
 
 def fields(value, allowed, code='invalid_map_definition'):
