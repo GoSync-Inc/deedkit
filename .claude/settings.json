@@ -95,6 +95,8 @@
       "mcp__claude_ai_Deedkit__agents_stop_task",
       "mcp__claude_ai_Deedkit__android_delete_file",
       "mcp__claude_ai_Deedkit__android_execute",
+      "mcp__claude_ai_Deedkit__android_flows",
+      "mcp__claude_ai_Deedkit__android_run_flow",
       "mcp__claude_ai_Deedkit__android_session",
       "mcp__claude_ai_Deedkit__android_upload",
       "mcp__claude_ai_Deedkit__calendar_apply",

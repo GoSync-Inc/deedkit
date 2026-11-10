@@ -8,12 +8,19 @@ from pathlib import Path
 import re
 import signal
 import shlex
+import struct
+import io
+
+from PIL import Image
+
+import yaml
 import tempfile
 import time
 import uuid
 from xml.etree import ElementTree
 
 from .config import Refused
+from .maestro import Maestro, screen_elements
 from .store import MAX_FILE
 
 OUTPUT_LIMIT = 4 * 1024 * 1024
@@ -80,16 +87,18 @@ class Devices:
         self.config, self.store = config, store
         self.locks = {name: asyncio.Lock() for name in config.devices}
         self.tasks = {}
+        self.maestro = Maestro(config, store.lock_fd)
 
     async def close(self):
         tasks = list(self.tasks.values())
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await self.maestro.close()
 
     @asynccontextmanager
     async def locked(self, owner, device, session):
-        self.store.check_reservation(owner, device, session)
+        self.store.touch(owner, device, session)
         lock = self.locks[device]
         if lock.locked():
             raise Refused("device_busy")
@@ -116,39 +125,83 @@ class Devices:
         return [{"device_id": name, "state": states.get(self.config.devices[name], "disconnected")}
                 for name in allowed]
 
-    async def observe(self, owner, device, session, screenshot=True, hierarchy=True):
+    async def observe(self, owner, device, session, screenshot=True, hierarchy=True, image_mode="inline", crop=None):
         async with self.locked(owner, device, session):
-            result = {"device_id": device, "observed_at": time.time()}
-            if hierarchy:
-                path = "/data/local/tmp/deedkit-" + uuid.uuid4().hex + ".xml"
-                script = f"uiautomator dump {path} >/dev/null && cat {path}; result=$?; rm -f {path}; exit $result"
-                try:
-                    code, data, stderr = await run_process([*self.adb(device), "shell", script], 15)
-                    start = data.index(b"<?xml")
-                    root = ElementTree.fromstring(data[start:])
-                    result["elements"] = []
-                    for node in root.iter("node"):
-                        item = dict(node.attrib)
-                        if item.get("password") == "true":
-                            item["text"], item["content-desc"] = "", ""
-                        result["elements"].append(item)
-                except (TimeoutError, OSError, Refused):
-                    result["hierarchy_error"] = "capture_failed"
-                except (ValueError, ElementTree.ParseError):
-                    result["hierarchy_error"] = "unavailable"
-                    result["hierarchy_exit_code"] = code
-                    result["hierarchy_diagnostic"] = stderr.decode(errors="replace")[:1000]
+            result = {"device_id": device, "observed_at": time.time(),
+                      "coordinate_space": "device_pixels", "resized": False}
+            jobs = []
             if screenshot:
-                try:
-                    code, data, _ = await run_process([*self.adb(device), "exec-out", "screencap", "-p"],
-                                                      10, stdout_limit=SCREENSHOT_LIMIT)
-                except (TimeoutError, OSError, Refused):
-                    code, data = -1, b""
-                if code == 0 and data.startswith(b"\x89PNG\r\n\x1a\n"):
-                    result["image"] = {"mime_type": "image/png", "data": base64.b64encode(data).decode()}
+                jobs.append(self.capture_image(owner, device, image_mode, crop))
+            if hierarchy:
+                jobs.append(self.capture_hierarchy(device))
+            tasks = [asyncio.create_task(job) for job in jobs]
+            try:
+                for part in await asyncio.gather(*tasks):
+                    result.update(part)
+                return result
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def capture_image(self, owner, device, image_mode, crop):
+        try:
+            code, data, _ = await run_process([*self.adb(device), "exec-out", "screencap", "-p"],
+                                              6, stdout_limit=SCREENSHOT_LIMIT)
+            if code == 0 and data.startswith(b"\x89PNG\r\n\x1a\n"):
+                metadata = {}
+                if len(data) >= 24 and data[12:16] == b"IHDR":
+                    width, height = struct.unpack(">II", data[16:24])
+                    metadata = {"width": width, "height": height}
+                result = {"device_size": dict(metadata)}
+                if crop:
+                    if not metadata or crop["x"] + crop["w"] > width or crop["y"] + crop["h"] > height:
+                        raise Refused("crop_outside_screen", 422)
+                    with Image.open(io.BytesIO(data)) as original:
+                        frame = original.crop((crop["x"], crop["y"], crop["x"] + crop["w"], crop["y"] + crop["h"]))
+                        target = io.BytesIO()
+                        frame.save(target, format="PNG", compress_level=1)
+                        data = target.getvalue()
+                    metadata = {"width": crop["w"], "height": crop["h"]}
+                    result["image_origin"] = {"x": crop["x"], "y": crop["y"]}
                 else:
-                    result["screenshot_error"] = "unavailable"
-            return result
+                    result["image_origin"] = {"x": 0, "y": 0}
+                if len(data) > SCREENSHOT_LIMIT:
+                    raise Refused("screenshot_too_large", 413)
+                if image_mode in {"inline", "both"}:
+                    result["image"] = {"mime_type": "image/png", "data": base64.b64encode(data).decode(), **metadata}
+                if image_mode in {"file", "both"}:
+                    result["image_file"] = {**self.store.save(owner, data), "mime_type": "image/png", **metadata}
+                return result
+        except (TimeoutError, OSError):
+            pass
+        return {"screenshot_error": "unavailable"}
+
+    async def capture_hierarchy(self, device):
+        if self.config.maestro:
+            try:
+                hierarchy = await self.maestro.call("inspect_screen", {"device_id": self.config.devices[device]}, 8)
+                return {"hierarchy_source": "maestro", "elements": screen_elements(hierarchy)}
+            except (TimeoutError, OSError, Refused, ValueError, KeyError, TypeError):
+                return {"hierarchy_source": "maestro", "hierarchy_error": "unavailable",
+                        "next_action": "use_screenshot_or_retry_hierarchy"}
+        path = "/data/local/tmp/deedkit-" + uuid.uuid4().hex + ".xml"
+        script = f"uiautomator dump {path} >/dev/null && cat {path}; result=$?; rm -f {path}; exit $result"
+        try:
+            code, data, stderr = await run_process([*self.adb(device), "shell", script], 8)
+            root = ElementTree.fromstring(data[data.index(b"<?xml"):])
+            elements = []
+            for node in root.iter("node"):
+                item = dict(node.attrib)
+                if item.get("password") == "true":
+                    item["text"], item["content-desc"] = "", ""
+                elements.append(item)
+            return {"elements": elements, "hierarchy_source": "adb"}
+        except (TimeoutError, OSError, Refused):
+            return {"hierarchy_error": "capture_failed"}
+        except (ValueError, ElementTree.ParseError):
+            return {"hierarchy_error": "unavailable", "hierarchy_exit_code": code,
+                    "hierarchy_diagnostic": stderr.decode(errors="replace")[:1000]}
 
     def prepare(self, owner, device, argv, temporary):
         if not argv or argv[0] not in COMMANDS:
@@ -189,9 +242,10 @@ class Devices:
                 argv[index + offset] = str(target)
         return [*self.adb(device), *argv], output
 
-    async def execute(self, owner, device, session, request_id, argv, timeout, wait):
+    async def execute(self, owner, device, session, request_id, argv, timeout, wait, flow=None):
         # A known request is read before reservation checks: its receipt survives lease expiry.
-        payload = {"device_id": device, "argv": argv, "timeout_s": timeout}
+        payload = {"device_id": device, "timeout_s": timeout}
+        payload["flow" if flow is not None else "argv"] = flow if flow is not None else argv
         try:
             previous = self.store.operation(owner, request_id)
         except Refused as error:
@@ -200,7 +254,7 @@ class Devices:
         else:
             self.store.admit(owner, request_id, payload)
             return previous
-        self.store.check_reservation(owner, device, session)
+        self.store.touch(owner, device, session)
         lock = self.locks[device]
         if lock.locked():
             raise Refused("device_busy")
@@ -208,17 +262,73 @@ class Devices:
         temporary = None
         try:
             temporary = tempfile.TemporaryDirectory(dir=self.store.directory)
-            command, output = self.prepare(owner, device, argv, Path(temporary.name))
+            if flow is None:
+                command, output = self.prepare(owner, device, argv, Path(temporary.name))
+            elif not self.config.maestro:
+                raise Refused("maestro_not_configured", 503)
             self.store.admit(owner, request_id, payload)
         except BaseException:
             if temporary is not None:
                 temporary.cleanup()
             lock.release()
             raise
-        task = asyncio.create_task(self.perform(owner, request_id, command, output, timeout, temporary, lock))
+        if flow is None:
+            operation = self.perform(owner, request_id, command, output, timeout, temporary, lock)
+        else:
+            operation = self.perform_flow(owner, device, request_id, flow, timeout, temporary, lock)
+        task = asyncio.create_task(self.keep_reserved(owner, device, session, operation))
         self.tasks[(owner, request_id)] = task
         task.add_done_callback(lambda _: self.tasks.pop((owner, request_id), None))
         return await self.receipt(owner, request_id, wait)
+
+    async def keep_reserved(self, owner, device, session, operation):
+        async def renew():
+            while True:
+                await asyncio.sleep(5)
+                self.store.touch(owner, device, session)
+        heartbeat = asyncio.create_task(renew())
+        try:
+            return await operation
+        finally:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+            # Leave a full inactivity interval after completion for the next agent decision.
+            try:
+                self.store.touch(owner, device, session)
+            except Refused:
+                pass  # The caller may have released the completed operation already.
+
+    async def perform_flow(self, owner, device, request_id, commands, timeout, temporary, lock):
+        state, result = "unknown", {}
+        try:
+            checkpoint = next((i for i, command in enumerate(commands)
+                               if isinstance(command, dict) and "checkpoint" in command), len(commands))
+            if checkpoint:
+                await self.maestro.call("run", {"device_id": self.config.devices[device],
+                                        "yaml": "appId: android\n---\n" + yaml.safe_dump(commands[:checkpoint], allow_unicode=True)}, timeout)
+            result = {"commands_executed": checkpoint, "device_id": device}
+            state = "succeeded"
+            if checkpoint < len(commands):
+                state = "paused"
+                result.update({"checkpoint": commands[checkpoint]["checkpoint"],
+                               "remaining_yaml": yaml.safe_dump(commands[checkpoint + 1:], allow_unicode=True),
+                               "next_action": "observe_then_resolve_checkpoint_and_submit_remaining_yaml"})
+        except Refused as error:
+            result = {"error": error.code, "next_action": "inspect_device_before_any_new_request"}
+            if getattr(error, "diagnostic", None):
+                result["diagnostic"] = error.diagnostic
+        except TimeoutError:
+            result = {"error": "command_timeout", "next_action": "inspect_device_before_any_new_request"}
+        except asyncio.CancelledError:
+            result = {"error": "service_stopped", "next_action": "inspect_device_before_any_new_request"}
+        except (OSError, ValueError):
+            result = {"error": "maestro_unavailable", "next_action": "inspect_device_before_any_new_request"}
+        finally:
+            try:
+                self.store.finish(owner, request_id, state, result)
+            finally:
+                temporary.cleanup()
+                lock.release()
 
     async def perform(self, owner, request_id, command, output, timeout, temporary, lock):
         state, result = "unknown", {}
@@ -240,6 +350,8 @@ class Devices:
             result = {"error": "command_timeout", "next_action": "inspect_device_before_any_new_request"}
         except Refused as error:
             result = {"error": error.code, "next_action": "inspect_device_before_any_new_request"}
+            if getattr(error, "diagnostic", None):
+                result["diagnostic"] = error.diagnostic
         except asyncio.CancelledError:
             result = {"error": "service_stopped", "next_action": "inspect_device_before_any_new_request"}
         except OSError:

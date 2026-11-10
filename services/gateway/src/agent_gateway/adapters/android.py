@@ -29,6 +29,7 @@ def content(name, result):
     except (KeyError, ValueError, binascii.Error):
         raise Denied("invalid_android_image", 502) from None
     structured = {**result, "image": {"mime_type": "image/png", "bytes": len(data),
-                                     "sha256": hashlib.sha256(data).hexdigest()}}
+                                     "sha256": hashlib.sha256(data).hexdigest(),
+                                     **{key: picture[key] for key in ("width", "height") if key in picture}}}
     return [TextContent(type="text", text=json.dumps(structured, ensure_ascii=False, separators=(",", ":"))),
             ImageContent(type="image", mimeType="image/png", data=encoded)], structured

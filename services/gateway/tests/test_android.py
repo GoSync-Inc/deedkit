@@ -65,7 +65,7 @@ def test_android_tools_and_native_image_preserve_structured_screen(tmp_path):
     app, calls = setup(tmp_path)
     with TestClient(app) as client:
         names = {tool['name'] for tool in rpc(client, 'tools/list').json()['result']['tools']}
-        assert len(TOOLS) == 8 and set(TOOLS) <= names
+        assert len(TOOLS) == 10 and set(TOOLS) <= names
         result = rpc(client, 'tools/call', {'name': 'android_observe', 'arguments': {
             'device_id': 'home', 'session_id': 'session'}}).json()['result']
         assert not result.get('isError'), result
@@ -77,7 +77,8 @@ def test_android_tools_and_native_image_preserve_structured_screen(tmp_path):
         assert 'data' not in structured['image']
         assert json.loads(result['content'][0]['text']) == structured
         assert calls == [('android', 'observe', {'device_id': 'home', 'session_id': 'session',
-                                                'screenshot': True, 'hierarchy': True})]
+                                                'screenshot': True, 'hierarchy': True,
+                                                'image_mode': 'inline', 'crop': None})]
 
 
 @pytest.mark.parametrize('options', [{'scopes': ['android:read']},
@@ -132,3 +133,24 @@ def test_high_resolution_android_image_is_returned_as_native_content(tmp_path):
             'device_id': 'home', 'session_id': 'session'}}).json()['result']
         assert not result.get('isError'), result.get('structuredContent')
         assert base64.b64decode(result['content'][1]['data']) == image
+
+
+# spec: ANYM-951
+def test_workflow_transport_failure_returns_original_receipt_id(tmp_path):
+    from agent_gateway.dispatch import Dispatch
+    from agent_gateway.policy import Denied
+    error = Denied('backend_unavailable', 503)
+    request_id = str(uuid.uuid4())
+    Dispatch.backend_failure(None, error, 'android_run_flow', {'request_id': request_id},
+        {'module': 'android', 'operation': 'run_flow'}, False, {}, {}, {}, {}, {}, None)
+    assert error.detail['request_id'] == request_id
+    assert error.detail['next_action'] == 'read_android_get_operation_with_original_request_id'
+
+
+# spec: ANYM-951
+def test_image_geometry_is_forwarded_without_scaling():
+    from agent_gateway.adapters.android import content
+    image = {'mime_type': 'image/png', 'data': base64.b64encode(PNG).decode(), 'width': 1220, 'height': 2712}
+    blocks, result = content('android_observe', {'image': image, 'coordinate_space': 'device_pixels'})
+    assert blocks[1].data == image['data']
+    assert result['image']['width'] == 1220 and result['image']['height'] == 2712

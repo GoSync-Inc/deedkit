@@ -25,6 +25,7 @@ def takes_wait(tool):
 # never the metadata pool. An entry names the pool and when the arguments make the call wait; wait_s=0 stays a plain
 # call. A catalog tool with wait_s but no entry still waits in "waits" and fails test_wait_admission.
 WAIT_ADMISSION = {
+    ("android", "run_flow"): ("waits", lambda a: a.get("wait_s", 15) > 0),
     ("android", "execute"): ("waits", lambda a: a.get("wait_s", 15) > 0),
     ("android", "get_operation"): ("waits", lambda a: a.get("wait_s", 0) > 0),
     ("android", "observe"): ("waits", lambda a: True),

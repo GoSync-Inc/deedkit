@@ -252,3 +252,26 @@ def test_high_resolution_phone_screenshot_exceeds_command_output_limit(service):
     (service[1] / 'screenshot.png').write_bytes(image)
     result = post(service, 'observe', {'device_id': 'home', 'session_id': session(service)}).json()
     assert base64.b64decode(result['image']['data']) == image
+
+
+# spec: ANYM-951
+def test_screenshot_crop_geometry_file_mode_and_large_download(service):
+    import io
+    from PIL import Image
+    original = Image.new('RGB', (1220, 2712), (10, 20, 30))
+    original.save(service[1] / 'screenshot.png')
+    token = session(service)
+    args = {'device_id': 'home', 'session_id': token, 'hierarchy': False,
+            'image_mode': 'both', 'crop': {'x': 100, 'y': 200, 'w': 900, 'h': 600}}
+    result = post(service, 'observe', args).json()
+    assert result['device_size'] == {'width': 1220, 'height': 2712}
+    assert result['image_origin'] == {'x': 100, 'y': 200}
+    assert result['image']['width'] == 900 and result['image']['height'] == 600
+    data = base64.b64decode(result['image']['data'])
+    assert Image.open(io.BytesIO(data)).getpixel((0, 0)) == (10, 20, 30)
+    downloaded = post(service, 'download', {'file_id': result['image_file']['file_id'],
+                                          'length': 4194304}).json()
+    assert downloaded['eof'] and base64.b64decode(downloaded['data_base64']) == data
+    file_only = post(service, 'observe', {**args, 'image_mode': 'file'}).json()
+    assert 'image' not in file_only and file_only['image_file']['width'] == 900
+    assert post(service, 'observe', {**args, 'crop': {'x': 1000, 'y': 200, 'w': 900, 'h': 600}}).status_code == 422

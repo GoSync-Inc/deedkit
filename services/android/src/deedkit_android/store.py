@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import sqlite3
 import time
@@ -47,6 +48,9 @@ class Store:
                 owner TEXT, id TEXT, complete INTEGER, PRIMARY KEY(owner, id));
             CREATE TABLE IF NOT EXISTS reservations (
                 device TEXT PRIMARY KEY, owner TEXT, token TEXT, expires REAL);
+            CREATE TABLE IF NOT EXISTS reservation_options (device TEXT PRIMARY KEY, seconds INTEGER);
+            CREATE TABLE IF NOT EXISTS flows (owner TEXT, name TEXT, version TEXT, source TEXT,
+                PRIMARY KEY(owner, name));
         """)
         # A crashed process may already have acted on the phone. Never replay it.
         self.db.execute("UPDATE operations SET state='unknown' WHERE state='running'")
@@ -67,8 +71,10 @@ class Store:
             raise Refused("reservation_expired_or_forbidden")
         if action == "release":
             self.db.execute("DELETE FROM reservations WHERE device=?", (device,))
+            self.db.execute("DELETE FROM reservation_options WHERE device=?", (device,))
             self.db.commit()
             return {"device_id": device, "released": True}
+        self.db.execute("INSERT OR REPLACE INTO reservation_options VALUES(?,?)", (device, seconds))
         expires = time.time() + seconds
         self.db.execute("INSERT OR REPLACE INTO reservations VALUES(?,?,?,?)", (device, owner, token, expires))
         self.db.commit()
@@ -78,6 +84,42 @@ class Store:
         row = self.db.execute("SELECT * FROM reservations WHERE device=?", (device,)).fetchone()
         if not row or row["expires"] <= time.time() or row["owner"] != owner or row["token"] != token:
             raise Refused("reservation_expired_or_forbidden")
+
+    def touch(self, owner, device, token):
+        self.check_reservation(owner, device, token)
+        row = self.db.execute("SELECT seconds FROM reservation_options WHERE device=?", (device,)).fetchone()
+        seconds = row["seconds"] if row else 300
+        expires = time.time() + seconds
+        self.db.execute("UPDATE reservations SET expires=? WHERE device=?", (expires, device))
+        self.db.commit()
+        return expires
+
+    def flow(self, owner, action, name, source, version):
+        if action == "list":
+            rows = self.db.execute("SELECT name,version FROM flows WHERE owner=? ORDER BY name", (owner,))
+            return {"flows": [dict(row) for row in rows]}
+        if not name or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}", name):
+            raise Refused("invalid_flow_name", 422)
+        row = self.db.execute("SELECT * FROM flows WHERE owner=? AND name=?", (owner, name)).fetchone()
+        if version and (row is None or row["version"] != version):
+            raise Refused("flow_version_conflict")
+        if action == "put":
+            if not source or len(source.encode()) > 32768:
+                raise Refused("invalid_flow_source", 422)
+            count = self.db.execute("SELECT count(*) FROM flows WHERE owner=?", (owner,)).fetchone()[0]
+            if row is None and count >= 128:
+                raise Refused("flow_storage_full", 507)
+            digest = hashlib.sha256(source.encode()).hexdigest()
+            self.db.execute("INSERT OR REPLACE INTO flows VALUES(?,?,?,?)", (owner, name, digest, source))
+            self.db.commit()
+            return {"name": name, "version": digest}
+        if action == "delete":
+            self.db.execute("DELETE FROM flows WHERE owner=? AND name=?", (owner, name))
+            self.db.commit()
+            return {"name": name, "deleted": True}
+        if row is None:
+            raise Refused("flow_not_found", 404)
+        return {"name": name, "version": row["version"], "yaml": row["source"]}
 
     def operation(self, owner, request_id):
         row = self.db.execute("SELECT * FROM operations WHERE owner=? AND id=?", (owner, request_id)).fetchone()

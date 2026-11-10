@@ -762,7 +762,7 @@ class Dispatch:
                 **safe_error("mutation_outcome_unknown", unknown_outcome=True),
                 **{key: diagnostics[key] for key in FAILURE_FIELDS if key in diagnostics},
             }
-            if module == "android" and tool["operation"] == "execute":
+            if module == "android" and tool["operation"] in {"execute", "run_flow"}:
                 error.detail.update(request_id=values["request_id"],
                                     next_action="read_android_get_operation_with_original_request_id")
         elif error.code == "backend_unavailable":

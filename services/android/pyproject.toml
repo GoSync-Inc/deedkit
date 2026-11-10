@@ -8,7 +8,14 @@ version = "0.1.0"
 description = "USB Android device execution behind the DeedKit gateway"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
-dependencies = ["fastapi==0.143.0", "starlette==1.8.0", "pydantic>=2.12,<3", "uvicorn==0.54.0"]
+dependencies = [
+    "fastapi==0.143.0",
+    "starlette==1.8.0",
+    "pydantic>=2.12,<3",
+    "uvicorn==0.54.0",
+    "pyyaml>=6.0.3,<7",
+    "pillow>=13,<14",
+]
 
 [project.scripts]
 deedkit-android = "deedkit_android.cli:main"
