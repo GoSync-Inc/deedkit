@@ -17,7 +17,7 @@ from .catalog import CATALOG, ACTIONS, routed
 
 # The deployable modules. ANYM-820: a build that knows `agents` must serve before a policy names it, and on a
 # rollback a policy without it goes back first: an older build refuses the whole policy (policy_unavailable).
-MODULES = frozenset({"calendar", "messaging", "calls", "recordings", "agents"})
+MODULES = frozenset({"calendar", "messaging", "calls", "recordings", "agents", "android"})
 
 
 class Denied(Exception):

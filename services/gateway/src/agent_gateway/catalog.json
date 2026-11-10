@@ -8953,5 +8953,332 @@
         "task_id"
       ]
     }
+  },
+  {
+    "name": "android_capabilities",
+    "module": "android",
+    "operation": "capabilities",
+    "scopes": [
+      "android:read"
+    ],
+    "required_manifest": true,
+    "description": "Connected, explicitly granted Android devices and available commands. Inspect before use.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "android_observe",
+    "module": "android",
+    "operation": "observe",
+    "scopes": [
+      "android:read"
+    ],
+    "required_manifest": true,
+    "description": "Read the phone screen as a native image plus UI elements. Requires an acquired session. Password element text is omitted. Re-observe after UI changes.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "device_id": {
+          "title": "Device Id",
+          "type": "string"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "screenshot": {
+          "default": true,
+          "title": "Screenshot",
+          "type": "boolean"
+        },
+        "hierarchy": {
+          "default": true,
+          "title": "Hierarchy",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "device_id",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "android_execute",
+    "module": "android",
+    "operation": "execute",
+    "scopes": [
+      "android:control"
+    ],
+    "required_manifest": true,
+    "description": "Run device-targeted ADB argv with durable request_id. Supports shell and exec-out, input, intents, packages, settings, reboot, logcat, push/pull and APK install. For push/install use uploaded file UUIDs instead of host paths. Pull takes one remote path and returns a downloadable file UUID. Same request_id never re-executes. Inspect unknown outcomes before creating another request.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "device_id": {
+          "title": "Device Id",
+          "type": "string"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "argv": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "minItems": 1,
+          "title": "Argv",
+          "type": "array"
+        },
+        "timeout_s": {
+          "default": 30,
+          "maximum": 600,
+          "minimum": 1,
+          "title": "Timeout S",
+          "type": "integer"
+        },
+        "wait_s": {
+          "default": 15,
+          "maximum": 25,
+          "minimum": 0,
+          "title": "Wait S",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "device_id",
+        "session_id",
+        "request_id",
+        "argv"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "android_get_operation",
+    "module": "android",
+    "operation": "get_operation",
+    "scopes": [
+      "android:read"
+    ],
+    "required_manifest": true,
+    "description": "Read or briefly wait for an Android command receipt by its original request_id. A state of unknown can mean the device already acted. Never retry with a new request_id without inspecting the device.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "wait_s": {
+          "default": 0,
+          "maximum": 25,
+          "minimum": 0,
+          "title": "Wait S",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "android_session",
+    "module": "android",
+    "operation": "session",
+    "scopes": [
+      "android:control"
+    ],
+    "required_manifest": true,
+    "description": "Acquire, renew or release exclusive control of one phone. Acquire before observe or execute. Keep session_id and renew before expiry.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "device_id": {
+          "title": "Device Id",
+          "type": "string"
+        },
+        "action": {
+          "pattern": "^(acquire|renew|release)$",
+          "title": "Action",
+          "type": "string"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Session Id"
+        },
+        "seconds": {
+          "default": 300,
+          "maximum": 900,
+          "minimum": 30,
+          "title": "Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "device_id",
+        "action"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "android_upload",
+    "module": "android",
+    "operation": "upload",
+    "scopes": [
+      "android:control"
+    ],
+    "required_manifest": true,
+    "description": "Upload a private binary file in base64 chunks of at most 32768 bytes. Choose a UUID file_id, use exact byte offsets and final=true on the last chunk. Identical chunks can be resent.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "file_id": {
+          "title": "File Id",
+          "type": "string"
+        },
+        "offset": {
+          "minimum": 0,
+          "title": "Offset",
+          "type": "integer"
+        },
+        "data_base64": {
+          "maxLength": 43692,
+          "title": "Data Base64",
+          "type": "string"
+        },
+        "final": {
+          "default": false,
+          "title": "Final",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "file_id",
+        "offset",
+        "data_base64"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "android_download",
+    "module": "android",
+    "operation": "download",
+    "scopes": [
+      "android:read"
+    ],
+    "required_manifest": true,
+    "description": "Read a private output file as bounded base64 chunks. Follow next_offset until eof=true. Files are scoped to the calling principal.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "file_id": {
+          "title": "File Id",
+          "type": "string"
+        },
+        "offset": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Offset",
+          "type": "integer"
+        },
+        "length": {
+          "default": 32768,
+          "maximum": 32768,
+          "minimum": 1,
+          "title": "Length",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "file_id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "android_delete_file",
+    "module": "android",
+    "operation": "delete_file",
+    "scopes": [
+      "android:control"
+    ],
+    "required_manifest": true,
+    "description": "Remove a private uploaded or downloaded file when finished. Repeated deletion is safe. Wait for active device commands to finish first.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "file_id": {
+          "title": "File Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "file_id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "openWorldHint": false
+    }
   }
 ]

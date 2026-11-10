@@ -1,0 +1,210 @@
+import base64
+import hashlib
+import json
+import uuid
+
+import pytest
+from fastapi.testclient import TestClient
+
+from deedkit_android.app import create_app
+from deedkit_android.config import Refused
+from deedkit_android.store import Store
+
+
+@pytest.fixture
+def service(tmp_path):
+    adb = tmp_path / 'adb'
+    adb.write_text('''#!/usr/bin/env python3
+import os,sys,time
+args=sys.argv[1:]
+if args == ['devices','-l']:
+ print('List of devices attached\\nSERIAL device product:synthetic')
+elif args[2:4] == ['shell','count']:
+ path=os.path.join(os.path.dirname(__file__),'executions')
+ with open(path,'a') as f: f.write('x')
+ print('done')
+elif args[2:4] == ['shell','slow']:
+ time.sleep(5)
+elif args[2:4] == ['shell','echo']:
+ print(' '.join(args[4:]))
+elif args[2:4] == ['exec-out','screencap']:
+ sys.stdout.buffer.write(b'\\x89PNG\\r\\n\\x1a\\nsynthetic')
+elif args[2:4] == ['exec-out','cat']:
+ sys.stdout.buffer.write(b'\\x00\\xffsynthetic file')
+elif args[2] == 'shell' and 'uiautomator' in args[3]:
+ print('<?xml version="1.0"?><hierarchy><node text="secret" password="true"/><node text="Search" resource-id="search"/></hierarchy>')
+else:
+ print('arguments:',repr(args))
+''')
+    adb.chmod(0o700)
+    config = tmp_path / 'config.json'
+    config.write_text(json.dumps({
+        'adb': str(adb), 'state_dir': str(tmp_path / 'state'), 'devices': {'home': 'SERIAL'},
+        'principals': [
+            {'id': 'one', 'key_sha256': hashlib.sha256(b'one').hexdigest(),
+             'devices': ['home'], 'permissions': ['android:read', 'android:control']},
+            {'id': 'two', 'key_sha256': hashlib.sha256(b'two').hexdigest(),
+             'devices': ['home'], 'permissions': ['android:read', 'android:control']},
+            {'id': 'reader', 'key_sha256': hashlib.sha256(b'reader').hexdigest(),
+             'devices': ['home'], 'permissions': ['android:read']},
+        ]}))
+    config.chmod(0o600)
+    app = create_app(config)
+    with TestClient(app) as client:
+        yield client, tmp_path, config
+
+
+def post(service, operation, values=None, key='one'):
+    return service[0].post('/v1/' + operation, json=values or {}, headers={'Authorization': 'Bearer ' + key})
+
+
+def session(service):
+    response = post(service, 'session', {'device_id': 'home', 'action': 'acquire'})
+    assert response.status_code == 200, response.text
+    return response.json()['session_id']
+
+
+def execute(service, token, request_id, argv, **kwargs):
+    return post(service, 'execute', {'device_id': 'home', 'session_id': token,
+                                   'request_id': request_id, 'argv': argv, **kwargs})
+
+
+def test_auth_device_grants_and_reservation(service):
+    assert post(service, 'capabilities', key='invalid').status_code == 401
+    assert post(service, 'session', {'device_id': 'home', 'action': 'acquire'}, key='reader').status_code == 403
+    assert post(service, 'session', {'device_id': 'other', 'action': 'acquire'}).status_code == 404
+    token = session(service)
+    assert post(service, 'session', {'device_id': 'home', 'action': 'acquire'}, key='two').status_code == 409
+    assert post(service, 'observe', {'device_id': 'home', 'session_id': token}, key='two').status_code == 409
+    observed = post(service, 'observe', {'device_id': 'home', 'session_id': token}).json()
+    assert observed['elements'][0]['text'] == ''
+    assert observed['elements'][1]['text'] == 'Search'
+    assert base64.b64decode(observed['image']['data']).startswith(b'\x89PNG')
+
+
+def test_replay_never_repeats_device_action_and_conflicts_are_rejected(service):
+    token, request_id = session(service), str(uuid.uuid4())
+    first = execute(service, token, request_id, ['shell', 'count'])
+    assert first.status_code == 200 and first.json()['state'] == 'succeeded'
+    repeated = execute(service, token, request_id, ['shell', 'count'])
+    assert repeated.json() == first.json()
+    assert (service[1] / 'executions').read_text() == 'x'
+    assert execute(service, token, request_id, ['shell', 'echo', 'different']).status_code == 409
+    assert post(service, 'get_operation', {'request_id': request_id}, key='two').status_code == 404
+
+
+def test_expiry_revocation_and_busy_do_not_admit_a_second_command(service):
+    token, first_id = session(service), str(uuid.uuid4())
+    first = execute(service, token, first_id, ['shell', 'slow'], wait_s=0, timeout_s=1)
+    assert first.json()['state'] == 'running'
+    assert execute(service, token, str(uuid.uuid4()), ['shell', 'count']).json()['error'] == 'device_busy'
+    receipt = post(service, 'get_operation', {'request_id': first_id, 'wait_s': 3}).json()
+    assert receipt['state'] == 'unknown' and receipt['error'] == 'command_timeout'
+    assert not (service[1] / 'executions').exists()
+    config = json.loads(service[2].read_text())
+    config['principals'] = [p for p in config['principals'] if p['id'] != 'one']
+    service[2].write_text(json.dumps(config))
+    assert post(service, 'capabilities').status_code == 401
+
+
+def test_binary_files_retry_offsets_scope_and_device_only_commands(service):
+    token, file_id = session(service), str(uuid.uuid4())
+    values = {'file_id': file_id, 'offset': 0, 'data_base64': base64.b64encode(b'APK').decode(), 'final': True}
+    assert post(service, 'upload', values).status_code == 200
+    assert post(service, 'upload', values).status_code == 200
+    assert post(service, 'upload', {**values, 'data_base64': 'eA=='}).status_code == 409
+    assert post(service, 'download', {'file_id': file_id}, key='two').status_code == 404
+    installed = execute(service, token, str(uuid.uuid4()), ['install', '-r', file_id]).json()
+    assert installed['state'] == 'succeeded'
+    assert execute(service, token, str(uuid.uuid4()), ['install', '/etc/passwd']).status_code == 422
+    assert execute(service, token, str(uuid.uuid4()), ['-H', 'another-host', 'shell', 'id']).status_code == 422
+    assert execute(service, token, str(uuid.uuid4()), ['wait-for-device', 'kill-server']).status_code == 422
+    pulled = execute(service, token, str(uuid.uuid4()), ['pull', '/sdcard/item']).json()
+    downloaded = post(service, 'download', {'file_id': pulled['download']['file_id']}).json()
+    assert base64.b64decode(downloaded['data_base64']) == b'\x00\xffsynthetic file'
+    assert post(service, 'delete_file', {'file_id': file_id}, key='two').status_code == 200
+    assert post(service, 'download', {'file_id': file_id}).status_code == 200
+    assert post(service, 'delete_file', {'file_id': file_id}).status_code == 200
+    assert post(service, 'delete_file', {'file_id': file_id}).status_code == 200
+    assert post(service, 'download', {'file_id': file_id}).status_code == 404
+
+
+def test_restart_marks_inflight_unknown_and_keeps_receipt(tmp_path):
+    store = Store(tmp_path / 'state')
+    request_id = str(uuid.uuid4())
+    assert store.admit('one', request_id, {'argv': ['shell', 'action']})
+    store.close()
+    resumed = Store(tmp_path / 'state')
+    try:
+        assert resumed.operation('one', request_id)['state'] == 'unknown'
+        assert not resumed.admit('one', request_id, {'argv': ['shell', 'action']})
+        with pytest.raises(Refused):
+            resumed.operation('two', request_id)
+    finally:
+        resumed.close()
+
+
+def test_partial_chunk_recovery_and_exclusive_store(tmp_path):
+    store = Store(tmp_path / 'state')
+    try:
+        with pytest.raises(ValueError, match='already_in_use'):
+            Store(tmp_path / 'state')
+        file_id = str(uuid.uuid4())
+        store.upload('one', file_id, 0, '', False)
+        store.path('one', file_id).write_bytes(b'par')
+        result = store.upload('one', file_id, 0, base64.b64encode(b'partial').decode(), True)
+        assert result['complete']
+        assert store.file('one', file_id).read_bytes() == b'partial'
+        assert store.upload('one', file_id, 7, '', True)['size'] == 7
+        with pytest.raises(Refused, match='file_content_conflict'):
+            store.upload('one', file_id, 7, 'eA==', True)
+    finally:
+        store.close()
+
+
+def test_expired_reservation_and_shutdown_receipt(service):
+    token = session(service)
+
+    def expire():
+        store = service[0].app.state.store
+        store.db.execute('UPDATE reservations SET expires=0')
+        store.db.commit()
+
+    service[0].portal.call(expire)
+    assert execute(service, token, str(uuid.uuid4()), ['shell', 'count']).status_code == 409
+    token = session(service)
+    request_id = str(uuid.uuid4())
+    assert execute(service, token, request_id, ['shell', 'slow'], wait_s=0).json()['state'] == 'running'
+    service[0].portal.call(service[0].app.state.devices.close)
+    result = post(service, 'get_operation', {'request_id': request_id}).json()
+    assert result['state'] == 'unknown' and result['error'] == 'service_stopped'
+
+
+def test_gateway_catalog_matches_service_schemas():
+    from pathlib import Path
+    from deedkit_android.app import SCHEMAS
+
+    catalog_path = Path(__file__).resolve().parents[2] / 'gateway/src/agent_gateway/catalog.json'
+    tools = [row for row in json.loads(catalog_path.read_text()) if row['module'] == 'android']
+    assert {row['operation'] for row in tools} == SCHEMAS.keys()
+    for row in tools:
+        schema = SCHEMAS[row['operation']].model_json_schema()
+        schema.pop('title', None)
+        assert row['inputSchema'] == schema
+
+
+def test_hierarchy_timeout_still_returns_screenshot(service, monkeypatch):
+    from deedkit_android import device
+
+    original = device.run_process
+
+    async def capture(argv, *args, **kwargs):
+        if any('uiautomator' in arg for arg in argv):
+            raise TimeoutError
+        return await original(argv, *args, **kwargs)
+
+    monkeypatch.setattr(device, 'run_process', capture)
+    token = session(service)
+    result = post(service, 'observe', {'device_id': 'home', 'session_id': token}).json()
+    assert result['hierarchy_error'] == 'capture_failed'
+    assert base64.b64decode(result['image']['data']).startswith(b'\x89PNG')
