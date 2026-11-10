@@ -1004,10 +1004,10 @@ Tiden through the main push run; otherwise link the migration PR to its intent
 branch and publish real results there before reviewing the merge. After
 merge, verify both main's gate and the GitHub App processing/drift state.
 
-The integrated CI includes gateway, platform-contracts, calendar, calls,
+The integrated CI includes Android, gateway, platform-contracts, calendar, calls,
 calls-frontend, inference and agent-runner reports, plus the measured gateway load gate, which runs on a
 runner of its own in
-parallel with the suite; the gateway, platform-contracts, calls, calls-frontend, inference and agent-runner
+parallel with the suite; the Android, gateway, platform-contracts, calls, calls-frontend, inference and agent-runner
 suites run together in `checks / services`, also on a runner of their own. Existing messaging check/test identities
 and links remain intact. Module assertions support reviewed contracts in the
 same product; a successful messaging run alone cannot verify another module.

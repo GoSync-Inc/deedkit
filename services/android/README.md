@@ -19,6 +19,7 @@ the USB host executes selector-based actions and reusable workflows.
 | `android_session` | Acquire, renew or release exclusive control of a phone |
 | `android_observe` | PNG screenshot plus Android UI hierarchy |
 | `android_execute` | Run device-targeted ADB arguments and retain a result receipt |
+| `android_maestro` | Read the supported dialect or validate a flow without execution |
 | `android_run_flow` | Run inline or saved Maestro YAML with a durable receipt |
 | `android_flows` | List, save, read and delete reusable owner-scoped flows |
 | `android_get_operation` | Read or wait for the receipt using the original request UUID |
@@ -97,7 +98,7 @@ the private network. Keep ADB connected over USB.
 
 Deploy a gateway build containing the Android catalog before adding `android` to
 its policy. Add the private service URL under `deployment.backends.android`, include
-`android` in `deployment.modules`, and add the ten exact tool names to the chosen
+`android` in `deployment.modules`, and add the eleven exact tool names to the chosen
 profile. Grant that principal `android:read` and `android:control`. Its Android
 credential uses a private `key_file` holding the backend token and `key_sha256`
 matching that token. The MCP client continues using its separate gateway token.
@@ -239,3 +240,30 @@ uv run --locked --group dev pytest -q
 
 Gateway tests verify tool discovery, permission intersections, native image
 delivery, isolated backend failure and recovery after a lost command response.
+
+
+### Authoring and composition
+
+Call `android_maestro` with `action=reference` for the versioned command and selector
+reference. `action=validate` accepts inline `yaml` or a saved `name`, optional
+`version`, and literal `parameters`. It validates the supported dialect and expands
+saved references without taking control of the device.
+
+Relative selectors include `below`, `above`, `leftOf`, `rightOf`, `childOf`,
+`containsChild` and `containsDescendants`. Clipboard, orientation, location,
+permissions, application state and display-mode commands are listed in the reference.
+Saved flows compose through `runFlow` with a `name` and optional `version`.
+They share the outer call's parameters. References resolve within the authenticated
+principal's store before admission to device execution. Expansion shares the
+200-command limit and bounded nesting. A checkpoint belongs at the top level.
+
+```yaml
+- runFlow:
+    name: open_search
+    version: <saved SHA256>
+- inputText: ${QUERY}
+- pressKey: Enter
+```
+
+The API exposes local device workflows. Host scripts, JavaScript expressions,
+cloud execution and a browser viewer are outside this dialect.

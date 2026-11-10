@@ -109,3 +109,11 @@ Exit codes: 0 success, 1 rejected, 2 usage error, 3 outcome unknown. Exit code
 
 Sends and other actions need exact owner confirmation by the acting agent; the
 gateway and this package do not obtain it.
+
+
+## Updating the tool catalog
+
+From the repository root run `python3 scripts/generate_sdk_catalog.py` to refresh
+SDK metadata and the TypeScript tool-name union after editing the gateway catalog.
+`--check` verifies that generated files are current. Connector permission
+classification remains explicit in `.claude/settings.json`.

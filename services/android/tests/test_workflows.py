@@ -214,3 +214,41 @@ def test_guardian_stops_descendant_after_launcher_exits(tmp_path):
     # A killed orphan can briefly remain as a zombie before init reaps it.
     status = subprocess.run(['ps', '-o', 'stat=', '-p', child_pid.read_text()], capture_output=True, text=True)
     assert not status.stdout.strip() or status.stdout.strip().startswith('Z')
+
+
+# spec: ANYM-952
+def test_extended_device_commands_and_relative_selectors_compile():
+    commands = compile_flow('''
+- tapOn: {text: Buy, below: {id: product}, childOf: {id: card}, containsChild: {text: In stock}}
+- copyTextFrom: {id: order_number}
+- pasteText
+- setOrientation: PORTRAIT
+- setLocation: {latitude: -8.5, longitude: 115.2}
+- clearState: com.example.synthetic
+- killApp: com.example.synthetic
+''', {})
+    assert commands[0]['tapOn']['below'] == {'id': 'product'}
+    assert commands[2] == 'pasteText'
+
+
+# spec: ANYM-952
+def test_saved_flow_composition_is_bounded_and_uses_the_resolver():
+    sources = {'child': '- inputText: ${QUERY}\n- back', 'cycle': '- runFlow: {name: cycle}'}
+    seen = []
+    def resolve(name, version):
+        seen.append((name, version))
+        return sources[name]
+    result = compile_flow('- runFlow: {name: child, version: abc}', {'QUERY': 'чай'}, resolve=resolve)
+    assert result == [{'runFlow': {'commands': [{'inputText': 'чай'}, 'back']}}]
+    assert seen == [('child', 'abc')]
+    with pytest.raises(Refused):
+        compile_flow('- runFlow: {name: cycle}', {}, resolve=resolve)
+    with pytest.raises(Refused):
+        compile_flow('- runFlow: {file: /etc/passwd}', {}, resolve=resolve)
+
+
+# spec: ANYM-952
+def test_saved_subflows_cannot_hide_checkpoints_or_script_conditions():
+    for source in ('- checkpoint: nested', '- runFlow: {when: {"true": "Java.type(1)"}, commands: [back]}'):
+        with pytest.raises(Refused):
+            compile_flow('- runFlow: {name: inner}', {}, resolve=lambda *args: source)

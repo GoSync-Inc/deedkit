@@ -366,7 +366,8 @@ def verify(sha, get=api):
     verified_by, queue = latest, None
     reused = job_concluded(jobs, QUEUE_VERIFIED_JOB, "skipped")
     # A skipped native job counts only beside that reuse, and then the run that verified must show it passed.
-    native = reused and job_concluded(jobs, NATIVE_JOB, "skipped")
+    native_jobs = [job for job in jobs if job.get("name") in {NATIVE_JOB, "native"}]
+    native = reused and len(native_jobs) == 1 and job_concluded(native_jobs, native_jobs[0]["name"], "skipped")
     for required in sorted(REQUIRED_JOBS):
         if required == NATIVE_JOB and native:
             continue

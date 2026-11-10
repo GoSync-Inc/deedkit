@@ -7,7 +7,7 @@
 #   scripts/remote-test.sh --load                         print every host's load.log
 #   scripts/remote-test.sh --list <worktree>              print the files a run sends
 #
-# Suites: root calendar gateway calls go build frontend node. GitHub CI runs the full suites (owner D46), so by
+# Suites: root calendar gateway android calls go build frontend node. GitHub CI runs the full suites (owner D46), so by
 # default a run takes only what the worktree touched against main: ruff on the suite's changed Python files and
 # its changed test modules (go: the whatsmeow tests when a whatsmeow file changed). Args replace that selection
 # (pytest paths/options; go packages); --full runs the whole suite. build, frontend and node always run whole.
@@ -79,7 +79,7 @@ HOST_FILE="${HOME:-}/.config/deedkit/mini-host"
 SERVICE_USER="${DEEDKIT_REMOTE_USER:-_deedkitci}"
 SHIM="${DEEDKIT_REMOTE_SHIM:-/usr/local/libexec/deedkit-remote-test}"
 SHARED="${DEEDKIT_REMOTE_SHARED:-/Users/Shared/deedkit-ci}"
-SUITES=" root calendar gateway calls go build frontend node "
+SUITES=" root calendar gateway android calls go build frontend node "
 FULL=0
 BUSY=90
 UNREACHABLE=91
@@ -721,6 +721,10 @@ run_suite() {
       pg_start pg1
       [ $# -gt 0 ] || set -- -m 'not live'
       run in_dir services/calendar env FCS_TEST_DSN="$PG_DSN" uv run pytest "$@" ;;
+    android)
+      run sync_env services/android
+      [ $# -gt 0 ] || set -- -q
+      run in_dir services/android uv run pytest "$@" ;;
     gateway)
       run sync_env services/gateway
       [ $# -gt 0 ] || set -- -q
@@ -915,7 +919,7 @@ select_touched() {
   local tree="$1" suite="$2" path dir
   case "$suite" in
     root) dir="" ;;
-    calendar|gateway|calls) dir="services/$suite/" ;;
+    calendar|gateway|android|calls) dir="services/$suite/" ;;
     go)
       if touched_files "$tree" | grep -Eq '^whatsapp/whatsmeow/(.*\.go|go\.mod|go\.sum|fork\.patch)$'; then SELECTED=(./...); fi
       return ;;

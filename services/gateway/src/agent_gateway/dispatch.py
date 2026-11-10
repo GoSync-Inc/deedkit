@@ -18,6 +18,7 @@ from .http_clients import WAIT_POOL, WAIT_RETRY_AFTER_S
 from .policy import Denied, key_from_file
 from .sections import capabilities_view, subscription_blocks  # noqa: F401
 from .tiers import ADVANCED, default_list, REPLACED_BY
+from .catalog_search import search_tools
 from .dispatch_shaping import (  # noqa: F401  (the moved names stay importable from here)
     CALENDAR_CONSTRAINTS, EXACT_TO, FILE_NAME, INLINE_UPLOAD_FIELDS, MIN_PAYLOAD, MIN_TOKEN, NAMED_WINDOWS, PHONE,
     REFERENCE_KEY, TIME_KEY, TIMESTAMP, WRITE_ONLY_ARGUMENTS, branches, caller_payload, candidate_query, carries,
@@ -26,6 +27,8 @@ from .dispatch_shaping import (  # noqa: F401  (the moved names stay importable 
 
 PLAIN_PATH = "/mcp"
 MODULE_PATH = "/mcp/modules/"
+COMPACT_PATH = "/mcp/compact"
+COMPACT_TOOLS = {"platform_capabilities", "platform_search_tools", "platform_call_tool"}
 LIVE_SEARCH = "search_messages_live"
 OPEN_CHAT_BY_PHONE = "open_chat_by_phone"
 OPEN_CHAT_BY_USERNAME = "open_chat_by_username"
@@ -59,6 +62,8 @@ class Route:
     @classmethod
     def parse(cls, path):
         """The route of an MCP path, None for any other path; a malformed module path is `unknown_module`."""
+        if path.rstrip("/") == COMPACT_PATH:
+            return cls(COMPACT_PATH)
         if path.rstrip("/") == PLAIN_PATH:
             return cls(PLAIN_PATH)
         if path.rstrip("/") != PLAIN_PATH + "/modules" and not path.startswith(MODULE_PATH):
@@ -72,6 +77,8 @@ class Route:
 
     def listed(self, names):
         """This route's tools/list out of the caller's effective tools: without `advanced`, the default list."""
+        if self.path == COMPACT_PATH:
+            return [name for name in names if name in COMPACT_TOOLS]
         return names if self.advanced else default_list(names)
 
 
@@ -313,7 +320,7 @@ class Dispatch:
         if revision != self.selection_revision:
             # Any request that observes a new policy revision clears every principal's selection.
             self.selections, self.selection_revision = {}, revision
-        if route is None:
+        if route is None or route.path == COMPACT_PATH:
             return None
         modules = route.modules
         entry = self.selections.get((agent["id"], route.path))
@@ -799,6 +806,17 @@ class Dispatch:
         """One admitted tool call; `route` is the MCP connection path (REST passes None and ignores selection).
         The stages above run in this order; each one's refusal ends the call before anything reaches a backend."""
         snapshot, agent, tool, selected, args = self.admit_call(key, name, values, route)
+        if tool["operation"] == "search_tools":
+            lookup = Route("/mcp/discovery", selected, advanced=True)
+            if args["module"] is not None:
+                lookup.modules = {args["module"]} if selected is None else selected & {args["module"]}
+            _, _, visible, details = await self.discover(key, lookup)
+            return search_tools(visible, details, args)
+        if tool["operation"] == "call_tool":
+            if args["name"] in {"platform_call_tool", "platform_select_modules"}:
+                raise Denied("invalid_forwarded_tool", 422)
+            # Re-enter normal admission so the wrapper never adds access or retries an operation.
+            return await self.call(key, args["name"], args["arguments"], route)
         if tool["operation"] == "select_modules":
             return await self.select_modules(key, route, args["modules"])
         if tool["module"] == "gateway":

@@ -3171,3 +3171,18 @@ def test_the_evidence_verdict_fails_on_failed_added_tests(tmp_path):
     done = subprocess.run([sys.executable, str(root / "scripts/tiden_ci.py"), "verdict", "--directory", str(out)],
                           capture_output=True, text=True)
     assert done.returncode == 1 and "failed added tests" in done.stdout
+
+
+# spec: ANYM-154
+def test_android_evidence_runs_in_the_services_fragment():
+    from scripts import tiden_ci
+    import yaml
+    assert tiden_ci.MODULE_REPORTS['android'] == ('android.xml', 'python', 'services/android')
+    assert 'android' in tiden_ci.SERVICE_MODULES
+    workflow = yaml.safe_load((Path(__file__).resolve().parents[1] / '.github/workflows/checks.yml').read_text())
+    steps = workflow['jobs']['services']['steps']
+    step = next(step for step in steps if step.get('id') == 'android')
+    assert step['working-directory'] == 'services/android'
+    assert '--junitxml="$RUNNER_TEMP/ci-evidence/android.xml"' in step['run']
+    outcomes = next(step for step in steps if step.get('name') == 'Record the service outcomes')
+    assert '"android":"${{ steps.android.outcome }}"' in outcomes['env']['MODULE_OUTCOMES']

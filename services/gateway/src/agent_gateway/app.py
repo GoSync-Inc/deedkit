@@ -38,7 +38,7 @@ UPLOAD_CHUNK_TOOL = "messages_upload_file_chunk"
 # ANYM-547: inline files of messages_send; the inline cap itself (256 KiB decoded) is the backend's.
 SEND_BODY_LIMIT = 524288
 # The only tools whose call may carry more than NORMAL_BODY_LIMIT, each with its own cap, after authentication.
-LARGE_BODY_LIMITS = {UPLOAD_CHUNK_TOOL: UPLOAD_BODY_LIMIT, "messages_send": SEND_BODY_LIMIT}
+LARGE_BODY_LIMITS = {UPLOAD_CHUNK_TOOL: UPLOAD_BODY_LIMIT, "messages_send": SEND_BODY_LIMIT, "platform_call_tool": SEND_BODY_LIMIT + 2048}
 SPACE = re.compile(r"[ \t\n\r]*")
 # ANYM-843: one content-free line per tool call (docs/operations/production.md, Tool call durations).
 CALLS = logging.getLogger("agent_gateway.calls")
@@ -234,7 +234,8 @@ def create_app(policy_path, public_url, *, transports=None):
         started, outcome = time.monotonic(), "error"
         try:
             result = await dispatch.call(current_key.get(), params.name, params.arguments or {}, current_route.get())
-            content, result = android_content(params.name, result)
+            result_name = params.arguments.get("name") if params.name == "platform_call_tool" else params.name
+            content, result = android_content(result_name, result)
             credential = admitted.get()
             notice = expiry_notice(credential)
             if not notice:
@@ -441,6 +442,17 @@ def create_app(policy_path, public_url, *, transports=None):
                         raise Denied("body_timeout", 408) from None
                     if len(body) > NORMAL_BODY_LIMIT and large_call(request.url.path, body) != large:
                         raise Denied("body_too_large", 413)
+                    if large == "platform_call_tool" and len(body) > NORMAL_BODY_LIMIT:
+                        try:
+                            envelope = json.loads(body)
+                            forwarded = (envelope["params"]["arguments"] if route else envelope)
+                            target = forwarded["name"]
+                            policy.authorize_agent(*policy.authenticate(key), target)
+                            target_limit = LARGE_BODY_LIMITS.get(target, NORMAL_BODY_LIMIT)
+                            if target == "platform_call_tool" or len(json.dumps(forwarded["arguments"]).encode()) > target_limit:
+                                raise Denied("body_too_large", 413)
+                        except (KeyError, TypeError, ValueError):
+                            raise Denied("invalid_body", 422) from None
                     sent = False
                     original_receive = receive
 

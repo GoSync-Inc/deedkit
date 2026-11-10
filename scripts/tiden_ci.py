@@ -25,6 +25,7 @@ REPORTS = {"python": "python.xml", "collector": "collector.xml", "npm": "npm.xml
 MODULE_REPORTS = {
     "load": ("load.xml", "python", ""),
     "gateway": ("gateway.xml", "python", "services/gateway"),
+    "android": ("android.xml", "python", "services/android"),
     # The shared contract package the gateway depends on, run from its own directory in its own verify step.
     "platform_contracts": ("platform-contracts.xml", "python", "packages/platform-contracts"),
     "calendar": ("calendar.xml", "python", "services/calendar"),
@@ -50,7 +51,7 @@ REQUIRED_EXECUTIONS = {
 }
 GO_MODULES = tuple(name for name, (_, framework, _) in MODULE_REPORTS.items() if framework == "go")
 # The gateway, its contract package, the calls, inference and agent-runner services run on a runner of their own, in parallel with verify.
-SERVICE_MODULES = ("gateway", "platform_contracts", "calls", "calls_frontend", "inference", "agent_runner")
+SERVICE_MODULES = ("android", "gateway", "platform_contracts", "calls", "calls_frontend", "inference", "agent_runner")
 _VERIFY_MODULES = tuple(name for name in MODULE_REPORTS if name != "load" and name not in GO_MODULES and name not in SERVICE_MODULES)
 # The root Python suite runs in file-level shards (scripts/python_shards.py): verify runs shard 1, each
 # `checks / python` matrix job one of the others, and assembly merges their reports into python.xml.
