@@ -33,7 +33,7 @@ CATALOG["platform_capabilities"] = {
     "description": "Overview of authorized modules and backend availability. Read modules_available for sections. "
     "Optional when tool names and schemas are known. On /mcp/compact, use platform_search_tools(detail=full) "
     "for inputSchema, then platform_call_tool with matching arguments. Reuse schemas and IDs. "
-    "tool_paths lists alternative connections. If discovery.catalog differs from Catalog below, "
+    "For frequent work, connect directly to /mcp/modules/android or /mcp/modules/messaging with the same key; those list domain tools for direct calls. Use /mcp/compact for occasional discovery. tool_paths lists alternative connections. If discovery.catalog differs from Catalog below, "
     "tell the owner once to reconnect the DeedKit MCP client. Backend coverage remains explicit/unknown. Example: {}",
     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
