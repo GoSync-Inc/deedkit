@@ -392,7 +392,7 @@ backend tests, load budgets, server restore evidence and Tiden readback; see
 ### Android devices
 
 The optional `android` module connects to a USB host through private HTTP.
-`/mcp/modules/android` lists its eight tools when the profile, deployment,
+`/mcp/modules/android` lists its ten tools when the profile, deployment,
 backend credentials and scopes grant access. `android_observe` returns a native
 MCP image alongside structured UI elements. `android_execute` retains its request
 UUID across retries and exposes command receipts through `android_get_operation`.
