@@ -1,6 +1,8 @@
 """Fresh small originals remain usable when background history lacks space."""
 import asyncio
 import json
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -271,6 +273,43 @@ def test_the_media_worker_passes_its_live_tier_and_burst_to_the_provider(worker,
     capacity(monkeypatch)
     assert asyncio.run(w.media_once()) is True
     assert sources[0]['_tier']==LIVE_MEDIA and sources[0]['_burst']==[92]
+
+
+# spec: ANYM-877
+def test_a_failed_burst_lookup_fetches_the_one_message_and_logs_under_the_collector_logger(worker,monkeypatch,caplog):
+    from messaging_service.telegram_governor import LIVE_MEDIA
+    w,s,_=worker
+    sources,limits=[],[]
+    async def chunks(source,descriptor):
+        sources.append(source);yield b'voic'
+    def media_burst(job,*,window_seconds,limit):
+        limits.append(limit);raise RuntimeError('synthetic-burst-secret')
+    w.provider.chunks=chunks;w.provider.fetches_bursts=True
+    monkeypatch.setattr(w.archive,'media_burst',media_burst)
+    at=(datetime.now(timezone.utc)-timedelta(seconds=300)).isoformat()
+    w.archive.ingest(event(account=w.account,provider_id='93',sent_at=at,updated_at=at,
+        media=[{'provider_id':'media-93','filename':'voice.ogg','mime':'audio/ogg','bytes':4}]))
+    w.writer,w.live_writer=writers(s);w.live_window_seconds=86400
+    capacity(monkeypatch)
+    caplog.set_level('WARNING')
+    assert asyncio.run(w.media_once()) is True
+    assert limits==[20] and sources[0]['_tier']==LIVE_MEDIA and '_burst' not in sources[0]
+    [record]=[r for r in caplog.records if r.getMessage()=='media_burst_failed error=RuntimeError']
+    assert record.name=='messaging_service.telegram_collector' and 'synthetic-burst-secret' not in caplog.text
+
+
+# spec: ANYM-877
+@pytest.mark.parametrize('entry,logger',[('messaging_service.telegram_collector','__main__'),
+    ('messaging_service.whatsapp_collector','messaging_service.telegram_collector')])
+def test_the_media_path_keeps_the_collector_logger_when_a_collector_module_is_the_entry_point(entry,logger):
+    # `python -m <entry>` (Compose) runs that module as __main__ with its spec set (runpy). telegram_collector's
+    # own log is then getLogger('__main__'), and the media path it calls logs there too (Astra r1, W5-4a).
+    script=('import importlib.util,sys\n'
+            f'sys.modules["__main__"].__spec__=importlib.util.find_spec({entry!r})\n'
+            'from messaging_service import collector_media\n'
+            'print(collector_media.log.name)\n')
+    result=subprocess.run([sys.executable,'-c',script],capture_output=True,text=True,timeout=60,check=True)
+    assert result.stdout.strip()==logger
 
 
 def test_recent_priority_preserves_history_bound(archive,monkeypatch):
