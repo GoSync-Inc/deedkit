@@ -204,6 +204,14 @@ and fails with `screen_not_settled`, a definite failure. `openApp` and
 the number of screen `polls`, which explains warm-run variance. `- sleep: 500`
 pauses for milliseconds (at most 10000) and is a last resort.
 
+`inspectMap` keeps its match counts by default. `hierarchy: true` adds compact
+nodes (index, depth, class, id, text, description, bounds, clickable,
+scrollable; password text omitted; `max_nodes` 1-500, default 200).
+`suggest: true` adds unique selectors (id, then exact text, then description)
+and list candidates: an id or class repeated under one parent, with its count,
+field ids present in at least half of the items and `has_text`. A candidate
+without text points to the full-hierarchy option and `readScreenText`.
+
 Older installations can still install a pinned Maestro CLI release with its supported Java runtime. Set optional
 absolute `maestro` and `java_home` paths in the private service configuration and
 restart the service. The service starts one local stdio MCP process lazily and

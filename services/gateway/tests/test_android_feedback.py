@@ -57,6 +57,13 @@ def test_loading_waits_and_phases_are_discoverable_in_descriptions():
     assert 'waitSettled' in run and 'settle_ms' in run and 'phases' in run and 'sleep' in run
 
 
+# spec: ANYM-957
+def test_image_parts_and_download_chunks_are_described():
+    observe, download = CATALOG['android_observe']['description'], CATALOG['android_download']['description']
+    assert 'two MCP content parts' in observe and 'image_mode=file returns one JSON part' in observe
+    assert 'read_next_chunk' in download and 'length=4194304' in download
+
+
 # spec: ANYM-951
 def test_existing_flows_remain_compatible_before_android_backend_upgrade():
     values = {'device_id': 'phone', 'session_id': 'lease',

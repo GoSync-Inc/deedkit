@@ -20,7 +20,7 @@ MAP_ACTIONS = {
     'typeInto': {'selector', 'text', 'clear', 'submit', 'expect_screen', 'timeout'},
     'waitScreen': {'screen', 'timeout'}, 'assertScreen': {'screen'},
     'readList': {'list', 'fields', 'limit', 'scroll_pages'},
-    'inspectMap': set(), 'dismissPopups': {'max_rounds'},
+    'inspectMap': {'hierarchy', 'suggest', 'max_nodes'}, 'dismissPopups': {'max_rounds'},
 }
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,79}')
 
@@ -41,6 +41,7 @@ def reference():
             'Publish the tested map, then the tested flow with android_flows(action=publish, kind=map|flow, name=..., version=..., test_request_id=<same UUID>, base_version=<previous published version or null>).',
             'Use android_run_flow(name=orders, request_id=<new UUID>) for normal runs. Release the session after work.',
         ],
+        'inspect': 'inspectMap returns match counts per selector and screen. Add hierarchy: true for compact nodes (index, depth, class, resource-id, text, content-desc, bounds, clickable, scrollable; password text omitted; max_nodes 1-500, default 200) and suggest: true for unique selectors (resourceId, then textExact, then description) and list candidates (an id or class repeated under one parent, its count and field ids present in at least half the items; has_text false means try the map hierarchy option or readScreenText). At most 50 of each.',
         'repair': 'Get the current source with android_flows(action=get, stage=draft). Save a draft with base_version equal to the current draft version, or published version when no draft exists. Inspect with a draft scenario containing inspectMap, test the intended scenario, then publish. history returns versions and audit events; rollback takes a previously published version and the current published base_version.',
         'hierarchy': 'Optional map field hierarchy: {compressed: false, max_depth: 1-200}. Every snapshot for that map then dumps the full accessibility tree; the default (compressed true, depth 50) hides nodes that are not important for accessibility and deep subtrees. Try it when inspectMap finds no text, before readScreenText. Plain selector commands later in the same batch may then also see the full tree.',
         'maps': 'Fields: package, selectors, screens, deep_links, popups, lists, hierarchy, meta. Named selectors are ordered candidate lists. text/id are full regular expressions, textExact/resourceId are exact. An ambiguous first matching candidate stops the action. index explicitly selects one match. A point candidate requires tapElement.expect_screen. Screens require all require conditions and no forbid conditions; each condition is a selector name or inline selector. Optional activity is a regex.',
@@ -197,14 +198,14 @@ def validate_action(name, options, app_map):
         raise Refused('unknown_deep_link', 422)
     if name == 'typeInto' and not isinstance(options.get('text'), str):
         raise Refused('invalid_input_text', 422)
-    for key in ('cold', 'clear', 'submit'):
+    for key in ('cold', 'clear', 'submit', 'hierarchy', 'suggest'):
         if key in options:
             if options[key] in ('true', 'True', 'false', 'False'):
                 options[key] = options[key].lower() == 'true'
             if type(options[key]) is not bool:
                 raise Refused('invalid_map_action', 422)
     for key, low, high in (('timeout', 0, 60000), ('limit', 1, 100), ('scroll_pages', 0, 5), ('max_rounds', 1, 5),
-                            ('settle_ms', 0, 5000), ('stable_ms', 100, 5000)):
+                            ('settle_ms', 0, 5000), ('stable_ms', 100, 5000), ('max_nodes', 1, 500)):
         if key in options:
             try:
                 if isinstance(options[key], bool) or str(int(options[key])) != str(options[key]) or not low <= int(options[key]) <= high:

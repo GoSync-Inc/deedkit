@@ -226,7 +226,13 @@ def execute_map(device, name, options, native):
                 screens[key] = screen_state(root, app_map, key, activity)
             except Refused as error:
                 screens[key] = {'error': error.code, **error.details}
-        return {'selectors': selectors, 'screens': screens}
+        result = {'selectors': selectors, 'screens': screens}
+        from .map_inspect import compact, suggest
+        if options.get('hierarchy'):
+            result['hierarchy'] = compact(root, options.get('max_nodes', 200))
+        if options.get('suggest'):
+            result['suggestions'] = suggest(root)
+        return result
     elif name == 'dismissPopups':
         dismissed = []
         for _ in range(options.get('max_rounds', 3)):

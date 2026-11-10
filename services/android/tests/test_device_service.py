@@ -277,6 +277,20 @@ def test_screenshot_crop_geometry_file_mode_and_large_download(service):
     assert post(service, 'observe', {**args, 'crop': {'x': 1000, 'y': 200, 'w': 900, 'h': 600}}).status_code == 422
 
 
+# spec: ANYM-957
+def test_partial_download_names_the_next_chunk_and_the_larger_limit(service):
+    from PIL import Image
+    Image.effect_noise((400, 400), 100).save(service[1] / 'screenshot.png')
+    token = session(service)
+    result = post(service, 'observe', {'device_id': 'home', 'session_id': token, 'hierarchy': False,
+                                       'image_mode': 'file'}).json()
+    file_id = result['image_file']['file_id']
+    first = post(service, 'download', {'file_id': file_id}).json()
+    assert not first['eof'] and first['next_action'] == 'read_next_chunk' and first['max_length'] == 4194304
+    whole = post(service, 'download', {'file_id': file_id, 'length': 4194304}).json()
+    assert whole['eof'] and 'next_action' not in whole and 'max_length' not in whole
+
+
 # spec: ANYM-952
 def test_maestro_authoring_requires_no_device_action_and_resolves_only_owned_flows(service):
     reference = post(service, 'maestro', {'action': 'reference'}, key='reader')
