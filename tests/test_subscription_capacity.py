@@ -28,6 +28,21 @@ def test_default_capacity_allows_one_hundred_active_subscriptions(seeded, monkey
 
 
 # spec: ANYM-183
+def test_subscription_limit_error_names_active_count_and_cap(seeded, monkeypatch):
+    from messaging_service.error_details import payload
+    store, _, _ = seeded
+    token = key(store)
+    monkeypatch.setenv('SUBSCRIPTION_MAX_DEFINITIONS', '2')
+    create(store, token)
+    create(store, token)
+    with pytest.raises(APIError, match='subscription_limit') as error:
+        create(store, token)
+    body = payload(error.value, 'create_subscription')
+    assert (body['error'], body['active'], body['max']) == ('subscription_limit', 2, 2)
+    assert body['next_action'] == 'ask_operator_to_review_subscription_budget'
+
+
+# spec: ANYM-183
 @pytest.mark.parametrize('state', ['paused', 'closed', 'expired', 'access_changed'])
 def test_inactive_definitions_free_capacity_without_losing_history(seeded, monkeypatch, state):
     store, _, _ = seeded

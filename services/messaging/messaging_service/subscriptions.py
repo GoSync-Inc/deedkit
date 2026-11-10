@@ -527,7 +527,9 @@ def _check_capacity(c, p):
         AND state='active' AND (expires_at IS NULL OR expires_at>clock_timestamp())''',
         (p['id'], p['key_id'])).fetchone()['n']
     if count >= maximum:
-        raise APIError('subscription_limit', 429)
+        error = APIError('subscription_limit', 429)
+        error.active, error.max = count, maximum  # Grok 17e07270: the caller's own usage and cap.
+        raise error
 
 
 def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=None, kinds=None,

@@ -132,7 +132,8 @@ Pausing or closing a definition frees its slot immediately; `expired`, `access_c
 and tombstoned definitions occupy no slot. An elapsed expiry frees capacity even before
 the matcher or a read persists the `expired` state. Creation and resume check the same
 per-key budget under one transaction lock. A resume at capacity returns `subscription_limit`
-(HTTP 429), keeping its paused state, version and checkpoint for a later retry.
+(HTTP 429), keeping its paused state, version and checkpoint for a later retry. The
+`subscription_limit` error carries `active` (the key's occupied slots) and `max` (its cap).
 Listing includes retained history and has no continuation cursor yet; a page contains at
 most 100 definitions, so manage older known IDs individually when `has_more` is true.
 
