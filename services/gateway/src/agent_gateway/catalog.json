@@ -9150,7 +9150,7 @@
       "android:read"
     ],
     "required_manifest": true,
-    "description": "Use the request_id returned by android_execute or android_run_flow, including when either returns state=running. Read or briefly wait for an Android command receipt by its original request_id. A state of unknown can mean the device already acted. Never retry with a new request_id without inspecting the device.",
+    "description": "Use the request_id returned by android_execute or android_run_flow, including when either returns state=running. Read or briefly wait for an Android command receipt by its original request_id. A state of unknown can mean the device already acted. Never retry with a new request_id without inspecting the device. Failed flow receipts retain the original observation.image_file.file_id and compact hierarchy, so polling does not take another snapshot. Fetch that PNG with android_download. failed does not mean earlier steps were undone.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -9185,7 +9185,7 @@
       "android:control"
     ],
     "required_manifest": true,
-    "description": "Acquire, renew or release exclusive control of one phone. Get device_id from android_capabilities. Acquire with action=acquire and no session_id, save the returned session_id, and pass it to every observe/execute/run_flow call. Renew and release require that session_id. Release after running operations finish. Valid activity and running operations renew automatically. Abandoned sessions expire after seconds (30-900). On device_reserved or device_busy, wait and try to acquire later. Each agent needs its own session even with a shared key.",
+    "description": "Acquire, renew or release exclusive control of one phone. Get device_id from android_capabilities. Acquire with action=acquire and no session_id, save the returned session_id, and pass it to every observe/execute/run_flow call. Renew and release require that session_id. Release after running operations finish. Valid activity and running operations renew automatically. Abandoned sessions expire after seconds (30-900). On device_reserved or device_busy, wait and try to acquire later. Each agent needs its own session even with a shared key. Legacy lease_s is accepted as an alias for seconds; never supply both. device_id remains required for acquire, renew and release.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -9352,7 +9352,7 @@
       "android:control"
     ],
     "required_manifest": true,
-    "description": "Acquire android_session first and validate with android_maestro. Provide exactly one of yaml or saved name. List saved names and versions with android_flows. Run inline device-only Maestro YAML or a saved flow name with optional pinned version and literal parameters. Supports text/id selectors, Unicode input, waits, gestures and nested inline flows. Use ${NAME} for literal parameters. No host scripts, JavaScript or external flow paths. One request_id never replays actions. A top-level checkpoint returns paused and remaining_yaml for the agent to observe and continue deliberately. Poll android_get_operation after running or unknown responses.",
+    "description": "Acquire android_session first and validate with android_maestro. Provide exactly one of yaml or saved name. List saved names and versions with android_flows. Run inline device-only Maestro YAML or a saved flow name with optional pinned version and literal parameters. Supports text/id selectors, Unicode input, waits, gestures and nested inline flows. Use ${NAME} for literal parameters. No host scripts, JavaScript or external flow paths. One request_id never replays actions. A top-level checkpoint returns paused and remaining_yaml for the agent to observe and continue deliberately. Poll android_get_operation after running or unknown responses. Missing elements wait 5s by default (optional: 1s); set element_timeout_ms/optional_timeout_ms or selector.timeout/when.timeout to override. These bound native lookup probes, not driver startup or subsequent actions. On terminal failure, observation contains an owner-scoped image_file.file_id and compact elements; android_download retrieves the PNG. failed_command_index is zero-based; failed_command_path includes nested indexes. Earlier steps may have acted: inspect before resuming, never replay the whole flow automatically. If backend_unavailable explicitly says operation_sent=false, wait retry_after_seconds then retry with the same request_id.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -9425,6 +9425,20 @@
           "minimum": 0,
           "title": "Wait S",
           "type": "integer"
+        },
+        "element_timeout_ms": {
+          "type": "integer",
+          "default": 5000,
+          "minimum": 100,
+          "maximum": 60000,
+          "title": "Element Timeout Ms"
+        },
+        "optional_timeout_ms": {
+          "type": "integer",
+          "default": 1000,
+          "minimum": 100,
+          "maximum": 60000,
+          "title": "Optional Timeout Ms"
         }
       },
       "required": [
@@ -9602,7 +9616,7 @@
     "scopes": [
       "android:read"
     ],
-    "description": "Read the local Maestro reference with action=reference before authoring YAML. It lists supported commands, selector fields and examples. Then use action=validate with exactly one of yaml or saved name, plus parameters when needed. Validation returns compiled commands without executing them. Saved subflows are owner-scoped. Execute validated YAML or a saved name with android_run_flow under an acquired android_session. Example: {\"action\":\"reference\"}",
+    "description": "Read the local Maestro reference with action=reference before authoring YAML. It lists supported commands, selector fields and examples. Then use action=validate with exactly one of yaml or saved name, plus parameters when needed. Validation returns compiled commands without executing them. Saved subflows are owner-scoped. Execute validated YAML or a saved name with android_run_flow under an acquired android_session. Example: {\"action\":\"reference\"} YAML is a command list without appId/--- headers. A checkpoint is a scalar: - checkpoint: verify. Reference includes saved-subflow and targeted permission-dialog examples.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
