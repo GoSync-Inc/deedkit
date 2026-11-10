@@ -8982,8 +8982,45 @@
       "android:read"
     ],
     "required_manifest": true,
-    "description": "Read the phone screen as a native image plus UI elements. Requires an acquired session. Password element text is omitted. Re-observe after UI changes.",
+    "description": "Read native-resolution PNG and UI elements in device-pixel coordinates under an acquired session. Image width/height identify the source coordinate space even if the client resizes its preview. Maestro hierarchy is used when configured. Missing hierarchy does not prevent a screenshot. Re-observe after UI changes. Use crop={x,y,w,h} for small text. image_mode=file or both saves exact PNG bytes and returns image_file.file_id. Download that file with length up to 4194304.",
     "inputSchema": {
+      "$defs": {
+        "Crop": {
+          "additionalProperties": false,
+          "properties": {
+            "x": {
+              "minimum": 0,
+              "title": "X",
+              "type": "integer"
+            },
+            "y": {
+              "minimum": 0,
+              "title": "Y",
+              "type": "integer"
+            },
+            "w": {
+              "maximum": 16384,
+              "minimum": 1,
+              "title": "W",
+              "type": "integer"
+            },
+            "h": {
+              "maximum": 16384,
+              "minimum": 1,
+              "title": "H",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "x",
+            "y",
+            "w",
+            "h"
+          ],
+          "title": "Crop",
+          "type": "object"
+        }
+      },
       "additionalProperties": false,
       "properties": {
         "device_id": {
@@ -9003,6 +9040,27 @@
           "default": true,
           "title": "Hierarchy",
           "type": "boolean"
+        },
+        "image_mode": {
+          "default": "inline",
+          "enum": [
+            "inline",
+            "file",
+            "both"
+          ],
+          "title": "Image Mode",
+          "type": "string"
+        },
+        "crop": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Crop"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -9122,7 +9180,7 @@
       "android:control"
     ],
     "required_manifest": true,
-    "description": "Acquire, renew or release exclusive control of one phone. Acquire before observe or execute. Keep session_id and renew before expiry.",
+    "description": "Acquire, renew or release exclusive control of one phone. Save session_id and release when finished. Valid observe/execute/run_flow activity and running operations renew automatically. Abandoned sessions expire after seconds (30–900). Another agent sharing this key still needs its own session.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -9148,7 +9206,7 @@
           "title": "Session Id"
         },
         "seconds": {
-          "default": 300,
+          "default": 900,
           "maximum": 900,
           "minimum": 30,
           "title": "Seconds",
@@ -9220,7 +9278,7 @@
       "android:read"
     ],
     "required_manifest": true,
-    "description": "Read a private output file as bounded base64 chunks. Follow next_offset until eof=true. Files are scoped to the calling principal.",
+    "description": "Read a private file as base64 with byte offset and length up to 4194304 (4 MiB). Default length remains 32768 for compatibility. Return includes SHA256 for each chunk, next_offset and eof.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -9236,7 +9294,7 @@
         },
         "length": {
           "default": 32768,
-          "maximum": 32768,
+          "maximum": 4194304,
           "minimum": 1,
           "title": "Length",
           "type": "integer"
@@ -9279,6 +9337,168 @@
       "readOnlyHint": false,
       "destructiveHint": true,
       "openWorldHint": false
+    }
+  },
+  {
+    "name": "android_run_flow",
+    "module": "android",
+    "operation": "run_flow",
+    "scopes": [
+      "android:control"
+    ],
+    "required_manifest": true,
+    "description": "Run inline device-only Maestro YAML or a saved flow name with optional pinned version and literal parameters. Supports text/id selectors, Unicode input, waits, gestures and nested inline flows. Use ${NAME} for literal parameters. No host scripts, JavaScript or external flow paths. One request_id never replays actions. A top-level checkpoint returns paused and remaining_yaml for the agent to observe and continue deliberately. Poll android_get_operation after running or unknown responses.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "device_id": {
+          "title": "Device Id",
+          "type": "string"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "yaml": {
+          "anyOf": [
+            {
+              "maxLength": 32768,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Yaml"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Version"
+        },
+        "parameters": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Parameters",
+          "type": "object"
+        },
+        "timeout_s": {
+          "default": 120,
+          "maximum": 600,
+          "minimum": 1,
+          "title": "Timeout S",
+          "type": "integer"
+        },
+        "wait_s": {
+          "default": 15,
+          "maximum": 25,
+          "minimum": 0,
+          "title": "Wait S",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "device_id",
+        "session_id",
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "android_flows",
+    "module": "android",
+    "operation": "flows",
+    "scopes": [
+      "android:control"
+    ],
+    "required_manifest": true,
+    "description": "List, get, put or delete owner-scoped reusable Maestro YAML flows on the USB host. Use version for optimistic update/delete or pinned reads. Saving a flow does not execute it. See android_capabilities for supported commands and schemas.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "pattern": "^(list|get|put|delete)$",
+          "title": "Action",
+          "type": "string"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "yaml": {
+          "anyOf": [
+            {
+              "maxLength": 32768,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Yaml"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Version"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": true
     }
   }
 ]

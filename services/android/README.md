@@ -8,8 +8,8 @@ existing server and exposes the `android` module through `/mcp/modules/android`.
 Grok → DeedKit MCP gateway → private HTTP → USB host → ADB → Android apps
 ```
 
-The client agent chooses each action. A second language model and Maestro are
-optional additions for a later workflow layer.
+The client agent chooses each action. An optional persistent Maestro process on
+the USB host executes selector-based actions and reusable workflows.
 
 ## Tools
 
@@ -19,6 +19,8 @@ optional additions for a later workflow layer.
 | `android_session` | Acquire, renew or release exclusive control of a phone |
 | `android_observe` | PNG screenshot plus Android UI hierarchy |
 | `android_execute` | Run device-targeted ADB arguments and retain a result receipt |
+| `android_run_flow` | Run inline or saved Maestro YAML with a durable receipt |
+| `android_flows` | List, save, read and delete reusable owner-scoped flows |
 | `android_get_operation` | Read or wait for the receipt using the original request UUID |
 | `android_upload` | Upload an APK or another file in bounded chunks |
 | `android_download` | Read command output or a pulled file in bounded chunks |
@@ -95,7 +97,7 @@ the private network. Keep ADB connected over USB.
 
 Deploy a gateway build containing the Android catalog before adding `android` to
 its policy. Add the private service URL under `deployment.backends.android`, include
-`android` in `deployment.modules`, and add the eight exact tool names to the chosen
+`android` in `deployment.modules`, and add the ten exact tool names to the chosen
 profile. Grant that principal `android:read` and `android:control`. Its Android
 credential uses a private `key_file` holding the backend token and `key_sha256`
 matching that token. The MCP client continues using its separate gateway token.
@@ -115,7 +117,9 @@ inspect capabilities and its previously created receipts and files.
 2. Observe the screen, then execute one intended action with a fresh request UUID.
 3. Keep that UUID and read its receipt until it leaves `running`.
 4. Observe again before deciding on another UI action.
-5. Renew the reservation before its expiry and release it when finished.
+5. Release the reservation when finished. Valid activity and running commands renew
+   it automatically. The default inactivity interval is 900 seconds. Explicit
+   `seconds` remains supported from 30 to 900.
 
 A duplicate request UUID with the same device, arguments and command timeout
 returns its existing receipt. Different arguments produce `request_id_conflict`.
@@ -134,12 +138,95 @@ including a partially written final chunk after a crash. File deletion is idempo
 and waits until device commands have finished.
 
 Commands have a 1–600 second timeout and can be polled with a 0–25 second wait.
-File chunks hold up to 32 KiB, files up to 256 MiB and stored files up to 512 MiB
+Uploads hold up to 32 KiB per chunk. Downloads accept up to 4 MiB per call, with
+the previous 32 KiB default retained. Files hold up to 256 MiB and stored files up to 512 MiB
 in total. Delete completed transfers to free the quota. Command stdout and stderr
 are bounded at 4 MiB each. Large or binary stdout becomes a downloadable file.
 Observation PNGs have a separate 16 MiB ceiling, to preserve full-resolution phone screenshots.
 Receipts persist in SQLite. Preserve the state directory across upgrades to retain
 duplicate-request protection.
+
+## Maestro workflows
+
+Install a pinned Maestro CLI release with its supported Java runtime. Set optional
+absolute `maestro` and `java_home` paths in the private service configuration and
+restart the service. The service starts one local stdio MCP process lazily and
+retains its device connection. The gateway continues using the same Android
+backend credential and the client continues using its existing gateway key.
+
+`android_run_flow` takes `device_id`, `session_id`, `request_id` and exactly one of
+`yaml` or a saved `name`. `parameters` supplies literal `${NAME}` substitutions.
+`version` pins a saved flow revision. `timeout_s` bounds the entire run from 1 to
+600 seconds and `wait_s` controls how long the HTTP call waits for its receipt.
+Use `android_get_operation` to poll after a `running` response or lost reply.
+A duplicate UUID never repeats admitted actions.
+
+```yaml
+- launchApp: com.example.app
+- tapOn:
+    id: com.example.app:id/search
+- inputText: ${QUERY}
+- pressKey: Enter
+- extendedWaitUntil:
+    visible: Results
+    timeout: 10000
+- checkpoint: review_results
+- back
+```
+
+Save this through `android_flows` with `action=put`, `name` and `yaml`, then pass
+its returned `version` on subsequent reads or runs. Save, read and delete accept
+a version for optimistic concurrency. Each principal can store 128 flows, each
+up to 32 KiB. `android_capabilities` includes supported commands and input schemas.
+
+The default `launchApp` resumes the app and leaves runtime permission states
+unchanged. Explicit launch options can override these defaults. The supported
+subset includes text and resource-ID selectors, Unicode input, key presses,
+swipes, waits, inline `runFlow`, `repeat` and `retry`. Host scripts, JavaScript
+expressions, external YAML paths and image-file selectors are rejected before
+admission. Nested command sequences share the outer timeout and device lock.
+
+A top-level `checkpoint` returns a `paused` receipt, its label and `remaining_yaml`.
+The calling agent can observe the phone, handle the checkpoint, then deliberately
+submit the remaining commands with a new request UUID. This supports variable UI
+interruptions such as app verification screens. Detection and interpretation of
+such screens belongs to the calling agent. The service does not retry a failed
+or timed-out flow. An `unknown` receipt requires observing the device before any
+new action because a prefix of the flow may have executed.
+
+Saved flows, operation receipts and checkpoint remainders persist in private
+SQLite state. Substituted commands temporarily occupy a private Java temporary
+directory during execution. The service removes its process-owned directory on
+shutdown or timeout. A small parent-process monitor holds the state lock while
+Maestro runs, stops its process group when the service disappears, and removes
+its temporary directory. A later service removes crash leftovers only after
+obtaining that exclusive lock. No model API is called by this runtime. Device interactions
+can cause the apps themselves to contact their services.
+
+## Observation and image coordinates
+
+Screenshot capture and hierarchy inspection run concurrently with bounded waits.
+With Maestro configured, the hierarchy uses its persistent accessibility driver.
+Nodes keep the existing ADB-style attribute names. Maestro's compact hierarchy
+omits password flags, so editable-node text is conservatively omitted. Without
+Maestro, the existing ADB hierarchy path remains available.
+
+PNGs retain their source pixels. `device_size` gives the full frame dimensions,
+`image.width` and `image.height` give delivered image dimensions, and `image_origin`
+gives the top-left position within the full frame. Bounds and ADB coordinates use
+device pixels. A client's smaller preview can have a different pixel scale.
+Maestro also accepts percentage points for taps and swipes.
+
+`crop={x,y,w,h}` returns only that region. It preserves pixel values and reports
+its origin. Use a region whose longest side is within the client preview limit
+to inspect small text. `image_mode=file` saves the exact PNG as an owner-scoped
+file and returns `image_file.file_id`. `image_mode=both` also includes the native
+MCP image. Fetch it through `android_download` with `length=4194304` to avoid
+many small round trips, then delete it through `android_delete_file`.
+
+Upgrading a host to a Maestro-enabled config must update the executable and
+configuration together. Rollback must restore both originals because older
+service versions reject the new optional keys.
 
 ## Verification
 
