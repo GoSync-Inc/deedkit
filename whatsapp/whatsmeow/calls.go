@@ -102,17 +102,17 @@ func (p *Provider) captureCallEvent(value any) error {
 		if e == nil || !validCallMeta(e.BasicCallMeta) {
 			return errCallEvent
 		}
-		return p.Capture.acceptCall(e.CallID)
+		return p.acceptCall(e.CallID)
 	case *events.CallReject:
 		if e == nil || !validCallMeta(e.BasicCallMeta) {
 			return errCallEvent
 		}
-		return p.Capture.endCall(e.CallID, "rejected", e.Timestamp.Unix())
+		return p.endCall(e.CallID, "rejected", e.Timestamp.Unix())
 	case *events.CallTerminate:
 		if e == nil || !validCallMeta(e.BasicCallMeta) {
 			return errCallEvent
 		}
-		return p.Capture.endCall(e.CallID, "", e.Timestamp.Unix())
+		return p.endCall(e.CallID, "", e.Timestamp.Unix())
 	default:
 		return nil
 	}
@@ -202,20 +202,42 @@ func (s *CaptureStore) offerCall(r callRecord) error {
 }
 
 // acceptCall notes an accept seen for a pending call: it ends as answered.
-func (s *CaptureStore) acceptCall(id string) error {
+func (p *Provider) acceptCall(id string) error {
 	callsMu.Lock()
 	defer callsMu.Unlock()
-	_, err := s.db.Exec("UPDATE calls SET accepted=1,updated_ms=? WHERE call_id=? AND state='pending'", time.Now().UnixMilli(), id)
+	policy, err := p.policy()
+	if err != nil {
+		return err
+	}
+	s := p.Capture
+	r, _, err := s.pendingCall(id)
+	if err != nil || r == nil {
+		return err
+	}
+	if !policy.Allows(r.chat) {
+		_, err = s.db.Exec("UPDATE calls SET state='done',updated_ms=? WHERE call_id=?", time.Now().UnixMilli(), id)
+		return err
+	}
+	_, err = s.db.Exec("UPDATE calls SET accepted=1,updated_ms=? WHERE call_id=? AND state='pending'", time.Now().UnixMilli(), id)
 	return err
 }
 
 // endCall journals a pending call with its outcome; "" derives it from an
 // accept seen. A call never offered here, or already closed, adds nothing.
-func (s *CaptureStore) endCall(id, outcome string, at int64) error {
+func (p *Provider) endCall(id, outcome string, at int64) error {
 	callsMu.Lock()
 	defer callsMu.Unlock()
+	policy, err := p.policy()
+	if err != nil {
+		return err
+	}
+	s := p.Capture
 	r, accepted, err := s.pendingCall(id)
 	if err != nil || r == nil {
+		return err
+	}
+	if !policy.Allows(r.chat) {
+		_, err = s.db.Exec("UPDATE calls SET state='done',updated_ms=? WHERE call_id=?", time.Now().UnixMilli(), id)
 		return err
 	}
 	if outcome == "" {
@@ -355,11 +377,30 @@ func (p *Provider) sweepCalls(now time.Time) {
 
 // putCallLog journals a call-log message or a synced call record, unless the
 // same call ID already has its entry (a live call, or an earlier sync).
-func (s *CaptureStore) putCallLog(r callRecord, origin string) error {
+func (p *Provider) putCallLog(r callRecord, origin string) error {
+	s := p.Capture
+	if !r.group {
+		creator, err := ParseChatID(r.chat)
+		if err != nil {
+			return errCallEvent
+		}
+		chat, err := s.callChat(creator, types.EmptyJID)
+		if err != nil {
+			return err
+		}
+		r.chat, r.sender = chat, chat
+	}
+	policy, err := p.policy()
+	if err != nil {
+		return err
+	}
+	if !policy.Allows(r.chat) {
+		return nil
+	}
 	callsMu.Lock()
 	defer callsMu.Unlock()
 	var state string
-	err := s.db.QueryRow("SELECT state FROM calls WHERE call_id=?", r.id).Scan(&state)
+	err = s.db.QueryRow("SELECT state FROM calls WHERE call_id=?", r.id).Scan(&state)
 	if err == nil && state == "done" {
 		return nil
 	}
@@ -442,7 +483,7 @@ func (p *Provider) captureCallLog(chat, sender types.JID, id string, fromMe bool
 		return false, nil
 	}
 	if err == nil && r != nil {
-		err = p.Capture.putCallLog(*r, origin)
+		err = p.putCallLog(*r, origin)
 	}
 	if skippableCapture(err) {
 		err = p.Capture.skip(err)
@@ -455,14 +496,7 @@ func (p *Provider) captureCallLogRecords(records []*waSyncAction.CallLogRecord) 
 	for _, c := range records {
 		r, err := callLogRecord(c)
 		if err == nil && r != nil {
-			var policy Policy
-			if policy, err = p.policy(); err != nil {
-				return err
-			}
-			if !policy.Allows(r.chat) {
-				continue
-			}
-			err = p.Capture.putCallLog(*r, "history")
+			err = p.putCallLog(*r, "history")
 		}
 		if skippableCapture(err) {
 			err = p.Capture.skip(err)
