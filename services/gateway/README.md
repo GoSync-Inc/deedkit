@@ -409,6 +409,14 @@ profile granting them. `platform_capabilities` reports the available sections.
 `name` and its `arguments`. Calls use the ordinary dispatcher, including per-tool
 grants, schemas, mutation receipts and native Android image blocks.
 
+Known names and schemas can be called directly through `platform_call_tool`.
+For an unfamiliar tool, one `detail=full` search supplies the schema needed for
+the next call. Reuse it during the session. Capabilities and summary browsing are
+optional orientation. An exact canonical name finds only that authorized tool,
+while other queries match every whitespace-separated word in names/descriptions.
+Follow a result's `{tool, arguments}` next-call hint through the same wrapper as
+`{name: tool, arguments}` after checking its schema.
+
 Search filters belong to the request. Independent agents sharing a key can browse
 different sections concurrently. The compact path ignores the legacy principal-wide
 selection set by `platform_select_modules`. Existing paths retain their selection

@@ -6,6 +6,7 @@
       "readOnlyHint": true
     },
     "description": "Identity, permitted accounts, source coverage and unavailable features. detail=summary (default) is a short index naming the sections; sections=[names] returns only those blocks; detail=full returns everything. An unknown section name returns invalid_filter. version is the package version and does not change per release; build.source_sha is the commit this messaging server was built from and build.started_at when it started (the gateway, calls and calendar services deploy separately and are not reported here). A null build.source_sha means the image was built without its commit: on production, report it as a deploy defect. A restart without a deploy also moves started_at, so compare SHAs when the expected one is known.",
+    "guidance": "Start here for messaging. Use accounts[].id as account. Discover messages_list_chats for chat IDs, messages_search for message IDs and messages_search_files for attachment IDs. Reuse those IDs in reading tools. For live messenger actions, inspect messages_list_messenger_operations for the selected account and its operation-specific parameters_schema.",
     "inputSchema": {
       "properties": {
         "detail": {
@@ -2361,6 +2362,7 @@
   {
     "name": "calendar_capabilities",
     "description": "Read-only. Granted calendars with allowed event actions, plus constraints: accepted time format, window/calendar/event limits, plan action limit and TTL. recurrence_write and future_split describe calendar_plan only (false: a plan never edits a whole series or this-and-following; invitations false: a plan never invites); series_write lists calendar_schedule's series scopes per provider (this, following, all). Read this before planning.",
+    "guidance": "Start here for calendar work. Discover calendar_calendars for calendar_ref and calendar_members for member IDs. Read events with calendar_agenda, find availability with calendar_find_time or calendar_slots, and discover the full schema of the chosen planning or scheduling tool before any change. Follow calendar_operation for unsettled operation_id results.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},
@@ -2379,6 +2381,7 @@
   {
     "name": "calendar_calendars",
     "description": "List only explicitly granted Google/iCloud calendars. Provider credentials and URLs are never returned.",
+    "guidance": "Use each returned calendar_ref in calendar_agenda and calendar_plan.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},
@@ -2397,6 +2400,7 @@
   {
     "name": "calendar_members",
     "description": "Family members, roles and authorized availability bindings; inaccessible or unbound sources are explicit.",
+    "guidance": "Use each returned person_id in calendar_slots.member_ids.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},
@@ -5893,6 +5897,7 @@
     "operation": "capabilities",
     "scopes": [],
     "description": "Read-only; places no call. Shows this principal's calls scopes, each granted channel's configured state and recipient policy (any valid destination; SIP: exact allowlist), the daily call cap with the owner's active raises, daily_calls_remaining, brief/call limits, and voice_engines: each engine (gemini_live, grok_live) with available (key configured), model, voices, languages, tool_calls, success_fields and which engine an omitted voice_engine uses. calling_readiness per channel: configuration_ready and blockers judge an omitted voice_engine; voice_engines, ready_engines and auto say which explicit choice works now. Contacts no provider; preflight_call checks one external brief.",
+    "guidance": "Start here for calls. Discover calls_call for a single-call workflow, or calls_prepare_external_call then calls_preflight_call and calls_dial_call for staged preparation. Browser rehearsal uses calls_prepare_call then calls_start_call. Follow returned call_id with calls_call_result or calls_get_call_status and calls_get_call_result. Only use tools authorized by discovery.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},
@@ -8423,7 +8428,7 @@
       "openWorldHint": true,
       "readOnlyHint": true
     },
-    "description": "Permitted recording accounts and limits. On-demand provider reads, not an archive. Omi audio is unsupported. Example: {}",
+    "description": "Start here for recordings and reuse a permitted account ID as account. Discover recordings_list then recordings_read for provider content using recording_id. Local archive search uses recordings_search then recordings_context with recording_ref. These two IDs are different. recordings_archive_status reports local freshness and coverage. Permitted recording accounts and limits. On-demand provider reads, not an archive. Omi audio is unsupported. Example: {}",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},
@@ -8751,7 +8756,7 @@
     "scopes": [
       "agents:read"
     ],
-    "description": "Read-only: the agent runner on the Mac mini. Per engine (claude, codex): configured, login_state (ok, login_required, unknown), running and queued counts and their caps; starts_left of the rolling 24-hour cap, paused, host_gate (ok or busy with a reason) and host_check. Starts nothing. When it rechecks the engine logins (at most every 10 minutes) it can take up to a minute and end backend_unavailable with reason gateway_timeout: ask again a minute later. Example: {}",
+    "description": "Start here for delegated agent tasks. Check engine availability and capacity before agents_start_task. Save its task_id for agents_get_task and agents_read_task_log. Recover an uncertain start with agents_list_tasks using the original request_id. Read-only: the agent runner on the Mac mini. Per engine (claude, codex): configured, login_state (ok, login_required, unknown), running and queued counts and their caps; starts_left of the rolling 24-hour cap, paused, host_gate (ok or busy with a reason) and host_check. Starts nothing. When it rechecks the engine logins (at most every 10 minutes) it can take up to a minute and end backend_unavailable with reason gateway_timeout: ask again a minute later. Example: {}",
     "annotations": {
       "readOnlyHint": true,
       "destructiveHint": false,
@@ -8962,7 +8967,7 @@
       "android:read"
     ],
     "required_manifest": true,
-    "description": "Connected, explicitly granted Android devices and available commands. Inspect before use.",
+    "description": "Start here for Android. Read devices[].device_id and state, session_policy, adb_commands and maestro. Pick a connected device, acquire android_session, then use android_observe and android_execute or android_run_flow. For saved scenarios discover android_flows, and for the supported YAML dialect use android_maestro. Example: {}",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},
@@ -8982,7 +8987,7 @@
       "android:read"
     ],
     "required_manifest": true,
-    "description": "Read native-resolution PNG and UI elements in device-pixel coordinates under an acquired session. Image width/height identify the source coordinate space even if the client resizes its preview. Maestro hierarchy is used when configured. Missing hierarchy does not prevent a screenshot. Re-observe after UI changes. Use crop={x,y,w,h} for small text. image_mode=file or both saves exact PNG bytes and returns image_file.file_id. Download that file with length up to 4194304.",
+    "description": "Read native-resolution PNG and UI elements in device-pixel coordinates under an acquired session. Image width/height identify the source coordinate space even if the client resizes its preview. Maestro hierarchy is used when configured. Missing hierarchy does not prevent a screenshot. Re-observe after UI changes. Use crop={x,y,w,h} for small text. image_mode=file or both saves exact PNG bytes and returns image_file.file_id. Use android_download with that file_id and length up to 4194304 to obtain the original bytes.",
     "inputSchema": {
       "$defs": {
         "Crop": {
@@ -9083,7 +9088,7 @@
       "android:control"
     ],
     "required_manifest": true,
-    "description": "Run device-targeted ADB argv with durable request_id. Supports shell and exec-out, input, intents, packages, settings, reboot, logcat, push/pull and APK install. For push/install use uploaded file UUIDs instead of host paths. Pull takes one remote path and returns a downloadable file UUID. Same request_id never re-executes. Inspect unknown outcomes before creating another request.",
+    "description": "Acquire android_session first. argv starts with the ADB command such as [\"shell\",\"input\",\"tap\",\"200\",\"400\"]; omit the adb executable and device selector because the service supplies them. Run device-targeted ADB argv with durable request_id. Supports shell and exec-out, input, intents, packages, settings, reboot, logcat, push/pull and APK install. For push/install use uploaded file UUIDs instead of host paths. Pull takes one remote path and returns a downloadable file UUID. Same request_id never re-executes. Inspect unknown outcomes before creating another request.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -9145,7 +9150,7 @@
       "android:read"
     ],
     "required_manifest": true,
-    "description": "Read or briefly wait for an Android command receipt by its original request_id. A state of unknown can mean the device already acted. Never retry with a new request_id without inspecting the device.",
+    "description": "Use the request_id returned by android_execute or android_run_flow, including when either returns state=running. Read or briefly wait for an Android command receipt by its original request_id. A state of unknown can mean the device already acted. Never retry with a new request_id without inspecting the device.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -9180,7 +9185,7 @@
       "android:control"
     ],
     "required_manifest": true,
-    "description": "Acquire, renew or release exclusive control of one phone. Save session_id and release when finished. Valid observe/execute/run_flow activity and running operations renew automatically. Abandoned sessions expire after seconds (30–900). Another agent sharing this key still needs its own session.",
+    "description": "Acquire, renew or release exclusive control of one phone. Get device_id from android_capabilities. Acquire with action=acquire and no session_id, save the returned session_id, and pass it to every observe/execute/run_flow call. Renew and release require that session_id. Release after running operations finish. Valid activity and running operations renew automatically. Abandoned sessions expire after seconds (30-900). On device_reserved or device_busy, wait and try to acquire later. Each agent needs its own session even with a shared key.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -9347,7 +9352,7 @@
       "android:control"
     ],
     "required_manifest": true,
-    "description": "Run inline device-only Maestro YAML or a saved flow name with optional pinned version and literal parameters. Supports text/id selectors, Unicode input, waits, gestures and nested inline flows. Use ${NAME} for literal parameters. No host scripts, JavaScript or external flow paths. One request_id never replays actions. A top-level checkpoint returns paused and remaining_yaml for the agent to observe and continue deliberately. Poll android_get_operation after running or unknown responses.",
+    "description": "Acquire android_session first and validate with android_maestro. Provide exactly one of yaml or saved name. List saved names and versions with android_flows. Run inline device-only Maestro YAML or a saved flow name with optional pinned version and literal parameters. Supports text/id selectors, Unicode input, waits, gestures and nested inline flows. Use ${NAME} for literal parameters. No host scripts, JavaScript or external flow paths. One request_id never replays actions. A top-level checkpoint returns paused and remaining_yaml for the agent to observe and continue deliberately. Poll android_get_operation after running or unknown responses.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -9443,7 +9448,7 @@
       "android:control"
     ],
     "required_manifest": true,
-    "description": "List, get, put or delete owner-scoped reusable Maestro YAML flows on the USB host. Use version for optimistic update/delete or pinned reads. Saving a flow does not execute it. See android_capabilities for supported commands and schemas.",
+    "description": "List, get, put or delete owner-scoped reusable Maestro YAML flows on the USB host. Use version for optimistic update/delete or pinned reads. Saving a flow does not execute it. See android_capabilities for supported commands and schemas. Begin with action=list, then action=get with a returned name. For action=put provide name and yaml; save the returned version for pinned android_run_flow calls. Validate source with android_maestro.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -9506,7 +9511,7 @@
     "module": "gateway",
     "operation": "search_tools",
     "scopes": [],
-    "description": "Browse authorized MCP sections and search tools. detail=full returns exact schemas. Filters are per request and safe for agents sharing a key. Use platform_call_tool with the returned name and arguments. Example: {\"module\":\"android\",\"detail\":\"full\"}",
+    "description": "Find authorized tools and their schemas. An exact canonical name returns only that tool. Otherwise all query words match names/descriptions; use English keywords or omit query to browse a module. detail=full returns inputSchema and annotations in the same call; summary is optional. Reuse schemas until the catalog changes. Page with next_offset as offset until null. Filters are per request. Call the exact returned name with platform_call_tool. A module's capabilities tool gives optional orientation. Example: {\"module\":\"android\",\"query\":\"android_capabilities\",\"detail\":\"full\"}",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -9566,7 +9571,7 @@
     "module": "gateway",
     "operation": "call_tool",
     "scopes": [],
-    "description": "Invoke an authorized tool discovered with platform_search_tools. Preserves its validation, request_id, errors and image results. Arguments are the exact object from its inputSchema. May perform writes. Never replay an unknown mutation. Example: {\"name\":\"android_capabilities\",\"arguments\":{}}",
+    "description": "Run a known authorized tool directly in one call. For unknown names/schemas, use platform_search_tools(detail=full) first. Put the exact name in name and all target inputs inside arguments, matching inputSchema and its described conditions. Reuse returned IDs. For next/next_call shaped as {tool,arguments}, pass {name:tool,arguments} here. Target annotations define effects. Native images, validation, errors and request_id are preserved. On unknown mutation outcomes follow recovery guidance with the original request_id; never replay or replace it. Example: {\"name\":\"android_capabilities\",\"arguments\":{}}",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -9597,7 +9602,7 @@
     "scopes": [
       "android:read"
     ],
-    "description": "Get the supported local Maestro reference or validate a YAML/saved flow without executing it. Saved subflows are owner-scoped. Example: {\"action\":\"reference\"}",
+    "description": "Read the local Maestro reference with action=reference before authoring YAML. It lists supported commands, selector fields and examples. Then use action=validate with exactly one of yaml or saved name, plus parameters when needed. Validation returns compiled commands without executing them. Saved subflows are owner-scoped. Execute validated YAML or a saved name with android_run_flow under an acquired android_session. Example: {\"action\":\"reference\"}",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
