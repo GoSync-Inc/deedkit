@@ -280,7 +280,10 @@ def run(config, source=None):
     work=Path(config['work_directory'])
     try:restored=decrypt_snapshot_stream(source,config['identity_file'],work/'bundle',max_bytes=config['max_plaintext_bytes'])
     except Exception as error:
-        code=('restore_bundle_failed' if profile=='calendar' and str(error) in CALENDAR_BUNDLE_ERRORS else
+        # verify_bundle's schema refusal runs after age authenticated the stream (incident 11-11: a helper behind
+        # the bundle's schema): a schema failure, not a decryption one.
+        code=('restore_schema_failed' if str(error)=='unsupported_backup' else
+              'restore_bundle_failed' if profile=='calendar' and str(error) in CALENDAR_BUNDLE_ERRORS else
               'restore_mismatch' if profile=='calls' and str(error) in CALLS_BUNDLE_ERRORS else 'restore_decryption_failed')
         raise RestoreStageError(code) from None
     with (restored/'manifest.json').open('rb') as manifest_file:

@@ -383,6 +383,64 @@ def test_the_halt_codes_are_the_deployers_and_each_event_survives_before_send(mo
 
 
 # spec: ANYM-807
+@pytest.mark.parametrize('error,offset,raised', [('restore_schema_failed', 1, True), ('restore_schema_failed', -1, False),
+                                                 ('restore_decryption_failed', 1, False)])
+def test_a_helper_behind_the_bundles_schema_raises_backup_receiver_behind(tmp_path, error, offset, raised):
+    # Incident 11-11: a helper at schema 67 refused every schema-84 bundle for two days.
+    cfg = config(tmp_path, side='verifier', profiles=['messaging', 'calendar'])
+    verified(tmp_path, 'calendar', NOW - timedelta(hours=3))
+    verified(tmp_path, 'messaging', NOW - timedelta(hours=3))
+    (tmp_path / 'messaging' / 'last-failure.json').write_text(json.dumps({
+        'v': 1, 'status': 'failed', 'error': error, 'failed_at': iso(NOW - timedelta(hours=1) + timedelta(hours=offset))}))
+    sent = []
+    h.check(cfg, now=NOW, run=systemctl(), send=codes_sent(sent))
+    assert ('backup_receiver_behind' in [code for _, code, _ in sent]) is raised
+
+
+# spec: ANYM-807
+@pytest.mark.parametrize('follow,raised', [(None, True), ({'status': 'current', 'age': 2}, False),
+                                           ({'status': 'switched', 'age': 25}, False), ({'status': 'waiting', 'age': 1}, False),
+                                           ({'status': 'refused', 'age': 1}, True), ({'status': 'current', 'age': 27}, True),
+                                           ({'status': 'current', 'age': -1}, True), ('not json', True)])
+def test_with_follow_on_a_missing_refused_or_stale_follow_raises_backup_receiver_behind(tmp_path, follow, raised):
+    cfg = {**config(tmp_path, side='verifier', profiles=['messaging']), 'follow': True}
+    verified(tmp_path, 'messaging', NOW - timedelta(hours=3))
+    path = tmp_path / 'messaging' / h.FOLLOW_STATUS
+    if isinstance(follow, dict):
+        path.write_text(json.dumps({'v': 1, 'status': follow['status'], 'revision': 'a' * 40,
+                                    'checked_at': (NOW - timedelta(hours=follow['age'])).isoformat()}))
+    elif follow is not None:
+        path.write_text(follow)
+    sent = []
+    h.check(cfg, now=NOW, run=systemctl(), send=codes_sent(sent))
+    assert [code for _, code, _ in sent] == (['backup_receiver_behind'] if raised else [])
+    # Without the setting the follow is not read: a missing status raises nothing.
+    if follow is None:
+        sent.clear(); (tmp_path / 'state' / 'state.json').unlink()
+        h.check({**cfg, 'follow': False}, now=NOW, run=systemctl(), send=codes_sent(sent))
+        assert sent == []
+
+
+# spec: ANYM-807
+def test_follow_is_a_backup_server_setting_and_its_code_survives_before_send(tmp_path, monkeypatch):
+    for side, value, accepted in [('verifier', True, True), ('verifier', 'yes', False), ('producer', True, False)]:
+        config(tmp_path, side=side, profiles=['messaging'])
+        path = tmp_path / f'{side}.json'
+        path.write_text(json.dumps({**json.loads(path.read_text()), 'follow': value}))
+        if accepted:
+            assert h.load_config(path)['follow'] is True
+        else:
+            with pytest.raises(h.ConfigError, match='follow'):
+                h.load_config(path)
+    assert h.RECEIVER_CODES <= telemetry.CODES and not h.RECEIVER_CODES & (h.CODES | h.DEPLOY_CODES)
+    monkeypatch.setenv('DEEDKIT_SOURCE_SHA', SHA)
+    event = h.build_event('backup_receiver_behind', {'release_sha': SHA, 'environment': 'local-synthetic'}, 1793860000.0)
+    assert telemetry.before_send(json.loads(json.dumps(event))) == event
+    assert event['fingerprint'] == ['backup-health', 'backup', 'backup_receiver_behind']
+    assert telemetry.safe_event(None, 'backup', 'backup_receiver_behind')['fingerprint'] == event['fingerprint']
+
+
+# spec: ANYM-807
 @pytest.mark.parametrize('value', ['1e309', '-1e309', '1' + '0' * 400, 'true', '"x"'])
 def test_a_corrupt_stored_time_never_silences_an_alert(tmp_path, value):
     cfg = config(tmp_path, profiles=['messaging', 'calls'])

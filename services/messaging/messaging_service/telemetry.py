@@ -14,7 +14,7 @@ import threading
 import time
 
 from . import __version__
-from .backup_health import CODES as BACKUP_HEALTH_CODES, DEPLOY_CODES
+from .backup_health import CODES as BACKUP_HEALTH_CODES, DEPLOY_CODES, RECEIVER_CODES
 from .operational import TELEMETRY_STOP_CODES as STOP_CODES
 
 COMPONENTS = {'gateway', 'telegram', 'whatsapp', 'indexer', 'enricher', 'subscriptions', 'module_router', 'backup',
@@ -33,6 +33,8 @@ CODES |= ENRICHMENT_HEALTH_CODES
 CODES |= BACKUP_HEALTH_CODES
 # The autodeploy halt codes the same checker posts on the production host (ci-deploy-speed 11-09).
 CODES |= DEPLOY_CODES
+# The backup server's receiver lag code from the same checker (incident 11-11).
+CODES |= RECEIVER_CODES
 ROOT = Path(__file__).resolve().parent
 SOURCE_FILES = frozenset(p.name for p in ROOT.glob('*.py'))
 # Repository-root paths, matching Tiden component paths.
@@ -91,7 +93,8 @@ def safe_event(error, component, code):
     if code in ENRICHMENT_HEALTH_CODES:
         event['fingerprint'] = ['enrichment-health', component, code]
     # One issue per backup profile and kind, whichever host raised it (ANYM-807).
-    if component == 'backup' and code in BACKUP_HEALTH_CODES or component == 'deploy' and code in DEPLOY_CODES:
+    if (component == 'backup' and (code in BACKUP_HEALTH_CODES or code in RECEIVER_CODES) or
+            component == 'deploy' and code in DEPLOY_CODES):
         event['fingerprint'] = ['backup-health', component, code]
     return event
 
