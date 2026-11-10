@@ -5,7 +5,6 @@ import fcntl
 import hashlib
 import json
 import os
-import re
 from pathlib import Path
 import sqlite3
 import time
@@ -44,6 +43,8 @@ class Store:
             CREATE TABLE IF NOT EXISTS operations (
                 owner TEXT, id TEXT, fingerprint TEXT, state TEXT, result TEXT,
                 PRIMARY KEY(owner, id));
+            CREATE TABLE IF NOT EXISTS operation_requests (
+                owner TEXT, id TEXT, identity TEXT, PRIMARY KEY(owner,id));
             CREATE TABLE IF NOT EXISTS files (
                 owner TEXT, id TEXT, complete INTEGER, PRIMARY KEY(owner, id));
             CREATE TABLE IF NOT EXISTS reservations (
@@ -55,6 +56,8 @@ class Store:
         # A crashed process may already have acted on the phone. Never replay it.
         self.db.execute("UPDATE operations SET state='unknown' WHERE state='running'")
         self.db.commit()
+        from .library import Library
+        self.library = Library(self)
 
     def close(self):
         self.db.close()
@@ -95,31 +98,18 @@ class Store:
         return expires
 
     def flow(self, owner, action, name, source, version):
-        if action == "list":
-            rows = self.db.execute("SELECT name,version FROM flows WHERE owner=? ORDER BY name", (owner,))
-            return {"flows": [dict(row) for row in rows]}
-        if not name or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}", name):
-            raise Refused("invalid_flow_name", 422)
-        row = self.db.execute("SELECT * FROM flows WHERE owner=? AND name=?", (owner, name)).fetchone()
-        if version and (row is None or row["version"] != version):
-            raise Refused("flow_version_conflict")
-        if action == "put":
-            if not source or len(source.encode()) > 32768:
-                raise Refused("invalid_flow_source", 422)
-            count = self.db.execute("SELECT count(*) FROM flows WHERE owner=?", (owner,)).fetchone()[0]
-            if row is None and count >= 128:
-                raise Refused("flow_storage_full", 507)
-            digest = hashlib.sha256(source.encode()).hexdigest()
-            self.db.execute("INSERT OR REPLACE INTO flows VALUES(?,?,?,?)", (owner, name, digest, source))
-            self.db.commit()
-            return {"name": name, "version": digest}
-        if action == "delete":
-            self.db.execute("DELETE FROM flows WHERE owner=? AND name=?", (owner, name))
-            self.db.commit()
-            return {"name": name, "deleted": True}
+        if action == 'list':
+            rows = self.db.execute('SELECT name,version FROM flows WHERE owner=? ORDER BY name', (owner,))
+            return {'flows': [dict(row) for row in rows]}
+        return self.library.manage(owner, action=action, name=name, source=source, version=version)
+
+    def replay(self, owner, request_id, identity):
+        row = self.db.execute('SELECT identity FROM operation_requests WHERE owner=? AND id=?', (owner, request_id)).fetchone()
         if row is None:
-            raise Refused("flow_not_found", 404)
-        return {"name": name, "version": row["version"], "yaml": row["source"]}
+            return None
+        if row['identity'] != hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest():
+            raise Refused('request_id_conflict')
+        return self.operation(owner, request_id)
 
     def operation(self, owner, request_id):
         row = self.db.execute("SELECT * FROM operations WHERE owner=? AND id=?", (owner, request_id)).fetchone()
@@ -127,20 +117,26 @@ class Store:
             raise Refused("not_found", 404)
         return {"request_id": request_id, "state": row["state"], **json.loads(row["result"] or "{}")}
 
-    def admit(self, owner, request_id, payload):
+    def admit(self, owner, request_id, payload, identity=None, metadata=None):
         fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         row = self.db.execute("SELECT * FROM operations WHERE owner=? AND id=?", (owner, request_id)).fetchone()
         if row:
             if row["fingerprint"] != fingerprint:
                 raise Refused("request_id_conflict")
             return False
-        self.db.execute("INSERT INTO operations VALUES(?,?,?,'running','{}')", (owner, request_id, fingerprint))
-        self.db.commit()
+        with self.db:
+            self.db.execute("INSERT INTO operations VALUES(?,?,?,'running',?)",
+                            (owner, request_id, fingerprint, json.dumps(metadata or {})))
+            if identity is not None:
+                self.db.execute('INSERT INTO operation_requests VALUES(?,?,?)',
+                                (owner, request_id, hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()))
         return True
 
     def finish(self, owner, request_id, state, result):
+        previous = self.operation(owner, request_id)
+        metadata = {'library': previous['library']} if 'library' in previous else {}
         self.db.execute("UPDATE operations SET state=?, result=? WHERE owner=? AND id=?",
-                        (state, json.dumps(result), owner, request_id))
+                        (state, json.dumps({**metadata, **result}), owner, request_id))
         self.db.commit()
 
     def path(self, owner, file_id):

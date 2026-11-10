@@ -11,11 +11,12 @@ from fastapi.responses import JSONResponse
 from pydantic import AliasChoices, Field, ValidationError
 from typing import Literal
 
+from .app_maps import compile_scenario, load, validate_map
 from .config import Configuration, Refused, Strict
 from .device import COMMANDS, Devices
 from .flows import BARE, FIELDS, compile_flow, reference
 from .store import Store, identifier
-from .uiautomator import UI_FIELDS, reference as ui_reference, validate_commands
+from .uiautomator import reference as ui_reference
 
 
 class Device(Strict):
@@ -49,15 +50,23 @@ class RunFlow(Device):
     yaml: str | None = Field(default=None, max_length=32768)
     name: str | None = None
     version: str | None = None
-    parameters: dict[str, str] = Field(default_factory=dict)
+    parameters: dict[str, str | int | bool] = Field(default_factory=dict)
     timeout_s: int = Field(default=120, ge=1, le=600)
     wait_s: int = Field(default=15, ge=0, le=25)
     element_timeout_ms: int = Field(default=5000, ge=100, le=60000)
     optional_timeout_ms: int = Field(default=1000, ge=100, le=60000)
+    stage: Literal["published", "draft"] = "published"
 
 
 class Flows(Strict):
-    action: str = Field(pattern="^(list|get|put|delete)$")
+    action: str = Field(pattern="^(list|get|put|delete|draft|publish|rollback|history)$")
+    kind: Literal["flow", "map"] = "flow"
+    stage: Literal["published", "draft"] = "published"
+    base_version: str | None = None
+    test_request_id: str | None = None
+    message: str = Field(default="", max_length=1024)
+    limit: int = Field(default=50, ge=1, le=100)
+    before: int | None = Field(default=None, ge=1)
     name: str | None = None
     yaml: str | None = Field(default=None, max_length=32768)
     version: str | None = None
@@ -65,10 +74,11 @@ class Flows(Strict):
 
 class MaestroInfo(Strict):
     action: Literal["reference", "validate"] = "reference"
+    stage: Literal["published", "draft"] = "published"
     yaml: str | None = Field(default=None, max_length=32768)
     name: str | None = None
     version: str | None = None
-    parameters: dict[str, str] = Field(default_factory=dict)
+    parameters: dict[str, str | int | bool] = Field(default_factory=dict)
 
 
 class Receipt(Strict):
@@ -151,11 +161,11 @@ def create_app(config_path):
         if device is not None and device not in principal.devices:
             raise Refused("not_found", 404)
         owner = principal.id
-        def compile_source(source, parameters):
-            commands = compile_flow(source, parameters, fields=UI_FIELDS if devices.ui else None,
-                resolve=lambda name, version: store.flow(owner, "get", name, None, version)["yaml"])
+        def compile_source(source, parameters, validate_only=False):
             if devices.ui:
-                validate_commands(commands)
+                return compile_scenario(store.library, owner, source, parameters, validate_only=validate_only)[0]
+            commands = compile_flow(source, parameters, fields=None,
+                resolve=lambda name, version: store.flow(owner, "get", name, None, version)["yaml"])
             return commands
         if operation == "capabilities":
             result = {"service": "deedkit-android", "permissions": principal.permissions,
@@ -188,27 +198,52 @@ def create_app(config_path):
                 if (args["yaml"] is None) == (args["name"] is None):
                     raise Refused("provide_yaml_or_flow_name", 422)
                 source = args["yaml"]
-                if source is None:
+                if source is None and not devices.ui:
                     source = store.flow(owner, "get", args["name"], None, args["version"])["yaml"]
-                commands = compile_source(source, args["parameters"])
-                result = {"valid": True, "dialect_version": 3 if devices.ui else 2, "commands": commands}
+                if devices.ui:
+                    commands, metadata = compile_scenario(store.library, owner, source, args['parameters'],
+                        stage=args['stage'], root={'name': args['name'], 'version': args['version']} if args['name'] else None)
+                else:
+                    commands, metadata = compile_source(source, args['parameters']), {}
+                result = {"valid": True, "dialect_version": 4 if devices.ui else 2, "commands": commands, 'library': metadata}
         elif operation == "run_flow":
             if (args["yaml"] is None) == (args["name"] is None):
                 raise Refused("provide_yaml_or_flow_name", 422)
+            request_id = identifier(args['request_id'])
+            identity = {key: value for key, value in args.items() if key not in {'request_id', 'session_id', 'wait_s'}}
+            previous = store.replay(owner, request_id, identity)
+            if previous is not None:
+                return JSONResponse(previous, headers={"Cache-Control": "no-store"})
             source = args["yaml"]
-            if source is None:
-                source = store.flow(owner, "get", args["name"], None, args["version"])["yaml"]
-            commands = compile_source(source, args["parameters"])
-            result = await devices.execute(owner, device, args["session_id"], identifier(args["request_id"]),
+            if devices.ui:
+                commands, metadata = compile_scenario(store.library, owner, source, args['parameters'],
+                    stage=args['stage'], root={'name': args['name'], 'version': args['version']} if args['name'] else None)
+            else:
+                if source is None:
+                    source = store.flow(owner, 'get', args['name'], None, args['version'])['yaml']
+                commands, metadata = compile_source(source, args['parameters']), {}
+            result = await devices.execute(owner, device, args["session_id"], request_id,
                                            None, args["timeout_s"], args["wait_s"], flow=commands,
                                            element_timeout_ms=args['element_timeout_ms'],
-                                           optional_timeout_ms=args['optional_timeout_ms'])
+                                           optional_timeout_ms=args['optional_timeout_ms'],
+                                           identity=identity, metadata={'library': metadata})
         elif operation == "flows":
-            if args["action"] == "put":
-                if not args["yaml"]:
-                    raise Refused("invalid_flow_source", 422)
-                compile_source(args["yaml"], defaultdict(lambda: "placeholder"))
-            result = store.flow(owner, args["action"], args["name"], args["yaml"], args["version"])
+            if args['action'] in {'put', 'draft'}:
+                if args['kind'] == 'map':
+                    if args['action'] == 'put':
+                        raise Refused('map_requires_draft', 422)
+                    validate_map(args['yaml'])
+                elif args['action'] == 'put':
+                    if not isinstance(load(args['yaml']), list):
+                        raise Refused('scenario_requires_draft', 422)
+                    compile_source(args['yaml'], defaultdict(lambda: 'placeholder'), validate_only=True)
+                else:
+                    compile_scenario(store.library, owner, args['yaml'], {}, stage='draft', validate_only=True)
+            if args['kind'] == 'flow' and args['action'] in {'put', 'delete'}:
+                result = store.flow(owner, args['action'], args['name'], args['yaml'], args['version'])
+            else:
+                options = {key: value for key, value in args.items() if key != 'yaml'}
+                result = store.library.manage(owner, source=args['yaml'], **options)
         elif operation == "get_operation":
             result = await devices.receipt(owner, identifier(args["request_id"]), args["wait_s"])
         elif operation == "upload":

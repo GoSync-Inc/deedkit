@@ -133,10 +133,11 @@ def validate_commands(commands):
 
 
 def reference():
-    return {'engine': 'uiautomator2', 'dialect_version': 3,
+    from .app_maps import reference as map_reference
+    return {'engine': 'uiautomator2', 'dialect_version': 4, 'library': map_reference(),
             'commands': {name: sorted(UI_FIELDS.get(name, set())) for name in sorted(SUPPORTED)},
             'selector_fields': sorted(SELECTORS),
-            'format': 'YAML command list, without appId/--- headers. All steps run on the USB host in one batch.',
+            'format': 'YAML command list or structured scenario with map, params, side_effects and steps. All steps run on the USB host in one batch.',
             'selectors': 'text and id are Android regular expressions; textExact and resourceId are exact. Combine fields with AND.',
             'examples': {'search': '- tapOn: Search\n- inputText: ${QUERY}\n- pressKey: Enter',
                          'set_text': '- setText: {resourceId: "example:id/search", value: "${QUERY}"}',
@@ -185,6 +186,8 @@ class UiRunner(FlowRunner):
                 raise Refused('element_not_found')
         except Refused as error:
             step['error'] = error.code
+            if hasattr(error, 'details'):
+                step['details'] = error.details
             raise
         finally:
             step['elapsed_ms'] = round((time.monotonic() - started) * 1000, 2)
@@ -257,10 +260,13 @@ class Uiautomator:
                     raise Refused('uiautomator_disconnected', 503)
                 result = json.loads(response)
                 if 'error' in result:
-                    raise Refused(result['error'], 409)
+                    error = Refused(result['error'], 409)
+                    if 'details' in result:
+                        error.details = result['details']
+                    raise error
                 return result
             except Refused as error:
-                if error.code not in {'element_not_found', 'unsupported_uiautomator_command', 'invalid_point'}:
+                if error.code not in {'element_not_found', 'screen_not_found', 'ambiguous_selector', 'invalid_element_bounds', 'unsupported_uiautomator_command', 'invalid_point'}:
                     await self.close(device)
                 raise
             except BaseException:

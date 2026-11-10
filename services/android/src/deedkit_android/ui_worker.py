@@ -120,6 +120,11 @@ def shell(device, args):
 
 
 def execute(device, command, element_timeout_ms=5000, optional_timeout_ms=1000):
+    from .app_maps import MAP_ACTIONS
+    from .map_runtime import execute_map
+    if isinstance(command, dict) and next(iter(command)) in MAP_ACTIONS:
+        name, options = next(iter(command.items()))
+        return execute_map(device, name, options, execute)
     name, value = next(iter(command.items())) if isinstance(command, dict) else (command, None)
     options = value if isinstance(value, dict) else {}
     timeout = options.get('timeout', optional_timeout_ms if options.get('optional') else element_timeout_ms)
@@ -247,7 +252,7 @@ def main():
                 else:
                     result = execute(device, **args)
             except Refused as error:
-                result = {'error': error.code}
+                result = {'error': error.code, **({'details': error.details} if hasattr(error, 'details') else {})}
             except UiObjectNotFoundError:
                 result = {'error': 'element_not_found'}
             except Exception:
