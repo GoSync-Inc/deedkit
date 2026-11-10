@@ -120,15 +120,21 @@ A native equivalent is `python -m messaging_service.subscription_worker` with
 operator diagnostics. This worker needs no public port. The optional overlay
 limits memory to 256 MiB and has a read-only filesystem and internal DB network.
 
-Operator bounds are `SUBSCRIPTION_MAX_DEFINITIONS` (default 64 per key, including
-closed definitions and tombstones younger than 30 days; 1–1000) and `SUBSCRIPTION_MAX_MATCHES` (default 10,000 references
+Operator bounds are `SUBSCRIPTION_MAX_DEFINITIONS` (default 100 active definitions per key;
+1–1000) and `SUBSCRIPTION_MAX_MATCHES` (default 10,000 references
 per subscription; 1–1,000,000). Set the match bound on the worker and the definition
 bound on the API. Raising a match budget resumes retained events without provider
 polling. Old ACKed references are pruned (see [Event retention](#event-retention));
 a passive-only subscription at its match bound stops with `match_budget` and needs
 the operator. Outbox rows are not deleted.
-Listing has no continuation cursor yet; keep the default definition
-bound within one 100-item page or manage known IDs individually.
+Only `active` definitions with no expiry or an expiry in the future occupy capacity.
+Pausing or closing a definition frees its slot immediately; `expired`, `access_changed`
+and tombstoned definitions occupy no slot. An elapsed expiry frees capacity even before
+the matcher or a read persists the `expired` state. Creation and resume check the same
+per-key budget under one transaction lock. A resume at capacity returns `subscription_limit`
+(HTTP 429), keeping its paused state, version and checkpoint for a later retry.
+Listing includes retained history and has no continuation cursor yet; a page contains at
+most 100 definitions, so manage older known IDs individually when `has_more` is true.
 
 Schema-26 backups include definitions, source sets and matched references.
 Quarantine restore closes definitions and advances versions, revokes credentials
@@ -1247,8 +1253,8 @@ is idle; a read of deleted data says when it was deleted instead of `not_found`.
   `recreate_required` and `scope_masked` instead of the floor and counts).
   `get_subscription_events` below the floor returns `retention_gap` up to it (an
   `access_changed` tombstone keeps its scope-masked empty page); fetch, ACK and wait keep
-  answering `subscription_closed`. A tombstone more than 30 days old no
-  longer counts toward `SUBSCRIPTION_MAX_DEFINITIONS`.
+  answering `subscription_closed`. Terminal definitions and their tombstones never count
+  toward `SUBSCRIPTION_MAX_DEFINITIONS`; the active slot was freed when the definition ended.
 - **Held definitions:** a quarantine-restored definition (`retention_hold`) is skipped by
   both paths until the operator's release; its 30 days count from the release.
 - **Mechanics:** the subscription worker runs one pass a minute (at once again while a

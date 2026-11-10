@@ -517,6 +517,19 @@ def _visible_exclusions(c, p, pairs):
         raise APIError('not_found', 404)
 
 
+def _check_capacity(c, p):
+    """Creation and resume share a key's active-only admission lock; retained history occupies no slot."""
+    from .store import APIError
+    c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',
+        ('subscriptions:' + str(p['key_id']),))
+    maximum = _bound_setting('SUBSCRIPTION_MAX_DEFINITIONS', 100, 1, 1000)
+    count = c.execute('''SELECT count(*) AS n FROM subscriptions WHERE principal=%s AND key_id=%s
+        AND state='active' AND (expires_at IS NULL OR expires_at>clock_timestamp())''',
+        (p['id'], p['key_id'])).fetchone()['n']
+    if count >= maximum:
+        raise APIError('subscription_limit', 429)
+
+
 def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=None, kinds=None,
         direction='incoming', origins=None, label='', expires_at=None, wake_rules=None, reply_to_send=None,
         delivery=None):
@@ -579,16 +592,7 @@ def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=
             if len(accounts) != 1:
                 raise APIError('ambiguous_reference', 409)
             sender_accounts[sender] = next(iter(accounts))
-    c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',
-        ('subscriptions:' + str(p['key_id']),))
-    maximum = _bound_setting('SUBSCRIPTION_MAX_DEFINITIONS', 64, 1, 1000)
-    # ANYM-447: a tombstone older than 30 days no longer counts (schema 62; an older database has none).
-    aged = tombstones_ready(c)
-    count = c.execute('SELECT count(*) AS n FROM subscriptions WHERE principal=%s AND key_id=%s' + (
-        ' AND (tombstoned_at IS NULL OR tombstoned_at>=clock_timestamp()-make_interval(days=>%s))' if aged else ''),
-        (p['id'], p['key_id'], *((CLOSED_RETENTION_DAYS,) if aged else ()))).fetchone()['n']
-    if count >= maximum:
-        raise APIError('subscription_limit', 429)
+    _check_capacity(c, p)
     # The counter is serialized by event publishers. An MVCC read sees only a
     # committed frontier and cannot skip an uncommitted event transaction.
     head = c.execute('SELECT value FROM feed_counter WHERE id=1').fetchone()['value']
@@ -694,6 +698,8 @@ def update_subscription(store, c, p, subscription_id, version, *, action, resume
         return _set_exclusions(c, p, row, pairs, exclusions_revision)
     if row['state'] in ('closed', 'expired'):
         raise APIError('subscription_closed', 409)
+    if action == 'resume' and row['state'] == 'paused':
+        _check_capacity(c, p)
     from . import module_events
     module = module_events.stream(c, row['id'], lock=True)
     if action == 'resume' and row['state'] == 'active' and module and module['rollback_hold']:
