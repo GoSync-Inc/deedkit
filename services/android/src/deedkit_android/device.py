@@ -264,7 +264,7 @@ class Devices:
         return [*self.adb(device), *argv], output
 
     async def execute(self, owner, device, session, request_id, argv, timeout, wait, flow=None,
-                      element_timeout_ms=5000, optional_timeout_ms=1000):
+                      element_timeout_ms=5000, optional_timeout_ms=1000, identity=None, metadata=None):
         # A known request is read before reservation checks: its receipt survives lease expiry.
         payload = {"device_id": device, "timeout_s": timeout}
         payload["flow" if flow is not None else "argv"] = flow if flow is not None else argv
@@ -293,7 +293,7 @@ class Devices:
                 command, output = self.prepare(owner, device, argv, Path(temporary.name))
             elif not self.config.maestro and not self.ui:
                 raise Refused("maestro_not_configured", 503)
-            self.store.admit(owner, request_id, payload)
+            self.store.admit(owner, request_id, payload, identity=identity, metadata=metadata)
         except BaseException:
             if temporary is not None:
                 temporary.cleanup()
@@ -356,6 +356,12 @@ class Devices:
         result.update(hierarchy)
         return result
 
+    def remaining(self, commands):
+        if self.ui:
+            from .app_maps import continuation
+            return continuation(commands)
+        return commands
+
     async def perform_flow(self, owner, device, request_id, commands, timeout, temporary, lock,
                            element_timeout_ms=5000, optional_timeout_ms=1000):
         state, result = "unknown", {}
@@ -375,16 +381,18 @@ class Devices:
             if checkpoint < len(commands):
                 state = "paused"
                 result.update({"checkpoint": commands[checkpoint]["checkpoint"],
-                               "remaining_yaml": yaml.safe_dump(commands[checkpoint + 1:], allow_unicode=True),
+                               "remaining_yaml": yaml.safe_dump(self.remaining(commands[checkpoint + 1:]), allow_unicode=True),
                                "next_action": "observe_then_resolve_checkpoint_and_submit_remaining_yaml"})
         except Refused as error:
             result = {"error": error.code, "next_action": "inspect_device_before_any_new_request"}
-            if error.code == 'element_not_found':
+            if error.code in {'element_not_found', 'screen_not_found', 'ambiguous_selector', 'invalid_element_bounds'}:
                 state = 'failed'
                 result['next_action'] = 'inspect_failure_observation_and_correct_flow'
             if hasattr(error, 'command_path'):
                 result.update(failed_command_index=error.command_path[0],
                               failed_command_path=error.command_path, failed_command=error.command)
+            if getattr(error, "details", None):
+                result["details"] = error.details
             if getattr(error, "diagnostic", None):
                 result["diagnostic"] = error.diagnostic
         except TimeoutError:
@@ -405,6 +413,8 @@ class Devices:
                     if not cancelled:
                         result['observation'] = await self.failure_observation(owner, device)
                 if self.ui:
+                    result["data"] = {step["result"]["list"]: step["result"]["rows"] for step in runner.steps
+                                      if "result" in step and "rows" in step["result"]}
                     result.update(engine='uiautomator2', steps=runner.steps,
                                   elapsed_ms=round((time.monotonic() - started) * 1000, 2))
                 self.store.finish(owner, request_id, state, result)

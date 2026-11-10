@@ -8,8 +8,9 @@ existing server and exposes the `android` module through `/mcp/modules/android`.
 Grok → DeedKit MCP gateway → private HTTP → USB host → ADB → Android apps
 ```
 
-The client agent chooses each action. An optional persistent Maestro process on
-the USB host executes selector-based actions and reusable workflows.
+The client agent chooses each action. A persistent uiautomator2 worker on the USB
+host executes selector-based actions and reusable workflows. Existing installations
+may retain the legacy Maestro engine.
 
 ## Tools
 
@@ -344,3 +345,49 @@ unreachable, so later operations must complete cleanup first. It never kills a
 generic `app_process` or adopts another server. Rollback to an older service must
 finish this cleanup while the new service still understands those markers.
 No model API or analytics service receives device content from the runtime.
+
+
+### Application maps and scenario versions
+
+`android_flows` also stores maps with `kind=map`. Both maps and structured
+scenarios use immutable SQLite versions and separate draft/published heads.
+`action=list` includes the draft version. `get` accepts `stage=draft` or a
+historical `version`, including after deletion. `history` pages audit events.
+
+A map contains `package`, named selector candidate lists, screen signatures,
+optional `deep_links`, `popups`, `lists` and `meta`. A scenario contains `map`,
+optional `map_version`, `params`, advisory `side_effects`, and `steps`.
+The full schema and worked authoring sequence are returned by
+`android_maestro(action=reference).library`.
+
+```yaml
+map: shop
+side_effects: none
+steps:
+  - openApp: {cold: false}
+  - tapElement: {selector: orders, expect_screen: orders}
+```
+
+Save with `action=draft` and `base_version` equal to the current draft version,
+or published version when no draft exists. First creation uses null.
+Run with `stage=draft`, the draft flow's `version` and a fresh request UUID.
+Only terminal `succeeded` is publication evidence. Publish the map, then the flow,
+using `action=publish`, the tested `version`, `test_request_id`, and the expected
+published `base_version`. Changed floating dependencies require another test.
+A normal run supplies the published `name` and a new request UUID. Each receipt
+records its complete `library.pins`; a repeated request retrieves the same receipt.
+`rollback` switches to a previously published revision with the current
+published `base_version`.
+
+Generic actions are `openApp`, `openDeepLink`, `tapElement`, `typeInto`,
+`waitScreen`, `assertScreen`, `inspectMap`, `dismissPopups`, and `readList`.
+Selectors are tried in order and an ambiguous candidate stops before an action.
+Explicit `index` selects one match. Coordinate fallback requires a resulting
+screen check. Screen signatures share one hierarchy snapshot per poll.
+List fields are extracted locally from each snapshot, with password text masked.
+Every visible row is retained. An optional list `key` names fields identifying
+the same item across pages and enables deduplication during scrolling.
+Checkpoint `remaining_yaml` retains explicit historical map versions and can be
+submitted under a new request UUID after the checkpoint is resolved.
+Application-specific navigation stays in scenario data. Existing command lists,
+raw ADB, sessions, receipt polling and screenshot downloads retain their entry points.

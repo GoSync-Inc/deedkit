@@ -9352,7 +9352,7 @@
       "android:control"
     ],
     "required_manifest": true,
-    "description": "Acquire android_session first and validate with android_maestro. Provide exactly one of yaml or saved name. List saved names and versions with android_flows. Run inline device-only YAML on the configured engine or a saved flow name with optional pinned version and literal parameters. Supports text/id selectors, Unicode input, waits, gestures and nested inline flows. Use ${NAME} for literal parameters. No host scripts, JavaScript or external flow paths. One request_id never replays actions. A top-level checkpoint returns paused and remaining_yaml for the agent to observe and continue deliberately. Poll android_get_operation after running or unknown responses. Missing elements wait 5s by default (optional: 1s); set element_timeout_ms/optional_timeout_ms or selector.timeout/when.timeout to override. These bound lookups; timeout_s bounds the full batch including startup. On uiautomator2, steps lists each executed command’s path, elapsed_ms and result, and elapsed_ms gives the batch total. Execute several steps in one call to avoid MCP round trips. On terminal failure, observation contains an owner-scoped image_file.file_id and compact elements; android_download retrieves the PNG. failed_command_index is zero-based; failed_command_path includes nested indexes. Earlier steps may have acted: inspect before resuming, never replay the whole flow automatically. If backend_unavailable explicitly says operation_sent=false, wait retry_after_seconds then retry with the same request_id.",
+    "description": "Use an acquired android_session. Provide exactly one of yaml or saved name. A known published scenario runs directly by name; validate new or edited YAML with android_maestro while authoring. List saved names and versions with android_flows. Run inline device-only YAML on the configured engine or a saved flow name with optional pinned version and literal parameters. Supports text/id selectors, Unicode input, waits, gestures and nested inline flows. Use ${NAME} for literal parameters. No host scripts, JavaScript or external flow paths. One request_id never replays actions. A top-level checkpoint returns paused and remaining_yaml for the agent to observe and continue deliberately. Poll android_get_operation after running or unknown responses. Missing elements wait 5s by default (optional: 1s); set element_timeout_ms/optional_timeout_ms or selector.timeout/when.timeout to override. These bound lookups; timeout_s bounds the full batch including startup. On uiautomator2, steps lists each executed command’s path, elapsed_ms and result, and elapsed_ms gives the batch total. Execute several steps in one call to avoid MCP round trips. On terminal failure, observation contains an owner-scoped image_file.file_id and compact elements; android_download retrieves the PNG. failed_command_index is zero-based; failed_command_path includes nested indexes. Earlier steps may have acted: inspect before resuming, never replay the whole flow automatically. If backend_unavailable explicitly says operation_sent=false, wait retry_after_seconds then retry with the same request_id. Structured scenarios use map plus steps and the generic actions in android_maestro(action=reference).library. A known published scenario needs only name and a fresh request_id under the session. stage=draft tests candidate flows/maps with published fallback; version pins a particular root revision. Every receipt includes library.pins and advisory side_effects. The whole dependency set is fixed before execution. A repeated request_id returns its original receipt even after publication. New maps and scenarios are authored through android_flows drafts. readList results appear in data and the step result. Validation is useful when authoring, not required before every normal run.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -9407,7 +9407,17 @@
         },
         "parameters": {
           "additionalProperties": {
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "boolean"
+              }
+            ]
           },
           "title": "Parameters",
           "type": "object"
@@ -9427,18 +9437,27 @@
           "type": "integer"
         },
         "element_timeout_ms": {
-          "type": "integer",
           "default": 5000,
-          "minimum": 100,
           "maximum": 60000,
-          "title": "Element Timeout Ms"
+          "minimum": 100,
+          "title": "Element Timeout Ms",
+          "type": "integer"
         },
         "optional_timeout_ms": {
-          "type": "integer",
           "default": 1000,
-          "minimum": 100,
           "maximum": 60000,
-          "title": "Optional Timeout Ms"
+          "minimum": 100,
+          "title": "Optional Timeout Ms",
+          "type": "integer"
+        },
+        "stage": {
+          "default": "published",
+          "enum": [
+            "published",
+            "draft"
+          ],
+          "title": "Stage",
+          "type": "string"
         }
       },
       "required": [
@@ -9462,14 +9481,82 @@
       "android:control"
     ],
     "required_manifest": true,
-    "description": "List, get, put or delete owner-scoped reusable device workflow YAML on the USB host. Use version for optimistic update/delete or pinned reads. Saving a flow does not execute it. See android_capabilities for supported commands and schemas. Begin with action=list, then action=get with a returned name. For action=put provide name and yaml; save the returned version for pinned android_run_flow calls. Validate source with android_maestro.",
+    "description": "Maintain owner-scoped reusable flows and app maps on the USB host. action=list discovers names, published version and draft_version; kind defaults to flow, use kind=map for maps. action=get returns YAML, optionally at a historical version or stage=draft. Existing command lists support put/delete; structured scenarios and maps use draft -> test -> publish. Draft needs name, yaml and base_version equal to the current draft or published version (null for first creation). Run the draft with android_run_flow(stage=draft); publish needs its version, successful test_request_id and expected published base_version. Publish the tested map before its tested scenario. Failed/paused tests and changed floating dependencies cannot publish. history provides paged audit events; rollback takes a previously published version and current base_version. Versions remain readable after deletion. Saving never drives the phone. android_maestro(action=reference).library gives complete examples, map fields and repair steps.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "action": {
-          "pattern": "^(list|get|put|delete)$",
+          "pattern": "^(list|get|put|delete|draft|publish|rollback|history)$",
           "title": "Action",
           "type": "string"
+        },
+        "kind": {
+          "default": "flow",
+          "enum": [
+            "flow",
+            "map"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "stage": {
+          "default": "published",
+          "enum": [
+            "published",
+            "draft"
+          ],
+          "title": "Stage",
+          "type": "string"
+        },
+        "base_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Base Version"
+        },
+        "test_request_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Test Request Id"
+        },
+        "message": {
+          "default": "",
+          "maxLength": 1024,
+          "title": "Message",
+          "type": "string"
+        },
+        "limit": {
+          "default": 50,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "before": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Before"
         },
         "name": {
           "anyOf": [
@@ -9616,7 +9703,7 @@
     "scopes": [
       "android:read"
     ],
-    "description": "Read the active Android workflow engine reference with action=reference. The compatibility name android_maestro also serves uiautomator2. It lists supported commands, selector fields and examples. Then use action=validate with exactly one of yaml or saved name, plus parameters when needed. Validation returns compiled commands without executing them. Saved subflows are owner-scoped. Execute validated YAML or a saved name with android_run_flow under an acquired android_session. Example: {\"action\":\"reference\"} YAML is a command list without appId/--- headers. A checkpoint is a scalar: - checkpoint: verify. Reference includes saved-subflow and targeted permission-dialog examples.",
+    "description": "Read the active Android workflow engine reference with action=reference. The compatibility name android_maestro also serves uiautomator2. It lists supported commands, selector fields and examples. Then use action=validate with exactly one of yaml or saved name, plus parameters when needed. Validation returns compiled commands without executing them. Saved subflows are owner-scoped. Execute validated YAML or a saved name with android_run_flow under an acquired android_session. Example: {\"action\":\"reference\"} YAML is a command list without appId/--- headers. A checkpoint is a scalar: - checkpoint: verify. Reference includes saved-subflow and targeted permission-dialog examples. The reference.library section documents app maps, generic actions, typed parameters and the complete draft/test/publish/repair path. Structured scenarios use map and steps; stage=draft validates candidate dependencies. A normal published scenario can run directly by name without repeating validation or discovery.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -9627,6 +9714,15 @@
             "validate"
           ],
           "title": "Action",
+          "type": "string"
+        },
+        "stage": {
+          "default": "published",
+          "enum": [
+            "published",
+            "draft"
+          ],
+          "title": "Stage",
           "type": "string"
         },
         "yaml": {
@@ -9668,7 +9764,17 @@
         },
         "parameters": {
           "additionalProperties": {
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "boolean"
+              }
+            ]
           },
           "title": "Parameters",
           "type": "object"
