@@ -207,6 +207,8 @@ class Clients:
                     failed = response.status_code >= 500 or response.status_code in (301, 302, 303, 307, 308)
                     body = bytearray()
                     maximum = 65536 if failed else 8 * 1024 * 1024
+                    if not failed and module == "android" and operation == "observe":
+                        maximum = 24 * 1024 * 1024  # bounded PNG base64 plus UI hierarchy
                     async for chunk in response.aiter_bytes(65536):
                         if len(body) + len(chunk) > maximum:
                             if failed:

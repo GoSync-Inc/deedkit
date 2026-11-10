@@ -28,7 +28,8 @@ elif args[2:4] == ['shell','slow']:
 elif args[2:4] == ['shell','echo']:
  print(' '.join(args[4:]))
 elif args[2:4] == ['exec-out','screencap']:
- sys.stdout.buffer.write(b'\\x89PNG\\r\\n\\x1a\\nsynthetic')
+ image=os.path.join(os.path.dirname(__file__),'screenshot.png')
+ sys.stdout.buffer.write(open(image,'rb').read() if os.path.exists(image) else b'\\x89PNG\\r\\n\\x1a\\nsynthetic')
 elif args[2:4] == ['exec-out','cat']:
  sys.stdout.buffer.write(b'\\x00\\xffsynthetic file')
 elif args[2] == 'shell' and 'uiautomator' in args[3]:
@@ -208,3 +209,11 @@ def test_hierarchy_timeout_still_returns_screenshot(service, monkeypatch):
     result = post(service, 'observe', {'device_id': 'home', 'session_id': token}).json()
     assert result['hierarchy_error'] == 'capture_failed'
     assert base64.b64decode(result['image']['data']).startswith(b'\x89PNG')
+
+
+def test_high_resolution_phone_screenshot_exceeds_command_output_limit(service):
+    # Regression: the real 1220x2712 home-screen PNG exceeded the command's 4 MiB limit.
+    image = b'\x89PNG\r\n\x1a\n' + b'x' * (5 * 1024 * 1024)
+    (service[1] / 'screenshot.png').write_bytes(image)
+    result = post(service, 'observe', {'device_id': 'home', 'session_id': session(service)}).json()
+    assert base64.b64decode(result['image']['data']) == image

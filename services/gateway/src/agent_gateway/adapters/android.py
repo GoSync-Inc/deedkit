@@ -9,6 +9,9 @@ from mcp.types import ImageContent, TextContent
 
 from ..policy import Denied
 
+IMAGE_LIMIT = 16 * 1024 * 1024
+ENCODED_LIMIT = ((IMAGE_LIMIT + 2) // 3) * 4
+
 
 def content(name, result):
     if name != "android_observe" or "image" not in result:
@@ -18,10 +21,10 @@ def content(name, result):
         if not isinstance(picture, dict) or picture.get("mime_type") != "image/png":
             raise ValueError
         encoded = picture["data"]
-        if not isinstance(encoded, str) or len(encoded) > 6 * 1024 * 1024:
+        if not isinstance(encoded, str) or len(encoded) > ENCODED_LIMIT:
             raise ValueError
         data = base64.b64decode(encoded, validate=True)
-        if not data.startswith(b"\x89PNG\r\n\x1a\n") or len(data) > 4 * 1024 * 1024:
+        if not data.startswith(b"\x89PNG\r\n\x1a\n") or len(data) > IMAGE_LIMIT:
             raise ValueError
     except (KeyError, ValueError, binascii.Error):
         raise Denied("invalid_android_image", 502) from None

@@ -16,6 +16,7 @@ from .config import Refused
 from .store import MAX_FILE
 
 OUTPUT_LIMIT = 4 * 1024 * 1024
+SCREENSHOT_LIMIT = 16 * 1024 * 1024
 COMMANDS = frozenset({
     "shell", "exec-out", "reboot", "logcat", "get-state", "get-devpath", "wait-for-device",
     "root", "unroot", "remount", "disable-verity", "enable-verity", "reconnect", "jdwp",
@@ -36,13 +37,14 @@ async def stop_process(process):
         await process.wait()
 
 
-async def run_process(argv, timeout, output_file=None):
+async def run_process(argv, timeout, output_file=None, stdout_limit=OUTPUT_LIMIT):
     async def read(stream, sink=None):
         result = bytearray()
         size = 0
         while chunk := await stream.read(65536):
             size += len(chunk)
-            if size > (MAX_FILE if sink else OUTPUT_LIMIT):
+            limit = MAX_FILE if sink else stdout_limit if stream is process.stdout else OUTPUT_LIMIT
+            if size > limit:
                 raise Refused("output_limit_reached")
             if sink:
                 sink.write(chunk)
@@ -131,7 +133,8 @@ class Devices:
                     result["hierarchy_diagnostic"] = stderr.decode(errors="replace")[:1000]
             if screenshot:
                 try:
-                    code, data, _ = await run_process([*self.adb(device), "exec-out", "screencap", "-p"], 10)
+                    code, data, _ = await run_process([*self.adb(device), "exec-out", "screencap", "-p"],
+                                                      10, stdout_limit=SCREENSHOT_LIMIT)
                 except (TimeoutError, OSError, Refused):
                     code, data = -1, b""
                 if code == 0 and data.startswith(b"\x89PNG\r\n\x1a\n"):

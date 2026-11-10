@@ -122,3 +122,13 @@ def test_invalid_android_image_is_refused(tmp_path, image):
             'device_id': 'home', 'session_id': 'session'}}).json()['result']
         assert result['isError']
         assert result['structuredContent']['error'] == 'invalid_android_image'
+
+
+def test_high_resolution_android_image_is_returned_as_native_content(tmp_path):
+    image = PNG + b'x' * (10 * 1024 * 1024)
+    app, _ = setup(tmp_path, image={'mime_type': 'image/png', 'data': base64.b64encode(image).decode()})
+    with TestClient(app) as client:
+        result = rpc(client, 'tools/call', {'name': 'android_observe', 'arguments': {
+            'device_id': 'home', 'session_id': 'session'}}).json()['result']
+        assert not result.get('isError'), result.get('structuredContent')
+        assert base64.b64decode(result['content'][1]['data']) == image

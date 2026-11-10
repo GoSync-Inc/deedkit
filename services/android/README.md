@@ -131,6 +131,7 @@ Commands have a 1–600 second timeout and can be polled with a 0–25 second wa
 File chunks hold up to 32 KiB, files up to 256 MiB and stored files up to 512 MiB
 in total. Delete completed transfers to free the quota. Command stdout and stderr
 are bounded at 4 MiB each. Large or binary stdout becomes a downloadable file.
+Observation PNGs have a separate 16 MiB ceiling, to preserve full-resolution phone screenshots.
 Receipts persist in SQLite. Preserve the state directory across upgrades to retain
 duplicate-request protection.
 
