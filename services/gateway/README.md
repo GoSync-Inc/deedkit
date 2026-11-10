@@ -180,11 +180,9 @@ low-level tool only while the key also has its everyday twin. The twins are in `
 
 | Low-level tools | Everyday twin |
 | --- | --- |
-| `messages_preview_message`, `messages_send_message`, `messages_get_send_status` | `messages_send` |
-| `calls_prepare_external_call`, `calls_preflight_call`, `calls_dial_call` | `calls_call` |
-| `calls_get_call_status`, `calls_get_call_result`, `calls_get_call_analysis` | `calls_call_result` |
+| `calls_get_call_analysis` | `calls_call_result` |
 
-Every other tool keeps its place on the default list until its twin lands. The calendar tools wait for
+Other low-level methods remain listed while their replacements lack equivalent arguments or result fields. The calendar tools wait for
 find-time (ANYM-553). The everyday layer (`EVERYDAY`) is `platform_capabilities`, `messages_search`,
 `messages_search_people`, `platform_resolve_target`, `messages_get_messages`, `messages_get_context`,
 `messages_get_file_text`, `messages_send`, the four risk-class tools, `messages_get_messenger_operation`,
@@ -392,7 +390,7 @@ backend tests, load budgets, server restore evidence and Tiden readback; see
 ### Android devices
 
 The optional `android` module connects to a USB host through private HTTP.
-`/mcp/modules/android` lists its ten tools when the profile, deployment,
+`/mcp/modules/android` lists its eleven tools when the profile, deployment,
 backend credentials and scopes grant access. `android_observe` returns a native
 MCP image alongside structured UI elements. `android_execute` retains its request
 UUID across retries and exposes command receipts through `android_get_operation`.
@@ -400,3 +398,23 @@ A lost command response includes that UUID for recovery.
 
 The USB service, configuration, limits and deployment order are described in
 [the Android service guide](../android/README.md).
+
+
+## Compact MCP discovery
+
+Connect the existing gateway key to `/mcp/compact` for three tools, subject to the
+profile granting them. `platform_capabilities` reports the available sections.
+`platform_search_tools` accepts a `module`, search `query`, `limit`, `offset` and
+`detail=full` for exact input schemas. `platform_call_tool` takes the discovered
+`name` and its `arguments`. Calls use the ordinary dispatcher, including per-tool
+grants, schemas, mutation receipts and native Android image blocks.
+
+Search filters belong to the request. Independent agents sharing a key can browse
+different sections concurrently. The compact path ignores the legacy principal-wide
+selection set by `platform_select_modules`. Existing paths retain their selection
+behavior. Use the compact path when client software caches its tool inventory.
+
+Forwarding permits only tools already granted to the caller. It cannot forward
+itself or change the legacy selection. Large message payloads retain their original
+per-tool size limits. An uncertain mutation keeps its original request ID and
+recovery instruction.

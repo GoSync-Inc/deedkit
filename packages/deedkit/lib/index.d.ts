@@ -11,17 +11,11 @@ export type ToolName =
   | 'android_execute'
   | 'android_flows'
   | 'android_get_operation'
+  | 'android_maestro'
   | 'android_observe'
   | 'android_run_flow'
   | 'android_session'
   | 'android_upload'
-  | 'recordings_archive_status'
-  | 'recordings_audio'
-  | 'recordings_context'
-  | 'recordings_search'
-  | 'recordings_capabilities'
-  | 'recordings_list'
-  | 'recordings_read'
   | 'calendar_agenda'
   | 'calendar_apply'
   | 'calendar_assignment'
@@ -114,9 +108,18 @@ export type ToolName =
   | 'messages_update_wake_target'
   | 'messages_upload_file_chunk'
   | 'messages_wait_for_subscription_events'
+  | 'platform_call_tool'
   | 'platform_capabilities'
   | 'platform_resolve_target'
-  | 'platform_select_modules';
+  | 'platform_search_tools'
+  | 'platform_select_modules'
+  | 'recordings_archive_status'
+  | 'recordings_audio'
+  | 'recordings_capabilities'
+  | 'recordings_context'
+  | 'recordings_list'
+  | 'recordings_read'
+  | 'recordings_search';
 
 export interface ToolCatalogEntry {
   readonly name: ToolName;

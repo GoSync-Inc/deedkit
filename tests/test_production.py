@@ -9359,3 +9359,26 @@ def test_a_deploy_returns_busy_while_a_calendar_backup_worker_is_not_verified_st
     assert host.steps == [] and host.git == [] and host.paused() is None
     marker.unlink()
     assert host.deploy(auto=auto)["status"] == "deployed"
+
+
+# spec: ANYM-215
+def test_reused_native_parent_placeholder_still_requires_successful_native_producer():
+    original, _, _ = queue_github(push_native='skipped', queue_jobs=QUEUE_JOBS_WITH_NATIVE)
+    def parent(get):
+        def request(path):
+            result = get(path)
+            if 'runs/40/attempts/1/jobs?' in path:
+                result = copy.deepcopy(result)
+                for job in result['jobs']:
+                    if job['name'] == p.NATIVE_JOB:
+                        job['name'] = 'native'
+            return result
+        return request
+    assert p.verify(SHA, parent(original))['verify_run_id'] == 30
+    jobs = [job for job in QUEUE_JOBS_WITH_NATIVE if job['name'] != p.NATIVE_JOB]
+    missing, _, _ = queue_github(push_native='skipped', queue_jobs=jobs)
+    with pytest.raises(p.Refused):
+        p.verify(SHA, parent(missing))
+    plain, _, _ = queue_github(push_verify='success', push_native='skipped', queue_jobs=QUEUE_JOBS_WITH_NATIVE)
+    with pytest.raises(p.Refused):
+        p.verify(SHA, parent(plain))

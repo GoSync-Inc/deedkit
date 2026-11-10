@@ -1,6 +1,7 @@
 """Authenticated HTTP backend for the gateway's reviewed android_* tools."""
 
 import base64
+from collections import defaultdict
 from contextlib import asynccontextmanager
 import hashlib
 import json
@@ -12,7 +13,7 @@ from typing import Literal
 
 from .config import Configuration, Refused, Strict
 from .device import COMMANDS, Devices
-from .flows import FIELDS, VARIABLE, compile_flow
+from .flows import BARE, FIELDS, compile_flow, reference
 from .store import Store, identifier
 
 
@@ -59,6 +60,14 @@ class Flows(Strict):
     version: str | None = None
 
 
+class MaestroInfo(Strict):
+    action: Literal["reference", "validate"] = "reference"
+    yaml: str | None = Field(default=None, max_length=32768)
+    name: str | None = None
+    version: str | None = None
+    parameters: dict[str, str] = Field(default_factory=dict)
+
+
 class Receipt(Strict):
     request_id: str
     wait_s: int = Field(default=0, ge=0, le=25)
@@ -88,10 +97,10 @@ class Download(FileRef):
 
 
 SCHEMAS = {
-    "capabilities": Strict, "observe": Observe, "execute": Execute, "get_operation": Receipt,
+    "capabilities": Strict, "maestro": MaestroInfo, "observe": Observe, "execute": Execute, "get_operation": Receipt,
     "run_flow": RunFlow, "flows": Flows, "session": Session, "upload": Upload, "download": Download, "delete_file": FileRef,
 }
-READS = {"capabilities", "observe", "get_operation", "download"}
+READS = {"capabilities", "observe", "get_operation", "download", "maestro"}
 
 
 def create_app(config_path):
@@ -143,7 +152,7 @@ def create_app(config_path):
                       "tool_manifest": {"version": 1, "names": list(SCHEMAS)},
                       "input_schemas": {name: schema.model_json_schema() for name, schema in SCHEMAS.items()},
                       "maestro": {"configured": bool(configuration.initial.maestro),
-                                  "commands": sorted(FIELDS), "checkpoint": "explicit_agent_handoff"},
+                                  "commands": sorted(FIELDS.keys() | BARE), "dialect_version": 2, "checkpoint": "explicit_agent_handoff"},
                       "session_policy": {"renew_on_activity": True, "release_explicitly": True,
                                          "maximum_idle_seconds": 900},
                       "limits": {"command_seconds": 600, "file_bytes": 268435456, "chunk_bytes": 32768, "download_chunk_bytes": 4194304}}
@@ -159,20 +168,34 @@ def create_app(config_path):
                 raise Refused("invalid_arguments", 422)
             result = await devices.execute(owner, device, args["session_id"], identifier(args["request_id"]),
                                            args["argv"], args["timeout_s"], args["wait_s"])
+        elif operation == "maestro":
+            if args["action"] == "reference":
+                result = reference()
+            else:
+                if (args["yaml"] is None) == (args["name"] is None):
+                    raise Refused("provide_yaml_or_flow_name", 422)
+                source = args["yaml"]
+                if source is None:
+                    source = store.flow(owner, "get", args["name"], None, args["version"])["yaml"]
+                commands = compile_flow(source, args["parameters"],
+                    resolve=lambda name, version: store.flow(owner, "get", name, None, version)["yaml"])
+                result = {"valid": True, "dialect_version": 2, "commands": commands}
         elif operation == "run_flow":
             if (args["yaml"] is None) == (args["name"] is None):
                 raise Refused("provide_yaml_or_flow_name", 422)
             source = args["yaml"]
             if source is None:
                 source = store.flow(owner, "get", args["name"], None, args["version"])["yaml"]
-            commands = compile_flow(source, args["parameters"])
+            commands = compile_flow(source, args["parameters"],
+                resolve=lambda name, version: store.flow(owner, "get", name, None, version)["yaml"])
             result = await devices.execute(owner, device, args["session_id"], identifier(args["request_id"]),
                                            None, args["timeout_s"], args["wait_s"], flow=commands)
         elif operation == "flows":
             if args["action"] == "put":
                 if not args["yaml"]:
                     raise Refused("invalid_flow_source", 422)
-                compile_flow(args["yaml"], {name: "placeholder" for name in VARIABLE.findall(args["yaml"])})
+                compile_flow(args["yaml"], defaultdict(lambda: "placeholder"),
+                    resolve=lambda name, version: store.flow(owner, "get", name, None, version)["yaml"])
             result = store.flow(owner, args["action"], args["name"], args["yaml"], args["version"])
         elif operation == "get_operation":
             result = await devices.receipt(owner, identifier(args["request_id"]), args["wait_s"])

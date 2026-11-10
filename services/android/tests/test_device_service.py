@@ -275,3 +275,20 @@ def test_screenshot_crop_geometry_file_mode_and_large_download(service):
     file_only = post(service, 'observe', {**args, 'image_mode': 'file'}).json()
     assert 'image' not in file_only and file_only['image_file']['width'] == 900
     assert post(service, 'observe', {**args, 'crop': {'x': 1000, 'y': 200, 'w': 900, 'h': 600}}).status_code == 422
+
+
+# spec: ANYM-952
+def test_maestro_authoring_requires_no_device_action_and_resolves_only_owned_flows(service):
+    reference = post(service, 'maestro', {'action': 'reference'}, key='reader')
+    assert reference.status_code == 200
+    assert 'pasteText' in reference.json()['commands']
+    source = '- inputText: ${QUERY}'
+    saved = post(service, 'flows', {'action': 'put', 'name': 'search', 'yaml': source}).json()
+    outer = '- runFlow: {name: search}'
+    assert post(service, 'flows', {'action': 'put', 'name': 'composed', 'yaml': outer}).status_code == 200
+    result = post(service, 'maestro', {'action': 'validate', 'yaml': outer, 'parameters': {'QUERY': 'чай'}})
+    assert result.status_code == 200 and result.json()['valid']
+    assert result.json()['commands'] == [{'runFlow': {'commands': [{'inputText': 'чай'}]}}]
+    assert post(service, 'maestro', {'action': 'validate', 'name': 'search',
+                                    'version': saved['version'], 'parameters': {'QUERY': 'hello'}}, key='two').status_code != 200
+    assert not (service[1] / 'executions').exists()

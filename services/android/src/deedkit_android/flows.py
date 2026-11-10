@@ -9,7 +9,8 @@ from .config import Refused
 
 SELECTOR = {'text', 'id', 'index', 'point', 'enabled', 'selected', 'checked', 'focused',
             'optional', 'retryTapIfNoChange', 'waitToSettleTimeoutMs', 'label', 'longPress',
-            'repeat', 'delay', 'width', 'height'}
+            'repeat', 'delay', 'width', 'height', 'below', 'above', 'leftOf', 'rightOf',
+            'containsChild', 'containsDescendants', 'childOf', 'traits', 'tolerance', 'waitUntilVisible'}
 FIELDS = {
     'tapOn': SELECTOR, 'doubleTapOn': SELECTOR, 'longPressOn': SELECTOR,
     'assertVisible': SELECTOR, 'assertNotVisible': SELECTOR,
@@ -22,14 +23,23 @@ FIELDS = {
                            'centerElement', 'label'},
     'extendedWaitUntil': {'visible', 'notVisible', 'timeout', 'label'},
     'waitForAnimationToEnd': {'timeout', 'label'},
-    'runFlow': {'commands', 'when', 'label'}, 'repeat': {'times', 'commands', 'while', 'label'},
+    'runFlow': {'commands', 'name', 'version', 'when', 'label'}, 'repeat': {'times', 'commands', 'while', 'label'},
     'retry': {'maxRetries', 'commands', 'label'}, 'checkpoint': {'label'},
+    'copyTextFrom': SELECTOR, 'clearState': {'appId', 'label'}, 'killApp': {'appId', 'label'},
+    'setOrientation': {'orientation', 'label', 'optional'}, 'setLocation': {'latitude', 'longitude', 'label', 'optional'},
+    'setAirplaneMode': {'value', 'label', 'optional'}, 'toggleAirplaneMode': {'label', 'optional'},
+    'setDarkMode': {'value', 'label', 'optional'}, 'toggleDarkMode': {'label', 'optional'},
+    'assertDarkMode': {'label', 'optional'}, 'assertLightMode': {'label', 'optional'},
+    'setClipboard': {'text', 'label', 'optional'},
+    'setPermissions': {'appId', 'permissions', 'label', 'optional'},
+    'travel': {'points', 'speed', 'label', 'optional'},
+    'inputRandomText': {'length', 'label', 'optional'}, 'inputRandomNumber': {'length', 'label', 'optional'},
 }
-BARE = {'back', 'scroll', 'hideKeyboard'}
+BARE = {'back', 'scroll', 'hideKeyboard', 'pasteText', 'toggleAirplaneMode', 'toggleDarkMode', 'assertDarkMode', 'assertLightMode'}
 VARIABLE = re.compile(r'\$\{([A-Z][A-Z0-9_]{0,63})\}')
 
 
-def compile_flow(source, parameters):
+def compile_flow(source, parameters, *, resolve=None, _stack=(), _budget=None, _depth=0):
     if len(source.encode()) > 32768 or len(parameters) > 64:
         raise Refused('flow_too_large', 422)
     if any(not re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}', k) or len(v) > 4096 or '${' in v
@@ -41,7 +51,7 @@ def compile_flow(source, parameters):
         commands = yaml.safe_load(source)
     except yaml.YAMLError:
         raise Refused('invalid_flow_yaml', 422) from None
-    count = 0
+    budget = [0] if _budget is None else _budget
 
     def value(item, depth=0):
         if depth > 16:
@@ -67,13 +77,12 @@ def compile_flow(source, parameters):
         raise Refused('invalid_flow_value', 422)
 
     def sequence(items, depth=0):
-        nonlocal count
         if not isinstance(items, list) or not items or depth > 8:
             raise Refused('flow_requires_command_list', 422)
         output = []
         for command in items:
-            count += 1
-            if count > 200:
+            budget[0] += 1
+            if budget[0] > 200:
                 raise Refused('too_many_flow_commands', 422)
             if isinstance(command, str) and command in BARE:
                 output.append(command)
@@ -85,8 +94,25 @@ def compile_flow(source, parameters):
                 raise Refused('unsupported_flow_command', 422)
             if isinstance(argument, dict) and set(argument) - FIELDS[name]:
                 raise Refused('unsupported_flow_option', 422)
+            if isinstance(argument, dict):
+                for condition in ('when', 'while'):
+                    if condition in argument and (not isinstance(argument[condition], dict)
+                            or set(argument[condition]) - {'platform', 'visible', 'notVisible'}):
+                        raise Refused('unsupported_flow_condition', 422)
             if name == 'checkpoint' and (depth or not isinstance(argument, str)):
                 raise Refused('checkpoint_requires_top_level_label', 422)
+            if name == 'runFlow' and isinstance(argument, dict) and 'name' in argument:
+                reference = argument['name']
+                if (resolve is None or not isinstance(reference, str) or 'commands' in argument
+                        or reference in _stack or len(_stack) >= 8):
+                    raise Refused('invalid_flow_reference', 422)
+                nested = compile_flow(resolve(reference, argument.get('version')), parameters,
+                                      resolve=resolve, _stack=(*_stack, reference), _budget=budget, _depth=depth + 1)
+                argument = {key: child for key, child in argument.items() if key not in {'name', 'version'}}
+                argument['commands'] = nested
+                # The referenced source has already consumed the shared command budget.
+                output.append({name: argument})
+                continue
             if name in {'runFlow', 'repeat', 'retry'}:
                 if not isinstance(argument, dict) or 'commands' not in argument:
                     raise Refused('inline_flow_required', 422)
@@ -100,4 +126,17 @@ def compile_flow(source, parameters):
             output.append({name: argument})
         return output
 
-    return sequence(value(commands))
+    return sequence(value(commands), _depth)
+
+
+def reference():
+    """The accepted dialect, derived from the compiler's own allowlists."""
+    return {"dialect_version": 2, "commands": {name: sorted(FIELDS.get(name, set()))
+                                               for name in sorted(FIELDS.keys() | BARE)},
+            "bare_commands": sorted(BARE), "selector_fields": sorted(SELECTOR),
+            "parameters": "Literal ${UPPER_CASE} substitution. The same parameters reach saved subflows.",
+            "saved_subflow": {"runFlow": {"name": "saved-name", "version": "optional SHA256"}},
+            "limits": {"source_bytes": 32768, "expanded_commands": 200, "reference_depth": 8},
+            "examples": {"relative_selector": "- tapOn: {text: Buy, below: {id: product_title}}",
+                         "search": "- tapOn: Search\n- inputText: ${QUERY}\n- pressKey: Enter"},
+            "unsupported": ["host files", "JavaScript", "cloud runs", "viewer"]}

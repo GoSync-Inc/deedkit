@@ -9500,5 +9500,167 @@
       "destructiveHint": false,
       "openWorldHint": true
     }
+  },
+  {
+    "name": "platform_search_tools",
+    "module": "gateway",
+    "operation": "search_tools",
+    "scopes": [],
+    "description": "Browse authorized MCP sections and search tools. detail=full returns exact schemas. Filters are per request and safe for agents sharing a key. Use platform_call_tool with the returned name and arguments. Example: {\"module\":\"android\",\"detail\":\"full\"}",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "maxLength": 256,
+          "default": ""
+        },
+        "module": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            null,
+            "android",
+            "agents",
+            "calendar",
+            "calls",
+            "messaging",
+            "recordings"
+          ],
+          "default": null
+        },
+        "detail": {
+          "type": "string",
+          "enum": [
+            "summary",
+            "full"
+          ],
+          "default": "summary"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 30,
+          "default": 15
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000,
+          "default": 0
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "platform_call_tool",
+    "module": "gateway",
+    "operation": "call_tool",
+    "scopes": [],
+    "description": "Invoke an authorized tool discovered with platform_search_tools. Preserves its validation, request_id, errors and image results. Arguments are the exact object from its inputSchema. May perform writes. Never replay an unknown mutation. Example: {\"name\":\"android_capabilities\",\"arguments\":{}}",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,127}$"
+        },
+        "arguments": {
+          "type": "object",
+          "default": {}
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "android_maestro",
+    "module": "android",
+    "operation": "maestro",
+    "scopes": [
+      "android:read"
+    ],
+    "description": "Get the supported local Maestro reference or validate a YAML/saved flow without executing it. Saved subflows are owner-scoped. Example: {\"action\":\"reference\"}",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "default": "reference",
+          "enum": [
+            "reference",
+            "validate"
+          ],
+          "title": "Action",
+          "type": "string"
+        },
+        "yaml": {
+          "anyOf": [
+            {
+              "maxLength": 32768,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Yaml"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Version"
+        },
+        "parameters": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Parameters",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    }
   }
 ]

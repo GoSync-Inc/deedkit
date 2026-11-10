@@ -63,7 +63,9 @@
       "mcp__claude_ai_Deedkit__recordings_context",
       "mcp__claude_ai_Deedkit__recordings_list",
       "mcp__claude_ai_Deedkit__recordings_read",
-      "mcp__claude_ai_Deedkit__recordings_search"
+      "mcp__claude_ai_Deedkit__recordings_search",
+      "mcp__claude_ai_Deedkit__platform_search_tools",
+      "mcp__claude_ai_Deedkit__android_maestro"
     ],
     "deny": [
       "Read(./.local/**)",
@@ -145,7 +147,8 @@
       "mcp__claude_ai_Deedkit__messages_update_wake_target",
       "mcp__claude_ai_Deedkit__messages_upload_file_chunk",
       "mcp__claude_ai_Deedkit__messages_wait_for_subscription_events",
-      "mcp__claude_ai_Deedkit__platform_select_modules"
+      "mcp__claude_ai_Deedkit__platform_select_modules",
+      "mcp__claude_ai_Deedkit__platform_call_tool"
     ]
   },
   "$schema": "https://json.schemastore.org/claude-code-settings.json",

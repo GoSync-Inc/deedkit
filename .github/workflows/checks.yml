@@ -598,6 +598,19 @@ jobs:
               assert not any(p.endswith(('.key', '.env', '.db', '.sqlite')) or '/.plaud/' in p for p in paths), paths
           PYCODE
           "$RUNNER_TEMP/recordings-installed/bin/deedkit-recordings" --help
+      - name: Android device service tests and installable package
+        id: android
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
+        working-directory: services/android
+        run: |
+          uv sync --locked --group dev
+          uv run ruff check src tests
+          uv run pytest -q -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/android.xml"
+          uv build --out-dir "$RUNNER_TEMP/android-dist"
+          uv venv "$RUNNER_TEMP/android-installed" --python 3.13
+          uv pip install --python "$RUNNER_TEMP/android-installed/bin/python" "$RUNNER_TEMP"/android-dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/android-installed/bin/deedkit-android" --help
       - name: Shared platform contract package tests
         id: platform_contracts
         if: ${{ !cancelled() && steps.source.outcome == 'success' }}
@@ -649,7 +662,7 @@ jobs:
         if: ${{ always() }}
         env:
           MODULE_OUTCOMES: >-
-            {"gateway":"${{ steps.gateway.outcome }}","platform_contracts":"${{ steps.platform_contracts.outcome }}","calls":"${{ steps.calls.outcome }}","calls_frontend":"${{ steps.calls_frontend.outcome }}","inference":"${{ steps.inference.outcome }}","agent_runner":"${{ steps.agent_runner.outcome }}"}
+            {"android":"${{ steps.android.outcome }}","gateway":"${{ steps.gateway.outcome }}","platform_contracts":"${{ steps.platform_contracts.outcome }}","calls":"${{ steps.calls.outcome }}","calls_frontend":"${{ steps.calls_frontend.outcome }}","inference":"${{ steps.inference.outcome }}","agent_runner":"${{ steps.agent_runner.outcome }}"}
         run: |
           python3 -c 'import json, os, pathlib; pathlib.Path(os.environ["RUNNER_TEMP"], "ci-evidence", "outcomes.json").write_text(json.dumps({"module_checks": json.loads(os.environ["MODULE_OUTCOMES"])}))'
       - name: Retain service evidence even when a test fails
