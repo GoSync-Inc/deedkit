@@ -26,6 +26,14 @@ Known system events are filtered **before** page/window limits by default.
 `include_system=true` exposes their reviewed classification; it does not expose
 raw provider objects. Unclassified empty records stay visible as `unknown`.
 
+Empty WhatsApp `placeholder` and `biz_content_placeholder` records keep their
+original empty `body` and `kind="unknown"`. Their `display_text` explains that
+the content is unavailable on the linked device and directs the reader to the
+primary phone. This applies to existing archived records in full, compact and
+transcript conversation views. The label is derived on read and applies only to
+live, empty records of these two types. A later revision with text displays that
+text.
+
 WhatsApp group changes (ANYM-869) are system events of kind `group_change` (label
 «Изменение группы»). The default adapter stores each change WhatsApp pushes as
 one row, live within seconds; a synced history stub of the same change maps to

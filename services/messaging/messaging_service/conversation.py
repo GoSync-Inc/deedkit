@@ -166,6 +166,10 @@ def present_message(row,position,*,lost=()):
     row['kind']=kind;row['is_service']=kind=='system';row['position']=position
     row['conversation_view_version']=1
     label=LABELS.get(kind)
+    if (kind=='unknown' and row.get('platform')=='whatsapp'
+            and row.get('provider_message_type') in ('placeholder','biz_content_placeholder')
+            and not (body or row.get('attachments') or row.get('deleted'))):
+        label='Содержимое недоступно на связанном устройстве WhatsApp. Откройте сообщение на основном телефоне'
     # ANYM-664: the first file's words; a sticker, a contact and a service event have none. A caption with a file but
     # no observed media kind stays kind text and gets the label a file without a caption gets.
     first=(row.get('attachments') or [{}])[0]
