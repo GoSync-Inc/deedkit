@@ -293,6 +293,7 @@ def test_reference_expansion_stops_at_the_shared_budget(store, monkeypatch):
 
     def read(*args, **kwargs):
         count[0] += 1
+        assert count[0] <= 201, 'reference expansion exceeded the bounded read budget'
         return original(*args, **kwargs)
 
     monkeypatch.setattr(store.library, 'read', read)
