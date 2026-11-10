@@ -63,3 +63,39 @@ def test_compact_forwarding_preserves_native_images_and_request_ids(tmp_path):
         assert lost['structuredContent']['request_id'] == request_id
         assert lost['structuredContent']['error'] == 'mutation_outcome_unknown'
         assert sum(row[1] == 'execute' for row in requests) == 1
+
+
+# spec: ANYM-952
+def test_maestro_discovery_and_forwarding_require_current_backend_manifest(tmp_path):
+    import httpx
+    from test_android import setup
+    from test_transport import rpc
+    app, calls = setup(tmp_path)
+    path = app.state.policy.path
+    policy = json.loads(path.read_text())
+    policy['profiles']['reader']['tools'].extend(['platform_search_tools', 'platform_call_tool'])
+    policy['revision'] += 1
+    path.write_text(json.dumps(policy))
+    original = app.state.clients.transports['android']
+
+    async def old_backend(request):
+        response = await original.handle_async_request(request)
+        await response.aread()
+        if request.url.path == '/v1/capabilities':
+            body = json.loads(response.content)
+            body['tool_manifest']['names'].remove('maestro')
+            return httpx.Response(200, json=body)
+        return response
+
+    app.state.clients.transports['android'] = httpx.MockTransport(old_backend)
+    with TestClient(app) as client:
+        names = {tool['name'] for tool in rpc(client, 'tools/list').json()['result']['tools']}
+        assert 'android_maestro' not in names
+        result = call(client, 'platform_search_tools', {'query': 'android_maestro'}, path='/mcp/compact')
+        assert result['structuredContent']['tools'] == []
+        for name, arguments in [('android_maestro', {}),
+                                ('platform_call_tool', {'name': 'android_maestro', 'arguments': {}})]:
+            result = call(client, name, arguments, path='/mcp/compact')
+            assert result['isError']
+            assert result['structuredContent']['error'] == 'operation_not_in_module_build'
+        assert calls == []

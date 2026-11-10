@@ -9661,6 +9661,7 @@
       "readOnlyHint": true,
       "destructiveHint": false,
       "openWorldHint": false
-    }
+    },
+    "required_manifest": true
   }
 ]
