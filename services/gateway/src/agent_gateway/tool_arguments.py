@@ -65,6 +65,12 @@ def feedback_operation_errors(value, known_tools):
 def arguments(tool, value, known_tools):
     if not isinstance(value, dict):
         raise ValueError("invalid_arguments")
+    if tool.get('name') == 'android_session' and 'lease_s' in value:
+        if 'seconds' in value:
+            raise InvalidArguments([{'field': 'lease_s', 'reason': 'unknown_field',
+                                     'expected': 'Use seconds or lease_s, not both'}])
+        value = {**value, 'seconds': value['lease_s']}
+        del value['lease_s']
     finite_numbers(value)
     schema = tool["inputSchema"]
     errors = list(StrictValidator(schema).iter_errors(value))

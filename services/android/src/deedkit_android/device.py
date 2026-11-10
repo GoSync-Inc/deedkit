@@ -20,6 +20,7 @@ import uuid
 from xml.etree import ElementTree
 
 from .config import Refused
+from .flow_runner import FlowRunner
 from .maestro import Maestro, screen_elements
 from .store import MAX_FILE
 
@@ -242,10 +243,14 @@ class Devices:
                 argv[index + offset] = str(target)
         return [*self.adb(device), *argv], output
 
-    async def execute(self, owner, device, session, request_id, argv, timeout, wait, flow=None):
+    async def execute(self, owner, device, session, request_id, argv, timeout, wait, flow=None,
+                      element_timeout_ms=5000, optional_timeout_ms=1000):
         # A known request is read before reservation checks: its receipt survives lease expiry.
         payload = {"device_id": device, "timeout_s": timeout}
         payload["flow" if flow is not None else "argv"] = flow if flow is not None else argv
+        # Keep the default payload hash compatible with already persisted receipts.
+        if flow is not None and (element_timeout_ms, optional_timeout_ms) != (5000, 1000):
+            payload.update(element_timeout_ms=element_timeout_ms, optional_timeout_ms=optional_timeout_ms)
         try:
             previous = self.store.operation(owner, request_id)
         except Refused as error:
@@ -275,7 +280,8 @@ class Devices:
         if flow is None:
             operation = self.perform(owner, request_id, command, output, timeout, temporary, lock)
         else:
-            operation = self.perform_flow(owner, device, request_id, flow, timeout, temporary, lock)
+            operation = self.perform_flow(owner, device, request_id, flow, timeout, temporary, lock,
+                                          element_timeout_ms, optional_timeout_ms)
         task = asyncio.create_task(self.keep_reserved(owner, device, session, operation))
         self.tasks[(owner, request_id)] = task
         task.add_done_callback(lambda _: self.tasks.pop((owner, request_id), None))
@@ -298,14 +304,47 @@ class Devices:
             except Refused:
                 pass  # The caller may have released the completed operation already.
 
-    async def perform_flow(self, owner, device, request_id, commands, timeout, temporary, lock):
+    async def failure_observation(self, owner, device):
+        """Capture while holding the operation lock; store once, never at poll time."""
+        result = {"device_id": device, "observed_at": time.time(),
+                  "coordinate_space": "device_pixels", "resized": False}
+
+        async def capture(kind, operation):
+            try:
+                async with asyncio.timeout(8):
+                    return await operation
+            except Exception:
+                # A protected screen, full file quota or offline driver must not
+                # replace the operation's original failure or leak its lock.
+                return {kind + '_error': 'unavailable'}
+
+        image, hierarchy = await asyncio.gather(
+            capture('screenshot', self.capture_image(owner, device, 'file', None)),
+            capture('hierarchy', self.capture_hierarchy(device)))
+        elements = hierarchy.pop('elements', [])
+        if elements:
+            hierarchy['elements'] = [{key: value[:256] if isinstance(value, str) else value
+                                      for key, value in item.items() if key in {
+                                          'text', 'resource-id', 'content-desc', 'bounds', 'class',
+                                          'clickable', 'enabled', 'focused', 'checked', 'scrollable'}}
+                                     for item in elements[:80]]
+            hierarchy['element_count'] = len(elements)
+            hierarchy['truncated'] = len(elements) > 80
+        result.update(image)
+        result.update(hierarchy)
+        return result
+
+    async def perform_flow(self, owner, device, request_id, commands, timeout, temporary, lock,
+                           element_timeout_ms=5000, optional_timeout_ms=1000):
         state, result = "unknown", {}
+        runner = FlowRunner(self.maestro.call, self.config.devices[device], element_timeout_ms, optional_timeout_ms)
+        cancelled = False
         try:
             checkpoint = next((i for i, command in enumerate(commands)
                                if isinstance(command, dict) and "checkpoint" in command), len(commands))
             if checkpoint:
-                await self.maestro.call("run", {"device_id": self.config.devices[device],
-                                        "yaml": "appId: android\n---\n" + yaml.safe_dump(commands[:checkpoint], allow_unicode=True)}, timeout)
+                async with asyncio.timeout(timeout):
+                    await runner.run(commands[:checkpoint])
             result = {"commands_executed": checkpoint, "device_id": device}
             state = "succeeded"
             if checkpoint < len(commands):
@@ -315,16 +354,31 @@ class Devices:
                                "next_action": "observe_then_resolve_checkpoint_and_submit_remaining_yaml"})
         except Refused as error:
             result = {"error": error.code, "next_action": "inspect_device_before_any_new_request"}
+            if error.code == 'element_not_found':
+                state = 'failed'
+                result['next_action'] = 'inspect_failure_observation_and_correct_flow'
+            if hasattr(error, 'command_path'):
+                result.update(failed_command_index=error.command_path[0],
+                              failed_command_path=error.command_path, failed_command=error.command)
             if getattr(error, "diagnostic", None):
                 result["diagnostic"] = error.diagnostic
         except TimeoutError:
             result = {"error": "command_timeout", "next_action": "inspect_device_before_any_new_request"}
         except asyncio.CancelledError:
+            cancelled = True
             result = {"error": "service_stopped", "next_action": "inspect_device_before_any_new_request"}
         except (OSError, ValueError):
             result = {"error": "maestro_unavailable", "next_action": "inspect_device_before_any_new_request"}
         finally:
             try:
+                if state not in {'succeeded', 'paused'}:
+                    result.update(device_id=device, commands_executed=runner.completed,
+                                  automatic_retry=False, side_effects='may_have_occurred')
+                    if runner.current_path is not None and 'failed_command_path' not in result:
+                        result.update(failed_command_index=runner.current_path[0],
+                                      failed_command_path=runner.current_path, failed_command=runner.current_command)
+                    if not cancelled:
+                        result['observation'] = await self.failure_observation(owner, device)
                 self.store.finish(owner, request_id, state, result)
             finally:
                 temporary.cleanup()

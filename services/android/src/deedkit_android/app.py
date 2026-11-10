@@ -8,7 +8,7 @@ import json
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import Field, ValidationError
+from pydantic import AliasChoices, Field, ValidationError
 from typing import Literal
 
 from .config import Configuration, Refused, Strict
@@ -51,6 +51,8 @@ class RunFlow(Device):
     parameters: dict[str, str] = Field(default_factory=dict)
     timeout_s: int = Field(default=120, ge=1, le=600)
     wait_s: int = Field(default=15, ge=0, le=25)
+    element_timeout_ms: int = Field(default=5000, ge=100, le=60000)
+    optional_timeout_ms: int = Field(default=1000, ge=100, le=60000)
 
 
 class Flows(Strict):
@@ -77,7 +79,7 @@ class Session(Strict):
     device_id: str
     action: str = Field(pattern="^(acquire|renew|release)$")
     session_id: str | None = None
-    seconds: int = Field(default=900, ge=30, le=900)
+    seconds: int = Field(default=900, ge=30, le=900, validation_alias=AliasChoices('seconds', 'lease_s'))
 
 
 class Upload(Strict):
@@ -121,7 +123,7 @@ def create_app(config_path):
 
     @app.exception_handler(Refused)
     async def refused(request, error):
-        return JSONResponse({"error": error.code}, status_code=error.status,
+        return JSONResponse({"error": error.code, **({'hint': error.hint} if hasattr(error, 'hint') else {})}, status_code=error.status,
                             headers={"Cache-Control": "no-store"})
 
     @app.post("/v1/{operation}")
@@ -189,7 +191,9 @@ def create_app(config_path):
             commands = compile_flow(source, args["parameters"],
                 resolve=lambda name, version: store.flow(owner, "get", name, None, version)["yaml"])
             result = await devices.execute(owner, device, args["session_id"], identifier(args["request_id"]),
-                                           None, args["timeout_s"], args["wait_s"], flow=commands)
+                                           None, args["timeout_s"], args["wait_s"], flow=commands,
+                                           element_timeout_ms=args['element_timeout_ms'],
+                                           optional_timeout_ms=args['optional_timeout_ms'])
         elif operation == "flows":
             if args["action"] == "put":
                 if not args["yaml"]:

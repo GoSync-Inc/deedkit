@@ -104,6 +104,12 @@ class Maestro:
                     if not texts:
                         raise Refused('maestro_empty_result', 502)
                     return json.loads(texts[0])
+                except Refused as error:
+                    # A completed tools/call error leaves the protocol synchronized.
+                    # Keep the warm driver for optional lookup probes and diagnostics.
+                    if error.code != 'maestro_action_failed':
+                        await self.close()
+                    raise
                 except BaseException:
                     # Only the call holding this lock can stop the shared process.
                     await self.close()

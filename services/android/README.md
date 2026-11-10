@@ -162,6 +162,30 @@ backend credential and the client continues using its existing gateway key.
 Use `android_get_operation` to poll after a `running` response or lost reply.
 A duplicate UUID never repeats admitted actions.
 
+Missing-element probes use `element_timeout_ms=5000`, or
+`optional_timeout_ms=1000` for optional selectors and `when`/`while` conditions.
+Both accept 100–60000 ms. A selector's `timeout` or a condition's `timeout`
+overrides the run default. Native `extendedWaitUntil` keeps its explicit timeout.
+The local runner uses Maestro's native visibility assertions, then sends the
+action only after a successful probe; nested flow, repeat and explicit retry
+blocks retain this behavior. Probe limits exclude cold driver startup and an
+action after the probe (whose element may disappear in the meantime). The total
+`timeout_s` still bounds execution. Completed lookup misses retain the warm
+Maestro connection; transport errors close it.
+
+```yaml
+- tapOn: {text: Optional popup, optional: true, timeout: 300}
+- runFlow:
+    when: {visible: {id: known_dialog_button}, timeout: 500}
+    commands:
+      - tapOn: {id: known_dialog_button, timeout: 500}
+```
+
+Use a saved `runFlow: {name: dismiss-known-dialog}` for a reusable handler of
+known dialogs. The service does not dismiss arbitrary permission or payment
+screens automatically. Input is a command list, without native `appId`/`---`
+headers, and checkpoints use the scalar form `- checkpoint: review`.
+
 ```yaml
 - launchApp: com.example.app
 - tapOn:
@@ -194,6 +218,23 @@ interruptions such as app verification screens. Detection and interpretation of
 such screens belongs to the calling agent. The service does not retry a failed
 or timed-out flow. An `unknown` receipt requires observing the device before any
 new action because a prefix of the flow may have executed.
+
+A definite missing-element probe returns `state=failed`, `error=element_not_found`,
+zero-based `failed_command_index`, nested `failed_command_path`, and the original
+`failed_command`. This does not undo previous steps. Other uncertain failures
+retain `state=unknown`. Terminal failures include a best-effort `observation`
+with at most 80 compact hierarchy nodes and `image_file.file_id`; fetch the PNG
+with `android_download`. Capture runs under the same device lock, adds up to
+eight seconds, and is saved once with the receipt. Polling never captures again.
+Secure screens, disconnection or exhausted file quota produce capture error
+fields without replacing the original failure. Service shutdown skips capture.
+
+Use `seconds` for the session's idle interval. The legacy `lease_s` input remains
+accepted by the gateway and host, but cannot be combined with `seconds`.
+`device_id` is required for acquire, renew and release. If `backend_unavailable`
+explicitly includes `operation_sent:false`, wait `retry_after_seconds` and retry
+with the same request UUID. If dispatch may have happened, read the original
+receipt; never mint another UUID as a recovery attempt.
 
 Saved flows, operation receipts and checkpoint remainders persist in private
 SQLite state. Substituted commands temporarily occupy a private Java temporary
