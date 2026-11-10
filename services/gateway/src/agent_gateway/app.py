@@ -19,6 +19,7 @@ from starlette.responses import JSONResponse
 from platform_contracts.release import ReleaseRuntime
 
 from .catalog import CATALOG, public
+from .adapters.android import content as android_content
 from .diagnostics import with_catalog
 from .dispatch import Dispatch, PLAIN_PATH, Route, admitted
 from .http_clients import Clients
@@ -233,7 +234,7 @@ def create_app(policy_path, public_url, *, transports=None):
         started, outcome = time.monotonic(), "error"
         try:
             result = await dispatch.call(current_key.get(), params.name, params.arguments or {}, current_route.get())
-            content = [TextContent(type="text", text=text_block(result))]
+            content, result = android_content(params.name, result)
             credential = admitted.get()
             notice = expiry_notice(credential)
             if not notice:

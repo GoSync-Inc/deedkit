@@ -25,6 +25,9 @@ def takes_wait(tool):
 # never the metadata pool. An entry names the pool and when the arguments make the call wait; wait_s=0 stays a plain
 # call. A catalog tool with wait_s but no entry still waits in "waits" and fails test_wait_admission.
 WAIT_ADMISSION = {
+    ("android", "execute"): ("waits", lambda a: a.get("wait_s", 15) > 0),
+    ("android", "get_operation"): ("waits", lambda a: a.get("wait_s", 0) > 0),
+    ("android", "observe"): ("waits", lambda a: True),
     # ANYM-532, ANYM-643: a phone or username recipient also waits, for its open_chat_by_* lookup.
     ("messaging", "send_message"): ("waits", lambda a: (a.get("wait_s") or 0) > 0 or bool(a.get("phone"))
                                     or bool(a.get("username"))),
@@ -204,6 +207,8 @@ class Clients:
                     failed = response.status_code >= 500 or response.status_code in (301, 302, 303, 307, 308)
                     body = bytearray()
                     maximum = 65536 if failed else 8 * 1024 * 1024
+                    if not failed and module == "android" and operation == "observe":
+                        maximum = 24 * 1024 * 1024  # bounded PNG base64 plus UI hierarchy
                     async for chunk in response.aiter_bytes(65536):
                         if len(body) + len(chunk) > maximum:
                             if failed:

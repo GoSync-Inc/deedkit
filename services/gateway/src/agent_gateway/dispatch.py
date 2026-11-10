@@ -45,6 +45,7 @@ MODULE_PURPOSES = {
     "calls": "Voice calls with briefs and preflight plus placed calls and their records",
     "messaging": "Messenger chats with search and the reply queue plus files and sending",
     "agents": "Agent sessions on the Mac mini that work on a task and return a branch for review",
+    "android": "Physical Android devices with screen observation, ADB commands and file transfer",
 }
 
 
@@ -761,6 +762,9 @@ class Dispatch:
                 **safe_error("mutation_outcome_unknown", unknown_outcome=True),
                 **{key: diagnostics[key] for key in FAILURE_FIELDS if key in diagnostics},
             }
+            if module == "android" and tool["operation"] == "execute":
+                error.detail.update(request_id=values["request_id"],
+                                    next_action="read_android_get_operation_with_original_request_id")
         elif error.code == "backend_unavailable":
             error.detail = unavailable(tool["operation"], getattr(error, "detail", None),
                                        phase="operation", read_only=True)

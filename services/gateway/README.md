@@ -133,7 +133,7 @@ An agent that needs only some modules can load fewer tools. Selection only narro
 no tool, scope or action.
 
 - **Connection path.** `POST /mcp/modules/<m>[,<m>...]` with `m` from `messaging`, `calendar`, `calls`,
-  `recordings`, `agents` is the same MCP endpoint as `/mcp`. Its `tools/list` and `tools/call` cover `platform_capabilities`,
+  `recordings`, `agents`, `android` is the same MCP endpoint as `/mcp`. Its `tools/list` and `tools/call` cover `platform_capabilities`,
   `platform_select_modules` (when the profile lists it) and the named modules' tools, intersected with
   everything that limits the key on `/mcp`. Order does not matter (`calendar,messaging` and
   `messaging,calendar` are one path, reported as the sorted form). An unknown or repeated name, an empty list
@@ -388,3 +388,15 @@ Normal tests use synthetic HTTP doubles and real SDK loopback transport. They do
 read accounts or start provider sessions. Full acceptance also requires real isolated
 backend tests, load budgets, server restore evidence and Tiden readback; see
 `docs/quality/platform-acceptance.md` at the repository root.
+
+### Android devices
+
+The optional `android` module connects to a USB host through private HTTP.
+`/mcp/modules/android` lists its eight tools when the profile, deployment,
+backend credentials and scopes grant access. `android_observe` returns a native
+MCP image alongside structured UI elements. `android_execute` retains its request
+UUID across retries and exposes command receipts through `android_get_operation`.
+A lost command response includes that UUID for recovery.
+
+The USB service, configuration, limits and deployment order are described in
+[the Android service guide](../android/README.md).

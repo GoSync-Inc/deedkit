@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "deedkit-android"
+version = "0.1.0"
+description = "USB Android device execution behind the DeedKit gateway"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = ["fastapi==0.143.0", "starlette==1.8.0", "pydantic>=2.12,<3", "uvicorn==0.54.0"]
+
+[project.scripts]
+deedkit-android = "deedkit_android.cli:main"
+
+[dependency-groups]
+dev = ["pytest==9.1.1", "httpx==0.28.1", "ruff==0.15.7"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/deedkit_android"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
