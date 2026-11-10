@@ -41,7 +41,8 @@ def reference():
             'Use android_run_flow(name=orders, request_id=<new UUID>) for normal runs. Release the session after work.',
         ],
         'repair': 'Get the current source with android_flows(action=get, stage=draft). Save a draft with base_version equal to the current draft version, or published version when no draft exists. Inspect with a draft scenario containing inspectMap, test the intended scenario, then publish. history returns versions and audit events; rollback takes a previously published version and the current published base_version.',
-        'maps': 'Fields: package, selectors, screens, deep_links, popups, lists, meta. Named selectors are ordered candidate lists. text/id are full regular expressions, textExact/resourceId are exact. An ambiguous first matching candidate stops the action. index explicitly selects one match. A point candidate requires tapElement.expect_screen. Screens require all require conditions and no forbid conditions; each condition is a selector name or inline selector. Optional activity is a regex.',
+        'hierarchy': 'Optional map field hierarchy: {compressed: false, max_depth: 1-200}. Every snapshot for that map then dumps the full accessibility tree; the default (compressed true, depth 50) hides nodes that are not important for accessibility and deep subtrees. Try it when inspectMap finds no text, before readScreenText. Plain selector commands later in the same batch may then also see the full tree.',
+        'maps': 'Fields: package, selectors, screens, deep_links, popups, lists, hierarchy, meta. Named selectors are ordered candidate lists. text/id are full regular expressions, textExact/resourceId are exact. An ambiguous first matching candidate stops the action. index explicitly selects one match. A point candidate requires tapElement.expect_screen. Screens require all require conditions and no forbid conditions; each condition is a selector name or inline selector. Optional activity is a regex.',
         'lists': 'lists.<name> has item (selector or candidate list), fields (field names mapped to selectors), and optional key (field names identifying one item across pages). Without key, every visible row is preserved. readList returns rows under both its step result and receipt.data.<list>. limit defaults to 20, at most 100; scroll_pages defaults to 0, at most 5. Password fields return null.',
         'popups': 'popups.<name> has detect (selector name) and either dismiss (selector name) or press: back. dismissPopups is explicit and bounded by max_rounds, default 3.',
         'parameters': 'params maps UPPER_CASE names to {type: string|integer|boolean, default?, required?, enum?, max_length?}. Values substitute literally as ${NAME}. Existing string parameters work without declarations.',
@@ -113,7 +114,7 @@ def candidates(value, point=False):
 
 def validate_map(source):
     value = load(source)
-    fields(value, {'package', 'selectors', 'screens', 'deep_links', 'popups', 'lists', 'meta'})
+    fields(value, {'package', 'selectors', 'screens', 'deep_links', 'popups', 'lists', 'meta', 'hierarchy'})
     if not isinstance(value.get('package'), str) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+', value['package']):
         raise Refused('invalid_app_package', 422)
     for name in ('selectors', 'screens', 'deep_links', 'popups', 'lists'):
@@ -164,6 +165,12 @@ def validate_map(source):
         listing['fields'] = {name: candidates(selector) for name, selector in listing['fields'].items()}
         if 'key' in listing and (not isinstance(listing['key'], list) or not listing['key'] or any(not isinstance(key, str) or key not in listing['fields'] for key in listing['key'])):
             raise Refused('invalid_list_key', 422)
+    if 'hierarchy' in value:
+        options = value['hierarchy']
+        fields(options, {'compressed', 'max_depth'}, 'invalid_map_hierarchy')
+        if ('compressed' in options and type(options['compressed']) is not bool) or (
+                'max_depth' in options and (type(options['max_depth']) is not int or not 1 <= options['max_depth'] <= 200)):
+            raise Refused('invalid_map_hierarchy', 422)
     if 'meta' in value and not isinstance(value['meta'], dict):
         raise Refused('invalid_map_metadata', 422)
     return value

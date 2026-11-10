@@ -49,8 +49,12 @@ def resolve_selector(root, candidates, multiple=False):
     return [] if multiple else None, trace
 
 
-def snapshot(device):
-    return ElementTree.fromstring(device.jsonrpc_call('dumpWindowHierarchy', (True, 50)))
+def snapshot(device, app_map=None):
+    # A map may opt into the full tree; the default hides nodes that are not
+    # important for accessibility and subtrees deeper than 50.
+    options = (app_map or {}).get('hierarchy', {})
+    return ElementTree.fromstring(device.jsonrpc_call(
+        'dumpWindowHierarchy', (options.get('compressed', True), options.get('max_depth', 50))))
 
 
 def screen_state(root, app_map, name, activity=None):
@@ -71,7 +75,7 @@ def wait_screen(device, app_map, name, timeout):
     deadline = time.monotonic() + timeout / 1000
     while True:
         activity = device.app_current().get('activity') if 'activity' in app_map['screens'][name] else None
-        result = screen_state(snapshot(device), app_map, name, activity)
+        result = screen_state(snapshot(device, app_map), app_map, name, activity)
         if result['matched']:
             return {'screen': name, **result}
         if time.monotonic() >= deadline:
@@ -81,10 +85,10 @@ def wait_screen(device, app_map, name, timeout):
         time.sleep(min(0.1, max(0, deadline - time.monotonic())))
 
 
-def wait_element(device, candidates, timeout):
+def wait_element(device, candidates, timeout, app_map=None):
     deadline = time.monotonic() + timeout / 1000
     while True:
-        node, trace = resolve_selector(snapshot(device), candidates)
+        node, trace = resolve_selector(snapshot(device, app_map), candidates)
         if node is not None:
             return node, trace
         if time.monotonic() >= deadline:
@@ -134,14 +138,14 @@ def execute_map(device, name, options, native):
     elif name in {'waitScreen', 'assertScreen'}:
         return wait_screen(device, app_map, options['screen'], 0 if name == 'assertScreen' else timeout)
     elif name in {'tapElement', 'typeInto'}:
-        node, trace = wait_element(device, app_map['selectors'][options['selector']], timeout)
+        node, trace = wait_element(device, app_map['selectors'][options['selector']], timeout, app_map)
         result.update(selector=options['selector'], candidates=trace)
         if name == 'tapElement':
             tap(device, node)
         else:
             # An explicit ordinal selects the exact node from this snapshot.
             # Direct accessibility setText avoids keyboard/clipboard fallbacks.
-            root = snapshot(device)
+            root = snapshot(device, app_map)
             node, _ = resolve_selector(root, app_map['selectors'][options['selector']])
             if node is None:
                 raise Refused('element_not_found')
@@ -159,7 +163,7 @@ def execute_map(device, name, options, native):
         for page in range(options.get('scroll_pages', 0) + 1):
             requested = options.get('fields', list(listing['fields']))
             fields = list(dict.fromkeys([*requested, *listing.get('key', [])]))
-            page_rows = extract_list(snapshot(device), listing, fields, options.get('limit', 20))
+            page_rows = extract_list(snapshot(device, app_map), listing, fields, options.get('limit', 20))
             for row in page_rows:
                 key = tuple(row.get(field) for field in listing.get('key', []))
                 if not key or None in key or key not in seen:
@@ -170,7 +174,7 @@ def execute_map(device, name, options, native):
             device.swipe_ext('up', scale=0.6, duration=0.3)
         return {'list': options['list'], 'rows': rows[:options.get('limit', 20)]}
     elif name == 'inspectMap':
-        root = snapshot(device)
+        root = snapshot(device, app_map)
         selectors, screens = {}, {}
         for key, candidates in app_map['selectors'].items():
             try:
@@ -188,7 +192,7 @@ def execute_map(device, name, options, native):
     elif name == 'dismissPopups':
         dismissed = []
         for _ in range(options.get('max_rounds', 3)):
-            root = snapshot(device)
+            root = snapshot(device, app_map)
             present = False
             for key, popup in app_map['popups'].items():
                 node, _ = resolve_selector(root, app_map['selectors'][popup['detect']])
@@ -198,7 +202,7 @@ def execute_map(device, name, options, native):
                 if 'press' in popup:
                     device.press(popup['press'])
                 else:
-                    node, _ = wait_element(device, app_map['selectors'][popup['dismiss']], timeout)
+                    node, _ = wait_element(device, app_map['selectors'][popup['dismiss']], timeout, app_map)
                     tap(device, node)
                 dismissed.append(key)
                 break

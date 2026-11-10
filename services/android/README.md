@@ -176,6 +176,24 @@ command name, nested path, elapsed milliseconds and result or error. One
 Use several local steps per call to avoid network/model round trips. Original
 PNG download and failure capture follow the same contract below.
 
+Some apps draw text that the accessibility tree does not expose. Two read-only
+tools help. An app map may set `hierarchy: {compressed: false, max_depth: 120}`;
+every snapshot for that map then dumps the full tree instead of the default
+compressed tree of depth 50. When the text is still missing, `readScreenText`
+captures one PNG and recognizes it on the USB host with Tesseract
+(`--psm 11 tsv`). It accepts `region: {x, y, w, h}` or `within: <selector>`,
+`min_confidence` (default 60), `limit` (default 100, at most 300) and `key`
+(default `screen_text`). It returns lines with `text`, device-pixel `bounds` and
+`confidence`, top to bottom, in the step result and in `receipt.data.<key>`. The
+PNG lives in a private temporary directory removed after each call; nothing leaves
+the host except the authenticated receipt. It never taps. Enable it with absolute
+`ocr_command` (for example `/opt/homebrew/bin/tesseract`) and `ocr_languages`
+(default `eng`; `eng+ind` needs the `ind` language data, Homebrew
+`tesseract-lang`) in the private config. Without them, or when recognition fails,
+the step fails with `ocr_unavailable` or `ocr_failed` as a definite failure.
+Older service versions reject these keys, so roll back the config with the
+executable.
+
 Older installations can still install a pinned Maestro CLI release with its supported Java runtime. Set optional
 absolute `maestro` and `java_home` paths in the private service configuration and
 restart the service. The service starts one local stdio MCP process lazily and
