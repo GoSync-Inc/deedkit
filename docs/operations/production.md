@@ -1247,23 +1247,26 @@ entry, `TypeError`, on every command); before a `tool-rollback` to such a tool, 
 - Deferral. When a holder's ANYM-895 decision is a changed digest, `apply` (also inside `deploy`) recreates it only
   when the recreate begins inside the window and the holder had no planned recreate earlier in that window. Otherwise
   the running container stays as a kept service on the inputs it carries, and the receipt's `services` entry says
-  `deferred (<parts>, next window <UTC>, <local> WITA)`. The decision is taken after the call waits, right before
-  the first stop. Precedence: a holder that is stopped, restarting, paused, unhealthy, `unlabeled` or `unreadable` is
+  `deferred (<parts>, next window <UTC>, <local> WITA)`. The decision is taken after the call waits and checked
+  again right before each project's first stop: a window that closed meanwhile defers the holder, uncounted. Precedence: a holder that is stopped, restarting, paused, unhealthy, `unlabeled` or `unreadable` is
   recreated at once (kind `recovery` with that reason). A migration changes no holder: a holder copies none.
 - Collectors are never kept back: a collector that changed goes in its release. A holder and its collector that both
   go form a pair: the collector stops first, the holder comes up and passes its check, then the collector comes up and
   must attach (the holder's `holder.attached` log event within 120 s). A collector alone needs its new image's
   protocol range (`io.deedkit.collector.protocol.{min,max}`) to include the running holder's protocol (the maximum of
   `io.deedkit.holder.protocol.{min,max}`), a holder alone the reverse; a pair, each the other's. A recreate that leaves
-  no shared protocol is refused before any stop (`session_pair_incompatible`). A changed collector that cannot speak to
-  the running holder takes the holder with it at once (`recovery`, `collector_requires_holder`). A failure in the pair
-  records the release `unhealthy`; its rollback restores both, holder first (`deploy` does it at once).
+  no shared protocol is refused before any stop (`session_pair_incompatible`), and so is a new collector that cannot
+  speak to a holder kept for the window: apply that release inside the window. A failure once a paired collector
+  stopped (a holder check, an attach, a log read that timed out) restores those pairs on their previous images,
+  holder first, before `apply` returns; the release is `unhealthy` with them as kept services, so its rollback (which
+  `deploy` runs at once) leaves them as they are.
 - Night pass. A `deploy --auto` run that finds nothing new to deploy, when a deferred change is recorded, runs one
   session-only pass a night from its per-night start (inside 03:30-04:30, derived from the date) until the window
   ends. It uses the current applied release, recomputes every digest (a change a rollback undid is `nothing
   pending`) and writes `<state>/<sha>/session-<time>/attempted.json` as `started` before its call wait; a crash
   leaves that receipt without `result.json`, which every later deploy refuses as unfinished. A call wait that reaches
-  the window's end stops nothing: `deferred (window closed during call wait)`. Before it stops a holder it writes
+  the window's end stops nothing: `deferred (window closed during call wait)`; a planned group whose stop would begin
+  after the window's end is `deferred` (`window closed`), uncounted. Before it stops a holder it writes
   `.planned-stop` (`{reason: session_window, planned_end}`, 0600, the collectors' owner) in the holder's socket
   directory and removes it after the holder is back, so the collector reports `provider_disconnected` with reason
   `session_window`. A holder (or pair) failing its check is restored inside the pass, holder first (no
@@ -1273,7 +1276,7 @@ entry, `TypeError`, on every command); before a `tool-rollback` to such a tool, 
   record>"` (the incident recovery override, AGENTS.md section 2, docs/operations/incident-recovery.md) or `--reason
   "owner:<the owner's line, quoted>"` recreates the named holders at once in a session-only pass (`--dry-run` lists
   them). Anything else, or a name that is no configured session service, is refused before any stop
-  (`session_flag_invalid`). Each one is a `flagged` recreate with its reference.
+  (`session_flag_invalid`); so is a flag while the configuration drifted from the current release. Each one is a `flagged` recreate with its reference.
 - Visibility. `status` and the deploy's stdout list `session_pending`: the holder, the changed parts, the release, the
   next window in UTC and WITA, and `session_deferral_stale` once two windows passed without it. The ledger
   `<state>/session-ledger.json` keeps the recreates by kind (`planned`, `recovery`, `flagged`, `rollback`) and window,

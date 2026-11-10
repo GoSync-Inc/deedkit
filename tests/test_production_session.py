@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import time
 
 import pytest
@@ -14,6 +15,7 @@ from test_production import OLD_IMAGE, KeepHost
 from messaging_service import whatsapp_holder
 
 WITA = timezone(timedelta(hours=8))
+HOLDER_LOG = p.holder_log
 SHAS = tuple(str(digit) * 40 for digit in range(1, 8))
 HOLDER = "whatsapp1-holder"
 COLLECTOR = "whatsapp1"
@@ -290,8 +292,8 @@ def test_a_holder_and_collector_change_goes_as_a_pair_collector_stopped_first_an
 
 
 # spec: ANYM-896
-@pytest.mark.parametrize("failure", ["holder check", "collector attach"])
-def test_a_pair_failing_its_holder_check_or_collector_attach_is_unhealthy_and_its_rollback_restores_both_holder_first(
+@pytest.mark.parametrize("failure", ["holder check", "collector attach", "log read timeout"])
+def test_a_pair_failing_in_apply_is_restored_holder_first_before_apply_ends_and_recorded_unhealthy(
         tmp_path, monkeypatch, failure):
     host = first(tmp_path, monkeypatch)
     previous = {service: host.containers[service]["Image"] for service in (HOLDER, COLLECTOR)}
@@ -299,19 +301,79 @@ def test_a_pair_failing_its_holder_check_or_collector_attach_is_unhealthy_and_it
     host.files["whatsapp/whatsmeow/main.go"] = ("100644", "package main // both\n")
     if failure == "holder check":
         host.broken.add(host.image_of("holder", SHAS[1]))
-    else:
+    elif failure == "collector attach":
         host.silent.add(HOLDER)
+    else:
+        def timed_out(container, since):
+            raise subprocess.TimeoutExpired(["docker", "logs"], 30)
+        monkeypatch.setattr(p, "holder_log", timed_out)
     with pytest.raises(p.Refused, match="rollback --sha"):
         released(host, SHAS[1], wita(11, 3, 40))
-    assert p.read(host.state / SHAS[1] / "result.json")["status"] == "unhealthy"
-    if failure == "holder check":  # nothing attached to the failed holder
-        assert ("up", COLLECTOR) not in host.order
-    host.silent.clear()
+    # The by-hand apply itself restored the pair, holder first; nothing attached to a failed holder.
+    assert {service: host.containers[service]["Image"] for service in (HOLDER, COLLECTOR)} == previous
+    assert all(host.containers[service]["State"]["Running"] for service in (HOLDER, COLLECTOR))
+    ups = host.ups()
+    assert ups[-2:] == [HOLDER, COLLECTOR] and ups.count(COLLECTOR) == (1 if failure == "holder check" else 2)
+    result = p.read(host.state / SHAS[1] / "result.json")
+    assert result["status"] == "unhealthy" and set(result["rollback"]["projects"][0]["kept"]) >= {HOLDER, COLLECTOR}
+    # The release's rollback leaves the restored pair as it is.
     host.order = []
     p.rollback(host.settings, SHAS[1])
+    assert HOLDER not in host.stopped() and COLLECTOR not in host.stopped()
     assert {service: host.containers[service]["Image"] for service in (HOLDER, COLLECTOR)} == previous
-    ups = host.ups()
-    assert ups.index(HOLDER) < ups.index(COLLECTOR)
+
+
+# spec: ANYM-896
+def test_a_holder_only_attach_failure_beside_a_pair_restores_the_stopped_collector_and_records_unhealthy(
+        tmp_path, monkeypatch):
+    host = first(tmp_path, monkeypatch, ("1", "2"))
+    previous = {service: host.containers[service]["Image"] for service in (HOLDER, COLLECTOR, "whatsapp2-holder")}
+    host.change_holder("serve 2")  # both holders change; only whatsapp1's collector changes too (its definition)
+    host.units[COLLECTOR]["environment"] = {"SYNTHETIC": "changed"}
+    host.write_compose()
+    host.silent.add("whatsapp2-holder")
+    with pytest.raises(p.Refused, match="rollback --sha"):
+        released(host, SHAS[1], wita(11, 3, 40))
+    assert host.containers[COLLECTOR]["State"]["Running"] and host.containers[COLLECTOR]["Image"] == previous[COLLECTOR]
+    assert p.read(host.state / SHAS[1] / "result.json")["status"] == "unhealthy" and p.unfinished(host.state) == []
+    host.silent.clear()
+    p.rollback(host.settings, SHAS[1])
+    assert {service: host.containers[service]["Image"] for service in previous} == previous
+
+
+# spec: ANYM-896
+def test_a_window_that_closes_before_the_stop_defers_the_planned_holder_without_counting_it(tmp_path, monkeypatch):
+    host = first(tmp_path, monkeypatch)
+    host.change_holder("serve 2")
+    host.now, host.order, host.main = wita(11, 4, 59), [], SHAS[1]
+    p.prepare(host.settings, SHAS[1])
+    locks = p.provide_session_locks
+    def late(*args, **kwargs):  # in apply, between the decision and the project's stop, the window ends
+        host.now = wita(11, 5, 1)
+        return locks(*args, **kwargs)
+    monkeypatch.setattr(p, "provide_session_locks", late)
+    result = p.apply(host.settings, SHAS[1])
+    assert host.stopped() == [] and host.outcome(result, HOLDER)["deferred"]["next_window"].endswith("2026-11-12 03:00-05:00 WITA")
+    assert [event for event in host.ledger()["events"] if event["release"] == SHAS[1]] == []
+    assert "synthetic/" + HOLDER in host.ledger()["pending"]
+
+
+# spec: ANYM-896
+def test_a_new_collector_that_cannot_speak_to_a_holder_kept_for_the_window_is_refused_before_any_stop(
+        tmp_path, monkeypatch):
+    host = first(tmp_path, monkeypatch)
+    host.change_holder("serve 2")
+    host.files["whatsapp/whatsmeow/main.go"] = ("100644", "package main // protocol 2\n")
+    host.ranges = {"holder": ("1", "2"), "collector": ("2", "2")}  # the new pair speaks 2; the running holder only 1
+    host.now, host.order, host.main = wita(10, 10), [], SHAS[1]
+    p.prepare(host.settings, SHAS[1])
+    with pytest.raises(p.Refused, match="session_pair_incompatible: the new synthetic/whatsapp1 cannot speak"):
+        p.apply(host.settings, SHAS[1])
+    assert host.order == [] and host.ledger()["events"][-1]["release"] == SHAS[0]
+    host.now = wita(11, 3, 40)  # inside the window the pair goes together
+    p.apply(host.settings, SHAS[1])
+    assert [entry for entry in host.order if entry[1] in (HOLDER, COLLECTOR)] == [
+        ("stop", COLLECTOR), ("stop", HOLDER), ("up", HOLDER), ("up", COLLECTOR)]
 
 
 def deferred_host(tmp_path, monkeypatch):
@@ -448,6 +510,56 @@ def test_a_call_wait_running_past_05_00_stops_nothing_and_defers(tmp_path, monke
     assert host.order == [] and 590 < bounds[0] <= 600  # bounded by the window's end, 10 minutes away
     assert result["counts"] == {"planned": 0, "recovery": 0, "flagged": 0, "rollback": 0}
     assert "synthetic/" + HOLDER in host.ledger()["pending"] and p.unfinished(host.state) == []
+
+
+# spec: ANYM-896
+def test_a_pass_whose_call_wait_returns_after_05_00_stops_nothing_and_counts_nothing(tmp_path, monkeypatch):
+    host = deferred_host(tmp_path, monkeypatch)
+    def calls(settings, deadline):  # the last poll started before 05:00 and answered after it
+        host.now = wita(11, 5, 0, ) + timedelta(seconds=2)
+    monkeypatch.setattr(p, "wait_for_calls", calls)
+    host.now, host.order = wita(11, 4, 59), []
+    result = p.holder_pass(host.settings, None)
+    assert host.order == [] and result["status"] == "deferred"
+    assert result["outcomes"]["synthetic/" + HOLDER] == {"status": "deferred", "services": [HOLDER], "reason": "window closed"}
+    assert result["counts"] == {"planned": 0, "recovery": 0, "flagged": 0, "rollback": 0}
+    assert "synthetic/" + HOLDER in host.ledger()["pending"] and p.unfinished(host.state) == []
+
+
+# spec: ANYM-896
+def test_a_log_read_that_times_out_in_the_pass_restores_the_holder(tmp_path, monkeypatch):
+    host = deferred_host(tmp_path, monkeypatch)
+    previous = host.containers[HOLDER]["Image"]
+    def timed_out(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, 30)
+    monkeypatch.setattr(p.subprocess, "run", timed_out)
+    monkeypatch.setattr(p, "holder_log", HOLDER_LOG)  # the real reader: a timeout is no attach seen
+    monkeypatch.setattr(p, "HOLDER_ATTACH_S", 0)
+    host.now, host.order = wita(11, 3, 45), []
+    result = p.holder_pass(host.settings, None)
+    assert result["status"] == "rolled_back" and "no collector attached" in result["outcomes"]["synthetic/" + HOLDER]["check"]
+    assert host.containers[HOLDER]["Image"] == previous and p.unfinished(host.state) == []
+    def broken(container, since):
+        raise RuntimeError("synthetic")
+    monkeypatch.setattr(p, "holder_log", broken)  # any other exception of a check restores too
+    host.now = wita(12, 3, 45)
+    again = p.holder_pass(host.settings, None)
+    assert again["outcomes"]["synthetic/" + HOLDER]["check"] == "a session check failed: RuntimeError"
+    assert host.containers[HOLDER]["Image"] == previous
+
+
+# spec: ANYM-896
+def test_the_urgent_flag_is_refused_while_the_compose_configuration_drifted(tmp_path, monkeypatch):
+    host = first(tmp_path, monkeypatch)
+    http = {"state_directory": str(tmp_path / "http-state")}
+    (tmp_path / "http-state").mkdir()
+    p.write(tmp_path / "http-state" / "http-current.json", {"config_digest": p.digest(http)})
+    host.units[HOLDER]["environment"] = {"SYNTHETIC": "edited by hand"}
+    host.write_compose()
+    host.order = []
+    result = p.holder_flagged(host.settings, http, (HOLDER, "incident:synthetic-record"))
+    assert result["status"] == "refused" and "Compose configuration of synthetic changed" in result["reason"]
+    assert host.order == []
 
 
 # spec: ANYM-896
