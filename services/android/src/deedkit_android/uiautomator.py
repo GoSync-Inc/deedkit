@@ -92,6 +92,7 @@ def validate_commands(commands):
         if name == 'launchApp':
             permissions = options.get('permissions', {})
             if not isinstance(permissions, dict) or any(
+                not isinstance(permission, str) or not isinstance(setting, str) or
                 setting not in {'allow', 'deny', 'unset'} or
                 (permission == 'all' and setting != 'unset') or
                 (permission not in {'all', 'notifications'} and not permission.startswith('android.permission.'))

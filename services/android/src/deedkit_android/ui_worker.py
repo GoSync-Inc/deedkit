@@ -98,7 +98,7 @@ def point(device, value):
         raise Refused('invalid_point', 422)
     width, height = device.window_size()
     return tuple(round(float(str(v).strip().rstrip('%')) * size / 100) if str(v).strip().endswith('%')
-                 else int(v) for v, size in zip(parts, (width, height)))
+                 else round(float(v)) for v, size in zip(parts, (width, height)))
 
 
 def shell(device, args):

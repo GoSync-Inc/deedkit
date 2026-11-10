@@ -174,6 +174,20 @@ def test_invalid_action_options_are_rejected_before_a_batch_can_tap():
 
 
 # spec: ANYM-953
+def test_decimal_points_and_malformed_permission_values():
+    from deedkit_android.ui_worker import point
+    from deedkit_android.uiautomator import validate_commands
+
+    device = SimpleNamespace(window_size=lambda: (1000, 2000))
+    assert point(device, '12.5, 20.9') == (12, 21)
+    assert point(device, '12.5%, 20.9%') == (125, 418)
+    for source in ('- launchApp: {appId: example.app, permissions: {notifications: []}}',
+                   '- launchApp: {appId: example.app, permissions: {42: allow}}'):
+        with pytest.raises(Refused):
+            validate_commands(compile_flow(source, {}))
+
+
+# spec: ANYM-953
 def test_unicode_input_uses_accessibility_without_copying_to_clipboard():
     from deedkit_android.ui_worker import execute
 
