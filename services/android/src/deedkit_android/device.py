@@ -21,6 +21,7 @@ from xml.etree import ElementTree
 
 from .config import Refused
 from .flow_runner import FlowRunner
+from .uiautomator import Uiautomator, UiRunner
 from .maestro import Maestro, screen_elements
 from .store import MAX_FILE
 
@@ -89,6 +90,7 @@ class Devices:
         self.locks = {name: asyncio.Lock() for name in config.devices}
         self.tasks = {}
         self.maestro = Maestro(config, store.lock_fd)
+        self.ui = Uiautomator(config, store.lock_fd) if getattr(config, "uiautomator2_jar", None) else None
 
     async def close(self):
         tasks = list(self.tasks.values())
@@ -96,10 +98,14 @@ class Devices:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await self.maestro.close()
+        if self.ui:
+            await self.ui.close()
 
     @asynccontextmanager
     async def locked(self, owner, device, session):
         self.store.touch(owner, device, session)
+        if self.ui:
+            await self.ui.ensure_fenced_process_stopped(device)
         lock = self.locks[device]
         if lock.locked():
             raise Refused("device_busy")
@@ -179,6 +185,20 @@ class Devices:
         return {"screenshot_error": "unavailable"}
 
     async def capture_hierarchy(self, device):
+        if self.ui:
+            try:
+                async with asyncio.timeout(8):
+                    result = await self.ui.call(device, '__hierarchy__')
+                root = ElementTree.fromstring(result['xml'])
+                elements = []
+                for node in root.iter('node'):
+                    item = dict(node.attrib)
+                    if item.get('password') == 'true':
+                        item['text'], item['content-desc'] = '', ''
+                    elements.append(item)
+                return {'hierarchy_source': 'uiautomator2', 'elements': elements}
+            except (TimeoutError, OSError, Refused, ValueError, KeyError):
+                return {'hierarchy_source': 'uiautomator2', 'hierarchy_error': 'unavailable'}
         if self.config.maestro:
             try:
                 hierarchy = await self.maestro.call("inspect_screen", {"device_id": self.config.devices[device]}, 8)
@@ -260,6 +280,8 @@ class Devices:
             self.store.admit(owner, request_id, payload)
             return previous
         self.store.touch(owner, device, session)
+        if self.ui:
+            await self.ui.ensure_fenced_process_stopped(device)
         lock = self.locks[device]
         if lock.locked():
             raise Refused("device_busy")
@@ -269,7 +291,7 @@ class Devices:
             temporary = tempfile.TemporaryDirectory(dir=self.store.directory)
             if flow is None:
                 command, output = self.prepare(owner, device, argv, Path(temporary.name))
-            elif not self.config.maestro:
+            elif not self.config.maestro and not self.ui:
                 raise Refused("maestro_not_configured", 503)
             self.store.admit(owner, request_id, payload)
         except BaseException:
@@ -337,7 +359,10 @@ class Devices:
     async def perform_flow(self, owner, device, request_id, commands, timeout, temporary, lock,
                            element_timeout_ms=5000, optional_timeout_ms=1000):
         state, result = "unknown", {}
-        runner = FlowRunner(self.maestro.call, self.config.devices[device], element_timeout_ms, optional_timeout_ms)
+        started = time.monotonic()
+        runner = (UiRunner(lambda command, **options: self.ui.call(device, command, **options),
+                           element_timeout_ms, optional_timeout_ms) if self.ui else
+                  FlowRunner(self.maestro.call, self.config.devices[device], element_timeout_ms, optional_timeout_ms))
         cancelled = False
         try:
             checkpoint = next((i for i, command in enumerate(commands)
@@ -379,6 +404,9 @@ class Devices:
                                       failed_command_path=runner.current_path, failed_command=runner.current_command)
                     if not cancelled:
                         result['observation'] = await self.failure_observation(owner, device)
+                if self.ui:
+                    result.update(engine='uiautomator2', steps=runner.steps,
+                                  elapsed_ms=round((time.monotonic() - started) * 1000, 2))
                 self.store.finish(owner, request_id, state, result)
             finally:
                 temporary.cleanup()

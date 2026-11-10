@@ -39,7 +39,8 @@ BARE = {'back', 'scroll', 'hideKeyboard', 'pasteText', 'toggleAirplaneMode', 'to
 VARIABLE = re.compile(r'\$\{([A-Z][A-Z0-9_]{0,63})\}')
 
 
-def compile_flow(source, parameters, *, resolve=None, _stack=(), _budget=None, _depth=0):
+def compile_flow(source, parameters, *, resolve=None, fields=None, _stack=(), _budget=None, _depth=0):
+    fields = FIELDS if fields is None else fields
     if len(source.encode()) > 32768 or len(parameters) > 64:
         raise Refused('flow_too_large', 422)
     if any(not re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}', k) or len(v) > 4096 or '${' in v
@@ -94,9 +95,9 @@ def compile_flow(source, parameters, *, resolve=None, _stack=(), _budget=None, _
             if not isinstance(command, dict) or len(command) != 1:
                 raise Refused('invalid_flow_command', 422)
             name, argument = next(iter(command.items()))
-            if name not in FIELDS:
+            if name not in fields:
                 raise Refused('unsupported_flow_command', 422)
-            if isinstance(argument, dict) and set(argument) - FIELDS[name]:
+            if isinstance(argument, dict) and set(argument) - fields[name]:
                 raise Refused('unsupported_flow_option', 422)
             if isinstance(argument, dict):
                 for condition in ('when', 'while'):
@@ -124,7 +125,7 @@ def compile_flow(source, parameters, *, resolve=None, _stack=(), _budget=None, _
                         or reference in _stack or len(_stack) >= 8):
                     raise Refused('invalid_flow_reference', 422)
                 nested = compile_flow(resolve(reference, argument.get('version')), parameters,
-                                      resolve=resolve, _stack=(*_stack, reference), _budget=budget, _depth=depth + 1)
+                                      resolve=resolve, fields=fields, _stack=(*_stack, reference), _budget=budget, _depth=depth + 1)
                 argument = {key: child for key, child in argument.items() if key not in {'name', 'version'}}
                 argument['commands'] = nested
                 # The referenced source has already consumed the shared command budget.

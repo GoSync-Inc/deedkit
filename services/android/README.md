@@ -147,9 +147,35 @@ Observation PNGs have a separate 16 MiB ceiling, to preserve full-resolution pho
 Receipts persist in SQLite. Preserve the state directory across upgrades to retain
 duplicate-request protection.
 
-## Maestro workflows
+## Device workflows
 
-Install a pinned Maestro CLI release with its supported Java runtime. Set optional
+The recommended engine is persistent uiautomator2 3.7.1. Build the patched device
+server with `tools/build_uiautomator.py` on a host with JDK 17 and Android SDK 35.
+The script pins upstream source, binds the server to `127.0.0.1`, removes request
+body logging and suppresses clipboard/toast information logs. Record the printed
+SHA256, stage the artifact beside the service release, and set absolute
+`uiautomator2_jar` and matching `uiautomator2_jar_sha256` in the private config.
+The service verifies the artifact before starting. Each device gets one lazy,
+persistent worker and a loopback-only server reachable through USB ADB.
+
+Read `android_capabilities.ui.engine`, then `android_maestro(action=reference)`.
+The latter keeps its existing compatibility name and reports the active engine's
+commands. Validation rejects unsupported commands before the first action. On
+uiautomator2, `text` and `id` are regular expressions, while `textExact` and
+`resourceId` are exact. `setText: {resourceId: example:id/search, value: '${QUERY}'}`
+replaces an input's value directly. `inputText` appends to a focused field.
+`exists` returns a boolean in the corresponding step result. Legacy
+`retryTapIfNoChange` is accepted without automatic repeated taps. Explicit
+`waitToSettleTimeoutMs` adds a post-tap wait. Relative/image selectors, clipboard,
+location and display settings use the existing ADB entry point on this engine.
+
+The batch response adds `engine`, `elapsed_ms` and `steps`. Each step records its
+command name, nested path, elapsed milliseconds and result or error. One
+`android_run_flow` call executes the whole batch on the USB host, including waits.
+Use several local steps per call to avoid network/model round trips. Original
+PNG download and failure capture follow the same contract below.
+
+Older installations can still install a pinned Maestro CLI release with its supported Java runtime. Set optional
 absolute `maestro` and `java_home` paths in the private service configuration and
 restart the service. The service starts one local stdio MCP process lazily and
 retains its device connection. The gateway continues using the same Android
@@ -248,7 +274,7 @@ can cause the apps themselves to contact their services.
 ## Observation and image coordinates
 
 Screenshot capture and hierarchy inspection run concurrently with bounded waits.
-With Maestro configured, the hierarchy uses its persistent accessibility driver.
+With uiautomator2 or Maestro configured, the hierarchy uses the active persistent accessibility driver.
 Nodes keep the existing ADB-style attribute names. Maestro's compact hierarchy
 omits password flags, so editable-node text is conservatively omitted. Without
 Maestro, the existing ADB hierarchy path remains available.
@@ -257,7 +283,7 @@ PNGs retain their source pixels. `device_size` gives the full frame dimensions,
 `image.width` and `image.height` give delivered image dimensions, and `image_origin`
 gives the top-left position within the full frame. Bounds and ADB coordinates use
 device pixels. A client's smaller preview can have a different pixel scale.
-Maestro also accepts percentage points for taps and swipes.
+Both engines accept percentage points for taps and swipes.
 
 `crop={x,y,w,h}` returns only that region. It preserves pixel values and reports
 its origin. Use a region whose longest side is within the client preview limit
@@ -266,7 +292,7 @@ file and returns `image_file.file_id`. `image_mode=both` also includes the nativ
 MCP image. Fetch it through `android_download` with `length=4194304` to avoid
 many small round trips, then delete it through `android_delete_file`.
 
-Upgrading a host to a Maestro-enabled config must update the executable and
+Upgrading a host to an engine-enabled config must update the executable and
 configuration together. Rollback must restore both originals because older
 service versions reject the new optional keys.
 
@@ -290,7 +316,7 @@ reference. `action=validate` accepts inline `yaml` or a saved `name`, optional
 `version`, and literal `parameters`. It validates the supported dialect and expands
 saved references without taking control of the device.
 
-Relative selectors include `below`, `above`, `leftOf`, `rightOf`, `childOf`,
+On the legacy Maestro engine, relative selectors include `below`, `above`, `leftOf`, `rightOf`, `childOf`,
 `containsChild` and `containsDescendants`. Clipboard, orientation, location,
 permissions, application state and display-mode commands are listed in the reference.
 Saved flows compose through `runFlow` with a `name` and optional `version`.
@@ -308,3 +334,13 @@ principal's store before admission to device execution. Expansion shares the
 
 The API exposes local device workflows. Host scripts, JavaScript expressions,
 cloud execution and a browser viewer are outside this dialect.
+
+### Runtime cleanup
+
+The UIA2 worker sends every RPC once. Lost responses stop the owned worker and
+its token-identified Android process before another operation is admitted.
+Cleanup verifies the PID identity and leaves a private marker if the device is
+unreachable, so later operations must complete cleanup first. It never kills a
+generic `app_process` or adopts another server. Rollback to an older service must
+finish this cleanup while the new service still understands those markers.
+No model API or analytics service receives device content from the runtime.

@@ -26,6 +26,8 @@ class Config(Strict):
     state_dir: str
     maestro: str | None = None
     java_home: str | None = None
+    uiautomator2_jar: str | None = None
+    uiautomator2_jar_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     devices: dict[str, str]
     principals: list[Principal]
 
@@ -40,9 +42,14 @@ class Configuration:
     def __init__(self, path):
         self.path = Path(path)
         self.initial = self.read()
-        for value in (self.initial.adb, self.initial.state_dir, self.initial.maestro, self.initial.java_home):
+        for value in (self.initial.adb, self.initial.state_dir, self.initial.maestro, self.initial.java_home, self.initial.uiautomator2_jar):
             if value is not None and not Path(value).is_absolute():
                 raise ValueError("absolute_runtime_paths_required")
+
+        if self.initial.uiautomator2_jar:
+            digest = hashlib.sha256(Path(self.initial.uiautomator2_jar).read_bytes()).hexdigest()
+            if digest != self.initial.uiautomator2_jar_sha256:
+                raise ValueError("uiautomator2_artifact_hash_mismatch")
 
     def read(self):
         fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -73,8 +80,8 @@ class Configuration:
             config = self.read()
         except (OSError, ValueError):
             raise Refused("configuration_unavailable", 503) from None
-        if (config.adb, config.state_dir, config.devices, config.maestro, config.java_home) != (
-            self.initial.adb, self.initial.state_dir, self.initial.devices, self.initial.maestro, self.initial.java_home,
+        if (config.adb, config.state_dir, config.devices, config.maestro, config.java_home, config.uiautomator2_jar, config.uiautomator2_jar_sha256) != (
+            self.initial.adb, self.initial.state_dir, self.initial.devices, self.initial.maestro, self.initial.java_home, self.initial.uiautomator2_jar, self.initial.uiautomator2_jar_sha256,
         ):
             raise Refused("runtime_configuration_changed", 503)
         if not authorization.startswith("Bearer "):

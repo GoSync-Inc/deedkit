@@ -15,6 +15,7 @@ from .config import Configuration, Refused, Strict
 from .device import COMMANDS, Devices
 from .flows import BARE, FIELDS, compile_flow, reference
 from .store import Store, identifier
+from .uiautomator import UI_FIELDS, reference as ui_reference, validate_commands
 
 
 class Device(Strict):
@@ -116,8 +117,10 @@ def create_app(config_path):
         try:
             yield
         finally:
-            await devices.close()
-            store.close()
+            try:
+                await devices.close()
+            finally:
+                store.close()
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -148,11 +151,19 @@ def create_app(config_path):
         if device is not None and device not in principal.devices:
             raise Refused("not_found", 404)
         owner = principal.id
+        def compile_source(source, parameters):
+            commands = compile_flow(source, parameters, fields=UI_FIELDS if devices.ui else None,
+                resolve=lambda name, version: store.flow(owner, "get", name, None, version)["yaml"])
+            if devices.ui:
+                validate_commands(commands)
+            return commands
         if operation == "capabilities":
             result = {"service": "deedkit-android", "permissions": principal.permissions,
                       "devices": await devices.status(principal.devices), "adb_commands": sorted(COMMANDS),
                       "tool_manifest": {"version": 1, "names": list(SCHEMAS)},
                       "input_schemas": {name: schema.model_json_schema() for name, schema in SCHEMAS.items()},
+                      "ui": {"engine": "uiautomator2" if devices.ui else "maestro",
+                             "reference_tool": "android_maestro", "batch_tool": "android_run_flow"},
                       "maestro": {"configured": bool(configuration.initial.maestro),
                                   "commands": sorted(FIELDS.keys() | BARE), "dialect_version": 2, "checkpoint": "explicit_agent_handoff"},
                       "session_policy": {"renew_on_activity": True, "release_explicitly": True,
@@ -172,24 +183,22 @@ def create_app(config_path):
                                            args["argv"], args["timeout_s"], args["wait_s"])
         elif operation == "maestro":
             if args["action"] == "reference":
-                result = reference()
+                result = ui_reference() if devices.ui else reference()
             else:
                 if (args["yaml"] is None) == (args["name"] is None):
                     raise Refused("provide_yaml_or_flow_name", 422)
                 source = args["yaml"]
                 if source is None:
                     source = store.flow(owner, "get", args["name"], None, args["version"])["yaml"]
-                commands = compile_flow(source, args["parameters"],
-                    resolve=lambda name, version: store.flow(owner, "get", name, None, version)["yaml"])
-                result = {"valid": True, "dialect_version": 2, "commands": commands}
+                commands = compile_source(source, args["parameters"])
+                result = {"valid": True, "dialect_version": 3 if devices.ui else 2, "commands": commands}
         elif operation == "run_flow":
             if (args["yaml"] is None) == (args["name"] is None):
                 raise Refused("provide_yaml_or_flow_name", 422)
             source = args["yaml"]
             if source is None:
                 source = store.flow(owner, "get", args["name"], None, args["version"])["yaml"]
-            commands = compile_flow(source, args["parameters"],
-                resolve=lambda name, version: store.flow(owner, "get", name, None, version)["yaml"])
+            commands = compile_source(source, args["parameters"])
             result = await devices.execute(owner, device, args["session_id"], identifier(args["request_id"]),
                                            None, args["timeout_s"], args["wait_s"], flow=commands,
                                            element_timeout_ms=args['element_timeout_ms'],
@@ -198,8 +207,7 @@ def create_app(config_path):
             if args["action"] == "put":
                 if not args["yaml"]:
                     raise Refused("invalid_flow_source", 422)
-                compile_flow(args["yaml"], defaultdict(lambda: "placeholder"),
-                    resolve=lambda name, version: store.flow(owner, "get", name, None, version)["yaml"])
+                compile_source(args["yaml"], defaultdict(lambda: "placeholder"))
             result = store.flow(owner, args["action"], args["name"], args["yaml"], args["version"])
         elif operation == "get_operation":
             result = await devices.receipt(owner, identifier(args["request_id"]), args["wait_s"])

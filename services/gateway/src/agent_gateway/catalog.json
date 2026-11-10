@@ -8967,7 +8967,7 @@
       "android:read"
     ],
     "required_manifest": true,
-    "description": "Start here for Android. Read devices[].device_id and state, session_policy, adb_commands and maestro. Pick a connected device, acquire android_session, then use android_observe and android_execute or android_run_flow. For saved scenarios discover android_flows, and for the supported YAML dialect use android_maestro. Example: {}",
+    "description": "Start here for Android. Read devices[].device_id and state, session_policy, adb_commands and ui.engine (or legacy maestro). Pick a connected device, acquire android_session, then use android_observe and android_execute or android_run_flow. For saved scenarios discover android_flows, and for the active engine’s supported YAML dialect use android_maestro (compatibility tool name, also serves uiautomator2). Example: {}",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},
@@ -8987,7 +8987,7 @@
       "android:read"
     ],
     "required_manifest": true,
-    "description": "Read native-resolution PNG and UI elements in device-pixel coordinates under an acquired session. Image width/height identify the source coordinate space even if the client resizes its preview. Maestro hierarchy is used when configured. Missing hierarchy does not prevent a screenshot. Re-observe after UI changes. Use crop={x,y,w,h} for small text. image_mode=file or both saves exact PNG bytes and returns image_file.file_id. Use android_download with that file_id and length up to 4194304 to obtain the original bytes.",
+    "description": "Read native-resolution PNG and UI elements in device-pixel coordinates under an acquired session. Image width/height identify the source coordinate space even if the client resizes its preview. The active persistent UI engine supplies the hierarchy when configured. Missing hierarchy does not prevent a screenshot. Re-observe after UI changes. Use crop={x,y,w,h} for small text. image_mode=file or both saves exact PNG bytes and returns image_file.file_id. Use android_download with that file_id and length up to 4194304 to obtain the original bytes.",
     "inputSchema": {
       "$defs": {
         "Crop": {
@@ -9352,7 +9352,7 @@
       "android:control"
     ],
     "required_manifest": true,
-    "description": "Acquire android_session first and validate with android_maestro. Provide exactly one of yaml or saved name. List saved names and versions with android_flows. Run inline device-only Maestro YAML or a saved flow name with optional pinned version and literal parameters. Supports text/id selectors, Unicode input, waits, gestures and nested inline flows. Use ${NAME} for literal parameters. No host scripts, JavaScript or external flow paths. One request_id never replays actions. A top-level checkpoint returns paused and remaining_yaml for the agent to observe and continue deliberately. Poll android_get_operation after running or unknown responses. Missing elements wait 5s by default (optional: 1s); set element_timeout_ms/optional_timeout_ms or selector.timeout/when.timeout to override. These bound native lookup probes, not driver startup or subsequent actions. On terminal failure, observation contains an owner-scoped image_file.file_id and compact elements; android_download retrieves the PNG. failed_command_index is zero-based; failed_command_path includes nested indexes. Earlier steps may have acted: inspect before resuming, never replay the whole flow automatically. If backend_unavailable explicitly says operation_sent=false, wait retry_after_seconds then retry with the same request_id.",
+    "description": "Acquire android_session first and validate with android_maestro. Provide exactly one of yaml or saved name. List saved names and versions with android_flows. Run inline device-only YAML on the configured engine or a saved flow name with optional pinned version and literal parameters. Supports text/id selectors, Unicode input, waits, gestures and nested inline flows. Use ${NAME} for literal parameters. No host scripts, JavaScript or external flow paths. One request_id never replays actions. A top-level checkpoint returns paused and remaining_yaml for the agent to observe and continue deliberately. Poll android_get_operation after running or unknown responses. Missing elements wait 5s by default (optional: 1s); set element_timeout_ms/optional_timeout_ms or selector.timeout/when.timeout to override. These bound lookups; timeout_s bounds the full batch including startup. On uiautomator2, steps lists each executed command’s path, elapsed_ms and result, and elapsed_ms gives the batch total. Execute several steps in one call to avoid MCP round trips. On terminal failure, observation contains an owner-scoped image_file.file_id and compact elements; android_download retrieves the PNG. failed_command_index is zero-based; failed_command_path includes nested indexes. Earlier steps may have acted: inspect before resuming, never replay the whole flow automatically. If backend_unavailable explicitly says operation_sent=false, wait retry_after_seconds then retry with the same request_id.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -9462,7 +9462,7 @@
       "android:control"
     ],
     "required_manifest": true,
-    "description": "List, get, put or delete owner-scoped reusable Maestro YAML flows on the USB host. Use version for optimistic update/delete or pinned reads. Saving a flow does not execute it. See android_capabilities for supported commands and schemas. Begin with action=list, then action=get with a returned name. For action=put provide name and yaml; save the returned version for pinned android_run_flow calls. Validate source with android_maestro.",
+    "description": "List, get, put or delete owner-scoped reusable device workflow YAML on the USB host. Use version for optimistic update/delete or pinned reads. Saving a flow does not execute it. See android_capabilities for supported commands and schemas. Begin with action=list, then action=get with a returned name. For action=put provide name and yaml; save the returned version for pinned android_run_flow calls. Validate source with android_maestro.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -9616,7 +9616,7 @@
     "scopes": [
       "android:read"
     ],
-    "description": "Read the local Maestro reference with action=reference before authoring YAML. It lists supported commands, selector fields and examples. Then use action=validate with exactly one of yaml or saved name, plus parameters when needed. Validation returns compiled commands without executing them. Saved subflows are owner-scoped. Execute validated YAML or a saved name with android_run_flow under an acquired android_session. Example: {\"action\":\"reference\"} YAML is a command list without appId/--- headers. A checkpoint is a scalar: - checkpoint: verify. Reference includes saved-subflow and targeted permission-dialog examples.",
+    "description": "Read the active Android workflow engine reference with action=reference. The compatibility name android_maestro also serves uiautomator2. It lists supported commands, selector fields and examples. Then use action=validate with exactly one of yaml or saved name, plus parameters when needed. Validation returns compiled commands without executing them. Saved subflows are owner-scoped. Execute validated YAML or a saved name with android_run_flow under an acquired android_session. Example: {\"action\":\"reference\"} YAML is a command list without appId/--- headers. A checkpoint is a scalar: - checkpoint: verify. Reference includes saved-subflow and targeted permission-dialog examples.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
