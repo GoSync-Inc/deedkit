@@ -5,7 +5,8 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Start here for messaging. Use accounts[].id as account. Discover messages_list_chats for chat IDs, messages_search for message IDs and messages_search_files for attachment IDs. Reuse those IDs in reading tools. For live messenger actions, inspect messages_list_messenger_operations for the selected account and its operation-specific parameters_schema. Identity, permitted accounts, source coverage and unavailable features. detail=summary (default) is a short index naming the sections; sections=[names] returns only those blocks; detail=full returns everything. An unknown section name returns invalid_filter. version is the package version and does not change per release; build.source_sha is the commit this messaging server was built from and build.started_at when it started (the gateway, calls and calendar services deploy separately and are not reported here). A null build.source_sha means the image was built without its commit: on production, report it as a deploy defect. A restart without a deploy also moves started_at, so compare SHAs when the expected one is known.",
+    "description": "Identity, permitted accounts, source coverage and unavailable features. detail=summary (default) is a short index naming the sections; sections=[names] returns only those blocks; detail=full returns everything. An unknown section name returns invalid_filter. version is the package version and does not change per release; build.source_sha is the commit this messaging server was built from and build.started_at when it started (the gateway, calls and calendar services deploy separately and are not reported here). A null build.source_sha means the image was built without its commit: on production, report it as a deploy defect. A restart without a deploy also moves started_at, so compare SHAs when the expected one is known.",
+    "guidance": "Start here for messaging. Use accounts[].id as account. Discover messages_list_chats for chat IDs, messages_search for message IDs and messages_search_files for attachment IDs. Reuse those IDs in reading tools. For live messenger actions, inspect messages_list_messenger_operations for the selected account and its operation-specific parameters_schema.",
     "inputSchema": {
       "properties": {
         "detail": {
@@ -2360,7 +2361,8 @@
   },
   {
     "name": "calendar_capabilities",
-    "description": "Start here for calendar work. Discover calendar_calendars for calendar_ref and calendar_members for member IDs. Read events with calendar_agenda, find availability with calendar_find_time or calendar_slots, and discover the full schema of the chosen planning or scheduling tool before any change. Follow calendar_operation for unsettled operation_id results. Read-only. Granted calendars with allowed event actions, plus constraints: accepted time format, window/calendar/event limits, plan action limit and TTL. recurrence_write and future_split describe calendar_plan only (false: a plan never edits a whole series or this-and-following; invitations false: a plan never invites); series_write lists calendar_schedule's series scopes per provider (this, following, all). Read this before planning.",
+    "description": "Read-only. Granted calendars with allowed event actions, plus constraints: accepted time format, window/calendar/event limits, plan action limit and TTL. recurrence_write and future_split describe calendar_plan only (false: a plan never edits a whole series or this-and-following; invitations false: a plan never invites); series_write lists calendar_schedule's series scopes per provider (this, following, all). Read this before planning.",
+    "guidance": "Start here for calendar work. Discover calendar_calendars for calendar_ref and calendar_members for member IDs. Read events with calendar_agenda, find availability with calendar_find_time or calendar_slots, and discover the full schema of the chosen planning or scheduling tool before any change. Follow calendar_operation for unsettled operation_id results.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},
@@ -2378,7 +2380,8 @@
   },
   {
     "name": "calendar_calendars",
-    "description": "Use each returned calendar_ref in calendar_agenda and calendar_plan. List only explicitly granted Google/iCloud calendars. Provider credentials and URLs are never returned.",
+    "description": "List only explicitly granted Google/iCloud calendars. Provider credentials and URLs are never returned.",
+    "guidance": "Use each returned calendar_ref in calendar_agenda and calendar_plan.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},
@@ -2396,7 +2399,8 @@
   },
   {
     "name": "calendar_members",
-    "description": "Use each returned person_id in calendar_slots.member_ids. Family members, roles and authorized availability bindings; inaccessible or unbound sources are explicit.",
+    "description": "Family members, roles and authorized availability bindings; inaccessible or unbound sources are explicit.",
+    "guidance": "Use each returned person_id in calendar_slots.member_ids.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},
@@ -5892,7 +5896,8 @@
     "module": "calls",
     "operation": "capabilities",
     "scopes": [],
-    "description": "Read-only; places no call. Start here for calls. Discover calls_call for a single-call workflow, or calls_prepare_external_call then calls_preflight_call and calls_dial_call for staged preparation. Browser rehearsal uses calls_prepare_call then calls_start_call. Follow returned call_id with calls_call_result or calls_get_call_status and calls_get_call_result. Only use tools authorized by discovery. Shows this principal's calls scopes, each granted channel's configured state and recipient policy (any valid destination; SIP: exact allowlist), the daily call cap with the owner's active raises, daily_calls_remaining, brief/call limits, and voice_engines: each engine (gemini_live, grok_live) with available (key configured), model, voices, languages, tool_calls, success_fields and which engine an omitted voice_engine uses. calling_readiness per channel: configuration_ready and blockers judge an omitted voice_engine; voice_engines, ready_engines and auto say which explicit choice works now. Contacts no provider; preflight_call checks one external brief.",
+    "description": "Read-only; places no call. Shows this principal's calls scopes, each granted channel's configured state and recipient policy (any valid destination; SIP: exact allowlist), the daily call cap with the owner's active raises, daily_calls_remaining, brief/call limits, and voice_engines: each engine (gemini_live, grok_live) with available (key configured), model, voices, languages, tool_calls, success_fields and which engine an omitted voice_engine uses. calling_readiness per channel: configuration_ready and blockers judge an omitted voice_engine; voice_engines, ready_engines and auto say which explicit choice works now. Contacts no provider; preflight_call checks one external brief.",
+    "guidance": "Start here for calls. Discover calls_call for a single-call workflow, or calls_prepare_external_call then calls_preflight_call and calls_dial_call for staged preparation. Browser rehearsal uses calls_prepare_call then calls_start_call. Follow returned call_id with calls_call_result or calls_get_call_status and calls_get_call_result. Only use tools authorized by discovery.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},

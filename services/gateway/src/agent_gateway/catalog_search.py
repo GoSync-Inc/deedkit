@@ -14,16 +14,18 @@ def search_tools(visible, details, args):
         matches = [name for name in names if name == query]
     else:
         words = query.split()
-        matches = [name for name in names if all(word in (name + " " + CATALOG[name]["description"]).casefold()
+        matches = [name for name in names if all(word in (name + " " + CATALOG[name]["description"] + " "
+                                                        + CATALOG[name].get("guidance", "")).casefold()
                                                 for word in words)]
     start, end = args["offset"], args["offset"] + args["limit"]
     rows = []
     for name in matches[start:end]:
         tool = CATALOG[name]
-        row = {"name": name, "module": tool["module"], "description": tool["description"],
+        published = public(tool, details["actions"])
+        row = {"name": name, "module": tool["module"], "description": published["description"],
                "read_only": tool.get("annotations", {}).get("readOnlyHint", False)}
         if args["detail"] == "full":
-            row.update(public(tool, details["actions"]))
+            row.update(published)
         rows.append(row)
     return {"modules": [{"id": module, "tool_count": count} for module, count in sorted(modules.items())],
             "tools": rows, "total": len(matches), "next_offset": end if end < len(matches) else None,

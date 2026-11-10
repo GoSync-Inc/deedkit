@@ -59,6 +59,8 @@ def public(tool, actions=None):
     if tool.get("action_group") and "operation" in result["inputSchema"].get("properties", {}):
         result["inputSchema"]["properties"]["operation"]["enum"] = routed(tool, actions)
         result["description"] = with_example(tool, result["inputSchema"]["properties"]["operation"]["enum"])
+    if tool.get("guidance"):
+        result["description"] += " " + tool["guidance"]
     return result
 
 

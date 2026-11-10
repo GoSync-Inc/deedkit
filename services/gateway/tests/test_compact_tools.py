@@ -9,8 +9,20 @@ pytest_plugins = ("test_module_selection",)
 
 
 # spec: ANYM-952
+def test_public_tool_adds_gateway_guidance_without_changing_backend_metadata():
+    from agent_gateway.catalog import CATALOG, public
+
+    tool = dict(CATALOG['calendar_calendars'], guidance='Reuse the returned calendar_ref.')
+    original = tool['description']
+    published = public(tool)
+    assert published['description'] == original + ' ' + tool['guidance']
+    assert tool['description'] == original
+    assert 'guidance' not in published
+
+
+# spec: ANYM-952
 def test_every_module_has_entry_guidance_and_valid_example_arguments():
-    from agent_gateway.catalog import CATALOG, arguments
+    from agent_gateway.catalog import CATALOG, arguments, public
 
     entry_points = {
         'messaging': ('messages_capabilities', 'messages_list_chats'),
@@ -23,7 +35,7 @@ def test_every_module_has_entry_guidance_and_valid_example_arguments():
     }
     assert set(entry_points) == {tool['module'] for tool in CATALOG.values()}
     for entry, next_tool in entry_points.values():
-        assert next_tool in CATALOG[entry]['description']
+        assert next_tool in public(CATALOG[entry])['description']
     for name, tool in CATALOG.items():
         _, marker, example = tool['description'].partition('Example: ')
         if marker:
