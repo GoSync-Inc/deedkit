@@ -9,6 +9,7 @@ from deedkit_android.flows import compile_flow
 from deedkit_android.store import Store
 
 
+# spec: ANYM-951
 def test_flow_compilation_keeps_text_literal_and_refuses_host_execution():
     commands = compile_flow('- inputText: ${QUERY}\n- pressKey: Enter', {'QUERY': 'чай ☕'})
     assert commands[0] == {'inputText': 'чай ☕'}
@@ -22,6 +23,7 @@ def test_flow_compilation_keeps_text_literal_and_refuses_host_execution():
         compile_flow('- inputText: ${QUERY}', {'QUERY': '${java.lang.System.exit(0)}'})
 
 
+# spec: ANYM-951
 def test_checkpoint_is_explicit_and_launch_preserves_current_app_state():
     commands = compile_flow('- launchApp: com.example.synthetic\n- checkpoint: verify\n- back', {})
     assert commands[0]['launchApp']['stopApp'] is False
@@ -31,6 +33,7 @@ def test_checkpoint_is_explicit_and_launch_preserves_current_app_state():
         compile_flow('- repeat: {times: 2, commands: [{checkpoint: nested}]}', {})
 
 
+# spec: ANYM-951
 def test_activity_renewal_retains_token_isolation_and_bounds_abandonment(tmp_path, monkeypatch):
     now = [1000.0]
     monkeypatch.setattr(time, 'time', lambda: now[0])
@@ -50,6 +53,7 @@ def test_activity_renewal_retains_token_isolation_and_bounds_abandonment(tmp_pat
         store.close()
 
 
+# spec: ANYM-951
 def test_saved_flows_are_owner_scoped_and_versioned(tmp_path):
     store = Store(tmp_path / 'state')
     try:
@@ -64,6 +68,7 @@ def test_saved_flows_are_owner_scoped_and_versioned(tmp_path):
         store.close()
 
 
+# spec: ANYM-951
 def test_compact_maestro_hierarchy_preserves_legacy_nodes_and_masks_inputs():
     from deedkit_android.maestro import screen_elements
     nodes = screen_elements({'elements': [{'b': '[0,0][10,20]', 'txt': 'Search', 'clickable': True,
@@ -73,6 +78,7 @@ def test_compact_maestro_hierarchy_preserves_legacy_nodes_and_masks_inputs():
     assert not {'text', 'content-desc', 'val'} & nodes[1].keys()
 
 
+# spec: ANYM-951
 def test_flow_nested_expressions_and_file_matchers_are_rejected():
     for source in ('- runFlow: {when: {script: "java.lang.System.exit(0)"}, commands: [back]}',
                    '- tapOn: {text: hi, below: {image: /etc/passwd}}',
@@ -82,6 +88,7 @@ def test_flow_nested_expressions_and_file_matchers_are_rejected():
             compile_flow(source, {})
 
 
+# spec: ANYM-951
 def test_workflow_execution_checkpoint_and_replay_use_one_device_lock(tmp_path, monkeypatch):
     import asyncio
     import uuid
@@ -116,6 +123,7 @@ def test_workflow_execution_checkpoint_and_replay_use_one_device_lock(tmp_path, 
     asyncio.run(scenario())
 
 
+# spec: ANYM-951
 def test_maestro_lock_wait_is_bounded_without_stopping_another_device(monkeypatch):
     import asyncio
     from types import SimpleNamespace
@@ -137,6 +145,7 @@ def test_maestro_lock_wait_is_bounded_without_stopping_another_device(monkeypatc
     asyncio.run(scenario())
 
 
+# spec: ANYM-951
 def test_guardian_stops_child_when_parent_is_gone_and_removes_private_temp(tmp_path):
     import os
     import subprocess
@@ -153,6 +162,7 @@ def test_guardian_stops_child_when_parent_is_gone_and_removes_private_temp(tmp_p
     assert not temporary.exists()
 
 
+# spec: ANYM-951
 def test_failed_image_cancels_hierarchy_before_releasing_phone(tmp_path, monkeypatch):
     import asyncio
     from types import SimpleNamespace
@@ -184,6 +194,7 @@ def test_failed_image_cancels_hierarchy_before_releasing_phone(tmp_path, monkeyp
     asyncio.run(scenario())
 
 
+# spec: ANYM-951
 def test_guardian_stops_descendant_after_launcher_exits(tmp_path):
     import os
     import subprocess

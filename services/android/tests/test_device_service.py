@@ -254,6 +254,7 @@ def test_high_resolution_phone_screenshot_exceeds_command_output_limit(service):
     assert base64.b64decode(result['image']['data']) == image
 
 
+# spec: ANYM-951
 def test_screenshot_crop_geometry_file_mode_and_large_download(service):
     import io
     from PIL import Image

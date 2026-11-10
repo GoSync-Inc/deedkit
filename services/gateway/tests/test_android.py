@@ -135,6 +135,7 @@ def test_high_resolution_android_image_is_returned_as_native_content(tmp_path):
         assert base64.b64decode(result['content'][1]['data']) == image
 
 
+# spec: ANYM-951
 def test_workflow_transport_failure_returns_original_receipt_id(tmp_path):
     from agent_gateway.dispatch import Dispatch
     from agent_gateway.policy import Denied
@@ -146,6 +147,7 @@ def test_workflow_transport_failure_returns_original_receipt_id(tmp_path):
     assert error.detail['next_action'] == 'read_android_get_operation_with_original_request_id'
 
 
+# spec: ANYM-951
 def test_image_geometry_is_forwarded_without_scaling():
     from agent_gateway.adapters.android import content
     image = {'mime_type': 'image/png', 'data': base64.b64encode(PNG).decode(), 'width': 1220, 'height': 2712}
