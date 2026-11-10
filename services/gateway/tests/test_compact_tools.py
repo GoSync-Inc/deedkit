@@ -9,6 +9,79 @@ pytest_plugins = ("test_module_selection",)
 
 
 # spec: ANYM-952
+def test_every_module_has_entry_guidance_and_valid_example_arguments():
+    from agent_gateway.catalog import CATALOG, arguments
+
+    entry_points = {
+        'messaging': ('messages_capabilities', 'messages_list_chats'),
+        'calendar': ('calendar_capabilities', 'calendar_calendars'),
+        'calls': ('calls_capabilities', 'calls_call'),
+        'recordings': ('recordings_capabilities', 'recordings_list'),
+        'agents': ('agents_capabilities', 'agents_start_task'),
+        'android': ('android_capabilities', 'android_session'),
+        'gateway': ('platform_capabilities', 'platform_search_tools'),
+    }
+    assert set(entry_points) == {tool['module'] for tool in CATALOG.values()}
+    for entry, next_tool in entry_points.values():
+        assert next_tool in CATALOG[entry]['description']
+    for name, tool in CATALOG.items():
+        _, marker, example = tool['description'].partition('Example: ')
+        if marker:
+            values = json.JSONDecoder().raw_decode(example)[0]
+            arguments(tool, values)
+
+
+# spec: ANYM-952
+def test_compact_descriptions_guide_a_runnable_first_call(tmp_path):
+    from test_android import setup
+    from test_module_selection import mcp
+
+    app, _ = setup(tmp_path)
+    path = app.state.policy.path
+    policy = json.loads(path.read_text())
+    policy['profiles']['reader']['tools'].extend(['platform_search_tools', 'platform_call_tool'])
+    policy['revision'] += 1
+    path.write_text(json.dumps(policy))
+    with TestClient(app) as client:
+        initialized = mcp(client, 'initialize', {
+            'protocolVersion': '2025-06-18', 'capabilities': {},
+            'clientInfo': {'name': 'synthetic-agent', 'version': '1'},
+        }, path='/mcp/compact').json()
+        assert 'result' in initialized, initialized
+        instructions = initialized['result']['instructions']
+        for name in ('platform_capabilities', 'platform_search_tools', 'platform_call_tool'):
+            assert name in instructions
+        tools = {tool['name']: tool for tool in mcp(client, 'tools/list', path='/mcp/compact').json()['result']['tools']}
+        capabilities = tools['platform_capabilities']['description']
+        assert 'modules_available' in capabilities
+        assert 'platform_search_tools' in capabilities
+        assert 'platform_call_tool' in capabilities
+        assert 'next_offset' in tools['platform_search_tools']['description']
+        assert 'inputSchema' in tools['platform_call_tool']['description']
+        examples = {name: json.JSONDecoder().raw_decode(tool['description'].partition('Example: ')[2])[0]
+                    for name, tool in tools.items()}
+        start = call(client, 'platform_capabilities', examples['platform_capabilities'], path='/mcp/compact')
+        assert not start.get('isError'), start
+        assert 'android' in {module['id'] for module in start['structuredContent']['modules_available']}
+        search = call(client, 'platform_search_tools', examples['platform_search_tools'], path='/mcp/compact')
+        assert not search.get('isError'), search
+        target = examples['platform_call_tool']['name']
+        schema = next(tool['inputSchema'] for tool in search['structuredContent']['tools'] if tool['name'] == target)
+        assert schema['type'] == 'object'
+        result = call(client, 'platform_call_tool', examples['platform_call_tool'], path='/mcp/compact')
+        assert not result.get('isError'), result
+        assert target in result['structuredContent']['gateway_tools']
+        section = call(client, 'platform_search_tools', {'module': 'android', 'detail': 'full'},
+                       path='/mcp/compact')['structuredContent']
+        descriptions = {tool['name']: tool['description'] for tool in section['tools']}
+        assert 'android_session' in descriptions['android_capabilities']
+        assert 'android_observe' in descriptions['android_capabilities']
+        assert 'android_maestro' in descriptions['android_run_flow']
+        assert 'android_run_flow' in descriptions['android_maestro']
+        assert 'android_download' in descriptions['android_observe']
+
+
+# spec: ANYM-952
 def test_compact_discovery_is_stateless_for_agents_sharing_a_key(gateway):
     app, _, write, requests = gateway
     write(lambda doc: doc['profiles']['reader']['tools'].extend(['platform_search_tools', 'platform_call_tool']))
@@ -39,6 +112,17 @@ def test_compact_search_paginates_and_does_not_reveal_forbidden_tools(gateway):
         result = call(client, 'platform_search_tools', {'query': 'messages_send', 'detail': 'full'}, path='/mcp/compact')['structuredContent']
         assert result['tools'] == []
         assert 'messages_send' not in json.dumps(result)
+
+
+# spec: ANYM-952
+def test_exact_tool_search_does_not_return_tools_that_only_reference_it(gateway):
+    app, _, write, _ = gateway
+    write(lambda doc: doc['profiles']['reader']['tools'].extend([
+        'platform_search_tools', 'platform_call_tool', 'calendar_capabilities']))
+    with TestClient(app) as client:
+        result = call(client, 'platform_search_tools', {'query': ' CALENDAR_CALENDARS ', 'detail': 'full'},
+                      path='/mcp/compact')['structuredContent']
+        assert [tool['name'] for tool in result['tools']] == ['calendar_calendars']
 
 
 # spec: ANYM-952

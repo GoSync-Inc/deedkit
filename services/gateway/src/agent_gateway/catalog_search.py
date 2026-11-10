@@ -9,9 +9,13 @@ def search_tools(visible, details, args):
     for name in names:
         module = CATALOG[name]["module"]
         modules[module] = modules.get(module, 0) + 1
-    words = args["query"].casefold().split()
-    matches = [name for name in names if all(word in (name + " " + CATALOG[name]["description"]).casefold()
-                                            for word in words)]
+    query = args["query"].strip().casefold()
+    if query in CATALOG:
+        matches = [name for name in names if name == query]
+    else:
+        words = query.split()
+        matches = [name for name in names if all(word in (name + " " + CATALOG[name]["description"]).casefold()
+                                                for word in words)]
     start, end = args["offset"], args["offset"] + args["limit"]
     rows = []
     for name in matches[start:end]:
