@@ -44,6 +44,20 @@ def test_lease_alias_conflict_is_rejected_and_lookup_defaults_are_discoverable()
     assert fields['optional_timeout_ms']['default'] == 1000
 
 
+# spec: ANYM-951
+def test_existing_flows_remain_compatible_before_android_backend_upgrade():
+    values = {'device_id': 'phone', 'session_id': 'lease',
+              'request_id': '00000000-0000-4000-8000-000000000001', 'yaml': '- back'}
+    forwarded = arguments(CATALOG['android_run_flow'], values)
+    # Older strict backends do not declare the two new fields. Omitted options
+    # must stay omitted on the wire; both old and new backends own their defaults.
+    assert 'element_timeout_ms' not in forwarded
+    assert 'optional_timeout_ms' not in forwarded
+    explicit = arguments(CATALOG['android_run_flow'], {**values, 'element_timeout_ms': 400,
+                                                       'optional_timeout_ms': 200})
+    assert explicit['element_timeout_ms'] == 400 and explicit['optional_timeout_ms'] == 200
+
+
 # spec: ANYM-952
 def test_offline_phone_does_not_break_compact_discovery_and_retry_is_explicit(tmp_path):
     app, _ = setup(tmp_path, unavailable=True)

@@ -92,6 +92,10 @@ def arguments(tool, value, known_tools):
     # REST and MCP backend defaults differ for conversation tools. Preserve the
     # reviewed MCP defaults when routing either gateway transport over REST.
     for key, prop in schema.get("properties", {}).items():
+        # Android may upgrade after the gateway. Its backend applies the same
+        # defaults; injecting new optional fields breaks older strict backends.
+        if tool.get('name') == 'android_run_flow' and key in {'element_timeout_ms', 'optional_timeout_ms'}:
+            continue
         if key not in result and "default" in prop:
             result[key] = deepcopy(prop["default"])
     return result
