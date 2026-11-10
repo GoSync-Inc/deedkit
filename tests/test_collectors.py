@@ -1374,11 +1374,15 @@ def test_poll_updates_wake_only_a_subscription_that_lists_them(wa_groups):
 
 
 TG_POLL_CHAT='-500'
+# One send time per test (tg_polls sets it): two captures of one message taken a second boundary apart would carry
+# two send times, a different message version, and ingest rightly calls that a conflict (merge-queue flake, #850).
+TG_POLL_SENT={}
 
 
 @pytest.fixture
 def tg_polls(seeded,tmp_path,monkeypatch):
     monkeypatch.setenv('ANYMSG_CAPTURE_TELEGRAM_POLLS','1')
+    monkeypatch.setitem(TG_POLL_SENT,'at',datetime.now(timezone.utc).replace(microsecond=0))
     store,_,_=seeded; archive=Archive(store)
     archive.register('tg-polls','telegram','Synthetic Telegram polls',discover=True)
     worker=TelegramCollector(archive,'tg-polls',FakeProvider(),CaptureSpool(tmp_path/'polls',reserve_bytes=0),
@@ -1405,7 +1409,7 @@ def tg_poll_message(mid=30,*,options=('Да','Нет','Может быть'),vot
         answers=[types.PollAnswer(text=types.TextWithEntities(text=t,entities=[]),option=str(i).encode()) for i,t in enumerate(options)],
         public_voters=public or None,multiple_choice=None,quiz=None,closed=None)
     return types.Message(id=mid,peer_id=types.PeerChat(group),from_id=types.PeerUser(42),
-        date=sent or datetime.now(timezone.utc).replace(microsecond=0),message='',
+        date=sent or TG_POLL_SENT.get('at') or datetime.now(timezone.utc).replace(microsecond=0),message='',
         media=types.MessageMediaPoll(poll=poll,results=results or tg_poll_results(voters,chosen=chosen)))
 
 
