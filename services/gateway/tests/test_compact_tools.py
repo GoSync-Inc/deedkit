@@ -3,7 +3,9 @@ import json
 
 from starlette.testclient import TestClient
 
-from test_module_selection import gateway, call, listed  # noqa: F401
+from test_module_selection import call, listed
+
+pytest_plugins = ("test_module_selection",)
 
 
 # spec: ANYM-952
