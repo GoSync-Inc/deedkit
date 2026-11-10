@@ -138,8 +138,26 @@ class Library:
         except Refused:
             raise Refused('successful_test_required') from None
         pins = result.get('library', {}).get('pins', [])
-        if result['state'] != 'succeeded' or {'kind': kind, 'name': name, 'version': version} not in pins:
+        target = {'kind': kind, 'name': name, 'version': version}
+        steps = result.get('steps', [])
+        if kind == 'flow':
+            exercised = result.get('library', {}).get('root') == target and bool(steps)
+        else:
+            exercised = any(step.get('map') == target for step in steps)
+        if result['state'] != 'succeeded' or target not in pins or not exercised:
             raise Refused('successful_test_required')
         for pin in result.get('library', {}).get('floating', pins):
             if self.read(owner, pin['kind'], pin['name'], stage='draft')['version'] != pin['version']:
                 raise Refused('test_dependencies_changed')
+
+        if kind == 'flow':
+            for pin in pins:
+                if pin == target:
+                    continue
+                published = self.db.execute("SELECT 1 FROM library_events WHERE owner=? AND kind=? AND name=? AND version=? AND action IN ('put','publish','rollback')",
+                    (owner, pin['kind'], pin['name'], pin['version'])).fetchone()
+                if not published:
+                    raise Refused('test_dependency_not_published')
+            for pin in result.get('library', {}).get('floating', pins):
+                if pin != target and self.read(owner, pin['kind'], pin['name'])['version'] != pin['version']:
+                    raise Refused('test_dependencies_changed')

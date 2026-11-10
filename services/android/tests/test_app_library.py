@@ -46,7 +46,9 @@ def draft(store, kind, name, source, base=None):
 def evidence(store, pins, state='succeeded'):
     request_id = str(uuid.uuid4())
     store.admit('one', request_id, {})
-    store.finish('one', request_id, state, {'library': {'pins': pins}})
+    store.finish('one', request_id, state, {'library': {'pins': pins,
+        'root': next((pin for pin in pins if pin['kind'] == 'flow'), None)},
+        'steps': [{'map': pin} for pin in pins if pin['kind'] == 'map'] or [{'command': 'back'}]})
     return request_id
 
 
@@ -232,3 +234,82 @@ def test_map_tap_verifies_the_screen_and_ambiguity_never_clicks():
     with pytest.raises(Refused, match='ambiguous_selector'):
         execute_map(device, 'tapElement', options, None)
     assert device.clicks == [(10, 20)]
+
+
+# spec: ANYM-954
+def test_publishing_requires_executed_root_and_published_dependencies(store):
+    app_map = draft(store, 'map', 'shop', MAP)
+    flow = draft(store, 'flow', 'orders', FLOW)
+    map_pin = {'kind': 'map', 'name': 'shop', 'version': app_map['version']}
+    flow_pin = {'kind': 'flow', 'name': 'orders', 'version': flow['version']}
+    skipped = str(uuid.uuid4())
+    store.admit('one', skipped, {})
+    store.finish('one', skipped, 'succeeded', {'library': {'pins': [map_pin, flow_pin]}, 'steps': []})
+    for pin in (map_pin, flow_pin):
+        with pytest.raises(Refused, match='successful_test_required'):
+            store.library.manage('one', action='publish', **pin, test_request_id=skipped)
+    tested = evidence(store, [map_pin, flow_pin])
+    with pytest.raises(Refused, match='test_dependency_not_published'):
+        store.library.manage('one', action='publish', **flow_pin, test_request_id=tested)
+    store.library.manage('one', action='publish', **map_pin, test_request_id=tested)
+    store.library.manage('one', action='publish', **flow_pin, test_request_id=tested)
+
+
+# spec: ANYM-954
+def test_map_checkpoint_source_recompiles_with_immutable_map_versions(store):
+    import yaml
+    from deedkit_android.app_maps import compile_scenario, continuation
+
+    version = draft(store, 'map', 'shop', MAP)['version']
+    commands, _ = compile_scenario(store.library, 'one', FLOW, {}, stage='draft')
+    source = yaml.safe_dump(continuation(commands))
+    assert 'app_map' not in source and 'map_ref' not in source
+    draft(store, 'map', 'shop', MAP.replace('Orders', 'NewOrders'), version)
+    resumed, pins = compile_scenario(store.library, 'one', source, {})
+    assert resumed == commands
+    assert pins['pins'] == [{'kind': 'map', 'name': 'shop', 'version': version}]
+
+
+# spec: ANYM-954
+def test_control_flow_selectors_are_validated_before_admission(store):
+    from deedkit_android.app_maps import compile_scenario
+
+    for source in ('- back\n- runFlow: {when: {visible: {file: x}}, commands: [back]}',
+                   '- back\n- repeat: {while: {visible: {selected: bad}}, commands: [back]}'):
+        with pytest.raises(Refused):
+            compile_scenario(store.library, 'one', source, {})
+
+
+# spec: ANYM-954
+def test_reference_expansion_stops_at_the_shared_budget(store, monkeypatch):
+    from deedkit_android.app_maps import compile_scenario
+
+    store.flow('one', 'put', 'leaf', '- back', None)
+    for index in range(6):
+        child = 'leaf' if index == 0 else 'branch' + str(index - 1)
+        store.flow('one', 'put', 'branch' + str(index), ('- runFlow: {name: ' + child + '}\n') * 20, None)
+    count = [0]
+    original = store.library.read
+
+    def read(*args, **kwargs):
+        count[0] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store.library, 'read', read)
+    with pytest.raises(Refused, match='too_many_flow_commands'):
+        compile_scenario(store.library, 'one', '- runFlow: {name: branch5}', {})
+    assert count[0] <= 201
+
+
+# spec: ANYM-954
+def test_visible_list_keeps_distinct_identical_rows():
+    from deedkit_android.app_maps import validate_map
+    from deedkit_android.map_runtime import execute_map
+
+    class Device:
+        def jsonrpc_call(self, method, args):
+            item = '<node resource-id="example.shop:id/item"><node resource-id="example.shop:id/title" text="Tea"/></node>'
+            return '<hierarchy>' + item * 2 + '</hierarchy>'
+
+    result = execute_map(Device(), 'readList', {'app_map': validate_map(MAP), 'list': 'products'}, None)
+    assert result['rows'] == [{'title': 'Tea'}, {'title': 'Tea'}]

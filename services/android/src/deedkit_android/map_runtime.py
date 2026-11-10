@@ -157,12 +157,14 @@ def execute_map(device, name, options, native):
         listing = app_map['lists'][options['list']]
         rows, seen = [], set()
         for page in range(options.get('scroll_pages', 0) + 1):
-            page_rows = extract_list(snapshot(device), listing, options.get('fields', list(listing['fields'])), options.get('limit', 20))
+            requested = options.get('fields', list(listing['fields']))
+            fields = list(dict.fromkeys([*requested, *listing.get('key', [])]))
+            page_rows = extract_list(snapshot(device), listing, fields, options.get('limit', 20))
             for row in page_rows:
-                key = tuple(row.items())
-                if key not in seen:
+                key = tuple(row.get(field) for field in listing.get('key', []))
+                if not key or None in key or key not in seen:
                     seen.add(key)
-                    rows.append(row)
+                    rows.append({field: row[field] for field in requested})
             if len(rows) >= options.get('limit', 20) or page == options.get('scroll_pages', 0):
                 break
             device.swipe_ext('up', scale=0.6, duration=0.3)

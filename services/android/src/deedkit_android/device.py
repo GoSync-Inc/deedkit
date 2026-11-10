@@ -356,6 +356,12 @@ class Devices:
         result.update(hierarchy)
         return result
 
+    def remaining(self, commands):
+        if self.ui:
+            from .app_maps import continuation
+            return continuation(commands)
+        return commands
+
     async def perform_flow(self, owner, device, request_id, commands, timeout, temporary, lock,
                            element_timeout_ms=5000, optional_timeout_ms=1000):
         state, result = "unknown", {}
@@ -375,7 +381,7 @@ class Devices:
             if checkpoint < len(commands):
                 state = "paused"
                 result.update({"checkpoint": commands[checkpoint]["checkpoint"],
-                               "remaining_yaml": yaml.safe_dump(commands[checkpoint + 1:], allow_unicode=True),
+                               "remaining_yaml": yaml.safe_dump(self.remaining(commands[checkpoint + 1:]), allow_unicode=True),
                                "next_action": "observe_then_resolve_checkpoint_and_submit_remaining_yaml"})
         except Refused as error:
             result = {"error": error.code, "next_action": "inspect_device_before_any_new_request"}

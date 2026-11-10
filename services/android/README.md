@@ -385,5 +385,9 @@ Selectors are tried in order and an ambiguous candidate stops before an action.
 Explicit `index` selects one match. Coordinate fallback requires a resulting
 screen check. Screen signatures share one hierarchy snapshot per poll.
 List fields are extracted locally from each snapshot, with password text masked.
+Every visible row is retained. An optional list `key` names fields identifying
+the same item across pages and enables deduplication during scrolling.
+Checkpoint `remaining_yaml` retains explicit historical map versions and can be
+submitted under a new request UUID after the checkpoint is resolved.
 Application-specific navigation stays in scenario data. Existing command lists,
 raw ADB, sessions, receipt polling and screenshot downloads retain their entry points.

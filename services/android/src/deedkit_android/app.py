@@ -164,7 +164,9 @@ def create_app(config_path):
         def compile_source(source, parameters, validate_only=False):
             if devices.ui:
                 return compile_scenario(store.library, owner, source, parameters, validate_only=validate_only)[0]
-            commands = compile_flow(source, parameters, fields=None,
+            literal_parameters = parameters.copy()
+            literal_parameters.update({key: str(value) for key, value in parameters.items()})
+            commands = compile_flow(source, literal_parameters, fields=None,
                 resolve=lambda name, version: store.flow(owner, "get", name, None, version)["yaml"])
             return commands
         if operation == "capabilities":

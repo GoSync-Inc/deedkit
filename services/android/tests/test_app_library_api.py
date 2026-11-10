@@ -74,3 +74,19 @@ def test_raw_input_cannot_inject_internal_maps_or_nested_checkpoints(tmp_path):
                 compile_scenario(store.library, 'one', source, {})
     finally:
         store.close()
+
+
+# spec: ANYM-954
+def test_typed_parameters_validate_through_the_legacy_backend(tmp_path):
+    config = tmp_path / 'config.json'
+    config.write_text(json.dumps({'adb': '/synthetic/adb', 'state_dir': str(tmp_path / 'state'),
+        'devices': {'home': 'SERIAL'}, 'principals': [{'id': 'one',
+        'key_sha256': hashlib.sha256(b'one').hexdigest(), 'devices': ['home'],
+        'permissions': ['android:read', 'android:control']}]}))
+    config.chmod(0o600)
+    with TestClient(create_app(config)) as client:
+        response = client.post('/v1/maestro', headers={'Authorization': 'Bearer one'}, json={
+            'action': 'validate', 'yaml': '- inputText: ${COUNT} ${ENABLED}',
+            'parameters': {'COUNT': 3, 'ENABLED': True}})
+        assert response.status_code == 200
+        assert response.json()['commands'] == [{'inputText': '3 True'}]

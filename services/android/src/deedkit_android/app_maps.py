@@ -1,6 +1,7 @@
 """Validated application data and compilation into the existing batch runner."""
 
 from datetime import date
+import hashlib
 import math
 import re
 
@@ -41,9 +42,10 @@ def reference():
         ],
         'repair': 'Get the current source with android_flows(action=get, stage=draft). Save a draft with base_version equal to the current draft version, or published version when no draft exists. Inspect with a draft scenario containing inspectMap, test the intended scenario, then publish. history returns versions and audit events; rollback takes a previously published version and the current published base_version.',
         'maps': 'Fields: package, selectors, screens, deep_links, popups, lists, meta. Named selectors are ordered candidate lists. text/id are full regular expressions, textExact/resourceId are exact. An ambiguous first matching candidate stops the action. index explicitly selects one match. A point candidate requires tapElement.expect_screen. Screens require all require conditions and no forbid conditions; each condition is a selector name or inline selector. Optional activity is a regex.',
-        'lists': 'lists.<name> has item (selector or candidate list) and fields (field names mapped to selectors). readList returns rows under both its step result and receipt.data.<list>. limit defaults to 20, at most 100; scroll_pages defaults to 0, at most 5. Password fields return null.',
+        'lists': 'lists.<name> has item (selector or candidate list), fields (field names mapped to selectors), and optional key (field names identifying one item across pages). Without key, every visible row is preserved. readList returns rows under both its step result and receipt.data.<list>. limit defaults to 20, at most 100; scroll_pages defaults to 0, at most 5. Password fields return null.',
         'popups': 'popups.<name> has detect (selector name) and either dismiss (selector name) or press: back. dismissPopups is explicit and bounded by max_rounds, default 3.',
         'parameters': 'params maps UPPER_CASE names to {type: string|integer|boolean, default?, required?, enum?, max_length?}. Values substitute literally as ${NAME}. Existing string parameters work without declarations.',
+        'continuation': 'A checkpoint returns runnable remaining_yaml with explicit historical map versions. Submit it under a new request_id after resolving the checkpoint. Returned runFlow groups may contain map, map_version and commands to retain their map context.',
         'versions': 'Every run records library.pins. Unversioned references resolve once at admission. stage=draft uses current drafts with published fallback. Explicit map_version and runFlow.version pin historical dependencies. Publication rejects stale floating dependencies.',
         'effects': 'side_effects is advisory metadata (none, purchase, payment, send, account). The caller decides when user approval is required.',
     }
@@ -152,12 +154,14 @@ def validate_map(source):
             if selector_name and any('point' in c for c in value['selectors'][selector_name]):
                 raise Refused('popup_requires_selector', 422)
     for listing in value['lists'].values():
-        fields(listing, {'item', 'fields'})
+        fields(listing, {'item', 'fields', 'key'})
         listing['item'] = candidates(listing.get('item'))
         named(listing.get('fields'))
         if not listing['fields']:
             raise Refused('list_requires_fields', 422)
         listing['fields'] = {name: candidates(selector) for name, selector in listing['fields'].items()}
+        if 'key' in listing and (not isinstance(listing['key'], list) or not listing['key'] or any(not isinstance(key, str) or key not in listing['fields'] for key in listing['key'])):
+            raise Refused('invalid_list_key', 422)
     if 'meta' in value and not isinstance(value['meta'], dict):
         raise Refused('invalid_map_metadata', 422)
     return value
@@ -206,6 +210,8 @@ def validate_action(name, options, app_map):
 def compile_scenario(library, owner, source, parameters, *, stage='published', root=None, validate_only=False):
     pins, floating, effects = {}, {}, set()
     stack = []
+    budget = [0]
+    root_pin = None
 
     def resolve(kind, name, version=None):
         row = library.read(owner, kind, name, version, stage)
@@ -220,8 +226,9 @@ def compile_scenario(library, owner, source, parameters, *, stage='published', r
 
     if root:
         source = resolve('flow', root['name'], root.get('version'))
+        root_pin = {'kind': 'flow', 'name': root['name'], 'version': hashlib.sha256(source.encode()).hexdigest()}
 
-    def compile_one(text, inherited_map=None, inherited_values=None):
+    def compile_one(text, inherited_map=None, inherited_values=None, inherited_ref=None):
         if len(stack) > 8:
             raise Refused('flow_too_deep', 422)
         document = load(text)
@@ -229,7 +236,7 @@ def compile_scenario(library, owner, source, parameters, *, stage='published', r
             if depth > 16:
                 raise Refused('flow_too_deep', 422)
             if isinstance(value, dict):
-                if 'app_map' in value:
+                if 'app_map' in value or 'map_ref' in value:
                     raise Refused('reserved_scenario_field', 422)
                 for child in value.values():
                     check_input(child, depth + 1)
@@ -238,11 +245,13 @@ def compile_scenario(library, owner, source, parameters, *, stage='published', r
                     check_input(child, depth + 1)
         check_input(document)
         values = dict(inherited_values) if inherited_values is not None else {key: str(value) for key, value in parameters.items()}
-        app_map = inherited_map
+        app_map, map_ref = inherited_map, inherited_ref
         if isinstance(document, dict):
             fields(document, {'map', 'map_version', 'params', 'steps', 'side_effects', 'description'}, 'invalid_scenario')
             if 'map' in document:
-                app_map = validate_map(resolve('map', document['map'], document.get('map_version')))
+                map_source = resolve('map', document['map'], document.get('map_version'))
+                app_map = validate_map(map_source)
+                map_ref = {'kind': 'map', 'name': document['map'], 'version': hashlib.sha256(map_source.encode()).hexdigest()}
             effect = document.get('side_effects', 'none')
             if not isinstance(effect, str) or effect not in {'none', 'purchase', 'payment', 'send', 'account'}:
                 raise Refused('invalid_side_effects', 422)
@@ -284,6 +293,9 @@ def compile_scenario(library, owner, source, parameters, *, stage='published', r
                 raise Refused('flow_requires_command_list', 422)
             result = []
             for item in items:
+                budget[0] += 1
+                if budget[0] > 200:
+                    raise Refused('too_many_flow_commands', 422)
                 if isinstance(item, str):
                     result.append(item)
                     continue
@@ -295,9 +307,13 @@ def compile_scenario(library, owner, source, parameters, *, stage='published', r
                     if reference in stack or 'commands' in options or set(options) - {'name', 'version', 'when', 'label'}:
                         raise Refused('invalid_flow_reference', 422)
                     stack.append(reference)
-                    child = compile_one(resolve('flow', reference, options.get('version')), app_map, values)
+                    child = compile_one(resolve('flow', reference, options.get('version')), app_map, values, map_ref)
                     stack.pop()
                     result.append({'runFlow': {**{k: v for k, v in options.items() if k not in {'name', 'version'}}, 'commands': child}})
+                elif name == 'runFlow' and isinstance(options, dict) and 'map' in options:
+                    fields(options, {'map', 'map_version', 'commands'}, 'invalid_flow_reference')
+                    child_source = yaml.safe_dump({'map': options['map'], 'map_version': options.get('map_version'), 'steps': options.get('commands')})
+                    result.extend(compile_one(child_source, app_map, values, map_ref))
                 elif name in {'runFlow', 'repeat', 'retry'} and isinstance(options, dict) and 'commands' in options:
                     result.append({name: {**options, 'commands': expand(options['commands'])}})
                 else:
@@ -321,6 +337,7 @@ def compile_scenario(library, owner, source, parameters, *, stage='published', r
                     child = options['commands']
                     wrapper = {name: {**options, 'commands': ['back']}}
                     parsed = compile_flow(yaml.safe_dump([wrapper]), values, fields=all_fields)[0]
+                    validate_commands([parsed])
                     parsed[name]['commands'] = prepare(child, depth + 1)
                     output.append(parsed)
                 elif name in MAP_ACTIONS:
@@ -336,7 +353,7 @@ def compile_scenario(library, owner, source, parameters, *, stage='published', r
                     if app_map is None:
                         raise Refused('scenario_requires_map', 422)
                     validate_action(name, parsed, app_map)
-                    output.append({name: {**parsed, 'app_map': app_map}})
+                    output.append({name: {**parsed, 'app_map': app_map, 'map_ref': map_ref}})
                 else:
                     parsed = compile_flow(yaml.safe_dump([item]), values, fields=all_fields)
                     validate_commands(parsed)
@@ -357,5 +374,25 @@ def compile_scenario(library, owner, source, parameters, *, stage='published', r
         return total
     if count(commands) > 200:
         raise Refused('too_many_flow_commands', 422)
-    return commands, {'pins': list(pins.values()), 'floating': list(floating.values()),
+    return commands, {'root': root_pin, 'pins': list(pins.values()), 'floating': list(floating.values()),
                       'side_effects': sorted(effects or {'none'})}
+
+
+def continuation(commands):
+    """Return ordinary source with immutable map references, never internal fields."""
+    output = []
+    for command in commands:
+        if not isinstance(command, dict):
+            output.append(command)
+            continue
+        name, options = next(iter(command.items()))
+        if name in MAP_ACTIONS:
+            pin = options['map_ref']
+            arguments = {key: value for key, value in options.items() if key not in {'app_map', 'map_ref'}}
+            output.append({'runFlow': {'map': pin['name'], 'map_version': pin['version'],
+                                      'commands': [{name: arguments}]}})
+        elif name in {'runFlow', 'repeat', 'retry'}:
+            output.append({name: {**options, 'commands': continuation(options['commands'])}})
+        else:
+            output.append(command)
+    return output

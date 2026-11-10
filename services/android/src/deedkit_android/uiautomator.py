@@ -179,6 +179,8 @@ class UiRunner(FlowRunner):
             raise Refused('flow_step_limit')
         started = time.monotonic()
         step = {'path': path, 'command': name}
+        if isinstance(command, dict) and isinstance(command[name], dict) and command[name].get('map_ref'):
+            step['map'] = command[name]['map_ref']
         try:
             step['result'] = await self.call(command, element_timeout_ms=self.element_timeout_ms,
                                              optional_timeout_ms=self.optional_timeout_ms)
