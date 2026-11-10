@@ -34,10 +34,16 @@ commands on the USB host are outside this interface.
 
 `push` takes a completed upload UUID and a device destination. `pull` takes one
 device file path and returns a download UUID. It transfers regular file bytes.
-`install` takes flags followed by one upload UUID. For `install-multiple`, each
-non-flag argument must be an upload UUID. Flags requiring a separate value are
-currently unsupported by that command. Shell and `exec-out` otherwise retain
-ADB's command-line quoting semantics.
+`install` takes options followed by one upload UUID. `install-multiple` takes
+options followed by one or more upload UUIDs. Each completed upload is staged
+under a private `.apk` name for that command. Supported switches are `-r`, `-t`,
+`-d`, `-g`, `-s`, `-f`, `-p`, `--instant`, `--full`, `--dont-kill`,
+`--enable-rollback`, `--force-queryable`, `--no-streaming`, `--streaming`,
+`--no-incremental`, `--staged` and `--force-non-staged`. The options `-i`,
+`--abi`, `--user`, `--install-location` and `--install-reason` take one value.
+Values contain letters, digits, underscores, dots or hyphens and cannot end
+in `.apk` or `.apex`. Shell and `exec-out` retain ADB's command-line quoting
+semantics.
 
 The MCP observation result contains a native image content block. Its structured
 result includes image size and SHA-256, plus the UI nodes. The REST result carries

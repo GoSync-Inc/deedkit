@@ -5,6 +5,7 @@ import base64
 from contextlib import asynccontextmanager, nullcontext
 import os
 from pathlib import Path
+import re
 import signal
 import shlex
 import tempfile
@@ -22,6 +23,12 @@ COMMANDS = frozenset({
     "root", "unroot", "remount", "disable-verity", "enable-verity", "reconnect", "jdwp",
     "push", "pull", "install", "install-multiple", "uninstall",
 })
+INSTALL_FLAGS = frozenset({
+    "-r", "-t", "-d", "-g", "-s", "-f", "-p", "--instant", "--full", "--dont-kill",
+    "--enable-rollback", "--force-queryable", "--no-streaming", "--streaming", "--no-incremental",
+    "--staged", "--force-non-staged",
+})
+INSTALL_VALUE_FLAGS = frozenset({"-i", "--abi", "--user", "--install-location", "--install-reason"})
 
 
 async def stop_process(process):
@@ -159,18 +166,27 @@ class Devices:
                 raise Refused("pull_takes_one_device_path", 422)
             output = temporary / "download"
             argv = ["exec-out", "cat", "--", shlex.quote(argv[1])]
-        elif argv[0] == "install":
-            if len(argv) < 2:
+        elif argv[0] in {"install", "install-multiple"}:
+            index = 1
+            while index < len(argv) and argv[index].startswith("-"):
+                flag = argv[index]
+                index += 1
+                if flag in INSTALL_VALUE_FLAGS:
+                    if index == len(argv) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", argv[index]):
+                        raise Refused("invalid_install_option_value", 422)
+                    # ADB also discovers APK operands by suffix, including option values.
+                    if argv[index].lower().endswith((".apk", ".apex")):
+                        raise Refused("invalid_install_option_value", 422)
+                    index += 1
+                elif flag not in INSTALL_FLAGS:
+                    raise Refused("unsupported_install_option", 422)
+            if index == len(argv) or (argv[0] == "install" and len(argv) - index != 1):
                 raise Refused("install_requires_uploaded_file", 422)
-            argv[-1] = str(self.store.file(owner, argv[-1]))
-        elif argv[0] == "install-multiple":
-            converted = 0
-            for index in range(1, len(argv)):
-                if not argv[index].startswith("-"):
-                    argv[index] = str(self.store.file(owner, argv[index]))
-                    converted += 1
-            if not converted:
-                raise Refused("install_requires_uploaded_file", 422)
+            files = [self.store.file(owner, file_id) for file_id in argv[index:]]
+            for offset, source in enumerate(files):
+                target = temporary / f"{offset}.apk"
+                os.link(source, target)
+                argv[index + offset] = str(target)
         return [*self.adb(device), *argv], output
 
     async def execute(self, owner, device, session, request_id, argv, timeout, wait):

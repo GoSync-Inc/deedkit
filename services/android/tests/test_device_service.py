@@ -34,6 +34,14 @@ elif args[2:4] == ['exec-out','cat']:
  sys.stdout.buffer.write(b'\\x00\\xffsynthetic file')
 elif args[2] == 'shell' and 'uiautomator' in args[3]:
  print('<?xml version="1.0"?><hierarchy><node text="secret" password="true"/><node text="Search" resource-id="search"/></hierarchy>')
+elif args[2] in ('install', 'install-multiple'):
+ paths=[arg for arg in args[3:] if arg.endswith('.apk')]
+ if not paths or not args[-1].endswith('.apk'):
+  sys.exit('need APK file on command line')
+ for path in paths:
+  with open(path, 'rb') as stream:
+   assert stream.read() == b'APK'
+ print('Success')
 else:
  print('arguments:',repr(args))
 ''')
@@ -128,6 +136,33 @@ def test_binary_files_retry_offsets_scope_and_device_only_commands(service):
     assert post(service, 'delete_file', {'file_id': file_id}).status_code == 200
     assert post(service, 'delete_file', {'file_id': file_id}).status_code == 200
     assert post(service, 'download', {'file_id': file_id}).status_code == 404
+
+
+# Regression: ADB must only select APKs staged from this principal's completed uploads.
+def test_install_stages_apks_and_rejects_unvalidated_host_operands(service):
+    token = session(service)
+    file_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    for file_id in file_ids:
+        assert post(service, 'upload', {'file_id': file_id, 'offset': 0,
+                    'data_base64': base64.b64encode(b'APK').decode(), 'final': True}).status_code == 200
+    for argv in (
+        ['install', '--no-streaming', '/existing/host/file.apk', file_ids[0]],
+        ['install', file_ids[0], file_ids[1]],
+        ['install-multiple', '--no-streaming', '/existing/host/file.apk', *file_ids],
+        ['install', '--fastdeploy', file_ids[0]],
+        ['install', '--user'],
+        ['install-multiple', '-i', 'host.apk', *file_ids],
+        ['install-multiple', *file_ids, '--no-streaming'],
+    ):
+        assert execute(service, token, str(uuid.uuid4()), argv).status_code == 422
+    for argv in (
+        ['install', '--no-streaming', file_ids[0]],
+        ['install', '-r', '--user', '0', '--abi', 'arm64-v8a', file_ids[0]],
+        ['install-multiple', '-r', *file_ids],
+    ):
+        result = execute(service, token, str(uuid.uuid4()), argv).json()
+        assert result['state'] == 'succeeded', result
+    assert post(service, 'download', {'file_id': file_ids[0]}).status_code == 200
 
 
 def test_restart_marks_inflight_unknown_and_keeps_receipt(tmp_path):
