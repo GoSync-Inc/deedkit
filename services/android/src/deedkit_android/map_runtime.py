@@ -1,5 +1,6 @@
 """Generic map actions. Application-specific navigation belongs to scenarios."""
 
+import hashlib
 import re
 import time
 from xml.etree import ElementTree
@@ -73,16 +74,44 @@ def screen_state(root, app_map, name, activity=None):
 
 def wait_screen(device, app_map, name, timeout):
     deadline = time.monotonic() + timeout / 1000
+    polls = 0
     while True:
         activity = device.app_current().get('activity') if 'activity' in app_map['screens'][name] else None
         result = screen_state(snapshot(device, app_map), app_map, name, activity)
+        polls += 1
         if result['matched']:
-            return {'screen': name, **result}
+            return {'screen': name, **result, 'polls': polls}
         if time.monotonic() >= deadline:
             error = Refused('screen_not_found')
-            error.details = {'screen': name, **result}
+            error.details = {'screen': name, **result, 'polls': polls}
             raise error
         time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+
+
+def signature(root):
+    fields = ('class', 'resource-id', 'text', 'content-desc', 'bounds')
+    return hashlib.sha256('\n'.join('\t'.join(node.get(key, '') for key in fields)
+                                    for node in root.iter('node')).encode()).hexdigest()
+
+
+def wait_settled(device, app_map, timeout, stable_ms):
+    """Wait until the map's hierarchy is unchanged for stable_ms, e.g. after a spinner."""
+    started = time.monotonic()
+    deadline = started + timeout / 1000
+    last, since, polls = None, started, 0
+    while True:
+        current = signature(snapshot(device, app_map))
+        now = time.monotonic()
+        polls += 1
+        if current != last:
+            last, since = current, now
+        elif (now - since) * 1000 >= stable_ms:
+            return {'settled': True, 'elapsed_ms': round((now - started) * 1000, 2), 'polls': polls}
+        if now >= deadline:
+            error = Refused('screen_not_settled')
+            error.details = {'elapsed_ms': round((now - started) * 1000, 2), 'polls': polls, 'stable_ms': stable_ms}
+            raise error
+        time.sleep(min(0.1, max(0, deadline - now)))
 
 
 def wait_element(device, candidates, timeout, app_map=None):
@@ -133,8 +162,17 @@ def execute_map(device, name, options, native):
         native(device, {'launchApp': {'appId': app_map['package'], 'stopApp': options.get('cold', False)}})
     elif name == 'openDeepLink':
         link = app_map['deep_links'][options['name']]
+        started = time.monotonic()
         native(device, {'openLink': link['url']})
-        return wait_screen(device, app_map, link['screen'], timeout)
+        opened = time.monotonic()
+        result = wait_screen(device, app_map, link['screen'], timeout)
+        phases = {'open_ms': round((opened - started) * 1000, 2),
+                  'screen_ms': round((time.monotonic() - opened) * 1000, 2)}
+        if options.get('settle_ms'):
+            phases['settle_ms'] = wait_settled(device, app_map, timeout, options['settle_ms'])['elapsed_ms']
+        return {**result, 'phases': phases}
+    elif name == 'waitSettled':
+        return wait_settled(device, app_map, timeout, options.get('stable_ms', 500))
     elif name in {'waitScreen', 'assertScreen'}:
         return wait_screen(device, app_map, options['screen'], 0 if name == 'assertScreen' else timeout)
     elif name in {'tapElement', 'typeInto'}:
@@ -211,4 +249,6 @@ def execute_map(device, name, options, native):
         result['dismissed'] = dismissed
     if 'expect_screen' in options:
         result.update(wait_screen(device, app_map, options['expect_screen'], timeout))
+    if name == 'openApp' and options.get('settle_ms'):
+        result.update(wait_settled(device, app_map, timeout, options['settle_ms']))
     return result

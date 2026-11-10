@@ -17,7 +17,7 @@ SUPPORTED = {'tapOn', 'doubleTapOn', 'longPressOn', 'assertVisible', 'assertNotV
              'clearState', 'openLink', 'swipe', 'scroll', 'scrollUntilVisible',
              'extendedWaitUntil', 'waitForAnimationToEnd', 'back', 'hideKeyboard',
              'copyTextFrom', 'exists', 'setOrientation', 'runFlow', 'repeat', 'retry', 'checkpoint',
-             'readScreenText'}
+             'readScreenText', 'sleep'}
 SELECTORS = {'text', 'id', 'textExact', 'resourceId', 'description', 'className', 'index',
              'enabled', 'selected', 'checked', 'focused', 'clickable', 'scrollable'}
 OPTIONS = SELECTORS | {'point', 'optional', 'timeout', 'label', 'retryTapIfNoChange',
@@ -37,10 +37,12 @@ UI_FIELDS = {
     'runFlow': {'commands', 'when', 'label', 'name', 'version'}, 'repeat': {'commands', 'times', 'while', 'label'},
     'retry': {'commands', 'maxRetries', 'label'}, 'checkpoint': set(),
     'readScreenText': {'region', 'within', 'min_confidence', 'limit', 'key', 'label'},
+    'sleep': set(),
 }
 # Definite read/lookup failures: nothing acted, so the persistent worker stays.
 DEFINITE = {'element_not_found', 'screen_not_found', 'ambiguous_selector', 'invalid_element_bounds',
-            'ocr_unavailable', 'ocr_failed', 'screenshot_unavailable', 'region_outside_screen'}
+            'ocr_unavailable', 'ocr_failed', 'screenshot_unavailable', 'region_outside_screen',
+            'screen_not_settled'}
 
 
 
@@ -147,6 +149,8 @@ def validate_commands(commands):
                 raise Refused('invalid_wait_condition', 422)
         if name == 'readScreenText':
             validate_screen_text(value)
+        if name == 'sleep' and (type(value) is not int or not 0 <= value <= 10000):
+            raise Refused('invalid_sleep_ms', 422)
         if name in {'repeat', 'retry', 'runFlow'}:
             validate_commands(value['commands'])
         if name == 'launchApp' and value.get('clearKeychain'):
@@ -167,6 +171,7 @@ def reference():
             'examples': {'search': '- tapOn: Search\n- inputText: ${QUERY}\n- pressKey: Enter',
                          'set_text': '- setText: {resourceId: "example:id/search", value: "${QUERY}"}',
                          'exists': '- exists: {text: Popup, timeout: 100}',
+                         'sleep': '- sleep: 500  # milliseconds, at most 10000; prefer waitSettled or a screen forbid condition',
                          'orders': '- launchApp: {appId: com.tokopedia.tkpd, stopApp: false}\n- tapOn: "Transaction|Transaksi"\n- checkpoint: orders'},
             'lookup_timeouts': {'element_timeout_ms': 5000, 'optional_timeout_ms': 1000,
                                 'override': 'selector.timeout or when/while.timeout, in milliseconds'},

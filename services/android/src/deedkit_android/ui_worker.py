@@ -240,6 +240,9 @@ def execute(device, command, element_timeout_ms=5000, optional_timeout_ms=1000, 
                 raise Refused('element_not_found')
             device.swipe_ext({'down': 'up', 'up': 'down', 'left': 'right', 'right': 'left'}[
                 str(options.get('direction', 'DOWN')).lower()], scale=0.6, duration=0.3)
+    elif name == 'sleep':
+        time.sleep(value / 1000)
+        return {'success': True, 'slept_ms': value}
     elif name == 'waitForAnimationToEnd':
         # Explicit idle wait, independent of the zero-wait default configurator.
         device.jsonrpc_call('waitForIdle', (options.get('timeout', 1000),))
