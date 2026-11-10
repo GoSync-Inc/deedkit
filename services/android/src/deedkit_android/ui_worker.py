@@ -74,6 +74,17 @@ class Device(u2.Device):
     def jsonrpc_call(self, method, params=None, timeout=10):
         return _jsonrpc_call(self._dev, self._device_server_port, method, params, timeout, False)
 
+    def app_current(self):
+        # Android 16 omits focus from `dumpsys window windows`. The upstream
+        # fallback dumps every activity's view tree, adding seconds per launch.
+        output = shell(self, ['dumpsys', 'window'])
+        focused = set(re.findall(r'^\s*mCurrentFocus=Window\{[^}\n]*\s([^\s/]+)/([^}\s]+)\}',
+                                 output, re.MULTILINE))
+        if len(focused) != 1:
+            raise Refused('app_foreground_unavailable')
+        package, activity = focused.pop()
+        return {'package': package, 'activity': activity}
+
 
 def selector(device, value):
     value = {'text': value} if isinstance(value, str) else value

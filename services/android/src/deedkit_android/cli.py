@@ -17,7 +17,10 @@ def main():
     address = ipaddress.ip_address(args.host)
     if not (address.is_loopback or address in ipaddress.ip_network("100.64.0.0/10")):
         parser.error("bind to loopback or a Tailscale IPv4 address")
-    uvicorn.run(create_app(args.config), host=args.host, port=args.port, access_log=False)
+    # Leave headroom beyond the gateway's five-second idle pool expiry and
+    # tailnet transit, so it retires a connection before this server closes it.
+    uvicorn.run(create_app(args.config), host=args.host, port=args.port, access_log=False,
+                timeout_keep_alive=30)
 
 
 if __name__ == "__main__":
