@@ -22,7 +22,8 @@ from xml.etree import ElementTree
 
 from .config import Refused
 from .secrets import Run, SecretStore
-from .uiautomator import DEFINITE, Uiautomator, UiRunner
+from .flow_runner import Progress
+from .uiautomator import DEFINITE, Uiautomator, UiRunner, collect_data
 from .store import MAX_FILE
 
 OUTPUT_LIMIT = 4 * 1024 * 1024
@@ -376,7 +377,13 @@ class Devices:
         started = time.monotonic()
         run = Run(self.secrets)  # The run's secrets, in memory only (ANYM-969).
         call = functools.partial(run.call, lambda command, **options: self.ui.call(device, command, **options))
-        runner = UiRunner(call, element_timeout_ms, optional_timeout_ms)
+
+        def write_progress(path, name, finished, elapsed_ms):
+            # Step results are masked as they arrive; the data passes the mask once more on its way to the row.
+            self.store.progress(owner, request_id, {'step_path': path, 'step_name': name, 'finished_steps': finished,
+                                                    'elapsed_ms': elapsed_ms}, run.mask(collect_data(runner.steps)))
+        progress = Progress(write_progress, started)
+        runner = UiRunner(call, element_timeout_ms, optional_timeout_ms, progress.step)
         cancelled = False
         try:
             run.bind(commands)  # Before any input: an unknown secret fails the run definitely.
@@ -423,6 +430,7 @@ class Devices:
         except (OSError, ValueError):
             result = {"error": "ui_engine_unavailable", "next_action": "inspect_device_before_any_new_request"}
         finally:
+            progress.close()  # Nothing writes progress after this; the final receipt replaces it.
             try:
                 if state == 'stopped':
                     result.update(device_id=device, commands_executed=runner.completed, automatic_retry=False)
@@ -436,11 +444,7 @@ class Devices:
                                       failed_command_path=runner.current_path, failed_command=runner.current_command)
                     if not cancelled:
                         result['observation'] = await self.failure_observation(owner, device, run)
-                result["data"] = {step["result"]["list"]: step["result"]["rows"] for step in runner.steps
-                                  if "result" in step and "rows" in step["result"]}
-                result["data"].update({step["result"]["key"]: {"lines": step["result"]["lines"], **step["result"]["structure"]}
-                                       if "structure" in step["result"] else step["result"]["lines"]
-                                       for step in runner.steps if "result" in step and "lines" in step["result"]})
+                result["data"] = collect_data(runner.steps)
                 result.update(engine='uiautomator2', steps=runner.steps,
                               elapsed_ms=round((time.monotonic() - started) * 1000, 2))
                 # Every typed value is its reference in what the caller reads and what is stored.

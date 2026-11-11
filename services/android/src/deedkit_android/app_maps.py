@@ -12,7 +12,7 @@ from yaml.tokens import AliasToken, AnchorToken
 from .config import Refused
 from .flows import VARIABLE, compile_flow
 from .secrets import mentions
-from .uiautomator import UI_FIELDS, UNSUPPORTED_HINT, validate_commands, validate_selector
+from .uiautomator import UI_FIELDS, UNSUPPORTED_HINT, check_data_keys, validate_commands, validate_selector
 
 MAP_ACTIONS = {
     'openApp': {'cold', 'expect_screen', 'timeout', 'settle_ms'},
@@ -429,6 +429,7 @@ def compile_scenario(library, owner, source, parameters, *, stage='published', r
         return total
     if count(commands) > 200:
         raise Refused('too_many_flow_commands', 422)
+    check_data_keys(commands)
     return commands, {'root': root_pin, 'pins': list(pins.values()), 'floating': list(floating.values()),
                       'side_effects': sorted(effects or {'none'})}
 

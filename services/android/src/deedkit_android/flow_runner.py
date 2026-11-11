@@ -4,6 +4,9 @@ Each command and read-only probe goes through the engine's call; the base class
 only walks nested commands, records paths and never repeats a mutation itself.
 """
 
+import asyncio
+import time
+
 from .config import Refused
 
 
@@ -64,3 +67,42 @@ class FlowRunner:
                         raise
         else:
             raise Refused('unsupported_uiautomator_command', 422)
+
+
+class Progress:
+    """Step-boundary progress of one running flow (ANYM-970).
+
+    `write(step_path, step_name, finished_steps, elapsed_ms)` gets the latest boundary at most every `interval` seconds:
+    at once when the last write is older, else from a timer, so a slow step shows within one interval. It is advisory:
+    a failing write is dropped and never reaches the run."""
+
+    def __init__(self, write, started, interval=0.25, clock=time.monotonic):
+        self.write, self.started, self.interval, self.clock = write, started, interval, clock
+        self.pending, self.last, self.timer = None, None, None
+
+    def step(self, path, name, finished):
+        now = self.clock()
+        self.pending = (path, name, finished, round((now - self.started) * 1000, 2))
+        if self.last is None or now - self.last >= self.interval:
+            self.flush()
+        elif self.timer is None:
+            self.timer = asyncio.get_running_loop().call_later(self.last + self.interval - now, self.flush)
+
+    def flush(self):
+        if self.timer is not None:
+            self.timer.cancel()
+            self.timer = None
+        if self.pending is None:
+            return
+        pending, self.pending, self.last = self.pending, None, self.clock()
+        try:
+            self.write(*pending)
+        except Exception:  # noqa: BLE001 - progress is advisory; the receipt at the end is the record
+            pass
+
+    def close(self):
+        """Stop writing, before the final receipt is stored."""
+        if self.timer is not None:
+            self.timer.cancel()
+            self.timer = None
+        self.pending = None
