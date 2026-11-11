@@ -1,0 +1,64 @@
+{
+ "languages": "eng",
+ "size": [
+  1080,
+  564
+ ],
+ "lines": [
+  {
+   "text": "Help Center",
+   "bounds": [
+    40,
+    68,
+    287,
+    109
+   ]
+  },
+  {
+   "text": "Refunds are processed within 3 to 5",
+   "bounds": [
+    72,
+    185,
+    526,
+    212
+   ]
+  },
+  {
+   "text": "business days after we receive the",
+   "bounds": [
+    72,
+    226,
+    508,
+    253
+   ]
+  },
+  {
+   "text": "returned item. You will get an email",
+   "bounds": [
+    72,
+    267,
+    515,
+    294
+   ]
+  },
+  {
+   "text": "when the refund is complete.",
+   "bounds": [
+    72,
+    308,
+    436,
+    335
+   ]
+  },
+  {
+   "text": "Contact support",
+   "bounds": [
+    401,
+    423,
+    679,
+    456
+   ]
+  }
+ ],
+ "lists": []
+}

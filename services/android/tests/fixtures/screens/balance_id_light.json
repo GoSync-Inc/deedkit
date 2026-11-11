@@ -1,0 +1,46 @@
+{
+ "languages": "eng+ind",
+ "size": [
+  1080,
+  552
+ ],
+ "lines": [
+  {
+   "text": "Saldo GoPay",
+   "bounds": [
+    40,
+    68,
+    335,
+    114
+   ]
+  },
+  {
+   "text": "Rp 1.234.567",
+   "bounds": [
+    72,
+    193,
+    362,
+    238
+   ]
+  },
+  {
+   "text": "Diperbarui 11 Nov 2026",
+   "bounds": [
+    72,
+    263,
+    583,
+    308
+   ]
+  },
+  {
+   "text": "Isi Saldo",
+   "bounds": [
+    450,
+    404,
+    629,
+    436
+   ]
+  }
+ ],
+ "lists": []
+}

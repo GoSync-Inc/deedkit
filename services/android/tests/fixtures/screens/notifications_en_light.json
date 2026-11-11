@@ -1,0 +1,156 @@
+{
+ "languages": "eng",
+ "size": [
+  1080,
+  1037
+ ],
+ "lines": [
+  {
+   "text": "Notifications",
+   "bounds": [
+    40,
+    67,
+    258,
+    93
+   ]
+  },
+  {
+   "text": "Package arrived",
+   "bounds": [
+    72,
+    209,
+    243,
+    231
+   ]
+  },
+  {
+   "text": "2m",
+   "bounds": [
+    975,
+    209,
+    1008,
+    226
+   ]
+  },
+  {
+   "text": "Your parcel is at the front desk",
+   "bounds": [
+    72,
+    245,
+    396,
+    268
+   ]
+  },
+  {
+   "text": "Payment received",
+   "bounds": [
+    72,
+    373,
+    262,
+    396
+   ]
+  },
+  {
+   "text": "1h",
+   "bounds": [
+    982,
+    374,
+    1008,
+    391
+   ]
+  },
+  {
+   "text": "You received $25.00 from Alex",
+   "bounds": [
+    72,
+    410,
+    397,
+    430
+   ]
+  },
+  {
+   "text": "Reminder",
+   "bounds": [
+    72,
+    539,
+    175,
+    556
+   ]
+  },
+  {
+   "text": "3h",
+   "bounds": [
+    982,
+    539,
+    1008,
+    556
+   ]
+  },
+  {
+   "text": "Dentist appointment on Nov 12 at 9:30",
+   "bounds": [
+    72,
+    575,
+    478,
+    598
+   ]
+  },
+  {
+   "text": "Security alert",
+   "bounds": [
+    72,
+    703,
+    211,
+    726
+   ]
+  },
+  {
+   "text": "1d",
+   "bounds": [
+    982,
+    704,
+    1008,
+    721
+   ]
+  },
+  {
+   "text": "New sign-in from Chrome on Windows",
+   "bounds": [
+    72,
+    741,
+    477,
+    763
+   ]
+  },
+  {
+   "text": "Weekly report",
+   "bounds": [
+    72,
+    868,
+    219,
+    891
+   ]
+  },
+  {
+   "text": "2d",
+   "bounds": [
+    982,
+    869,
+    1008,
+    886
+   ]
+  },
+  {
+   "text": "You walked 42,318 steps this week",
+   "bounds": [
+    72,
+    905,
+    443,
+    928
+   ]
+  }
+ ],
+ "lists": [
+  5
+ ]
+}

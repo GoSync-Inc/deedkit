@@ -1,0 +1,129 @@
+{
+ "languages": "eng+ind",
+ "size": [
+  1080,
+  898
+ ],
+ "lines": [
+  {
+   "text": "Hasil Pencarian",
+   "bounds": [
+    40,
+    71,
+    421,
+    106
+   ]
+  },
+  {
+   "text": "Kaos Polos Katun",
+   "bounds": [
+    72,
+    220,
+    334,
+    243
+   ]
+  },
+  {
+   "text": "Rp 49.900",
+   "bounds": [
+    851,
+    221,
+    1008,
+    249
+   ]
+  },
+  {
+   "text": "Terjual 1rb+",
+   "bounds": [
+    72,
+    266,
+    263,
+    295
+   ]
+  },
+  {
+   "text": "Jakarta Barat",
+   "bounds": [
+    72,
+    312,
+    276,
+    335
+   ]
+  },
+  {
+   "text": "Celana Jeans Slim",
+   "bounds": [
+    72,
+    446,
+    347,
+    469
+   ]
+  },
+  {
+   "text": "Rp 179.000",
+   "bounds": [
+    832,
+    447,
+    1008,
+    475
+   ]
+  },
+  {
+   "text": "Terjual 250+",
+   "bounds": [
+    72,
+    492,
+    269,
+    521
+   ]
+  },
+  {
+   "text": "Bandung",
+   "bounds": [
+    72,
+    538,
+    206,
+    567
+   ]
+  },
+  {
+   "text": "Topi Baseball",
+   "bounds": [
+    72,
+    672,
+    272,
+    701
+   ]
+  },
+  {
+   "text": "Rp 35.000",
+   "bounds": [
+    851,
+    673,
+    1008,
+    701
+   ]
+  },
+  {
+   "text": "Terjual 3rb+",
+   "bounds": [
+    72,
+    718,
+    263,
+    747
+   ]
+  },
+  {
+   "text": "Surabaya",
+   "bounds": [
+    72,
+    764,
+    216,
+    793
+   ]
+  }
+ ],
+ "lists": [
+  3
+ ]
+}
