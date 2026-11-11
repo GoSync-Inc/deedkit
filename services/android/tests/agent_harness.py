@@ -137,7 +137,7 @@ class FakePhone:
         self.commands.append(command)
         self.options.append(options)
         if command == '__guard__':
-            return {'success': True}
+            return {'success': True, 'package': self.package, 'packages': [self.package]}
         if command == '__hierarchy__':
             return {'xml': screen_xml(self.package, self.field, self.nodes)}
         name = next(iter(command))

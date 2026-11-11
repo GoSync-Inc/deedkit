@@ -26,7 +26,7 @@ from .agent_tools import MODELS, target
 from .app_maps import compile_scenario
 from .config import Package, Refused, Strict
 from .flows import VARIABLE
-from .guard import Rules
+from .guard import Rules, Stop
 from .secrets import REFERENCE, Run as SecretRun, references
 from .store import identifier
 from .uiautomator import DATA_KEY, UiRunner, collect_data, validate_commands
@@ -34,6 +34,12 @@ from .uiautomator import DATA_KEY, UiRunner, collect_data, validate_commands
 MINUTE_S = 60
 FINISH_GRACE_S = 10
 TOOL_TIMEOUT_S = 90
+# Surfaces an action may leave the phone on without leaving the run's apps: home screens, the system UI, permission
+# prompts and keyboards. Any other foreground app after an action ends the run (rule foreign_app).
+NEUTRAL_PACKAGES = frozenset({
+    'com.android.systemui', 'com.android.launcher3', 'com.google.android.apps.nexuslauncher', 'com.sec.android.app.launcher',
+    'com.miui.home', 'com.android.permissioncontroller', 'com.google.android.permissioncontroller',
+    'com.google.android.inputmethod.latin', 'com.samsung.android.honeyboard', 'com.android.inputmethod.latin'})
 RETENTION_S = 14 * 24 * 3600
 MAX_NOTES = 200
 STATES = ('running', 'succeeded', 'stopped_by_guard', 'timed_out', 'action_cap', 'failed', 'stopped', 'lost')
@@ -283,8 +289,15 @@ class AgentRun:
     async def guarded(self, command):
         """One command through the guard and the secret resolution, then the guard's screen rule on its result."""
         result = await self.call(self.command(command))
-        await self.call('__guard__')
+        self.check_foreground(await self.call('__guard__'))
         return result
+
+    def check_foreground(self, seen):
+        """The app on screen after an action is one of the run's apps or a neutral system surface; any other ends the run."""
+        package = (seen or {}).get('package')
+        if package is None or package in self.apps or package in NEUTRAL_PACKAGES:
+            return
+        raise Stop('foreign_app', package, package, 'after')
 
     async def do_screen(self, args):
         await self.call('__guard__')
@@ -377,7 +390,7 @@ class AgentRun:
         self.check_commands(commands)
         runner = UiRunner(self.call, 5000, 1000)
         await runner.run(commands)
-        await self.call('__guard__')
+        self.check_foreground(await self.call('__guard__'))
         data = self.secrets.mask(collect_data(runner.steps))
         return {'text': cap_bytes(json.dumps({'steps': len(runner.steps), 'data': data}, ensure_ascii=False), 8192)}
 
