@@ -21,10 +21,9 @@ from uiautomator2.exceptions import HTTPError as HTTPError, UiObjectNotFoundErro
 
 from .config import Refused
 from .guard import POINT_TAP_PX, Guard, Rules, Stop
+from .secrets import REFERENCE, TEXT_FIELDS, typed_text
 from .uiautomator import SELECTORS, stop_script
 
-# Accessibility classes of editable fields (EditText subclasses report EditText).
-TEXT_FIELDS = ('EditText', 'AutoCompleteTextView')
 # Bound for a launched app's window to take focus after `am start -W` returns.
 LAUNCH_FOREGROUND_S = 10
 
@@ -153,15 +152,21 @@ def element_region(device, value, timeout):
     return region
 
 
-def execute(device, command, element_timeout_ms=5000, optional_timeout_ms=1000, ocr=None, guard=None):
+def field_attributes(info):
+    """A uiautomator2 node info as the XML attributes typed_text checks."""
+    return {'class': info.get('className'), 'package': info.get('packageName'),
+            'focused': 'true' if info.get('focused') else 'false'}
+
+
+def execute(device, command, element_timeout_ms=5000, optional_timeout_ms=1000, ocr=None, guard=None, secrets=None):
     from .app_maps import MAP_ACTIONS
     from .map_runtime import execute_map
-    if guard is not None:
-        # Screen and write rules before the action; the tap rule runs at each tap below.
-        guard.before(device, command)
+    # Screen and write rules before the action; the tap rule runs at each tap below.
+    context = guard.before(device, command) if guard is not None else None
     if isinstance(command, dict) and next(iter(command)) in MAP_ACTIONS:
         name, options = next(iter(command.items()))
-        return execute_map(device, name, options, functools.partial(execute, guard=guard), guard)
+        return execute_map(device, name, options, functools.partial(execute, guard=guard), guard,
+                           typed=lambda text, field: typed_text(device, text, secrets, context, field))
     name, value = next(iter(command.items())) if isinstance(command, dict) else (command, None)
     options = value if isinstance(value, dict) else {}
     timeout = options.get('timeout', optional_timeout_ms if options.get('optional') else element_timeout_ms)
@@ -189,7 +194,9 @@ def execute(device, command, element_timeout_ms=5000, optional_timeout_ms=1000, 
         if name == 'copyTextFrom':
             return {'text': target.get_text(timeout=0)}
         if name == 'setText':
-            target.set_text(value['value'], timeout=0)
+            # A reference types the secret only into a focused editable field of its own app (typed_text).
+            field = field_attributes(target.info) if REFERENCE.fullmatch(value['value']) else None
+            target.set_text(typed_text(device, value['value'], secrets, context, field), timeout=0)
         else:
             x, y = point(device, options['point']) if 'point' in options else target.center()
             if guard is not None:
@@ -209,7 +216,9 @@ def execute(device, command, element_timeout_ms=5000, optional_timeout_ms=1000, 
         root = ElementTree.fromstring(device.jsonrpc_call('dumpWindowHierarchy', (True, 50)))
         focused = next((node for node in root.iter('node') if node.get('focused') == 'true'
                         and (node.get('class') or '').endswith(TEXT_FIELDS)), None)
+        wanted = (value['text'] if isinstance(value, dict) else str(value)) if name == 'inputText' else ''
         if focused is None:
+            typed_text(device, wanted, secrets, context, None)  # A reference stops here: nothing is typed.
             raise Refused('focused_field_not_found')
         selector = {'focused': True, 'className': focused.get('class')}
         if focused.get('package'):
@@ -219,7 +228,7 @@ def execute(device, command, element_timeout_ms=5000, optional_timeout_ms=1000, 
         if focused.get('hint') == text:
             text = ''
         if name == 'inputText':
-            text += value['text'] if isinstance(value, dict) else str(value)
+            text += typed_text(device, wanted, secrets, context, focused.attrib)
         else:
             count = value.get('charactersToErase', len(text)) if isinstance(value, dict) else value
             text = text[:-int(count)] if int(count) else text
@@ -292,6 +301,12 @@ def execute(device, command, element_timeout_ms=5000, optional_timeout_ms=1000, 
     return {'success': True}
 
 
+def make_guard(args):
+    """The guard of one call. Built-in rules always apply; the parent's host configuration may only add to them.
+    secret_packages are the apps the run's referenced secrets are bound to, where a password field is expected."""
+    return Guard(Rules(args.pop('guard', None)), args.get('ocr'), secret_packages=args.pop('secret_packages', ()))
+
+
 def main():
     logging.disable(logging.CRITICAL)
     device = None
@@ -303,8 +318,7 @@ def main():
                 if device is None:
                     device = Device(*sys.argv[1:])
                 args = json.loads(line)
-                # Built-in rules always apply; the parent's host configuration may only add to them.
-                guard = Guard(Rules(args.pop('guard', None)), args.get('ocr'))
+                guard = make_guard(args)
                 if args['command'] == '__hierarchy__':
                     result = {'xml': device.jsonrpc_call('dumpWindowHierarchy', (True, 50))}
                 elif args['command'] == '__guard__':

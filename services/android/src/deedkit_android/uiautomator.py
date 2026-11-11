@@ -44,7 +44,9 @@ UNSUPPORTED_HINT = 'Use android_execute for this operation. The reference lists 
 # Definite read/lookup failures: nothing acted, so the persistent worker stays.
 DEFINITE = {'element_not_found', 'screen_not_found', 'ambiguous_selector', 'invalid_element_bounds',
             'ocr_unavailable', 'ocr_failed', 'screenshot_unavailable', 'region_outside_screen',
-            'screen_not_settled', 'focused_field_not_found'}
+            'screen_not_settled', 'focused_field_not_found',
+            # ANYM-969: nothing was typed (the worker refused, or the host could not read or find the secret).
+            'secret_package_mismatch', 'secret_unknown', 'secrets_unavailable'}
 
 
 
@@ -189,6 +191,13 @@ def reference():
             'compatibility': 'Saved command lists and literal parameters remain usable. Unsupported commands fail validation before execution. Legacy retryTapIfNoChange is accepted but never repeats a tap. waitToSettleTimeoutMs is an explicit post-tap wait.',
             'receipts': 'steps contains path, command name, elapsed_ms and result. First failure has a durable screenshot and compact hierarchy. Poll running/unknown with the same request_id; never replay uncertain mutations.',
             'parameters': 'Literal ${UPPER_CASE} substitution, including saved subflows.',
+            'secrets': 'inputText: ${secret:NAME} (also setText value and a map typeInto text, as the whole value only) types a secret '
+                       'the owner stored on the USB host with `deedkit-android secret set NAME --package PKG`; android_capabilities.secrets '
+                       'lists names and packages. The host resolves it only when typing, into a focused editable field of the bound app: '
+                       'another app or field fails with secret_package_mismatch and nothing is typed. Elsewhere a reference fails '
+                       'validation (secret_reference_not_allowed, secret_unknown). A PIN screen, a protected app or a messenger still '
+                       'stops the run. The value is in no request, saved flow, receipt or log: reads after it was typed (copyTextFrom, '
+                       'readScreenText, readList, the failure observation) show ${secret:NAME} instead, and that observation has no screenshot.',
             'screen_text': 'readScreenText: {region: {x, y, w, h} | within: <selector>, min_confidence: 0-100 (engine default: Apple Vision 50, Tesseract 60), limit: 1-300 (100), key: name (screen_text)} '
                            'recognizes text in one screenshot on the USB host when the host config sets ocr_command: Apple Vision on a macOS host with the vision extra, else Tesseract; ocr.engine names the one used. '
                            'Use it when the hierarchy has no text, e.g. canvas-drawn list cards. It returns lines {text, bounds, confidence} in full-screen '

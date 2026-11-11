@@ -16,7 +16,7 @@ engine: the Maestro engine was removed on 2026-11-11.
 
 | Tool | Purpose |
 | --- | --- |
-| `android_capabilities` | Granted devices, connection states and command names |
+| `android_capabilities` | Granted devices, connection states, command names, the run guard's rules and secret names with their packages |
 | `android_session` | Acquire, renew or release exclusive control of a phone |
 | `android_observe` | PNG screenshot plus Android UI hierarchy |
 | `android_execute` | Run device-targeted ADB arguments and retain a result receipt |
@@ -130,7 +130,8 @@ nested `runFlow`/`repeat`/`retry`, map actions) passes the guard in the worker
   OCR in a 400x240 px box when `ocr_command` is set; otherwise it stops.
 - Screen rule, before every action and after the last one: a protected package
   (authenticators, password managers, Indonesian and Russian banks and wallets), a
-  configured stop activity, a PIN or payment-code prompt, or a visible password field.
+  configured stop activity, a PIN or payment-code prompt, or a visible password field (a run
+  that references a secret bound to that app expects one there; see Secrets).
 - Write-denied apps: in WhatsApp, Telegram, Signal, Messages, Gmail, Messenger and
   the dialer every tap, type, key, swipe and `setText` stops; `launchApp`,
   `clearState`, `openLink` and `openDeepLink` into one stop before they run.
@@ -152,6 +153,58 @@ The host config can only add rules, in an optional `guard` object:
 (`package/.Activity` or full class names). It has no field that removes or
 disables a built-in rule; changing it needs a service restart. Older service
 versions reject the `guard` key, so roll back the config with the executable.
+
+## Secrets
+
+A flow types a stored secret by reference, so the value never passes through a request
+(ANYM-969). The owner, or an agent with a shell on the USB host, stores it there:
+
+```sh
+deedkit-android secret set SHOP_PASSWORD --package com.example.shop --config /path/to/config.json   # value on standard input
+deedkit-android secret list --config /path/to/config.json                                          # names and packages only
+deedkit-android secret delete SHOP_PASSWORD --config /path/to/config.json
+```
+
+Run it as the user that runs the service. A terminal prompt shows no echo; otherwise the
+value is read from standard input (one trailing newline is dropped; at most 256
+characters, one line). `NAME` matches `[A-Z][A-Z0-9_]{0,63}` and is refused when it
+contains `PIN`, `CVV`, `CVC`, `CARD`, `OTP` or `PASSCODE`: payment PINs and card data
+are the owner's hands, and the guard stops a run on a PIN screen anyway. The values live
+in `<state_dir>/secrets.json` (0600, replaced atomically, read again on every use, so a
+change needs no restart; a file open to others is refused). No HTTP route or tool sets,
+reads or lists a value. `android_capabilities.secrets` lists `{name, package}` only.
+
+A flow writes `${secret:NAME}` as the whole value of `inputText` (its text), `setText`
+(its `value`) or a map `typeInto` (its `text`):
+
+```yaml
+- tapOn: {id: "com.example.shop:id/password"}
+- inputText: ${secret:SHOP_PASSWORD}
+```
+
+- Anywhere else, including inside a longer string, a selector, a parameter value, a map
+  or a scenario field, validation fails before admission with
+  `secret_reference_not_allowed`; an unknown name fails with `secret_unknown`. The same
+  checks run for `android_maestro` validation and for saving a flow.
+- The host resolves the reference only when it types. The foreground app, and the field
+  (an `EditText` or `AutoCompleteTextView` with focus), must belong to the package the
+  secret is bound to. Otherwise the run fails with `secret_package_mismatch` (details:
+  `secret`, `reason`, `bound_package`, `foreground_package`) and nothing is typed.
+- The guard still stops on a PIN screen, a protected app and a messenger, so a secret is
+  never typed there. A run that references a secret expects a password field in the
+  bound app and no longer stops on it; every other run still does.
+- The value reaches no request identity, saved flow, draft or version, `failed_command`,
+  `remaining_yaml`, step result, receipt row, log or file: they hold `${secret:NAME}`.
+  From the moment a run sends a typing command, every read of that run replaces each
+  occurrence of the value with the reference: `copyTextFrom`, `readScreenText` (OCR
+  words of a masked line are dropped), `readList`, error details and the failure or
+  stop observation, whose text is masked before it is cut. That observation also has
+  no screenshot (`screenshot_withheld: secret_typed`), because a picture could show the
+  value. A service restart ends the run as `unknown` and it has no later reads.
+- The value goes from the host file to the phone app over the existing accessibility
+  `setText` call; it is never an `adb` argument and never appears in the host's process list.
+- Out of scope: `android_execute` and `android_observe` are unchanged and do not mask,
+  and a value left in a visible field stays on the screen after the run.
 
 ## Execution and recovery
 

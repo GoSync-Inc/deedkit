@@ -3,6 +3,7 @@
 import asyncio
 import base64
 from contextlib import asynccontextmanager, nullcontext
+import functools
 import os
 from pathlib import Path
 import re
@@ -20,6 +21,7 @@ import uuid
 from xml.etree import ElementTree
 
 from .config import Refused
+from .secrets import Run, SecretStore
 from .uiautomator import DEFINITE, Uiautomator, UiRunner
 from .store import MAX_FILE
 
@@ -87,6 +89,7 @@ class Devices:
         self.config, self.store = config, store
         self.locks = {name: asyncio.Lock() for name in config.devices}
         self.tasks = {}
+        self.secrets = SecretStore(store.directory)
         self.ui = Uiautomator(config, store.lock_fd) if getattr(config, "uiautomator2_jar", None) else None
 
     async def close(self):
@@ -315,8 +318,10 @@ class Devices:
             except Refused:
                 pass  # The caller may have released the completed operation already.
 
-    async def failure_observation(self, owner, device):
-        """Capture while holding the operation lock; store once, never at poll time."""
+    async def failure_observation(self, owner, device, run=None):
+        """Capture while holding the operation lock; store once, never at poll time.
+
+        After a secret was typed in the run its text is masked and no screenshot is taken: it could show the value."""
         result = {"device_id": device, "observed_at": time.time(),
                   "coordinate_space": "device_pixels", "resized": False}
 
@@ -329,9 +334,13 @@ class Devices:
                 # replace the operation's original failure or leak its lock.
                 return {kind + '_error': 'unavailable'}
 
-        image, hierarchy = await asyncio.gather(
-            capture('screenshot', self.capture_image(owner, device, 'file', None)),
-            capture('hierarchy', self.capture_hierarchy(device)))
+        if run is not None and run.masker:
+            image = {'screenshot_withheld': 'secret_typed'}
+            hierarchy = run.mask(await capture('hierarchy', self.capture_hierarchy(device)))
+        else:
+            image, hierarchy = await asyncio.gather(
+                capture('screenshot', self.capture_image(owner, device, 'file', None)),
+                capture('hierarchy', self.capture_hierarchy(device)))
         elements = hierarchy.pop('elements', [])
         if elements:
             hierarchy['elements'] = [{key: value[:256] if isinstance(value, str) else value
@@ -345,13 +354,13 @@ class Devices:
         result.update(hierarchy)
         return result
 
-    async def stop_observation(self, owner, device, package, sensitive):
+    async def stop_observation(self, owner, device, package, sensitive, run=None):
         """The stop screen; on a protected or secure screen only its package: no text, no image."""
         withheld = {"device_id": device, "observed_at": time.time(), "package": package,
                     "withheld": "protected_screen"}
         if sensitive:
             return withheld
-        observation = await self.failure_observation(owner, device)
+        observation = await self.failure_observation(owner, device, run)
         if "screenshot_error" in observation:
             # A secure window refuses capture: keep its text out of the receipt as well.
             return {**withheld, "withheld": "secure_screen"}
@@ -365,17 +374,19 @@ class Devices:
                            element_timeout_ms=5000, optional_timeout_ms=1000):
         state, result, stop = "unknown", {}, {}
         started = time.monotonic()
-        runner = UiRunner(lambda command, **options: self.ui.call(device, command, **options),
-                          element_timeout_ms, optional_timeout_ms)
+        run = Run(self.secrets)  # The run's secrets, in memory only (ANYM-969).
+        call = functools.partial(run.call, lambda command, **options: self.ui.call(device, command, **options))
+        runner = UiRunner(call, element_timeout_ms, optional_timeout_ms)
         cancelled = False
         try:
+            run.bind(commands)  # Before any input: an unknown secret fails the run definitely.
             checkpoint = next((i for i, command in enumerate(commands)
                                if isinstance(command, dict) and "checkpoint" in command), len(commands))
             if checkpoint:
                 async with asyncio.timeout(timeout):
                     await runner.run(commands[:checkpoint])
                     # The guard's screen rule after the last step too (ANYM-968).
-                    await self.ui.call(device, '__guard__')
+                    await call('__guard__')
             result = {"commands_executed": checkpoint, "device_id": device}
             state = "succeeded"
             if checkpoint < len(commands):
@@ -416,7 +427,7 @@ class Devices:
                 if state == 'stopped':
                     result.update(device_id=device, commands_executed=runner.completed, automatic_retry=False)
                     result['observation'] = await self.stop_observation(owner, device, result.get('package'),
-                                                                        stop.get('sensitive', True))
+                                                                        stop.get('sensitive', True), run)
                 elif state not in {'succeeded', 'paused'}:
                     result.update(device_id=device, commands_executed=runner.completed,
                                   automatic_retry=False, side_effects='may_have_occurred')
@@ -424,7 +435,7 @@ class Devices:
                         result.update(failed_command_index=runner.current_path[0],
                                       failed_command_path=runner.current_path, failed_command=runner.current_command)
                     if not cancelled:
-                        result['observation'] = await self.failure_observation(owner, device)
+                        result['observation'] = await self.failure_observation(owner, device, run)
                 result["data"] = {step["result"]["list"]: step["result"]["rows"] for step in runner.steps
                                   if "result" in step and "rows" in step["result"]}
                 result["data"].update({step["result"]["key"]: {"lines": step["result"]["lines"], **step["result"]["structure"]}
@@ -432,7 +443,8 @@ class Devices:
                                        for step in runner.steps if "result" in step and "lines" in step["result"]})
                 result.update(engine='uiautomator2', steps=runner.steps,
                               elapsed_ms=round((time.monotonic() - started) * 1000, 2))
-                self.store.finish(owner, request_id, state, result)
+                # Every typed value is its reference in what the caller reads and what is stored.
+                self.store.finish(owner, request_id, state, run.mask(result))
             finally:
                 temporary.cleanup()
                 lock.release()

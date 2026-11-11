@@ -2,6 +2,7 @@
 
 import base64
 from contextlib import asynccontextmanager
+import functools
 import hashlib
 import json
 
@@ -141,6 +142,8 @@ def create_app(config_path):
     @app.post("/v1/{operation}")
     async def call(operation: str, request: Request):
         devices, store = request.app.state.devices, request.app.state.store
+        # The stored secret names, read once and only when a flow holds a reference (ANYM-969).
+        known = functools.cache(devices.secrets.packages)
         principal = configuration.authenticate(request.headers.get("authorization", ""))
         if operation not in SCHEMAS:
             raise Refused("not_found", 404)
@@ -161,7 +164,11 @@ def create_app(config_path):
             raise Refused("not_found", 404)
         owner = principal.id
         if operation == "capabilities":
-            result = {"service": "deedkit-android", "permissions": principal.permissions,
+            try:
+                secrets = {"secrets": devices.secrets.listing()}  # Names and packages only, never a value.
+            except Refused:
+                secrets = {"secrets": [], "secrets_error": "unavailable"}
+            result = {**secrets, "service": "deedkit-android", "permissions": principal.permissions,
                       "devices": await devices.status(principal.devices), "adb_commands": sorted(COMMANDS),
                       "tool_manifest": {"version": 1, "names": list(SCHEMAS)},
                       "input_schemas": {name: schema.model_json_schema() for name, schema in SCHEMAS.items()},
@@ -194,7 +201,8 @@ def create_app(config_path):
                     raise Refused("provide_yaml_or_flow_name", 422)
                 # Authoring needs no device and no configured engine.
                 commands, metadata = compile_scenario(store.library, owner, args["yaml"], args['parameters'],
-                    stage=args['stage'], root={'name': args['name'], 'version': args['version']} if args['name'] else None)
+                    stage=args['stage'], root={'name': args['name'], 'version': args['version']} if args['name'] else None,
+                    secrets=known)
                 result = {"valid": True, "dialect_version": 4, "commands": commands, 'library': metadata}
         elif operation == "run_flow":
             if (args["yaml"] is None) == (args["name"] is None):
@@ -205,7 +213,8 @@ def create_app(config_path):
             if previous is not None:
                 return JSONResponse(previous, headers={"Cache-Control": "no-store"})
             commands, metadata = compile_scenario(store.library, owner, args["yaml"], args['parameters'],
-                stage=args['stage'], root={'name': args['name'], 'version': args['version']} if args['name'] else None)
+                stage=args['stage'], root={'name': args['name'], 'version': args['version']} if args['name'] else None,
+                secrets=known)
             result = await devices.execute(owner, device, args["session_id"], request_id,
                                            None, args["timeout_s"], args["wait_s"], flow=commands,
                                            element_timeout_ms=args['element_timeout_ms'],
@@ -220,9 +229,10 @@ def create_app(config_path):
                 elif args['action'] == 'put':
                     if not isinstance(load(args['yaml']), list):
                         raise Refused('scenario_requires_draft', 422)
-                    compile_scenario(store.library, owner, args['yaml'], {}, validate_only=True)
+                    compile_scenario(store.library, owner, args['yaml'], {}, validate_only=True, secrets=known)
                 else:
-                    compile_scenario(store.library, owner, args['yaml'], {}, stage='draft', validate_only=True)
+                    compile_scenario(store.library, owner, args['yaml'], {}, stage='draft', validate_only=True,
+                                     secrets=known)
             if args['kind'] == 'flow' and args['action'] in {'put', 'delete'}:
                 result = store.flow(owner, args['action'], args['name'], args['yaml'], args['version'])
             else:

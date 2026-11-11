@@ -11,6 +11,7 @@ from yaml.tokens import AliasToken, AnchorToken
 
 from .config import Refused
 from .flows import VARIABLE, compile_flow
+from .secrets import mentions
 from .uiautomator import UI_FIELDS, UNSUPPORTED_HINT, validate_commands, validate_selector
 
 MAP_ACTIONS = {
@@ -128,6 +129,8 @@ def candidates(value, point=False):
 
 def validate_map(source):
     value = load(source)
+    if mentions(value):
+        raise Refused('secret_reference_not_allowed', 422)  # A map holds selectors and screens, never a typed value.
     fields(value, {'package', 'selectors', 'screens', 'deep_links', 'popups', 'lists', 'meta', 'hierarchy'})
     if not isinstance(value.get('package'), str) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+', value['package']):
         raise Refused('invalid_app_package', 422)
@@ -241,7 +244,8 @@ def link_url(url, values, validate_only=False):
     return VARIABLE.sub(value, url)
 
 
-def compile_scenario(library, owner, source, parameters, *, stage='published', root=None, validate_only=False):
+def compile_scenario(library, owner, source, parameters, *, stage='published', root=None, validate_only=False,
+                     secrets=None):
     pins, floating, effects = {}, {}, set()
     stack = []
     budget = [0]
@@ -272,12 +276,17 @@ def compile_scenario(library, owner, source, parameters, *, stage='published', r
             if isinstance(value, dict):
                 if 'app_map' in value or 'map_ref' in value:
                     raise Refused('reserved_scenario_field', 422)
+                if any(mentions(key) for key in value):
+                    raise Refused('secret_reference_not_allowed', 422)
                 for child in value.values():
                     check_input(child, depth + 1)
             elif isinstance(value, list):
                 for child in value:
                     check_input(child, depth + 1)
         check_input(document)
+        if isinstance(document, dict) and any(mentions(key) or (key != 'steps' and mentions(child))
+                                              for key, child in document.items()):
+            raise Refused('secret_reference_not_allowed', 422)  # Only a step types a secret.
         values = dict(inherited_values) if inherited_values is not None else {key: str(value) for key, value in parameters.items()}
         app_map, map_ref = inherited_map, inherited_ref
         if isinstance(document, dict):
@@ -370,7 +379,7 @@ def compile_scenario(library, owner, source, parameters, *, stage='published', r
                     options = item[name]
                     child = options['commands']
                     wrapper = {name: {**options, 'commands': ['back']}}
-                    parsed = compile_flow(yaml.safe_dump([wrapper]), values, fields=all_fields)[0]
+                    parsed = compile_flow(yaml.safe_dump([wrapper]), values, fields=all_fields, secrets=secrets)[0]
                     validate_commands([parsed])
                     parsed[name]['commands'] = prepare(child, depth + 1)
                     output.append(parsed)
@@ -383,7 +392,8 @@ def compile_scenario(library, owner, source, parameters, *, stage='published', r
                     if 'app_map' in options:
                         output.append(item)  # already compiled saved child
                         continue
-                    parsed = compile_flow(yaml.safe_dump([{name: options}]), values, fields=all_fields)[0][name]
+                    parsed = compile_flow(yaml.safe_dump([{name: options}]), values, fields=all_fields,
+                                          secrets=secrets)[0][name]
                     if app_map is None:
                         raise Refused('scenario_requires_map', 422)
                     validate_action(name, parsed, app_map)
@@ -400,7 +410,7 @@ def compile_scenario(library, owner, source, parameters, *, stage='published', r
                         error = Refused('unsupported_uiautomator_command', 422)
                         error.hint = UNSUPPORTED_HINT
                         raise error
-                    parsed = compile_flow(yaml.safe_dump([item]), values, fields=all_fields)
+                    parsed = compile_flow(yaml.safe_dump([item]), values, fields=all_fields, secrets=secrets)
                     validate_commands(parsed)
                     output.extend(parsed)
             if not output:

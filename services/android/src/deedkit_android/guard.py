@@ -117,7 +117,7 @@ class Rules:
                 'stop_activity': 'the foreground activity is listed',
                 'pin_prompt': 'the screen shows a PIN or payment-code prompt (hierarchy text, or OCR when the '
                               'hierarchy has none and ocr_command is set)',
-                'password_field': 'a visible password field',
+                'password_field': 'a visible password field, unless the run references a secret bound to that app',
                 'write_denied': 'any input in a messenger, mail or dialer app, or launching, linking into or '
                                 'clearing one',
                 'unresolved_target': 'the hierarchy, foreground, link target or a point tap\'s text cannot be read',

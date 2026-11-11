@@ -166,7 +166,7 @@ def extract_list(root, listing, fields, limit):
     return rows
 
 
-def execute_map(device, name, options, native, guard=None):
+def execute_map(device, name, options, native, guard=None, typed=None):
     app_map = options['app_map']
     timeout = options.get('timeout', 3000)
     dump = lambda: snapshot(device, app_map)  # noqa: E731 - the map's own hierarchy options
@@ -203,6 +203,9 @@ def execute_map(device, name, options, native, guard=None):
             same_class = [item for item in root.iter('node') if item.get('class') == node.get('class')]
             index = next(i for i, item in enumerate(same_class) if item is node)
             value = options['text']
+            if typed is not None:
+                # A secret reference becomes its value only for a focused editable field of its own app.
+                value = typed(value, node.attrib)
             if not options.get('clear', True) and node.get('password') != 'true':
                 value = node.get('text', '') + value
             device(className=node.get('class'), instance=index).set_text(value, timeout=0)
