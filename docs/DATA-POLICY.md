@@ -70,6 +70,14 @@ volume) (owner 11-03, see Data egress).
   Backups and cold copies follow today's rule, with the gap the Deletion line records unchanged
   and no stronger promise. Egress: no model, and nothing beyond agent reads (ANYM-909) and
   reference-only hints (ANYM-911).
+- Telegram birthdays (ANYM-919): the birthday (day, month, optional year) of each active Telegram contact of an
+  account, or the fact that the user hides it, with its check time, is stored in `contact_birthdays`; "active" is the
+  archive rule in PEOPLE.md (3 outgoing and 1 incoming message in the private chat in the last 90 days, no bots, no
+  self chat). The collector's birthday pass deletes the row of a user who is no longer active, or whose chat the
+  collection policy excludes, at its next pass (about every 10 minutes); nothing is written to any calendar
+  (owner 2026-11-09, DECISIONS.md: "birthdays YES but only contacts the owner actively talks to, reminders, NOT all
+  into calendar"). Egress: agent reads through `list_birthdays` and a chat-and-date-only `contact.birthday` hint.
+  WhatsApp is not covered: it has no provider birthday field.
 - Statement statistics (ANYM-842, docs/operations/production.md "Database settings"): `pg_stat_statements` keeps
   SQL text normalized as PostgreSQL does it (constants usually replaced by `$n`, but not always: a text can keep its
   constants, for example after its entry was deallocated and re-entered; comments and identifiers stay), with call

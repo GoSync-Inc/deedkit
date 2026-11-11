@@ -1064,13 +1064,13 @@ def test_migration_70_runs_twice_and_keeps_the_counts_and_every_grant(seeded):
     emit(store)
     match_subscriptions(store)
     with store.pool.connection() as c:
-        c.execute('DELETE FROM archive_migrations WHERE version IN (70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85)')
+        c.execute('DELETE FROM archive_migrations WHERE version IN (70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86)')
         c.execute("UPDATE probe_metadata SET value='69' WHERE name='schema_version'")
         grants = c.execute("SELECT oid,relacl::text FROM pg_class WHERE relnamespace='public'::regnamespace ORDER BY oid").fetchall()
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '85'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '86'
         assert c.execute('SELECT count(*) AS n FROM archive_migrations WHERE version=70').fetchone()['n'] == 1
         assert c.execute("SELECT oid,relacl::text FROM pg_class WHERE relnamespace='public'::regnamespace ORDER BY oid").fetchall() == grants
     assert activity(store, token, sid) == {'telegram': {'scanned': 1, 'matched': 1}}
@@ -1091,6 +1091,34 @@ def failure_event(store, kind, token):
             c.execute('''INSERT INTO events(id,account,message,kind,revision,origin,snapshot,event_key)
                 VALUES(%s,'telegram-demo',NULL,'source.health',1,'live',%s,%s)''',
                 (value, Jsonb({'account': 'telegram-demo', 'status': 'degraded'}), 'source.health:synthetic-%d' % value))
+
+
+def birthday_event(store, chat='telegram-demo-chat', day='2026-11-12'):
+    """A synthetic contact.birthday row as schema 87's journal function writes it: account, chat and date only."""
+    with store.pool.connection() as c:
+        value = c.execute('UPDATE feed_counter SET value=value+1 WHERE id=1 RETURNING value').fetchone()['value']
+        c.execute('''INSERT INTO events(id,account,message,kind,revision,origin,snapshot,event_key)
+            VALUES(%s,'telegram-demo',NULL,'contact.birthday',1,'live',%s,%s)''',
+            (value, Jsonb({'account': 'telegram-demo', 'chat': chat, 'date': day}), 'contact.birthday:synthetic-%d' % value))
+
+
+# spec: ANYM-919
+def test_a_contact_birthday_reaches_only_a_definition_that_names_the_kind_in_the_selected_chat(seeded):
+    store, _, _ = seeded
+    with store.pool.connection() as c:
+        c.execute("INSERT INTO chats(id,account,title,chat_type) VALUES('telegram-demo-other','telegram-demo','Other','private')")
+    token = key(store, 'birthday-subscriber')
+    named = create(store, token, kinds=['contact.birthday'])['subscription_id']
+    default = create(store, token)['subscription_id']
+    elsewhere = store.create_subscription(token, ['telegram-demo-other'], kinds=['contact.birthday'])['subscription_id']
+    birthday_event(store)
+    match_subscriptions(store)
+    items = store.get_subscription_events(token, named)['items']
+    assert [(i['kind'], i['chat'], i['date'], i.get('message')) for i in items] == [
+        ('contact.birthday', 'telegram-demo-chat', '2026-11-12', None)]
+    # Default subscriptions never receive it, nor does a definition of another chat.
+    assert store.get_subscription_events(token, default)['items'] == []
+    assert store.get_subscription_events(token, elsewhere)['items'] == []
 
 
 # spec: ANYM-824

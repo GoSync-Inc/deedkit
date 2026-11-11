@@ -743,6 +743,14 @@ needs `read-live`, the account opt-in and, through the gateway, the
 Roll out as for live search: API and collectors, then the gateway, then the
 policy naming the action; roll back in the reverse order.
 
+## Upcoming birthdays of active Telegram contacts (ANYM-919)
+
+`list_birthdays` (`contacts-read`, Telegram only, account target; a chat-scoped key may call it and sees only its
+own chats' contacts) lists the upcoming birthdays of the owner's active Telegram contacts from the archive, with no
+provider request; `days_ahead` 0-31 (default 14). The active rule, the background birthday reads and the result
+fields are in PEOPLE.md "Birthdays of active contacts". It adds nothing to any calendar. Enable it per account like
+any operation (`operations_enabled`) and grant the `list_birthdays` action to the agents that should read it.
+
 ## Finding a Telegram contact by name (ANYM-673)
 
 `list_contacts` on a Telegram account takes an optional `query` besides `limit` and `offset`

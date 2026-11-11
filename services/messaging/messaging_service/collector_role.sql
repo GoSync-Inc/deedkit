@@ -74,3 +74,6 @@ GRANT SELECT,INSERT,DELETE ON poll_voters TO messaging_collector;
 -- Schema 84 (ANYM-920): a Telegram poll's ID, option keys, Telegram's total, the owner's choice and the voter-list read.
 -- Ingest inserts and updates its own account's rows (the table's row-level security); it never deletes one.
 GRANT SELECT,INSERT,UPDATE ON telegram_polls TO messaging_collector;
+-- Schema 86 (ANYM-919): the birthday pass writes an active contact's birthday or hidden and deletes the row of a user
+-- who is no longer active; list_birthdays reads it. Its own account's rows only (the table's row-level security).
+GRANT SELECT,INSERT,UPDATE,DELETE ON contact_birthdays TO messaging_collector;

@@ -14,6 +14,8 @@ services:
     environment:
       DATABASE_URL_FILE: /run/secrets/database_url
       PROBE_FILES: /data/files
+      # ANYM-919: list_birthdays dates in the owner's zone (the api's line, compose.yaml); empty means UTC.
+      ANYMSG_OWNER_TIMEZONE: ${ANYMSG_OWNER_TIMEZONE:-}
     volumes:
       - ./private/collector.dsn:/run/secrets/database_url:ro
       - ./private/telegram.json:/run/secrets/telegram_config:ro

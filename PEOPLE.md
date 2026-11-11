@@ -43,6 +43,33 @@ field is absent when there are none. Follow it with the messenger operation `lis
 `limit`/`offset` page the filtered list. Each call reads the whole book once per account, so for many names page
 the full list once without `query`. Nothing is stored; the contact book is not merged into the archive results.
 
+### Birthdays of active contacts (ANYM-919, schema 86)
+
+DeedKit keeps the Telegram birthday of the people the owner actually talks to, never of the whole contact book, and
+writes no calendar (owner 2026-11-09). One deterministic archive rule decides who is **active** for an account
+(`messaging_service/birthdays.py`): a Telegram user is active when, in the private chat with that user
+(`chats.chat_type='private'`, the chat's provider ID is the user ID), the archive holds at least 3 outgoing and at
+least 1 incoming message sent in the last 90 days, not deleted. The self chat, Telegram's service chat (777000) and a
+chat whose incoming message in that window Telegram marked as sent by a bot are never active, nor is a chat the
+collection policy excludes.
+
+The Telegram collector keeps `contact_birthdays` to exactly the active users. About every 10 minutes it deletes the
+row of anyone no longer active, reads `contacts.getBirthdays` (Telegram answers for birthdays within a day of today)
+at most every 6 hours, and reads `users.getFullUser` for each active user whose birthday is unread or older than 7
+days, at most 30 users per hour per account, through the account's request governor (background lane; a FloodWait
+stops the pass until the wait ends). A user who does not share a birthday, or whom Telegram refuses, is stored
+`hidden`. `ANYMSG_TELEGRAM_BIRTHDAYS=0` stops the reads. WhatsApp has no birthday field and is not covered.
+
+Read it with the messenger operation `list_birthdays` (`contacts-read`, Telegram, tool `messages_read_contacts`;
+`days_ahead` 0-31, default 14). It answers from the archive without a provider request: for each active contact
+with a known birthday within `days_ahead` days of today in the owner's zone (`ANYMSG_OWNER_TIMEZONE`, named in
+`time_zone`), `name`, `chat_id`, `day`, `month`, `year` (null when not shared), `date`, `days_until` and
+`age_turning` when the year is known, sorted by date, at most 100 (`truncated`). 29 February falls on 28 February
+in a common year. Hidden and not yet read birthdays are only counted in `not_shared`, without names. A chat-scoped
+key sees only the contacts of its own chats: another contact is neither listed nor counted. To be woken the day
+before, subscribe to `contact.birthday` (SUBSCRIPTIONS.md). An agent may propose a calendar entry only when the
+owner asks, under the calendar's own confirmation; a greeting is a send with its own confirmation.
+
 ## Linked people (ANYM-283, schema 43)
 
 The owner may state that identities in different messengers are one person. Links are

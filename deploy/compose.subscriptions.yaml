@@ -13,6 +13,8 @@ services:
       db: {condition: service_healthy}
     environment:
       DATABASE_URL_FILE: /run/secrets/database_url
+      # ANYM-919: the contact.birthday hint is due from 09:00 in the owner's zone; empty means UTC.
+      ANYMSG_OWNER_TIMEZONE: ${ANYMSG_OWNER_TIMEZONE:-}
     volumes:
       - type: bind
         source: ./private/subscriptions.dsn

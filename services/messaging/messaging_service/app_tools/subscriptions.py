@@ -57,6 +57,9 @@ def register_subscription_tools(mcp, call, async_call, read, upload_write):
         reply_to_own_send (dynamic only) catches an exact native reply to any confirmed send of
         this key. Optional sender_ids (explicit chats only) are exact account-scoped IDs from search_people.
         Starts at the committed event boundary; default message.created/incoming/live.
+        contact.birthday (named in kinds only) wakes once per contact and year, from 09:00 owner time the day
+        before, with the chat ID and date only; it covers the owner's active Telegram contacts only
+        (list_birthdays) and DeedKit adds nothing to any calendar.
         Historical events require explicit backfill/reconcile origins; a message the live stream lost and a
         reconcile pass found within 6 hours of sending has origin live_recovered and matches live. File readiness
         is independent of message arrival. Optional expiry is a future zoned ISO time

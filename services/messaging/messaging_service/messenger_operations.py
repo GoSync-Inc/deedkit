@@ -99,6 +99,12 @@ CONTACTS_QUERY_LIMITATION = ('Telegram: one call per account reads the whole con
     'name and username only, no phone number (ё and е are one letter; a Latin spelling finds the Cyrillic name: fedor finds '
     'Федор, fyodor finds Фёдор), and limit/offset page the filtered list. For many names page the full list once without '
     'query instead of one call per name.')
+BIRTHDAYS_LIMITATION = ('Telegram: upcoming birthdays of the owner\'s active Telegram contacts only (a private chat with at '
+    'least 3 outgoing and 1 incoming message in the last 90 days; no bots, no self chat), from the archive with no '
+    'provider request: name, chat_id, day, month, year (null when not shared), date, days_until and age_turning when '
+    'the year is known, sorted by date, within days_ahead (0-31, default 14) of today in the owner\'s time zone; '
+    'hidden or not yet read birthdays only as the not_shared count. Telegram is read in the background (at most 30 '
+    'users per hour), so a new contact may wait. DeedKit adds nothing to any calendar.')
 LIVE_CHAT_TYPES = ('private', 'group', 'channel')
 LIVE_FILTERS = ('documents', 'photos', 'links', 'voice')
 BATCH_LIMITATION = ('One row per ID: applied, refused, unknown or not_attempted; an uncertain ID is never retried.')
@@ -152,6 +158,9 @@ OPERATIONS = {
     'list_contacts': _spec('contacts-read', 'account', full_account=True, fields=_page),
     'get_contact': _spec('contacts-read', 'account', full_account=True, fields=_user),
     'list_blocked': _spec('contacts-read', 'account', full_account=True, fields=_page),
+    # ANYM-919: read from the archive, no provider request; a chat-scoped key sees its own chats' contacts only.
+    'list_birthdays': _spec('contacts-read', 'account', platforms=('telegram',), fields={
+        'days_ahead': _field('integer', default=14, minimum=0, maximum=31)}, limitation=BIRTHDAYS_LIMITATION),
     'send_file': _spec('send', mutation=True, fields={
         'attachment_id': _field('attachment_id'),
         'upload_id': _field('upload_id'),
@@ -285,7 +294,7 @@ OPERATION_TOOLS = {
                     'set_slow_mode', 'set_join_approval', 'approve_join_requests', 'reject_join_requests', 'join_chat',
                     MODERATION, BAN, UNBAN),
     'change_contacts': ('add_contact', 'delete_contact', 'block_contact', 'unblock_contact'),
-    'read_contacts': ('list_contacts', 'get_contact', 'list_blocked', 'get_labels'),
+    'read_contacts': ('list_contacts', 'get_contact', 'list_blocked', 'get_labels', 'list_birthdays'),
 }
 LOCAL_WRITE_OPERATIONS = frozenset(('open_chat_by_phone', 'open_chat_by_username'))
 _SEND = 'a send: the send layer (send_message, ANYM-546) owns sends'

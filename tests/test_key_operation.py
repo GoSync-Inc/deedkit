@@ -201,7 +201,7 @@ def schema_43(store):
     finally:
         with store.pool.connection() as c:
             c.execute(MIGRATION_044.read_text())
-            c.execute("UPDATE probe_metadata SET value='85' WHERE name='schema_version'")
+            c.execute("UPDATE probe_metadata SET value='86' WHERE name='schema_version'")
 
 
 def rows_any(store):
