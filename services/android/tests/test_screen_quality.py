@@ -79,6 +79,21 @@ def test_corpus_character_error_rate_and_list_items_meet_the_bar():
     assert summary['list_items_exact'] == summary['list_screens'], summary
 
 
+# spec: ANYM-966
+def test_vision_corpus_character_error_rate_and_list_items_meet_the_bar():
+    """Apple Vision with ink-tight boxes holds the same bar; it runs only on a macOS host with the vision extra."""
+    from deedkit_android.ocr_quality import evaluate
+    from deedkit_android.screen_text import recognize
+    from deedkit_android.screen_vision import available
+
+    if not available():
+        pytest.skip('Apple Vision (macOS with the vision extra) is not available here')
+    summary = evaluate(CORPUS, None, recognizer=lambda image, ocr: recognize(image, {**ocr, 'engine': 'vision'}))
+    assert summary['screens'] >= 20
+    assert summary['cer_percent'] <= 2.0, summary
+    assert summary['list_items_exact'] == summary['list_screens'], summary
+
+
 # spec: ANYM-961
 def test_read_screen_text_reports_preprocessing_and_reads_a_corpus_list(tmp_path):
     from deedkit_android.ui_worker import execute
