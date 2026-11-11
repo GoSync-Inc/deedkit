@@ -286,8 +286,8 @@ If a worker restarted during a read, that refresh becomes `failed`, and coverage
 
 Each complete window read is compared with the last stored state of every event it holds (`event_states`), and what
 changed is written to `change_journal` in the transaction that replaces the window. A change is seen only when a read
-covers it: there is no background refresh (ANYM-576), so a change appears no sooner than the next agenda or slots
-refresh of a window that holds the event.
+covers it: a change appears no sooner than the next agenda or slots refresh of a window that holds the event, or the
+next scheduled refresh of a calendar the operator configured (below).
 
 - The first read of a calendar seeds the baseline and journals nothing. `created` means *first seen after the
   baseline*, not the provider's creation time: an event in a window first read later is `created` then.
@@ -328,6 +328,45 @@ and only the contract's data keys: `calendar_ref`, `event_ref`, `start_at`, `ver
 `changed`. `series_ref`, the occurrence count and `origin` stay in the journal until the contract accepts them.
 `seq` is gapless and commits in order (writers take the one `journal_head` row); the journal is not pruned
 (`retention_floor` 0). Before the worker's first journal write the head is `503 journal_not_ready`.
+
+## Scheduled refresh and starting reminders (ANYM-576, schema 9)
+
+Only the operator names the calendars the worker refreshes on its own; nothing else asks for a refresh (the gateway,
+and so messaging, can only read the configuration). A calendar without configuration is never refreshed.
+
+```sh
+uv run family-calendar service refresh-calendar --calendar <ref> \
+  [--window-days 14] [--cadence-minutes 5] [--lead 15 [--lead 60 ...]]
+uv run family-calendar service refresh-list
+uv run family-calendar service refresh-calendar --calendar <ref> --off   # undo
+```
+
+Defaults: the window now to +14 days (1-60), every 5 minutes (1-1440), one lead time of 15 minutes (1-1440, up to
+four). A new or changed configuration is due at once.
+
+- **Order and bound.** The worker's tick runs an agent's refresh request, a series read and the next operation first;
+  then one due calendar's scheduled refresh, cut at 45 s (`provider_timeout`), so a queued operation waits at most
+  that long behind it. The refresh is the same read an agent's refresh makes (window read, change journal, Google
+  sync and CalDAV probes of at most 15 s each), under the calendar's lock.
+- **Provider quota.** A calendar is read at most once per its cadence; at most one scheduled refresh starts every 10 s
+  across all calendars. At the defaults one calendar costs 12 window reads an hour (Google: `events.list` pages; CalDAV:
+  one calendar-query REPORT) plus the journal's bounded sync and probe requests.
+- **Failures.** A failed refresh writes the calendar's `error` and `failures` (`refresh-list`) and marks its coverage
+  `blocked`, as an agent's failed refresh does; it is never a journal event, and the calendar is tried again one cadence
+  later. Two refusals of provider authorization in a row (`reauth_required` and the other credential errors) set the
+  calendar's `health` to `auth_failed` (`health_since`); while a calendar the reader is bound to is `auth_failed`,
+  `GET /v1/events` answers `503 calendar_auth_failed`, which the event router reports as the per-source
+  `module_unreachable` of `deedkit:calendar`. Nothing is lost: the next successful refresh (after the owner reconnects
+  the provider) clears the health and the router reads on from its cursor. Events of the other calendars bound to
+  the same reader wait with it; a `starting` reminder whose start passed meanwhile expires undelivered.
+- **`calendar.event.starting`.** For each configured lead the worker journals one event per (`event_ref`, `start_at`,
+  lead) once the start is at most the lead away and still in the future: data `calendar_ref`, `event_ref`,
+  `start_at`, `lead_minutes`; `urgency` `now`; `expires_at` the start. It is in the journal's `seq` (`starting_reminders`),
+  stored before it is served, so a restart never repeats it. Reminders come only from the stored occurrences of a
+  calendar whose last successful scheduled refresh is at most twice its cadence plus a minute old; all-day events
+  and starts already past get none. A moved occurrence has a new start, so its pending reminder is withdrawn and the
+  new start gets its own; a cancelled occurrence is gone and gets none. A reminder already served is not recalled:
+  the `changed` or `cancelled` event that follows it tells the agent.
 
 ## Operations
 

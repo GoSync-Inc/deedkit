@@ -269,7 +269,7 @@ def test_db_roles_check_is_clean_after_db_roles_and_writes_nothing(fcs_home):
     run(["migrate"], home)
     run(["db-roles"], home)
     before = snapshot(home, dsn)
-    assert run(["db-roles", "--check"], home) == {"db_roles_check": "ok", "schema_version": 8}
+    assert run(["db-roles", "--check"], home) == {"db_roles_check": "ok", "schema_version": store_module.MIGRATIONS[-1][0]}
     assert snapshot(home, dsn) == before
 
 
@@ -285,7 +285,7 @@ def test_db_roles_check_names_each_drift_and_writes_nothing(fcs_home, change, li
     with pytest.raises(CalendarError) as caught:
         run(["db-roles", "--check"], home)
     assert caught.value.code == "db_roles_drift"
-    assert caught.value.details == {"schema_version": 8, "drift": lines}
+    assert caught.value.details == {"schema_version": store_module.MIGRATIONS[-1][0], "drift": lines}
     assert snapshot(home, dsn) == before
 
 

@@ -268,15 +268,39 @@ def rfc3339(value):
 
 def envelope(row):
     """One event of the cursor contract: ANYM-562's envelope, its calendar data keys and a top-level scope_ref.
-    series_ref, occurrences and origin stay in the journal until the contract accepts them."""
-    data = {"calendar_ref": row["calendar_ref"], "event_ref": row["event_ref"], "start_at": rfc3339(row["start_at"])}
-    if row["type"] != "cancelled":
+    series_ref, occurrences and origin stay in the journal until the contract accepts them. A `starting` reminder
+    (ANYM-576) is urgent and expires at the start it announces."""
+    start = rfc3339(row["start_at"])
+    data = {"calendar_ref": row["calendar_ref"], "event_ref": row["event_ref"], "start_at": start}
+    if row["type"] == "starting":
+        data["lead_minutes"] = row["lead_minutes"]
+    elif row["type"] != "cancelled":
         data["version"] = row["version"]
     if row["type"] == "changed":
         data["changed"] = row["changed"]
+    starting = row["type"] == "starting"
     return {"specversion": "1.0", "id": "calendar:%d" % row["seq"], "source": SOURCE,
             "type": "calendar.event." + row["type"], "subject": row["event_ref"], "time": rfc3339(row["at"]),
-            "data": data, "urgency": "batch", "expires_at": None, "scope_ref": "calendar:" + row["calendar_ref"]}
+            "data": data, "urgency": "now" if starting else "batch", "expires_at": start if starting else None,
+            "scope_ref": "calendar:" + row["calendar_ref"]}
+
+
+def reminders_ready(c):
+    """Migration 9 and its grants are in place for this reader (ANYM-576)."""
+    return c.execute(
+        "SELECT coalesce(has_table_privilege(to_regclass('starting_reminders'),'SELECT') "
+        "AND has_table_privilege(to_regclass('refresh_calendars'),'SELECT'),false) AS ok"
+    ).fetchone()["ok"]
+
+
+def check_health(c, calendars):
+    """A bound calendar whose provider authorization keeps failing refuses the page (ANYM-576): the router reads the
+    refusal as the per-source `module_unreachable`, and reads the journal from its cursor once a refresh succeeds."""
+    if calendars and c.execute(
+        "SELECT 1 FROM refresh_calendars WHERE health='auth_failed' AND calendar_ref=ANY(%s) LIMIT 1",
+        (sorted(calendars),),
+    ).fetchone():
+        raise CalendarError("calendar_auth_failed")
 
 
 def head(c):
@@ -290,13 +314,20 @@ def page(c, after, limit, calendars):
     """{events, next_after, has_more, retention_floor, journal_id} after the exclusive cursor `after`, for the
     calendars the reader is bound to; next_after moves past rows of other calendars, a cursor past the head reads
     the head (the router's source reset)."""
+    reminders = reminders_ready(c)
+    if reminders:
+        check_health(c, calendars)
     top = head(c)
     last, floor, journal_id = top["head"], top["retention_floor"], top["journal_id"]
     shell = {"next_after": last, "has_more": False, "retention_floor": floor, "journal_id": journal_id}
     if after >= last:
         return dict(shell, events=[])
+    columns = "seq,calendar_ref,type,event_ref,start_at,version,changed,at"
     rows = c.execute(
-        "SELECT * FROM change_journal WHERE seq>%s AND seq<=%s ORDER BY seq LIMIT %s", (after, last, SCAN_ROWS)
+        "SELECT " + columns + ",NULL::int AS lead_minutes FROM change_journal WHERE seq>%(a)s AND seq<=%(b)s"
+        + (" UNION ALL SELECT seq,calendar_ref,'starting',event_ref,start_at,NULL,NULL,at,lead_minutes "
+           "FROM starting_reminders WHERE seq>%(a)s AND seq<=%(b)s" if reminders else "")
+        + " ORDER BY seq LIMIT %(n)s", {"a": after, "b": last, "n": SCAN_ROWS}
     ).fetchall()
     events, position = [], after
     size = len(json.dumps(dict(shell, events=[], next_after=MAX_SEQ), separators=(",", ":")))
