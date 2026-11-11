@@ -51,6 +51,12 @@ def test_screen_text_and_full_hierarchy_are_discoverable_in_descriptions():
     assert 'reference.screen_text' in reference
 
 
+# spec: ANYM-956
+def test_loading_waits_and_phases_are_discoverable_in_descriptions():
+    run = CATALOG['android_run_flow']['description']
+    assert 'waitSettled' in run and 'settle_ms' in run and 'phases' in run and 'sleep' in run
+
+
 # spec: ANYM-951
 def test_existing_flows_remain_compatible_before_android_backend_upgrade():
     values = {'device_id': 'phone', 'session_id': 'lease',

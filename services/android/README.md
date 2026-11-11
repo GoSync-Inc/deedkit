@@ -194,6 +194,16 @@ the step fails with `ocr_unavailable` or `ocr_failed` as a definite failure.
 Older service versions reject these keys, so roll back the config with the
 executable.
 
+A screen signature can match while content still loads. Add the spinner to the
+screen's `forbid` list so screen waits continue until it is gone. `waitSettled`
+(`stable_ms` 100-5000, default 500, and `timeout`) waits until the map's
+hierarchy (class, id, text, description, bounds) stays unchanged for `stable_ms`
+and fails with `screen_not_settled`, a definite failure. `openApp` and
+`openDeepLink` accept `settle_ms` (0-5000) to settle after their screen check.
+`openDeepLink` returns `phases` (`open_ms`, `screen_ms`, optional `settle_ms`) and
+the number of screen `polls`, which explains warm-run variance. `- sleep: 500`
+pauses for milliseconds (at most 10000) and is a last resort.
+
 Older installations can still install a pinned Maestro CLI release with its supported Java runtime. Set optional
 absolute `maestro` and `java_home` paths in the private service configuration and
 restart the service. The service starts one local stdio MCP process lazily and

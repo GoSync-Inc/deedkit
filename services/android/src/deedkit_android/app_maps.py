@@ -13,8 +13,9 @@ from .flows import VARIABLE, compile_flow
 from .uiautomator import UI_FIELDS, validate_commands, validate_selector
 
 MAP_ACTIONS = {
-    'openApp': {'cold', 'expect_screen', 'timeout'},
-    'openDeepLink': {'name', 'timeout'},
+    'openApp': {'cold', 'expect_screen', 'timeout', 'settle_ms'},
+    'openDeepLink': {'name', 'timeout', 'settle_ms'},
+    'waitSettled': {'stable_ms', 'timeout'},
     'tapElement': {'selector', 'expect_screen', 'timeout'},
     'typeInto': {'selector', 'text', 'clear', 'submit', 'expect_screen', 'timeout'},
     'waitScreen': {'screen', 'timeout'}, 'assertScreen': {'screen'},
@@ -44,6 +45,7 @@ def reference():
         'hierarchy': 'Optional map field hierarchy: {compressed: false, max_depth: 1-200}. Every snapshot for that map then dumps the full accessibility tree; the default (compressed true, depth 50) hides nodes that are not important for accessibility and deep subtrees. Try it when inspectMap finds no text, before readScreenText. Plain selector commands later in the same batch may then also see the full tree.',
         'maps': 'Fields: package, selectors, screens, deep_links, popups, lists, hierarchy, meta. Named selectors are ordered candidate lists. text/id are full regular expressions, textExact/resourceId are exact. An ambiguous first matching candidate stops the action. index explicitly selects one match. A point candidate requires tapElement.expect_screen. Screens require all require conditions and no forbid conditions; each condition is a selector name or inline selector. Optional activity is a regex.',
         'lists': 'lists.<name> has item (selector or candidate list), fields (field names mapped to selectors), and optional key (field names identifying one item across pages). Without key, every visible row is preserved. readList returns rows under both its step result and receipt.data.<list>. limit defaults to 20, at most 100; scroll_pages defaults to 0, at most 5. Password fields return null.',
+        'loading': 'A screen signature can match while content still loads. Prefer forbid: [<spinner selector>] on the screen so waits continue until it is gone. waitSettled {stable_ms: 100-5000 (500), timeout} waits until the hierarchy (class, id, text, description, bounds) is unchanged for stable_ms and fails with screen_not_settled. openApp and openDeepLink accept settle_ms (0-5000) to settle after their screen check. openDeepLink returns phases {open_ms, screen_ms, settle_ms} and polls. The plain sleep command (milliseconds, at most 10000) is a last resort.',
         'popups': 'popups.<name> has detect (selector name) and either dismiss (selector name) or press: back. dismissPopups is explicit and bounded by max_rounds, default 3.',
         'parameters': 'params maps UPPER_CASE names to {type: string|integer|boolean, default?, required?, enum?, max_length?}. Values substitute literally as ${NAME}. Existing string parameters work without declarations.',
         'continuation': 'A checkpoint returns runnable remaining_yaml with explicit historical map versions. Submit it under a new request_id after resolving the checkpoint. Returned runFlow groups may contain map, map_version and commands to retain their map context.',
@@ -201,7 +203,8 @@ def validate_action(name, options, app_map):
                 options[key] = options[key].lower() == 'true'
             if type(options[key]) is not bool:
                 raise Refused('invalid_map_action', 422)
-    for key, low, high in (('timeout', 0, 60000), ('limit', 1, 100), ('scroll_pages', 0, 5), ('max_rounds', 1, 5)):
+    for key, low, high in (('timeout', 0, 60000), ('limit', 1, 100), ('scroll_pages', 0, 5), ('max_rounds', 1, 5),
+                            ('settle_ms', 0, 5000), ('stable_ms', 100, 5000)):
         if key in options:
             try:
                 if isinstance(options[key], bool) or str(int(options[key])) != str(options[key]) or not low <= int(options[key]) <= high:
