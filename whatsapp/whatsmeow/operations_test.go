@@ -360,6 +360,147 @@ func TestNativeMessageOperationsTargetExactCapturedMessage(t *testing.T) {
 	}
 }
 
+// pollVoteFixture is a captured group poll, the vote_poll IPC frame the collector sends for it
+// (expected_poll is the archived metadata.poll the owner confirmed) and fakes that count the
+// encryption, the send and the journaled vote.
+type pollVoteCalls struct {
+	built, sent, journaled int
+	names                  []string
+	selected               [][]byte
+	info                   types.MessageInfo
+}
+
+func pollVoteFixture(t *testing.T, selectable int, indices string) (operationDependencies, operationRequest, *pollVoteCalls) {
+	t.Helper()
+	d, calls := operationsFake(t), &pollVoteCalls{}
+	m := operationMessage(operationsGroup, "POLL", false, 1700000000)
+	m.Info.Sender.Device = 7
+	m.Message = (&whatsmeow.Client{}).BuildPollCreation("Кто в субботу?", []string{"Да", "Нет", "Может быть"}, selectable)
+	m.RawMessage = m.Message
+	d.get = func(chat, id string) (*events.Message, error) { return m, nil }
+	frame := fmt.Sprintf(`{"operation":"vote_poll","provider_chat":%q,"provider_message_id":%q,"expires_at":%d,"parameters":{"option_indices":%s},
+		"expected_poll":{"question":"Кто в субботу?","options":[{"index":0,"text":"Да"},{"index":1,"text":"Нет"},{"index":2,"text":"Может быть"}],"selectable_count":%d,"truncated":false}}`,
+		operationsGroup, LegacyMessageID(m), time.Now().Add(time.Hour).Unix(), indices, selectable)
+	var job operationRequest
+	if err := decodeStrict(json.RawMessage(frame), &job); err != nil {
+		t.Fatal(err)
+	}
+	d.pollVote = func(_ context.Context, info *types.MessageInfo, names []string) (*waE2E.Message, error) {
+		calls.built++
+		calls.info, calls.names = *info, names
+		return &waE2E.Message{PollUpdateMessage: &waE2E.PollUpdateMessage{Vote: &waE2E.PollEncValue{EncPayload: []byte{1}, EncIV: make([]byte, 12)}, SenderTimestampMS: proto.Int64(1700000001234)}}, nil
+	}
+	d.send = func(_ context.Context, to types.JID, wire *waE2E.Message, extra whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+		calls.sent++
+		if wire.GetPollUpdateMessage() == nil || LegacyChatID(to) != operationsGroup {
+			t.Fatal("wrong vote send")
+		}
+		return whatsmeow.SendResponse{ID: extra.ID, Chat: to, Sender: d.owner, Timestamp: time.Unix(1700000001, 0)}, nil
+	}
+	d.putPollVote = func(chat, pollID, voteID string, poll *waE2E.PollCreationMessage, voter types.JID, selected [][]byte, at time.Time) error {
+		calls.journaled++
+		calls.selected = selected
+		if chat != operationsGroup || pollID != LegacyMessageID(m) || voteID == "" || poll == nil || voter != d.owner || at.UnixMilli() != 1700000001234 {
+			t.Fatalf("wrong journaled vote %s %s %s %v %v", chat, pollID, voteID, voter, at)
+		}
+		return nil
+	}
+	return d, job, calls
+}
+
+// spec: ANYM-315
+func TestNativePollVoteSendsTheConfirmedOptionsOfTheCapturedPoll(t *testing.T) {
+	for name, tc := range map[string]struct {
+		selectable int
+		indices    string
+		names      []string
+	}{"multiple": {0, "[2,0]", []string{"Может быть", "Да"}}, "single": {1, "[1]", []string{"Нет"}}, "retract": {1, "[]", []string{}}} {
+		t.Run(name, func(t *testing.T) {
+			d, job, calls := pollVoteFixture(t, tc.selectable, tc.indices)
+			r, err := executeOperation(context.Background(), job, d)
+			operationResult(t, r, err, "submitted")
+			if calls.built != 1 || calls.sent != 1 || calls.journaled != 1 || !reflect.DeepEqual(calls.names, tc.names) {
+				t.Fatalf("calls %+v", calls)
+			}
+			// The empty selection retracts the owner's vote: no option hash at all.
+			if !reflect.DeepEqual(calls.selected, whatsmeow.HashPollOptions(tc.names)) || (name == "retract") != (len(calls.selected) == 0) {
+				t.Fatal("journaled selection differs from the sent one")
+			}
+			if calls.info.ID != "POLL" || calls.info.Sender.Device != 0 || calls.info.Chat.String() != "15550000000-123456789@g.us" {
+				t.Fatalf("vote bound to the wrong poll %+v", calls.info)
+			}
+		})
+	}
+}
+
+// spec: ANYM-315
+func TestNativePollVoteRefusesBeforeSending(t *testing.T) {
+	for name, tc := range map[string]struct {
+		selectable int
+		indices    string
+		modify     func(*operationDependencies, *operationRequest)
+		code       string
+	}{
+		"changed poll":  {0, "[0]", func(_ *operationDependencies, j *operationRequest) { j.ExpectedPoll.Options[1].Text = "Нет!" }, "operation_target_changed"},
+		"changed count": {0, "[0]", func(_ *operationDependencies, j *operationRequest) { j.ExpectedPoll.SelectableCount = 1 }, "operation_target_changed"},
+		"unbound poll":  {0, "[0]", func(_ *operationDependencies, j *operationRequest) { j.ExpectedPoll = nil }, "operation_target_changed"},
+		"unknown poll": {0, "[0]", func(d *operationDependencies, _ *operationRequest) {
+			d.get = func(string, string) (*events.Message, error) { return nil, errors.New("missing") }
+		}, "operation_target_unavailable"},
+		"not a poll": {0, "[0]", func(d *operationDependencies, _ *operationRequest) {
+			d.get = func(string, string) (*events.Message, error) {
+				return operationMessage(operationsGroup, "POLL", false, 1700000000), nil
+			}
+		}, "operation_target_invalid"},
+		"out of range":    {0, "[3]", nil, "operation_invalid_parameters"},
+		"negative":        {0, "[-1]", nil, "operation_invalid_parameters"},
+		"repeated":        {0, "[1,1]", nil, "operation_invalid_parameters"},
+		"too many":        {1, "[0,1]", nil, "operation_invalid_parameters"},
+		"not a list":      {0, `"1"`, nil, "operation_invalid_parameters"},
+		"missing indices": {0, "[0]", func(_ *operationDependencies, j *operationRequest) { delete(j.Parameters, "option_indices") }, "operation_invalid_parameters"},
+		"missing secret": {0, "[0]", func(d *operationDependencies, _ *operationRequest) {
+			d.pollVote = func(context.Context, *types.MessageInfo, []string) (*waE2E.Message, error) {
+				return nil, fmt.Errorf("failed to encrypt poll vote: %w", whatsmeow.ErrOriginalMessageSecretNotFound)
+			}
+		}, "poll_secret_unavailable"},
+		"encryption failed": {0, "[0]", func(d *operationDependencies, _ *operationRequest) {
+			d.pollVote = func(context.Context, *types.MessageInfo, []string) (*waE2E.Message, error) {
+				return nil, errors.New("store")
+			}
+		}, "operation_target_unavailable"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			d, job, calls := pollVoteFixture(t, tc.selectable, tc.indices)
+			if tc.modify != nil {
+				tc.modify(&d, &job)
+			}
+			_, err := executeOperation(context.Background(), job, d)
+			requireError(t, err, tc.code)
+			if calls.sent != 0 || calls.journaled != 0 {
+				t.Fatalf("refused vote still sent %+v", calls)
+			}
+		})
+	}
+}
+
+// spec: ANYM-315
+func TestNativePollVoteUnknownOutcomeIsNeverRetried(t *testing.T) {
+	d, job, calls := pollVoteFixture(t, 0, "[0]")
+	d.send = func(context.Context, types.JID, *waE2E.Message, whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+		calls.sent++
+		return whatsmeow.SendResponse{}, errors.New("timeout")
+	}
+	r, err := executeOperation(context.Background(), job, d)
+	if operationResult(t, r, err, "unknown")["code"] != "provider_operation_uncertain" || calls.sent != 1 || calls.journaled != 0 {
+		t.Fatalf("uncertain vote %+v", calls)
+	}
+	// The IPC frame names exactly the archived poll block: an unknown field is refused.
+	var strict operationRequest
+	if decodeStrict(json.RawMessage(`{"operation":"vote_poll","expected_poll":{"question":"q","options":[],"selectable_count":0,"truncated":false,"voters":1}}`), &strict) == nil {
+		t.Fatal("unknown expected_poll field accepted")
+	}
+}
+
 func TestNativeGroupAdministrationUsesTypedTargetAndNoPrivateInvites(t *testing.T) {
 	for _, op := range []string{"rename_group", "set_group_description", "add_participant", "remove_participant", "promote_participant", "demote_participant", "leave_group", "get_invite_link", "revoke_invite_link"} {
 		t.Run(op, func(t *testing.T) {
