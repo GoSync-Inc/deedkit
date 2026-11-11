@@ -586,6 +586,10 @@ func TestNativePollVoteIsKeyedToTheIdentityTheSendCarries(t *testing.T) {
 	if _, _, err := nativePollVote(whatsmeow.NewClient(&device, nil))(context.Background(), creator, poll, nil); !errors.Is(err, whatsmeow.ErrOriginalMessageSecretNotFound) {
 		t.Fatalf("missing secret: %v", err)
 	}
+	// pollVoteSender mirrors the pinned send.go identity choice; a bump can move it silently.
+	if raw, err := os.ReadFile("go.mod"); err != nil || !bytes.Contains(raw, []byte("=> github.com/GoSync-Inc/whatsmeow v0.0.0-20261022114855-fa2ca87d4bd8\n")) {
+		t.Fatal("whatsmeow changed: recheck pollVoteSender and nativePollVote against the new send.go and msgsecret.go, then update this pin")
+	}
 }
 
 func TestNativeGroupAdministrationUsesTypedTargetAndNoPrivateInvites(t *testing.T) {
