@@ -305,6 +305,71 @@ def test_ban_member_takes_until_or_forever_and_optional_messages_of_that_person(
         validate_operation('telegram', 'unban_member', {'user': '42', 'forever': True})
 
 
+# spec: ANYM-932
+def test_post_and_delete_story_are_telegram_mutations_behind_stories_post_no_key_holds():
+    from messaging_service.messenger_operations import ADVANCED_ONLY, OPERATION_TOOLS, OPT_IN_AS
+    from messaging_service.policy import LEGACY_PERMISSIONS, MESSENGER_PERMISSIONS, PERMISSIONS
+    for name in ('post_story', 'delete_story'):
+        spec = operation_spec(name)
+        assert (spec['permission'], spec['target'], spec['mutation'], spec['full_account'], spec['platforms']) == (
+            'stories-post', 'account', True, True, ['telegram'])
+        assert name in ADVANCED_ONLY and not any(name in names for names in OPERATION_TOOLS.values())
+    limits, own = operation_spec('get_story_limits'), operation_spec('list_own_stories')
+    assert (limits['permission'], limits['mutation'], own['permission'], own['mutation']) == (
+        'stories-post', False, 'read-live', False)
+    assert OPT_IN_AS == {'list_own_stories': 'post_story', 'get_story_limits': 'post_story'}
+    # A new permission: no default or legacy ceiling and no existing messenger family carries it.
+    assert 'stories-post' in PERMISSIONS and 'stories-post' not in LEGACY_PERMISSIONS | MESSENGER_PERMISSIONS
+    telegram = {r['operation']: r for r in operation_manifest('telegram')}
+    assert set(telegram['post_story']['parameters_schema']) == {'attachment_id', 'upload_id', 'sha256', 'caption',
+                                                                'audience'}
+    assert telegram['post_story']['parameters_schema']['audience']['default'] is None
+    assert telegram['post_story']['parameters_schema']['audience']['required'] is True
+    assert set(telegram['delete_story']['parameters_schema']) == {'story_id'}
+    assert all(word in telegram['post_story']['limitation'] for word in (
+        'media_unsuitable', 'stories_limit_reached', 'story_flood_wait', 'premium_required', 'caption_too_long',
+        'media_rejected', 'list_own_stories', '24 hours', '60 s'))
+    assert 'not_posted_here' in telegram['delete_story']['limitation']
+    assert 'already_gone' in telegram['delete_story']['limitation']
+    for provider in ('whatsmeow', 'webjs'):
+        rows = {r['operation']: r for r in operation_manifest('whatsapp', provider=provider)}
+        assert not any(rows[name]['supported'] for name in ('post_story', 'delete_story', 'list_own_stories',
+                                                             'get_story_limits'))
+
+
+# spec: ANYM-932
+def test_post_story_takes_one_original_a_bounded_caption_and_a_named_audience():
+    from messaging_service.messenger_operations import ParameterError
+    def errors(parameters, operation='post_story'):
+        with pytest.raises(ParameterError, match='^invalid_operation_parameters$') as failure:
+            validate_operation('telegram', operation, parameters)
+        return [(e['field'], e['reason']) for e in failure.value.field_errors]
+    attachment, sha = 'att_' + 'a' * 32, 'b' * 64
+    ok = {'attachment_id': attachment, 'sha256': sha, 'audience': 'close_friends'}
+    assert validate_operation('telegram', 'post_story', ok) == {**ok, 'caption': ''}
+    for audience in ('contacts', 'close_friends', 'everyone'):
+        assert validate_operation('telegram', 'post_story', {**ok, 'audience': audience})['audience'] == audience
+    upload = {'upload_id': 'up_' + 'c' * 32, 'sha256': sha, 'audience': 'contacts', 'caption': 'Синтетика'}
+    assert validate_operation('telegram', 'post_story', upload) == upload
+    # No default audience: the owner confirms who sees it.
+    assert errors({'attachment_id': attachment, 'sha256': sha}) == [('audience', 'required')]
+    assert errors({**ok, 'audience': 'selected'}) == [('audience', 'enum')]
+    assert errors({**ok, 'audience': ['contacts']}) == [('audience', 'type')]
+    assert errors({'sha256': sha, 'audience': 'contacts'}) == [('attachment_id', 'required')]
+    assert errors({**ok, 'upload_id': 'up_' + 'c' * 32}) == [('upload_id', 'unique')]
+    assert errors({'attachment_id': attachment, 'audience': 'contacts'}) == [('sha256', 'required')]
+    assert validate_operation('telegram', 'post_story', {**ok, 'caption': 'x' * 2048})['caption'] == 'x' * 2048
+    assert errors({**ok, 'caption': 'x' * 2049}) == [('caption', 'max_length')]
+    assert errors({**ok, 'mode': 'photo'}) == [('mode', 'unknown_field')]
+    assert errors({**ok, 'period': 172800}) == [('period', 'unknown_field')]
+    assert validate_operation('telegram', 'delete_story', {'story_id': 7}) == {'story_id': 7}
+    assert errors({'story_id': 0}, 'delete_story') == [('story_id', 'minimum')]
+    assert errors({'story_id': '7'}, 'delete_story') == [('story_id', 'type')]
+    assert errors({}, 'delete_story') == [('story_id', 'required')]
+    with pytest.raises(ValueError, match='^unsupported_operation$'):
+        validate_operation('whatsapp', 'post_story', ok, provider='whatsmeow')
+
+
 # spec: ANYM-243
 def test_chat_link_validation():
     from messaging_service.messenger_operations import ParameterError

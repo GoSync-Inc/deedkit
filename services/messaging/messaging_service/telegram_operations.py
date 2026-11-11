@@ -26,6 +26,7 @@ from .formatting import MAX_SOURCE_UNITS
 from .name_variants import contact_matcher
 from .messenger_operations import (HISTORY, INSPECT_BUTTONS, LIVE_SEARCH, live_cursor_binding, platform_parameters,
                                    validate_operation)
+from .telegram_stories import STORY_HANDLERS  # ANYM-932: the story operations, beside this module
 
 log = logging.getLogger('anymsg.live_search')
 history_log = logging.getLogger('anymsg.chat_history')
@@ -1186,7 +1187,7 @@ GROUP_HANDLERS = {
     **dict.fromkeys(('delete_member_messages', 'ban_member', 'unban_member', 'get_member_state'), write_member_messages),
 }
 
-HANDLERS = {**READ_HANDLERS, **ACCOUNT_HANDLERS, **MESSAGE_HANDLERS, **GROUP_HANDLERS}
+HANDLERS = {**READ_HANDLERS, **ACCOUNT_HANDLERS, **MESSAGE_HANDLERS, **GROUP_HANDLERS, **STORY_HANDLERS}
 
 
 def check_slow_mode(parameters, job, prepared):
@@ -1293,7 +1294,7 @@ PARAMETER_CHECKS = {
     'approve_join_requests': check_join_request_users, 'reject_join_requests': check_join_request_users,
     'send_file': check_send_file, 'send_reaction': check_reaction, 'send_poll': check_poll,
     'vote_poll': check_vote, 'send_location': check_location, 'create_group': check_create_group,
-    'list_topics': check_topics_page, 'check_chat_link': check_link, 'join_chat': check_link,
+    'list_topics': check_topics_page, 'check_chat_link': check_link, 'join_chat': check_link, 'post_story': check_send_file,
     **dict.fromkeys(('delete_member_messages', 'ban_member', 'unban_member', 'get_member_state'), check_member_targets),
 }
 
@@ -1304,7 +1305,7 @@ def check_parameters(operation, parameters, job, prepared):
     Stores the prepared values in the caller's `prepared`: `ids` (create_group), `stream` and `info`
     (send_file). The stream is the caller's to close, also when a check refused the file.
     """
-    text_keys = {'caption': (1024, True), 'question': (300, False),
+    text_keys = {'caption': (2048 if operation == 'post_story' else 1024, True), 'question': (300, False),
                  'first_name': (64, False), 'last_name': (64, True),
                  'text': (MAX_SOURCE_UNITS if operation == 'edit_message' and job.get('edit_artifact') is not None
                           else 4000, False), 'title': (128, False),
@@ -1333,7 +1334,7 @@ def check_parameters(operation, parameters, job, prepared):
 
 ACCOUNT_ONLY = frozenset({'list_contacts', 'list_blocked', 'get_contact', 'get_profile',
                           'add_contact', 'delete_contact', 'block_contact', 'unblock_contact',
-                          'update_profile', 'create_group', 'check_chat_link', 'join_chat'})
+                          'update_profile', 'create_group', 'check_chat_link', 'join_chat', *STORY_HANDLERS})
 MESSAGE_OPERATIONS = frozenset({'get_reactions', 'get_message_info', 'edit_message', 'delete_message',
                                 'send_reaction', 'vote_poll', 'pin_message', 'unpin_message', 'mark_read',
                                 'press_button'})

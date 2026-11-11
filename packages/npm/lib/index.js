@@ -44,6 +44,7 @@ const SAFE_ERRORS = new Set([
   'operation_expired','operation_rejected','invalid_operation_result',
   'button_not_captured','button_not_found','label_mismatch','button_kind_unsupported','message_changed','password_required','press_uncertain',
   'not_admin','missing_admin_right','moderation_unsupported','ban_unsupported','unsupported_chat_type','target_protected',
+  'media_unsuitable','caption_too_long','stories_limit_reached','story_flood_wait','premium_required','media_rejected',
   'reply_target_changed','invalid_subscription','subscription_limit','subscription_conflict','subscription_closed',
   'subscription_access_changed','invalid_subscription_state',
   'invalid_upload','invalid_upload_chunk','upload_limit','upload_capacity',

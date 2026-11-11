@@ -35,6 +35,9 @@
   "delete_message": [
     "message-delete"
   ],
+  "delete_story": [
+    "stories-post"
+  ],
   "demote_participant": [
     "groups-manage"
   ],
@@ -69,6 +72,9 @@
   "get_reactions": [
     "read-live"
   ],
+  "get_story_limits": [
+    "stories-post"
+  ],
   "inspect_message_buttons": [
     "read-live"
   ],
@@ -89,6 +95,9 @@
   ],
   "list_join_requests": [
     "groups-read"
+  ],
+  "list_own_stories": [
+    "read-live"
   ],
   "list_participants": [
     "groups-read"
@@ -116,6 +125,9 @@
   ],
   "pin_message": [
     "message-pin"
+  ],
+  "post_story": [
+    "stories-post"
   ],
   "press_button": [
     "bot-press"

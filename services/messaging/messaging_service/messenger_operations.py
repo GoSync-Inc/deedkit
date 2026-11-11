@@ -140,6 +140,31 @@ UNBAN_LIMITATION = ('Telegram only: lifts the ban of user in this supergroup, di
     'changed false, unknown and the read-back as ban_member.')
 MEMBER_STATE_LIMITATION = ('Telegram only: one live read of user in this supergroup, discussion group or channel: '
     'member, left or banned (with banned_until, null for forever), role and the channel\'s linked discussion group.')
+# ANYM-932: a Telegram story is a publication under the owner's name to an audience; each post and each delete waits for
+# the owner's exact confirmation. get_story_limits is the live limits read the post_story preview runs; list_own_stories
+# is the read that decides an unknown post. Both reads are enabled with post_story's account opt-in.
+POST_STORY, DELETE_STORY, OWN_STORIES, STORY_LIMITS = 'post_story', 'delete_story', 'list_own_stories', 'get_story_limits'
+STORY_FAMILY = (POST_STORY, DELETE_STORY, OWN_STORIES, STORY_LIMITS)
+STORY_AUDIENCES = ('contacts', 'close_friends', 'everyone')
+STORY_CAPTION_MAX = 2048  # Telegram Premium's caption limit; the preview applies the account's own (200 without Premium)
+STORY_PERIOD_S, STORY_VIDEO_MAX_S = 86400, 60
+POST_STORY_LIMITATION = ('Telegram only: publishes one photo or video as a story of the owner for 24 hours, after the '
+    'owner\'s exact confirmation of the media, caption and audience (contacts, close_friends or everyone; no default). '
+    'Exactly one accessible attachment_id or own upload_id with its SHA-256, as send_file: a photo (JPEG, PNG or WebP, '
+    'at most 10 MiB) or a video (at most 60 s by its archived duration, 32 MiB); else media_unsuitable with reason kind, '
+    'duration or size before the owner is asked (an upload has no stored duration, so a video comes from an archived '
+    'attachment). The preview reads Telegram\'s story limits and the account\'s caption limit: a reached limit is '
+    'stories_limit_reached, story_flood_wait (retry_after_s) or premium_required, a longer caption caption_too_long. '
+    'Execute checks the limits again; a provider media rejection is media_rejected with provider_code and nothing '
+    'is posted. The receipt has story_id and expires_at. A timeout is unknown and never retried: verify with '
+    'list_own_stories; until then a new preview of the same media is operation_result_unknown.')
+DELETE_STORY_LIMITATION = ('Telegram only: deletes one story this account posted through DeedKit (story_id from a '
+    'post_story receipt; else the field error not_posted_here: a story posted from the phone is deleted in the app), '
+    'after the owner\'s exact confirmation. A story Telegram no longer has is already_gone with changed false.')
+OWN_STORIES_LIMITATION = ('Telegram only: one live read of the owner\'s own active stories (not other people\'s): '
+    'story_id, kind, posted_at, expires_at, audience and caption. It decides an unknown post_story.')
+STORY_LIMITS_LIMITATION = ('Telegram only: one live read of whether the owner may post a story now and the '
+    'account\'s caption limit; the post_story preview runs it.')
 OPERATIONS = {
     'chat_info': _spec('read-live'),
     'list_participants': _spec('groups-read', fields=_page),
@@ -243,6 +268,16 @@ OPERATIONS = {
         'message_ids': _field('message_ids'), 'expected_revisions': _field('revisions')}, limitation=BAN_LIMITATION),
     UNBAN: _spec('groups-moderate', mutation=True, platforms=('telegram',), fields=_person, limitation=UNBAN_LIMITATION),
     MEMBER_STATE: _spec('groups-moderate', platforms=('telegram',), fields=_person, limitation=MEMBER_STATE_LIMITATION),
+    POST_STORY: _spec('stories-post', 'account', mutation=True, full_account=True, platforms=('telegram',), fields={
+        'attachment_id': _field('attachment_id'), 'upload_id': _field('upload_id'),
+        'sha256': _field('sha256', required=True),
+        'caption': _field('string', default='', maximum=STORY_CAPTION_MAX),
+        'audience': _field('story_audience', required=True)}, limitation=POST_STORY_LIMITATION),
+    DELETE_STORY: _spec('stories-post', 'account', mutation=True, full_account=True, platforms=('telegram',), fields={
+        'story_id': _field('integer', required=True, minimum=1, maximum=2147483647)}, limitation=DELETE_STORY_LIMITATION),
+    OWN_STORIES: _spec('read-live', 'account', full_account=True, platforms=('telegram',), limitation=OWN_STORIES_LIMITATION),
+    STORY_LIMITS: _spec('stories-post', 'account', full_account=True, platforms=('telegram',),
+                        limitation=STORY_LIMITS_LIMITATION),
     'check_chat_link': _spec('groups-read', 'account', full_account=True, fields=_link,
         limitation='Passive live read of an invite or public link; no member list, inviter or description.'),
     'join_chat': _spec('groups-manage', 'account', mutation=True, full_account=True, fields=_link,
@@ -312,7 +347,13 @@ ADVANCED_ONLY = {
     'get_profile': 'the owner\'s own account profile, not a contact',
     MEMBER_STATE: 'a live read of one person\'s membership and ban state, which the ban preview runs (ANYM-935)',
     'update_profile': 'changes the owner\'s own profile seen by every contact; kept advanced',
+    POST_STORY: 'a publication under the owner\'s name to an audience, not a chat change; kept advanced (ANYM-932)',
+    DELETE_STORY: 'removes a story the owner published; kept advanced beside post_story (ANYM-932)',
+    OWN_STORIES: 'a live read of the owner\'s own stories, the verify of an unknown post_story (ANYM-932)',
+    STORY_LIMITS: 'the live limits read the post_story preview runs (ANYM-932)',
 }
+# ANYM-932: the story reads need no opt-in of their own: post_story's account opt-in enables them.
+OPT_IN_AS = {OWN_STORIES: POST_STORY, STORY_LIMITS: POST_STORY}
 
 
 def operation_spec(name, platform=None):
@@ -508,6 +549,8 @@ def parameter_format(platform, kind):
             'ahead; exactly one of until or forever: true'),
         'schedule_time': 'RFC 3339 date and time with an offset, such as 2026-11-12T09:00:00+03:00, 60 s to 365 days '
             'ahead; Telegram holds the file in the owner\'s Scheduled messages until then',
+        'story_audience': ('one of ' + ', '.join(STORY_AUDIENCES) + ': who can see the story; no default, the owner '
+            'confirms it'),
         'search_cursor': 'next_cursor of an earlier search_messages_live with the same account, chat_id and parameters',
         'label_ids': 'up to 20 unique label IDs of 1-64 letters, digits, _ or -, from get_labels'}.get(kind)
 
@@ -603,6 +646,9 @@ def _problem(platform, descriptor, value, field):
         if not 1 <= len(value) <= 3: return fail('min_items' if not value else 'max_items', parameter_format(platform, kind))
         if any(item not in LIVE_CHAT_TYPES for item in value): return fail('enum', allowed=list(LIVE_CHAT_TYPES))
         return None if len(set(value)) == len(value) else fail('unique', 'no duplicate items')
+    if kind == 'story_audience':
+        if not isinstance(value, str): return fail('type', 'string')
+        return None if value in STORY_AUDIENCES else fail('enum', allowed=list(STORY_AUDIENCES))
     if kind == 'search_filter':
         if not isinstance(value, str): return fail('type', 'string')
         return None if value in LIVE_FILTERS else fail('enum', allowed=list(LIVE_FILTERS))
@@ -734,7 +780,7 @@ def validate_operation(platform, operation, parameters, *, provider=None):
                                          'one revision per message_ids item'))
     if operation == 'update_profile' and not output:
         raise ParameterError(field_error('parameters', 'required', 'at least one of ' + ', '.join(fields)))
-    if operation == 'send_file' and (('attachment_id' in output)+('upload_id' in output)!=1):
+    if operation in ('send_file', POST_STORY) and (('attachment_id' in output)+('upload_id' in output)!=1):
         raise ParameterError(field_error('upload_id' if 'upload_id' in output else 'attachment_id',
             'unique' if 'upload_id' in output else 'required', 'exactly one of attachment_id or upload_id'))
     if operation == LIVE_SEARCH and 'from_time' in output and 'to_time' in output and (
