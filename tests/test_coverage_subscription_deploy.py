@@ -58,7 +58,8 @@ def test_subscription_overlay_is_opt_in_and_has_bounded_runtime_authority(tmp_pa
     assert set(service['networks']) == {'backend'}
     assert config['networks']['backend']['internal'] is True
     assert not service.get('ports')
-    assert service['environment'] == {'DATABASE_URL_FILE': '/run/secrets/database_url'}
+    # ANYM-919: the owner's zone dates the contact.birthday hint; no secret.
+    assert service['environment'] == {'DATABASE_URL_FILE': '/run/secrets/database_url', 'ANYMSG_OWNER_TIMEZONE': ''}
     assert len(service['volumes']) == 1
     secret = service['volumes'][0]
     assert secret['type'] == 'bind' and secret['read_only'] is True

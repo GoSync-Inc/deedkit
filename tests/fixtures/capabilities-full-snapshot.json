@@ -191,7 +191,7 @@
   "independent_key_permissions": true,
   "mutation_preview_digest_required": true,
   "new_permissions_inherited_by_existing_keys": false,
-  "operation_count": 67,
+  "operation_count": 68,
   "platform_counts_basis": "legacy_defaults_use_account_manifest_for_actual_support",
   "preview_accepts_request_id": true,
   "preview_digest_proves_owner_approval": false,
@@ -201,7 +201,7 @@
   "supported_by_account": {
    "telegram-demo": {
     "available_operations": [],
-    "count": 58,
+    "count": 59,
     "operations": [
      "add_contact",
      "add_participant",
