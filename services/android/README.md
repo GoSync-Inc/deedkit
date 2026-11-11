@@ -202,8 +202,12 @@ lines that share a row) and `words`, all with bounds and confidence. A clickable
 or identified tree container (for example a textless order card) groups the
 text inside it; elsewhere a vertical gap above 1.5 line heights starts a new
 block. Each block names the smallest tree node that contains it, and `source:
-tree` marks text the tree already exposes. Consecutive blocks of the same shape
-form `lists` of item block indexes. `tree` says whether the hierarchy was merged.
+tree` marks text the tree already exposes. Blocks inside two or more children of
+one scrolling container (RecyclerView, ListView, GridView, ViewPager or any
+`scrollable` node) form a list in the cards' reading order: `items` holds each
+card's first block index and `cards` all its block indexes. Without such a tree,
+consecutive blocks of the same shape form `lists` of item block indexes. `tree`
+says whether the hierarchy was merged.
 The receipt then keeps `{lines, blocks, lists, tree, truncated}` under the key.
 
 Before Tesseract, the screenshot is normalized on the host (`ocr.preprocess:

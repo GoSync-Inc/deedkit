@@ -116,13 +116,47 @@ def build(lines, root, screen):
         block = {'bounds': text(*bounds), 'box': bounds, 'rows': len(rows_of(members)),
                  'confidence': round(sum(line['confidence'] for line in members) / len(members), 1), 'lines': ordered}
         node = smallest(nodes, bounds)
+        block['element'] = None if node is None else node['node']
         if node is not None:
             block['node'] = describe(node)
         output.append(block)
-    lists = repeated(output)
+    lists = card_lists(output, root)
+    taken = {index for item in lists for card in item['cards'] for index in card}
+    lists += [item for item in repeated(output) if not taken.intersection(item['items'])]
+    lists.sort(key=lambda item: min(item['items']))
     for block in output:
-        del block['box'], block['rows']
+        del block['box'], block['rows'], block['element']
     return output, lists
+
+
+LIST_CLASSES = ('RecyclerView', 'ListView', 'GridView', 'ViewPager', 'ViewPager2')
+
+
+def card_lists(blocks, root):
+    """Blocks in two or more cards (children) of one scrolling container form a list, one item per card."""
+    if root is None:
+        return []
+    parents = {child: parent for parent in root.iter() for child in parent}
+    found = {}
+    for index, block in enumerate(blocks):
+        element = block['element']
+        for _ in range(16):
+            parent = parents.get(element) if element is not None else None
+            if parent is None or parent.tag != 'node':
+                break
+            if parent.get('scrollable') == 'true' or (parent.get('class') or '').endswith(LIST_CLASSES):
+                found.setdefault(parent, {}).setdefault(element, []).append(index)
+                break
+            element = parent
+    lists = []
+    for cards in found.values():
+        if len(cards) >= 2:
+            # Reading order of the cards themselves (rows of a grid, then columns).
+            order = sorted(cards, key=lambda card: (box(card.get('bounds')) or (0, 0))[1::-1])
+            groups = [cards[card] for card in order][:MAX_ITEMS]
+            lists.append({'bounds': text(*union([blocks[i]['box'] for group in groups for i in group])),
+                          'items': [group[0] for group in groups], 'cards': groups})
+    return lists
 
 
 def intersection(a, b):

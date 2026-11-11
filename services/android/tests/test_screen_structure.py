@@ -192,3 +192,41 @@ def test_real_tesseract_cards_become_three_items():
     for i, index in enumerate(structure['lists'][0]['items']):
         assert f'Rp 12{i}.000' in texts(structure['blocks'][index])
     json.dumps(result)
+
+
+GRID = ('<hierarchy><node class="android.widget.FrameLayout" bounds="[0,0][1080,2400]">'
+        '<node class="android.widget.EditText" text="Search" bounds="[40,40][1040,140]"/>'
+        '<node class="androidx.recyclerview.widget.RecyclerView" scrollable="true" bounds="[0,200][1080,2400]">'
+        '<node class="android.view.ViewGroup" clickable="true" bounds="[20,220][530,1000]"/>'
+        '<node class="android.view.ViewGroup" clickable="true" bounds="[550,220][1060,900]"/>'
+        '<node class="android.view.ViewGroup" clickable="true" bounds="[20,1020][530,1700]"/>'
+        '<node class="android.view.ViewGroup" clickable="true" bounds="[550,1020][1060,1800]"/>'
+        '</node></node></hierarchy>')
+
+
+def grid_lines():
+    def line(text, left, top):
+        return {'text': text, 'box': (left, top, left + 400, top + 40), 'bounds': f'[{left},{top}][{left + 400},{top + 40}]',
+                'confidence': 90.0, 'words': [], 'source': 'ocr'}
+    # Product photos (no text) fill each card's top; titles wrap differently, so rows differ.
+    cards = [(40, 760, ['Clay Tools 36pcs', 'Rp68.310', 'Power Shop']),
+             (570, 700, ['Body Wash 200g', 'Rp46.718']),
+             (40, 1480, ['Facial Wash', 'and Toner Set', 'Rp213.596', 'Bisa COD']),
+             (570, 1580, ['Sabun Mandi', 'Rp243.804', 'Belanja'])]
+    lines = [line('Search', 60, 70)]
+    for left, top, texts in cards:
+        lines += [line(text, left, top + 50 * number) for number, text in enumerate(texts)]
+    return sorted(lines, key=lambda item: (item['box'][1], item['box'][0]))
+
+
+# spec: ANYM-960
+def test_cards_under_a_scrolling_list_form_one_list_in_reading_order():
+    from xml.etree import ElementTree
+
+    from deedkit_android.screen_structure import build
+
+    blocks, lists = build(grid_lines(), ElementTree.fromstring(GRID), (0, 0, 1080, 2400))
+    firsts = [blocks[index]['lines'][0]['text'] for index in lists[0]['items']]
+    assert len(lists) == 1 and firsts == ['Clay Tools 36pcs', 'Body Wash 200g', 'Facial Wash', 'Sabun Mandi']
+    assert all(len(card) == 1 for card in lists[0]['cards'])
+    assert 'Search' not in [blocks[index]['lines'][0]['text'] for index in lists[0]['items']]
