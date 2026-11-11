@@ -2,6 +2,8 @@
   "version": 1,
   "state_directory": "/var/lib/deedkit-production",
   "backup": {"wait_seconds": 2700},
+  "session_window": "03:00-05:00",
+  "session_timezone": "Asia/Makassar",
   "migration": {
     "copy_timeout_s": 1800,
     "receiver_schema_max": 51,
