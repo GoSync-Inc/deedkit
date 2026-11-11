@@ -281,6 +281,7 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
             payload['provider_message_id']=message['provider_id'];refs.append(message_id)
         elif message_id or expected_revision:raise _empty(spec,chat_id,message_id,expected_revision)
     if operation=='delete_member_messages':from . import member_messages;payload['targets']=member_messages.resolve(c,p,account,chat,parameters)
+    if operation=='vote_poll' and provider=='whatsmeow':from .polls import bind_whatsapp_vote;bind_whatsapp_vote(c,p,payload,message,parameters['option_indices'])
     if operation==HISTORY and account_row['platform']=='telegram':
         anchor=parameters.get('before_message') or parameters.get('around_message')
         if anchor is not None:
@@ -857,7 +858,7 @@ class CommandWorker:
                 'rate_limited','provider_timeout','invalid_phone','identity_changed','sending_disabled','invite_invalid','invite_expired','chat_full',
                 'join_not_allowed','already_member','invalid_cursor','invalid_anchor','username_not_found',
                 'recipient_not_user','message_changed','password_required','press_uncertain',
-                'button_kind_unsupported','not_admin','missing_admin_right') else 'operation_rejected'
+                'button_kind_unsupported','not_admin','missing_admin_right','poll_secret_unavailable') else 'operation_rejected'
             # Nothing was sent, so a lookup that ran out of time is a retryable read.
             result={'data':{'code':code,'retry':True}} if code=='provider_timeout' else {'data':{'code':code,**exc.data}} if code in ('not_admin','missing_admin_right') and isinstance(exc.data,dict) else None
             # ANYM-676: a press refused before it left (the live message differs from the preview) returns the live

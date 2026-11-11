@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"time"
 
@@ -285,4 +287,93 @@ func (p *Provider) historyPollVote(poll *events.Message, creation *waE2E.PollCre
 	vote := &events.Message{Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: poll.Info.Chat, Sender: voter, IsFromMe: key.GetFromMe(), IsGroup: poll.Info.IsGroup}, ID: key.GetID()}}
 	at := pollVoteTime(u.GetSenderTimestampMS(), time.UnixMilli(u.GetServerTimestampMS()))
 	return p.Capture.putPollVote(chat, LegacyMessageID(poll), LegacyMessageID(vote), creation, voter, key.GetFromMe(), u.GetVote().GetSelectedOptions(), at, "history")
+}
+
+// expectedPoll is the archived poll block (pollBlock) the owner confirmed a vote on: the
+// collector binds the message's metadata.poll at the reviewed revision (ANYM-315).
+type expectedPoll struct {
+	Question        string       `json:"question"`
+	Options         []pollOption `json:"options"`
+	SelectableCount uint32       `json:"selectable_count"`
+	Truncated       bool         `json:"truncated"`
+}
+
+type pollOption struct {
+	Index int    `json:"index"`
+	Text  string `json:"text"`
+}
+
+// samePoll is whether the captured poll v still archives as the block the owner confirmed.
+func samePoll(v *waE2E.PollCreationMessage, want *expectedPoll) bool {
+	var got expectedPoll
+	raw, err := json.Marshal(pollBlock(v))
+	if want == nil || err != nil || json.Unmarshal(raw, &got) != nil {
+		return false
+	}
+	return reflect.DeepEqual(got, *want)
+}
+
+// pollVoteNames are the full option names of the selected positions, in the given order: each
+// once, among the poll's archived options and at most its selectable count (0: any number).
+// The empty selection retracts the owner's vote.
+func pollVoteNames(v *waE2E.PollCreationMessage, indices []int) ([]string, error) {
+	limit := min(len(v.GetOptions()), maxPollOptions)
+	if count := int(v.GetSelectableOptionsCount()); count > 0 && len(indices) > count {
+		return nil, errors.New("operation_invalid_parameters")
+	}
+	names := []string{}
+	for i, n := range indices {
+		if n < 0 || n >= limit || slices.Contains(indices[:i], n) {
+			return nil, errors.New("operation_invalid_parameters")
+		}
+		names = append(names, v.GetOptions()[n].GetOptionName())
+	}
+	return names, nil
+}
+
+// votePoll sends the owner's confirmed vote on a captured poll (ANYM-315). The poll must still
+// be the one the owner confirmed. whatsmeow encrypts the vote with the poll's secret from its
+// store, so a poll whose secret this session never received is refused before anything is
+// sent. The sent vote is journaled as the owner's poll_vote, never as a chat message; an
+// uncertain send answers unknown and is never retried.
+func (e *operationEnv) votePoll(string) (any, error) {
+	var indices []int
+	if decodeValue(e.job.Parameters["option_indices"], &indices) != nil || indices == nil {
+		return nil, errors.New("operation_invalid_parameters")
+	}
+	m, err := e.getMessage()
+	if err != nil {
+		return nil, err
+	}
+	m = unwrap(m)
+	poll := pollCreation(m.Message)
+	if poll == nil {
+		return nil, errors.New("operation_target_invalid")
+	}
+	if !samePoll(poll, e.job.ExpectedPoll) {
+		return nil, errors.New("operation_target_changed")
+	}
+	names, err := pollVoteNames(poll, indices)
+	if err != nil {
+		return nil, err
+	}
+	info := m.Info
+	info.Sender = info.Sender.ToNonAD() // the creator, as the vote's key names it
+	wire, err := e.d.pollVote(e.ctx, &info, names)
+	if errors.Is(err, whatsmeow.ErrOriginalMessageSecretNotFound) {
+		return nil, errors.New("poll_secret_unavailable")
+	}
+	if err != nil || wire.GetPollUpdateMessage() == nil {
+		return nil, errors.New("operation_target_unavailable")
+	}
+	selected := whatsmeow.HashPollOptions(names)
+	sd := e.d.sendDependencies
+	sd.put = func(sent *events.Message, _ string) error {
+		at := pollVoteTime(wire.GetPollUpdateMessage().GetSenderTimestampMS(), sent.Info.Timestamp)
+		return e.d.putPollVote(e.job.ProviderChat, e.job.ProviderMessageID, LegacyMessageID(sent), poll, sent.Info.Sender, selected, at)
+	}
+	if err = e.mutate("", func() error { _, err := sendAndCapture(e.ctx, sd, e.target, wire); return err }); err != nil {
+		return nil, err
+	}
+	return e.submitted(nil)
 }

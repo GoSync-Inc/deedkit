@@ -161,7 +161,8 @@ OPERATIONS = {
     'send_reaction': _spec('message-react', 'message', mutation=True, fields={
         'emoji': _field('string', required=True, maximum=64)},
         limitation='Empty emoji removes the reaction; no paid or custom-emoji transactions.'),
-    'vote_poll': _spec('message-react', 'message', mutation=True, platforms=('telegram',),
+    # ANYM-315: WhatsApp votes on the native adapter only; the empty selection retracts the owner's vote.
+    'vote_poll': _spec('message-react', 'message', mutation=True,
         fields={'option_indices': _field('poll_indices', required=True)}),
     'pin_message': _spec('message-pin', 'message', mutation=True, fields=_duration),
     'unpin_message': _spec('message-pin', 'message', mutation=True),
@@ -293,13 +294,15 @@ GROUP_ADMIN_OPERATIONS=('set_group_messages_admins_only','set_group_info_admins_
     'set_join_approval','list_join_requests','approve_join_requests','reject_join_requests')
 # ANYM-243: likewise native only; the browser fallback never joins through another path.
 CHAT_LINK_OPERATIONS=('check_chat_link','join_chat')
+# ANYM-315: likewise native only; whatsapp-web.js has no vote.
+NATIVE_ONLY_OPERATIONS=GROUP_ADMIN_OPERATIONS+CHAT_LINK_OPERATIONS+('vote_poll',)
 
 
 def _supported(platform, name, spec, provider=None):
     if platform not in spec['platforms']:return False
     if platform!='whatsapp':return True
     if provider=='whatsmeow':return name not in NATIVE_UNSUPPORTED
-    return name not in ('delete_message','request_chat_history','open_chat_by_phone')+GROUP_ADMIN_OPERATIONS+CHAT_LINK_OPERATIONS
+    return name not in ('delete_message','request_chat_history','open_chat_by_phone')+NATIVE_ONLY_OPERATIONS
 
 
 def _fields(platform, name, spec):
@@ -356,7 +359,7 @@ def operation_manifest(platform, *, provider=None):
             row['limitation']='Archived attachment or own destination-bound uploaded SHA-256 original only; 32 MiB bound. Sticker requires existing WebP. Audio/voice/sticker captions are unsupported; no implicit conversion.'
         elif platform=='whatsapp' and provider=='whatsmeow' and name=='forward_message':
             row['limitation']='Authorized retained ordinary content only; control, view-once and poll replay are unsupported.'
-        elif platform=='whatsapp' and provider!='whatsmeow' and name in GROUP_ADMIN_OPERATIONS+CHAT_LINK_OPERATIONS and platform in spec['platforms']:
+        elif platform=='whatsapp' and provider!='whatsmeow' and name in NATIVE_ONLY_OPERATIONS and platform in spec['platforms']:
             row['limitation']='Unsupported here: native WhatsApp (whatsmeow) accounts only.'
         elif name == 'open_chat_by_phone' and not row['supported']:
             row['limitation'] = 'Unsupported here: native WhatsApp (whatsmeow) accounts only.'

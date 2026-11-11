@@ -152,7 +152,7 @@ def test_native_vote_preview_binds_the_archived_poll_and_refuses_a_bad_selection
     s,a,state,_,_=native_account
     key=native_voter(s,state);args=native_poll(state,1)
     draft=s.preview_messenger_operation(key,**args,parameters={'option_indices':[1]})
-    assert draft['adapter']=='whatsmeow' and draft['mutation'] is True
+    assert draft['adapter']=='whatsmeow' and draft['mutation'] is True and draft['required_permissions']==['message-react','read']
     assert draft['expected_poll']=={'question':'Кто в субботу?','selectable_count':1,'truncated':False,
         'options':[{'index':0,'text':'Да'},{'index':1,'text':'Нет'},{'index':2,'text':'Может быть'}]}
     # The empty selection retracts the owner's vote: a separate intent with its own digest.
@@ -166,6 +166,10 @@ def test_native_vote_preview_binds_the_archived_poll_and_refuses_a_bad_selection
     not_a_poll={**args,'message_id':stable_id('msg','wa-native','123@c.us','true_123@c.us_000001')}
     with pytest.raises(APIError,match='unsupported_operation'):
         s.preview_messenger_operation(key,**not_a_poll,parameters={'option_indices':[0]})
+    # The preview shows archived poll text: a key that cannot read the chat cannot vote there.
+    blind=s.issue_key('native-blind-voter',['wa-native'],permissions=['message-react'])
+    with pytest.raises(APIError,match='forbidden'):
+        s.preview_messenger_operation(blind,**args,parameters={'option_indices':[1]})
     with s.pool.connection() as c:
         assert c.execute('SELECT count(*) AS n FROM messenger_commands').fetchone()['n']==0
 

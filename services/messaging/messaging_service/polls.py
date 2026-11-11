@@ -75,6 +75,33 @@ def poll_block(value):
             'truncated':value['truncated']}
 
 
+def bind_whatsapp_vote(c,p,payload,message,indices):
+    """ANYM-315: binds a native WhatsApp vote to the archived poll at the message revision the owner reviewed. The
+    poll goes into the operation intent as `expected_poll`, so the preview digest binds the exact poll and options and
+    the adapter refuses when its captured poll no longer archives as this block. The preview shows archived poll text,
+    so the key also needs `read` (as forward_message). An option past the archived ones or more selections than
+    `selectable_count` (0: any number) is refused before queueing."""
+    from .field_errors import refusal
+    from .store import APIError
+    if 'read' not in p['permissions']:raise APIError('forbidden',403)
+    binding=payload['authorization_binding']
+    binding['required_permissions']=sorted({*binding['required_permissions'],'read'})
+    row=c.execute('''SELECT coalesce(mm.metadata,mr.snapshot->'metadata')->'poll' AS poll FROM messages m
+        LEFT JOIN message_revisions mr ON mr.message=m.id AND mr.revision=m.revision
+        LEFT JOIN message_metadata mm ON mm.message=m.id AND mm.revision=m.revision
+        WHERE m.id=%s AND m.revision=%s''',(message['id'],message['revision'])).fetchone()
+    try:poll=poll_block(row['poll']) if row and row['poll'] is not None else None
+    except ValueError:poll=None
+    if poll is None or 'provider_poll_id' in poll:raise APIError('unsupported_operation')
+    if any(i>=len(poll['options']) for i in indices):
+        raise refusal('invalid_operation_parameters',[('option_indices','maximum',
+            'zero-based positions of the poll\'s archived options (metadata.poll.options)')])
+    if poll['selectable_count'] and len(indices)>poll['selectable_count']:
+        raise refusal('invalid_operation_parameters',[('option_indices','max_items',
+            'at most the poll\'s selectable_count options; an empty list retracts the vote')])
+    payload['expected_poll']=poll
+
+
 def validate_vote(value):
     """One vote capture: the poll's provider ID, the voter's archive sender ID and the chosen option indices."""
     if not isinstance(value,dict) or set(value)!=VOTE_KEYS:raise ValueError('invalid_poll_vote')
