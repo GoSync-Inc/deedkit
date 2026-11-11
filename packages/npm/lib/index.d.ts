@@ -42,6 +42,10 @@ export interface MessageContent {
   format?: MessageFormat;
   link_preview?: boolean;
   allow_lossy?: boolean;
+  /** ANYM-986, archive-chat sends: `{within: '6h'}` (`<n>m`, `<n>h` or `<n>d`, 60 seconds to 14 days). Once the message is sent the
+   * server creates a `reply_to_send` subscription with a silence timer on your enabled delivery endpoint. The preview shows
+   * it and its digest binds it: send the same value. */
+  await_reply?: {within: string};
 }
 /** Exactly one recipient: an archive chat_id, a phone number on a native WhatsApp account (ANYM-532), or a
  * Telegram @username of a person (ANYM-643). */

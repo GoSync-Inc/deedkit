@@ -15,7 +15,7 @@ from .identifiers import ACCOUNT_RE, SEND_ID_RE, WA_CHAT_RE
 from .envelope import canonical, stable_id
 from .policy import audit, effective_permissions, lock_principal, targets
 from .store import APIError, serial
-from . import group_mentions, scheduled_send
+from . import await_reply as awaiting, group_mentions, scheduled_send
 from .silent_send import check as silent_check, render_policy, unsupported as silent_unsupported
 from .subscriptions import journal_send_failures
 
@@ -146,7 +146,7 @@ def target(c,p,account,chat_id,reply_to):
 
 
 def reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id,menu=None,silent=False,
-             mentions=None,fresh_s=group_mentions.SEND_FRESH_S,schedule_at=None):
+             mentions=None,fresh_s=group_mentions.SEND_FRESH_S,schedule_at=None,await_reply=None):
     """menu (ANYM-837): a resolved menu_choice; its menu, revision, type, option and label join the digest.
     silent (ANYM-927): Telegram only; it joins the digest through the render policy (silent_send.py).
     mentions (ANYM-928): group members to @-mention; the request and provider forms join the digest (group_mentions.py)."""
@@ -171,12 +171,14 @@ def reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,c
     if menu is not None:
         bound['menu_choice']={name:menu[name] for name in ('message_id','provider_message_id','revision','menu_type',
             'option_id','label')}
+    if await_reply is not None:bound['await_reply']=await_reply  # ANYM-986: its own bound field, never render_policy.
     digest=hashlib.sha256(canonical(bound)).hexdigest()
     draft={**artifact,'account':account,'chat_id':chat_id,'provider_chat_id':chat['provider_chat'],
         'reply_to':reply_to,'reply_provider_id':reply_id,'render_policy':policy,
         'preview_digest':digest,'owner_approval_verified_by_server':False}
     if silent:draft['silent']=True
     if schedule_at is not None:draft.update(scheduled_send.preview_block(schedule_at))  # ANYM-464: what the owner confirms.
+    if await_reply is not None:draft.update(awaiting.preview_block(await_reply))
     draft.update(notice,**group_mentions.notices(chat['platform'],artifact))
     if menu is not None:
         from . import menu_choice
@@ -185,21 +187,23 @@ def reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,c
 
 
 def preview(c,p,account,chat_id,text,reply_to='',format='plain',link_preview=False,allow_lossy=False,menu_choice=None,
-            silent=False,mentions=None,schedule_at=None):
+            silent=False,mentions=None,schedule_at=None,await_reply=None):
     """Render a scoped draft without provider calls, readiness or enqueueing."""
     format_options(format,link_preview,allow_lossy,silent=silent)
     if schedule_at is not None:scheduled_send.in_range(schedule_at)
+    await_reply=awaiting.normalized(await_reply)
     mentions=group_mentions.normalized(mentions);group_mentions.conflicts(mentions,menu_choice)
     if menu_choice is not None:
         # A menu is answered only on WhatsApp, which has no silent send (ANYM-927).
         if silent:raise silent_unsupported()
+        if await_reply:raise awaiting.unsupported()
         if schedule_at is not None:raise scheduled_send.unsupported()
         chat,menu=menu_target(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,menu_choice)
         return reviewed(c,p,account,chat_id,menu['label'],menu['message_id'],'plain',False,False,chat,
             menu['provider_message_id'],menu)
     chat,reply_id=target(c,p,account,chat_id,reply_to)
     return reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id,silent=silent,
-        mentions=mentions,fresh_s=group_mentions.PREVIEW_FRESH_S,schedule_at=schedule_at)
+        mentions=mentions,fresh_s=group_mentions.PREVIEW_FRESH_S,schedule_at=schedule_at,await_reply=await_reply)
 
 
 def menu_arguments(text,reply_to,format,link_preview,allow_lossy,menu_choice):
@@ -467,6 +471,7 @@ def result(row,c=None,p=None):
             'warnings':[code for code in warning_codes if isinstance(code,str) and
                 re.fullmatch(r'[a-z_]{1,64}',code)][:32],
             'preview_digest':row.get('preview_digest')},
+        **awaiting.result_fields(row),
         **scheduled_send.result_fields(row,(row.get('render_policy') or {}).get('schedule_at')
             if isinstance(row.get('render_policy'),dict) else None),
         'next_action':scheduled_send.next_action(row['status']) or 'get_send_status' if row['status'] in (
@@ -589,7 +594,7 @@ def outbound_status(c,accounts):
 def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
             preview_digest='',link_preview=False,allow_lossy=False,phone_hash=None,child=False,
             expected_last_message_id=None,guard=None,duplicate_guard=False,allow_duplicate=None,menu_choice=None,silent=False,
-            mentions=None,schedule_at=None):
+            mentions=None,schedule_at=None,await_reply=None):
     """menu_choice (ANYM-837): {message_id, option_id} of an archived WhatsApp menu, answered with its structured
     reply; it needs its own preview_digest and stores the archived label as the text.
     expected_last_message_id, guard (ANYM-736): the optional chat-head precondition, send_guard.py.
@@ -598,7 +603,8 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
     child: a messages_send step (ANYM-546) under its child key; only such a call may use the child prefix.
     silent (ANYM-927): Telegram without a notification sound, with its own preview_digest (silent_send.py).
     mentions (ANYM-928): group members to @-mention, with their own preview_digest (group_mentions.py).
-    schedule_at (ANYM-464): Telegram holds the message until this time, with its own preview_digest (scheduled_send.py)."""
+    schedule_at (ANYM-464): Telegram holds the message until this time, with its own preview_digest (scheduled_send.py).
+    await_reply (ANYM-986): {within} asks for a reply_to_send subscription once sent, with its own preview_digest."""
     def refused(error,resolved=False):
         # ANYM-646: a caller's own send names the preview call; a phone step or a messages_send child keeps its body.
         # The chat is echoed only once it resolves for this key; a malformed digest is refused before that.
@@ -609,7 +615,8 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
         from . import preview_refusal
         return preview_refusal.send(error,p,account,chat_id,reply_to=reply_to if isinstance(reply_to,str) else '',
             format=format,link_preview=link_preview,allow_lossy=allow_lossy,silent=silent,mentions=mentions,
-            schedule_at=schedule_at)
+            schedule_at=schedule_at,await_reply=await_reply)
+    await_reply=awaiting.normalized(await_reply)
     mentions=group_mentions.normalized(mentions);group_mentions.conflicts(mentions,menu_choice)
     if menu_choice is not None:
         if phone_hash is not None or child:
@@ -618,6 +625,7 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
         format_options(format,link_preview,allow_lossy,preview_digest,silent)
         if silent:raise silent_unsupported()
         if schedule_at is not None:raise scheduled_send.unsupported()
+        if await_reply:raise awaiting.unsupported()
         menu_arguments(text,reply_to,format,link_preview,allow_lossy,menu_choice)
         return enqueue_menu_choice(c,p,account,chat_id,text,request_id,preview_digest,expected_last_message_id,guard,
             duplicate_guard,allow_duplicate,menu_choice)
@@ -651,7 +659,8 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
         # between this read and the insert is the guard's documented limit.
         try:send_guard.check(c,p,account,chat_id,chat['platform'],expected_last_message_id,guard)
         except APIError as failure:guard_refusal=failure
-    default_policy=format=='plain' and not link_preview and not allow_lossy and not silent and not mentions and not scheduled
+    default_policy=format=='plain' and not link_preview and not allow_lossy and not silent and not mentions and not scheduled \
+        and not await_reply
     legacy_hash=hashlib.sha256(canonical([account,chat_id,text,reply_id])).hexdigest()
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('outgoing:'+p['id'],))
     existing=c.execute('SELECT * FROM outgoing_messages WHERE principal=%s AND request_id=%s',
@@ -672,7 +681,7 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
                 existing['provider_chat']==chat['provider_chat'] and existing['reply_provider_id']==reply_id and
                 existing.get('source_text')==text and existing.get('source_format')==format and
                 existing.get('render_policy')==render_policy(link_preview,allow_lossy,silent,mentions,scheduled) and
-                (existing.get('preview_digest') or '')==preview_digest)
+                existing.get('await_reply')==await_reply and (existing.get('preview_digest') or '')==preview_digest)
         if not matches:raise APIError('idempotency_conflict',409)
         return result(existing,c,p)
     if guard_refusal is not None:raise guard_refusal
@@ -685,7 +694,7 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
             render_policy(link_preview,allow_lossy,silent,mentions,scheduled),reply_id)
     if not default_policy and not preview_digest:raise refused(APIError('preview_required',409),True)
     draft=reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id,silent=silent,
-        mentions=mentions,schedule_at=schedule_at)
+        mentions=mentions,schedule_at=schedule_at,await_reply=await_reply)
     if phone_hash is None and preview_digest and preview_digest!=draft['preview_digest']:
         raise refused(APIError('preview_mismatch',409),True)
     artifact={name:draft[name] for name in ('format','source_text','rendered_text','provider_text','entities',
@@ -695,9 +704,10 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
     admit(c,account,chat)
     row=c.execute('''INSERT INTO outgoing_messages(principal,key_id,scope_version,key_permission_version,request_id,request_hash,
         account,chat,provider_chat,body,reply_provider_id,source_text,source_format,render_artifact,render_policy,
-        preview_digest) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *''',
+        preview_digest,await_reply,await_state) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *''',
         (p['id'],p['key_id'],p['scope_version'],p['key_permission_version'],request_id,request_hash,account,chat_id,chat['provider_chat'],
-         artifact['provider_text'],reply_id,text,format,Jsonb(artifact),Jsonb(draft['render_policy']),preview_digest or None)).fetchone()
+         artifact['provider_text'],reply_id,text,format,Jsonb(artifact),Jsonb(draft['render_policy']),preview_digest or None,
+         Jsonb(await_reply) if await_reply else None,'pending' if await_reply else None)).fetchone()
     targets(p,[chat_id,row['id']])
     return result(row,c,p)
 

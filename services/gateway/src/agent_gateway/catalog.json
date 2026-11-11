@@ -160,6 +160,21 @@
           ],
           "description": "Telegram chat_id sends: an absolute time, RFC 3339 with an offset (2026-11-12T09:00:00+03:00), 60 s to 365 days ahead. Telegram holds the message in the owner's Scheduled messages and publishes it then; the owner can move, edit or delete it in the app. preview_message shows schedule_at_utc, schedule_at_local in the owner's zone and owner_zone_source; its preview_digest binds the UTC time, so send with the same schedule_at. Status: scheduled (nothing to do until the time), then sent, or scheduled_cancelled when deleted before it. WhatsApp: schedule_unsupported, nothing queued. Omitted: send now.",
           "title": "Schedule At"
+        },
+        "await_reply": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "chat_id sends: {\"within\": \"6h\"} (60 seconds to 14 days). Once the message is sent, the server creates a reply_to_send subscription with a silence timer on your one enabled delivery endpoint, so you stop polling. Preview and send must match: the digest binds it. The send result shows await_reply.state.",
+          "title": "Await Reply"
         }
       },
       "required": [
@@ -2870,6 +2885,21 @@
           ],
           "description": "Telegram chat_id sends: an absolute time, RFC 3339 with an offset (2026-11-12T09:00:00+03:00), 60 s to 365 days ahead. Telegram holds the message in the owner's Scheduled messages and publishes it then; the owner can move, edit or delete it in the app. preview_message shows schedule_at_utc, schedule_at_local in the owner's zone and owner_zone_source; its preview_digest binds the UTC time, so send with the same schedule_at. Status: scheduled (nothing to do until the time), then sent, or scheduled_cancelled when deleted before it. WhatsApp: schedule_unsupported, nothing queued. Omitted: send now.",
           "title": "Schedule At"
+        },
+        "await_reply": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "chat_id sends: {\"within\": \"6h\"} (60 seconds to 14 days). Once the message is sent, the server creates a reply_to_send subscription with a silence timer on your one enabled delivery endpoint, so you stop polling. Preview and send must match: the digest binds it. The send result shows await_reply.state.",
+          "title": "Await Reply"
         }
       },
       "required": [
