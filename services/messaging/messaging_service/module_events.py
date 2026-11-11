@@ -80,7 +80,7 @@ KINDS = {
     'call.owner_request': ({'call_id': _ref, 'decision_id': _ref, 'state': _enum('pending')}, frozenset(),
         'call_id'),
     # ANYM-564: the calls service's journal of an ownership or permission change of one calls principal (the
-    # event's scope_ref); publishing it marks every active link naming that principal stale (schema 90).
+    # event's scope_ref); every link granted before it that names that principal is stale (module_links.stale).
     'call.access.changed': ({'principal_ref': _ref, 'reason': _enum('permission_removed', 'principal_removed',
         'owner_changed')}, frozenset(), 'principal_ref'),
     # ANYM-726/732: opaque references and an enumeration only; never a title, text, label, provider id, token or URL.

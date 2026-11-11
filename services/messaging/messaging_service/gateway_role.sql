@@ -143,8 +143,8 @@ GRANT SELECT ON session_claims TO messaging_gateway;
 GRANT SELECT ON poll_results,poll_voters TO messaging_gateway;
 -- Schema 84 (ANYM-920): message reads show a Telegram poll's total, the owner's choice and voter names; read only.
 GRANT SELECT ON telegram_polls TO messaging_gateway;
--- Schema 90 (ANYM-564): read links and each call source's generation (fetch, views); a call source only through
--- admit_module_source, which checks the subscription principal's link. No link write: set_module_link is owner-only.
+-- Schema 90 (ANYM-564): read links and each call source's generation (fetch, views); insert a call source and its
+-- generation only after module_links.admit read the principal's live link under the request's ACL lock. No link
+-- write: only the owner CLI writes links.
 GRANT SELECT ON module_links,subscription_module_links TO messaging_gateway;
-REVOKE ALL ON FUNCTION public.admit_module_source(uuid,text,text,text[]),public.set_module_link(text,text,text,text) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.admit_module_source(uuid,text,text,text[]) TO messaging_gateway;
+GRANT INSERT ON subscription_module_sources,subscription_module_links TO messaging_gateway;

@@ -1,26 +1,22 @@
 -- rollout: manual
 -- ANYM-564: a key sees call events only through a link the operator set for its principal (calls:own).
 -- module_links holds one link per principal and module (module 'calls' only in this card): the calls principal whose
--- calls the key may be woken by, a generation and a state. subscription_module_links records the generation each call
--- source was admitted under; a call source is live only while its principal's link is active with that generation
--- and names the source's scope_ref (module_links.py). Revoking, marking stale or regranting moves the generation, so a
--- source, its matches and its queued hints never come back, even after a regrant. Generations come from the clock
--- (microseconds), never below the previous one plus one, so a regrant after a restore from backup still passes every
--- generation issued before the restore.
--- Functions (definer, fixed search path, no PUBLIC execute):
---  set_module_link: the only writer of module_links; takes the principal's ACL lock (policy.lock_principal), so a
---      delivery that checked the link under the shared lock finishes first, and expires the principal's open receipts
---      with a module range, so no receipt issued before a change ACKs past it. Owner CLI only; no role is granted it.
---  admit_module_source: the API's only way to give a subscription a call source: it checks the link of the
---      subscription's own principal and records the generation. Granted to the gateway role (gateway_role.sql).
---  publish_module_event (056's text, same signature and ACL) additionally marks the active links naming the event's
---      scope stale when it stores a call.access.changed event (the calls-side journal of an ownership or permission
---      change); module_event_valid (067's text) admits that type: subject principal_ref, urgency now, no expiry.
--- Repeatable (the module tests re-run migrations from 065): IF NOT EXISTS tables and index, OR REPLACE functions.
+-- calls may wake the principal's keys, a generation, a state and the module journal head when it was (re)granted.
+-- subscription_module_links records the generation each call source was admitted under. A call source is live only
+-- while its principal's link is active with that generation, names the source's scope_ref and no call.access.changed
+-- event for that calls principal follows granted_through (stale: computed from the journal, never written). The owner
+-- CLI writes links (module_links.py: a revocation or regrant moves the generation, so a source never comes back);
+-- generations come from the clock and never fall below the previous one plus one, so a regrant after a restore from
+-- backup passes every generation issued before it.
+-- The API admits a call source only after reading the subscription principal's live link under the request's shared
+-- ACL lock, which a revocation's exclusive lock waits for (module_links.admit). module_event_valid (067's text) admits
+-- call.access.changed (subject principal_ref, urgency now, no expiry), which a partial index finds by scope.
+-- Repeatable (the module tests re-run migrations from 065): IF NOT EXISTS tables and indexes, OR REPLACE functions.
 -- Risk tier: non-critical (docs/operations/production.md "Migration risk tiers": one CHECK widening pair on one column,
--- a superset of 067's list, as 064 and 085; two new tables; CREATE OR REPLACE of two functions with the same
--- signatures; no row is read, rewritten or deleted). Grants only on the new objects, in the role files. A schema-89
--- runtime never names the new tables or type; no producer journals call.access.changed yet.
+-- a superset of 067's list, as 064 and 085; two new tables; a partial index on module_events (a small table); the
+-- same-signature validator; no row is read, rewritten or deleted). Grants in the role files: reads of the new tables,
+-- and the gateway's INSERT of call sources (subscription_module_sources, subscription_module_links). A schema-88 runtime never names the new tables or type; no producer journals
+-- call.access.changed yet (ANYM-965).
 SET LOCAL lock_timeout='2s';
 
 ALTER TABLE module_events DROP CONSTRAINT module_events_type_check;
@@ -34,7 +30,8 @@ CREATE TABLE IF NOT EXISTS module_links (
  module text NOT NULL CHECK(module='calls'),
  module_principal text NOT NULL CHECK(module_principal ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$'),
  generation bigint NOT NULL CHECK(generation>0),
- state text NOT NULL CHECK(state IN ('active','revoked','stale')),
+ state text NOT NULL CHECK(state IN ('active','revoked')),
+ granted_through bigint NOT NULL CHECK(granted_through>=0),
  updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
  PRIMARY KEY(principal,module)
 );
@@ -48,6 +45,7 @@ CREATE TABLE IF NOT EXISTS subscription_module_links (
  FOREIGN KEY(subscription,source,scope_ref) REFERENCES subscription_module_sources(subscription,source,scope_ref)
   ON DELETE CASCADE
 );
+CREATE INDEX IF NOT EXISTS module_events_access_changed ON module_events(scope_ref,seq) WHERE type='call.access.changed';
 
 -- 067's text; only the call.access.changed spec and its urgency rule are new.
 CREATE OR REPLACE FUNCTION public.module_event_valid(p_id text, p_source text, p_type text, p_subject text,
@@ -156,82 +154,4 @@ BEGIN
   RETURN false;
  END IF;
  RETURN true;
-END $$;
-
-
-CREATE OR REPLACE FUNCTION public.set_module_link(p_principal text, p_module text, p_module_principal text, p_state text)
- RETURNS public.module_links LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
-DECLARE result public.module_links;
-BEGIN
- PERFORM pg_advisory_xact_lock(hashtextextended('acl:'||p_principal,0));
- INSERT INTO public.module_links AS l(principal,module,module_principal,generation,state)
-  VALUES(p_principal,p_module,p_module_principal,(extract(epoch FROM clock_timestamp())*1000000)::bigint,p_state)
-  ON CONFLICT(principal,module) DO UPDATE SET module_principal=excluded.module_principal,
-   generation=greatest(l.generation+1,excluded.generation),state=excluded.state,updated_at=clock_timestamp()
-  RETURNING * INTO result;
- UPDATE public.subscription_receipts r SET expires_at=clock_timestamp() FROM public.subscriptions s
-  WHERE r.subscription=s.id AND s.principal=p_principal AND r.ack_result IS NULL
-  AND r.module_through_position IS NOT NULL AND r.expires_at>clock_timestamp();
- RETURN result;
-END $$;
-REVOKE ALL ON FUNCTION public.set_module_link(text,text,text,text) FROM PUBLIC;
-
-CREATE OR REPLACE FUNCTION public.admit_module_source(p_subscription uuid, p_source text, p_scope_ref text, p_types text[])
- RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
-DECLARE link public.module_links;
-BEGIN
- -- The module's types only (module_event_valid lists them; the caller checks each against the contract), so this
- -- function names no module list of its own.
- IF p_types IS NULL OR cardinality(p_types) NOT BETWEEN 1 AND 16
-   OR EXISTS(SELECT FROM unnest(p_types) k WHERE k IS NULL OR k !~ '^call\.[a-z_]+(\.[a-z_]+)?$') THEN
-  RAISE EXCEPTION 'invalid_filter' USING ERRCODE='check_violation';
- END IF;
- SELECT l.* INTO link FROM public.subscriptions s JOIN public.module_links l ON l.principal=s.principal AND l.module='calls'
-  WHERE s.id=p_subscription AND p_source='deedkit:'||l.module AND l.state='active' AND l.module_principal=p_scope_ref
-  FOR SHARE OF l;
- IF NOT FOUND THEN
-  RAISE EXCEPTION 'module_not_linked' USING ERRCODE='insufficient_privilege';
- END IF;
- INSERT INTO public.subscription_module_sources(subscription,source,scope_ref,types)
-  VALUES(p_subscription,p_source,p_scope_ref,p_types)
-  ON CONFLICT(subscription,source,scope_ref) DO UPDATE SET types=excluded.types;
- INSERT INTO public.subscription_module_links(subscription,source,scope_ref,generation)
-  VALUES(p_subscription,p_source,p_scope_ref,link.generation)
-  ON CONFLICT(subscription,source,scope_ref) DO UPDATE SET generation=excluded.generation;
- RETURN link.generation;
-END $$;
-REVOKE ALL ON FUNCTION public.admit_module_source(uuid,text,text,text[]) FROM PUBLIC;
-
--- 056's text; only the call.access.changed step after the insert is new. Same signature, so the ACL stays.
-CREATE OR REPLACE FUNCTION public.publish_module_event(p_id text, p_source text, p_type text, p_subject text,
-  p_scope_ref text, p_time text, p_data jsonb, p_urgency text, p_expires_at text)
- RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
-DECLARE stored public.module_events; seq bigint; link record;
-BEGIN
- IF NOT public.module_event_valid(p_id,p_source,p_type,p_subject,p_time,p_data,p_urgency,p_expires_at) THEN
-  RAISE EXCEPTION 'invalid_module_event' USING ERRCODE='check_violation';
- END IF;
- PERFORM 1 FROM public.module_event_counter WHERE id=1 FOR UPDATE;
- SELECT * INTO stored FROM public.module_events WHERE event_key=p_id;
- IF FOUND THEN
-  IF (stored.source,stored.type,stored.subject,stored.scope_ref,stored.occurred_at,stored.data,stored.urgency,stored.expires_at)
-    IS NOT DISTINCT FROM (p_source,p_type,p_subject,p_scope_ref,p_time::timestamptz,p_data,p_urgency,
-      p_expires_at::timestamptz) THEN
-   RETURN stored.seq;
-  END IF;
-  RAISE EXCEPTION 'module_event_conflict' USING ERRCODE='unique_violation';
- END IF;
- UPDATE public.module_event_counter SET value=value+1 WHERE id=1 RETURNING value INTO seq;
- INSERT INTO public.module_events(seq,event_key,source,type,subject,scope_ref,occurred_at,data,urgency,expires_at)
-  VALUES(seq,p_id,p_source,p_type,p_subject,p_scope_ref,p_time::timestamptz,p_data,p_urgency,
-   p_expires_at::timestamptz);
- -- ANYM-564: the calls service journaled an ownership or permission change of this calls principal; every active
- -- link naming it goes stale (a new generation) until the operator links again.
- IF p_type='call.access.changed' THEN
-  FOR link IN SELECT principal FROM public.module_links WHERE module='calls' AND module_principal=p_scope_ref
-    AND state='active' ORDER BY principal LOOP
-   PERFORM public.set_module_link(link.principal,'calls',p_scope_ref,'stale');
-  END LOOP;
- END IF;
- RETURN seq;
 END $$;

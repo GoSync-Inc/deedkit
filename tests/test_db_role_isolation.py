@@ -1137,11 +1137,14 @@ def test_activity_grants_add_only_the_new_table_to_each_role(seeded, template, b
         later = {('outgoing_messages', 'menu_choice', 'INSERT')} if base == 'messaging_gateway' else set()
         # Schema 73 (ANYM-848) adds the gateway's wake target tables; they are that block's, not this one's.
         # Schema 76 (ANYM-907) adds the gateway's read of the negotiation tables and schema 77 (ANYM-851) its structure
-        # reads; schema 78 (ANYM-914) its read of session_claims; those blocks' too.
+        # reads; schema 78 (ANYM-914) its read of session_claims; those blocks' too. Schema 90 (ANYM-564): the link
+        # tables and the gateway's INSERT of call sources are that block's.
         assert {grant for grant in after if grant[0] not in ('subscription_activity', 'wake_targets',
             'wake_target_subscriptions', 'negotiations', 'negotiation_sources', 'negotiation_times',
             'attachment_structure', 'structure_profiles', 'session_claims', 'poll_results', 'poll_voters',
-            'poll_votes', 'telegram_polls', 'journal_contact_birthdays')} - later == before  # 89: ANYM-919's EXECUTE
+            'poll_votes', 'telegram_polls', 'journal_contact_birthdays', 'module_links',
+            'subscription_module_links') and
+            grant[:3:2] != ('subscription_module_sources', 'INSERT')} - later == before  # 89: ANYM-919's EXECUTE
         assert {grant[2] for grant in after if grant[0] == 'subscription_activity' and grant[1] == ''} == added
         token = store.issue_key('activity-acl', ['telegram-demo'], permissions=['read', 'subscription-write'],
             key_permissions=['read', 'subscription-write'])

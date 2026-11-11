@@ -308,7 +308,10 @@ deedkit admin module-links unlink --principal assistant-work --module calls
   with `module_not_linked`, rechecked under the shared ACL lock the revocation waits for. Message sources and
   the subscription's state are unaffected. A regrant never revives it: create a new subscription.
 - A calls-side ownership or permission change arrives as a `call.access.changed` event for the calls
-  principal; publishing it marks every active link naming that principal `stale` until the owner links again.
+  principal; from then on every active link naming that principal reads `stale` (computed from the module journal
+  after the link's `granted_through`, nothing is rewritten) until the owner links again: its sources match, page and
+  announce nothing more. Receipts issued before it are not expired (an ACK only moves the cursor past references
+  already read).
 - `create_subscription(..., module_sources=[{scope: "calls:own", types: [call.* types]}])` without an active
   link is refused with `module_not_linked` (409) and a `next` asking the owner to link calls for the key.
 - `deedkit admin key issue --like` copies links only with `--copy-links`; the installed gateway profile gains

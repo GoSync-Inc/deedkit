@@ -51,8 +51,8 @@ def sources(store, token, sid):
 
 
 def link_row(store, principal):
-    with store.pool.connection() as c:
-        return c.execute("SELECT * FROM module_links WHERE principal=%s AND module='calls'", (principal,)).fetchone()
+    """The owner's view of the principal's calls link (principal-info): state active, stale or revoked."""
+    return next(row for row in store.principal_info(principal)['module_links'] if row['module'] == 'calls')
 
 
 # spec: ANYM-564
@@ -190,22 +190,28 @@ def test_a_call_access_changed_event_marks_the_link_stale(modules):
     sid, kept = calls_subscription(store, token), calls_subscription(store, other)
     publish(store, call_event(1), scope='owner-a')
     match_subscriptions(store)
-    page = store.fetch_subscription_events(token, sid)
     before = link_row(store, 'module-reader')
     event = access_changed(2)
     assert validate_event(event) == 2
     assert publish(store, event, scope='owner-a') == 2
     after = link_row(store, 'module-reader')
-    assert after['state'] == 'stale' and after['generation'] > before['generation']
+    assert after['state'] == 'stale' and before['state'] == 'active'
     assert link_row(store, 'other-reader')['state'] == 'active'
     assert sources(store, token, sid) == [('owner-a', 'access_changed')] and sources(store, other, kept) == [
         ('owner-b', 'active')]
-    with pytest.raises(APIError, match='invalid_receipt'):
-        store.ack_subscription_events(token, sid, page['receipt'], page['ack_version'])
+    # Its references leave the pages and later calls never match; the other principal's source keeps flowing.
+    assert store.fetch_subscription_events(token, sid)['module']['items'] == []
+    third = publish(store, call_event(3, 'call-3'), scope='owner-b')
+    match_subscriptions(store)
+    assert [i['module_event_id'] for i in store.fetch_subscription_events(other, kept)['module']['items']] == [third]
     # A replay of the same event is idempotent and changes nothing more; a new subscription is refused until relinked.
     assert publish(store, event, scope='owner-a') == 2 and link_row(store, 'module-reader') == after
     with pytest.raises(APIError, match='module_not_linked'):
         calls_subscription(store, token)
+    relinked = store.link_module('module-reader', 'calls', 'owner-a')
+    assert relinked['changed'] and relinked['state'] == 'active' and relinked['generation'] > after['generation']
+    assert sources(store, token, calls_subscription(store, token)) == [('owner-a', 'active')]
+    assert sources(store, token, sid) == [('owner-a', 'access_changed')]
     for wrong in ({'urgency': 'batch'}, {'expires_at': '2099-01-01T00:00:00Z'},
             {'data': {'principal_ref': 'owner-a', 'reason': 'other'}}):
         with pytest.raises(module_events.ModuleContractError):
@@ -240,16 +246,15 @@ def test_the_gateway_role_reads_links_admits_only_through_the_link_and_never_wri
             def can(role, kind, name, privilege):
                 check = {'table': 'has_table_privilege', 'function': 'has_function_privilege'}[kind]
                 return c.execute('SELECT ' + check + '(%s,%s,%s) AS x', (role, name, privilege)).fetchone()['x']
-            admit, write = 'public.admit_module_source(uuid,text,text,text[])', 'public.set_module_link(text,text,text,text)'
             for name, role in roles.items():
-                reads = name != 'module_router_role.sql'
+                reads, gateway = name != 'module_router_role.sql', name == 'gateway_role.sql'
                 assert can(role, 'table', 'module_links', 'SELECT') is reads
                 assert can(role, 'table', 'subscription_module_links', 'SELECT') is reads
-                assert not any(can(role, 'table', table, change) for table in ('module_links', 'subscription_module_links')
-                    for change in ('INSERT', 'UPDATE', 'DELETE'))
-                assert not can(role, 'function', write, 'EXECUTE')
-                assert can(role, 'function', admit, 'EXECUTE') is (name == 'gateway_role.sql')
-            assert not can(roles['gateway_role.sql'], 'table', 'subscription_module_sources', 'INSERT')
+                # Only the owner CLI writes links; the API inserts a call source and its generation, nothing else.
+                assert not any(can(role, 'table', 'module_links', change) for change in ('INSERT', 'UPDATE', 'DELETE'))
+                for table in ('subscription_module_sources', 'subscription_module_links'):
+                    assert can(role, 'table', table, 'INSERT') is gateway
+                    assert not can(role, 'table', table, 'UPDATE') and not can(role, 'table', table, 'DELETE')
     finally:
         with store.pool.connection() as c:
             for role in roles.values():
