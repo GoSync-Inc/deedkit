@@ -11,7 +11,7 @@ from messaging_service.telegram_collector import configuration
 from test_archive import archive as archive, event
 from test_collectors import worker as worker
 from test_live_media import config_path
-from test_media_claim_performance import ACCOUNT, BOUND, backlog as backlog, explained, grow_dormant, index_tables, work
+from test_media_claim_performance import ACCOUNT, BOUND, analyze, backlog as backlog, explained, grow_dormant, index_tables, work
 
 
 DAY=86400
@@ -91,11 +91,16 @@ def test_backfill_needs_a_bounded_window(backlog, days):
     with pytest.raises(ValueError,match='invalid_backfill'):claim(backfill=1)
 
 
+def analyze_backlog(s):
+    """The statistics the measured claim is planned from, read from every row (#892)."""
+    with s.pool.connection() as c:
+        c.execute("SET LOCAL statement_timeout='120s'"); analyze(c,'media_jobs','messages')
+
+
 def backfill_claim_work(ar, s, claim, name):
     """Claims a fresh out-of-window voice note through backfill; returns the locked statement's work."""
     newest=job(ar,name,8*DAY-3600)
-    with s.pool.connection() as c:
-        c.execute("SET LOCAL statement_timeout='120s'"); c.execute('ANALYZE media_jobs'); c.execute('ANALYZE messages')
+    analyze_backlog(s)
     assert claim() is None
     plans=[]
     with explained(ar,plans): got=claim(backfill=True)
@@ -121,6 +126,22 @@ def test_backfill_claim_in_a_dormant_backlog_picks_the_newest_voice_note(backlog
     # Under the locks the claim looks up only its 16 candidates: the work does not grow with the backlog.
     for relation,entry in large.items():
         assert entry['tuples']<=small[relation]['tuples']+16 and entry['buffers']<=small[relation]['buffers']+32,(small,large)
+
+
+# spec: ANYM-472
+def test_the_backfill_backlog_gets_the_same_statistics_on_every_analyze(backlog):
+    """Regression (flake 11-09..11-11, the sibling of #892): the analyze before the measured backfill claim read ANALYZE's
+    random 30,000-row sample of a backlog of more than 30,000 rows, so each run planned from different statistics."""
+    ar,s,_,_=backlog
+    grow_dormant(s,30_000)
+    job(ar,'newest-old-voice',8*DAY-3600)
+    def statistics():
+        analyze_backlog(s)
+        with s.pool.connection() as c:
+            return c.execute('''SELECT tablename,attname,null_frac,n_distinct,correlation,most_common_vals::text,
+                histogram_bounds::text FROM pg_stats WHERE tablename IN ('messages','media_jobs') ORDER BY 1,2''').fetchall()
+    first=statistics()
+    assert first and all(statistics()==first for _ in range(3))
 
 
 # spec: ANYM-472

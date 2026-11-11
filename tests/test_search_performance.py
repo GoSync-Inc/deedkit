@@ -268,13 +268,17 @@ def test_conversation_view_runs_a_fixed_number_of_statements_for_25_and_100_rows
 
 class AttentionPlans:
     """EXPLAIN (ANALYZE) of every statement that reads group attention, with the function that issued it."""
-    def __init__(self,connection):self.connection=connection;self.plans=[]
+    def __init__(self,connection):
+        self.connection=connection;self.plans=[];self.jit=[]
+        # The measured work is the rows read, not the compiling of a plan that reads a few hundred (1.5 to 3.5 s of JIT per
+        # statement, past the 5 s statement timeout on a busy host).
+        connection.execute('SET LOCAL jit=off')
     def execute(self,sql,args=None):
         import traceback
         if 'thread_messages AS MATERIALIZED' in sql:
             chain=[f.name for f in traceback.extract_stack()[:-1] if '/messaging_service/' in f.filename]
-            plan=self.connection.execute('EXPLAIN (ANALYZE,FORMAT JSON) '+sql,args).fetchone()['QUERY PLAN'][0]['Plan']
-            self.plans.append((chain[-1] if chain else 'test',plan))
+            explained=self.connection.execute('EXPLAIN (ANALYZE,FORMAT JSON) '+sql,args).fetchone()['QUERY PLAN'][0]
+            self.plans.append((chain[-1] if chain else 'test',explained['Plan']));self.jit.append(explained.get('JIT'))
         return self.connection.execute(sql,args)
     def __getattr__(self,name):return getattr(self.connection,name)
 
@@ -385,6 +389,24 @@ def timeless(value):
     if isinstance(value,dict):return {k:timeless(v) for k,v in value.items() if k!='as_of'}
     if isinstance(value,list):return [timeless(v) for v in value]
     return value
+
+# spec: ANYM-915
+def test_the_attention_measurement_never_waits_for_jit_compilation(seeded):
+    """Regression (flake 11-09..11-11, a 5 s statement timeout): the measured statements read a few hundred rows in about
+    a millisecond, but each crosses jit_above_cost and was compiled first, for 1.5 to 3.5 s on an idle host and past the
+    timeout on a busy one. Every plan crosses the threshold here, as in the flake; none may compile."""
+    from messaging_service.conversation_state import conversation_states
+    s,_,_=seeded
+    seed_attention_groups(s)
+    try:
+        key=s.issue_key('attention-jit',['telegram-demo'],chats=['ga-tg'])
+        with s.authorized(key,'list_chats') as (c,p):
+            c.execute('SET LOCAL jit_above_cost=0')
+            measured=AttentionPlans(c)
+            conversation_states(measured,p,[('telegram-demo','ga-tg')])
+        assert measured.jit and measured.jit==[None]*len(measured.jit),measured.jit
+    finally:forget_attention_groups(s)
+
 
 # spec: ANYM-915
 def test_group_attention_reads_its_candidates_not_the_group_history(seeded,monkeypatch):
