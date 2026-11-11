@@ -3372,18 +3372,25 @@ own pause, in that older shape. A dry run reports `would_pause` and writes nothi
   production.py -> current/production.py
   seamless_release.py -> current/seamless_release.py
   current -> releases/<sha>
-  releases/<sha>/{production.py,seamless_release.py,tool.json}
+  releases/<sha>/{production.py,seamless_release.py,<other TOOL_FILES>,tool.json}
 ```
 
-Python takes `sys.path[0]` from the resolved script, so both modules always
+The tool's files are the `TOOL_FILES` of the release's own `production.py`:
+one top-level literal dict of `scripts/<module>.py` paths to their file names,
+read with `ast` and never run, `production.py` and `seamless_release.py` among
+them. Every check below reads that list from the release it checks (the
+candidate's blob for an update, the older release's file for a rollback), so a
+release may add a module; the two compatibility links stay the only links.
+Python takes `sys.path[0]` from the resolved script, so all modules always
 come from one release directory, and every documented command and the unit
 keep working. `tool.json` is `{"sha", "blobs": {"scripts/production.py": <git
-blob id>, "scripts/seamless_release.py": <id>}, "installed_at"}`. A host
+blob id>, "scripts/seamless_release.py": <id>, ...one per listed file},
+"installed_at"}`. A host
 without `current` never updates its tool and keeps the pause of step 3. With
 it, `deploy` checks the layout with `lstat` (no symlink followed): every
 directory and file root-owned and not group/other-writable, `current` and the
 two compatibility links the only symlinks, `current` exactly `releases/<40-hex
-sha>`, the release holding only the two files, `tool.json` and an optional
+sha>`, the release holding only its listed files, `tool.json` and an optional
 `__pycache__`, and `tool.json` naming that sha and the blob ids of its files.
 Anything else pauses; the reason ends "the tool does not update itself: ...".
 
@@ -3395,14 +3402,17 @@ pauses as above without installing. `--dry-run` reports `would update tool
 <sha>` and changes nothing; no other command updates the tool. In order:
 
 1. Forward only: the candidate must descend from the installed `tool.json` sha
-   (`merge-base --is-ancestor`); both files are read from the source mirror at
-   the candidate (`git cat-file blob`, the attested commit) and each must hash
-   to `git rev-parse <candidate>:<path>`. A pair `tool-rollback` rolled back is
-   not installed again.
+   (`merge-base --is-ancestor`); `production.py`, then the other files its
+   `TOOL_FILES` lists, are read from the source mirror at the candidate (`git
+   cat-file blob`, the attested commit) and each must hash to `git rev-parse
+   <candidate>:<path>`; a list that is not that literal dict pauses
+   (`tool_by_hand`, "names no TOOL_FILES"). A tool `tool-rollback` rolled back is not
+   installed again.
 2. Stage `releases/<sha>.staging-<random>` (temporary names, fsync, rename) and
    run its self-test: `/usr/bin/python3 -B -E -s <staging>/production.py
    self-test --config <plan A> --http-config <plan B>`, PATH only, 60 seconds.
-   The new code imports both modules from its directory, checks its
+   The new code imports both modules from its directory (any other listed
+   module loaded from there or, when not imported, compiled), checks its
    `tool.json`, loads and validates both configurations, reads `current.json`,
    `http-current.json` and `deploy.json`, and checks the verifier against its
    pin ("install the verifier first" when the candidate pins another build).

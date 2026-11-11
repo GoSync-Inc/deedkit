@@ -23,6 +23,7 @@ if GUARDED:
     sys.addaudithook(refuse_side_effects)
 
 import argparse
+import ast
 import copy
 from contextlib import ExitStack, contextmanager, suppress
 from datetime import datetime, timedelta, timezone
@@ -5063,14 +5064,19 @@ def range_changes(mirror, base, candidate, installed):
     paths = [path for path in run(["git", "-C", str(mirror), "diff", "--name-only", "--no-renames", "-z", base,
                                    candidate]).split("\0") if path]
     sql = [path for path in paths if SQL_INVENTORY.search(path)]
-    tools = [path for path in paths if path in DEPLOY_TOOLS or path.startswith(tuple(t for t in DEPLOY_TOOLS if t[-1] == "/"))]
+    tools = [path for path in paths if path in DEPLOY_TOOLS or path in TOOL_FILES or path.startswith(tuple(t for t in DEPLOY_TOOLS if t[-1] == "/"))]
     def current_tool(path):
         # The running tool is the candidate's when its installed file has the candidate's content; a unit this host
         # does not install (no timer) needs no install.
         if path in installed:
             if path in UNITS and not os.path.lexists(installed[path]):
                 return True
-            return run(["git", "-C", str(mirror), "rev-parse", f"{candidate}:{path}"]).strip() == blob(installed[path])
+            try:
+                return run(["git", "-C", str(mirror), "rev-parse", f"{candidate}:{path}"]).strip() == blob(installed[path])
+            except Refused:
+                if path in TOOL_FILES:  # a tool file the candidate deletes waits for the tool update, which installs
+                    return False        # the candidate's own list
+                raise
         # The verifier is the candidate's when the installed binary is this tool's pinned build and the candidate
         # records that same build (tests keep each commit's two pins equal to its recorded file): a later tool change
         # with an unchanged verifier then installs itself instead of pausing (ANYM-618).
@@ -6736,7 +6742,12 @@ def migrate(settings, http, plans, mirror, base, serving, candidate, release):
 # script's resolved directory). From a range whose only pause is that pair, `deploy` installs the candidate's pair:
 # stage, self-test, `activating`, switch `current`, self-test through the documented path, `active`.
 TOOL_ROOT = Path("/usr/local/lib/deedkit")
+# The tool's files (W5-1a): each release reads the list from its own production.py source, never from the running
+# code, so a candidate may add a module and a rollback to an older release checks that release's own list. The two
+# documented paths stay the only compatibility links, whatever the list holds.
 TOOL_FILES = {"scripts/production.py": "production.py", "scripts/seamless_release.py": "seamless_release.py"}
+TOOL_LINKS = ("production.py", "seamless_release.py")
+TOOL_FILE = re.compile(r"scripts/([a-z_][a-z0-9_]*\.py)")
 TOOL_PYTHON = "/usr/bin/python3"
 SELF_TEST_TIMEOUT = 60
 # The running module, resolved at import: after a switch the documented path already names the next tool.
@@ -6752,11 +6763,41 @@ def tool_path(path, kind):
                       "and writes")
 
 
+def tool_manifest(source, where):
+    """The TOOL_FILES of a production.py `source`, read without running it: the one statement that starts a line with
+    `TOOL_FILES =`, a literal dict of `scripts/<module>.py` paths to their file names with both TOOL_LINKS among them.
+    Only that statement is parsed, so a syntax error elsewhere is left to the self-test, which also checks that the
+    module's TOOL_FILES is this list."""
+    files = None
+    try:
+        lines = source.decode().splitlines()
+        if len(starts := [index for index, line in enumerate(lines) if line.startswith("TOOL_FILES =")]) == 1:
+            for end in range(starts[0] + 1, min(len(lines), starts[0] + 20) + 1):
+                with suppress(SyntaxError):
+                    body = ast.parse("\n".join(lines[starts[0]:end])).body
+                    break
+            else:
+                body = []
+            if (len(body) == 1 and isinstance(body[0], ast.Assign) and len(body[0].targets) == 1
+                    and isinstance(body[0].targets[0], ast.Name)):
+                files = ast.literal_eval(body[0].value)
+    except (ValueError, TypeError, MemoryError, RecursionError):
+        files = None
+    if (not isinstance(files, dict)
+            or not all(isinstance(path, str) and isinstance(name, str) and (match := TOOL_FILE.fullmatch(path))
+                       and match[1] == name for path, name in files.items())
+            or not set(TOOL_LINKS) <= set(files.values())):
+        raise Refused(f"{where} names no TOOL_FILES: one literal dict of scripts/<module>.py paths to their file "
+                      "names, production.py and seamless_release.py among them")
+    return files
+
+
 def tool_record(directory, sha=None):
-    """The tool.json of `directory`, which must name the git blob ids of the two files beside it."""
+    """The tool.json of `directory`, which must name the git blob ids of the files its production.py lists."""
     try:
         tool = json.loads((directory / "tool.json").read_text())
-        blobs = {path: blob(directory / name) for path, name in TOOL_FILES.items()}
+        files = tool_manifest((directory / "production.py").read_bytes(), directory / "production.py")
+        blobs = {path: blob(directory / name) for path, name in files.items()}
     except (OSError, ValueError) as exc:
         raise Refused(f"cannot read the tool files of {directory}: {type(exc).__name__}") from exc
     if (not isinstance(tool, dict) or set(tool) != {"sha", "blobs", "installed_at"} or tool["blobs"] != blobs
@@ -6767,20 +6808,23 @@ def tool_record(directory, sha=None):
 
 
 def tool_release(sha):
-    """The checked release TOOL_ROOT/releases/<sha>: its two files and tool.json, an optional bytecode cache, no
-    symlink, all of them the operator's alone."""
+    """The checked release TOOL_ROOT/releases/<sha>: exactly the files its production.py lists and tool.json, an
+    optional bytecode cache, no symlink, all of them the operator's alone."""
     directory = TOOL_ROOT / "releases" / sha
     try:
         tool_path(directory, stat.S_IFDIR)
         names = set(os.listdir(directory))
-        required = {*TOOL_FILES.values(), "tool.json"}
-        if not required <= names or names - required - {"__pycache__"}:
-            raise Refused(f"{directory} must hold exactly production.py, seamless_release.py and tool.json")
         for name in names:
             tool_path(directory / name, stat.S_IFDIR if name == "__pycache__" else stat.S_IFREG)
         if "__pycache__" in names:
             for name in os.listdir(directory / "__pycache__"):
                 tool_path(directory / "__pycache__" / name, stat.S_IFREG)
+        if "production.py" not in names:
+            raise Refused(f"{directory} holds no production.py")
+        required = {*tool_manifest((directory / "production.py").read_bytes(), directory / "production.py").values(),
+                    "tool.json"}
+        if not required <= names or names - required - {"__pycache__"}:
+            raise Refused(f"{directory} must hold exactly {', '.join(sorted(required))}")
     except OSError as exc:
         raise Refused(f"cannot check {directory}: {type(exc).__name__}") from exc
     return tool_record(directory, sha)
@@ -6805,7 +6849,7 @@ def installed_tool():
         releases = TOOL_ROOT / "releases"
         tool_path(TOOL_ROOT, stat.S_IFDIR)
         tool_path(releases, stat.S_IFDIR)
-        links = {"current": None, **{name: "current/" + name for name in TOOL_FILES.values()}}
+        links = {"current": None, **{name: "current/" + name for name in TOOL_LINKS}}
         for name, target in links.items():
             info = (TOOL_ROOT / name).lstat()
             if not stat.S_ISLNK(info.st_mode) or info.st_uid != os.geteuid() or target not in (
@@ -6842,11 +6886,13 @@ def point_current(sha):
     fsync_directory(TOOL_ROOT)
 
 
-def stage_tool(sha, files, blobs):
-    """releases/<sha>.staging-<random>, every file written to a temporary name, synced, then renamed into place."""
+def stage_tool(sha, manifest, contents, blobs):
+    """releases/<sha>.staging-<random> with the files of the candidate's `manifest` (its TOOL_FILES), every file
+    written to a temporary name, synced, then renamed into place."""
     staging = TOOL_ROOT / "releases" / f"{sha}.staging-{uuid.uuid4().hex}"
     staging.mkdir(mode=0o700)
     record = json.dumps({"sha": sha, "blobs": blobs, "installed_at": now()}, indent=2) + "\n"
+    files = {name: contents[path] for path, name in manifest.items()}
     for name, content in {**files, "tool.json": record.encode()}.items():
         temporary = staging / (name + ".tmp")
         with temporary.open("xb") as handle:
@@ -6943,21 +6989,28 @@ def reconcile_tool(settings, configs, s, *, dry_run, halt):
 
 
 def update_tool(settings, configs, s, mirror, candidate, base, tool, *, dry_run, halt):
-    """Install the candidate's tool pair (production.md "Deploy tool updates"). The run then ends `tool-updated`, and
-    the next one deploys with the new tool."""
+    """Install the candidate's tool, the files its production.py lists (production.md "Deploy tool updates"). The run
+    then ends `tool-updated`, and the next one deploys with the new tool."""
     state, old = Path(settings["state_directory"]), tool["sha"]
     receipt = state / "tool-update.json"
     # Forward only, from the commit whose images the verifier accepted, each file checked against its git blob id.
     if not on_main(mirror, old, candidate):
         return halt(f"the candidate {candidate} does not descend from the installed tool {old}; install the tool by "
                     "hand (production.md)", code="tool_not_descended", sha=candidate)
-    files, blobs = {}, {}
-    for path, name in TOOL_FILES.items():
+    contents, blobs, manifest, paths = {}, {}, None, ["scripts/production.py"]
+    while paths:  # production.py first: its TOOL_FILES names the other files
+        path = paths.pop(0)
         blobs[path] = run(["git", "-C", str(mirror), "rev-parse", f"{candidate}:{path}"]).strip()
-        files[name] = run(["git", "-C", str(mirror), "cat-file", "blob", f"{candidate}:{path}"], binary=True)
-        if hashlib.sha1(b"blob %d\0" % len(files[name]) + files[name]).hexdigest() != blobs[path]:
+        contents[path] = run(["git", "-C", str(mirror), "cat-file", "blob", f"{candidate}:{path}"], binary=True)
+        if hashlib.sha1(b"blob %d\0" % len(contents[path]) + contents[path]).hexdigest() != blobs[path]:
             return halt(f"{path} of {candidate} does not match its git blob id; the tool is not updated", code="tool_blob_mismatch",
                         sha=candidate)
+        if manifest is None:
+            try:
+                manifest = tool_manifest(contents[path], f"{path} of {candidate}")
+            except Refused as exc:
+                return halt(f"{exc}; the tool is not updated", code="tool_by_hand", sha=candidate)
+            paths = [other for other in manifest if other != path]
     last = tool_update_receipt(state)
     if last and last["status"] == "rolled-back" and last.get("blobs") == blobs:
         return halt(f"the tool of {last['to']} was rolled back (tool-rollback); install a changed tool by hand or merge "
@@ -6981,7 +7034,7 @@ def update_tool(settings, configs, s, mirror, candidate, base, tool, *, dry_run,
                 shutil.rmtree(target / "__pycache__")
             script = target / "production.py"
         else:
-            staged = stage_tool(candidate, files, blobs)
+            staged = stage_tool(candidate, manifest, contents, blobs)
             script = staged / "production.py"
         if error := self_test_error(script, configs, candidate):
             if staged:
@@ -7033,8 +7086,8 @@ def tool_rollback(settings, http, s):
 
 
 def self_test(config_path, http_path, verifier=None):
-    """This tool's check before `deploy` runs it (production.md "Deploy tool updates"): both modules from this
-    directory, its tool.json, both configurations and the current receipts read with this code, the verifier (or the
+    """This tool's check before `deploy` runs it (production.md "Deploy tool updates"): every module its TOOL_FILES
+    lists from this directory (an imported one loaded from here, any other compiled), its tool.json, both configurations and the current receipts read with this code, the verifier (or the
     staged build `verifier` names, read and never run) and its pin. It runs under the guard at the top of this file."""
     if not GUARDED:
         raise Refused("self-test must be the first argument")
@@ -7043,6 +7096,14 @@ def self_test(config_path, http_path, verifier=None):
     if Path(s.__file__).resolve().parent != directory:
         raise Refused("seamless_release.py was not imported from the directory of production.py")
     tool = tool_record(directory)
+    if tool_manifest(RUNNING.read_bytes(), RUNNING) != TOOL_FILES:
+        raise Refused("the TOOL_FILES this module runs with is not the list its source states")
+    for name in TOOL_FILES.values():
+        loaded = [module for key in (name[:-3], "scripts." + name[:-3]) if (module := sys.modules.get(key))]
+        if any(Path(getattr(module, "__file__", "") or "").resolve() != directory / name for module in loaded):
+            raise Refused(f"{name} was not imported from the directory of production.py")
+        if not loaded and name != RUNNING.name:
+            compile((directory / name).read_bytes(), str(directory / name), "exec", dont_inherit=True)
     settings = config(config_path)
     http = s.validate_settings(config(http_path))
     state, http_state = Path(settings["state_directory"]), Path(http["state_directory"])
@@ -7078,6 +7139,21 @@ def configuration_drift(settings, http, current, serving):
     return None
 
 
+def running_tool(s):
+    """This run's tool files by repository path: this module, the seamless_release it imported, and every other file
+    its TOOL_FILES lists from this module's directory."""
+    return {path: RUNNING if name == RUNNING.name else Path(s.__file__) if name == "seamless_release.py"
+            else RUNNING.parent / name for path, name in TOOL_FILES.items()}
+
+
+def runs_tool(tool, s):
+    """Whether this run is the installed `tool`: the blob ids of its files are exactly the ones tool.json records."""
+    try:
+        return {path: blob(file) for path, file in running_tool(s).items()} == tool["blobs"]
+    except OSError:
+        return False
+
+
 def stale_tool(s):
     """Why this run is not the tool `current` names on a host with a checked self-updating layout, or None. A refused
     or missing layout is left to the range check, which pauses for it when the tool changes."""
@@ -7085,7 +7161,7 @@ def stale_tool(s):
         tool = installed_tool()
     except Refused:
         return None
-    if tool and [blob(RUNNING), blob(s.__file__)] != [tool["blobs"][path] for path in TOOL_FILES]:
+    if tool and not runs_tool(tool, s):
         return f"this run is not the tool {TOOL_ROOT / 'current'} names ({tool['sha']})"
     return None
 
@@ -7360,12 +7436,12 @@ def deploy_plan(settings, s, configs, mirror, base, since, candidate, sql, pendi
     # instead of pausing.
     plans = migration_plans(settings, mirror, since, candidate, sql) if sql and not pending and candidate != base else None
     if (reasons := [] if plans else pause_text(sql, pending, migration_classes(mirror, since, candidate, sql))) and not sql and set(pending) <= TOOL_FILES.keys():
-        # Only the tool pair waits for an install: the self-updating layout installs it, when this run is its tool.
+        # Only the tool's files wait for an install: the self-updating layout installs it, when this run is its tool.
         try:
             tool = installed_tool()
         except Refused as exc:
             tool = reasons.append(f"the tool does not update itself: {exc}")
-        if tool and [blob(RUNNING), blob(s.__file__)] != [tool["blobs"][path] for path in TOOL_FILES]:
+        if tool and not runs_tool(tool, s):
             tool = reasons.append(f"the tool does not update itself: this run is not {TOOL_ROOT / 'current'}")
         if tool:
             return update_tool(settings, configs, s, mirror, candidate, base, tool, dry_run=dry_run, halt=halt), None
@@ -7546,8 +7622,7 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
         if enrolled := enrollment_only(mirror, head, settings, http, current, serving):
             return halt(enroll_required(enrolled[0], head), code="enroll_required")
         return halt(drift + "; apply the next release by hand", code="configuration_drift")
-    installed = {"scripts/production.py": RUNNING, "scripts/seamless_release.py": s.__file__,
-                 **{path: SYSTEMD_DIRECTORY / Path(path).name for path in UNITS}}
+    installed = {**running_tool(s), **{path: SYSTEMD_DIRECTORY / Path(path).name for path in UNITS}}
     halted, candidate, since = deploy_candidate(state, http_state, mirror, base, head, serving, last, misses, attested,
                                                 dry_run, halt)
     if halted is not None:
@@ -8130,8 +8205,7 @@ def enroll_plan(settings, http, name, sha, mirror, state=None):
     if not re.fullmatch(r"[0-9a-f]{40}", current.get("sha", "")):
         failures.append({"code": "no_current_release", "detail": "no applied release is recorded"})
     else:
-        installed = {"scripts/production.py": RUNNING, "scripts/seamless_release.py": http_release_tool().__file__,
-                     **{path: SYSTEMD_DIRECTORY / Path(path).name for path in UNITS}}
+        installed = {**running_tool(http_release_tool()), **{path: SYSTEMD_DIRECTORY / Path(path).name for path in UNITS}}
         sql, tools = range_changes(mirror, current["sha"], sha, installed)
         if sql:
             failures.append({"code": "range_sql_inventory", "detail": ", ".join(sql[:5])})

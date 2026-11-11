@@ -4819,7 +4819,7 @@ def test_production_md_states_the_manifest_invalid_pause_and_the_earlier_network
     assert "is refused as `network_unsafe` before the pause, the receipt or any file is written" in docs
 
 
-HALT_CALLS = 42  # every halt(...) of production.py; a new call raises this number and adds its code to p.HALTS
+HALT_CALLS = 43  # every halt(...) of production.py; a new call raises this number and adds its code to p.HALTS
 
 
 def halt_call_problems(source, table):
@@ -7750,8 +7750,125 @@ def test_a_tool_only_range_installs_the_candidates_pair_and_the_next_run_deploys
     assert [step for step, sha in host.steps] == ["prepare", "apply", "seamless prepare", "seamless promote"]
 
 
+def three_file_tool(verifier, manifest=None, extra=b'"""A synthetic third tool module."""\nVALUE = 1\n'):
+    """A candidate whose production.py lists a third module, scripts/tool_extra.py, in its TOOL_FILES."""
+    files = candidate_tool(verifier)
+    manifest = manifest or (b'TOOL_FILES = {"scripts/production.py": "production.py", "scripts/seamless_release.py": '
+                            b'"seamless_release.py", "scripts/tool_extra.py": "tool_extra.py"}')
+    source, count = re.subn(rb"(?m)^TOOL_FILES = \{.*\}$", manifest.replace(b"\\", b"\\\\"), files["scripts/production.py"])
+    assert count == 1
+    return {**files, "scripts/production.py": source, "scripts/tool_extra.py": extra}
+
+
 # spec: ANYM-443
-@pytest.mark.parametrize("other", ["services/messaging/messaging_service/migrations/039_synthetic.sql",
+def test_a_candidate_listing_a_third_tool_file_installs_it_deploys_with_it_and_rolls_back_to_the_pair(tmp_path,
+                                                                                                    monkeypatch):
+    host = ToolHost(tmp_path, monkeypatch)
+    host.serve(three_file_tool(host.verifier))
+    outcome = host.deploy()
+    assert outcome["status"] == "tool-updated" and host.current_tool() == f"releases/{NEWEST}"
+    release = host.tool / "releases" / NEWEST
+    assert sorted(path.name for path in release.iterdir()) == ["production.py", "seamless_release.py", "tool.json",
+                                                               "tool_extra.py"]
+    assert p.read(release / "tool.json")["blobs"] == {path: git_blob(content) for path, content in host.files.items()}
+    # The release's own list decides its layout, whatever the running tool lists: still an exact set.
+    assert p.installed_tool()["sha"] == NEWEST
+    (release / "tool_extra.py").rename(tmp_path / "tool_extra.py")
+    with pytest.raises(p.Refused, match="must hold exactly"):
+        p.tool_release(NEWEST)
+    (tmp_path / "tool_extra.py").rename(release / "tool_extra.py")
+    (release / "unlisted.py").write_bytes(b"")
+    with pytest.raises(p.Refused, match="must hold exactly"):
+        p.tool_release(NEWEST)
+    (release / "unlisted.py").unlink()
+    # The next timer run is the three-file tool: it is the tool `current` names, and it deploys.
+    host.restart()
+    assert host.p.TOOL_FILES["scripts/tool_extra.py"] == "tool_extra.py" and host.p.stale_tool(host.s) is None
+    outcome = host.deploy()
+    assert outcome["status"] == "deployed" and outcome["sha"] == NEWEST
+    # Its rollback returns to the two-file release, which that release's own list checks.
+    assert host.p.tool_rollback(host.settings, host.http, host.s) == {"status": "tool-rolled-back", "from": NEWEST,
+                                                                       "to": BASE}
+    assert host.current_tool() == f"releases/{BASE}"
+    assert host.p.installed_tool()["sha"] == BASE == p.installed_tool()["sha"] and p.stale_tool(host.s) is None
+
+
+# spec: ANYM-443
+def test_a_third_tool_file_that_does_not_compile_fails_the_staged_self_test(tmp_path, monkeypatch):
+    host = ToolHost(tmp_path, monkeypatch)
+    host.serve(three_file_tool(host.verifier, extra=b"def broken(:\n"))
+    before = tree(host.tool)
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and f"the self-test of tool {NEWEST} failed" in outcome["reason"]
+    assert "SyntaxError" in outcome["reason"] and tree(host.tool) == before and host.receipt() is None
+
+
+# spec: ANYM-443
+def test_a_candidate_that_drops_a_tool_file_the_running_tool_lists_installs_its_own_list(tmp_path, monkeypatch):
+    host = ToolHost(tmp_path, monkeypatch)
+    host.serve(three_file_tool(host.verifier))
+    assert host.deploy()["status"] == "tool-updated"
+    host.restart()
+    # The next commit removes scripts/tool_extra.py and lists the pair again: git has no blob for the removed path.
+    dropped = "3" * 40
+    host.history.append(dropped)
+    host.green.add(dropped)
+    host.changes[dropped], host.candidate = ["scripts/production.py", "scripts/tool_extra.py"], dropped
+    host.serve(candidate_tool(host.verifier, inject=b"# the pair again\n"))
+    run = host.p.run
+    def deleted(argv, **kwargs):
+        if argv[3:] == ["rev-parse", f"{dropped}:scripts/tool_extra.py"]:
+            raise p.Refused("git failed (exit 128); production was not accepted")
+        return run(argv, **kwargs)
+    monkeypatch.setattr(host.p, "run", deleted)
+    outcome = host.deploy()
+    assert outcome["status"] == "tool-updated" and host.current_tool() == f"releases/{dropped}"
+    assert sorted(path.name for path in (host.tool / "releases" / dropped).iterdir()) == [
+        "production.py", "seamless_release.py", "tool.json"]
+    assert p.installed_tool()["sha"] == dropped and host.paused() is None
+
+
+# spec: ANYM-443
+@pytest.mark.parametrize("value", ["[]", "{}", "{1}", "None"])
+def test_a_tool_files_value_that_is_no_file_name_is_refused_and_retention_skips_its_release(tmp_path, monkeypatch,
+                                                                                            value):
+    host = ToolHost(tmp_path, monkeypatch)
+    manifest = (b'TOOL_FILES = {"scripts/production.py": "production.py", "scripts/seamless_release.py": '
+                b'"seamless_release.py", "scripts/tool_extra.py": %s}' % value.encode())
+    files = three_file_tool(host.verifier, manifest)
+    with pytest.raises(p.Refused, match="names no TOOL_FILES"):
+        p.tool_manifest(files["scripts/production.py"], "synthetic")
+    # A release on the host with such a list is no checked release: retention keeps it and removes the others.
+    odd = "4" * 40
+    install_release(host.tool, odd, {path: content for path, content in files.items() if "extra" not in path})
+    install_release(host.tool, "5" * 40, TOOL, "2026-10-19T00:00:00Z")
+    assert p.retain_tools([BASE]) == ["5" * 40] and (host.tool / "releases" / odd).is_dir()
+
+
+# spec: ANYM-443
+@pytest.mark.parametrize("manifest", [
+    b'TOOL_FILES = dict(production="production.py")',
+    b'TOOL_FILES = {"scripts/production.py": "production.py", "scripts/seamless_release.py": "seamless_release.py", '
+    b'"tools/tool_extra.py": "tool_extra.py"}',
+    b'TOOL_FILES = {"scripts/production.py": "production.py", "scripts/seamless_release.py": "seamless_release.py", '
+    b'"scripts/tool_extra.py": "../tool_extra.py"}',
+    b'TOOL_FILES = {"scripts/production.py": "production.py", "scripts/tool_extra.py": "tool_extra.py"}',
+    b'TOOL_FILES = {"scripts/production.py": "production.py", "scripts/seamless_release.py": "seamless_release.py", '
+    b'"scripts/tool.json": "tool.json"}'], ids=["computed", "outside scripts", "path name", "no seamless", "not python"])
+def test_a_candidate_whose_tool_files_are_no_literal_list_of_script_modules_pauses_and_installs_nothing(
+        tmp_path, monkeypatch, manifest):
+    host = ToolHost(tmp_path, monkeypatch)
+    host.serve(three_file_tool(host.verifier, manifest))
+    before = tree(host.tool)
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and outcome["code"] == "tool_by_hand"
+    assert f"scripts/production.py of {NEWEST} names no TOOL_FILES" in outcome["reason"]
+    assert tree(host.tool) == before and host.receipt() is None and host.paused() == outcome["reason"]
+    assert not [argv for argv in host.git if "tool_extra.py" in argv[-1]]  # no file the list names is read
+
+
+# spec: ANYM-443
+@pytest.mark.parametrize("other",["services/messaging/messaging_service/migrations/039_synthetic.sql",
                                    "services/release-router/main.go", "tools/attest-verify/main.go",
                                    "deploy/deedkit-autodeploy.service", "deploy/deedkit-autodeploy.timer"])
 def test_a_tool_change_with_an_sql_router_verifier_or_unit_change_pauses_and_installs_nothing(tmp_path, monkeypatch,
