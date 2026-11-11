@@ -164,6 +164,20 @@ def test_every_action_goes_through_the_guard_and_a_secret_is_typed_only_as_a_dec
         service.post('agent', {'action': 'stop', 'request_id': request_id})
 
 
+# spec: ANYM-971
+def test_an_action_that_lands_in_an_app_outside_the_run_ends_the_run_at_the_guard(tmp_path):
+    with Service(running(tmp_path)) as service:
+        request_id, bearer = live(service)
+        service.phone.package = 'com.google.android.apps.nexuslauncher'  # home or the system UI is neutral
+        assert tool(service, bearer, 'key', {'key': 'Home'}).status_code == 200
+        service.phone.package = 'example.bank'  # a tap opened an app the run did not name
+        stopped = tool(service, bearer, 'tap', {'selector': {'text': 'Add to cart'}})
+        assert stopped.status_code == 200 and stopped.json()['is_error'] and 'STOPPED by the guard (foreign_app)' in stopped.json()['text']
+        done = service.finished(request_id)
+        assert done['state'] == 'stopped_by_guard' and done['guard']['rule'] == 'foreign_app'
+        assert done['guard']['matched'] == 'example.bank' and done['guard']['when'] == 'after' and done['guard']['tool'] == 'tap'
+
+
 FLOWS = {
     'a scenario step runs': ('- tapOn: Add to cart', None),
     'another app is launched': ('- launchApp: {appId: example.bank}', 'app_not_allowed'),
