@@ -22,7 +22,7 @@ from deedkit_android.app_maps import compile_scenario, validate_map
 from deedkit_android.config import Refused
 from deedkit_android.flows import compile_flow
 from deedkit_android.guard import Guard, Stop
-from deedkit_android.secrets import Masker, SecretStore
+from deedkit_android.secrets import Masker, Run, SecretStore
 from deedkit_android.store import Store
 from deedkit_android.ui_worker import execute, make_guard
 from deedkit_android.uiautomator import DEFINITE, reference
@@ -295,8 +295,8 @@ def test_the_worker_types_a_secret_only_into_its_package_and_a_focused_editable_
             secrets = {NAME: {'package': case.get('bound', PACKAGE), 'value': VALUE}}
             command = secret_command(form)
             if case['types']:
-                assert execute(phone, command, secrets=secrets, guard=Guard(secret_packages={PACKAGE})) == {'success': True}
-                assert phone.inputs == [VALUE], (form, situation)
+                done = execute(phone, command, secrets=secrets, guard=Guard(secret_packages={PACKAGE}))
+                assert done['success'] is True and phone.inputs == [VALUE], (form, situation)
                 continue
             with pytest.raises(Refused) as caught:
                 execute(phone, command, secrets=secrets, guard=Guard(secret_packages={PACKAGE}))
@@ -400,6 +400,73 @@ def test_masker_drops_ocr_words_of_a_masked_line_and_does_not_touch_keys():
     other = {'text': 'Search', 'words': [{'text': 'Search'}]}
     assert masker.mask({'lines': [line, other]}) == {'lines': [{'text': REF, 'words': []}, other]}
     assert masker.mask({'my pass phrase': 1}) == {'my pass phrase': 1}
+
+
+# spec: ANYM-969
+def test_a_run_masks_every_result_and_error_from_the_typing_call_on(tmp_path):
+    store = SecretStore(tmp_path / 'state')
+    store.set(NAME, PACKAGE, VALUE)
+    run = Run(store)
+    run.bind([{'tapOn': 'Password'}, {'inputText': REF}, {'copyTextFrom': 'Password'}])
+    sent = []
+
+    async def send(command, **options):
+        sent.append((command, options))
+        if command == {'copyTextFrom': 'Password'}:
+            return {'text': VALUE, 'rows': [{'field': f'<{VALUE}>'}]}
+        if command == {'tapOn': 'Missing'}:
+            error = Refused('ambiguous_selector')
+            error.details = {'candidates': [VALUE]}
+            error.hint = f'saw {VALUE}'
+            raise error
+        return {'success': True, 'echo': VALUE if command == 'before' else 'fine'}
+
+    async def scenario():
+        assert (await run.call(send, 'before'))['echo'] == VALUE  # Nothing typed yet: nothing to mask.
+        await run.call(send, {'inputText': REF})
+        assert (await run.call(send, {'copyTextFrom': 'Password'})) == {'text': REF, 'rows': [{'field': f'<{REF}>'}]}
+        with pytest.raises(Refused) as caught:
+            await run.call(send, {'tapOn': 'Missing'})
+        assert caught.value.details == {'candidates': [REF]} and caught.value.hint == f'saw {REF}'
+    asyncio.run(scenario())
+    assert [options.get('secrets') for _, options in sent] == [None, BOUND, None, None]  # Only the typing call.
+    assert all(options['secret_packages'] == [PACKAGE] for _, options in sent)
+
+
+# spec: ANYM-969
+def test_the_failure_observation_masks_before_it_cuts_long_text_and_takes_no_screenshot(tmp_path, monkeypatch):
+    async def scenario():
+        store = Store(tmp_path / 'state')
+        devices = ui_devices(tmp_path, store)
+        SecretStore(store.directory).set(NAME, PACKAGE, VALUE)
+        taken = []
+
+        async def hierarchy(device):
+            # The value straddles the 256-character cut a stored observation makes.
+            return {'elements': [{'text': 'x' * 250 + VALUE, 'class': 'android.widget.EditText'}]}
+
+        async def capture(*args):
+            taken.append(args)
+            return {'image_file': {'file_id': 'unused'}}
+        monkeypatch.setattr(devices, 'capture_hierarchy', hierarchy)
+        monkeypatch.setattr(devices, 'capture_image', capture)
+        try:
+            run = Run(devices.secrets)
+            run.bind([{'inputText': REF}])
+            idle = await devices.failure_observation('owner', 'phone', run)  # Nothing typed: the usual observation.
+            assert taken and 'image_file' in idle and idle['elements'][0]['text'] == ('x' * 250 + VALUE)[:256]
+            taken.clear()
+            run.attach({'inputText': REF})
+            typed = await devices.failure_observation('owner', 'phone', run)
+            assert taken == [] and typed['screenshot_withheld'] == 'secret_typed' and 'image_file' not in typed
+            # Six characters of the value would survive a cut made before masking; five must not appear anywhere.
+            assert typed['elements'][0]['text'].startswith('x' * 250) and VALUE[:5] not in json.dumps(typed)
+            stop = await devices.stop_observation('owner', 'phone', PACKAGE, False, run)
+            assert taken == [] and 'image_file' not in stop and VALUE[:5] not in json.dumps(stop)
+        finally:
+            await devices.close()
+            store.close()
+    asyncio.run(scenario())
 
 
 def ui_devices(tmp_path, store):
@@ -623,8 +690,8 @@ def screen_xml(*, package=PACKAGE, field_class='android.widget.EditText', focuse
 
 
 class Field:
-    def __init__(self, phone):
-        self.phone = phone
+    def __init__(self, phone, selector):
+        self.phone, self.selector = phone, selector
 
     @property
     def info(self):
@@ -659,7 +726,7 @@ class Phone:
         return 1000, 2000
 
     def __call__(self, **selector):
-        return Field(self)
+        return Field(self, selector)
 
     def acted(self):
         return bool(self.clicks or self.keys or self.swipes or self.inputs)
@@ -668,6 +735,8 @@ class Phone:
 SITUATIONS = {
     'bound': {'types': True, 'screen': {}},
     'foreground elsewhere': {'types': False, 'screen': {'package': 'example.other'}},
+    'foreground elsewhere, field of the bound app': {'types': False,
+                                                     'screen': {'package': 'example.other', 'field_package': PACKAGE}},
     'bound elsewhere': {'types': False, 'bound': 'example.other', 'screen': {}},
     'field of another package': {'types': False, 'screen': {'field_package': 'example.other'}},
     'not focused': {'types': False, 'screen': {'focused': 'false'}},

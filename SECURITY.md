@@ -102,3 +102,5 @@ the laptop and the Mac mini hold `timeout` in `/opt/homebrew/bin`, which a non-l
 the hook also looks there, and `python3` in `/usr/bin` (mini) or on `PATH` (laptop). CI runs only this hook's tests, on
 Ubuntu, which has `timeout`. Cloud sessions were not checked. The production host runs no agent session: an SSH command
 is checked on the machine that starts it, and Codex does not read `.claude/` hooks.
+
+Android app secrets (ANYM-969): a value a phone run types as `${secret:NAME}` lives only in `<state_dir>/secrets.json` (0600, atomic replace) on the phone host and is set from standard input by `deedkit-android secret set`; no HTTP route or tool sets, reads or lists one, the worker types it only into a focused editable field of the app it is bound to, names holding PIN, CVV, CVC, CARD, OTP or PASSCODE are refused, and every read of a run after the typing (receipt, failure observation) shows the reference instead, with no screenshot. Details: services/android/README.md, "Secrets".

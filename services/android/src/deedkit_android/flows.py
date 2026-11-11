@@ -6,6 +6,7 @@ import yaml
 from yaml.tokens import AliasToken, AnchorToken
 
 from .config import Refused
+from .secrets import REFERENCE
 
 SELECTOR = {'text', 'id', 'index', 'point', 'enabled', 'selected', 'checked', 'focused',
             'optional', 'retryTapIfNoChange', 'waitToSettleTimeoutMs', 'label', 'longPress',
@@ -37,9 +38,39 @@ FIELDS = {
 }
 BARE = {'back', 'scroll', 'hideKeyboard', 'pasteText', 'toggleAirplaneMode', 'toggleDarkMode', 'assertDarkMode', 'assertLightMode'}
 VARIABLE = re.compile(r'\$\{([A-Z][A-Z0-9_]{0,63})\}')
+CONTAINERS = {'runFlow', 'repeat', 'retry'}
 
 
-def compile_flow(source, parameters, *, resolve=None, fields=None, _stack=(), _budget=None, _depth=0):
+def own_references(name, argument):
+    """Whole-value secret references among a command's own arguments (nested commands are checked as commands)."""
+    if name in CONTAINERS and isinstance(argument, dict):
+        argument = {key: child for key, child in argument.items() if key != 'commands'}
+    found = []
+
+    def walk(item):
+        if isinstance(item, str):
+            if REFERENCE.fullmatch(item):
+                found.append(item)
+        elif isinstance(item, list):
+            for child in item:
+                walk(child)
+        elif isinstance(item, dict):
+            for child in item.values():
+                walk(child)
+    walk(argument)
+    return found
+
+
+def typed_slot(name, argument):
+    """The one place a reference may stand: the whole text inputText, setText.value or a map typeInto types."""
+    if name == 'inputText':
+        return argument if isinstance(argument, str) else argument.get('text') if isinstance(argument, dict) else None
+    key = {'setText': 'value', 'typeInto': 'text'}.get(name)
+    return argument.get(key) if key and isinstance(argument, dict) else None
+
+
+def compile_flow(source, parameters, *, resolve=None, fields=None, secrets=None, _stack=(), _budget=None, _depth=0):
+    # secrets: a callable giving the stored secret names; None checks where a reference stands but not its name.
     fields = FIELDS if fields is None else fields
     if len(source.encode()) > 32768 or len(parameters) > 64:
         raise Refused('flow_too_large', 422)
@@ -60,6 +91,10 @@ def compile_flow(source, parameters, *, resolve=None, fields=None, _stack=(), _b
         if depth > 16:
             raise Refused('flow_too_deep', 422)
         if isinstance(item, str):
+            if REFERENCE.fullmatch(item):
+                return item  # Where it may stand and whether it exists are checked per command, below.
+            if '${secret:' in item:
+                raise Refused('secret_reference_not_allowed', 422)
             try:
                 item = VARIABLE.sub(lambda match: parameters[match[1]], item)
             except KeyError:
@@ -70,6 +105,8 @@ def compile_flow(source, parameters, *, resolve=None, fields=None, _stack=(), _b
         if isinstance(item, list):
             return [value(child, depth + 1) for child in item]
         if isinstance(item, dict):
+            if any(isinstance(key, str) and '${secret:' in key for key in item):
+                raise Refused('secret_reference_not_allowed', 422)
             if any(not isinstance(key, str) or '${' in key or '\x00' in key or key in {'script', 'file', 'path', 'image', 'runScript',
                                                         'evalScript', 'onFlowStart', 'onFlowComplete'}
                    for key in item):
@@ -115,6 +152,12 @@ def compile_flow(source, parameters, *, resolve=None, fields=None, _stack=(), _b
                     timeout = argument.get('timeout', 5000)
                     if type(timeout) is not int or not 100 <= timeout <= 60000:
                         raise Refused('invalid_element_timeout', 422)
+            found = own_references(name, argument)
+            if found:
+                if len(found) != 1 or found[0] != typed_slot(name, argument):
+                    raise Refused('secret_reference_not_allowed', 422)
+                if secrets is not None and REFERENCE.fullmatch(found[0])[1] not in secrets():
+                    raise Refused('secret_unknown', 422)
             if name == 'checkpoint' and (depth or not isinstance(argument, str)):
                 error = Refused('checkpoint_requires_top_level_label', 422)
                 error.hint = 'Use a scalar checkpoint at top level: - checkpoint: verify'
@@ -125,7 +168,8 @@ def compile_flow(source, parameters, *, resolve=None, fields=None, _stack=(), _b
                         or reference in _stack or len(_stack) >= 8):
                     raise Refused('invalid_flow_reference', 422)
                 nested = compile_flow(resolve(reference, argument.get('version')), parameters,
-                                      resolve=resolve, fields=fields, _stack=(*_stack, reference), _budget=budget, _depth=depth + 1)
+                                      resolve=resolve, fields=fields, secrets=secrets,
+                                      _stack=(*_stack, reference), _budget=budget, _depth=depth + 1)
                 argument = {key: child for key, child in argument.items() if key not in {'name', 'version'}}
                 argument['commands'] = nested
                 # The referenced source has already consumed the shared command budget.
