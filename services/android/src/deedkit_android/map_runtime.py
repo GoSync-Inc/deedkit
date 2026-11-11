@@ -76,7 +76,13 @@ def wait_screen(device, app_map, name, timeout):
     deadline = time.monotonic() + timeout / 1000
     polls = 0
     while True:
-        activity = device.app_current().get('activity') if 'activity' in app_map['screens'][name] else None
+        activity = None
+        if 'activity' in app_map['screens'][name]:
+            try:
+                activity = device.app_current().get('activity')
+            except Refused as error:  # a splash or focus change: not matched yet
+                if error.code != 'app_foreground_unavailable':
+                    raise
         result = screen_state(snapshot(device, app_map), app_map, name, activity)
         polls += 1
         if result['matched']:
