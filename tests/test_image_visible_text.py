@@ -336,6 +336,19 @@ def test_search_files_ocr_only_match_keeps_its_ocr_excerpt(seeded):
 
 
 # spec: ANYM-987
+def test_search_files_ocr_only_deep_match_keeps_its_passage(seeded):
+    s, _, b = seeded
+    deep = 'filler ' * 7000 + f'tail {NEEDLE} end'
+    image(s, 'photo-1', ocr=deep, vision='Receipt without the word')
+    item = search(s, b, NEEDLE)['items'][0]
+    assert item['matched_content'] == 'extracted' and NEEDLE in item['excerpt'] and item['chunk_start'] > 0
+    both = f'{NEEDLE} also printed here'
+    image(s, 'photo-2', ocr=deep, vision=both)
+    other = {i['attachment_id']: i for i in search(s, b, NEEDLE)['items']}['photo-2']
+    assert other['matched_content'] == 'enriched' and 'also printed' in other['excerpt']
+
+
+# spec: ANYM-987
 def test_content_searched_counts_visible_text(seeded):
     s, _, b = seeded
     image(s, 'photo-1', ocr=None, vision=f'Receipt {NEEDLE}')

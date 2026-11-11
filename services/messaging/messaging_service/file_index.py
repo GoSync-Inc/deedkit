@@ -420,7 +420,7 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
     enriched_preview = "coalesce(e.title,'')||' '||coalesce(e.summary,'')||' '||coalesce(e.metadata->>'document_type','')||' '||left(coalesce(e.text_content,''),32000)"
     base_raw = plan.predicate('f', text_sql=raw_text)
     base_enriched = '(' + ENRICH_READY + ' AND ' + plan.predicate('e', text_sql=ENRICH_TEXT) + ')'
-    # ANYM-987: an image whose vision text matches shows that text, not its OCR text (the OCR passage branch is off for it).
+    # ANYM-987: an image whose vision text matches shows that text before its OCR text (an OCR-only match keeps its passage).
     vis = '(' + VISIBLE_TEXT_READY + ' AND ' + base_enriched + ')'
     # A voice note without extracted text shows its transcript, not its name (ANYM-453).
     # Only a name match: when the transcript matches too, the existing snippet stays.
@@ -464,7 +464,7 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
         # source keys fence stale/deleted/revised derivatives within this query.
         _, passage_scope_args = scope_filter(p, 'm')
         branches = []
-        for alias, table, state, kind in [('fc','attachment_text_chunks',"f.state='ready' AND NOT " + VISIBLE_TEXT_READY,'extracted'),
+        for alias, table, state, kind in [('fc','attachment_text_chunks',"f.state='ready'",'extracted'),
                                            ('ec','attachment_enrichment_chunks',ENRICH_READY,'enriched')]:
             branches.append('SELECT ' + plan.rank(alias) + ' AS rank,' + plan.match_type(alias) +
                 ' AS match_type,' + alias + ".header||' '||" + alias + '.text_content AS passage,' +
@@ -474,7 +474,7 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
                 ' AND ' + plan.predicate(alias, text_sql=alias+".header||' '||"+alias+'.text_content'))
             passage_args.extend(passage_scope_args)
         search_join += (' LEFT JOIN LATERAL (SELECT * FROM (' + ' UNION ALL '.join(branches) +
-            ') candidates ORDER BY rank DESC,content ASC,start_offset ASC LIMIT 1) hit ON true')
+            ') candidates ORDER BY (content=\'enriched\' AND ' + VISIBLE_TEXT_READY + ') DESC,rank DESC,content ASC,start_offset ASC LIMIT 1) hit ON true')
         predicate = '(' + base_raw + ' OR ' + base_enriched + ' OR ' + base_understanding + ' OR hit.content IS NOT NULL OR ' + base_context + ')'
         rank = 'greatest(' + plan.rank('f') + ',coalesce(CASE WHEN ' + ENRICH_READY + ' THEN ' + plan.rank('e') + ' ELSE 0 END,0),coalesce(CASE WHEN '+UNDERSTANDING_READY+' THEN '+plan.rank('u')+' ELSE 0 END,0),coalesce(hit.rank,0),' + plan.rank('m') + ')'
         if plan.mode == 'any':  # ANYM-668: distinct terms across the name, text, transcript, description and caption
