@@ -33,7 +33,9 @@
 # and caps.conf, ci/ the runs and load.log). Lease, slots, queue, cleanup and exit codes stay the same; 92 means
 # docker (OrbStack) is not running. Each database is a disposable container of CI's PostgreSQL 18 image on
 # 127.0.0.1, its name in ANYMSG_TEST_POSTGRES_CONTAINER, so the tests that need that container run here too.
-# Its default is MAX_RUNS=2 and MAX_LOAD=16 (18 cores); its caps.conf overrides them.
+# Its default is MAX_RUNS=2 and MAX_LOAD=16 (18 cores); its caps.conf overrides them. The Between container check
+# guards the mini only: the laptop's own Between containers (between-*-pg) never queue a local run, whose queue waits
+# on its slots, load and memory alone and says "local lane" in its lines.
 #
 # Caps: /Users/Shared/deedkit-ci/caps.conf on the mini (KEY=value lines, defaults below), so they change
 # without a pull request. Worker name: DEEDKIT_REMOTE_WORKER, else the worktree's last two path components; `-` reads
@@ -89,6 +91,7 @@ QUIET_QUEUE=0
 LOCAL=0   # the laptop side: 1 for the host `local`
 LOCAL_ROOT="${DEEDKIT_LOCAL_ROOT:-${HOME:-}/.cache/deedkit-ci}"
 LOCAL_LANE="${DEEDKIT_LOCAL_LANE:-0}"   # the runner side: 1 when it runs on the laptop (databases in docker)
+LANE=mini   # the runner's name for its host in queue lines: `local lane` on the laptop
 # CI's PostgreSQL service image (.github/workflows/checks.yml), so a local database is the one CI tests against.
 PG_IMAGE="${DEEDKIT_PG_IMAGE:-postgres:18-bookworm@sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c}"
 
@@ -226,7 +229,7 @@ runner_env() {
     if [ -d "$dir" ]; then PATH="$dir:$PATH"; fi
   done
   export PATH
-  if [ "$LOCAL_LANE" = 1 ]; then MAX_RUNS=2 MAX_LOAD=16; fi
+  if [ "$LOCAL_LANE" = 1 ]; then MAX_RUNS=2 MAX_LOAD=16 LANE="local lane"; fi
   read_caps "$SHARED/caps.conf"
 }
 
@@ -247,11 +250,12 @@ free_mem_gb() {
   printf '%s' "${gb:-0}"
 }
 
-# As the admin account: Between's containers on the default VM, a host load above MAX_LOAD (Between's own VM is
-# invisible to this docker; its load shows on the host), or too little free memory.
+# As the admin account: Between's containers on the default VM (the mini only: the local lane never waits for the
+# laptop's own Between containers), a host load above MAX_LOAD (Between's own VM is invisible to this docker; its load
+# shows on the host), or too little free memory.
 between_busy() {
   local load mem
-  if docker ps --format '{{.Names}} {{.Labels}}' 2>/dev/null | grep -Eq '^between-|io\.between\.'; then
+  if [ "$LOCAL_LANE" != 1 ] && docker ps --format '{{.Names}} {{.Labels}}' 2>/dev/null | grep -Eq '^between-|io\.between\.'; then
     echo "a Between container is running"; return 0
   fi
   load="$(load_1m)"
@@ -275,8 +279,8 @@ wait_not_busy() {
       if [ "$again" = 0 ] || [ "$(date +%s)" -lt "$deadline" ]; then return 0; fi
       reason="the DeedKit slot(s) stayed taken"
     fi
-    if [ "$(date +%s)" -ge "$deadline" ]; then say "mini busy ($reason), CI covers"; return "$BUSY"; fi
-    if [ "$told" = 0 ]; then say "waiting in the mini queue: $reason"; told=1; fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then say "$LANE busy ($reason), CI covers"; return "$BUSY"; fi
+    if [ "$told" = 0 ]; then say "waiting in the $LANE queue: $reason"; told=1; fi
     sleep "$POLL_SECONDS"
   done
 }
@@ -300,7 +304,7 @@ while parent and os.getppid() == parent:
 # A holder past its bound: say which wait ended, KILL that one process (it holds no lock worth keeping: a flock
 # ends with its process) and report the mini busy. Before the lease, so this is the wait's only bound.
 holder_stalled() {
-  say "mini busy (a slot holder $2), CI covers"
+  say "$LANE busy (a slot holder $2), CI covers"
   kill -KILL "$HOLDER" 2>/dev/null || true
   reap_jobs "$HOLDER"
   HOLDER=""
@@ -363,7 +367,7 @@ admit() {
   else
     return 0
   fi
-  if [ "$QUIET_QUEUE" = 0 ]; then say "waiting in the mini queue: $reason"; fi
+  if [ "$QUIET_QUEUE" = 0 ]; then say "waiting in the $LANE queue: $reason"; fi
   sleep "$POLL_SECONDS"
   return "$QUEUED"
 }

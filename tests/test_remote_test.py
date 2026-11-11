@@ -143,7 +143,8 @@ case "$1" in
   exec) [ -e "$FAKE_DOCKER_STATE/$2" ] ;;
   port) echo "127.0.0.1:55432" ;;
   kill) echo "docker $*" >> "$FAKE_LOG"; rm -f "$FAKE_DOCKER_STATE/${!#}" ;;
-  ps) case "$*" in *"name=^"*) name="${*##*name=^}"; name="${name%%\\$*}"; [ ! -e "$FAKE_DOCKER_STATE/$name" ] || echo "id-$name" ;; esac ;;
+  ps) case "$*" in *"name=^"*) name="${*##*name=^}"; name="${name%%\\$*}"; [ ! -e "$FAKE_DOCKER_STATE/$name" ] || echo "id-$name" ;;
+    *) printf "%s" "${FAKE_DOCKER_PS:-}" ;; esac ;;
 esac
 exit 0
 '''
@@ -567,6 +568,23 @@ def test_the_local_lane_runs_two_suites_at_once_by_default(local, worktree):
     _, stderr = first.communicate(timeout=60)
     assert first.returncode == 0, stderr
     assert len(log_lines(home, 'docker run')) == 2
+
+
+# spec: ANYM-639
+@pytest.mark.parametrize('listed', ['between-memory-pg \n', 'app-ready-1 io.between.local-ci.run=abc\n'],
+                         ids=['between-container', 'between-label'])
+def test_the_laptops_own_between_containers_never_queue_a_local_run(local, worktree, listed):
+    home, env = local
+    # The laptop's caps (WAIT_SECONDS=0): a run held behind Between would exit 90 here, not wait.
+    result = remote(env, worktree, 'root', 'tests/test_app.py', FAKE_DOCKER_PS=listed)
+    assert result.returncode == 0, result.stderr
+    assert 'Between' not in result.stderr and 'queue' not in result.stderr
+    assert log_lines(home, 'uv run pytest tests/test_app.py')
+    # A local run that does give up says so on one line naming its own lane and exits non-zero.
+    busy = remote(env, worktree, 'root', 'tests/test_app.py', FAKE_DOCKER_PS=listed, FAKE_LOAD='99.0')
+    assert busy.returncode == 90, busy.stderr
+    assert 'local lane busy (host load 99.0 is above 16), CI covers' in busy.stderr and 'mini' not in busy.stderr
+    assert len(log_lines(home, 'uv run pytest')) == 1
 
 
 # spec: ANYM-639
