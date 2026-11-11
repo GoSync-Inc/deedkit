@@ -715,6 +715,8 @@ func TestRepairCaptureArrivingMidTickWaitsForAtMostOneRowRead(t *testing.T) {
 	// the 200 ms slice, the tick ended before the second row and the capture never started (#916's PR run).
 	clock := time.Unix(1700000000, 0)
 	p.now = func() time.Time { clock = clock.Add(time.Second); return clock }
+	// The slice that bounds a tick is not what this test checks: the capture's wait between two row reads is.
+	p.slice = time.Hour
 	type result struct {
 		err     error
 		latency time.Duration
