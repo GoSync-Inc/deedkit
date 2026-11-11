@@ -97,12 +97,13 @@ the owner's explicit confirmation, one `request_id`, an unknown outcome is never
   indices on a single-choice poll are refused.
 - WhatsApp: native (whatsmeow) accounts only (ANYM-315); the browser fallback reports it unsupported. The preview
   binds and shows the archived poll at the reviewed revision (`expected_poll`, its `metadata.poll`), so the key
-  needs `read` beside `message-react`; `option_indices`
-  name its options by zero-based position. An index past the archived options or more selections than
-  `selectable_count` (0: any number) is refused before queueing; `[]` retracts the owner's vote. When the
+  needs `read` beside `message-react` (discovery lists both). `option_indices` name its options by zero-based
+  position (0-11: a WhatsApp poll has up to 12 options). An index past the archived options or more selections
+  than `selectable_count` (0: any number) is refused before queueing; `[]` retracts the owner's vote. When the
   captured poll no longer matches, the operation fails with `operation_target_changed`; when the session never
   received the poll's secret (for example a poll older than the pairing), with `poll_secret_unavailable`. Both
-  send nothing. The sent vote shows in the archive as the owner's vote.
+  send nothing. A sent vote answers `submitted` (receipt `unknown`, as the Telegram vote) and shows in the
+  archive as the owner's vote.
 
 The background read of a public Telegram poll's voter list is a read (`messages.getPollVotes`), never a vote.
 

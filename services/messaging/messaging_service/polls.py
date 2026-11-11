@@ -75,17 +75,14 @@ def poll_block(value):
             'truncated':value['truncated']}
 
 
-def bind_whatsapp_vote(c,p,payload,message,indices):
+def bind_whatsapp_vote(c,payload,message,indices):
     """ANYM-315: binds a native WhatsApp vote to the archived poll at the message revision the owner reviewed. The
     poll goes into the operation intent as `expected_poll`, so the preview digest binds the exact poll and options and
     the adapter refuses when its captured poll no longer archives as this block. The preview shows archived poll text,
-    so the key also needs `read` (as forward_message). An option past the archived ones or more selections than
-    `selectable_count` (0: any number) is refused before queueing."""
+    so the operation also requires `read` (commands._required_permissions, as forward_message). An option past the
+    archived ones or more selections than `selectable_count` (0: any number) is refused before queueing."""
     from .field_errors import refusal
     from .store import APIError
-    if 'read' not in p['permissions']:raise APIError('forbidden',403)
-    binding=payload['authorization_binding']
-    binding['required_permissions']=sorted({*binding['required_permissions'],'read'})
     row=c.execute('''SELECT coalesce(mm.metadata,mr.snapshot->'metadata')->'poll' AS poll FROM messages m
         LEFT JOIN message_revisions mr ON mr.message=m.id AND mr.revision=m.revision
         LEFT JOIN message_metadata mm ON mm.message=m.id AND mm.revision=m.revision

@@ -35,6 +35,11 @@ def _field(kind, *, required=False, default=None, **limits):
     return {'type': kind, 'required': required, 'default': default, **limits}
 
 
+def _poll_index_max(platform):
+    # ANYM-315 (Astra r1 M2): a WhatsApp poll archives up to 12 options (whatsmeow polls.go), a Telegram one 10.
+    return 11 if platform == 'whatsapp' else 9
+
+
 def _spec(permission, target='chat', *, mutation=False, full_account=False,
           platforms=('telegram', 'whatsapp'), fields=None, limitation=''):
     return dict(permission=permission, target=target, mutation=mutation,
@@ -453,7 +458,7 @@ def parameter_format(platform, kind):
             'WhatsApp channel links are not yet supported'),
         'slow_mode_seconds': 'one of ' + ', '.join(map(str, SLOW_MODE_SECONDS)) + ' seconds; 0 turns slow mode off',
         'poll_options': '2-10 unique non-blank strings of at most 100 UTF-16 code units',
-        'poll_indices': 'up to 20 unique integers from 0 to 9 (zero-based option positions)',
+        'poll_indices': 'up to 20 unique integers from 0 to %d (zero-based option positions)' % _poll_index_max(platform),
         'button_fp': '32 lowercase hex characters: the fp of this button from inspect_message_buttons of the same message',
         'operation_id': 'operation ID op_ plus 32 lowercase hex characters, from the earlier press receipt',
         'chat_types': '1-3 unique items of ' + ', '.join(LIVE_CHAT_TYPES),
@@ -540,7 +545,7 @@ def _problem(platform, descriptor, value, field):
         minimum = 2 if kind == 'poll_options' else 1 if kind in ('contact_ids', 'message_ids', 'revisions') else 0
         if len(value) < minimum: return fail('min_items', 'at least %d item%s' % (minimum, 's' * (minimum > 1)))
         item = {'poll_options': _field('string', maximum=100, nonempty=True), 'contact_ids': _field('contact_id'),
-                'poll_indices': _field('integer', minimum=0, maximum=9), 'label_ids': _field('label_id'),
+                'poll_indices': _field('integer', minimum=0, maximum=_poll_index_max(platform)), 'label_ids': _field('label_id'),
                 'message_ids': _field('message_id'), 'revisions': _field('integer', minimum=1, maximum=2147483647)}[kind]
         errors = [e for i, x in enumerate(value) for e in (_problem(platform, item, x, '%s/%d' % (field, i)) or ())]
         if errors: return errors

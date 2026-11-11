@@ -101,8 +101,8 @@ func noReplayJob(t *testing.T, op string, d *operationDependencies) operationReq
 		m.RawMessage = m.Message
 		job.Parameters["option_indices"] = json.RawMessage(`[0]`)
 		job.ExpectedPoll = &expectedPoll{Question: "Question", Options: []pollOption{{0, "a"}, {1, "b"}}, SelectableCount: 1}
-		d.pollVote = func(context.Context, *types.MessageInfo, []string) (*waE2E.Message, error) {
-			return &waE2E.Message{PollUpdateMessage: &waE2E.PollUpdateMessage{}}, nil
+		d.pollVote = func(context.Context, types.JID, *types.MessageInfo, []string) (*waE2E.Message, types.JID, error) {
+			return &waE2E.Message{PollUpdateMessage: &waE2E.PollUpdateMessage{}}, d.owner, nil
 		}
 		d.putPollVote = func(string, string, string, *waE2E.PollCreationMessage, types.JID, [][]byte, time.Time) error {
 			return nil

@@ -284,6 +284,12 @@ def test_poll_vote_is_native_only_on_whatsapp():
         validate_operation('whatsapp', 'vote_poll', {'option_indices': [0]}, provider='webjs')
     # The empty selection retracts the owner's vote.
     assert validate_operation('whatsapp', 'vote_poll', {'option_indices': []}, provider='whatsmeow') == {'option_indices': []}
+    # A WhatsApp poll archives up to 12 options; a Telegram one keeps its 10 (Astra r1 M2).
+    assert validate_operation('whatsapp', 'vote_poll', {'option_indices': [11]}, provider='whatsmeow') == {'option_indices': [11]}
+    for platform, index in (('whatsapp', 12), ('telegram', 10)):
+        with pytest.raises(ValueError, match='invalid_operation_parameters'):
+            validate_operation(platform, 'vote_poll', {'option_indices': [index]},
+                               provider='whatsmeow' if platform == 'whatsapp' else None)
     assert NATIVE_UNSUPPORTED == frozenset(('add_contact', 'delete_contact', 'get_labels', 'set_chat_labels'))
 
 

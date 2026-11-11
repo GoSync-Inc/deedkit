@@ -23,7 +23,7 @@ JS = '\n'.join(p.read_text() for p in sorted((ROOT / 'whatsapp').glob('*.mjs')))
 EXPECTED_NATIVE_ONLY = {
     'approve_join_requests', 'check_chat_link', 'join_chat', 'list_join_requests', 'open_chat_by_phone',
     'reject_join_requests', 'request_chat_history', 'set_group_info_admins_only',
-    'set_group_messages_admins_only', 'set_join_approval'}
+    'set_group_messages_admins_only', 'set_join_approval', 'vote_poll'}  # vote_poll: ANYM-315
 # In the Go table, but Python marks them unsupported for whatsmeow (NATIVE_UNSUPPORTED); Go answers
 # operation_unsupported for each of them.
 EXPECTED_GO_UNSUPPORTED = {'add_contact', 'delete_contact', 'get_labels', 'set_chat_labels'}

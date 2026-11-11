@@ -18,6 +18,7 @@ import (
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
@@ -385,10 +386,14 @@ func pollVoteFixture(t *testing.T, selectable int, indices string) (operationDep
 	if err := decodeStrict(json.RawMessage(frame), &job); err != nil {
 		t.Fatal(err)
 	}
-	d.pollVote = func(_ context.Context, info *types.MessageInfo, names []string) (*waE2E.Message, error) {
+	owner := d.owner
+	d.pollVote = func(_ context.Context, target types.JID, info *types.MessageInfo, names []string) (*waE2E.Message, types.JID, error) {
 		calls.built++
 		calls.info, calls.names = *info, names
-		return &waE2E.Message{PollUpdateMessage: &waE2E.PollUpdateMessage{Vote: &waE2E.PollEncValue{EncPayload: []byte{1}, EncIV: make([]byte, 12)}, SenderTimestampMS: proto.Int64(1700000001234)}}, nil
+		if LegacyChatID(target) != operationsGroup {
+			t.Fatal("vote keyed for another chat")
+		}
+		return &waE2E.Message{PollUpdateMessage: &waE2E.PollUpdateMessage{Vote: &waE2E.PollEncValue{EncPayload: []byte{1}, EncIV: make([]byte, 12)}, SenderTimestampMS: proto.Int64(1700000001234)}}, owner, nil
 	}
 	d.send = func(_ context.Context, to types.JID, wire *waE2E.Message, extra whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
 		calls.sent++
@@ -459,13 +464,13 @@ func TestNativePollVoteRefusesBeforeSending(t *testing.T) {
 		"not a list":      {0, `"1"`, nil, "operation_invalid_parameters"},
 		"missing indices": {0, "[0]", func(_ *operationDependencies, j *operationRequest) { delete(j.Parameters, "option_indices") }, "operation_invalid_parameters"},
 		"missing secret": {0, "[0]", func(d *operationDependencies, _ *operationRequest) {
-			d.pollVote = func(context.Context, *types.MessageInfo, []string) (*waE2E.Message, error) {
-				return nil, fmt.Errorf("failed to encrypt poll vote: %w", whatsmeow.ErrOriginalMessageSecretNotFound)
+			d.pollVote = func(context.Context, types.JID, *types.MessageInfo, []string) (*waE2E.Message, types.JID, error) {
+				return nil, types.EmptyJID, fmt.Errorf("failed to get original message secret key: %w", whatsmeow.ErrOriginalMessageSecretNotFound)
 			}
 		}, "poll_secret_unavailable"},
 		"encryption failed": {0, "[0]", func(d *operationDependencies, _ *operationRequest) {
-			d.pollVote = func(context.Context, *types.MessageInfo, []string) (*waE2E.Message, error) {
-				return nil, errors.New("store")
+			d.pollVote = func(context.Context, types.JID, *types.MessageInfo, []string) (*waE2E.Message, types.JID, error) {
+				return nil, types.EmptyJID, errors.New("store")
 			}
 		}, "operation_target_unavailable"},
 	} {
@@ -494,10 +499,92 @@ func TestNativePollVoteUnknownOutcomeIsNeverRetried(t *testing.T) {
 	if operationResult(t, r, err, "unknown")["code"] != "provider_operation_uncertain" || calls.sent != 1 || calls.journaled != 0 {
 		t.Fatalf("uncertain vote %+v", calls)
 	}
+	// Sent under another identity than the vote is keyed to (Astra r1 M1): the chat cannot open
+	// it, so it is unknown and never journaled as the owner's vote.
+	d, job, calls = pollVoteFixture(t, 0, "[0]")
+	d.send = func(_ context.Context, to types.JID, _ *waE2E.Message, extra whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+		calls.sent++
+		return whatsmeow.SendResponse{ID: extra.ID, Chat: to, Sender: types.NewJID("90000000000001", types.HiddenUserServer), Timestamp: time.Unix(1700000001, 0)}, nil
+	}
+	d.ownerLID = types.NewJID("90000000000001", types.HiddenUserServer)
+	r, err = executeOperation(context.Background(), job, d)
+	if operationResult(t, r, err, "unknown")["code"] != "provider_operation_uncertain" || calls.sent != 1 || calls.journaled != 0 {
+		t.Fatalf("vote under another identity %+v", calls)
+	}
 	// The IPC frame names exactly the archived poll block: an unknown field is refused.
 	var strict operationRequest
 	if decodeStrict(json.RawMessage(`{"operation":"vote_poll","expected_poll":{"question":"q","options":[],"selectable_count":0,"truncated":false,"voters":1}}`), &strict) == nil {
 		t.Fatal("unknown expected_poll field accepted")
+	}
+}
+
+// memorySecrets is a synthetic whatsmeow message-secret store keyed by chat, sender and ID.
+type memorySecrets map[string][]byte
+
+func (m memorySecrets) key(chat, sender types.JID, id types.MessageID) string {
+	return chat.ToNonAD().String() + "|" + sender.ToNonAD().String() + "|" + string(id)
+}
+func (m memorySecrets) PutMessageSecrets(ctx context.Context, inserts []store.MessageSecretInsert) error {
+	for _, i := range inserts {
+		m[m.key(i.Chat, i.Sender, i.ID)] = i.Secret
+	}
+	return nil
+}
+func (m memorySecrets) PutMessageSecret(_ context.Context, chat, sender types.JID, id types.MessageID, secret []byte) error {
+	m[m.key(chat, sender, id)] = secret
+	return nil
+}
+func (m memorySecrets) GetMessageSecret(_ context.Context, chat, sender types.JID, id types.MessageID) ([]byte, types.JID, error) {
+	return m[m.key(chat, sender, id)], sender.ToNonAD(), nil
+}
+
+// spec: ANYM-315
+func TestNativePollVoteIsKeyedToTheIdentityTheSendCarries(t *testing.T) {
+	pn, lid := types.NewJID("15550000000", types.DefaultUserServer), types.NewJID("90000000000001", types.HiddenUserServer)
+	creator := types.NewJID("15559876543", types.DefaultUserServer) // a phone-number-addressed poll creator
+	lidGroup, pnGroup := types.NewJID("15550000000-123456789", types.GroupServer), types.NewJID("15550000000-987654321", types.GroupServer)
+	for name, tc := range map[string]struct {
+		chat, voter types.JID
+		upstreamOK  bool
+	}{"direct chat": {creator, lid, false}, "lid group": {lidGroup, lid, false}, "pn group": {pnGroup, pn, true}} {
+		t.Run(name, func(t *testing.T) {
+			secrets := memorySecrets{}
+			device := *store.NoopDevice
+			device.ID, device.LID, device.MsgSecrets = &pn, lid, secrets
+			c := whatsmeow.NewClient(&device, nil)
+			c.DangerousInternals().CacheGroupInfo(&types.GroupInfo{JID: lidGroup, AddressingMode: types.AddressingModeLID}, true)
+			c.DangerousInternals().CacheGroupInfo(&types.GroupInfo{JID: pnGroup, AddressingMode: types.AddressingModePN}, true)
+			secrets[secrets.key(tc.chat, creator, "POLL")] = bytes.Repeat([]byte{7}, 32)
+			poll := &types.MessageInfo{MessageSource: types.MessageSource{Chat: tc.chat, Sender: creator, IsGroup: tc.chat.Server == types.GroupServer}, ID: "POLL"}
+			wire, voter, err := nativePollVote(c)(context.Background(), tc.chat, poll, []string{"Нет"})
+			if err != nil || voter != tc.voter {
+				t.Fatalf("voter %v err %v", voter, err)
+			}
+			// The chat opens the vote as it arrives: from the identity SendMessage sends it with.
+			arrived := func(m *waE2E.Message) *events.Message {
+				return &events.Message{Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: tc.chat, Sender: tc.voter, IsGroup: poll.IsGroup}, ID: "VOTE"}, Message: m}
+			}
+			opened, err := c.DecryptPollVote(context.Background(), arrived(wire))
+			if err != nil || !reflect.DeepEqual(opened.GetSelectedOptions(), whatsmeow.HashPollOptions([]string{"Нет"})) {
+				t.Fatalf("vote cannot be opened: %v", err)
+			}
+			// Upstream BuildPollVote keys a phone-number creator's poll to the owner's
+			// phone-number ID, which a direct chat or an LID group cannot open.
+			upstream, err := c.BuildPollVote(context.Background(), poll, []string{"Нет"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = c.DecryptPollVote(context.Background(), arrived(upstream)); (err == nil) != tc.upstreamOK {
+				t.Fatalf("upstream vote opened=%v", err == nil)
+			}
+		})
+	}
+	// A missing secret is refused before anything is built.
+	device := *store.NoopDevice
+	device.ID, device.LID, device.MsgSecrets = &pn, lid, memorySecrets{}
+	poll := &types.MessageInfo{MessageSource: types.MessageSource{Chat: creator, Sender: creator}, ID: "POLL"}
+	if _, _, err := nativePollVote(whatsmeow.NewClient(&device, nil))(context.Background(), creator, poll, nil); !errors.Is(err, whatsmeow.ErrOriginalMessageSecretNotFound) {
+		t.Fatalf("missing secret: %v", err)
 	}
 }
 

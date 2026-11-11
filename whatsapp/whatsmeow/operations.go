@@ -122,7 +122,7 @@ type operationDependencies struct {
 	history          func(context.Context, string, int) (any, error)
 	markRead         func(context.Context, []types.MessageID, time.Time, types.JID, types.JID) error
 	isOnWhatsApp     func(context.Context, []string) ([]types.IsOnWhatsAppResponse, error)
-	pollVote         func(context.Context, *types.MessageInfo, []string) (*waE2E.Message, error)
+	pollVote         func(context.Context, types.JID, *types.MessageInfo, []string) (*waE2E.Message, types.JID, error)
 	putPollVote      func(chat, pollID, voteID string, poll *waE2E.PollCreationMessage, voter types.JID, selected [][]byte, at time.Time) error
 	lookupTimeout    time.Duration
 	ownerName        string
@@ -142,7 +142,7 @@ func (d *operationDependencies) useGroupIQ(iq groupIQ) {
 func (p *Provider) operationDependencies() operationDependencies {
 	c := p.Client
 	d := operationDependencies{sendDependencies: p.sendDependencies(), contacts: c.Store.Contacts.GetAllContacts, contact: c.Store.Contacts.GetContact,
-		settings: c.Store.ChatSettings.GetChatSettings, patch: c.SendAppState, isOnWhatsApp: c.IsOnWhatsApp, pollVote: c.BuildPollVote,
+		settings: c.Store.ChatSettings.GetChatSettings, patch: c.SendAppState, isOnWhatsApp: c.IsOnWhatsApp, pollVote: nativePollVote(c),
 		putPollVote: func(chat, pollID, voteID string, poll *waE2E.PollCreationMessage, voter types.JID, selected [][]byte, at time.Time) error {
 			return p.Capture.putPollVote(chat, pollID, voteID, poll, voter, true, selected, at, "live")
 		},

@@ -131,10 +131,10 @@ def test_provider_change_invalidates_reviewed_preview_before_dispatch(native_acc
     assert row['status']=='cancelled' and row['error_code']=='operation_target_changed'
 
 
-def native_poll(state,selectable):
+def native_poll(state,selectable,options=('Да','Нет','Может быть')):
     """A captured native poll (whatsmeow polls.go pollBlock) and the vote_poll target naming it, synthetic only."""
     item=event(2,body='Кто в субботу?');item['messageType']='poll_creation'
-    item['poll']={'question':'Кто в субботу?','options':[{'index':i,'text':t} for i,t in enumerate(('Да','Нет','Может быть'))],
+    item['poll']={'question':'Кто в субботу?','options':[{'index':i,'text':t} for i,t in enumerate(options)],
                   'selectable_count':selectable,'truncated':False}
     state.apply(capture(item,account='wa-native'))
     return {'account':'wa-native','operation':'vote_poll','chat_id':stable_id('chat','wa-native','123@c.us'),
@@ -166,12 +166,24 @@ def test_native_vote_preview_binds_the_archived_poll_and_refuses_a_bad_selection
     not_a_poll={**args,'message_id':stable_id('msg','wa-native','123@c.us','true_123@c.us_000001')}
     with pytest.raises(APIError,match='unsupported_operation'):
         s.preview_messenger_operation(key,**not_a_poll,parameters={'option_indices':[0]})
-    # The preview shows archived poll text: a key that cannot read the chat cannot vote there.
+    # The preview shows archived poll text: a key that cannot read the chat cannot vote there, and discovery says so.
     blind=s.issue_key('native-blind-voter',['wa-native'],permissions=['message-react'])
     with pytest.raises(APIError,match='forbidden'):
         s.preview_messenger_operation(blind,**args,parameters={'option_indices':[1]})
+    row=next(x for x in s.list_messenger_operations(blind,'wa-native')['items'] if x['operation']=='vote_poll')
+    assert row['required_permissions']==['message-react','read'] and not row['available']
     with s.pool.connection() as c:
         assert c.execute('SELECT count(*) AS n FROM messenger_commands').fetchone()['n']==0
+
+
+# spec: ANYM-315
+def test_native_vote_reaches_the_twelfth_option_of_a_whatsapp_poll(native_account):
+    s,a,state,_,_=native_account
+    key=native_voter(s,state);args=native_poll(state,0,options=tuple('Вариант %d'%i for i in range(12)))
+    draft=s.preview_messenger_operation(key,**args,parameters={'option_indices':[10,11]})
+    assert [o['text'] for o in draft['expected_poll']['options']][10:]==['Вариант 10','Вариант 11']
+    assert s.execute_messenger_operation(key,**args,parameters={'option_indices':[10,11]},request_id='synthetic-vote-0012',
+                                         preview_digest=draft['preview_digest'])['status']=='queued'
 
 
 # spec: ANYM-315
@@ -199,7 +211,8 @@ def test_native_vote_dispatch_carries_the_confirmed_poll_once(native_account,tmp
     if 'error' in answer:
         assert receipt['status']=='failed' and receipt['error_code']==answer['error']
     else:
-        assert receipt['status']==('succeeded' if answer['result']['outcome']=='submitted' else 'unknown')
+        # A submitted vote (provider acknowledged, effect unverified) is an unknown receipt, as the Telegram vote.
+        assert receipt['status']=='unknown' and receipt['result']['outcome']==answer['result']['outcome']
     # One request_id is one vote: the worker never sends it again, whatever the outcome.
     assert not asyncio.run(CommandWorker(state,provider).once()) and len(lane.frames)==1
 
