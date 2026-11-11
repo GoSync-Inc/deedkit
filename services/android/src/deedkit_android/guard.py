@@ -23,14 +23,15 @@ TAP_PHRASES = (
 )
 # Criterion 3: a PIN or payment-code prompt anywhere on the screen stops the run.
 PIN_PHRASES = ('masukkan pin', 'enter pin', 'enter your pin', 'pin gopay', 'введите pin', 'введите пин-код')
-# Criterion 3: authenticators, password managers, Indonesian and Russian banks and wallets.
+# Criterion 3: authenticators, password managers, Indonesian and Russian banks and wallets
+# (ids checked on Google Play, RuStore or appgoblin 2026-11-11). Shopping apps are run targets, not here.
 PROTECTED_PACKAGES = (
     # authenticators
     'com.google.android.apps.authenticator2', 'com.azure.authenticator', 'com.authy.authy',
     'com.duosecurity.duomobile', 'org.fedorahosted.freeotp', 'com.beemdevelopment.aegis',
     'com.yubico.yubioath', 'com.twofasapp',
     # password managers
-    'com.x8bit.bitwarden', 'com.onepassword.android', 'com.agilebits.onepassword', 'com.lastpass.lpandroid',
+    'com.x8bit.bitwarden', 'com.onepassword.android', 'com.lastpass.lpandroid',
     'com.dashlane', 'keepass2android.keepass2android', 'com.kunzisoft.keepass.free',
     'com.callpod.android_apps.keeper', 'proton.android.pass', 'io.enpass.app',
     'com.nordpass.android.app.password.manager',
@@ -38,11 +39,12 @@ PROTECTED_PACKAGES = (
     'com.bca', 'com.bca.mybca.omni.android', 'id.co.bri.brimo', 'id.bmri.livin', 'src.com.bni', 'id.bni.wondr',
     'com.bsm.activity2', 'id.co.cimbniaga.mobile.android', 'com.btpn.dc', 'com.jago.digitalBanking',
     'id.co.bankbkemobile.digitalbank', 'com.bcadigital.blu', 'net.myinfosys.PermataMobileX', 'com.gojek.gopay',
-    'ovo.id', 'id.dana', 'com.telkom.mwallet',
+    'ovo.id', 'id.dana', 'com.telkom.mwallet', 'com.shopeepay.id', 'com.bnc.finance',
     # Russian banks and wallets
     'ru.sberbankmobile', 'com.idamob.tinkoff.android', 'ru.vtb24.mobilebanking.android',
-    'ru.alfabank.mobile.android', 'ru.raiffeisen.rmobile', 'ru.gazprombank.android.mobilebank.app',
-    'com.openbank', 'ru.yoo.money',
+    'ru.alfabank.mobile.android', 'ru.raiffeisennews', 'ru.gazprombank.android.mobilebank.app', 'ru.gpbmobile.lk',
+    'com.openbank', 'ru.yoo.money', 'ru.letobank.Prometheus', 'ru.sovcomcard.halva.v1', 'ru.rshb.dbo',
+    'ru.ozon.fintech.finance', 'ru.mts.money', 'ru.mw',
 )
 # Criterion 4: messengers, mail and dialer accept no input; a send from the phone is a live action.
 WRITE_DENIED_PACKAGES = (
