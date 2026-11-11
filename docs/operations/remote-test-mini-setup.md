@@ -2,9 +2,8 @@
 
 `scripts/remote-test.sh` runs DeedKit test and build suites on the Mac mini as the service user
 `_deedkitci`. Until section 1 is done, a run exits 92 ("not set up, CI covers"); nothing runs on the
-laptop. An agent runs section 1 over ssh with `sudo -n` (the admin account's sudo needs no password there) after
-Astra APPROVEs it, because the user and its sudoers line are an access change (harness process.md section
-2). Run it from a DeedKit checkout that holds `deploy/mac-mini/`, one block at a time. Stop at the first
+laptop. An agent runs section 1 over ssh with `sudo -n` (the admin account's sudo needs no password there); the
+user and its sudoers line are an access change under harness process.md section 2, with no review (owner 11-11). Run it from a DeedKit checkout that holds `deploy/mac-mini/`, one block at a time. Stop at the first
 failing block, run the undo, and report. No token or key is involved.
 
 The mini's ssh destination lives only on the laptop: the first line of `~/.config/deedkit/mini-host`

@@ -1,6 +1,6 @@
 # Production enablement of local media understanding (ANYM-686 plan)
 
-Status: plan for review (one review round, harness reviews.md Rounds 7, owner 11-04). No step runs without the plan's APPROVE.
+Status: plan (no review: owner 11-11). Each step keeps its read-back and undo.
 
 What it does: the owner's voice notes, photos and document text are processed by `deedkit-inference` on the
 Mac mini (`enricher-mini`, profile `enrichment-mini`) for the owner's messenger accounts. Authority: owner
@@ -161,7 +161,7 @@ Undo: start the service, clear the busy file.
 production.md "Mini inference: watch and enable record" is the watch step. The card records the three
 attachment ids (never content), the commands, the dates, the key expiry and the rotation due date.
 
-## Open points for the reviewer
+## Open points
 - The active-call gate imports the installed host tool's own `active_calls` and `config`; step 0 proves that it
   runs on the host before any step depends on it.
 - The enrollment image uses the tool's own verifier directly because `prepare` refuses a selected service with no
