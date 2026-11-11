@@ -880,10 +880,15 @@ reply is projected in memory to `{predecessor: {id, version}, newIssues: [issue
 IDs], seenCount}`; only that goes to `tiden-previous-issues.json` in the
 `tiden-release-receipt` artifact and one summary line `first seen in
 deedkit@<12 hex>: N issues: <IDs>`. Titles, messages and CLI error text stay in
-Tiden. A failed, slow or malformed read writes `state: unavailable` with a fixed
-reason (`timeout`, `exit <n>`, `malformed`, `no recorded release`, `more pages`:
-the CLI has no page token for `release list`, so a partial list proves no
-predecessor; a timestamp without a zone is `malformed`) and fails only
+Tiden. The CLI's `release list` (0.41.0-0.43.0) returns the first 20 releases
+and sends no page token, so later pages come from the Tiden API
+(`GET /v1/products/<id>/releases?environment=production&pagination.pageToken=<t>`,
+the same token) up to 50 pages; a repeated token, a release on two pages or a
+count that differs from `totalCount` is `malformed`, and pages left after 50
+are `more pages`: a partial list proves no predecessor. A failed, slow or malformed read writes `state: unavailable` with a fixed
+reason (`timeout`, `exit <n>`, `malformed`, `no recorded release`, `no token`,
+`http <code>`, `unreachable`, `more pages`; a timestamp without a zone is
+`malformed`) and fails only
 this step; the record, its receipt and the job outcome are unchanged. The daily
 issue triage (orchestrator side, outside Git) starts from the newest
 `tiden-previous-issues.json` of the latest production release run, or from

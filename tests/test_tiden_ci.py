@@ -1475,7 +1475,7 @@ def recorded_production_release(monkeypatch, tmp_path):
     return (tmp_path / "tiden-release-receipt.json").read_bytes(), calls
 
 
-def issues_cli(monkeypatch, releases, reply=None, mode=None):
+def issues_cli(monkeypatch, releases, reply=None, mode=None, pagination=None):
     """A synthetic Tiden for `release-issues`: a production release listing, then the issues of one release."""
     import subprocess
     reply = ISSUES_FIXTURE["reply"] if reply is None else reply
@@ -1484,7 +1484,7 @@ def issues_cli(monkeypatch, releases, reply=None, mode=None):
         calls.append(args)
         assert 0 < kwargs["timeout"] <= 45
         if args[1:3] == ["release", "list"]:
-            value = {"releases": releases, "pagination": {"nextPageToken": ""}}
+            value = {"releases": releases, "pagination": pagination or {"nextPageToken": ""}}
         elif args[1:3] == ["release", "issues"]:
             if mode == "timeout":
                 raise subprocess.TimeoutExpired(args, kwargs["timeout"])
@@ -1642,9 +1642,34 @@ def test_an_unreadable_release_listing_is_malformed(tmp_path, monkeypatch, capsy
     assert_no_sentinel(tmp_path, capsys.readouterr())
 
 
+def release_pages(monkeypatch, pages):
+    """A synthetic Tiden HTTP API for the listing pages after the CLI's first: `pages` maps a page token to a reply."""
+    import urllib.parse
+    import urllib.request
+    requests = []
+    class Reply:
+        def __init__(self, body):
+            self.body = body
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc):
+            return False
+        def read(self, limit):
+            return self.body.encode()
+    def urlopen(request, timeout):
+        assert 0 < timeout <= 45
+        requests.append(request)
+        token = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)["pagination.pageToken"][0]
+        reply = pages(token) if callable(pages) else pages[token]
+        return Reply(reply if isinstance(reply, str) else json.dumps(reply))
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    return requests
+
+
 # spec: ANYM-540
 def test_a_listing_with_more_pages_cannot_prove_the_predecessor(tmp_path, monkeypatch, capsys):
     import subprocess
+    from scripts import tiden_ci
     recorded_production_release(monkeypatch, tmp_path)
     listing = {"releases": [production_release("previous", "2026-01-01T00:10:00Z")],
                "pagination": {"nextPageToken": "2"}}
@@ -1653,11 +1678,103 @@ def test_a_listing_with_more_pages_cannot_prove_the_predecessor(tmp_path, monkey
         calls.append(args)
         return subprocess.CompletedProcess(args, 0, stdout=json.dumps(listing), stderr="")
     monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setenv("TIDEN_API_TOKEN", "synthetic-token")
+    # Pages that never end: the reader stops at its page bound instead of listing a partial history.
+    requests = release_pages(monkeypatch, lambda token: {
+        "releases": [production_release(f"older-{token}", "2026-01-01T00:01:00Z")],
+        "pagination": {"nextPageToken": str(int(token) + 1)}})
     capsys.readouterr()
     assert run_issues(monkeypatch, tmp_path) == 1
     assert previous_issues(tmp_path) == {"state": "unavailable", "reason": "more pages"}
     assert capsys.readouterr().out == "Tiden previous-release issues: unavailable (more pages)\n"
     assert [call[1:3] for call in calls] == [["release", "list"]]
+    assert len(requests) == tiden_ci.RELEASE_PAGES - 1
+
+
+# spec: ANYM-540
+def test_a_two_page_listing_is_read_to_its_end(tmp_path, monkeypatch, capsys):
+    # Run 42910672153: 47 production releases, the CLI returns 20 and its `release list` has no page token.
+    recorded_production_release(monkeypatch, tmp_path)
+    first = [production_release("release-id", "2026-01-01T00:20:00Z", digit="c"),
+             production_release("later", "2026-01-01T00:30:00Z", digit="d")]
+    calls = issues_cli(monkeypatch, first, {"newIssues": [{"id": "issue-1"}], "seenCount": "3"},
+                       pagination={"nextPageToken": "1", "totalCount": 4})
+    monkeypatch.setenv("TIDEN_API_TOKEN", "synthetic-token")
+    monkeypatch.setenv("TIDEN_BASE_URL", "https://tiden.example")
+    requests = release_pages(monkeypatch, {"1": {
+        "releases": [production_release("previous", "2026-01-01T00:10:00Z"),
+                     production_release("older", "2026-01-01T00:05:00Z", digit="a")],
+        "pagination": {"nextPageToken": "", "totalCount": 4}}})
+    capsys.readouterr()
+    assert run_issues(monkeypatch, tmp_path) == 0
+    assert previous_issues(tmp_path) == {"state": "listed",
+                                         "predecessor": {"id": "previous", "version": "deedkit@" + "b" * 40},
+                                         "newIssues": ["issue-1"], "seenCount": 3}
+    assert [call[1:4] for call in calls] == [["release", "list", "--environment"], ["release", "issues", "previous"]]
+    [request] = requests
+    assert request.full_url == ("https://tiden.example/v1/products/" + PRODUCT
+                                + "/releases?environment=production&pagination.pageToken=1")
+    assert request.get_header("Authorization") == "Bearer synthetic-token"
+    captured = capsys.readouterr()
+    assert not any("synthetic-token" in text for text in [captured.out, captured.err]
+                   + [path.read_text() for path in tmp_path.glob("tiden-*.json")])
+
+
+# spec: ANYM-540
+@pytest.mark.parametrize("pages, reason", [
+    # A repeated page token would loop.
+    ({"1": {"releases": [production_release("older", "2026-01-01T00:05:00Z")],
+            "pagination": {"nextPageToken": "1", "totalCount": 3}}}, "malformed"),
+    # A release on two pages (the listing moved while it was read).
+    ({"1": {"releases": [production_release("previous", "2026-01-01T00:10:00Z")],
+            "pagination": {"nextPageToken": "", "totalCount": 2}}}, "malformed"),
+    # Fewer releases than the listing's own count: a page was skipped.
+    ({"1": {"releases": [production_release("older", "2026-01-01T00:05:00Z")],
+            "pagination": {"nextPageToken": "", "totalCount": 9}}}, "malformed"),
+    ({"1": "<html>" + SENTINELS[0]}, "malformed"),
+    ({"1": {"releases": [], "pagination": None}}, "malformed"),
+])
+def test_an_inconsistent_later_page_writes_a_fixed_reason(tmp_path, monkeypatch, capsys, pages, reason):
+    recorded_production_release(monkeypatch, tmp_path)
+    calls = issues_cli(monkeypatch, [production_release("previous", "2026-01-01T00:10:00Z")],
+                       pagination={"nextPageToken": "1", "totalCount": 2})
+    monkeypatch.setenv("TIDEN_API_TOKEN", "synthetic-token")
+    release_pages(monkeypatch, pages)
+    capsys.readouterr()
+    assert run_issues(monkeypatch, tmp_path) == 1
+    assert previous_issues(tmp_path) == {"state": "unavailable", "reason": reason}
+    assert [call[1:3] for call in calls] == [["release", "list"]]
+    assert_no_sentinel(tmp_path, capsys.readouterr())
+
+
+# spec: ANYM-540
+def test_a_failed_later_page_or_a_missing_token_writes_a_fixed_reason(tmp_path, monkeypatch):
+    import urllib.error
+    import urllib.request
+    from email.message import Message
+    recorded_production_release(monkeypatch, tmp_path)
+    issues_cli(monkeypatch, [production_release("previous", "2026-01-01T00:10:00Z")],
+               pagination={"nextPageToken": "1", "totalCount": 2})
+    monkeypatch.delenv("TIDEN_API_TOKEN", raising=False)
+    assert run_issues(monkeypatch, tmp_path) == 1
+    assert previous_issues(tmp_path) == {"state": "unavailable", "reason": "no token"}
+    monkeypatch.setenv("TIDEN_API_TOKEN", "synthetic-token")
+    def refused(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 403, SENTINELS[0], Message(), None)
+    monkeypatch.setattr(urllib.request, "urlopen", refused)
+    assert run_issues(monkeypatch, tmp_path) == 1
+    assert previous_issues(tmp_path) == {"state": "unavailable", "reason": "http 403"}
+    def hung(request, timeout):
+        raise TimeoutError(SENTINELS[1])
+    monkeypatch.setattr(urllib.request, "urlopen", hung)
+    assert run_issues(monkeypatch, tmp_path) == 1
+    assert previous_issues(tmp_path) == {"state": "unavailable", "reason": "timeout"}
+    import http.client
+    def truncated(request, timeout):
+        raise http.client.IncompleteRead(SENTINELS[0].encode())
+    monkeypatch.setattr(urllib.request, "urlopen", truncated)
+    assert run_issues(monkeypatch, tmp_path) == 1
+    assert previous_issues(tmp_path) == {"state": "unavailable", "reason": "unreachable"}
 
 
 # spec: ANYM-540
