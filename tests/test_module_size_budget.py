@@ -137,6 +137,21 @@ def test_the_subscription_and_delivery_tools_live_in_their_app_tools_module_not_
 
 
 # spec: ANYM-949
+def test_the_conversation_and_update_tools_live_in_their_app_tools_modules_not_in_app_py():
+    package = ROOT / "services/messaging/messaging_service"
+    def tools(path):
+        return {node.name for node in ast.walk(ast.parse(path.read_text()))
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+                and any(ast.unparse(d).startswith("mcp.tool(") for d in node.decorator_list)}
+    conversations = {"list_chats", "dismiss_reply", "snooze_reply", "restore_reply", "mute_reply_source",
+                     "unmute_reply_source", "list_reply_dismissals", "list_negotiations"}
+    updates = {"get_updates", "ack_updates"}
+    assert tools(package / "app_tools/conversations.py") == conversations
+    assert tools(package / "app_tools/updates.py") == updates
+    assert not tools(package / "app.py") & (conversations | updates)
+
+
+# spec: ANYM-949
 def test_ratchet_flags_growth_a_new_large_file_and_a_stale_entry_but_not_a_shrink(tmp_path):
     def write(name, text):
         Path(tmp_path, name).parent.mkdir(parents=True, exist_ok=True)
