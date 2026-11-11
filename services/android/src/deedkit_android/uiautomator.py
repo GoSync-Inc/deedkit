@@ -37,7 +37,7 @@ UI_FIELDS = {
     'setOrientation': {'orientation', 'label'},
     'runFlow': {'commands', 'when', 'label', 'name', 'version'}, 'repeat': {'commands', 'times', 'while', 'label'},
     'retry': {'commands', 'maxRetries', 'label'}, 'checkpoint': set(),
-    'readScreenText': {'region', 'within', 'min_confidence', 'limit', 'key', 'structure', 'label'},
+    'readScreenText': {'region', 'within', 'min_confidence', 'limit', 'key', 'structure', 'mask_images', 'label'},
     'sleep': set(),
 }
 UNSUPPORTED_HINT = 'Use android_execute for this operation. The reference lists supported UI commands.'
@@ -80,8 +80,9 @@ def validate_screen_text(value):
             raise Refused('invalid_screen_text_region', 422)
     if 'within' in options:
         validate_selector(options['within'])
-    if 'structure' in options and type(options['structure']) is not bool:
-        raise Refused('invalid_screen_text_options', 422)
+    for key in ('structure', 'mask_images'):
+        if key in options and type(options[key]) is not bool:
+            raise Refused('invalid_screen_text_options', 422)
     for key, low, high in (('min_confidence', 0, 100), ('limit', 1, 300)):
         if key in options and (type(options[key]) is not int or not low <= options[key] <= high):
             raise Refused('invalid_screen_text_options', 422)
@@ -198,14 +199,17 @@ def reference():
                        'validation (secret_reference_not_allowed, secret_unknown). A PIN screen, a protected app or a messenger still '
                        'stops the run. The value is in no request, saved flow, receipt or log: reads after it was typed (copyTextFrom, '
                        'readScreenText, readList, the failure observation) show ${secret:NAME} instead, and that observation has no screenshot.',
-            'screen_text': 'readScreenText: {region: {x, y, w, h} | within: <selector>, min_confidence: 0-100 (engine default: Apple Vision 50, Tesseract 60), limit: 1-300 (100), key: name (screen_text)} '
+            'screen_text': 'readScreenText: {region: {x, y, w, h} | within: <selector>, min_confidence: 0-100 (engine default: Apple Vision 50, Tesseract 60), limit: 1-300 (100), key: name (screen_text), mask_images: true|false (true)} '
                            'recognizes text in one screenshot on the USB host when the host config sets ocr_command: Apple Vision on a macOS host with the vision extra, else Tesseract; ocr.engine names the one used. '
                            'Use it when the hierarchy has no text, e.g. canvas-drawn list cards. It returns lines {text, bounds, confidence} in full-screen '
                            'device pixels, top to bottom, also under receipt.data.<key>. Read-only; it never taps. ocr_unavailable or ocr_failed is a definite failure. '
                            'structure: true adds structure {blocks: [{bounds, confidence, node?, lines: [{text, bounds, confidence, row, source: ocr|tree, node?, words: [{text, bounds, confidence}]}]}], '
                            'lists: [{bounds, items: [block indexes]}], tree: merged|none|unavailable, truncated}, built from the OCR layout and geometry only. '
                            'A clickable or identified tree container groups the text inside it; node is the smallest tree node containing a block; source tree marks text the tree already has. '
-                           'Repeated blocks of the same shape form lists, e.g. order cards. receipt.data.<key> then holds {lines, blocks, lists, tree, truncated}.',
+                           'Repeated blocks of the same shape form lists, e.g. order cards. receipt.data.<key> then holds {lines, blocks, lists, tree, truncated}. '
+                           'mask_images (default true) paints the bounds of ImageView and TextureView nodes solid in the OCR copy only, so text printed inside photos is not read: '
+                           'a node with its own text drawn over a photo stays readable, an image over 60% of the read region is not painted, and ocr.masked {regions, skipped_large, tree: ok|unavailable} reports it '
+                           '(null with false; an unreadable hierarchy leaves the capture unpainted).',
             'limits': {'source_bytes': 32768, 'expanded_commands': 200, 'reference_depth': 8, 'executed_steps': 2000}}
 
 

@@ -290,6 +290,19 @@ the step fails with `ocr_unavailable` or `ocr_failed` as a definite failure.
 Older service versions reject these keys, so roll back the config with the
 executable.
 
+`mask_images` (default `true`) keeps text printed inside photos out of the lines.
+Right after the capture the service dumps the hierarchy and paints the bounds of every
+`ImageView` and `TextureView` node solid in the OCR copy only; the screenshot
+`android_observe` returns is unchanged. Text the app draws over a photo (a node with
+its own `text` inside the image, covering at most half of it) stays readable. An image
+that covers more than 60% of the read region (a full-screen viewer, or a `within` that
+selects an image) is read, not painted. `ocr.masked` reports `{regions, skipped_large,
+tree}`; `tree` is `unavailable` when the hierarchy could not be read, and the capture
+is then read unpainted. It is `null` with `mask_images: false`. Masking is best effort:
+the screen can change between the capture and the dump, and an app that prints text as
+an image on purpose needs `mask_images: false`. The dump adds one read-only step to
+each `readScreenText`; `structure: true` shares it.
+
 `structure: true` adds a layout built from the OCR engine's own words and their
 geometry, never from a model: `blocks`, each with `lines` (with a `row` index for
 lines that share a row) and `words`, all with bounds and confidence. A clickable
