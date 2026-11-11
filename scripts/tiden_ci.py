@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import http.client
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 import json
@@ -1243,7 +1244,7 @@ def release_page(product: str, token: str, deadline: float) -> object:
         raise IssuesUnavailable(f"http {int(exc.code)}") from None
     except TimeoutError:
         raise IssuesUnavailable("timeout") from None
-    except OSError:
+    except (OSError, http.client.HTTPException):
         raise IssuesUnavailable("unreachable") from None
     except ValueError:
         raise IssuesUnavailable("malformed") from None

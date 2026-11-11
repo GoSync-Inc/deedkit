@@ -1769,6 +1769,12 @@ def test_a_failed_later_page_or_a_missing_token_writes_a_fixed_reason(tmp_path, 
     monkeypatch.setattr(urllib.request, "urlopen", hung)
     assert run_issues(monkeypatch, tmp_path) == 1
     assert previous_issues(tmp_path) == {"state": "unavailable", "reason": "timeout"}
+    import http.client
+    def truncated(request, timeout):
+        raise http.client.IncompleteRead(SENTINELS[0].encode())
+    monkeypatch.setattr(urllib.request, "urlopen", truncated)
+    assert run_issues(monkeypatch, tmp_path) == 1
+    assert previous_issues(tmp_path) == {"state": "unavailable", "reason": "unreachable"}
 
 
 # spec: ANYM-540
