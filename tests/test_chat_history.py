@@ -296,11 +296,14 @@ def test_the_live_reads_use_the_running_collector_module_and_its_logger_under_py
               'from messaging_service import telegram_live_reads as m\n'
               'name="messaging_service.telegram_collector"\n'
               'module=m.collector_module()\n'
+              # A read through the proxy sees a rebinding on that same module (Astra r1, W5-4c).
+              'module.STORE_GRACE="synthetic-sentinel"\n'
+              'read=m.tc.STORE_GRACE\n'
               'print(module is sys.modules["__main__"],name in sys.modules,module is sys.modules.get(name),'
-              'm.log.name)\n')
+              'm.log.name,read)\n')
     result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, timeout=60, check=True)
-    expected = ('True False False __main__' if entry == 'messaging_service.telegram_collector'
-                else 'False True True messaging_service.telegram_collector')
+    expected = ('True False False __main__ synthetic-sentinel' if entry == 'messaging_service.telegram_collector'
+                else 'False True True messaging_service.telegram_collector synthetic-sentinel')
     assert result.stdout.strip() == expected
 
 
