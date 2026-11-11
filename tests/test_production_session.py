@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
+from pathlib import Path
 import stat
 import subprocess
 import time
@@ -91,6 +92,17 @@ class HolderHost(KeepHost):
         return [] if holder in self.silent else ['{"event": "holder.claimed"}', '{"event": "holder.attached"}']
 
     def run(self, argv, **kwargs):
+        if argv[:2] == ["docker", "ps"] and next(word.partition("service=")[2] for word in argv
+                                                 if word.startswith("label=com.docker.compose.service=")) not in self.containers:
+            self.calls.append(argv)
+            return ""  # a service that never had a container
+        if argv[:2] == ["docker", "compose"] and "--no-start" in argv:  # create-holder: created, never started
+            self.calls.append(argv)
+            override = json.loads(Path(argv[len(argv) - 1 - argv[::-1].index("-f") + 1]).read_text())
+            service = argv[-1]
+            self.containers[service] = {"Id": service + "created", "Image": override["services"][service]["image"],
+                                        "State": {"Running": False, "Status": "created"}, "Config": {"Labels": {}}}
+            return ""
         if argv[:2] == ["docker", "compose"] and "stop" in argv:
             for service in argv[argv.index("stop") + 1:]:
                 if service in self.sockets and (self.sockets[service] / p.PLANNED_STOP).exists():
@@ -237,6 +249,71 @@ def test_a_stopped_holder_is_recreated_at_once_in_the_daytime_and_names_its_reas
     assert host.containers[HOLDER]["State"]["Running"]
     [event] = [event for event in host.ledger()["events"] if event["release"] == SHAS[1]]
     assert (event["kind"], event["reason"]) == ("recovery", "stopped")
+
+
+def brand_new_holder(tmp_path, monkeypatch):
+    """Cutover step 3 done on a host where whatsapp1-holder never ran: its mark, services entry and Compose unit, no
+    container. Autodeploy is paused (step 0) by the caller."""
+    host = HolderHost(tmp_path, monkeypatch)
+    del host.containers[HOLDER]
+    monkeypatch.setattr(p, "PAUSE", tmp_path / "autodeploy.pause")
+    return host
+
+
+# spec: ANYM-937
+def test_a_brand_new_holder_is_created_unstarted_so_prepare_reads_it_and_the_release_starts_it_as_a_pair(
+        tmp_path, monkeypatch):
+    host = brand_new_holder(tmp_path, monkeypatch)
+    host.main = SHAS[0]
+    with pytest.raises(p.Refused, match="exactly one running container"):  # the defect: no container, no prepare
+        p.prepare(host.settings, SHAS[0])
+    p.PAUSE.write_text("holder cutover\n")
+    host.main = SHAS[1]
+    created = p.create_holder(host.settings, HOLDER, SHAS[1])
+    image = host.image_of("holder", SHAS[1])
+    assert (created["status"], created["container"], created["image"]) == ("created", HOLDER + "created", image)
+    assert created["undo"].startswith("docker compose") and created["undo"].endswith(f"rm --stop {HOLDER}")
+    # Nothing started or stopped: no provider session begins before apply's pair step.
+    assert host.containers[HOLDER]["State"] == {"Running": False, "Status": "created"} and host.order == []
+    assert not [path for path in host.state.iterdir() if path.name.startswith(".create-holder-")]
+    result = released(host, SHAS[1], wita(10, 14))
+    pair = [entry for entry in host.order if entry[1] in (HOLDER, COLLECTOR)]
+    assert pair == [("stop", COLLECTOR), ("stop", HOLDER), ("up", HOLDER), ("up", COLLECTOR)]
+    assert host.containers[HOLDER]["State"]["Running"] and host.containers[HOLDER]["Image"] == image
+    assert "recreated" in host.outcome(result, HOLDER)
+    [event] = [event for event in host.ledger()["events"] if event["service"] == "synthetic/" + HOLDER]
+    assert (event["kind"], event["reason"]) == ("recovery", "stopped")
+
+
+# spec: ANYM-937
+def test_create_holder_creates_nothing_unless_paused_marked_defined_and_absent_and_only_holders_may_be_created(
+        tmp_path, monkeypatch):
+    host = brand_new_holder(tmp_path, monkeypatch)
+    host.main = SHAS[1]
+    args = p.argument_parser().parse_args(["create-holder", "--service", HOLDER, "--sha", SHAS[1]])
+    assert (args.action, args.service) == ("create-holder", HOLDER)
+    with pytest.raises(p.Refused, match="autodeploy pause"):
+        p.create_holder(host.settings, HOLDER, SHAS[1])
+    p.PAUSE.write_text("holder cutover\n")
+    with pytest.raises(p.Refused, match="not a session holder"):
+        p.create_holder(host.settings, COLLECTOR, SHAS[1])
+    unit = host.units.pop(HOLDER)
+    host.write_compose()
+    with pytest.raises(p.Refused, match="define no"):
+        p.create_holder(host.settings, HOLDER, SHAS[1])
+    host.units[HOLDER] = unit
+    host.write_compose()
+    host.containers[HOLDER] = {"Id": HOLDER + "0", "Image": OLD_IMAGE, "State": {"Running": False, "Status": "exited"},
+                               "Config": {"Labels": {}}}
+    with pytest.raises(p.Refused, match="already has a container"):
+        p.create_holder(host.settings, HOLDER, SHAS[1])
+    assert not [call for call in host.calls if call[:2] == ["docker", "compose"] and ("up" in call or "stop" in call)]
+    assert not [call for call in host.calls if call[0] == "git"]
+    # Only a session service's container may be one that never started; any other selected service is refused as before.
+    host.containers["gateway"]["State"] = {"Running": False, "Status": "created"}
+    for loose in (False, True):
+        with pytest.raises(p.Refused, match="exactly one running container|neither running, restarting nor exited"):
+            p.snapshot(host.project, stopped=loose, exited={HOLDER})
 
 
 # spec: ANYM-896

@@ -523,7 +523,8 @@ def compose(project):
 def snapshot(project, *, stopped=False, labels=None, conditions=None, exited=()):
     """The project's Compose document and the identity of each selected service's container. Only rollback and a
     failed health wait (`stopped`) accept a container that exited or keeps restarting: that is when they run, and so
-    do the session services named in `exited` (ANYM-896: a stopped holder is recreated at once).
+    do the session services named in `exited` (ANYM-896: a stopped holder is recreated at once), which also may be a
+    container `create-holder` created and nothing started yet (whatsapp-native.md, Session holder cutover, step 5).
     `labels`, a dict, receives each service's input label (ANYM-895), None unless the container runs steadily;
     `conditions` why it does not: stopped, restarting, paused or unhealthy (None when it runs steadily)."""
     document = json.loads(run(compose(project) + ["config", "--format", "json"]))
@@ -539,7 +540,8 @@ def snapshot(project, *, stopped=False, labels=None, conditions=None, exited=())
         actual = json.loads(run(["docker", "inspect", ids[0]]))[0]
         condition = actual.get("State", {})
         if loose and not (condition.get("Running") and not condition.get("Paused")
-                          or condition.get("Status") in ("restarting", "exited")):
+                          or condition.get("Status") in ("restarting", "exited")
+                          or service in exited and condition.get("Status") == "created"):
             raise Refused("a selected container is neither running, restarting nor exited")
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", actual["Image"]):
             raise Refused("running container has no immutable image identity")
@@ -5497,14 +5499,14 @@ from release_enroll import (  # noqa: E402, F401  every name, re-exported: the p
     ENROLL_HEALTH_POLL, GATEWAY_SERVICE, CONNECT_CODE, run_input, file_sha256, replace_file, replace_like,
     enroll_calls, settle_halt, settle_finish, settle_retry, Enrollment, EnrollStop, public_http, enroll_apply,
     enroll_undo, enroll_command, enroll_required, ManifestInvalid, enrollment_halt, MANIFEST_FILE,
-    module_manifests, enrollment_pending, without_enrollments, enrollment_only)
+    module_manifests, enrollment_pending, without_enrollments, enrollment_only, create_holder)
 
 
 def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["verify", "prepare", "prepare-router", "apply", "rollback", "status",
                                            "images", "check-image", "deploy", "self-test", "tool-rollback",
-                                           "copy-database", "enroll"])
+                                           "copy-database", "enroll", "create-holder"])
     parser.add_argument("--sha")
     parser.add_argument("--target", choices=sorted(BUILDS))
     parser.add_argument("--config", help="default " + CONFIG + "; status: the autodeploy unit's (active_config)")
@@ -5514,6 +5516,7 @@ def argument_parser():
     parser.add_argument("--remove", action="store_true", help="images: remove the listed candidates")
     parser.add_argument("--database", help="copy-database: a name under the configuration's migration.databases")
     parser.add_argument("--module", help="enroll: the module of deploy/modules/<module>.json")
+    parser.add_argument("--service", help="create-holder: the new session holder, e.g. whatsapp1-holder")
     parser.add_argument("--plan", action="store_true", help="enroll: print the enrollment plan, change nothing")
     parser.add_argument("--apply", action="store_true", help="enroll: perform the plan named by --plan-digest")
     parser.add_argument("--plan-digest", help="enroll --apply: the plan_digest of the reviewed plan")
@@ -5589,6 +5592,7 @@ def locked_action(args):
                     result = {**result, "image_removal": retain_images(settings)}
             else:
                 result = (rollback(settings, args.sha, http, pre_claim=args.pre_claim_rollback) if args.action == "rollback" else
+                          create_holder(settings, args.service, args.sha) if args.action == "create-holder" else
                           {"prepare": prepare, "prepare-router": prepare_router}[args.action](settings, args.sha))
     return result
 

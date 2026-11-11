@@ -92,9 +92,17 @@ Then per account, `whatsapp1` first and `whatsapp2` only after `whatsapp1` verif
    project's `files` and add `"whatsapp<n>-holder": {"target": "whatsapp-holder", "session": true, "collector":
    "whatsapp<n>"}` (ANYM-896's marks, production.md "Session holders") to `services`. Read back with `jq`.
 4. Read-only: no active call (production.md, the active-call check).
-5. `production.py prepare --sha S`: it builds and smoke-checks `deedkit-production-whatsapp-holder:S` from the
-   release checkout and resolves the candidate. Review it: only `whatsapp<n>` (new mounts) and `whatsapp<n>-holder`
-   (new) change. A refusal stops here: undo step 3.
+5. First start, then prepare. `prepare` reads one container of every selected service, so a holder that never ran
+   refuses it ("exactly one running container"). First `sudo python3 /usr/local/lib/deedkit/production.py
+   create-holder --service whatsapp<n>-holder --sha S` (the installed tool must contain this command): under the
+   autodeploy pause only, for a session holder of the configuration that its Compose files define and that has no
+   container at all, it builds and smoke-checks `deedkit-production-whatsapp-holder:S` from the verified commit and
+   creates the holder's container with `up --no-start`. Nothing starts: no provider session begins before step 6. Read
+   back: `docker ps --all` shows the one container `Created` on that image. Its output names the undo, `docker compose
+   $F rm --stop whatsapp<n>-holder`. If the container runs before step 6 (a Docker restart), run that undo and create
+   it again. Then `production.py prepare --sha S`: it reuses that image and resolves the candidate. Review it: only
+   `whatsapp<n>` (new mounts) and `whatsapp<n>-holder` (new, `stopped`, so step 6 recreates it at once as a pair)
+   change. A refusal of either stops here: the undo above (if the container exists), then undo step 3.
 6. `production.py apply --sha S`. Order does not matter for safety: a holder started before the child-mode collector
    stopped waits in-process for the session locks, and an attach-mode collector retries until the holder serves.
 7. Verify: source status shows `operations.provider.name = whatsmeow` and `operations.holder` `state=attached`,

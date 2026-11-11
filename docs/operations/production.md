@@ -1245,6 +1245,10 @@ refuses the mark on any other target (`session_target_unsupported`), unknown key
 `Asia/Makassar`, WITA: the owner's 2026-10-17 «Да, ночью по Бали»); neither is part of the prepared configuration
 digest. Order: add a mark only once the installed tool carries this support (an older tool refuses the object
 entry, `TypeError`, on every command); before a `tool-rollback` to such a tool, remove the marks first.
+A holder that never ran has no container, and `prepare` refuses a selected service without one: `production.py
+create-holder --service <holder> --sha S`, under the autodeploy pause, creates its container on the image `prepare --sha
+S` builds and starts nothing; `snapshot` accepts such a `created` container for a session service only, and the next
+apply recreates it at once as `stopped` (docs/whatsapp-native.md, Session holder cutover, step 5, with its undo).
 
 - Deferral. When a holder's ANYM-895 decision is a changed digest, `apply` (also inside `deploy`) recreates it only
   when the recreate begins inside the window and the holder had no planned recreate earlier in that window. Otherwise
