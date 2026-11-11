@@ -428,7 +428,7 @@ asked; a thin answer (`empty_reason` `history_loading`, `history_not_scanned`, `
 `no_matches_in_partial_archive`) only adds `result_evidence.suggested_call`:
 `{tool: "messages_search", args: {live: "on"}}` when a Telegram account is in scope, otherwise, for
 WhatsApp chats that still load or have gaps, `messages_execute_messenger_operation` with
-`request_chat_history` and up to 5 `chat_ids`. Existing `next_action` values are unchanged.
+`request_chat_history` and up to 5 `chat_ids` (a chat whose history is `stalled`, COLLECTOR_STATES.md, counts as loading here). Existing `next_action` values are unchanged.
 
 `on` runs a live search for the first page; `auto` only when the archive answer is thin. Per permitted
 Telegram account in scope the call queues one `search_messages_live` operation, waits once up to

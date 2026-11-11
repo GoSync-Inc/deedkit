@@ -2,7 +2,7 @@
 import asyncio
 import json
 from pathlib import Path
-from datetime import datetime,timezone
+from datetime import datetime,timedelta,timezone
 from types import SimpleNamespace as NS
 
 import pytest
@@ -207,6 +207,85 @@ def test_incomplete_telegram_traversal_names_the_page_before_the_oldest_archived
     narrow=s.issue_key('history-narrow',[w.account],permissions=['read'])
     history=s.get_sync_status(narrow,chat_id=cid)['history']
     assert 'next_call' not in history and history['history_hint']=={'coverage':'unknown','reason':'traversal_incomplete'}
+
+
+NOW=datetime(2026,11,11,12,0,tzinfo=timezone.utc)
+def ago(**kw):return NOW-timedelta(**kw)
+def telegram_row(**kw):
+    row={'platform':'telegram','synthetic':False,'initialized':True,'window_complete':False,'history_exhausted':False,
+        'history_since':None,'high_water':None,'history_before':None,'last_scan_at':None,'last_attempt_at':None,
+        'last_head_scan_at':ago(minutes=1),'last_error_code':None,'last_error_at':None,'wa_progress':None,'wa_scan_at':None}
+    return {**row,**kw}
+def whatsapp_row(progress,**kw):
+    return telegram_row(platform='whatsapp',initialized=None,wa_progress=progress,**kw)
+STALL_BOUND=timedelta(minutes=15)
+NO_PAGE=('stalled','no_successful_page','wait_and_recheck')
+NO_ATTEMPT=('stalled','no_recent_attempt','check_sync_status')
+LOADING=('loading',None,None)
+
+
+# spec: ANYM-983
+@pytest.mark.parametrize('row,expected',[
+    (telegram_row(last_scan_at=ago(minutes=20),last_attempt_at=ago(minutes=1)),NO_PAGE),
+    (telegram_row(last_scan_at=ago(minutes=20),last_attempt_at=ago(minutes=16)),NO_ATTEMPT),
+    (telegram_row(last_scan_at=ago(hours=3)),NO_ATTEMPT),
+    (telegram_row(last_scan_at=None,last_attempt_at=ago(minutes=40)),NO_ATTEMPT),
+    (telegram_row(last_scan_at=ago(minutes=14,seconds=59),last_attempt_at=ago(hours=1)),LOADING),
+    (telegram_row(last_scan_at=NOW-STALL_BOUND,last_attempt_at=ago(minutes=1)),LOADING),
+    (telegram_row(last_scan_at=NOW-STALL_BOUND-timedelta(seconds=1),last_attempt_at=ago(minutes=1)),NO_PAGE),
+    (telegram_row(last_scan_at=NOW+timedelta(hours=1),last_attempt_at=ago(hours=2)),LOADING),
+    (telegram_row(last_scan_at=None,last_attempt_at=ago(minutes=1)),LOADING),
+    (telegram_row(last_scan_at=None,last_attempt_at=None),LOADING),
+    (telegram_row(last_scan_at=ago(hours=2),last_error_code='rate_limited'),('rate_limited',None,None)),
+    (telegram_row(last_scan_at=ago(hours=2),last_error_code='provider_unavailable'),('provider_unavailable',None,None)),
+    (telegram_row(last_scan_at=ago(hours=2),window_complete=True),('window_traversed',None,None)),
+    (telegram_row(last_scan_at=ago(hours=2),initialized=False),('not_scanned',None,None)),
+    (whatsapp_row({'history_exhausted':False,'last_attempt_at':(NOW-timedelta(minutes=1)).timestamp()},wa_scan_at=ago(hours=1)),NO_PAGE),
+    (whatsapp_row({'history_exhausted':False},wa_scan_at=ago(hours=1)),NO_ATTEMPT),
+    (whatsapp_row({'history_exhausted':False,'gap':True},wa_scan_at=ago(hours=1)),('gaps',None,None)),
+    (whatsapp_row({'history_exhausted':True},wa_scan_at=ago(hours=1)),('provider_exhausted',None,None)),
+    (whatsapp_row({},wa_scan_at=ago(hours=1)),('not_scanned',None,None)),
+],ids=['no-page-attempting','no-page-no-attempt','page-old-attempt-missing','page-missing-attempt-old','page-just-inside','page-at-bound',
+    'page-just-outside','page-in-the-future','page-missing-attempt-recent','nothing-known','rate-limited-wins','provider-unavailable-wins',
+    'complete','not-scanned','whatsapp-no-page','whatsapp-no-attempt','whatsapp-gaps-win','whatsapp-exhausted','whatsapp-not-scanned'])
+def test_a_loading_history_with_no_page_inside_the_bound_is_stalled_with_a_reason(row,expected):
+    from messaging_service.chat_evidence import history
+    h=history(row,now=NOW)
+    state,reason,next_action=expected
+    assert h['state']==state
+    assert h.get('reason')==reason and h.get('next_action')==next_action
+    assert ('reason' in h)==(reason is not None) and ('next_action' in h)==(next_action is not None)
+    # Without `now` the clock is the wall clock: a page and an attempt a moment ago are not a stall.
+    assert history(telegram_row(last_scan_at=datetime.now(timezone.utc),last_attempt_at=datetime.now(timezone.utc)))['state']=='loading'
+
+
+# spec: ANYM-983
+def test_a_stalled_chat_reads_the_same_through_sync_status_and_message_coverage(worker):
+    from messaging_service.live_search import HISTORY_STATES
+    w,s,_=worker
+    key=history_reader(w,s)
+    asyncio.run(w.sync_once())
+    cid=stable_id('chat',w.account,'100')
+    assert s.get_sync_status(key,chat_id=cid)['history']['state']=='loading'
+    with s.pool.connection() as c:
+        c.execute("UPDATE collector_chats SET last_scan_at=now()-interval '2 hours',last_attempt_at=now()-interval '90 minutes' "
+            "WHERE account=%s AND provider_chat='100'",(w.account,))
+    status=s.get_sync_status(key,chat_id=cid)
+    history=status['history']
+    assert history['state']=='stalled' and history['reason']=='no_recent_attempt' and history['next_action']=='check_sync_status'
+    assert not history['history_traversal_complete'] and history['next_call']['arguments']['operation']=='request_chat_history'
+    assert status['next_action']=='check_sync_status'
+    evidence=s.get_messages(key,cid,include_coverage=True)['result_evidence']
+    coverage=evidence['chats'][0]['history']
+    assert {k:coverage[k] for k in ('state','reason','next_action')}=={k:history[k] for k in ('state','reason','next_action')}
+    # A stalled chat still counts as loading, keeps its empty_reason, and live search still considers it.
+    assert evidence['chats_loading']==1
+    assert s.search(key,'no such words',chat=cid)['result_evidence']['empty_reason']=='history_loading'
+    assert {'loading','stalled'}<=HISTORY_STATES
+    # A page lands again: the chat is loading again, with no reason left behind.
+    asyncio.run(w.sync_once())
+    again=s.get_sync_status(key,chat_id=cid)['history']
+    assert again['state']in('loading','window_traversed') and 'reason' not in again and 'next_action' not in again
 
 
 # spec: ANYM-756
