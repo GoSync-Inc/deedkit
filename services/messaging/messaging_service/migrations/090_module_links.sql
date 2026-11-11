@@ -16,6 +16,7 @@
 --  publish_module_event (056's text, same signature and ACL) additionally marks the active links naming the event's
 --      scope stale when it stores a call.access.changed event (the calls-side journal of an ownership or permission
 --      change); module_event_valid (067's text) admits that type: subject principal_ref, urgency now, no expiry.
+-- Repeatable (the module tests re-run migrations from 065): IF NOT EXISTS tables and index, OR REPLACE functions.
 -- Risk tier: non-critical (docs/operations/production.md "Migration risk tiers": one CHECK widening pair on one column,
 -- a superset of 067's list, as 064 and 085; two new tables; CREATE OR REPLACE of two functions with the same
 -- signatures; no row is read, rewritten or deleted). Grants only on the new objects, in the role files. A schema-89
@@ -28,7 +29,7 @@ ALTER TABLE module_events ADD CONSTRAINT module_events_type_check CHECK(type IN 
   'recording.text.archived','recording.access.changed','call.access.changed'));
 SET LOCAL lock_timeout=DEFAULT;
 
-CREATE TABLE module_links (
+CREATE TABLE IF NOT EXISTS module_links (
  principal text NOT NULL REFERENCES principals(id),
  module text NOT NULL CHECK(module='calls'),
  module_principal text NOT NULL CHECK(module_principal ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$'),
@@ -37,8 +38,8 @@ CREATE TABLE module_links (
  updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
  PRIMARY KEY(principal,module)
 );
-CREATE INDEX module_links_scope ON module_links(module,module_principal);
-CREATE TABLE subscription_module_links (
+CREATE INDEX IF NOT EXISTS module_links_scope ON module_links(module,module_principal);
+CREATE TABLE IF NOT EXISTS subscription_module_links (
  subscription uuid NOT NULL,
  source text NOT NULL,
  scope_ref text NOT NULL,
@@ -158,7 +159,7 @@ BEGIN
 END $$;
 
 
-CREATE FUNCTION public.set_module_link(p_principal text, p_module text, p_module_principal text, p_state text)
+CREATE OR REPLACE FUNCTION public.set_module_link(p_principal text, p_module text, p_module_principal text, p_state text)
  RETURNS public.module_links LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
 DECLARE result public.module_links;
 BEGIN
@@ -175,17 +176,18 @@ BEGIN
 END $$;
 REVOKE ALL ON FUNCTION public.set_module_link(text,text,text,text) FROM PUBLIC;
 
-CREATE FUNCTION public.admit_module_source(p_subscription uuid, p_source text, p_scope_ref text, p_types text[])
+CREATE OR REPLACE FUNCTION public.admit_module_source(p_subscription uuid, p_source text, p_scope_ref text, p_types text[])
  RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
 DECLARE link public.module_links;
 BEGIN
- IF p_types IS NULL OR cardinality(p_types) NOT BETWEEN 1 AND 16 OR array_position(p_types,NULL) IS NOT NULL
-   OR NOT p_types <@ ARRAY['call.finished','call.failed','call.not_answered','call.interrupted','call.owner_request',
-     'call.access.changed'] THEN
+ -- The module's types only (module_event_valid lists them; the caller checks each against the contract), so this
+ -- function names no module list of its own.
+ IF p_types IS NULL OR cardinality(p_types) NOT BETWEEN 1 AND 16
+   OR EXISTS(SELECT FROM unnest(p_types) k WHERE k IS NULL OR k !~ '^call\.[a-z_]+(\.[a-z_]+)?$') THEN
   RAISE EXCEPTION 'invalid_filter' USING ERRCODE='check_violation';
  END IF;
  SELECT l.* INTO link FROM public.subscriptions s JOIN public.module_links l ON l.principal=s.principal AND l.module='calls'
-  WHERE s.id=p_subscription AND p_source='deedkit:calls' AND l.state='active' AND l.module_principal=p_scope_ref
+  WHERE s.id=p_subscription AND p_source='deedkit:'||l.module AND l.state='active' AND l.module_principal=p_scope_ref
   FOR SHARE OF l;
  IF NOT FOUND THEN
   RAISE EXCEPTION 'module_not_linked' USING ERRCODE='insufficient_privilege';

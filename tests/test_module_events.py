@@ -197,7 +197,9 @@ def subscriber(store):
 
 def mixed(store, token, types=('call.finished', 'call.owner_request')):
     sid = store.create_subscription(token, ['telegram-demo-chat'])['subscription_id']
-    store.link_module('module-reader', 'calls', 'owner-calls')  # ANYM-564: a call source needs the owner's link
+    with store.authorized(token) as (_, p):  # ANYM-564: a call source needs the owner's link for the key's principal
+        principal = p['id']
+    store.link_module(principal, 'calls', 'owner-calls')
     with store.pool.connection() as c:
         module_events.attach_sources(c, sid, [('deedkit:calls', 'owner-calls', list(types))])
     return sid
@@ -345,7 +347,7 @@ def test_schema67_replaces_only_the_module_lists_keeps_every_acl_and_is_repeatab
     function = "'public.module_event_valid(text,text,text,text,text,jsonb,text,text)'::regprocedure"
     other = "'public.publish_module_event(text,text,text,text,text,text,jsonb,text,text)'::regprocedure"
     with store.pool.connection() as c:
-        c.execute('DELETE FROM archive_migrations WHERE version IN (67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89)')
+        c.execute('DELETE FROM archive_migrations WHERE version IN (67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90)')
         c.execute("UPDATE probe_metadata SET value='66' WHERE name='schema_version'")
         acl = [c.execute(f'SELECT proacl::text AS acl, proowner::regrole::text AS owner, prosrc FROM pg_proc WHERE oid={f}').fetchone()
             for f in (function, other)]
@@ -388,7 +390,9 @@ def test_calls_and_calendar_decisions_of_the_validator_are_those_of_schema_65_fo
     previous = old[start:old.index('END $$;', start) + len('END $$;')].replace('public.module_event_valid(',
         'public.anym732_previous_valid(', 1)
     arguments = '%s,%s,%s,%s,%s,%s,%s,%s'
-    cases = {name: event for name, event in _mutations().items() if 'recording' not in name}
+    # ANYM-564: call.access.changed is a type 065 never had; every other calls and calendar decision stays 065's.
+    cases = {name: event for name, event in _mutations().items() if 'recording' not in name and
+        'call_access_changed' not in name}
     cases.update({f'provider_{label}': failed_event(1, **data) for label, data in (('five', {'provider_cause':
         'geo_permission_missing', 'provider_code': 21215}), ('code_alone', {'provider_code': 21215}),
         ('text', {'provider_text': 'x'}))})
@@ -681,6 +685,13 @@ def _mutations():
         'recording_id_leading_zero': recording_event(1, id='recordings:01'),
         'recording_id_above_2_53': recording_event(1, id='recordings:9007199254740992'),
         'recording_type_under_the_calls_source': recording_event(1, id='calls:1', source='deedkit:calls'),
+        # ANYM-564: a calls principal's access change: references and an enumeration, urgent, never expiring.
+        'valid_call_access_changed': {**finished, 'type': 'call.access.changed', 'subject': 'owner-a', 'urgency': 'now',
+            'data': {'principal_ref': 'owner-a', 'reason': 'permission_removed'}},
+        'call_access_changed_batch': {**finished, 'type': 'call.access.changed', 'subject': 'owner-a',
+            'data': {'principal_ref': 'owner-a', 'reason': 'permission_removed'}},
+        'call_access_changed_free_reason': {**finished, 'type': 'call.access.changed', 'subject': 'owner-a',
+            'urgency': 'now', 'data': {'principal_ref': 'owner-a', 'reason': 'private words'}},
         'call_type_under_the_recordings_source': {**finished, 'id': 'recordings:1', 'source': 'deedkit:recordings'},
         'calendar_type_under_the_recordings_source': {**starting_event(4), 'id': 'recordings:4',
             'source': 'deedkit:recordings'},
@@ -811,7 +822,7 @@ def test_schema65_replaces_only_the_validator_function_keeps_its_acl_and_is_repe
         # Synthetic disposable database only: the schema-64 function, ledger and version.
         c.execute(previous)
         assert accepts(c, failed_event(1)) and not accepts(c, five)
-        c.execute('DELETE FROM archive_migrations WHERE version IN (65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89)')
+        c.execute('DELETE FROM archive_migrations WHERE version IN (65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90)')
         c.execute("UPDATE probe_metadata SET value='64' WHERE name='schema_version'")
         acl = c.execute(f'SELECT proacl::text AS acl, proowner::regrole::text AS owner FROM pg_proc WHERE oid={function}').fetchone()
         grants = c.execute("SELECT oid,relacl::text FROM pg_class WHERE relnamespace='public'::regnamespace ORDER BY oid").fetchall()
