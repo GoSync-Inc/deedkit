@@ -645,13 +645,21 @@ def test_every_parser_error_class_rejects_one_live_read_update_and_capture_goes_
     w,_,_=worker
     import messaging_service.reply_state as reply_state
     import messaging_service.telegram_receipts as receipts
+    from telethon import types
     event=receipt_ready(w)
+    if callback=='owner_read':event=types.UpdateReadHistoryInbox(types.PeerUser(100),23,2,10,1)
+    module,name=(receipts,'telegram_receipt') if callback=='receipt' else (reply_state,'telegram_read_capture')
+    original=getattr(module,name)
     def boom(*a,**k):raise error('synthetic-private')
-    monkeypatch.setattr(receipts if callback=='receipt' else reply_state,
-        'telegram_receipt' if callback=='receipt' else 'telegram_read_capture',boom)
+    monkeypatch.setattr(module,name,boom)
     asyncio.run(getattr(w,callback)(event))
-    assert not w.failed.is_set() and w.capture_count==0
+    assert not w.failed.is_set() and not w.stopping.is_set() and w.capture_count==0
     assert w.rejected=={code:1} and names(w.spool.path)==[]
+    # Capture goes on: the next update through the same callback is stored (Astra r1 minor).
+    monkeypatch.setattr(module,name,original)
+    asyncio.run(getattr(w,callback)(event))
+    assert not w.failed.is_set() and w.capture_count==0 and w.rejected=={code:1}
+    assert [i['kind'] for i in spooled(w)]==['message_receipt' if callback=='receipt' else 'owner_read_state']
 
 
 def test_an_io_error_that_is_also_a_value_error_is_never_a_rejection(worker):
