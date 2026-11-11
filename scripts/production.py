@@ -4968,7 +4968,6 @@ HALTS = {
     "session_pass_failed": ("agent", _DOC + "session-holders-anym-896"),
     "tool_blob_mismatch": ("agent", _TOOLS),
     "tool_by_hand": ("agent", _TOOLS),
-    "tool_manifest_refused": ("agent", _TOOLS),
     "tool_not_descended": ("agent", _TOOLS),
     "tool_release_mismatch": ("agent", _TOOLS),
     "tool_rolled_back": ("agent", _TOOLS),
@@ -7010,7 +7009,7 @@ def update_tool(settings, configs, s, mirror, candidate, base, tool, *, dry_run,
             try:
                 manifest = tool_manifest(contents[path], f"{path} of {candidate}")
             except Refused as exc:
-                return halt(f"{exc}; the tool is not updated", code="tool_manifest_refused", sha=candidate)
+                return halt(f"{exc}; the tool is not updated", code="tool_by_hand", sha=candidate)
             paths = [other for other in manifest if other != path]
     last = tool_update_receipt(state)
     if last and last["status"] == "rolled-back" and last.get("blobs") == blobs:

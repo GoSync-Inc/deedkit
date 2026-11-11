@@ -3357,7 +3357,6 @@ own pause, in that older shape. A dry run reports `would_pause` and writes nothi
 | `session_pass_failed` | agent | `docs/operations/production.md#session-holders-anym-896` |
 | `tool_blob_mismatch` | agent | `docs/operations/production.md#deploy-tool-updates` |
 | `tool_by_hand` | agent | `docs/operations/production.md#deploy-tool-updates` |
-| `tool_manifest_refused` | agent | `docs/operations/production.md#deploy-tool-updates` |
 | `tool_not_descended` | agent | `docs/operations/production.md#deploy-tool-updates` |
 | `tool_release_mismatch` | agent | `docs/operations/production.md#deploy-tool-updates` |
 | `tool_rolled_back` | agent | `docs/operations/production.md#deploy-tool-updates` |
@@ -3407,7 +3406,7 @@ pauses as above without installing. `--dry-run` reports `would update tool
    `TOOL_FILES` lists, are read from the source mirror at the candidate (`git
    cat-file blob`, the attested commit) and each must hash to `git rev-parse
    <candidate>:<path>`; a list that is not that literal dict pauses
-   (`tool_manifest_refused`). A tool `tool-rollback` rolled back is not
+   (`tool_by_hand`, "names no TOOL_FILES"). A tool `tool-rollback` rolled back is not
    installed again.
 2. Stage `releases/<sha>.staging-<random>` (temporary names, fsync, rename) and
    run its self-test: `/usr/bin/python3 -B -E -s <staging>/production.py

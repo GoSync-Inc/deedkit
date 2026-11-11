@@ -4819,7 +4819,7 @@ def test_production_md_states_the_manifest_invalid_pause_and_the_earlier_network
     assert "is refused as `network_unsafe` before the pause, the receipt or any file is written" in docs
 
 
-HALT_CALLS = 42  # every halt(...) of production.py; a new call raises this number and adds its code to p.HALTS
+HALT_CALLS = 43  # every halt(...) of production.py; a new call raises this number and adds its code to p.HALTS
 
 
 def halt_call_problems(source, table):
@@ -7861,7 +7861,7 @@ def test_a_candidate_whose_tool_files_are_no_literal_list_of_script_modules_paus
     host.serve(three_file_tool(host.verifier, manifest))
     before = tree(host.tool)
     outcome = host.deploy()
-    assert outcome["status"] == "halted" and outcome["code"] == "tool_manifest_refused"
+    assert outcome["status"] == "halted" and outcome["code"] == "tool_by_hand"
     assert f"scripts/production.py of {NEWEST} names no TOOL_FILES" in outcome["reason"]
     assert tree(host.tool) == before and host.receipt() is None and host.paused() == outcome["reason"]
     assert not [argv for argv in host.git if "tool_extra.py" in argv[-1]]  # no file the list names is read
