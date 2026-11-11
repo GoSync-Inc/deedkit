@@ -64,6 +64,13 @@ def test_image_parts_and_download_chunks_are_described():
     assert 'read_next_chunk' in download and 'length=4194304' in download
 
 
+# spec: ANYM-958
+def test_descriptions_name_one_ui_engine():
+    assert 'the Maestro engine was removed' in CATALOG['android_capabilities']['description']
+    assert 'the only engine' in CATALOG['android_maestro']['description']
+    assert 'or legacy maestro' not in CATALOG['android_capabilities']['description']
+
+
 # spec: ANYM-951
 def test_existing_flows_remain_compatible_before_android_backend_upgrade():
     values = {'device_id': 'phone', 'session_id': 'lease',

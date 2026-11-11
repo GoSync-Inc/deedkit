@@ -108,6 +108,20 @@ def test_legacy_flows_import_and_keep_their_original_interface(store):
     assert store.library.read('one', 'flow', 'old', first['version'])['yaml'] == '- back'
 
 
+# spec: ANYM-958
+def test_saved_maestro_only_flow_is_refused_before_any_device_action(store):
+    from deedkit_android.app_maps import compile_scenario
+
+    store.flow('one', 'put', 'legacy', '- setLocation: {latitude: -8.5, longitude: 115.2}', None)
+    for source, root in ((None, {'name': 'legacy'}), ('- travel: {points: []}', None), ('- pasteText', None),
+                         ('side_effects: none\nsteps:\n  - setAirplaneMode: {value: enabled}', None)):
+        with pytest.raises(Refused, match='unsupported_uiautomator_command') as failure:
+            compile_scenario(store.library, 'one', source, {}, root=root)
+        assert 'android_execute' in failure.value.hint
+    commands, _ = compile_scenario(store.library, 'one', '- back\n- inputText: hi', {})
+    assert commands == ['back', {'inputText': 'hi'}]
+
+
 # spec: ANYM-954
 def test_scenario_compilation_pins_maps_and_subflows_and_keeps_inputs_literal(store):
     from deedkit_android.app_maps import compile_scenario

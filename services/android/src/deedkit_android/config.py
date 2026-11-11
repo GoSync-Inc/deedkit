@@ -24,6 +24,7 @@ class Principal(Strict):
 class Config(Strict):
     adb: str
     state_dir: str
+    # Removed engine (owner 11-11): a config that still names it fails at start.
     maestro: str | None = None
     java_home: str | None = None
     uiautomator2_jar: str | None = None
@@ -44,7 +45,7 @@ class Configuration:
     def __init__(self, path):
         self.path = Path(path)
         self.initial = self.read()
-        for value in (self.initial.adb, self.initial.state_dir, self.initial.maestro, self.initial.java_home, self.initial.uiautomator2_jar, self.initial.ocr_command):
+        for value in (self.initial.adb, self.initial.state_dir, self.initial.uiautomator2_jar, self.initial.ocr_command):
             if value is not None and not Path(value).is_absolute():
                 raise ValueError("absolute_runtime_paths_required")
 
@@ -62,6 +63,8 @@ class Configuration:
             config = Config.model_validate(json.loads(os.read(fd, 65537)))
         finally:
             os.close(fd)
+        if config.maestro is not None or config.java_home is not None:
+            raise ValueError("maestro_engine_removed")
         ids = [p.id for p in config.principals]
         keys = [p.key_sha256 for p in config.principals]
         if len(set(config.devices.values())) != len(config.devices) or any(
@@ -82,9 +85,9 @@ class Configuration:
             config = self.read()
         except (OSError, ValueError):
             raise Refused("configuration_unavailable", 503) from None
-        if (config.adb, config.state_dir, config.devices, config.maestro, config.java_home, config.uiautomator2_jar, config.uiautomator2_jar_sha256,
+        if (config.adb, config.state_dir, config.devices, config.uiautomator2_jar, config.uiautomator2_jar_sha256,
             config.ocr_command, config.ocr_languages) != (
-            self.initial.adb, self.initial.state_dir, self.initial.devices, self.initial.maestro, self.initial.java_home, self.initial.uiautomator2_jar, self.initial.uiautomator2_jar_sha256,
+            self.initial.adb, self.initial.state_dir, self.initial.devices, self.initial.uiautomator2_jar, self.initial.uiautomator2_jar_sha256,
             self.initial.ocr_command, self.initial.ocr_languages,
         ):
             raise Refused("runtime_configuration_changed", 503)

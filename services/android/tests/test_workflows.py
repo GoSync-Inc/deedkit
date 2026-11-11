@@ -69,13 +69,32 @@ def test_saved_flows_are_owner_scoped_and_versioned(tmp_path):
 
 
 # spec: ANYM-951
-def test_compact_maestro_hierarchy_preserves_legacy_nodes_and_masks_inputs():
-    from deedkit_android.maestro import screen_elements
-    nodes = screen_elements({'elements': [{'b': '[0,0][10,20]', 'txt': 'Search', 'clickable': True,
-        'c': [{'cls': 'android.widget.EditText', 'txt': 'private', 'a11y': 'private', 'val': 'private'}]}]})
+def test_compact_maestro_hierarchy_preserves_legacy_nodes_and_masks_inputs(tmp_path, monkeypatch):
+    # Maestro's compact hierarchy was removed (owner 11-11); uiautomator2 keeps ADB names and masks inputs.
+    import asyncio
+    from types import SimpleNamespace
+    from deedkit_android.device import Devices
+
+    async def scenario():
+        store = Store(tmp_path / 'state')
+        devices = Devices(SimpleNamespace(devices={'phone': 'SERIAL'}, adb='/synthetic', uiautomator2_jar='/synthetic',
+                                          state_dir=str(tmp_path / 'state')), store)
+        async def call(device, command, **options):
+            return {'xml': '<hierarchy><node text="Search" bounds="[0,0][10,20]" clickable="true" />'
+                           '<node class="android.widget.EditText" text="private" content-desc="private" password="true" />'
+                           '</hierarchy>'}
+        monkeypatch.setattr(devices.ui, 'call', call)
+        try:
+            return await devices.capture_hierarchy('phone')
+        finally:
+            await devices.close()
+            store.close()
+    result = asyncio.run(scenario())
+    nodes = result['elements']
+    assert result['hierarchy_source'] == 'uiautomator2'
     assert nodes[0]['text'] == 'Search' and nodes[0]['clickable'] == 'true'
     assert nodes[0]['bounds'] == '[0,0][10,20]'
-    assert not {'text', 'content-desc', 'val'} & nodes[1].keys()
+    assert nodes[1]['text'] == '' and nodes[1]['content-desc'] == ''
 
 
 # spec: ANYM-951
@@ -97,13 +116,14 @@ def test_workflow_execution_checkpoint_and_replay_use_one_device_lock(tmp_path, 
 
     async def scenario():
         store = Store(tmp_path / 'state')
-        devices = Devices(SimpleNamespace(devices={'phone': 'SERIAL'}, maestro='/synthetic', adb='/synthetic'), store)
+        devices = Devices(SimpleNamespace(devices={'phone': 'SERIAL'}, adb='/synthetic', uiautomator2_jar='/synthetic',
+                                          state_dir=str(tmp_path / 'state')), store)
         calls = []
-        async def run(name, args, timeout):
-            calls.append(args['yaml'])
+        async def run(device, command, **options):
+            calls.append(command)
             await asyncio.sleep(0.02)
             return {'success': True}
-        monkeypatch.setattr(devices.maestro, 'call', run)
+        monkeypatch.setattr(devices.ui, 'call', run)
         token = store.reserve('one', 'phone', 'acquire')['session_id']
         request_id = str(uuid.uuid4())
         flow = compile_flow('- inputText: hello\n- checkpoint: verify\n- back', {})
@@ -114,7 +134,7 @@ def test_workflow_execution_checkpoint_and_replay_use_one_device_lock(tmp_path, 
                 await devices.execute('one', 'phone', token, str(uuid.uuid4()), None, 3, 0, flow)
             completed = await devices.receipt('one', request_id, 3)
             assert completed['state'] == 'paused' and completed['remaining_yaml'].strip() == '- back'
-            assert len(calls) == 1 and 'checkpoint' not in calls[0]
+            assert calls == [{'inputText': 'hello'}]
             repeated = await devices.execute('one', 'phone', token, request_id, None, 3, 3, flow)
             assert repeated == completed and len(calls) == 1
         finally:
@@ -124,42 +144,54 @@ def test_workflow_execution_checkpoint_and_replay_use_one_device_lock(tmp_path, 
 
 
 # spec: ANYM-951
-def test_maestro_lock_wait_is_bounded_without_stopping_another_device(monkeypatch):
-    import asyncio
-    from types import SimpleNamespace
-    from deedkit_android.maestro import Maestro
+def test_maestro_lock_wait_is_bounded_without_stopping_another_device(tmp_path):
+    # The Maestro engine was removed (owner 11-11): a host config that still names it is refused at start.
+    import hashlib
+    import json
+    from deedkit_android.config import Configuration
 
-    async def scenario():
-        client = Maestro(SimpleNamespace())
-        closed = []
-        async def close():
-            closed.append(True)
-        monkeypatch.setattr(client, 'close', close)
-        await client.lock.acquire()
-        try:
-            with pytest.raises(TimeoutError):
-                await client.call('inspect_screen', {}, 0.02)
-            assert not closed and client.lock.locked()
-        finally:
-            client.lock.release()
-    asyncio.run(scenario())
+    base = {'adb': '/synthetic/adb', 'state_dir': str(tmp_path / 'state'), 'devices': {'home': 'SERIAL'},
+            'principals': [{'id': 'one', 'key_sha256': hashlib.sha256(b'one').hexdigest(), 'devices': ['home'],
+                            'permissions': ['android:read']}]}
+    config = tmp_path / 'config.json'
+    for extra in ({'maestro': '/opt/maestro/bin/maestro'}, {'java_home': '/opt/java'}):
+        config.write_text(json.dumps({**base, **extra}))
+        config.chmod(0o600)
+        with pytest.raises(ValueError, match='maestro_engine_removed'):
+            Configuration(config)
+    config.write_text(json.dumps(base))
+    assert Configuration(config).initial.maestro is None
 
 
 # spec: ANYM-951
-def test_guardian_stops_child_when_parent_is_gone_and_removes_private_temp(tmp_path):
-    import os
-    import subprocess
+def test_guardian_stops_child_when_parent_is_gone_and_removes_private_temp(monkeypatch, capsys):
+    # The Maestro guardian was removed; the uiautomator2 worker stops its device server when its parent's pipe closes.
+    import io
+    import logging
     import sys
-    temporary = tmp_path / 'private-java-temp'
-    temporary.mkdir()
-    (temporary / 'flow.yaml').write_text('private')
-    # Parent 0 cannot be this subprocess's real parent. All children are synthetic.
-    result = subprocess.run([sys.executable, '-m', 'deedkit_android.guardian', '0', str(temporary),
-                             sys.executable, '-c', 'import time; time.sleep(30)'],
-                            start_new_session=True, timeout=5, capture_output=True,
-                            env={**os.environ, 'PYTHONPATH': str(__import__('pathlib').Path(__file__).parents[1] / 'src')})
-    assert result.returncode != 0
-    assert not temporary.exists()
+    import deedkit_android.ui_worker as worker
+
+    stopped = []
+
+    class Device:
+        def __init__(self, *args):
+            self.args = args
+
+        def jsonrpc_call(self, method, params=None, timeout=10):
+            return '<hierarchy />'
+
+        def stop_uiautomator(self):
+            stopped.append(self.args)
+    monkeypatch.setattr(worker, 'Device', Device)
+    monkeypatch.setattr(worker.signal, 'signal', lambda *args: None)
+    monkeypatch.setattr(sys, 'argv', ['ui_worker', 'SERIAL', '/synthetic.jar', '/synthetic.marker'])
+    monkeypatch.setattr(sys, 'stdin', io.StringIO('{"command": "__hierarchy__"}\n'))
+    try:
+        worker.main()
+    finally:
+        logging.disable(logging.NOTSET)
+    assert stopped == [('SERIAL', '/synthetic.jar', '/synthetic.marker')]
+    assert '<hierarchy />' in capsys.readouterr().out
 
 
 # spec: ANYM-951
@@ -195,25 +227,27 @@ def test_failed_image_cancels_hierarchy_before_releasing_phone(tmp_path, monkeyp
 
 
 # spec: ANYM-951
-def test_guardian_stops_descendant_after_launcher_exits(tmp_path):
-    import os
-    import subprocess
-    import sys
-    from pathlib import Path
-    temporary = tmp_path / 'private-temp'
-    temporary.mkdir()
-    child_pid = tmp_path / 'pid'
-    source = ('import subprocess,sys; p=subprocess.Popen([sys.executable,"-c",'
-              '"import time; time.sleep(30)"]); open(sys.argv[1],"w").write(str(p.pid))')
-    result = subprocess.run([sys.executable, '-m', 'deedkit_android.guardian', str(os.getpid()),
-        str(temporary), sys.executable, '-c', source, str(child_pid)], start_new_session=True,
-        timeout=5, capture_output=True,
-        env={**os.environ, 'PYTHONPATH': str(Path(__file__).parents[1] / 'src')})
-    assert result.returncode == 0
-    assert not temporary.exists()
-    # A killed orphan can briefly remain as a zombie before init reaps it.
-    status = subprocess.run(['ps', '-o', 'stat=', '-p', child_pid.read_text()], capture_output=True, text=True)
-    assert not status.stdout.strip() or status.stdout.strip().startswith('Z')
+def test_guardian_stops_descendant_after_launcher_exits(tmp_path, monkeypatch):
+    # After a worker is gone, its Android server is stopped by the token in the private marker before reuse.
+    import asyncio
+    import json
+    from types import SimpleNamespace
+    import deedkit_android.device as device_module
+    from deedkit_android.uiautomator import Uiautomator
+
+    ui = Uiautomator(SimpleNamespace(devices={'phone': 'SERIAL'}, adb='/synthetic/adb', uiautomator2_jar='/synthetic',
+                                     state_dir=str(tmp_path)), 0)
+    token = 'deedkit-uia2-' + 'a' * 32
+    ui.marker('phone').write_text(json.dumps({'pid': 4242, 'token': token}))
+    calls = []
+    async def run_process(argv, timeout, *args, **kwargs):
+        calls.append(argv)
+        return 0, b'', b''
+    monkeypatch.setattr(device_module, 'run_process', run_process)
+    asyncio.run(ui.ensure_fenced_process_stopped('phone'))
+    assert len(calls) == 1 and calls[0][:4] == ['/synthetic/adb', '-s', 'SERIAL', 'shell']
+    assert 'kill 4242' in calls[0][4] and token in calls[0][4]
+    assert not ui.marker('phone').exists()
 
 
 # spec: ANYM-952

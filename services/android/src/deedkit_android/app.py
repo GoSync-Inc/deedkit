@@ -1,7 +1,6 @@
 """Authenticated HTTP backend for the gateway's reviewed android_* tools."""
 
 import base64
-from collections import defaultdict
 from contextlib import asynccontextmanager
 import hashlib
 import json
@@ -14,7 +13,6 @@ from typing import Literal
 from .app_maps import compile_scenario, load, validate_map
 from .config import Configuration, Refused, Strict
 from .device import COMMANDS, Devices
-from .flows import BARE, FIELDS, compile_flow, reference
 from .store import Store, identifier
 from .uiautomator import reference as ui_reference
 
@@ -161,23 +159,15 @@ def create_app(config_path):
         if device is not None and device not in principal.devices:
             raise Refused("not_found", 404)
         owner = principal.id
-        def compile_source(source, parameters, validate_only=False):
-            if devices.ui:
-                return compile_scenario(store.library, owner, source, parameters, validate_only=validate_only)[0]
-            literal_parameters = parameters.copy()
-            literal_parameters.update({key: str(value) for key, value in parameters.items()})
-            commands = compile_flow(source, literal_parameters, fields=None,
-                resolve=lambda name, version: store.flow(owner, "get", name, None, version)["yaml"])
-            return commands
         if operation == "capabilities":
             result = {"service": "deedkit-android", "permissions": principal.permissions,
                       "devices": await devices.status(principal.devices), "adb_commands": sorted(COMMANDS),
                       "tool_manifest": {"version": 1, "names": list(SCHEMAS)},
                       "input_schemas": {name: schema.model_json_schema() for name, schema in SCHEMAS.items()},
-                      "ui": {"engine": "uiautomator2" if devices.ui else "maestro",
+                      "ui": {"engine": "uiautomator2", "configured": bool(devices.ui),
                              "reference_tool": "android_maestro", "batch_tool": "android_run_flow"},
-                      "maestro": {"configured": bool(configuration.initial.maestro),
-                                  "commands": sorted(FIELDS.keys() | BARE), "dialect_version": 2, "checkpoint": "explicit_agent_handoff"},
+                      # Compatibility key: the Maestro engine was removed (owner 11-11).
+                      "maestro": {"configured": False, "removed": True, "engine": "uiautomator2"},
                       "session_policy": {"renew_on_activity": True, "release_explicitly": True,
                                          "maximum_idle_seconds": 900},
                       "limits": {"command_seconds": 600, "file_bytes": 268435456, "chunk_bytes": 32768, "download_chunk_bytes": 4194304}}
@@ -195,19 +185,14 @@ def create_app(config_path):
                                            args["argv"], args["timeout_s"], args["wait_s"])
         elif operation == "maestro":
             if args["action"] == "reference":
-                result = ui_reference() if devices.ui else reference()
+                result = ui_reference()
             else:
                 if (args["yaml"] is None) == (args["name"] is None):
                     raise Refused("provide_yaml_or_flow_name", 422)
-                source = args["yaml"]
-                if source is None and not devices.ui:
-                    source = store.flow(owner, "get", args["name"], None, args["version"])["yaml"]
-                if devices.ui:
-                    commands, metadata = compile_scenario(store.library, owner, source, args['parameters'],
-                        stage=args['stage'], root={'name': args['name'], 'version': args['version']} if args['name'] else None)
-                else:
-                    commands, metadata = compile_source(source, args['parameters']), {}
-                result = {"valid": True, "dialect_version": 4 if devices.ui else 2, "commands": commands, 'library': metadata}
+                # Authoring needs no device and no configured engine.
+                commands, metadata = compile_scenario(store.library, owner, args["yaml"], args['parameters'],
+                    stage=args['stage'], root={'name': args['name'], 'version': args['version']} if args['name'] else None)
+                result = {"valid": True, "dialect_version": 4, "commands": commands, 'library': metadata}
         elif operation == "run_flow":
             if (args["yaml"] is None) == (args["name"] is None):
                 raise Refused("provide_yaml_or_flow_name", 422)
@@ -216,14 +201,8 @@ def create_app(config_path):
             previous = store.replay(owner, request_id, identity)
             if previous is not None:
                 return JSONResponse(previous, headers={"Cache-Control": "no-store"})
-            source = args["yaml"]
-            if devices.ui:
-                commands, metadata = compile_scenario(store.library, owner, source, args['parameters'],
-                    stage=args['stage'], root={'name': args['name'], 'version': args['version']} if args['name'] else None)
-            else:
-                if source is None:
-                    source = store.flow(owner, 'get', args['name'], None, args['version'])['yaml']
-                commands, metadata = compile_source(source, args['parameters']), {}
+            commands, metadata = compile_scenario(store.library, owner, args["yaml"], args['parameters'],
+                stage=args['stage'], root={'name': args['name'], 'version': args['version']} if args['name'] else None)
             result = await devices.execute(owner, device, args["session_id"], request_id,
                                            None, args["timeout_s"], args["wait_s"], flow=commands,
                                            element_timeout_ms=args['element_timeout_ms'],
@@ -238,7 +217,7 @@ def create_app(config_path):
                 elif args['action'] == 'put':
                     if not isinstance(load(args['yaml']), list):
                         raise Refused('scenario_requires_draft', 422)
-                    compile_source(args['yaml'], defaultdict(lambda: 'placeholder'), validate_only=True)
+                    compile_scenario(store.library, owner, args['yaml'], {}, validate_only=True)
                 else:
                     compile_scenario(store.library, owner, args['yaml'], {}, stage='draft', validate_only=True)
             if args['kind'] == 'flow' and args['action'] in {'put', 'delete'}:
