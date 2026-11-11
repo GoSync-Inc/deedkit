@@ -89,7 +89,7 @@ def claimed_tool(prefix):
     return name
 
 # Optional arguments dropped when None, so payloads and audit records of callers that omit them stay unchanged.
-OMITTED_WHEN_NONE = {'create_subscription':('chat_ids','sources','wake_rules','reply_to_send','delivery'),
+OMITTED_WHEN_NONE = {'create_subscription':('chat_ids','sources','wake_rules','reply_to_send','delivery','feedback'),
     'configure_subscription_delivery':('delivery_policy','endpoint_id'),
     'register_delivery_endpoint':('headers',),'update_delivery_endpoint':('new_secret','headers'),
     'search_files':('media_kind','ready'),
@@ -165,8 +165,8 @@ def validate_arguments(models, method, arguments):
         invalid=[]
         if method=='create_subscription' and 'reply_to_confirmed_send' in (values.get('wake_rules') or []) and not values.get('reply_to_send'):
             invalid=[('reply_to_send','required','set when wake_rules has reply_to_confirmed_send')]
-        if method=='create_subscription' and (values.get('chat_ids') is None)==(values.get('sources') is None):
-            invalid.append(('chat_ids','required'))  # exactly one of chat_ids or sources (no shared hint text)
+        if method=='create_subscription' and (values.get('chat_ids') is None)==(values.get('sources') is None)!=(values.get('sources') is None and values.get('feedback') is not None):
+            invalid.append(('chat_ids','required'))  # at most one of chat_ids or sources; one unless feedback (ANYM-962)
         if method=='submit_feedback':
             if not values['description'].strip():invalid.append(('description','blank','text with a non-space character'))
             if len(json.dumps(values.get('refs') or {}).encode())>8192:invalid.append(('refs','size','at most 8 KiB'))

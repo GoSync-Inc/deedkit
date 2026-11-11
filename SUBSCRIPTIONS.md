@@ -550,6 +550,35 @@ note) until every card is merged (`fixed`) or deployed (`verify_requested`). Onl
 maintainer sets a status, with the operator command `set-feedback-status` (ACCESS.md); the
 agent-facing database role can insert only the submission fields and cannot update feedback.
 
+### Feedback status events (ANYM-962, schema 91)
+
+An agent no longer has to poll `list_feedback`: `create_subscription(feedback=true)` wakes it when the
+maintainer moves one of this key's own reports to `fixed` or `verify_requested` (ready to re-check) or to
+`declined` or `duplicate` (closed). `feedback={"statuses": [...]}` picks 1-6 of `received`, `accepted`,
+`declined`, `duplicate`, `fixed`, `verify_requested`; any other value is `invalid_filter`. `feedback` works
+alone or beside `chat_ids` or `sources`, needs no permission beyond `create_subscription`'s own, counts as
+one definition toward `SUBSCRIPTION_MAX_DEFINITIONS` and starts at the module journal head (no backlog).
+
+The server attaches the module source `deedkit:feedback` with `scope_ref` = the caller's own key ID; the caller
+cannot name a scope, so another key of the same principal never sees these events. `set-feedback-status`
+publishes one event per item whose status changes, in its own transaction (a rerun that leaves the status as
+it is publishes nothing; a new note alone publishes nothing):
+
+| Field | Value |
+|---|---|
+| `id` | `feedback:<n>` (`<n>` is the event's module journal number) |
+| `type` | `feedback.<status>`, one type per status, so the matcher filters by type |
+| `subject` | the feedback ID |
+| `data` | `feedback_id`, `status`, `previous_status`, `spec_ref` and `fixed_in` when set; never the note, the description, a principal name or a message reference |
+| `urgency` | `now` (passes quiet hours), no expiry |
+
+The events come through the module stream (`fetch_subscription_events`, `wait_for_subscription_events`, ACK as
+for any module event) and, with a bound endpoint (ANYM-519), as a `module_events` hint whose reference for a
+feedback event holds `event_id`, `type`, `occurred_at`, `feedback_id` and `status` only. Publishing runs in a
+savepoint: an error (an older database during a rolling upgrade, a timeout) rolls back the event only, is
+logged as `subscription_journal_failed` with kind `feedback.status` and counted, and the status change
+commits. The agent verdicts `verified` and `reopened` (ANYM-344) publish nothing.
+
 ## Schema 38: hint timing policy
 
 `configure_subscription_delivery(subscription_id, version, receiver_id, delivery_policy)`
@@ -1360,7 +1389,7 @@ attribute names, not the CloudEvents HTTP binding:
 | --- | --- |
 | `specversion` | `1.0` |
 | `id` | `<module>:<seq>`, `calendar:`, `calls:` or `recordings:` plus the module's own journal number; also the idempotency key (`event_key`, one identifier) |
-| `source` | `deedkit:calendar`, `deedkit:calls` or `deedkit:recordings` |
+| `source` | `deedkit:calendar`, `deedkit:calls`, `deedkit:recordings` or `deedkit:feedback` (in-process, "Feedback status events") |
 | `type` | one of the types below |
 | `subject` | the primary reference (`event_ref` or `call_id`), equal to that data key |
 | `time` | when it happened (RFC 3339) |

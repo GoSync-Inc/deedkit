@@ -28,7 +28,7 @@ from psycopg import errors
 from psycopg.rows import dict_row
 
 from . import module_events
-from .module_events import _ID, _SCOPE, MAX_SEQ, SOURCES, ModuleContractError, validate_event
+from .module_events import _ID, _SCOPE, IN_PROCESS_SOURCES, MAX_SEQ, SOURCES, ModuleContractError, validate_event
 
 LIMIT = 100
 MAX_PAGE_BYTES = 256 * 1024
@@ -61,7 +61,9 @@ def load_config(path):
         if not isinstance(module, dict) or set(module) != {'source', 'url', 'token_file'}:
             raise ValueError('invalid_router_config')
         url = urlsplit(module['url']) if isinstance(module['url'], str) else None
-        if (module['source'] not in SOURCES or module['source'] in seen or url is None or
+        # ANYM-962: an in-process source (feedback) is published by messaging itself, never fetched.
+        if (module['source'] not in SOURCES or module['source'] in IN_PROCESS_SOURCES or module['source'] in seen or
+                url is None or
                 url.scheme != 'http' or not url.hostname or url.username or url.password or
                 url.query or url.fragment or not isinstance(module['token_file'], str) or
                 not module['token_file'].startswith('/')):

@@ -347,7 +347,7 @@ def test_schema67_replaces_only_the_module_lists_keeps_every_acl_and_is_repeatab
     function = "'public.module_event_valid(text,text,text,text,text,jsonb,text,text)'::regprocedure"
     other = "'public.publish_module_event(text,text,text,text,text,text,jsonb,text,text)'::regprocedure"
     with store.pool.connection() as c:
-        c.execute('DELETE FROM archive_migrations WHERE version IN (67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90)')
+        c.execute('DELETE FROM archive_migrations WHERE version IN (67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91)')
         c.execute("UPDATE probe_metadata SET value='66' WHERE name='schema_version'")
         acl = [c.execute(f'SELECT proacl::text AS acl, proowner::regrole::text AS owner, prosrc FROM pg_proc WHERE oid={f}').fetchone()
             for f in (function, other)]
@@ -359,7 +359,8 @@ def test_schema67_replaces_only_the_module_lists_keeps_every_acl_and_is_repeatab
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '90'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '91'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '91'
         assert c.execute('SELECT count(*) AS n FROM archive_migrations WHERE version=67').fetchone()['n'] == 1
         now = [c.execute(f'SELECT proacl::text AS acl, proowner::regrole::text AS owner, prosrc FROM pg_proc WHERE oid={f}').fetchone()
             for f in (function, other)]
@@ -391,7 +392,7 @@ def test_calls_and_calendar_decisions_of_the_validator_are_those_of_schema_65_fo
         'public.anym732_previous_valid(', 1)
     arguments = '%s,%s,%s,%s,%s,%s,%s,%s'
     # ANYM-564: call.access.changed is a type 065 never had; every other calls and calendar decision stays 065's.
-    cases = {name: event for name, event in _mutations().items() if 'recording' not in name and
+    cases = {name: event for name, event in _mutations().items() if 'recording' not in name and 'feedback' not in name and
         'call_access_changed' not in name}
     cases.update({f'provider_{label}': failed_event(1, **data) for label, data in (('five', {'provider_cause':
         'geo_permission_missing', 'provider_code': 21215}), ('code_alone', {'provider_code': 21215}),
@@ -695,6 +696,11 @@ def _mutations():
         'call_type_under_the_recordings_source': {**finished, 'id': 'recordings:1', 'source': 'deedkit:recordings'},
         'calendar_type_under_the_recordings_source': {**starting_event(4), 'id': 'recordings:4',
             'source': 'deedkit:recordings'},
+        # ANYM-962: the feedback source (tests/test_feedback_events.py holds its own cases).
+        **{'valid_feedback_' + status: {'specversion': '1.0', 'id': 'feedback:5', 'source': 'deedkit:feedback',
+            'type': 'feedback.' + status, 'subject': 'fb-1', 'time': '2026-11-11T10:00:00Z', 'data': {'feedback_id': 'fb-1',
+            'status': status, 'previous_status': 'verified'}, 'urgency': 'now', 'expires_at': None}
+            for status in ('received', 'accepted', 'declined', 'duplicate', 'fixed', 'verify_requested')},
         'time_infinite': {**finished, 'time': 'infinity'}, 'expiry_infinite': {**finished, 'expires_at': 'infinity'},
         'time_before_1970': {**finished, 'time': '1969-12-31T23:59:59Z'},
         'expiry_past_latest': {**finished, 'expires_at': '9999-12-31T23:59:59Z'},
@@ -822,14 +828,15 @@ def test_schema65_replaces_only_the_validator_function_keeps_its_acl_and_is_repe
         # Synthetic disposable database only: the schema-64 function, ledger and version.
         c.execute(previous)
         assert accepts(c, failed_event(1)) and not accepts(c, five)
-        c.execute('DELETE FROM archive_migrations WHERE version IN (65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90)')
+        c.execute('DELETE FROM archive_migrations WHERE version IN (65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91)')
         c.execute("UPDATE probe_metadata SET value='64' WHERE name='schema_version'")
         acl = c.execute(f'SELECT proacl::text AS acl, proowner::regrole::text AS owner FROM pg_proc WHERE oid={function}').fetchone()
         grants = c.execute("SELECT oid,relacl::text FROM pg_class WHERE relnamespace='public'::regnamespace ORDER BY oid").fetchall()
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '90'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '91'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '91'
         assert c.execute('SELECT count(*) AS n FROM archive_migrations WHERE version=65').fetchone()['n'] == 1
         assert accepts(c, five) and accepts(c, failed_event(1))
         assert not accepts(c, failed_event(1, provider_code=21215)) and not accepts(c, failed_event(1, provider_text='x'))
@@ -1290,7 +1297,8 @@ def test_the_deployed_schema66_runtime_refuses_schema67_and_its_router_validator
     assert out['schema'] == 66 and out['migrate'] == 'database_newer_than_runtime'
     assert out['config'] == 'invalid_router_config'
     assert (out['text'], out['access']) == ('invalid_envelope', 'invalid_envelope')
-    assert out['backup_max'] == 66 and backup.SCHEMAS[-1] == 90
+    assert out['backup_max'] == 66 and backup.SCHEMAS[-1] == 91
+    assert out['backup_max'] == 66 and backup.SCHEMAS[-1] == 91
 
 
 # The deployed consumers never call migrate(): matcher, dispatcher, API reads and retention keep running on the

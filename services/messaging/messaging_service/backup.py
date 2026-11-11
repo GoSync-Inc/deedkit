@@ -99,7 +99,7 @@ V84_TABLES={'telegram_polls':'message'}
 V86_TABLES={'contact_birthdays':'account,provider_user'}
 # ANYM-564: the links and each call source's admitted generation, consistent with the sources in one snapshot.
 V90_TABLES={'module_links':'principal,module','subscription_module_links':'subscription,source,scope_ref'}
-SCHEMAS=range(2,91)
+SCHEMAS=range(2,92)
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
 V17_TABLES={'message_conflicts':'receipt_digest'}

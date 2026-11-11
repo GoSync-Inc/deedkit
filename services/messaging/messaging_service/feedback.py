@@ -233,7 +233,7 @@ def set_feedback_status(c, ids, status, *, fixed_in=None, spec_ref=None, duplica
     # The same 5 s bound as an agent submission's statements, so a status change never holds
     # agent_feedback row locks longer than a submission does.
     c.execute("SET LOCAL transaction_timeout='5s'")
-    rows = c.execute('SELECT id,principal,key_id,status_changed_at FROM agent_feedback WHERE id=ANY(%s::uuid[]) '
+    rows = c.execute('SELECT id,principal,key_id,status,status_changed_at FROM agent_feedback WHERE id=ANY(%s::uuid[]) '
         'ORDER BY id FOR UPDATE', (ids,)).fetchall()
     if len(rows) != len(ids):
         raise ValueError('unknown_feedback: %d of %d IDs' % (len(ids) - len(rows), len(ids)))
@@ -251,8 +251,12 @@ def set_feedback_status(c, ids, status, *, fixed_in=None, spec_ref=None, duplica
         if target is None or any(row['key_id'] != target['key_id'] for row in rows):
             raise ValueError('duplicate_of_not_same_key')
     changed = c.execute('''UPDATE agent_feedback SET status=%s,status_note=%s,fixed_in=%s,spec_ref=%s,
-        duplicate_of=%s,status_changed_at=clock_timestamp() WHERE id=ANY(%s::uuid[]) RETURNING id''',
+        duplicate_of=%s,status_changed_at=clock_timestamp() WHERE id=ANY(%s::uuid[]) RETURNING id,status_changed_at''',
         (status, note, fixed_in, spec_ref, duplicate_of, ids)).fetchall()
+    # ANYM-962: one module event per item whose status changes, each in its own savepoint (never undoes this write).
+    from .feedback_events import publish_changes
+    publish_changes(c, rows, status, {str(row['id']): row['status_changed_at'] for row in changed},
+        spec_ref=spec_ref, fixed_in=fixed_in)
     # One content-free operator audit row per item: the fixed operation code and the feedback ID only.
     for row in rows:
         audit(c, {'id': row['principal'], 'key_id': row['key_id'], '_audit_targets': [str(row['id'])]},
