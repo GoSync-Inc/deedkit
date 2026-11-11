@@ -81,12 +81,12 @@ its sweep's moves in the digest.
 Agents delete cards and weaken criteria (owner 10-27, process.md section 2). An agent deletes only
 a card no test (`# spec: <ID>`, a repository grep) and no merged PR (`Delivers: <ID>`, a `gh`
 search) names, as a hand write in the maintenance window: a duplicate after the read-back shows
-the card it duplicates; any other (stale, deferred, superseded) after one Fable round on its text,
-the evidence and the card that replaces it, if any, agrees. A card whose `Ready:` names the owner
+the card it duplicates; any other (stale, deferred, superseded) when its text, the evidence and the
+card that replaces it, if any, show it obsolete. A card whose `Ready:` names the owner
 as asker goes only as a duplicate; removing it otherwise, or behaviour a linked card holds, is
 item 1. A criterion is weakened only on evidence (unreachable as written, or contradicted by a
-later owner decision, quoted) and after one Fable round agrees; a weakening that changes what the
-user gets is the owner's (process.md section 2, item 1). Each is one "Decided by agents" digest
+later owner decision, quoted); a weakening that changes what the user gets is the owner's
+(process.md section 2, item 1). Each is one "Decided by agents" digest
 line (orchestration.md) whose undo is the deleted card's title and text or the old criterion.
 
 Main holds maintained behaviour, known defects and ready cards (planned work, owner 10-26). An
@@ -114,14 +114,14 @@ audits. A worker that finds work outside its task reports it to the orchestrator
 
 Covered defects, infra and refactors take the short `Problem / Expected / Proof` route in
 task-flow.md, linking the existing spec/issue; no duplicate card, research or wave plan. A small
-fix (reviews.md, Routing) takes the same route with no card even where no spec covers it yet: its
+fix (reviews.md, Small fix) takes the same route with no card even where no spec covers it yet: its
 `Spec:` line names the nearest story spec, and the missing criterion is written in the next Tiden
 maintenance window. Other new capabilities or changed product criteria keep intake below. Real access/data/live-action and
 owner gates apply equally to both routes.
 
 1. **Triage.** Search Tiden main and open branches. A match, merged or not, is updated, not
    duplicated. A new feature or epic idea from agents (feedback, audits, triage or any other
-   source) is written as a draft without asking the owner first (owner 10-26): its reviews make
+   source) is written as a draft without asking the owner first (owner 10-26): its self-check makes
    it ready, and nothing builds before that; which features to build is not an owner question.
    A candidate declined at triage or step 3 gets its reason at its source; for agent feedback,
    the triage's dispositions file (per feedback ID: status, matched card or duplicate-of, reason),
@@ -130,16 +130,13 @@ owner gates apply equally to both routes.
    capability, infrastructure and main research, Opus medium for defects and small improvements
    with clear evidence, Sonnet for simple ones. Value, Effort, Score and Depends on come last, from the written
    description: no estimate for an undescribed task, no list of estimates for approval first.
-3. **Review** (process.md section 5; owner 11-09): a big product epic, and a product card on
-   a review path (sends/calls, collector sessions, user-data deletion/rewrite, access/secrets/CI
-   permissions), one Fable round with the product-manager prompt, which also checks `How others
-   solve it` (adopt | adapt | build, sized to the task) and whether the card should be split; no
-   recheck, no Astra or Sol card round (reviews.md, Card review). Every other card: the author's
-   self-check. Production operation plans: one round, none for a tested runbook (reviews.md,
-   Rounds 7). The reviewer first judges whether the card should exist and may shrink or reject it.
-4. **Ready.** Clean step-3 reviews make a card ready; no acceptance follows (owner 10-26: the
-   owner's request, direct or through an agent or MCP, is the need). The writer fills `Ready:` from
-   the reviews' verdicts and runs the ready merge. A ready feature or epic card counts as
+3. **Self-check** (process.md section 5; owner 11-11): no card goes to a model for a second look. The writer
+   runs the self-check in Writing a card or spec text, checks `How others solve it` (adopt | adapt |
+   build, sized to the task) and whether the card should be split, first judges whether the card
+   should exist, and may shrink or reject it.
+4. **Ready.** A card that passed the step-3 self-check is ready; no acceptance follows (owner 10-26:
+   the owner's request, direct or through an agent or MCP, is the need). The writer fills `Ready:`
+   with the date and the self-check and runs the ready merge. A ready feature or epic card counts as
    owner-asked, whatever its step-1 source.
 5. **Queue.** Current breakages and deadlines first; then by Score, with the project's share
    rules (its AGENTS.md or workflow document); where it sets none, about 70% product and 30%
@@ -163,7 +160,7 @@ Evidence to close: <tests and checks; any separately authorized live action>
 Value: <1|2|3|5|8>   Effort: <1|2|3|5|8; 13 and 21 only before the split>   Score: <Value / Effort, two decimals>
 History: <legacy identity, related specs, feedback IDs, source/PR links, as-of SHA>
 How others solve it: <open-source projects or standards; adopt | adapt | build, and why>
-Ready: <date>, <reviews and verdicts>; asked by <owner, date | agent or MCP relaying the owner | source>
+Ready: <date>, <self-check>; asked by <owner, date | agent or MCP relaying the owner | source>
 ```
 
 A card that changes a schema splits its migrations (owner 10-30): the expand part (tables,
@@ -171,7 +168,7 @@ columns, indexes, grants on objects the same change creates) in its own migratio
 unattended autodeploy; backfills, triggers, grants on existing objects and a `CONCURRENTLY`
 index the runner cannot apply in a separate one, released at once (by hand where the tool
 cannot; no backup, window or freeze unless it deletes or rewrites user data, process.md section
-2). Role SQL, grants included, keeps its Astra r1. `Expected paths:` names both
+2). `Expected paths:` names both
 migrations, `Evidence to close:` the production deploy of each.
 
 Categories: defect = current behaviour breaks a contract or spec; feature = a new owner-visible
@@ -223,17 +220,16 @@ intake; an agent's idea stays a draft (Card intake step 1).
   its directory and leaves the first orchestrator's STATE.md.
   Then a writer worker (`research-vision-<slug>`, Opus high) drafts VISION.md in the project
   repository from templates/VISION.md and the file; each direction line traces to an owner
-  answer. The PR is AUTO+review: one Fable round on the draft and the owner's answers only (each
-  line traced, Not in scope concrete, each stage with an observable sign), no Codex. The
-  writer merges after that round: the ritual's answers are the owner's review, with no separate
-  yes (owner 10-27); the digest FYI names the problem, for whom, Not in scope, the stages and
-  which stage gets cards now. A later VISION.md PR is AUTO+review with one Fable round;
-  one changing who it is for, what we build or Not in scope quotes the owner's words, one
+  answer. The PR is AUTO: the writer checks the draft against the owner's answers only (each
+  line traced, Not in scope concrete, each stage with an observable sign) and merges: the
+  ritual's answers are the owner's sign-off, with no separate yes (owner 10-27); the digest FYI
+  names the problem, for whom, Not in scope, the stages and which stage gets cards now. A later
+  VISION.md PR is AUTO; one changing who it is for, what we build or Not in scope quotes the owner's words, one
   changing the stages quotes the merged epics or decisions behind the change.
 - **B6 Plan.** The first stage goes to Planning an ask (Card intake when it is one card) with
   VISION.md and the file in the planner's or writer's brief; P1's lens subagents and P2 run only
   for what the vision leaves open. Each epic's Problem cites its VISION.md stage as source; P4's
-  Fable round gets VISION.md. A later stage is planned in its turn, so its cards do not go stale.
+  self-check reads VISION.md. A later stage is planned in its turn, so its cards do not go stale.
 - **B7 Refresh.** Weekly (a wake automation, orchestration.md, Wake-ups) where VISION.md exists,
   when a large ask goes to Planning an ask, and at P7 Close, a Sonnet subagent compares VISION.md
   with merged epics, open cards and owner decisions since. No drift is one log line; other drift
@@ -263,13 +259,12 @@ the planner the rest.
 - **P2 Owner decisions.** Only a product-direction fork the ask leaves open: one decision brief
   (orchestration.md, Owner asks) sent as a question to the orchestrator, who relays it and logs
   the answer; one follow-up round at most; the planner waits or restarts (orchestration.md,
-  Sessions). Technical choices go to the reviewers; whether to build is not asked (step 1).
+  Sessions). Technical choices are the agents' own; whether to build is not asked (step 1).
 - **P3 Cards.** On one proposal branch: an epic with Problem, `Not in scope:` and the owner's
   decisions quoted; stories of at most 8 SP, one PR each, with the step-2 fields. Open refactor and
   defect cards on the same paths go into the epic's `History:` for the refactor slot of the wave
   before the story that shares them (or as its Depends on).
-- **P4 Reviews.** Step 3: one Fable round on a big epic with its stories (split check; VISION.md
-  where it exists), no recheck; self-check on the rest.
+- **P4 Self-check.** Step 3 on the epic with its stories (split check; VISION.md where it exists).
 - **P5 Ready and waves.** The ready merge (below). Then the orchestrator's waves: the backlog table
   (`backlog pull` where Estimates is on, orchestration.md; else one it writes in the same shape,
   plan-check.sh header) gets lane and paths columns from each story's `Lane:` and `Expected paths:`
@@ -302,18 +297,18 @@ split-off cards as new drafts on a new branch and deletes them from the unmerged
 never on main is no card for process.md section 2). A project with sync B but no job merges by hand
 in a batched maintenance window; one without sync B, by hand (differences.md). A card written by the
 PR that builds it (one story under a parent on main) skips the merge: the PR names its branch and
-the writer fills `Ready:` from its reviews.
+the writer fills `Ready:` from its self-check.
 
 A PR on a ready card names its stories on main and no proposal branch, so check A never meets an
 Epic, a Feature or another card in a preview. A later criterion edit goes on a
 `review/<name>` branch: the PR's own while coding, merged by sync B; before work starts, one
-reviewed like the card, refreshing `Ready:`, and merged by the job. Check A also enforces the order:
+checked like the card, refreshing `Ready:`, and merged by the job. Check A also enforces the order:
 it fails a story that is neither on main nor on the named branch. Weakening a criterion: Specs and statuses.
 
 ### Writing a card or spec text
 
 Self-check before every submission and after every fix; record it in the card's research note
-(process-diet 2026-10-18: these rules prevent most review findings):
+(process-diet 2026-10-18: these rules prevent most card rework):
 
 1. Code facts: every claim about existing code, schema, limits or tests cites `file:line` or the
    command run; trace each new job/artifact through every existing consumer.
@@ -342,7 +337,7 @@ test, and never start a provider session or weaken redaction to diagnose one.
 A worker runs `tiden intent skip` and reads the card and the `product-context` skill's answer before code; it
 opens no `intent/` branch. Tiden changes in step with each PR: the PR's proposal or review
 branch carries the spec text it changes (a card it writes, every criterion edit or flag made while
-coding, the settle text); the PR names it as `Tiden branch:`, the reviewers read it with the diff, check A reads its specs and compares
+coding, the settle text); the PR names it as `Tiden branch:`, check A reads its specs and compares
 its merge preview with the `Spec:`/`Delivers:` lines, and sync B merges it right after the squash, so the
 spec text is current at merge. One `main` push can carry several squashes (a merge-queue group or a
 batch): a project that groups or batches makes B merge the Tiden branch of every squash in the push's
@@ -353,7 +348,7 @@ merging agent does them without a window (orchestration.md, Pre-production mode)
 
 Every PR description carries `Spec impact:` (the `Spec:` and `Delivers:` IDs, each with its
 flags, such as a criterion deferred or not built, and the anchors it adds, or `none`) and
-`Settle text:` (`none`, or a reviewer copy of the settle text on the PR's `Tiden branch:`).
+`Settle text:` (`none`, or a copy of the settle text on the PR's `Tiden branch:`).
 A PR whose changed files all fall inside the project's anchor-exempt paths (`*.md`, `docs/`, `.claude/`,
 tests, lockfiles: for example an `EXCLUDED` list in `scripts/tiden_drift.py`) has no `Spec:` line, `Spec impact: none`
 and `Settle text: none`; tests it adds still carry their `spec:` markers. A `Spec:` or `Delivers:` line holds
@@ -380,7 +375,7 @@ still counts files and specs merged in from main; probe 10-24), and each settles
 timeout or a finding left open; a failure restarts the count. The orchestrator reports the
 trial's start and result in the digest, and the loop returns with that report.
 
-Criteria change only through a card's branch reviewed with its PR or by the ready-merge job;
+Criteria change only through a card's branch merged with its PR or by the ready-merge job;
 no daily delta audit runs.
 
 ## Commands (CLI 0.43.0)
@@ -413,7 +408,7 @@ A merge-preview reader ignores a key it does not know only with a warning naming
 naming the key; never silently. Server-side keys appear on every CLI version (`autoMerge`, Tiden
 scheduling its own merge of an intent branch); CLI 0.41 adds `testDuplicates` (tests already on
 main, omitted when empty; the merge copies them, so delete them on the branch first). A non-null
-`autoMerge` or a non-empty `testDuplicates` is a finding in check A or the hand review, never a
+`autoMerge` or a non-empty `testDuplicates` is a finding in check A or the hand check, never a
 pass. `autoMerge` does not see a merge made through a GitHub merge queue (it reports
 `no_merged_pr` on a merged PR); a project with a merge queue does not rely on it, and the
 orchestrator closes such a branch by hand (next paragraph).
@@ -443,7 +438,7 @@ pin: never run it. `tiden setup` and `permissions` rewrite skills, hooks and
 `~/.claude/settings.json` allow rules; an agent runs them only after a pin bump merges and the
 binary is on the pin (Tiden CLI version, below): it copies those files to its scratchpad first,
 diffs them afterwards and puts the old allow rules back at once; a new allow rule returns only
-after Astra r1 (process.md section 2). Then `tiden-version.sh check`.
+under process.md section 2 (backup, read-back, undo). Then `tiden-version.sh check`.
 
 ### Tiden CLI version
 
@@ -494,8 +489,7 @@ TIDEN_CLI_SHA256_linux_arm64=ca896b51d7a48f0d1660104211d4ac6542db743ac0f47a0ce99
   <to>` and the smoke is rerun. No `tiden upgrade` before the pin PR merges. The harness orchestrator
   reads the release notes for removed or changed flags, then bumps the pin by PR with the
   checksum of each platform the pin covers (`PLATFORMS` in bin/tiden-version.sh; not every line of
-  `checksums.txt`); the PR body quotes the smoke's OK lines and the notes check, and
-  its reviewer refuses it without them. After the merge it moves the local binary and sends every
+  `checksums.txt`); the PR body quotes the smoke's OK lines and the notes check. After the merge it moves the local binary and sends every
   project's orchestrator one ask. A failed smoke keeps the pin; the digest names the command.
 - A project's orchestrator, on the ask: a pinned-copy refresh PR (README, How a project consumes
   it) merged the same day, then a reply with its squash SHA. A refresh that cannot merge that day
