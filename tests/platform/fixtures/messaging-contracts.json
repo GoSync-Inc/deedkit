@@ -57,8 +57,34 @@
         "openWorldHint": true,
         "readOnlyHint": true
       },
-      "description": "Render an authorized draft without sending or queuing.\n\nPass exactly one recipient: chat_id (archive ID), phone (native WhatsApp: E.164\nwith or without +, or a @c.us/@s.whatsapp.net JID) or username (Telegram: @name of a\nperson or a bot, not a channel or group). A chat_id preview contacts no\nprovider and requires read permission for the account/chat and any reply target,\nwith no sending-policy or connected-collector requirement. A phone preview\ncontacts the provider: it does one open_chat_by_phone lookup (send key, full\naccount, the operation enabled; shared hourly quota), writes no chat and returns\non_whatsapp, verified_name, chat_existed, chats_on_other_accounts and a digest\nbound to the number and its WhatsApp identity, valid 10 minutes. A username preview\nlikewise does one open_chat_by_username lookup at Telegram (own hourly quota) and returns\nusername, user_id, name, is_bot, chat_existed and a digest bound to the resolved user ID, valid\n10 minutes. Returns visible/wire text,\nstructured entities, warnings, link destinations, UTF-16 lengths, renderer\nversion and a preview_digest bound to this principal, scope and exact payload.\nThe digest is not owner approval. Explicitly review lossy conversions before\nallowing them. To send rich content, use these SAME source/format/policy/target\nvalues and digest after obtaining exact owner confirmation. No automatic splitting.\n",
+      "description": "Render an authorized draft without sending or queuing.\n\nPass exactly one recipient: chat_id (archive ID), phone (native WhatsApp: E.164\nwith or without +, or a @c.us/@s.whatsapp.net JID) or username (Telegram: @name of a\nperson or a bot, not a channel or group). A chat_id preview contacts no\nprovider (with mentions: one list_participants read) and requires read permission for the account/chat and any reply target,\nwith no sending-policy or connected-collector requirement. A phone preview\ncontacts the provider: it does one open_chat_by_phone lookup (send key, full\naccount, the operation enabled; shared hourly quota), writes no chat and returns\non_whatsapp, verified_name, chat_existed, chats_on_other_accounts and a digest\nbound to the number and its WhatsApp identity, valid 10 minutes. A username preview\nlikewise does one open_chat_by_username lookup at Telegram (own hourly quota) and returns\nusername, user_id, name, is_bot, chat_existed and a digest bound to the resolved user ID, valid\n10 minutes. Returns visible/wire text,\nstructured entities, warnings, link destinations, UTF-16 lengths, renderer\nversion and a preview_digest bound to this principal, scope and exact payload.\nThe digest is not owner approval. Explicitly review lossy conversions before\nallowing them. To send rich content, use these SAME source/format/policy/target\nvalues and digest after obtaining exact owner confirmation. No automatic splitting.\n",
       "inputSchema": {
+        "$defs": {
+          "Mention": {
+            "additionalProperties": false,
+            "properties": {
+              "length": {
+                "title": "Length",
+                "type": "integer"
+              },
+              "offset": {
+                "title": "Offset",
+                "type": "integer"
+              },
+              "sender": {
+                "title": "Sender",
+                "type": "string"
+              }
+            },
+            "required": [
+              "sender",
+              "offset",
+              "length"
+            ],
+            "title": "Mention",
+            "type": "object"
+          }
+        },
         "additionalProperties": false,
         "properties": {
           "account": {
@@ -89,6 +115,21 @@
             "default": false,
             "title": "Link Preview",
             "type": "boolean"
+          },
+          "mentions": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/$defs/Mention"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Group chat_id sends: @-mention members, up to 20 {sender, offset, length}. sender is an archive sender ID (search_people sender_id, a message sender); offset and length count UTF-16 code units of text, as formatting entities do, and mark the span shown as the mention (for example \"@Anna\"). The member is notified as when the owner mentions them in the app. Telegram links the span to the user; WhatsApp (native adapter) replaces it with @<number> and the phone shows the name. preview_message checks membership (a list_participants read, else the archive: membership_basis) and returns mentions_notified, so show it to the owner; its preview_digest binds the mentions. Errors queue nothing: mention_out_of_range, mention_overlap, mentions_not_group, mention_not_member, mention_unresolvable, mentions_unsupported, mentions_conflict (with menu_choice).",
+            "title": "Mentions"
           },
           "menu_choice": {
             "anyOf": [
@@ -160,6 +201,32 @@
       },
       "description": "Send exact confirmed content using this account's existing collector.\n\nFor rich formatting or nondefault policies, call preview_message first and\npass its matching preview_digest. Show account, recipient, visible text,\nformatting, warnings, link destinations and reply target to the owner and\nobtain explicit confirmation. Digest is not approval. Requires send permission\nand operator opt-in. plain remains the default and native WhatsApp delimiters\ncan still be interpreted by WhatsApp.\nchat_id/reply_to are archive IDs; account must be explicit. request_id is a\nunique 8\u2013128 character key for this approved action; reuse it after network\nfailure with the SAME payload. queued is not sent. Poll get_send_status.\nsent means provider accepted, not recipient read/delivered; a sent result adds\nmessenger_reports (receipt levels this chat can report) and receipt_state. unknown must be\nchecked against history before any newly approved send. Text only, provider\npayload at most 4000 UTF-16 units; source at most 16000 units subject to the\n16384-byte HTTP JSON envelope. No splitting or server human-approval gate.\nPass exactly one recipient, chat_id, phone or username. A new WhatsApp number: preview_message\nwith phone, then send_message with the same phone and that preview_digest; it opens\nor reuses the chat with no second lookup and returns chat_id, chat_existed and\nverified_name. status opening_chat: repeat with the same request_id. A changed\nidentity or expired digest asks for a new preview. Opening the chat without a message\nstays execute_messenger_operation operation open_chat_by_phone. A Telegram @username\nwith no chat: preview_message with username, then send_message with the same username\nand that preview_digest; the send resolves the username again and refuses a different\nperson (identity_changed), then returns chat_id, chat_existed, user_id and name.\nOptional guard, chat_id sends with read on the chat: expected_last_message_id is the archive ID of the\nnewest message you actually read (never one from a preview). If newer eligible messages reached the archive,\nnothing is queued and the call is refused chat_changed_since_seen (409) with newer_count,\nnewer_outgoing_count, first_newer_message_id, newest_message_id and a next_call that reads them: read, then\ndecide again. guard any_message (default) counts any newer visible message, your own earlier send included;\noutgoing_only counts only the owner's. A retry with the same request_id returns the first result. The guard\nsees only the archive at that moment and cannot close the race\nbefore the provider send. An unknown ID or a phone/username\nrecipient is invalid_parameters expected_message_unknown; chat_guard_unavailable (503) queued nothing.\nAfter a lost response use get_send_status with request_id.\nSame content to the same chat while your earlier send is queued, dispatching or unknown (60 min):\nduplicate_send_unresolved (409); see allow_duplicate.\n",
       "inputSchema": {
+        "$defs": {
+          "Mention": {
+            "additionalProperties": false,
+            "properties": {
+              "length": {
+                "title": "Length",
+                "type": "integer"
+              },
+              "offset": {
+                "title": "Offset",
+                "type": "integer"
+              },
+              "sender": {
+                "title": "Sender",
+                "type": "string"
+              }
+            },
+            "required": [
+              "sender",
+              "offset",
+              "length"
+            ],
+            "title": "Mention",
+            "type": "object"
+          }
+        },
         "additionalProperties": false,
         "properties": {
           "account": {
@@ -228,6 +295,21 @@
             "default": false,
             "title": "Link Preview",
             "type": "boolean"
+          },
+          "mentions": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/$defs/Mention"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Group chat_id sends: @-mention members, up to 20 {sender, offset, length}. sender is an archive sender ID (search_people sender_id, a message sender); offset and length count UTF-16 code units of text, as formatting entities do, and mark the span shown as the mention (for example \"@Anna\"). The member is notified as when the owner mentions them in the app. Telegram links the span to the user; WhatsApp (native adapter) replaces it with @<number> and the phone shows the name. preview_message checks membership (a list_participants read, else the archive: membership_basis) and returns mentions_notified, so show it to the owner; its preview_digest binds the mentions. Errors queue nothing: mention_out_of_range, mention_overlap, mentions_not_group, mention_not_member, mention_unresolvable, mentions_unsupported, mentions_conflict (with menu_choice).",
+            "title": "Mentions"
           },
           "menu_choice": {
             "anyOf": [

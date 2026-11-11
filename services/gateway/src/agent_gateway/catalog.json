@@ -56,7 +56,7 @@
       "openWorldHint": true,
       "readOnlyHint": true
     },
-    "description": "Render an authorized draft without sending or queuing.\n\nPass exactly one recipient: chat_id (archive ID), phone (native WhatsApp: E.164\nwith or without +, or a @c.us/@s.whatsapp.net JID) or username (Telegram: @name of a\nperson or a bot, not a channel or group). A chat_id preview contacts no\nprovider and requires read permission for the account/chat and any reply target,\nwith no sending-policy or connected-collector requirement. A phone preview\ncontacts the provider: it does one open_chat_by_phone lookup (send key, full\naccount, the operation enabled; shared hourly quota), writes no chat and returns\non_whatsapp, verified_name, chat_existed, chats_on_other_accounts and a digest\nbound to the number and its WhatsApp identity, valid 10 minutes. A username preview\nlikewise does one open_chat_by_username lookup at Telegram (own hourly quota) and returns\nusername, user_id, name, is_bot, chat_existed and a digest bound to the resolved user ID, valid\n10 minutes. Returns visible/wire text,\nstructured entities, warnings, link destinations, UTF-16 lengths, renderer\nversion and a preview_digest bound to this principal, scope and exact payload.\nThe digest is not owner approval. Explicitly review lossy conversions before\nallowing them. To send rich content, use these SAME source/format/policy/target\nvalues and digest after obtaining exact owner confirmation. No automatic splitting.\n",
+    "description": "Render an authorized draft without sending or queuing.\n\nPass exactly one recipient: chat_id (archive ID), phone (native WhatsApp: E.164\nwith or without +, or a @c.us/@s.whatsapp.net JID) or username (Telegram: @name of a\nperson or a bot, not a channel or group). A chat_id preview contacts no\nprovider (with mentions: one list_participants read) and requires read permission for the account/chat and any reply target,\nwith no sending-policy or connected-collector requirement. A phone preview\ncontacts the provider: it does one open_chat_by_phone lookup (send key, full\naccount, the operation enabled; shared hourly quota), writes no chat and returns\non_whatsapp, verified_name, chat_existed, chats_on_other_accounts and a digest\nbound to the number and its WhatsApp identity, valid 10 minutes. A username preview\nlikewise does one open_chat_by_username lookup at Telegram (own hourly quota) and returns\nusername, user_id, name, is_bot, chat_existed and a digest bound to the resolved user ID, valid\n10 minutes. Returns visible/wire text,\nstructured entities, warnings, link destinations, UTF-16 lengths, renderer\nversion and a preview_digest bound to this principal, scope and exact payload.\nThe digest is not owner approval. Explicitly review lossy conversions before\nallowing them. To send rich content, use these SAME source/format/policy/target\nvalues and digest after obtaining exact owner confirmation. No automatic splitting.\n",
     "inputSchema": {
       "properties": {
         "account": {
@@ -133,6 +133,21 @@
           ],
           "description": "Telegram chat_id sends: true delivers without a notification sound (the recipient sees the message, their phone stays quiet), for example late in the evening. It is part of the preview: preview_message with silent true shows silent: true and its preview_digest binds it, so send with the same silent. WhatsApp has no silent send: silent_unsupported, nothing queued. Phone and username recipients: silent_unsupported or invalid_parameters; preview the archived chat_id instead. Omitted or false is the usual send with sound.",
           "title": "Silent"
+        },
+        "mentions": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Mention"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Group chat_id sends: @-mention members, up to 20 {sender, offset, length}. sender is an archive sender ID (search_people sender_id, a message sender); offset and length count UTF-16 code units of text, as formatting entities do, and mark the span shown as the mention (for example \"@Anna\"). The member is notified as when the owner mentions them in the app. Telegram links the span to the user; WhatsApp (native adapter) replaces it with @<number> and the phone shows the name. preview_message checks membership (a list_participants read, else the archive: membership_basis) and returns mentions_notified, so show it to the owner; its preview_digest binds the mentions. Errors queue nothing: mention_out_of_range, mention_overlap, mentions_not_group, mention_not_member, mention_unresolvable, mentions_unsupported, mentions_conflict (with menu_choice).",
+          "title": "Mentions"
         }
       },
       "required": [
@@ -141,7 +156,33 @@
       ],
       "type": "object",
       "title": "preview_messageArguments",
-      "additionalProperties": false
+      "additionalProperties": false,
+      "$defs": {
+        "Mention": {
+          "additionalProperties": false,
+          "properties": {
+            "length": {
+              "title": "Length",
+              "type": "integer"
+            },
+            "offset": {
+              "title": "Offset",
+              "type": "integer"
+            },
+            "sender": {
+              "title": "Sender",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sender",
+            "offset",
+            "length"
+          ],
+          "title": "Mention",
+          "type": "object"
+        }
+      }
     },
     "name": "messages_preview_message",
     "outputSchema": {
@@ -2790,6 +2831,21 @@
           ],
           "description": "Telegram chat_id sends: true delivers without a notification sound (the recipient sees the message, their phone stays quiet), for example late in the evening. It is part of the preview: preview_message with silent true shows silent: true and its preview_digest binds it, so send with the same silent. WhatsApp has no silent send: silent_unsupported, nothing queued. Phone and username recipients: silent_unsupported or invalid_parameters; preview the archived chat_id instead. Omitted or false is the usual send with sound.",
           "title": "Silent"
+        },
+        "mentions": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Mention"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Group chat_id sends: @-mention members, up to 20 {sender, offset, length}. sender is an archive sender ID (search_people sender_id, a message sender); offset and length count UTF-16 code units of text, as formatting entities do, and mark the span shown as the mention (for example \"@Anna\"). The member is notified as when the owner mentions them in the app. Telegram links the span to the user; WhatsApp (native adapter) replaces it with @<number> and the phone shows the name. preview_message checks membership (a list_participants read, else the archive: membership_basis) and returns mentions_notified, so show it to the owner; its preview_digest binds the mentions. Errors queue nothing: mention_out_of_range, mention_overlap, mentions_not_group, mention_not_member, mention_unresolvable, mentions_unsupported, mentions_conflict (with menu_choice).",
+          "title": "Mentions"
         }
       },
       "required": [
@@ -2799,7 +2855,33 @@
       ],
       "type": "object",
       "title": "send_messageArguments",
-      "additionalProperties": false
+      "additionalProperties": false,
+      "$defs": {
+        "Mention": {
+          "additionalProperties": false,
+          "properties": {
+            "length": {
+              "title": "Length",
+              "type": "integer"
+            },
+            "offset": {
+              "title": "Offset",
+              "type": "integer"
+            },
+            "sender": {
+              "title": "Sender",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sender",
+            "offset",
+            "length"
+          ],
+          "title": "Mention",
+          "type": "object"
+        }
+      }
     },
     "name": "messages_send_message",
     "outputSchema": {

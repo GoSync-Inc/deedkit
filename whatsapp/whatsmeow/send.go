@@ -61,6 +61,8 @@ type textRequest struct {
 	LinkPreview     *bool   `json:"link_preview,omitempty"`
 	// ANYM-837: answer the menu ReplyProviderID names with a structured reply.
 	MenuChoice *menuChoiceRequest `json:"menu_choice,omitempty"`
+	// ANYM-928: group members the text @-mentions; each @<user part> is already in Text.
+	Mentions []string `json:"mentions,omitempty"`
 }
 
 func decodeStrict(raw json.RawMessage, value any) error {
@@ -168,6 +170,10 @@ func sendText(ctx context.Context, req textRequest, d sendDependencies) (any, er
 		return nil, errors.New("link_preview_unsupported")
 	}
 	to, _ := ParseChatID(req.Chat)
+	mentioned, err := mentionedJIDs(req, to)
+	if err != nil {
+		return nil, err
+	}
 	message := &waE2E.Message{Conversation: proto.String(req.Text)}
 	if req.MenuChoice != nil {
 		// The reply re-reads the newest captured menu; every refusal comes before
@@ -189,10 +195,49 @@ func sendText(ctx context.Context, req textRequest, d sendDependencies) (any, er
 		}
 		message = &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: proto.String(req.Text), ContextInfo: messageKey(quoted)}}
 	}
+	if len(mentioned) > 0 {
+		// The phone renders each @<user part> as the member's name and notifies them; a reply keeps its quote.
+		if message.ExtendedTextMessage == nil {
+			message = &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: proto.String(req.Text)}}
+		}
+		if message.ExtendedTextMessage.ContextInfo == nil {
+			message.ExtendedTextMessage.ContextInfo = &waE2E.ContextInfo{}
+		}
+		message.ExtendedTextMessage.ContextInfo.MentionedJID = mentioned
+	}
 	if err := check(); err != nil {
 		return nil, err
 	}
 	return sendAndCaptureReceipt(ctx, d, to, message)
+}
+
+// mentionedJIDs validates a send's mentions (ANYM-928): at most 20 distinct person JIDs of a group send without a
+// menu choice, each with its @<user part> in the text. Every refusal comes before the send.
+func mentionedJIDs(req textRequest, to types.JID) ([]string, error) {
+	if req.Mentions == nil {
+		return nil, nil
+	}
+	if len(req.Mentions) == 0 || len(req.Mentions) > 20 || req.MenuChoice != nil || to.Server != types.GroupServer {
+		return nil, errors.New("send_target_invalid")
+	}
+	result := []string{}
+	seen := map[string]bool{}
+	for _, value := range req.Mentions {
+		j, err := ParseChatID(value)
+		if err != nil || (j.Server != types.DefaultUserServer && j.Server != types.HiddenUserServer) || seen[j.String()] ||
+			!mentionTokenPattern(j.User).MatchString(req.Text) {
+			return nil, errors.New("send_target_invalid")
+		}
+		seen[j.String()] = true
+		result = append(result, j.String())
+	}
+	return result, nil
+}
+
+// mentionTokenPattern finds @<user> apart from a word or @ before it and a digit after it; a formatting delimiter
+// (WhatsApp italics `_`, bold `*`) may touch it, as the server's preview allows (ANYM-928, Astra r1).
+func mentionTokenPattern(user string) *regexp.Regexp {
+	return regexp.MustCompile(`(^|[^0-9A-Za-z@])@` + regexp.QuoteMeta(user) + `($|[^0-9])`)
 }
 
 // menuAnswerFixture runs one send_text with menu_choice through sendText

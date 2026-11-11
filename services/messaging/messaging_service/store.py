@@ -509,20 +509,22 @@ class Store:
         return capabilities(self, token, detail, sections)
 
     def preview_message(self,token,account,chat_id,text,reply_to='',format='plain',
-                        link_preview=False,allow_lossy=False,menu_choice=None,silent=False):
+                        link_preview=False,allow_lossy=False,menu_choice=None,silent=False,mentions=None):
         from .outgoing import preview
         with self.authorized(token,'preview_message') as (c,p):
-            return preview(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,menu_choice=menu_choice,silent=silent)
+            return preview(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,menu_choice=menu_choice,silent=silent,
+                           mentions=mentions)
 
     def send_message(self,token,account,chat_id,text,request_id,reply_to='',format='plain',
                      preview_digest='',link_preview=False,allow_lossy=False,
                      expected_last_message_id=None,guard=None,allow_duplicate=None,duplicate_guard=False,menu_choice=None,
-                     silent=False):
+                     silent=False,mentions=None):
         from .outgoing import enqueue
         with self.authorized(token,'send_message') as (c,p):
             return enqueue(c,p,account,chat_id,text,request_id,reply_to,format,
                 preview_digest,link_preview,allow_lossy,expected_last_message_id=expected_last_message_id,guard=guard,
-                duplicate_guard=duplicate_guard,allow_duplicate=allow_duplicate,menu_choice=menu_choice,silent=silent)
+                duplicate_guard=duplicate_guard,allow_duplicate=allow_duplicate,menu_choice=menu_choice,silent=silent,
+                mentions=mentions)
 
     # ANYM-532: a phone recipient; phone_send.preview and phone_send.send wait between these short reads.
     def phone_preview_lookup(self,token,account,phone,text,reply_to='',format='plain',

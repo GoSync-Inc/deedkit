@@ -136,6 +136,84 @@ func TestNativeTextChecksRevocationAfterResolvingReply(t *testing.T) {
 	requireError(t, err, "sending_disabled")
 }
 
+// spec: ANYM-928
+func TestNativeTextMentionsSetMentionedJIDOnTheWireTextAndKeepTheQuote(t *testing.T) {
+	d := sendFake(t)
+	var wires []*waE2E.Message
+	d.send = func(_ context.Context, to types.JID, wire *waE2E.Message, extra whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+		wires = append(wires, wire)
+		return whatsmeow.SendResponse{ID: extra.ID, Timestamp: time.Unix(1700000000, 0), Chat: to, Sender: d.owner}, nil
+	}
+	r := textFixture()
+	r.Chat, r.Text = operationsGroup, "Привет, @15559876543 и @123456789012345!"
+	r.Mentions = []string{"15559876543@c.us", "123456789012345@lid"}
+	if _, err := sendText(context.Background(), r, d); err != nil {
+		t.Fatal(err)
+	}
+	quoted := operationMessage(operationsGroup, "QUOTED", false, 1600000000)
+	r.ReplyProviderID = LegacyMessageID(quoted)
+	d.get = func(chat, id string) (*events.Message, error) { return quoted, nil }
+	if _, err := sendText(context.Background(), r, d); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"15559876543@s.whatsapp.net", "123456789012345@lid"}
+	for i, wire := range wires {
+		text := wire.GetExtendedTextMessage()
+		if wire.GetConversation() != "" || text.GetText() != r.Text || strings.Join(text.GetContextInfo().GetMentionedJID(), ",") != strings.Join(want, ",") {
+			t.Fatalf("send %d: wrong mention wire %v", i, wire)
+		}
+		if (i == 1) != (text.GetContextInfo().GetStanzaID() == "QUOTED") {
+			t.Fatalf("send %d: quote changed", i)
+		}
+	}
+	if len(wires) != 2 {
+		t.Fatalf("want 2 sends, got %d", len(wires))
+	}
+	// A mention inside WhatsApp italics or bold: the delimiter touching the token is formatting, not a word.
+	r.ReplyProviderID, r.Text = "", "_@15559876543_ и *@123456789012345*"
+	if _, err := sendText(context.Background(), r, d); err != nil || len(wires) != 3 {
+		t.Fatalf("formatted mention refused: %v", err)
+	}
+}
+
+// spec: ANYM-928
+func TestNativeTextMentionsRefuseBeforeAnySend(t *testing.T) {
+	many := []string{}
+	for i := 0; i < 21; i++ {
+		many = append(many, fmt.Sprintf("1555000%04d@c.us", i))
+	}
+	for name, modify := range map[string]func(*textRequest){
+		"private_chat":  func(r *textRequest) { r.Chat = operationsChat },
+		"missing_token": func(r *textRequest) { r.Text = "Привет, 15559876543" },
+		"joined_token":  func(r *textRequest) { r.Text = "mail@15559876543" },
+		"longer_number": func(r *textRequest) { r.Text = "Hi @155598765430" },
+		"group_jid":     func(r *textRequest) { r.Mentions = []string{operationsGroup} },
+		"device_jid":    func(r *textRequest) { r.Mentions = []string{"15559876543:2@c.us"} },
+		"duplicate":     func(r *textRequest) { r.Mentions = []string{"15559876543@c.us", "15559876543@c.us"} },
+		"empty":         func(r *textRequest) { r.Mentions = []string{} },
+		"too_many":      func(r *textRequest) { r.Mentions = many },
+		"menu_choice":   func(r *textRequest) { r.MenuChoice = &menuChoiceRequest{} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			d := sendFake(t)
+			d.send = func(context.Context, types.JID, *waE2E.Message, whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+				t.Fatal("an invalid mention reached the provider")
+				return whatsmeow.SendResponse{}, nil
+			}
+			r := textFixture()
+			r.Chat, r.Text, r.Mentions = operationsGroup, "Hi @15559876543", []string{"15559876543@c.us"}
+			modify(&r)
+			_, err := sendText(context.Background(), r, d)
+			requireError(t, err, "send_target_invalid")
+		})
+	}
+	var raw json.RawMessage = []byte(`{"chat":"` + operationsGroup + `","text":"Hi @15559876543","expires_at":4102444800,"mentions":["15559876543@c.us"]}`)
+	var req textRequest
+	if decodeStrict(raw, &req) != nil || len(req.Mentions) != 1 {
+		t.Fatal("the Python collector's mentions field does not decode")
+	}
+}
+
 // menuFixture is a bot's menu message in operationsChat with the given content.
 func menuFixture(id string, m *waE2E.Message) *events.Message {
 	e := operationMessage(operationsChat, id, false, 1600000000)
