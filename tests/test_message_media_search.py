@@ -113,7 +113,10 @@ def test_media_text_search_off_is_body_only(seeded):
 # spec: ANYM-665
 def test_search_ignores_image_descriptions(seeded):
     s, _, b = seeded
-    voice(s, 'photo-described', filename='photo.jpg', mime='image/jpeg', transcript='Model description of a zeppelin')
+    # ANYM-987: the title and summary of an image never match; its visible text does (tests/test_image_visible_text.py).
+    voice(s, 'photo-described', filename='photo.jpg', mime='image/jpeg', transcript='')
+    with s.pool.connection() as c:
+        c.execute("UPDATE attachment_enrichment SET summary='Model description of a zeppelin' WHERE attachment='photo-described'")
     assert hits(find(s, b, 'zeppelin')) == []
 
 

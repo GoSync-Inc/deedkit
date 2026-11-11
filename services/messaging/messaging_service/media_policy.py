@@ -140,6 +140,14 @@ DESCRIPTION_WAITS=("((left(a.mime,6)='image/' OR "+audio_mime('a.mime')+") AND (
     " WHERE dpp.account=m.account AND dpp.enabled AND dpp.kind=CASE WHEN left(a.mime,6)='image/' THEN 'image'"
     " ELSE 'audio' END)) AND "+DESCRIPTION_SKIPPED+")")
 ENRICHMENT_REASON="CASE WHEN "+DESCRIPTION_WAITS+" THEN "+DESCRIPTION_REASON+" END AS description_reason"
+# ANYM-987: the vision model's visible text of an image attachment `a` is its enrichment row `e`'s text when that row is
+# ready and the text is not blank. The caller's join fences the source (digest and message revision). For an image it
+# takes precedence over the OCR text, which applies only without it. Decided at read time, never stored. No '%' in the
+# text, so it is valid in parameterized and plain statements alike.
+def visible_text_ready(attachment='a',enrichment='e'):
+    return ("(left("+attachment+".mime,6)='image/' AND "+enrichment+".state='ready' AND "
+        +enrichment+r".text_content ~ '\S')")
+VISIBLE_TEXT_READY=visible_text_ready()
 # Columns the policy reads (the worker role files grant exactly these).
 POLICY_COLUMNS=(('chats','id'),('chats','account'),('chats','provider_chat'),('chats','chat_type'),
     ('collector_chats','account'),('collector_chats','provider_chat'),('collector_chats','peer_kind'),

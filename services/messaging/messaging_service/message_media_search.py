@@ -3,7 +3,9 @@
 The media arm is a third source of candidate messages next to the body and the contact card. It reads only the GIN
 indexes the file search already uses (attachment_text 013/016, attachment_enrichment 015) and then rechecks the
 bounded text itself, because the indexed vector also holds the filename and the decoded display name: a filename is
-not extracted text. Image model descriptions never match (ANYM-490). Nothing here grants access: every candidate
+not extracted text. The title and summary of an image never match (ANYM-490); its visible text, the vision model's
+reading of the words printed in it, does (ANYM-987) and takes the place of its OCR text, which matches only for an image
+without visible text. Nothing here grants access: every candidate
 message still passes the caller's scope clauses of the search.
 """
 from __future__ import annotations
@@ -12,7 +14,7 @@ import logging
 import re
 
 from .file_extract import IMAGE_OCR_EXTRACTOR, OCR_LOW_CONFIDENCE, ocr_quality
-from .media_policy import ELIGIBILITY_JOIN
+from .media_policy import ELIGIBILITY_JOIN, visible_text_ready
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +28,11 @@ EVIDENCE_CAP = 20
 # and text read with low OCR confidence ranks last. Body scores keep their scale (cursors stay valid).
 ESCAPE = " ESCAPE E'\\\\'"
 AUDIO = "(a.mime LIKE 'audio/%%' OR a.mime='application/ogg')"
+IMAGE = "left(a.mime,6)='image/'"
+# ANYM-987: the vision text of attachment a is ready in enrichment row `ev`, current for the OCR row's revision `rev`.
+def _vision_of(rev):
+    return ("EXISTS(SELECT 1 FROM attachment_enrichment ev WHERE ev.attachment=a.id AND ev.source_digest=a.digest"
+            " AND ev.source_revision=" + rev + " AND " + visible_text_ready('a', 'ev') + ")")
 assert "'" not in IMAGE_OCR_EXTRACTOR
 # ANYM-669's ocr_quality in SQL: low = image OCR with a counted word and a mean confidence under the threshold.
 LOW = ("(CASE WHEN f.extractor='" + IMAGE_OCR_EXTRACTOR + "' AND jsonb_typeof(f.extraction_metadata->'ocr_words')='number'"
@@ -131,11 +138,11 @@ def ctes(plan, tiered=False):
     voice_rank = _tier(plan, voice) if tiered else '0::bigint'
     sql = ['media_text AS MATERIALIZED (SELECT a.message,f.source_revision,' + LOW + ' AS low,' + text_rank + ' AS relevance FROM attachment_text f'
         ' JOIN attachments a ON a.id=f.attachment AND a.active AND f.source_digest=a.digest AND f.source_filename=a.filename'
-        " AND f.source_mime=a.mime AND f.source_bytes=a.bytes CROSS JOIN search_query q WHERE f.state='ready' AND "
-        + pre_text + ' AND ' + plan.text_predicate(text) +
+        " AND f.source_mime=a.mime AND f.source_bytes=a.bytes CROSS JOIN search_query q WHERE f.state='ready' AND NOT "
+        + _vision_of('f.source_revision') + ' AND ' + pre_text + ' AND ' + plan.text_predicate(text) +
         ' UNION ALL SELECT a.message,e.source_revision,false,' + voice_rank + ' FROM attachment_enrichment e'
         ' JOIN attachments a ON a.id=e.attachment AND a.active AND e.source_digest=a.digest CROSS JOIN search_query q'
-        " WHERE " + AUDIO + " AND e.state='ready' AND " + pre_voice + ' AND ' + plan.text_predicate(voice) + ')']
+        " WHERE (" + AUDIO + ' OR ' + IMAGE + ") AND e.state='ready' AND " + pre_voice + ' AND ' + plan.text_predicate(voice) + ')']
     return sql, [*params_text, *params_voice]
 
 
@@ -199,11 +206,11 @@ def annotate(c, plan, items, flags, *, fuzzy_used):
                 ' FROM ' + pairs + ' JOIN messages m ON m.id=a.message AND m.revision=r.revision AND NOT m.deleted'
                 ' JOIN attachment_text f ON f.attachment=a.id AND f.source_digest=a.digest AND f.source_revision=r.revision'
                 ' AND f.source_filename=a.filename AND f.source_mime=a.mime AND f.source_bytes=a.bytes CROSS JOIN search_query q'
-                " WHERE f.state='ready' AND " + plan.text_predicate(text) +
-                " UNION ALL SELECT a.message,a.id,'transcript'," + _headline(plan, voice) + ',a.digest,a.bytes,NULL,NULL'
+                " WHERE f.state='ready' AND NOT " + _vision_of('r.revision') + ' AND ' + plan.text_predicate(text) +
+                " UNION ALL SELECT a.message,a.id,CASE WHEN " + AUDIO + " THEN 'transcript' ELSE 'visible_text' END," + _headline(plan, voice) + ',a.digest,a.bytes,NULL,NULL'
                 ' FROM ' + pairs + ' JOIN messages m ON m.id=a.message AND m.revision=r.revision AND NOT m.deleted'
                 ' JOIN attachment_enrichment e ON e.attachment=a.id AND e.source_digest=a.digest AND e.source_revision=r.revision'
-                ' CROSS JOIN search_query q WHERE ' + AUDIO + " AND e.state='ready' AND "
+                ' CROSS JOIN search_query q WHERE (' + AUDIO + ' OR ' + IMAGE + ") AND e.state='ready' AND "
                 + plan.text_predicate(voice) + ' ORDER BY 2,3', [*plan.params, ids, revisions, ids, revisions]).fetchall()
         except QueryCanceled as error:
             raise timeout(error)
@@ -223,12 +230,13 @@ def annotate(c, plan, items, flags, *, fuzzy_used):
             elif quality == 'low':
                 entry.update(quality='low', read_more=pointer)
             else:
-                entry.update(snippet=clip(row['snippet']), model_generated=row['source'] == 'transcript', untrusted=True,
+                entry.update(snippet=clip(row['snippet']), model_generated=row['source'] != 'extracted', untrusted=True,
                              read_more=pointer, **({'quality': quality} if quality else {}))
             entries.append(entry)
         sources = {e['source'] for e in entries}
         item['matched_in'] = [name for name, on in (('body', fuzzy_used or body), ('contact', contact),
-            ('extracted', 'extracted' in sources), ('transcript', 'transcript' in sources)) if on]
+            ('extracted', 'extracted' in sources), ('visible_text', 'visible_text' in sources),
+            ('transcript', 'transcript' in sources)) if on]
         if entries:
             item['media_matches'] = entries
             if not (fuzzy_used or body or contact):
