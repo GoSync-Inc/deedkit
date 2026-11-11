@@ -47,6 +47,9 @@ RECEIVER_CODES = frozenset({'backup_receiver_behind'})
 FOLLOW_STATUS = 'follow-status.json'
 # The follow runs an hour after its previous run ends (BACKUP_R2.md, Receiver update follow); a day plus margin.
 FOLLOW_LIMIT_HOURS = 26
+FOLLOW_PROGRESS = 'follow.json'
+# The profiles whose `restore_schema_failed` can only mean a helper older than the bundle.
+LAG_PROFILES = ('messaging', 'recordings')
 # Policy limits from capture, the normal day plus margin (ANYM-807 criterion 6); BACKUP.md, Backup alerts. Calls 30 h, not
 # 36 (11-09): a missed night shows the next morning; the 04:15 catch-up plus 2 h of verification is 29.5 h.
 LIMIT_HOURS = {'messaging': 30, 'calendar': 32, 'recordings': 30, 'calls': 30}
@@ -259,17 +262,35 @@ def halted(path=None):
     return 'deploy_halted.' + (code if code in HALT_CODES else 'other')
 
 
-def receiver_behind(config, now):
-    """`backup_receiver_behind` when a verifier's newest failure is its helper refusing the bundle's schema
-    (`restore_schema_failed`), or, with `follow: true` in the configuration, when the receiver update follow (ANYM-597;
-    its status in messaging's verifier directory) is missing, refused or has not checked within FOLLOW_LIMIT_HOURS;
-    else None. An unreadable follow
-    status counts as behind; an unreadable verifier file is verifier()'s to report."""
+def follow_progress(state_directory, status, now, write):
+    """When the follow last proved the pins (`current` or `switched`), kept by this checker in `follow.json`, since
+    the follow's own status only says when it last ran. A `waiting` with no record starts the clock now."""
+    path = Path(state_directory) / FOLLOW_PROGRESS
+    try:
+        last = parse_time((read_object(path) or {}).get('following_at'))
+    except ValueError:
+        last = None
+    if last is not None and status not in ('current', 'switched') and (now - last).total_seconds() >= -FUTURE_GRACE_S:
+        return last
+    if write:
+        write_json(path, {'v': 1, 'following_at': now.isoformat()}, 0o600)
+    return now
+
+
+def receiver_behind(config, now, write=False):
+    """`backup_receiver_behind` when the newest messaging or recordings verification failure is their helper refusing
+    a newer bundle schema (`restore_schema_failed`; calendar's code of that name is a restored-schema mismatch), or,
+    with `follow: true` in the configuration, when the receiver update follow (ANYM-597; its status in messaging's
+    verifier directory) is missing, unreadable, refused, has not run within FOLLOW_LIMIT_HOURS, or has only waited
+    (`verification_pending` behind a stuck retry journal) for that long since it last proved the pins; else None. An
+    unreadable verifier file is verifier()'s to report. `write` keeps the follow's progress time (not under --print)."""
     code, = RECEIVER_CODES
     entries = config['profiles']
-    for entry in entries.values():
+    for profile in LAG_PROFILES:
+        if profile not in entries:
+            continue
         try:
-            directory = Path(entry['directory'])
+            directory = Path(entries[profile]['directory'])
             success, failure = read_object(directory / 'last-success.json'), read_object(directory / 'last-failure.json')
         except ValueError:
             continue
@@ -284,11 +305,14 @@ def receiver_behind(config, now):
         follow = read_object(Path(entries['messaging']['directory']) / FOLLOW_STATUS) or {}
     except ValueError:
         return code
-    checked = parse_time(follow.get('checked_at'))
-    if follow.get('status') not in ('current', 'switched', 'waiting') or checked is None:
+    checked, status = parse_time(follow.get('checked_at')), follow.get('status')
+    if status not in ('current', 'switched', 'waiting') or checked is None:
         return code
     age = (now - checked).total_seconds()
-    return code if age > FOLLOW_LIMIT_HOURS * 3600 or age < -FUTURE_GRACE_S else None
+    if age > FOLLOW_LIMIT_HOURS * 3600 or age < -FUTURE_GRACE_S:
+        return code
+    since = follow_progress(config['state_directory'], status, now, write)
+    return code if (now - since).total_seconds() > FOLLOW_LIMIT_HOURS * 3600 else None
 
 
 def evaluate(config, now, run=None):
@@ -402,7 +426,7 @@ def read_state(path):
         return {}
     good = {}
     for code, entry in codes.items():
-        if (code not in CODES and code not in DEPLOY_CODES) or not isinstance(entry, dict):
+        if (code not in CODES and code not in DEPLOY_CODES and code not in RECEIVER_CODES) or not isinstance(entry, dict):
             continue
         sent, attempted = (moment_value(entry.get(k)) for k in ('sent', 'attempted'))
         if (sent is None) != (entry.get('sent') is None) or (attempted is None) != (entry.get('attempted') is None):
@@ -458,7 +482,7 @@ def check(config, *, now=None, clock=time.monotonic, run=None, send=None, wall=t
         active.add(code)
     if config['side'] == 'verifier':
         try:
-            behind = receiver_behind(config, moment)
+            behind = receiver_behind(config, moment, write=True)
         except Exception:
             behind = next((c for c in RECEIVER_CODES if c in previous), None)
         if behind:

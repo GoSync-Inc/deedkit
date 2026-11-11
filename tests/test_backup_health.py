@@ -383,18 +383,62 @@ def test_the_halt_codes_are_the_deployers_and_each_event_survives_before_send(mo
 
 
 # spec: ANYM-807
-@pytest.mark.parametrize('error,offset,raised', [('restore_schema_failed', 1, True), ('restore_schema_failed', -1, False),
-                                                 ('restore_decryption_failed', 1, False)])
-def test_a_helper_behind_the_bundles_schema_raises_backup_receiver_behind(tmp_path, error, offset, raised):
-    # Incident 11-11: a helper at schema 67 refused every schema-84 bundle for two days.
-    cfg = config(tmp_path, side='verifier', profiles=['messaging', 'calendar'])
-    verified(tmp_path, 'calendar', NOW - timedelta(hours=3))
-    verified(tmp_path, 'messaging', NOW - timedelta(hours=3))
-    (tmp_path / 'messaging' / 'last-failure.json').write_text(json.dumps({
+@pytest.mark.parametrize('profile,error,offset,raised', [('messaging', 'restore_schema_failed', 1, True),
+                                                         ('recordings', 'restore_schema_failed', 1, True),
+                                                         ('messaging', 'restore_schema_failed', -1, False),
+                                                         ('calendar', 'restore_schema_failed', 1, False),
+                                                         ('messaging', 'restore_decryption_failed', 1, False)])
+def test_a_helper_behind_the_bundles_schema_raises_backup_receiver_behind(tmp_path, profile, error, offset, raised):
+    # Incident 11-11: a helper at schema 67 refused every schema-84 bundle for two days. Calendar's code of that
+    # name is a restored-schema mismatch, not a helper behind the bundle.
+    cfg = config(tmp_path, side='verifier', profiles=['messaging', 'calendar', 'recordings'])
+    for p in ('messaging', 'calendar', 'recordings'):
+        verified(tmp_path, p, NOW - timedelta(hours=3))
+    (tmp_path / profile / 'last-failure.json').write_text(json.dumps({
         'v': 1, 'status': 'failed', 'error': error, 'failed_at': iso(NOW - timedelta(hours=1) + timedelta(hours=offset))}))
     sent = []
     h.check(cfg, now=NOW, run=systemctl(), send=codes_sent(sent))
     assert ('backup_receiver_behind' in [code for _, code, _ in sent]) is raised
+
+
+# spec: ANYM-807
+def test_backup_receiver_behind_repeats_once_a_day_and_keeps_its_episode_through_a_failed_check(tmp_path, monkeypatch):
+    cfg = config(tmp_path, side='verifier', profiles=['messaging'])
+    verified(tmp_path, 'messaging', NOW - timedelta(hours=40))
+    (tmp_path / 'messaging' / 'last-failure.json').write_text(json.dumps({
+        'v': 1, 'status': 'failed', 'error': 'restore_schema_failed', 'failed_at': iso(NOW - timedelta(minutes=5))}))
+    sent = []
+    for hours in (0, 1, 2):
+        h.check(cfg, now=NOW + timedelta(hours=hours), run=systemctl(), send=codes_sent(sent))
+    assert [c for _, c, _ in sent].count('backup_receiver_behind') == 1
+    assert 'backup_receiver_behind' in json.loads((tmp_path / 'state' / 'state.json').read_text())['codes']
+    monkeypatch.setattr(h, 'receiver_behind', lambda *a, **k: 1 / 0)
+    h.check(cfg, now=NOW + timedelta(hours=3), run=systemctl(), send=codes_sent(sent))
+    assert 'backup_receiver_behind' in json.loads((tmp_path / 'state' / 'state.json').read_text())['codes']
+    h.check(cfg, now=NOW + timedelta(hours=25), run=systemctl(), send=codes_sent(sent))
+    assert [c for _, c, _ in sent].count('backup_receiver_behind') == 2
+    monkeypatch.undo()
+    verified(tmp_path, 'messaging', NOW + timedelta(hours=24), verified_at=NOW + timedelta(hours=26))
+    h.check(cfg, now=NOW + timedelta(hours=27), run=systemctl(), send=codes_sent(sent))
+    assert 'backup_receiver_behind' not in json.loads((tmp_path / 'state' / 'state.json').read_text())['codes']
+
+
+# spec: ANYM-807
+@pytest.mark.parametrize('first', ['current', 'waiting'])
+def test_a_follow_that_only_waits_for_a_day_raises_backup_receiver_behind(tmp_path, first):
+    # A retry journal the follow cannot pass (verification_pending) makes it write a fresh `waiting` every hour.
+    cfg = {**config(tmp_path, side='verifier', profiles=['messaging']), 'follow': True}
+    verified(tmp_path, 'messaging', NOW - timedelta(hours=3))
+    path = tmp_path / 'messaging' / h.FOLLOW_STATUS
+    sent = []
+    for hours, status in [(0, first), (25, 'waiting'), (27, 'waiting'), (28, 'current'), (29, 'waiting')]:
+        moment = NOW + timedelta(hours=hours)
+        path.write_text(json.dumps({'v': 1, 'status': status, 'revision': 'a' * 40,
+                                    'checked_at': (moment - timedelta(minutes=10)).isoformat()}))
+        sent.clear()
+        h.check(cfg, now=moment, run=systemctl(), send=codes_sent(sent))
+        active = 'backup_receiver_behind' in json.loads((tmp_path / 'state' / 'state.json').read_text())['codes']
+        assert active is (hours == 27), (hours, status)
 
 
 # spec: ANYM-807

@@ -128,8 +128,22 @@ def test_worker_names_a_bundle_schema_beyond_its_own_as_schema_not_decryption(tm
     # authenticated; verify_bundle's refusal inside the decryption step was reported as restore_decryption_failed.
     from messaging_service import backup_restore_worker as worker, backup_r2_verifier as verifier
     from messaging_service.backup import SCHEMAS
-    _,manifest=bundle();manifest={**manifest,'schema_version':SCHEMAS[-1]+1};raw=json.dumps(manifest).encode()
-    out=io.BytesIO()
+    _,manifest=bundle();manifest={**manifest,'schema_version':SCHEMAS[-1]+1}
+    caught=run_with(tmp_path,monkeypatch,decoder,manifest)
+    assert str(caught.value)=='restore_schema_failed'
+    # The verifier passes the helper's code on unchanged (a code it does not know would read isolated_restore_failed).
+    payload=tmp_path/'payload';payload.mkdir(mode=0o700)
+    worker.write_failure(payload,caught.value)
+    monkeypatch.setattr(verifier,'private_file',lambda path,limit=65536:Path(path).read_bytes())
+    assert str(verifier.helper_failure(payload))=='restore_schema_failed'
+    # A malformed manifest is no schema verdict: it keeps the code it had.
+    for broken in ({**manifest,'format':9},{**manifest,'schema_version':str(SCHEMAS[-1]+1)},{**manifest,'schema_version':1}):
+        assert str(run_with(tmp_path,monkeypatch,decoder,broken).value)=='restore_decryption_failed'
+
+
+def run_with(tmp_path,monkeypatch,decoder,manifest):
+    from messaging_service import backup_restore_worker as worker
+    raw=json.dumps(manifest).encode();out=io.BytesIO()
     with tarfile.open(fileobj=out,mode='w') as archive:
         for name,data in [('manifest.json',raw),('database.dump',b'UNIT_DUMP_NOT_A_DATABASE')]:
             item=tarfile.TarInfo(name);item.size=len(data);archive.addfile(item,io.BytesIO(data))
@@ -138,12 +152,7 @@ def test_worker_names_a_bundle_schema_beyond_its_own_as_schema_not_decryption(tm
                         real(source,identity,tmp_path/'bundle',age=decoder,max_bytes=max_bytes))
     config={**calendar_worker_config(raw,data)};del config['profile']
     with pytest.raises(worker.RestoreStageError) as caught:worker.run(config,io.BytesIO(data))
-    assert str(caught.value)=='restore_schema_failed'
-    # The verifier passes the helper's code on unchanged (a code it does not know would read isolated_restore_failed).
-    payload=tmp_path/'payload';payload.mkdir(mode=0o700)
-    worker.write_failure(payload,caught.value)
-    monkeypatch.setattr(verifier,'private_file',lambda path,limit=65536:Path(path).read_bytes())
-    assert str(verifier.helper_failure(payload))=='restore_schema_failed'
+    return caught
 
 
 def test_large_stream_keeps_original_ciphertext_source_distinct_from_tar_members(tmp_path,decoder):

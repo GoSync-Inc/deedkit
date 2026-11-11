@@ -261,7 +261,10 @@ def verify_bundle(directory,*,blob_root=None,extracted=None,read_dump=True,hash_
     reading them: the streaming producer hashes both while tar reads them (ANYM-631)."""
     from .recovery_state import read_manifest,verify_recovery
     directory=Path(directory); manifest=read_manifest(directory)
-    if manifest.get('format') not in (1,2) or manifest.get('schema_version') not in SCHEMAS: raise ValueError('unsupported_backup')
+    version=manifest.get('schema_version')
+    # A well-formed bundle newer than this code names its own refusal (incident 11-11: a receiver behind production).
+    if manifest.get('format') in (1,2) and type(version) is int and version>SCHEMAS[-1]:raise ValueError('unsupported_backup_schema')
+    if manifest.get('format') not in (1,2) or version not in SCHEMAS: raise ValueError('unsupported_backup')
     if (extracted is None and not read_dump) or (extracted is not None and blob_root is not None):
         raise ValueError('invalid_backup_verification')
     verify_recovery(directory,manifest)
