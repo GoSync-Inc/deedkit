@@ -247,7 +247,9 @@ class RouterProof:
                         "--network", self.network,
                         *[option for alias in aliases for option in ["--network-alias", alias]],
                         "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
-                        "--memory=64m", "--cpus=0.5", "--pids-limit=32",
+                        # The old gateway also hosts every `docker exec python client.py`; 64m was OOM-killed twice in CI
+                        # (OOMKilled=true ExitCode=0, runs 42933490442 and 42956824143).
+                        "--memory=256m", "--cpus=0.5", "--pids-limit=32",
                         *self.fixture_user(),
                         "--mount", f"type=bind,source={self.directory},target=/proof",
                         "--mount", self.router_mount(),

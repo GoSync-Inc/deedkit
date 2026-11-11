@@ -116,7 +116,19 @@ class Holder:
         self.sockets.rmdir()
         return code
 
+    def wait_for_sockets(self, seconds=30):
+        """The holder logs holder.claimed before it writes its token and opens the control socket (serve.go), so a
+        collector that attaches on that event can arrive first: wait for both, as a real collector retries."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self.sockets.joinpath('token').exists() and self.sockets.joinpath('control.sock').exists():
+                return
+            assert self.process.poll() is None, f'the holder exited: {self.process.returncode}'
+            time.sleep(0.05)
+        raise AssertionError('the holder opened no control socket')
+
     def attach(self, owner, epoch):
+        self.wait_for_sockets()
         token = self.sockets.joinpath('token').read_text().strip()
         with socket.socket(socket.AF_UNIX) as s:
             s.settimeout(10)
@@ -205,6 +217,22 @@ def test_the_go_holder_and_the_python_caller_share_one_claim_under_the_holder_lo
         assert again.wait_for('holder.claimed')['claim_generation'] == 3
     finally:
         assert again.stop() == 0
+
+
+# spec: ANYM-937
+def test_an_attach_that_arrives_before_the_holder_has_opened_its_sockets_waits_for_them(
+        holder_login, native_fixture_binary, tmp_path):  # noqa: F811
+    store, _, dsn = holder_login
+    holder = Holder(native_fixture_binary, tmp_path / 'one', dsn)
+    try:
+        archive = Archive(store)
+        epoch = archive.acquire(ACCOUNT, 'collector-one')
+        # Straight after the process starts, before holder.claimed: the token and the socket do not exist yet.
+        hello, reply = holder.attach('collector-one', epoch)
+        assert hello['account'] == ACCOUNT and reply['attached']['account'] == ACCOUNT
+        archive.release(ACCOUNT, 'collector-one', epoch)
+    finally:
+        assert holder.stop() == 0
 
 
 # spec: ANYM-937
