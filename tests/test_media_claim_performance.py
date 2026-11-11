@@ -329,6 +329,52 @@ def test_claimable_job_in_a_dormant_backlog_is_claimed_with_bounded_plans(backlo
     assert_bounded(plans,index_tables(s)); selection_is_indexed(plans)
 
 
+def vacuumed(s, *tables):
+    """The pages as autovacuum leaves them once it keeps up (production): every page all-visible, which is what lets
+    the planner read an index without its table. VACUUM cannot run in a transaction block. It sets a page all-visible
+    only for rows whose hint bits are set, and a hint bit waits until the WAL holding the commit of every transaction
+    in the same group of 32 has been flushed; the local lane commits asynchronously, and the notifier's NOTIFY commits
+    land in that group after any one flush. So each try flushes the WAL first and a page left behind gets another."""
+    with s.pool.connection() as c:
+        c.autocommit=True
+        try:
+            c.execute("SET statement_timeout='120s'")
+            for _ in range(20):
+                c.execute("SELECT pg_logical_emit_message(false,'vacuum_fixture','flush',true)")
+                for table in tables: c.execute('VACUUM '+table)
+                visible={r['relname']:r['relallvisible']/r['relpages'] for r in c.execute(
+                    'SELECT relname,relallvisible,relpages FROM pg_class WHERE relname=ANY(%s)',(list(tables),)).fetchall()}
+                if all(share>0.9 for share in visible.values()): break
+                time.sleep(0.25)
+        finally:
+            c.execute('RESET statement_timeout'); c.autocommit=False
+        return visible
+
+
+# spec: ANYM-302
+@pytest.mark.parametrize('kind',['requested','recent'])
+def test_claimable_job_in_a_vacuumed_dormant_backlog_is_claimed_with_bounded_plans(backlog, kind):
+    """Regression (run 43023854462): with every page all-visible, as autovacuum leaves production, the selection's
+    window arm took an index-only skip scan of message_chat_date into media_jobs, 295 and 198 tuples and 695 and 707
+    buffers for BOUND=100. The plans above are measured on pages that are not all-visible, which hid it in CI."""
+    ar,s,claim,_=backlog
+    grow_dormant(s,30_000)
+    assert claim() is None  # runs the sweep, so the measured claim is an ordinary one
+    if kind=='requested':
+        target=message(ar,'wanted',90*86400)
+        with s.pool.connection() as c:
+            c.execute("UPDATE media_jobs SET requested_until=clock_timestamp()+interval '1 hour' WHERE message=%s",(target,))
+    else: target=message(ar,'recent',3600)
+    visible=vacuumed(s,*MEASURED)
+    assert all(share>0.9 for share in visible.values()),visible
+    with s.pool.connection() as c: analyze(c,'media_jobs','messages')
+    plans=[]
+    with explained(ar,plans): job=claim()
+    assert job['message']==target and job['attempts']==1
+    assert job['_live_media'] is (kind=='recent')
+    assert_bounded(plans,index_tables(s)); selection_is_indexed(plans)
+
+
 # spec: ANYM-302
 def test_the_dormant_backlog_gets_the_same_statistics_on_every_analyze(backlog):
     """Regression (#877 run 42953961641, the plan above without message_scope_date): ANALYZE sampled 30,000 of the
