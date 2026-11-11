@@ -1510,6 +1510,7 @@ def test_message_reads_return_a_whatsapp_event_with_a_calendar_suggestion_and_no
     from messaging_service.subscriptions import match_subscriptions
     state,store,key=wa_groups
     chat_id=stable_id('chat','wa-groups',WA_GROUP)
+    state.apply(wa_capture('false_'+WA_GROUP+'_HI_555555@c.us',1699999990,body='привет',actor='555555@c.us'))
     subscription=store.create_subscription(key,[chat_id])['subscription_id']
     state.apply(event_capture(responses={'going':1,'not_going':0,'maybe':2}))
     past={**SYNTHETIC_EVENT,'name':'Прошедшее','start':'2020-01-01T10:00:00Z','end':None,'location':None,'description':None}
