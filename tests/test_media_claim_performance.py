@@ -164,9 +164,20 @@ def selection_is_indexed(plans):
     return query
 
 
+# The tables the measured claim plans read.
+MEASURED=('messages','media_jobs')
+
+
 @pytest.fixture()
-def backlog(archive, monkeypatch):
+def backlog(archive, monkeypatch, request):
     ar,s,_,_=archive
+    # The visibility map is held fixed as the statistics are: an autovacuum pass, if it came before a measurement,
+    # set the pages all-visible and the claim was planned through other indexes (merge-group run 43011411497).
+    # The seeded fixture's TRUNCATE left the map empty; with autovacuum off on these tables it stays empty.
+    def autovacuum(change):
+        with s.pool.connection() as c:
+            for table in MEASURED: c.execute(f'ALTER TABLE {table} {change}')
+    autovacuum('SET (autovacuum_enabled=false)'); request.addfinalizer(lambda:autovacuum('RESET (autovacuum_enabled)'))
     # A fixed sweep clock: only the first claim sweeps, however slow the runner is.
     monkeypatch.setattr(archive_module,'monotonic',lambda:1000.0)
     owner='perf-collector'; epoch=ar.acquire(ACCOUNT,owner)
