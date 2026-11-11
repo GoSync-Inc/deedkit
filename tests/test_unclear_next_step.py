@@ -23,9 +23,9 @@ def documented_table():
 
 
 def described_table():
-    import inspect
     from messaging_service import app
-    source = inspect.getsource(app)
+    package = Path(app.__file__).parent
+    source = ''.join(path.read_text() for path in (package / 'app.py', *sorted((package / 'app_tools').glob('*.py'))))
     start = source.index('Compact rows omit')
     legend = source[start:source.index('limit defaults', start)]
     pairs = {}
