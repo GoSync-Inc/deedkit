@@ -95,6 +95,7 @@
     "ask": [
       "mcp__claude_ai_Deedkit__agents_start_task",
       "mcp__claude_ai_Deedkit__agents_stop_task",
+      "mcp__claude_ai_Deedkit__android_agent",
       "mcp__claude_ai_Deedkit__android_courier_chat",
       "mcp__claude_ai_Deedkit__android_delete_file",
       "mcp__claude_ai_Deedkit__android_execute",
