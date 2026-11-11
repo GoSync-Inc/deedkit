@@ -1,5 +1,6 @@
 """ANYM-576: operator-configured scheduled refresh and `calendar.event.starting` reminders. Provider fixtures only."""
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -93,6 +94,11 @@ def test_refresh_configuration_is_validated_and_names_an_existing_calendar(house
             configure(s, "--calendar", "cal-a", *bad)
     assert configure(s, "--calendar", "cal-a", "--window-days", "7", "--cadence-minutes", "10", "--lead", "60",
                      "--lead", "15")["leads"] == [15, 60]
+    asyncio.run(worker(s, Provider()).refresh_one(NOW))
+    [listed] = json.loads(json.dumps(cli.dispatch(cli.parser().parse_args(["refresh-list"]), None, None, {}, s)))[
+        "calendars"]
+    assert (listed["window_days"], listed["cadence_minutes"], listed["leads"], listed["health"]) == (7, 10, [15, 60], "ok")
+    assert datetime.fromisoformat(listed["last_ok_at"]) == NOW
 
 
 # spec: ANYM-576

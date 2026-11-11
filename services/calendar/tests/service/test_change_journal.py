@@ -553,6 +553,8 @@ def test_migration_8_is_an_unattended_expand_with_additive_grants():
             created = rollout.new_tables(files[version].read_text(), created)
     text = files[8].read_text()
     assert rollout.unattended_class(text, set(created)) == "expand"
+    # roles.sql as migration 8 left it: later migrations append their own grants after it.
     roles = store_module.ROLES.read_text()
+    roles = roles[: roles.index("-- Migration 9 (scheduled refresh")]
     base = roles[: roles.index("-- Migration 8 (change journal")]
     assert rollout.role_class(base, roles, rollout.new_tables(text), tables=set(created)) == "additive"

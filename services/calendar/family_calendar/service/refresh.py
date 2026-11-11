@@ -74,9 +74,12 @@ def unconfigure(store, calendar_ref):
 
 
 def listing(store):
-    return {"calendars": store.query(
+    """`service refresh-list`: each configured calendar with its schedule and health, times as ISO 8601 text."""
+    rows = store.query(
         "SELECT calendar_ref,window_days,cadence_minutes,leads,next_at,last_ok_at,failures,error,health,health_since "
-        "FROM refresh_calendars ORDER BY calendar_ref")}
+        "FROM refresh_calendars ORDER BY calendar_ref")
+    return {"calendars": [{k: v.isoformat() if isinstance(v, datetime) else v for k, v in row.items()}
+                          for row in rows]}
 
 
 def claim(store, now):
