@@ -43,7 +43,7 @@ UNSUPPORTED_HINT = 'Use android_execute for this operation. The reference lists 
 # Definite read/lookup failures: nothing acted, so the persistent worker stays.
 DEFINITE = {'element_not_found', 'screen_not_found', 'ambiguous_selector', 'invalid_element_bounds',
             'ocr_unavailable', 'ocr_failed', 'screenshot_unavailable', 'region_outside_screen',
-            'screen_not_settled'}
+            'screen_not_settled', 'focused_field_not_found'}
 
 
 

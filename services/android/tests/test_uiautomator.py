@@ -196,13 +196,55 @@ def test_unicode_input_uses_accessibility_without_copying_to_clipboard():
                              set_text=lambda value, timeout: values.append(value))
     class Device:
         def __call__(self, **selector):
-            assert selector == {'focused': True}
+            assert selector == {'focused': True, 'className': 'android.widget.EditText', 'packageName': 'example.app'}
             return target
         def jsonrpc_call(self, method, args):
             assert method == 'dumpWindowHierarchy'
-            return '<hierarchy><node focused="true" hint="Поиск" /></hierarchy>'
+            return ('<hierarchy><node focused="true" hint="Поиск" class="android.widget.EditText" '
+                    'package="example.app" /></hierarchy>')
     assert execute(Device(), {'inputText': 'Привет'}) == {'success': True}
     assert values == ['Привет']
+
+
+KEYBOARD_FOCUS = ('<hierarchy><node focused="true" text="" hint="Search" class="android.widget.EditText" '
+                  'package="example.app" /><node focused="true" content-desc="1" text="" '
+                  'class="android.widget.FrameLayout" package="com.google.android.inputmethod.latin" /></hierarchy>')
+
+
+class FocusDevice:
+    # A focused keyboard key next to the focused field: uiautomator2 clicks its setText
+    # target first, so text set on the key types that key's character into the field.
+    def __init__(self, hierarchy):
+        self.hierarchy, self.calls = hierarchy, []
+    def __call__(self, **selector):
+        name = 'field' if selector.get('className') == 'android.widget.EditText' else 'key'
+        return SimpleNamespace(get_text=lambda timeout: '',
+                               set_text=lambda value, timeout: self.calls.append((name, value)))
+    def jsonrpc_call(self, method, args):
+        return self.hierarchy
+
+
+# spec: ANYM-953
+def test_input_text_types_into_the_focused_field_not_a_focused_keyboard_key():
+    from deedkit_android.ui_worker import execute
+
+    device = FocusDevice(KEYBOARD_FOCUS)
+    assert execute(device, {'inputText': 'indomie'}) == {'success': True}
+    assert execute(device, {'eraseText': 3}) == {'success': True}
+    assert device.calls == [('field', 'indomie'), ('field', '')]
+
+
+# spec: ANYM-953
+def test_input_text_without_a_focused_text_field_fails_before_any_action():
+    from deedkit_android.ui_worker import execute
+    from deedkit_android.uiautomator import DEFINITE
+
+    keyboard_only = KEYBOARD_FOCUS.replace('focused="true" text="" hint="Search"', 'focused="false" text="" hint="Search"')
+    device = FocusDevice(keyboard_only)
+    with pytest.raises(Refused) as failure:
+        execute(device, {'inputText': 'indomie'})
+    assert failure.value.code == 'focused_field_not_found' and failure.value.code in DEFINITE
+    assert device.calls == []
 
 
 # spec: ANYM-953

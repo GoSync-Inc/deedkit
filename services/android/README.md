@@ -164,7 +164,9 @@ The latter keeps its existing compatibility name and reports the active engine's
 commands. Validation rejects unsupported commands before the first action. On
 uiautomator2, `text` and `id` are regular expressions, while `textExact` and
 `resourceId` are exact. `setText: {resourceId: example:id/search, value: '${QUERY}'}`
-replaces an input's value directly. `inputText` appends to a focused field.
+replaces an input's value directly. `inputText` appends to the focused text field
+(`EditText`/`AutoCompleteTextView`); a focused keyboard key is never the target, and with no
+focused text field the step fails with `focused_field_not_found` before any action.
 `exists` returns a boolean in the corresponding step result. Legacy
 `retryTapIfNoChange` is accepted without automatic repeated taps. Explicit
 `waitToSettleTimeoutMs` adds a post-tap wait. Relative/image selectors, clipboard,
