@@ -282,7 +282,126 @@ def test_a_brand_new_holder_is_created_unstarted_so_prepare_reads_it_and_the_rel
     assert host.containers[HOLDER]["State"]["Running"] and host.containers[HOLDER]["Image"] == image
     assert "recreated" in host.outcome(result, HOLDER)
     [event] = [event for event in host.ledger()["events"] if event["service"] == "synthetic/" + HOLDER]
-    assert (event["kind"], event["reason"]) == ("recovery", "stopped")
+    assert (event["kind"], event["reason"]) == ("recovery", "created")
+
+
+class FirstCutoverHost(HolderHost):
+    """Cutover steps 0-3 on a host whose whatsapp1 runs in child mode: the configuration and Compose files name
+    whatsapp1-holder, which binds the session directory and the lock directory, and the running whatsapp1 container
+    still mounts that session directory; the holder has no container yet. Docker answers the session-opener scan with
+    every container's Compose labels and mounts (as SessionHost in test_production does); `others` are foreign ones."""
+
+    def __init__(self, tmp_path, monkeypatch):
+        super().__init__(tmp_path, monkeypatch)
+        self.session, self.others = tmp_path / "private" / "whatsapp1-session", []
+        self.session.mkdir(parents=True)
+        self.units[HOLDER]["volumes"] += [
+            {"type": "bind", "source": str(self.session), "target": "/sessions"},
+            {"type": "bind", "source": str(tmp_path / "private" / "session-locks"), "target": p.SESSION_LOCKS}]
+        self.units[HOLDER]["stop_grace_period"] = "25s"
+        self.write_compose()
+        del self.containers[HOLDER]
+        self.containers[COLLECTOR]["Mounts"] = [{"Type": "bind", "Source": str(self.session), "Destination": "/sessions"}]
+        monkeypatch.setattr(p, "PAUSE", tmp_path / "autodeploy.pause")
+        p.PAUSE.write_text("holder cutover\n")
+
+    def run(self, argv, **kwargs):
+        for service, container in self.containers.items():
+            container.setdefault("Config", {}).setdefault("Labels", {}).update({
+                "com.docker.compose.project": "synthetic", "com.docker.compose.service": service,
+                "com.docker.compose.oneoff": "False"})
+            container.setdefault("Mounts", [{"Type": "bind", "Source": volume["source"], "Destination": volume["target"]}
+                                            for volume in self.units[service].get("volumes", [])])
+        everything = [*self.containers.values(), *self.others]
+        if argv == ["docker", "ps", "--all", "--quiet", "--no-trunc"]:
+            self.calls.append(argv)
+            return "".join(container["Id"] + "\n" for container in everything)
+        if argv[:2] == ["docker", "inspect"] and "--format" not in argv and (len(argv) > 3 or argv[2].startswith("other")):
+            self.calls.append(argv)
+            return json.dumps([next(item for item in everything if item["Id"] == identity) for identity in argv[2:]])
+        if argv[:2] == ["docker", "start"]:
+            self.calls.append(argv)
+            service = next(name for name, container in self.containers.items() if container["Id"] == argv[2])
+            self.order.append(("start", service))
+            self.containers[service]["State"] = {"Running": True}
+            return ""
+        return super().run(argv, **kwargs)
+
+
+# spec: ANYM-937
+def test_a_first_cutover_admits_the_child_mode_collector_it_stops_first_and_still_refuses_a_foreign_opener(
+        tmp_path, monkeypatch):
+    host = FirstCutoverHost(tmp_path, monkeypatch)
+    host.main = SHAS[1]
+    p.create_holder(host.settings, HOLDER, SHAS[1])
+    host.others.append({"Id": "other1", "Name": "/other1", "Image": OLD_IMAGE, "State": {"Running": True},
+                        "Config": {"Labels": {"com.docker.compose.project": "elsewhere"}},
+                        "Mounts": [{"Type": "bind", "Source": str(host.session), "Destination": "/sessions"}]})
+    p.prepare(host.settings, SHAS[1])
+    with pytest.raises(p.Refused, match="foreign_session_opener: container other1"):
+        p.apply(host.settings, SHAS[1])
+    assert host.order == []
+    # Without the foreign container the child-mode collector, which this apply stops before the holder, is admitted.
+    host.others.clear()
+    host.main, host.order = SHAS[2], []
+    released(host, SHAS[2], wita(10, 14))
+    pair = [entry for entry in host.order if entry[1] in (HOLDER, COLLECTOR)]
+    assert pair == [("stop", COLLECTOR), ("stop", HOLDER), ("up", HOLDER), ("up", COLLECTOR)]
+    assert all(host.containers[service]["State"]["Running"] for service in (HOLDER, COLLECTOR))
+
+
+# spec: ANYM-937
+def test_a_first_holder_failing_at_apply_stays_stopped_and_its_collector_restarts_its_own_child_mode_container(
+        tmp_path, monkeypatch):
+    host = FirstCutoverHost(tmp_path, monkeypatch)
+    child = {key: host.containers[COLLECTOR][key] for key in ("Id", "Image")}
+    host.main = SHAS[1]
+    p.create_holder(host.settings, HOLDER, SHAS[1])
+    host.broken.add(host.image_of("holder", SHAS[1]))  # e.g. a wrong holder DSN file: the holder exits at once
+    with pytest.raises(p.Refused, match="rollback --sha"):
+        released(host, SHAS[1], wita(10, 14))
+    # The holder is never started again; the collector runs its very container from before the release.
+    assert {key: host.containers[COLLECTOR][key] for key in ("Id", "Image")} == child
+    assert host.containers[COLLECTOR]["State"]["Running"] and not host.containers[HOLDER]["State"].get("Running")
+    assert host.ups().count(HOLDER) == 1 and COLLECTOR not in host.ups() and ("start", COLLECTOR) in host.order
+    result = p.read(host.state / SHAS[1] / "result.json")
+    assert result["status"] == "unhealthy" and set(result["rollback"]["projects"][0]["kept"]) >= {HOLDER, COLLECTOR}
+    # The release's rollback leaves that pair as it is: the holder stopped, the collector on its own container.
+    host.order = []
+    p.rollback(host.settings, SHAS[1])
+    assert not [entry for entry in host.order if entry[1] in (HOLDER, COLLECTOR)]
+    assert host.containers[COLLECTOR]["Id"] == child["Id"] and host.containers[COLLECTOR]["State"]["Running"]
+    assert not host.containers[HOLDER]["State"].get("Running")
+
+
+# spec: ANYM-937
+@pytest.mark.parametrize("case", ["replaced", "settings changed"])
+def test_a_first_cutover_that_cannot_return_to_its_child_mode_container_starts_nothing_and_names_the_hand_undo(
+        tmp_path, monkeypatch, case):
+    host = FirstCutoverHost(tmp_path, monkeypatch)
+    child = host.containers[COLLECTOR]
+    host.main = SHAS[1]
+    p.create_holder(host.settings, HOLDER, SHAS[1])
+    if case == "replaced":  # the attach fails after Compose replaced the collector: its old container is gone
+        host.silent.add(HOLDER)
+        monkeypatch.setattr(p, "HOLDER_ATTACH_S", 0)
+    else:  # the holder fails, and the old container no longer has the settings prepare recorded
+        host.broken.add(host.image_of("holder", SHAS[1]))
+        stop = host.run
+        def changed(argv, **kwargs):
+            result = stop(argv, **kwargs)
+            if argv[:2] == ["docker", "compose"] and "stop" in argv and COLLECTOR in argv:
+                child["HostConfig"] = {"Memory": 1}
+            return result
+        monkeypatch.setattr(p, "run", changed)
+    with pytest.raises(p.Refused, match="first_cutover_unrestored: .*docs/whatsapp-native.md") as refused:
+        released(host, SHAS[1], wita(10, 14))
+    assert ("gone" if case == "replaced" else "recorded image and settings") in str(refused.value)
+    assert ("start", COLLECTOR) not in host.order
+    assert (host.state / SHAS[1] / "attempted.json").exists() and not (host.state / SHAS[1] / "result.json").exists()
+    if case == "replaced":  # nothing more was stopped or started: both stay as the failed attach left them
+        assert host.order[-2:] == [("up", HOLDER), ("up", COLLECTOR)]
+        assert all(host.containers[service]["State"]["Running"] for service in (HOLDER, COLLECTOR))
 
 
 # spec: ANYM-937

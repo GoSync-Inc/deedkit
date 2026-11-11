@@ -1247,8 +1247,11 @@ digest. Order: add a mark only once the installed tool carries this support (an 
 entry, `TypeError`, on every command); before a `tool-rollback` to such a tool, remove the marks first.
 A holder that never ran has no container, and `prepare` refuses a selected service without one: `production.py
 create-holder --service <holder> --sha S`, under the autodeploy pause, creates its container on the image `prepare --sha
-S` builds and starts nothing; `snapshot` accepts such a `created` container for a session service only, and the next
-apply recreates it at once as `stopped` (docs/whatsapp-native.md, Session holder cutover, step 5, with its undo).
+S` builds and starts nothing. `snapshot` accepts such a container, condition `created`, for a session service only.
+The next apply recreates it at once (`recovery`, reason `created`) and admits the running child-mode collector it
+stops first as that session directory's opener. If the holder then fails, it stays stopped and the collector starts
+again on its own checked container (kept, so rollback leaves the pair). Otherwise the apply ends
+`first_cutover_unrestored` for the hand undo (docs/whatsapp-native.md, Session holder cutover, steps 5-6).
 
 - Deferral. When a holder's ANYM-895 decision is a changed digest, `apply` (also inside `deploy`) recreates it only
   when the recreate begins inside the window and the holder had no planned recreate earlier in that window. Otherwise
