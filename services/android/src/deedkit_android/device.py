@@ -85,6 +85,13 @@ async def run_process(argv, timeout, output_file=None, stdout_limit=OUTPUT_LIMIT
             await asyncio.gather(combined, return_exceptions=True)
 
 
+class HeldLock:
+    """Stands in for a device lock its caller holds: an operation that is given it never releases the real one."""
+
+    def release(self):
+        pass
+
+
 class Devices:
     def __init__(self, config, store):
         self.config, self.store = config, store
@@ -257,7 +264,9 @@ class Devices:
         return [*self.adb(device), *argv], output
 
     async def execute(self, owner, device, session, request_id, argv, timeout, wait, flow=None,
-                      element_timeout_ms=5000, optional_timeout_ms=1000, identity=None, metadata=None, job=None):
+                      element_timeout_ms=5000, optional_timeout_ms=1000, identity=None, metadata=None, job=None,
+                      held=False):
+        # `held`: the caller (a local-agent run, ANYM-973) already holds this device's lock and keeps it afterwards.
         # A known request is read before reservation checks: its receipt survives lease expiry.
         payload = {"device_id": device, "timeout_s": timeout}
         if job is not None:
@@ -278,10 +287,11 @@ class Devices:
         self.store.touch(owner, device, session)
         if self.ui:
             await self.ui.ensure_fenced_process_stopped(device)
-        lock = self.locks[device]
-        if lock.locked():
-            raise Refused("device_busy")
-        await lock.acquire()
+        lock = HeldLock() if held else self.locks[device]
+        if not held:
+            if lock.locked():
+                raise Refused("device_busy")
+            await lock.acquire()
         temporary = None
         try:
             temporary = tempfile.TemporaryDirectory(dir=self.store.directory)
