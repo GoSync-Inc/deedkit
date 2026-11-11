@@ -25,6 +25,8 @@ PREVIEW_FRESH_S = 600  # a preview reads participants itself when it holds no re
 SEND_FRESH_S = 86400  # the send checks against the newest read of the last day: the owner may confirm later
 READ_WAIT_S = 12
 PAGE_LIMIT = 100
+MAX_PAGES = 20  # Telegram returns at most 50 per page: a complete read covers groups of up to 1000 members
+RESOLVE_S = 20  # the collector's bound on resolving a send's mentioned users
 _now = time.time
 TELEGRAM_USER = re.compile(r'[1-9][0-9]{0,19}')
 WHATSAPP_USER = re.compile(r'([0-9]{1,20})(?::[0-9]{1,4})?@(c\.us|lid)')
@@ -162,37 +164,49 @@ def _member_id(platform, sender):
     return f'{match.group(1)}@{match.group(2)}' if match else None
 
 
+def _page(row):
+    """(offset, next_offset, {id: name}) of one stored list_participants page, or None when it is not a usable page."""
+    parameters = (row['payload'] or {}).get('parameters') or {}
+    data = (row['result'] or {}).get('data')
+    if not isinstance(data, dict) or data.get('coverage') == 'unavailable': return None
+    items = data.get('participants', data.get('items'))
+    offset, following = parameters.get('offset', 0), data.get('next_offset')
+    if not isinstance(items, list) or type(offset) is not int or following is not None and type(following) is not int:
+        return None
+    members = {}
+    for item in items:
+        if isinstance(item, dict) and isinstance(item.get('id'), str):
+            name = ' '.join(v for v in (item.get('first_name'), item.get('last_name')) if isinstance(v, str) and v)
+            members[item['id']] = name or None
+    return offset, None if data.get('has_more') is False else following, members
+
+
 def participants_read(c, p, account, chat_id, fresh_s):
-    """The newest first-page list_participants read of this chat by this principal: ({id: name}, complete) or None."""
-    rows = c.execute('''SELECT payload,result FROM messenger_commands WHERE principal=%s AND account=%s AND chat=%s
-        AND operation='list_participants' AND status='succeeded' AND created_at>clock_timestamp()-make_interval(secs=>%s)
-        ORDER BY created_at DESC LIMIT 5''', (p['id'], account, chat_id, fresh_s)).fetchall()
-    for row in rows:
-        parameters = (row['payload'] or {}).get('parameters') or {}
-        data = (row['result'] or {}).get('data')
-        if parameters.get('offset', 0) != 0 or not isinstance(data, dict) or data.get('coverage') == 'unavailable': continue
-        items = data.get('participants', data.get('items'))
-        if not isinstance(items, list): continue
-        members = {}
-        for item in items:
-            if isinstance(item, dict) and isinstance(item.get('id'), str):
-                name = ' '.join(v for v in (item.get('first_name'), item.get('last_name')) if isinstance(v, str) and v)
-                members[item['id']] = name or None
-        return members, data.get('next_offset') is None and data.get('has_more') is not True
+    """{id: name} of the newest COMPLETE participants read of this chat by this key: an offset-0 page and the pages
+    read after it that follow its next_offset to the end, or None. A partial read (one page of a larger group, a
+    chain cut by a rate limit) proves nobody's absence, so it is no read at all (Astra r1)."""
+    rows = c.execute('''SELECT payload,result,created_at FROM messenger_commands WHERE principal=%s AND key_id=%s AND account=%s
+        AND chat=%s AND operation='list_participants' AND status='succeeded'
+        AND created_at>clock_timestamp()-make_interval(secs=>%s) ORDER BY created_at DESC LIMIT 200''',
+        (p['id'], p['key_id'], account, chat_id, fresh_s)).fetchall()
+    pages = [(row['created_at'], page) for row in rows if (page := _page(row)) is not None]
+    for started, (offset, following, members) in pages:
+        if offset != 0: continue
+        found, seen = dict(members), {0}
+        while following is not None and following not in seen and len(seen) <= MAX_PAGES:
+            seen.add(following)
+            later = next((page for at, page in pages if at >= started and page[0] == following), None)
+            if later is None: break
+            found.update(later[2]); following = later[1]
+        if following is None: return found
     return None
 
 
 def _membership(c, p, chat, members, fresh_s):
     """(basis, {member: display name or None}) of the members found; one not in the dict is not a member."""
-    read = participants_read(c, p, chat['account'], chat['id'], fresh_s)
-    found, rest, basis = {}, list(members), 'participants'
-    if read is not None:
-        listed, complete = read
-        found = {m: listed[m] for m in members if m in listed}
-        rest = [m for m in members if m not in found]
-        if not rest or complete: rest = []
-        else: basis = 'archive'
-    else: basis = 'archive'
+    listed = participants_read(c, p, chat['account'], chat['id'], fresh_s)
+    if listed is not None: basis, found, rest = 'participants', {m: listed[m] for m in members if m in listed}, []
+    else: basis, found, rest = 'archive', {}, list(members)
     names = {r['sender']: r['display_name'] or None for r in c.execute('''SELECT sender,display_name FROM sender_profiles
         WHERE account=%s AND chat=%s AND sender=ANY(%s)''', (chat['account'], chat['id'], list(members))).fetchall()}
     for member in members:
@@ -230,12 +244,16 @@ def apply(c, p, chat, text, format, link_preview, allow_lossy, artifact, mention
                     for m, member, (seen, _) in zip(mentions, members, places)]
         return {**artifact, 'mentions': provider}, notified, basis
     # WhatsApp: each span becomes @<user part> in the wire text, the form a phone renders as the member's name.
-    wire = artifact['provider_text']; at = _boundaries(wire)
+    wire, rendered = artifact['provider_text'], artifact['rendered_text']
+    at, seen_at = _boundaries(wire), _boundaries(rendered)
     pieces, last, provider = [], 0, [{}] * len(mentions)
     for index in sorted(range(len(mentions)), key=lambda i: places[i][1]):
         start, end = at[places[index][1]], at[places[index][1] + mentions[index]['length']]
-        before, after = wire[start - 1:start], wire[end:end + 1]
-        if before.isalnum() or before in ('_', '@') or after.isdigit():
+        shown = seen_at[places[index][0]], seen_at[places[index][0] + mentions[index]['length']]
+        before, after = rendered[shown[0] - 1:shown[0]], rendered[shown[1]:shown[1] + 1]
+        # The wire may add only a formatting delimiter (`_`, `*`, `~`) next to the token, never a word or a digit.
+        if (before.isalnum() or before in ('_', '@') or after.isdigit() or wire[start - 1:start].isalnum() or
+                wire[start - 1:start] == '@' or wire[end:end + 1].isdigit()):
             # The phone renders @<number> as a mention only apart from a word before it and a digit after it.
             raise _refusal('mention_overlap', index, 'format', 'a span apart from a word before it or a digit after it',
                            max(bounds))
@@ -265,7 +283,7 @@ def notices(platform, artifact):
             if any(e['offset'] < at + 1 and at < e['offset'] + e['length'] and e.get('type') in (None, 'code', 'pre', 'text_link')
                    for e in spans): continue
             names.append(match.group(1))
-        return {'notified_by_username': list(dict.fromkeys(names))[:MAX_MENTIONS]} if names else {}
+        return {'notified_by_username': list(dict.fromkeys(names))} if names else {}
     wire, taken = artifact['provider_text'], {m['offset'] for m in artifact.get('mentions', [])}
     if any(_units(wire[:match.start()]) not in taken for match in WHATSAPP_PLAIN_AT.finditer(wire)):
         return {'warning': 'plain_at_is_not_a_mention'}
@@ -300,51 +318,65 @@ def dispatch_mentions(platform, artifact, policy, payload):
     return {**payload, 'mentions': list(dict.fromkeys(item['jid'] for item in provider))}
 
 
-async def telegram_entities(client, provider_chat, mentions):
+async def telegram_entities(client, provider_chat, mentions, rpc):
     """InputMessageEntityMentionName per previewed mention. A user the session cache does not hold is looked up once
-    through the chat's participants; one still unresolvable is mention_unresolvable before the send, never plain text."""
+    through the chat's participants; one still unresolvable is mention_unresolvable before the send, never plain text.
+    Each provider step goes through `rpc` (the governor), so a FloodWait pauses the account as any request does."""
     from telethon import types, utils
     from telethon.errors import FloodError, RPCError
     from .outgoing import SendRejected
 
-    async def resolve(user_id):
-        try: return utils.get_input_user(await client.get_input_entity(types.PeerUser(int(user_id))))
-        except (ValueError, TypeError): return None
+    async def lookup(user_ids):
+        found = {}
+        for user_id in user_ids:
+            try: found[user_id] = utils.get_input_user(await client.get_input_entity(types.PeerUser(int(user_id))))
+            except (ValueError, TypeError): pass
+        return found
 
-    users = {m['user_id']: await resolve(m['user_id']) for m in mentions}
-    if any(v is None for v in users.values()):
-        try: await client.get_participants(int(provider_chat), limit=200)
+    wanted = list(dict.fromkeys(m['user_id'] for m in mentions))
+    users = await rpc(lambda: lookup(wanted))
+    if len(users) < len(wanted):
+        try: await rpc(lambda: client.get_participants(int(provider_chat), limit=200))
         except FloodError: raise
         except (RPCError, ValueError, TypeError): pass
-        for user_id in [k for k, v in users.items() if v is None]: users[user_id] = await resolve(user_id)
-    if any(v is None for v in users.values()): raise SendRejected('mention_unresolvable')
+        users.update(await rpc(lambda: lookup([u for u in wanted if u not in users])))
+    if len(users) < len(wanted): raise SendRejected('mention_unresolvable')
     return [types.InputMessageEntityMentionName(m['offset'], m['length'], users[m['user_id']]) for m in mentions]
 
 
-async def with_mentions(client, provider_chat, payload, options):
-    """Telegram send options with the previewed entities and the mentions, ordered by offset. A repeated call (the
-    governor may run the step before a send again) builds the same list."""
-    from telethon import types
-    base = [e for e in options.get('formatting_entities', []) if not isinstance(e, types.InputMessageEntityMentionName)]
-    mentioned = await telegram_entities(client, provider_chat, payload['mentions'])
-    options['formatting_entities'] = sorted([*base, *mentioned], key=lambda e: (e.offset, -e.length))
+async def with_mentions(provider, provider_chat, payload, options):
+    """Telegram send options with the previewed entities and the mentions, ordered by offset. The collector awaits it
+    before the send's paced admission, whose step before the send checks expiry and access again afterwards."""
+    async with asyncio.timeout(RESOLVE_S):
+        mentioned = await telegram_entities(provider.client, provider_chat, payload['mentions'],
+                                            lambda operation: provider.rpc(operation, 'provider_send'))
+    options['formatting_entities'] = sorted([*options.get('formatting_entities', []), *mentioned],
+                                            key=lambda e: (e.offset, -e.length))
 
 
 async def refresh(store, token, account, chat_id):
-    """Before a preview with mentions: one list_participants read of the chat, unless a read from the last 10 minutes
-    is held. One request_id per chat and 10 minutes, so repeated previews queue one read. Never raises: an unavailable
-    read (not enabled, rate limit, provider down) leaves the archive to decide membership."""
+    """Before a preview with mentions: one complete list_participants read of the chat (page after page, at most
+    MAX_PAGES) unless one from the last 10 minutes is held. One request_id per chat, page and 10 minutes, so repeated
+    previews queue no second read. Never raises: an unavailable read (not enabled, rate limit, provider down, no answer
+    within READ_WAIT_S) leaves the archive to decide membership."""
     from .send_wait import wait_for_operation
     def held():
         with store.authorized(token) as (c, p):
             return participants_read(c, p, account, chat_id, PREVIEW_FRESH_S) is not None
     try:
         if await asyncio.to_thread(held): return
-        bucket = int(_now() // PREVIEW_FRESH_S)
-        request_id = 'mention-members:' + hashlib.sha256(f'{account}\0{chat_id}\0{bucket}'.encode()).hexdigest()[:40]
-        receipt = await asyncio.to_thread(store.execute_messenger_operation, token, account, 'list_participants', chat_id,
-                                          parameters={'limit': PAGE_LIMIT}, request_id=request_id)
-        if receipt.get('status') in ('queued', 'dispatching'):
-            await wait_for_operation(store, token, receipt['operation_id'], READ_WAIT_S)
+        loop = asyncio.get_running_loop(); deadline = loop.time() + READ_WAIT_S
+        key = hashlib.sha256(f'{account}\0{chat_id}\0{int(_now() // PREVIEW_FRESH_S)}'.encode()).hexdigest()[:40]
+        offset = 0
+        for page in range(MAX_PAGES):
+            receipt = await asyncio.to_thread(store.execute_messenger_operation, token, account, 'list_participants',
+                chat_id, parameters={'limit': PAGE_LIMIT, 'offset': offset}, request_id=f'mention-members:{key}:{page}')
+            left = deadline - loop.time()
+            if receipt.get('status') in ('queued', 'dispatching') and left > 0:
+                receipt = await wait_for_operation(store, token, receipt['operation_id'], min(left, 25))
+            data = (receipt.get('result') or {}).get('data') if receipt.get('status') == 'succeeded' else None
+            if not isinstance(data, dict) or data.get('has_more') is False or type(data.get('next_offset')) is not int:
+                return
+            offset = data['next_offset']
     except Exception as error:
         log.info('mention_participants_read_unavailable code=%s', getattr(error, 'code', type(error).__name__))

@@ -234,8 +234,10 @@ func mentionedJIDs(req textRequest, to types.JID) ([]string, error) {
 	return result, nil
 }
 
+// mentionTokenPattern finds @<user> apart from a word or @ before it and a digit after it; a formatting delimiter
+// (WhatsApp italics `_`, bold `*`) may touch it, as the server's preview allows (ANYM-928, Astra r1).
 func mentionTokenPattern(user string) *regexp.Regexp {
-	return regexp.MustCompile(`(^|[^0-9A-Za-z_@])@` + regexp.QuoteMeta(user) + `($|[^0-9])`)
+	return regexp.MustCompile(`(^|[^0-9A-Za-z@])@` + regexp.QuoteMeta(user) + `($|[^0-9])`)
 }
 
 // menuAnswerFixture runs one send_text with menu_choice through sendText

@@ -450,11 +450,12 @@ example `@Анна`. The member is notified as when the owner mentions them in t
   span must be plain source text that renders unchanged (inside bold is fine). Mentions are for groups: a private
   chat, a channel, a phone or a username recipient is `mentions_not_group`. With `menu_choice` it is
   `mentions_conflict`. The browser fallback (whatsapp-web.js) is `mentions_unsupported`.
-- **Membership.** The basis is the chat's current participants: a preview with mentions makes one
-  `list_participants` read of the chat itself (the key's own, when that operation is enabled for the account)
-  unless it holds one from the last 10 minutes; repeated previews within 10 minutes queue one read. Only when no
-  read is held (not enabled, rate limit, provider down, no answer within 12 s) does a sighting in that chat's
-  archive decide. The preview returns `membership_basis: participants|archive`. A person not found is
+- **Membership.** The basis is the chat's current participants: a preview with mentions reads the chat's
+  `list_participants` itself, page after page to the end (at most 20 pages, through the key's own access, when that
+  operation is enabled for the account), unless the key holds a complete read from the last 10 minutes; repeated
+  previews within 10 minutes queue no second read. Only a complete read of the same key counts: one page of a
+  larger group or another key's read proves nobody's absence. Only when no such read is held (not enabled, rate
+  limit, provider down, no answer within 12 s) does a sighting in that chat's archive decide. The preview returns `membership_basis: participants|archive`. A person not found is
   `mention_not_member`; a sender ID that names no person (a channel, a group, a malformed ID) is
   `mention_unresolvable`; both carry `next_call: {tool: list_participants, arguments: {account, chat_id}}`.
   The send checks the same rule against the newest read of the last day. On WhatsApp a participants read lists
@@ -466,12 +467,13 @@ example `@Анна`. The member is notified as when the owner mentions them in t
   `mentions`**. The `preview_digest` binds the mentions, so adding, removing or moving one is `preview_mismatch`,
   and a mentions send without a digest is `preview_required` (`caller_supplies` names `mentions`).
 - **Telegram.** Each mention becomes `InputMessageEntityMentionName` over the span. The collector resolves the
-  user from its session cache, else through one participants read of the chat; a user it still cannot resolve
-  fails the send `mention_unresolvable` before anything is sent, never as plain text.
+  user from its session cache, else through one participants read of the chat, each step a paced request of its
+  own, and checks expiry and access again afterwards, right before the send. A user it still cannot resolve fails
+  the send `mention_unresolvable` before anything is sent, never as plain text.
 - **WhatsApp (native adapter).** Each span is replaced by `@<user part>` of the member's JID (the preview's
   `provider_text` is this wire text) and the message carries `ContextInfo.MentionedJID`; a reply keeps its quote.
   The span must stand apart from a word before it and a digit after it (`mention_overlap`), or the phone would
-  not render it.
+  not render it; a formatting delimiter (italics, bold) may touch it.
 - **Retries.** The queued row keeps the mentions in its `render_policy` and render artifact: a retry with the same
   `request_id` repeats them (else `idempotency_conflict`), the duplicate check treats different mentions as
   different sends, and an `allow_duplicate` resend keeps its own mentions. `messages_send` does not take

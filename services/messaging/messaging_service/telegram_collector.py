@@ -468,8 +468,6 @@ class TelethonProvider(PollProvider):
             if datetime.now(timezone.utc).timestamp()>=job['expires_at']:
                 raise SendRejected('send_expired')
             if job.get('_preflight') is not None:await job['_preflight']()
-            if payload.get('mentions'):  # ANYM-928: each user resolved before the send, else mention_unresolvable.
-                from .group_mentions import with_mentions;await with_mentions(self.client,job['provider_chat'],payload,options)
         async def send():
             if datetime.now(timezone.utc).timestamp()>=job['expires_at']:
                 raise SendRejected('send_expired')
@@ -482,6 +480,8 @@ class TelethonProvider(PollProvider):
             if not message or str(message.chat_id)!=job['provider_chat']:
                 raise RuntimeError('send_receipt_mismatch')
             return {'provider_message_id':str(message.id),'message':message}
+        if payload.get('mentions'):  # ANYM-928: users resolved through the governor first; before() checks access after.
+            from .group_mentions import with_mentions;await with_mentions(self,job['provider_chat'],payload,options)
         return await self.rpc(send,'provider_send',before=before)
 
     async def execute_operation(self,job):
