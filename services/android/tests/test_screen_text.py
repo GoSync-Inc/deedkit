@@ -403,9 +403,11 @@ def test_per_card_reads_cards_clipped_to_a_region_in_full_screen_coordinates(mon
     from deedkit_android.ui_worker import execute
 
     calls = card_engine(monkeypatch)
-    _, data = textured(400, 300)
+    original, data = textured(400, 300)
     three = cards_tree(*(f'<node class="android.view.ViewGroup" bounds="[0,{100 * i}][400,{100 * i + 90}]"/>' for i in range(3)))
     result = execute(TreeDevice(three, data), {'readScreenText': {'per_card': True, 'region': {'x': 100, 'y': 50, 'w': 200, 'h': 150}}}, ocr=OCR)
+    assert calls[1][3].tobytes() == original.crop((100, 50, 300, 90)).tobytes()  # each crop holds its own card's pixels
+    assert calls[2][3].tobytes() == original.crop((100, 100, 300, 190)).tobytes()
     assert [card['bounds'] for card in result['cards']] == ['[100,50][300,90]', '[100,100][300,190]']  # the third card starts at 200: outside
     assert [(size, origin) for size, origin, _, _ in calls] == [((200, 150), (100, 50)), ((200, 40), (100, 50)), ((200, 90), (100, 100))]
 
