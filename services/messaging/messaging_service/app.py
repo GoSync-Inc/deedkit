@@ -691,7 +691,7 @@ def register_messenger_operation_tools(mcp, call, async_call, read):
     async def preview_messenger_operation(ctx: Context, account: StrictStr, operation: StrictStr,
         chat_id: StrictStr='', message_id: StrictStr='', expected_revision: StrictInt=0,
         parameters: dict[StrictStr, Any]={}, request_id: StrictStr='') -> dict[str, Any]:
-        """Validate an allowlisted intent without queueing it; ban_member/unban_member add one live state read.
+        """Validate an allowlisted intent without queueing it; ban/unban_member add a live state read, post_story a limits read.
 
         Call list_messenger_operations(account) first for each operation's
         parameters_schema and ID formats; rejected parameters return
@@ -877,6 +877,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
             # ANYM-549: accepted for parity with execute, ignored for idempotency.
             arguments.pop('request_id',None)  # ANYM-935: a ban or unban preview adds one live read of the person's state
             if arguments.get('operation') in ('ban_member','unban_member'):from .member_ban import preview_with_state;return await preview_with_state(store,token,arguments)
+            if arguments.get('operation')=='post_story':from .stories import preview_with_limits;return await preview_with_limits(store,token,arguments)  # ANYM-932
         if method == 'execute_messenger_operation':
             from .send_wait import validate_wait_s, wait_for_operation
             wait_s=validate_wait_s(arguments.pop('wait_s', 0))

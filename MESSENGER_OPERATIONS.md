@@ -62,6 +62,7 @@ python -m messaging_service set-messenger-operations --account account-demo --op
 | `chat-manage` | Archive, mute and provider-specific chat pins, stars and labels |
 | `groups-read` / `groups-manage` | Participants/topics / group and membership changes |
 | `groups-moderate` | Deleting other people's messages in a Telegram group, discussion group or channel (`delete_member_messages`, ANYM-934; "Moderation" below): a destructive live action toward other people in the owner's name, never inherited by an existing key |
+| `stories-post` | Posting and deleting the owner's Telegram story (`post_story`, `delete_story`, the live read `get_story_limits`, ANYM-932; "Stories and statuses" below): publication under the owner's name, never inherited by an existing key |
 | `contacts-read` / `contacts-manage` | Contact/blocked lists / contact and block changes |
 | `profile-read` / `profile-manage` | Read / update allowed account profile fields |
 
@@ -550,6 +551,58 @@ All the moderation operations ship opted out. For one key and account, after the
 ```sh
 python -m messaging_service set-key-permissions --key-id <credential-uuid> --permissions read read-live groups-moderate
 python -m messaging_service set-messenger-operations --account telegram-demo --operations delete_member_messages ban_member unban_member get_member_state
+```
+
+## Stories and statuses
+
+A story is a publication under the owner's name to an audience. Every post and every delete waits for the owner's
+exact confirmation of that call: the preview shows the media (its SHA-256, kind, video length and size), the caption,
+the audience in words and the lifetime, and `preview_digest` binds all of them, so a change to any one needs a new
+preview and a new confirmation. The media limits are checked from the stored metadata before the owner is asked: a
+photo (JPEG, PNG or WebP, at most 10 MiB) or a video of at most 60 s on Telegram, within the `send_file` size bound
+(32 MiB); anything else is `media_unsuitable` with `reason` `kind`, `duration` or `size`. An uploaded original has no
+stored duration, so a video story comes from an archived attachment (for example one sent to Saved Messages); an
+`upload_id` follows the `send_file` rules, including its `read`, `send` and `upload` permissions. An outcome that stays
+unknown is never retried and never re-posted under a new request ID: on Telegram the receipt's `verify` names the read
+that decides it.
+
+### Telegram stories (ANYM-932)
+
+`post_story` (Telegram, account level, full-account key, permission `stories-post`) takes exactly one of
+`attachment_id` or `upload_id` with its `sha256`, an optional `caption` and `audience`: `contacts`, `close_friends`
+or `everyone`. There is no default audience; a missing one is a field error. Selected people are not supported (use
+Close Friends). The story lives 24 hours (`period` 86400).
+
+- Preview: after the media checks, one live `get_story_limits` read (`stories.canSendStory` and the account's
+  caption limit, 200 UTF-16 code units without Premium, 2048 with it). A reached limit refuses the preview:
+  `stories_limit_reached`, `story_flood_wait` with `retry_after_s`, or `premium_required`; a longer caption is
+  `caption_too_long` with a field error. The limits are shown under `story_preview.limits` and are not part of the
+  digest. A read that does not answer refuses the preview with its code (`session_unavailable`, `rate_limited` ...).
+- Execute: `stories.canSendStory` again, then the upload, then one `stories.sendStory` to the owner's own stories
+  with the audience's one privacy rule (`InputPrivacyValueAllowContacts`, `...AllowCloseFriends`, `...AllowAll`) and
+  one `random_id` derived from the request ID. A named refusal posts nothing and fails the operation: the three
+  limit codes, `media_rejected` with the provider code (`MEDIA_INVALID`, `VIDEO_FILE_INVALID` and the like),
+  `caption_too_long`, or `rate_limited` with `retry_after` for a flood wait. The receipt holds `story_id` and
+  `expires_at`.
+- Unknown: a timeout or an unreadable answer after `sendStory` left is `unknown` with
+  `verify: {"operation": "list_own_stories", "requires": "read-live", "decides": "posted|not_posted"}`.
+  `list_own_stories` is one live read of the owner's own active stories (`story_id`, `kind`, `posted_at`,
+  `expires_at`, `audience`, `caption`; never other people's stories); compare them with the unknown post. While a
+  post of the same media on the account is pending or unknown and no later `list_own_stories` has answered, a new
+  preview or execute of that media is refused with `operation_result_unknown`, whatever its request ID.
+- `delete_story` (`story_id`) deletes one story with a DeedKit `post_story` receipt of this account; any other ID is
+  the field error `not_posted_here` before any provider call (a story posted from the phone is deleted in the app).
+  It calls `stories.deleteStories` for that ID; a story Telegram no longer has is `already_gone` with
+  `changed: false`. An unknown delete names `list_own_stories`: the ID absent means deleted.
+
+The story operations ship opted out. `get_story_limits` and `list_own_stories` need no opt-in of their own: they
+are enabled with `post_story`. One owner confirmation covers the permission on the named agent key and the
+account opt-in, because it lets that agent publish under the owner's name (`--permissions` is the key's whole list:
+keep its other permissions; WhatsApp's `post_status` and `delete_status` join the same lines with ANYM-933):
+
+```sh
+python -m messaging_service set-key-permissions --key-id <credential-uuid> --permissions read download read-live stories-post
+python -m messaging_service set-messenger-operations --account telegram-demo --operations post_story delete_story
 ```
 
 ## Group restrictions and join requests

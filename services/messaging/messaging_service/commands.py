@@ -38,6 +38,8 @@ LIVE_FOREGROUND_RESERVE = 1.0
 # Preflight, governor waits and the request end this long after the claim; the rest is the receipt's.
 LIVE_EXECUTION_TIMEOUT = 8
 PHONE_LOOKUPS_PER_HOUR = 10
+# ANYM-932: a story refused before anything was posted; their data (retry_after_s, provider_code) is the receipt's.
+STORY_REFUSALS = ('stories_limit_reached','story_flood_wait','premium_required','media_rejected','caption_too_long')
 # ANYM-643: Telegram username lookups, preview and send recheck alike.
 USERNAME_LOOKUPS_PER_HOUR = 20
 LOOKUP_BUDGETS = {'open_chat_by_phone':PHONE_LOOKUPS_PER_HOUR,'open_chat_by_username':USERNAME_LOOKUPS_PER_HOUR}
@@ -123,8 +125,8 @@ def permitted(p,account,chat):
 
 def _required_permissions(permission,operation,parameters=None,provider=None):
     values={permission}
-    if operation=='send_file':
-        values.update(('read','upload') if isinstance(parameters,dict) and 'upload_id' in parameters else ('download',))
+    if operation in ('send_file','post_story'):  # ANYM-932: a story's upload is the key's own, as a send_file's
+        values.update(('read','upload')+(('send',) if operation=='post_story' else ()) if isinstance(parameters,dict) and 'upload_id' in parameters else ('download',))
     if operation in ('forward_message','delete_member_messages','ban_member','unban_member') or (operation,provider)==('vote_poll','whatsmeow'):values.add('read')  # ANYM-934, ANYM-315: its preview shows the messages / the archived poll
     return sorted(values)
 
@@ -151,7 +153,8 @@ def _account(c,p,account):
 def _policy(c,account,operation,provider_chats=(),*,ready=False,live=False):
     from .collector_state import CollectorState
     row=c.execute('SELECT * FROM account_policies WHERE account=%s',(account,)).fetchone()
-    if not row or not row['enabled'] or operation not in row['operations_enabled']:
+    from .messenger_operations import OPT_IN_AS  # ANYM-932: the story reads are enabled with post_story
+    if not row or not row['enabled'] or OPT_IN_AS.get(operation,operation) not in row['operations_enabled']:
         failure=APIError('operation_disabled',409)
         if operation=='open_chat_by_phone':failure.hint=OPEN_CHAT_ENABLE_STEP
         if operation=='open_chat_by_username':failure.hint=OPEN_USERNAME_ENABLE_STEP
@@ -285,6 +288,7 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
             payload['provider_message_id']=message['provider_id'];refs.append(message_id)
         elif message_id or expected_revision:raise _empty(spec,chat_id,message_id,expected_revision)
     if operation in ('delete_member_messages','ban_member','unban_member','get_member_state'):from .member_ban import bind;bind(c,p,account,chat,operation,parameters,payload,saved)  # ANYM-934/935
+    if operation in ('post_story','delete_story'):from .stories import bind as story;more_refs,more_chats=story(store,c,p,account,operation,parameters,payload,saved,verify_file=verify_file,retained_upload=retained_upload);refs+=more_refs;provider_chats+=more_chats  # ANYM-932
     if operation=='vote_poll' and provider=='whatsmeow':from .polls import bind_whatsapp_vote;bind_whatsapp_vote(c,payload,message,parameters['option_indices'])
     if operation==HISTORY and account_row['platform']=='telegram':
         anchor=parameters.get('before_message') or parameters.get('around_message')
@@ -389,6 +393,7 @@ def preview(store,c,p,account,operation,chat_id='',message_id='',expected_revisi
         shown['earlier_presses']=button_press.earlier_presses(c,account,message_id,pressed['row'],pressed['column'])
     if operation in ('delete_member_messages','ban_member','unban_member'):from .member_ban import shown as moderation;shown['moderation']=moderation(c,p,account,_chat(c,p,account,chat_id),operation,payload)
     from .scheduled_send import operation_preview;shown.update(operation_preview(operation,parameters))  # ANYM-464
+    if operation in ('post_story','delete_story'):from .stories import shown as story;shown['story_preview']=story(payload)  # ANYM-932
     return serial({**payload,**shown,'permission':spec['permission'],'mutation':spec['mutation'],
         'required_permissions':payload['authorization_binding']['required_permissions'],
         'preview_digest':_digest(p,payload),'owner_approval_verified_by_server':False,
@@ -396,7 +401,7 @@ def preview(store,c,p,account,operation,chat_id='',message_id='',expected_revisi
 
 
 def manifest(c,p,account):
-    from .messenger_operations import operation_manifest
+    from .messenger_operations import operation_manifest,OPT_IN_AS
     from .whatsapp_capabilities import account_provider
     row=_account(c,p,account)
     provider=account_provider(c,account,row['platform'])
@@ -410,9 +415,11 @@ def manifest(c,p,account):
                         (entry['target']=='account' or p['chat_ids']!=[]))
         if entry['operation']=='send_file' and {'read','send','upload'}<=set(p['permissions']) and p['chat_ids']!=[]:
             permitted_here=True
-        enabled=bool(policy and policy['enabled'] and entry['operation'] in policy['operations_enabled'])
+        if entry['operation']=='post_story' and {'read','send','upload','stories-post'}<=set(p['permissions']) and p['chat_ids'] is None:permitted_here=True  # ANYM-932 (Astra r1 M3): an upload-only key
+        enabled=bool(policy and policy['enabled'] and OPT_IN_AS.get(entry['operation'],entry['operation']) in policy['operations_enabled'])
         items.append({**entry,'required_permissions':required,
             **({'source_permissions':{'attachment_id':['download','send'],'upload_id':['read','send','upload']}} if entry['operation']=='send_file' else {}),
+            **({'source_permissions':{'attachment_id':['download','stories-post'],'upload_id':['read','send','stories-post','upload']}} if entry['operation']=='post_story' else {}),
             'key_permitted':permitted_here,'account_enabled':enabled,
             'available':bool(entry['supported'] and permitted_here and enabled)})
     return {'account':account,'platform':row['platform'],'provider':provider,'items':items,
@@ -423,7 +430,8 @@ VERIFY={'delete_message':{'operation':'get_message_info','requires':'read-live',
     'send_reaction':{'operation':'get_reactions','requires':'read-live',
         'decides':'a reaction with chosen:true was set by this account'},
     'edit_message':{'operation':'get_message_info','requires':'read-live',
-        'decides':'text equal to the requested text means the edit applied'},'delete_member_messages':{'operation':'get_message_info','requires':'read-live','decides':'per result row in state unknown: exists:false means deleted'},**{o:{'operation':'get_member_state','requires':'groups-moderate','decides':'state banned (ban_member) or not banned (unban_member) means it applied'} for o in ('ban_member','unban_member')}}
+        'decides':'text equal to the requested text means the edit applied'},'delete_member_messages':{'operation':'get_message_info','requires':'read-live','decides':'per result row in state unknown: exists:false means deleted'},**{o:{'operation':'get_member_state','requires':'groups-moderate','decides':'state banned (ban_member) or not banned (unban_member) means it applied'} for o in ('ban_member','unban_member')},
+    'post_story':{'operation':'list_own_stories','requires':'read-live','decides':'posted|not_posted'},'delete_story':{'operation':'list_own_stories','requires':'read-live','decides':'story_id absent means deleted'}}  # ANYM-932
 # ANYM-755 (Astra r1, Sol r2): get_message_info shows no formatting, and body_rendered leaves out what it cannot render.
 VERIFY_FORMATTED_EDIT={'operation':'get_messages','requires':'read',
     'decides':'a revision newer than expected_revision whose body_rendered (body_format=html) has lossless true and '
@@ -549,6 +557,7 @@ def enqueue(store,c,p,account,operation,chat_id='',message_id='',expected_revisi
     from .scheduled_send import operation_preview;operation_preview(operation,parameters,bool(preview_digest))  # ANYM-464
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('commands-account:'+account,))
     if operation=='join_chat':_join_guard(c,account,payload['parameters']['link'])
+    if operation=='post_story':from .stories import guard;guard(c,account,payload['file_digest'])  # ANYM-932: again under the account lock
     if operation==PRESS:
         from . import button_press
         pressed=payload['parameters']
@@ -660,7 +669,7 @@ class CommandWorker:
                 if payload['operation']=='open_chat_by_username':
                     payload['lookup_allowed'],job['_lookup_resets_in']=_lookup_budget(
                         c,st.account,job['id'],'open_chat_by_username')
-                if payload['operation']=='send_file':
+                if payload['operation'] in ('send_file','post_story'):
                     # Only collectors get a filesystem path; previews/status never do.
                     root=store.files
                     if payload.get('file_upload_id'):
@@ -848,6 +857,7 @@ class CommandWorker:
             # Providers report 'waiting' and then 'started' before the first mutation.
             job['_provider_phase']=phases.append
             timeout=180 if job['operation']=='send_file' else 30
+            if job['operation']=='post_story':timeout=180  # ANYM-932: a story uploads its original as send_file does
             # The collector stops starting archive writes for a live read before this deadline.
             if live:timeout=left();job['_deadline']=deadline
             job['_ends_at']=loop.time()+timeout  # Work after the provider change stays inside this timeout.
@@ -871,9 +881,9 @@ class CommandWorker:
                 'join_not_allowed','already_member','invalid_cursor','invalid_anchor','username_not_found',
                 'recipient_not_user','message_changed','password_required','press_uncertain',
                 'button_kind_unsupported','not_admin','missing_admin_right','poll_secret_unavailable','target_protected','unsupported_chat_type',
-                'schedule_at_out_of_range') else 'operation_rejected'
+                'schedule_at_out_of_range',*STORY_REFUSALS) else 'operation_rejected'
             # Nothing was sent, so a lookup that ran out of time is a retryable read.
-            result={'data':{'code':code,'retry':True}} if code=='provider_timeout' else {'data':{'code':code,**exc.data}} if code in ('not_admin','missing_admin_right','target_protected') and isinstance(exc.data,dict) else None
+            result={'data':{'code':code,'retry':True}} if code=='provider_timeout' else {'data':{'code':code,**exc.data}} if code in ('not_admin','missing_admin_right','target_protected',*STORY_REFUSALS) and isinstance(exc.data,dict) else None
             # ANYM-676: a press refused before it left (the live message differs from the preview) returns the live
             # text and labels so the owner can reconfirm in one round; nothing was sent.
             if code=='message_changed' and isinstance(exc.data,dict):

@@ -11,7 +11,9 @@ FIELD_ERROR_REASONS = frozenset(('required', 'unknown_field', 'type', 'enum', 'm
     # ANYM-934: a delete_member_messages target that is not another person's live message of this collected chat.
     'message_not_found', 'message_from_other_chat', 'chat_not_collected', 'own_message',
     # ANYM-935: ban_member's person and messages.
-    'sender_not_found', 'message_from_other_sender'))
+    'sender_not_found', 'message_from_other_sender',
+    # ANYM-932: delete_story's story_id without a DeedKit receipt of this account.
+    'not_posted_here'))
 MAX_FIELD_ERRORS = 20
 MAX_FIELD_PATH = 128
 MAX_ALLOWED = 50

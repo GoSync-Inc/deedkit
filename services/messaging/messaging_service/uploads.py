@@ -55,7 +55,7 @@ def _pinned(c, upload_id):
         AND (m.status='queued' OR (m.status='dispatching' AND EXISTS(
             SELECT 1 FROM collector_leases l WHERE l.account=m.account
                 AND l.epoch=m.lease_epoch AND l.expires_at>clock_timestamp())))
-        AND m.operation='send_file' AND m.payload->'parameters'->>'upload_id'=%s LIMIT 1""",
+        AND m.operation IN ('send_file','post_story') AND m.payload->'parameters'->>'upload_id'=%s LIMIT 1""",
         (upload_id,)).fetchone() is not None
 
 

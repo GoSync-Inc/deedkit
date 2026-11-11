@@ -16,8 +16,10 @@ DELIVERY_PERMISSIONS = frozenset(('delivery-write',))
 BOT_PERMISSIONS = frozenset(('bot-press', 'webview-open'))
 # ANYM-934: deleting other people's messages in a group or channel; no existing key ceiling inherits it.
 MODERATION_PERMISSIONS = frozenset(('groups-moderate',))
+# ANYM-932: posting and deleting a story or status publishes under the owner's name; no existing key ceiling inherits it.
+STORY_PERMISSIONS = frozenset(('stories-post',))
 PERMISSIONS = (LEGACY_PERMISSIONS | MESSENGER_PERMISSIONS | SUBSCRIPTION_PERMISSIONS | UPLOAD_PERMISSIONS |
-               DELIVERY_PERMISSIONS | BOT_PERMISSIONS | MODERATION_PERMISSIONS)
+               DELIVERY_PERMISSIONS | BOT_PERMISSIONS | MODERATION_PERMISSIONS | STORY_PERMISSIONS)
 
 
 def effective_permissions(principal_permissions, key_permissions):
@@ -82,6 +84,7 @@ AUDIT_CODES = frozenset({
     'operation_access_changed','operation_result_unknown','operation_target_changed','operation_rejected',
     'button_not_captured','button_not_found','label_mismatch','button_kind_unsupported','message_changed','password_required','press_uncertain',
     'not_admin','missing_admin_right','moderation_unsupported','ban_unsupported','unsupported_chat_type','target_protected',
+    'media_unsuitable','caption_too_long','stories_limit_reached','story_flood_wait','premium_required','media_rejected',
     'reply_target_changed','invalid_subscription','subscription_limit','subscription_conflict','subscription_closed',
     'subscription_access_changed','invalid_subscription_state',
     'invalid_upload','invalid_upload_chunk','upload_limit','upload_capacity','upload_expired',
