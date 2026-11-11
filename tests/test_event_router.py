@@ -185,6 +185,7 @@ def subscriber(store):
 
 def mixed(store, token, types=('call.finished', 'call.owner_request'), **create):
     sid = store.create_subscription(token, ['telegram-demo-chat'], **create)['subscription_id']
+    store.link_module('module-reader', 'calls', 'owner-calls')  # ANYM-564: a call source needs the owner's link
     with store.pool.connection() as c:
         module_events.attach_sources(c, sid, [('deedkit:calls', 'owner-calls', list(types))])
     return sid

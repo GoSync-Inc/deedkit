@@ -79,6 +79,10 @@ KINDS = {
     'call.interrupted': ({'call_id': _ref, 'end_reason': _enum('service_restart')}, frozenset(), 'call_id'),
     'call.owner_request': ({'call_id': _ref, 'decision_id': _ref, 'state': _enum('pending')}, frozenset(),
         'call_id'),
+    # ANYM-564: the calls service's journal of an ownership or permission change of one calls principal (the
+    # event's scope_ref); publishing it marks every active link naming that principal stale (schema 90).
+    'call.access.changed': ({'principal_ref': _ref, 'reason': _enum('permission_removed', 'principal_removed',
+        'owner_changed')}, frozenset(), 'principal_ref'),
     # ANYM-726/732: opaque references and an enumeration only; never a title, text, label, provider id, token or URL.
     'recording.text.archived': ({'recording_ref': _ref, 'account_ref': _ref, 'revision': _int(0, MAX_SEQ)}, frozenset(),
         'recording_ref'),
@@ -129,6 +133,8 @@ def validate_event(event):
     if event['type'] in RECORDING_URGENCY and (event['urgency'] != RECORDING_URGENCY[event['type']] or
             event['expires_at'] is not None):
         _fail('recording_urgency_or_expiry')
+    if event['type'] == 'call.access.changed' and (event['urgency'] != 'now' or event['expires_at'] is not None):
+        _fail('access_changed_urgency_or_expiry')
     if event['type'] == 'call.owner_request' and (event['urgency'] != 'now' or event['expires_at'] is None):
         # The decision's stored deadline: an owner request is never held by batching or kept past it.
         _fail('owner_request_needs_now_and_deadline')
@@ -215,8 +221,9 @@ def report_reachability(c, source, reachable):
 def attach_sources(c, subscription_id, sources):
     """Give a subscription a module stream starting at the module journal's head.
 
-    For ANYM-564, which checks each scope against the key's links first; no API reaches this
-    without that check. sources: [(source, scope_ref, [types])].
+    sources: [(source, scope_ref, [types])]. A call source is admitted only through the subscription
+    principal's active calls link (ANYM-564, `admit_module_source`), which records the link's
+    generation; other modules have no API path yet (ANYM-577).
     """
     from .store import APIError
     if not isinstance(sources, (list, tuple)) or not 1 <= len(sources) <= 64:
@@ -230,7 +237,13 @@ def attach_sources(c, subscription_id, sources):
     c.execute('''INSERT INTO subscription_module_streams(subscription,start_position,matched_through,
         acked_through,hinted_through) VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING''',
         (subscription_id, head, head, head, head))
+    from . import module_links
     for source, scope_ref, types in sources:
+        if source == module_links.MODULES['calls']:
+            if not module_links.ready(c):
+                raise module_links.not_linked()
+            module_links.admit(c, subscription_id, source, scope_ref, sorted(set(types)))
+            continue
         c.execute('''INSERT INTO subscription_module_sources(subscription,source,scope_ref,types)
             VALUES(%s,%s,%s,%s) ON CONFLICT(subscription,source,scope_ref) DO UPDATE SET types=excluded.types''',
             (subscription_id, source, scope_ref, sorted(set(types))))
@@ -261,13 +274,18 @@ def view(c, row, module):
     health += [{'source': source, 'state': 'module_gap', 'since': gaps[source]} for source in
         sorted({item['source'] for item in sources} & set(gaps))]
     state = ('held_after_rollback' if module['rollback_hold'] else row['state'])
+    from .module_links import source_states
+    states = source_states(c, row['id'])
     return serial({'state': state, 'start_position': module['start_position'],
         'matched_through': module['matched_through'], 'acked_through': module['acked_through'],
         'matcher_caught_up': state == 'active' and module['matched_through'] == head,
         'matched_event_count': count, 'blocked_reason': module['blocked_reason'], 'gap': module['gap'],
         'retention_floor': module['retention_floor'], 'last_matched_at': module['last_matched_at'],
+        # ANYM-564: a call source whose link was revoked, went stale or was regranted is access_changed; the
+        # message stream and other sources keep flowing.
         'sources': [{'source': item['source'], 'scope_ref': item['scope_ref'], 'types': item['types'],
-            'coverage': 'incomplete' if item['source'] in gaps else 'complete'} for item in sources],
+            'coverage': 'incomplete' if item['source'] in gaps else 'complete',
+            'state': states.get((item['source'], item['scope_ref']), 'access_changed')} for item in sources],
         'health': health,
         'next_action': 'resume' if module['rollback_hold'] else None})
 
@@ -291,8 +309,10 @@ def match(c, row, *, batch_size, maximum, stats):
         (row['id'],)).fetchone()
     if module is None or module['rollback_hold']:
         return
-    sources = c.execute('SELECT source,scope_ref,types FROM subscription_module_sources WHERE subscription=%s',
-        (row['id'],)).fetchall()
+    from .module_links import live_sql
+    # ANYM-564: a call source matches only while its link is live; a revoked one matches nothing more.
+    sources = c.execute('SELECT s.source,s.scope_ref,s.types FROM subscription_module_sources s WHERE s.subscription=%s'
+        ' AND ' + live_sql(c, 's.subscription', 's.source', 's.scope_ref'), (row['id'],)).fetchall()
     lookup = {(source['source'], source['scope_ref']): set(source['types']) for source in sources}
     head = c.execute('SELECT value FROM module_event_counter WHERE id=1').fetchone()['value']
     events = c.execute('''SELECT seq,source,type,scope_ref,urgency,
@@ -392,28 +412,46 @@ def page(c, row, module, after, limit):
         return {'items': [], 'has_more': True, 'next_after': floor,
             'gap': {'reason': 'retention_gap', 'stream': 'modules', 'after': after, 'through': floor,
                 'recoverable': False, 'floor': floor}}
+    from .module_links import live_sql
+    # ANYM-564: references of a call source whose link is no longer live are never read again.
     events = c.execute('''SELECT e.*,e.expires_at IS NOT NULL AND e.expires_at<=clock_timestamp() AS expired
         FROM subscription_module_matches m JOIN module_events e ON e.seq=m.event
-        WHERE m.subscription=%s AND m.event>%s ORDER BY m.event LIMIT %s''', (row['id'], after, limit + 1)).fetchall()
+        WHERE m.subscription=%s AND m.event>%s AND ''' + live_sql(c, 'm.subscription', 'e.source', 'e.scope_ref') +
+        ' ORDER BY m.event LIMIT %s', (row['id'], after, limit + 1)).fetchall()
     items = [_item(event) for event in events[:limit]]
-    return {'items': items, 'has_more': len(events) > limit,
-        'next_after': items[-1]['module_event_id'] if items else after, 'gap': module['gap']}
+    position = items[-1]['module_event_id'] if items else after
+    if len(events) <= limit:
+        # The page holds every live reference: the cursor passes the hidden ones above it, so a fetch's receipt moves
+        # past them (as a dynamic definition's message page does). The read holds the definition's row.
+        position = max(position, c.execute('SELECT max(event) AS e FROM subscription_module_matches WHERE subscription=%s',
+            (row['id'],)).fetchone()['e'] or 0)
+    return {'items': items, 'has_more': len(events) > limit, 'next_after': position, 'gap': module['gap']}
 
 
-def hint_references(c, subscription_id, through):
+def hint_references(c, subscription_id, through, *, linked=True):
     """Unexpired references of a module_events hint: the type, the subject reference and the module only.
 
     Expiry is rechecked at every delivery attempt, so a reminder after its start or an owner request
-    past its deadline is never announced, even after budget waits or retries.
+    past its deadline is never announced, even after budget waits or retries. So is the link (ANYM-564):
+    a reference of a call source whose link is no longer live is never announced.
     """
+    from .module_links import live_sql
     module = c.execute('SELECT acked_through FROM subscription_module_streams WHERE subscription=%s',
         (subscription_id,)).fetchone()
     after = module['acked_through'] if module else through
     return c.execute('''SELECT e.seq,e.source,e.type,e.subject,e.urgency,e.expires_at,count(*) OVER () AS total
         FROM subscription_module_matches m JOIN module_events e ON e.seq=m.event
         WHERE m.subscription=%s AND m.event>%s AND m.event<=%s
-        AND (e.expires_at IS NULL OR e.expires_at>clock_timestamp()) ORDER BY m.event LIMIT 20''',
+        AND (e.expires_at IS NULL OR e.expires_at>clock_timestamp()) AND ''' +
+        (live_sql(c, 'm.subscription', 'e.source', 'e.scope_ref') if linked else 'true') + ' ORDER BY m.event LIMIT 20',
         (subscription_id, after, through)).fetchall()
+
+
+def hint_refusal(c, subscription_id, through):
+    """Why a module_events hint must not be sent now: None (send it), module_not_linked or module_events_expired."""
+    if hint_references(c, subscription_id, through):
+        return None
+    return 'module_not_linked' if hint_references(c, subscription_id, through, linked=False) else 'module_events_expired'
 
 
 def resume(c, row, policy):

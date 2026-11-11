@@ -65,7 +65,7 @@ def main():
         'reload-delivery-policy','set-delivery-features','migrate-expand','set-module-cursor','abandon-module-gap',
         'module-router-status','set-dynamic-subscriptions','set-source-filters',
         'set-source-exclusions','wake-targets-list','disable-wake-target','enable-wake-target','sync-latency',
-        'session-claim-list','session-claim-release'])
+        'session-claim-list','session-claim-release','link-module','unlink-module'])
     parser.add_argument('--principal')
     parser.add_argument('--accounts',nargs='+')
     parser.add_argument('--key-file',type=Path)
@@ -128,6 +128,8 @@ def main():
     parser.add_argument('--subscription-ids',nargs='+',help='release-retention-hold: subscription UUIDs')
     parser.add_argument('--all-subscriptions',action='store_true',help='release-retention-hold: every held subscription')
     parser.add_argument('--sender',help='link-person/unlink-person: exact provider sender ID (sender_id from search_people)')
+    parser.add_argument('--module',help='link-module/unlink-module: calls (ANYM-564)')
+    parser.add_argument('--module-principal',help='link-module: the calls principal whose calls wake this principal')
     parser.add_argument('--person',help='link-person: add to this person UUID (default: a new person); delete-person, list-people')
     parser.add_argument('--purpose',choices=['message','call'],help='set-person-channel: the purpose of the preference')
     parser.add_argument('--clear',action='store_true',help='set-person-channel: clear the preference instead of --account')
@@ -251,6 +253,12 @@ def main():
                 parser.error(args.command+' requires --account and --sender')
             print(json.dumps(store.link_person(args.account,args.sender,args.person) if args.command=='link-person'
                 else store.unlink_person(args.account,args.sender)))
+        elif args.command in ('link-module','unlink-module'):
+            # ANYM-564: the owner's step; an agent key has no path to links (calls:own).
+            if not args.principal or not args.module or (args.command=='link-module')!=bool(args.module_principal):
+                parser.error(args.command+' requires --principal and --module (link-module also --module-principal)')
+            print(json.dumps(store.link_module(args.principal,args.module,args.module_principal)
+                if args.command=='link-module' else store.unlink_module(args.principal,args.module)))
         elif args.command=='delete-person':
             if not args.person: parser.error('delete-person requires --person')
             print(json.dumps(store.delete_person(args.person)))

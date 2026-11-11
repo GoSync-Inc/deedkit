@@ -73,3 +73,5 @@ GRANT SELECT,INSERT,UPDATE,DELETE ON subscription_activity TO messaging_subscrip
 -- the 09:00 gate in the given zone from the database clock (chat and date only); no direct journal, counter or
 -- birthday-table access, and no grant on contact_birthdays_due.
 GRANT EXECUTE ON FUNCTION public.journal_contact_birthdays(text) TO messaging_subscriptions;
+-- Schema 90 (ANYM-564): the matcher matches a call source only while its link is live. Read only.
+GRANT SELECT ON module_links,subscription_module_links TO messaging_subscriptions;

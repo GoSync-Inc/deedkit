@@ -283,6 +283,37 @@ cannot be recalled. An in-flight operation finishes before the permissions chang
 operation re-checks them in the DB. All operator mutations use the same
 transactional principal lock; a direct UPDATE that bypasses the CLI breaks this rule.
 
+### Module links: call events (ANYM-564, schema 90)
+
+A key is woken by call events only through a link the owner set for its principal. A link names the calls
+principal whose calls count as the key's own (`calls:own`: calls whose `owner_principal`, which the calls
+service stamps on each event as its `scope_ref`, is the linked one). Without an active link no call source is
+admitted and no call event is delivered; messaging never takes a scope from the request or the router
+configuration, and the check is a local read under the ACL fence (no remote call).
+
+```sh
+deedkit admin module-links link --principal assistant-work --module calls --module-principal assistant-work
+deedkit admin module-links unlink --principal assistant-work --module calls
+# the same, on the host: python -m messaging_service link-module|unlink-module ...
+```
+
+- `link` grants or regrants (an unchanged active link changes nothing); `unlink` revokes at once. Each change
+  moves the link's `generation` (clock microseconds, never below the previous plus one, so a regrant after a
+  restore from backup still passes every earlier generation) and expires the principal's open receipts that
+  carry a module range.
+- A subscription's call source keeps the generation it was admitted under. After a revocation, a stale mark
+  or a regrant, that source shows `state: access_changed` in `module_stream.sources`; it matches nothing more,
+  its references leave fetch and passive pages (the cursor passes them), a receipt issued before the change
+  is refused (`invalid_receipt`), and queued hints whose call references all lost their link are cancelled
+  with `module_not_linked`, rechecked under the shared ACL lock the revocation waits for. Message sources and
+  the subscription's state are unaffected. A regrant never revives it: create a new subscription.
+- A calls-side ownership or permission change arrives as a `call.access.changed` event for the calls
+  principal; publishing it marks every active link naming that principal `stale` until the owner links again.
+- `create_subscription(..., module_sources=[{scope: "calls:own", types: [call.* types]}])` without an active
+  link is refused with `module_not_linked` (409) and a `next` asking the owner to link calls for the key.
+- `deedkit admin key issue --like` copies links only with `--copy-links`; the installed gateway profile gains
+  no grant from a link. `principal-info` lists a principal's links.
+
 ## Audit log boundaries
 
 `audit_log` contains the DB time, principal, public key UUID, db_role, actor,
