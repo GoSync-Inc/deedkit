@@ -167,6 +167,8 @@ export interface SubscriptionSelection {
   reply_to_send?: string | null;
   /** Your own endpoint from registerDeliveryEndpoint; needs delivery-write. */
   delivery?: {endpoint_id: string; delivery_policy?: Record<string,unknown>} | null;
+  /** Events of a module the owner linked for your key, as capabilities subscriptions.module_events lists them; module_not_linked without a link. */
+  module_sources?: {scope: string; types: string[]}[] | null;
 }
 /** Every chat the key can see now instead of chat_ids (dynamic_sources_disabled until the operator's switch). */
 export interface DynamicSubscriptionSelection extends Omit<SubscriptionSelection,'chat_ids'|'sender_ids'|'reply_to_send'> {

@@ -89,7 +89,7 @@ def claimed_tool(prefix):
     return name
 
 # Optional arguments dropped when None, so payloads and audit records of callers that omit them stay unchanged.
-OMITTED_WHEN_NONE = {'create_subscription':('chat_ids','sources','wake_rules','reply_to_send','delivery','feedback'),
+OMITTED_WHEN_NONE = {'create_subscription':('chat_ids','sources','wake_rules','reply_to_send','delivery','feedback','module_sources'),
     'configure_subscription_delivery':('delivery_policy','endpoint_id'),
     'register_delivery_endpoint':('headers',),'update_delivery_endpoint':('new_secret','headers'),
     'search_files':('media_kind','ready'),

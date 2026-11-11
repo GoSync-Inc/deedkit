@@ -139,6 +139,46 @@ def test_consumption_error_diagnostics_never_copy_arbitrary_backend_text(tmp_pat
     }
 
 
+LINK_NEXT = ("Ask the owner to link calls for this key: deedkit admin module-links link --principal <principal> "
+             "--module calls --module-principal <calls principal>; then create the subscription again.")
+
+
+# spec: ANYM-566
+def test_module_not_linked_is_a_named_consumption_error_and_a_create_refusal_keeps_the_owner_step(tmp_path):
+    from agent_gateway.diagnostics import CONSUMPTION_ERRORS
+    from agent_gateway.dispatch_shaping import REVIEWED_HINTS
+    assert "module_not_linked" in CONSUMPTION_ERRORS and LINK_NEXT in REVIEWED_HINTS
+    seen = []
+
+    def backend(request):
+        if request.url.path == "/v1/capabilities":
+            return httpx.Response(200, json={"permissions": ["read", "subscription-write", "subscription-ack"],
+                                            "tool_manifest": {"names": ["create_subscription", "ack_subscription_events"]}})
+        seen.append(json.loads(request.content))
+        return httpx.Response(409, json={"error": "module_not_linked", "request_id": "d" * 32, "next": LINK_NEXT,
+                                        "hint": LINK_NEXT})
+
+    tools = ["messages_create_subscription", "messages_ack_subscription_events"]
+    app, _, _ = configured(tmp_path, backend, module="messaging", tools=tools,
+                           grants=["read", "subscription-write", "subscription-ack"])
+    wanted = {"chat_ids": ["chat-synthetic"], "module_sources": [{"scope": "calls:own", "types": ["call.finished"]}]}
+    with TestClient(app) as client:
+        created = client.post("/v1/messages_create_subscription", json=wanted, headers=HEADERS)
+        mcp = rpc(client, "tools/call", {"name": "messages_create_subscription", "arguments": wanted}).json()["result"]
+        # An argument the catalog does not know stays refused before the backend is called.
+        unknown = client.post("/v1/messages_create_subscription", headers=HEADERS,
+                              json={**wanted, "module_sources": [{"scope": "calls:own", "types": ["call.finished"], "x": 1}]})
+        acked = client.post("/v1/messages_ack_subscription_events", headers=HEADERS,
+                            json={"subscription_id": "s", "receipt": "r" * 43, "version": 1})
+    assert created.status_code == 409 and mcp["isError"]
+    assert created.json()["error"] == mcp["structuredContent"]["error"] == "module_not_linked"
+    # The gateway relays a `next` only when it is a call it can run; the owner step reaches the agent as the hint.
+    assert created.json()["hint"] == mcp["structuredContent"]["hint"] == LINK_NEXT and "next" not in created.json()
+    assert {k: seen[0][k] for k in wanted} == wanted and unknown.status_code == 422
+    assert [body.get("subscription_id") for body in seen] == [None, None, "s"]  # the refused one never reached the backend
+    assert acked.json() == {"error": "module_not_linked", "backend_status": 409, "request_id": "d" * 32}
+
+
 FEEDBACK = {"request_id": "synthetic-request", "category": "bug", "description": "Synthetic feedback"}
 GOOD_FIELD_ERRORS = [
     {"field": "category", "reason": "enum", "allowed": ["bug", "feature", "quality", "other"]},

@@ -93,6 +93,16 @@ def transports(rows, shown):
     return kept
 
 
+def module_event_entries(value, shown):
+    """ANYM-566: `subscriptions.module_events` after `named_calls`: a module's entry stays only while its `create`
+    call is one of the caller's listed tools (the kinds are of no use without it); an entry of another shape and a
+    value that is not an object are dropped, never passed on."""
+    if not isinstance(value, dict):
+        return {}
+    return {module: entry for module, entry in value.items()
+            if isinstance(entry, dict) and isinstance(entry.get("create"), str) and entry["create"] in shown}
+
+
 def subscription_blocks(result, visible):
     """The `subscriptions` and `events` blocks name only calls in the caller's tool list (ANYM-528).
 
@@ -126,6 +136,12 @@ def subscription_blocks(result, visible):
             policy = block.get("delivery_policy")
             if not isinstance(policy, dict) or not isinstance(policy.get("tool"), str) or policy["tool"] not in shown:
                 block.pop("delivery_policy", None)
+            if "module_events" in block:
+                entries = module_event_entries(block["module_events"], shown)
+                if entries:
+                    block["module_events"] = entries
+                else:
+                    del block["module_events"]
         result[key] = block
     return result
 

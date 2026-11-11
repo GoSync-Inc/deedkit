@@ -4,12 +4,16 @@ from uuid import uuid4
 
 from psycopg import sql
 import pytest
+from starlette.testclient import TestClient
 
-from messaging_service import module_events
+from messaging_service import module_events, module_links
+from messaging_service.app import create_app
 from messaging_service.event_delivery import dispatch_hints
 from messaging_service.module_events import validate_event
 from messaging_service.store import APIError
 from messaging_service.subscriptions import match_subscriptions
+from test_capabilities_summary import structured, tool_error
+from test_client_contract import rpc
 from test_module_events import SOURCE, beat, bound, call_event, emit, empty_module_journal, module_hints, publish
 
 PERMISSIONS = ['read', 'subscription-write', 'subscription-ack']
@@ -75,6 +79,95 @@ def test_without_a_link_no_call_source_is_admitted_and_the_refusal_names_the_own
     view = store.get_subscription(token, calls_subscription(store, token))
     assert [(s['source'], s['scope_ref'], s['state']) for s in view['module_stream']['sources']] == [
         ('deedkit:calls', 'owner-a', 'active')]
+
+
+def module_events_block(store, token):
+    """What `capabilities` tells this key about module events, and whether a call kind is named anywhere in it."""
+    full = store.capabilities(token, detail='full')
+    return full['subscriptions'].get('module_events'), 'call.' in json.dumps(full)
+
+
+# spec: ANYM-566
+def test_capabilities_name_call_kinds_only_to_a_key_with_a_live_link_and_exactly_the_kinds_it_can_use(modules):
+    store = modules[0]
+    token = key(store, 'module-reader')
+    assert module_events_block(store, token) == (None, False)
+    assert 'module_events' not in store.capabilities(token, sections=['subscriptions'])['subscriptions']
+    store.link_module('module-reader', 'calls', 'owner-a')
+    block, named = module_events_block(store, token)
+    kinds = block['calls']['kinds']
+    assert named and kinds == sorted(kinds) and 'call.finished' in kinds
+    assert block == {'calls': {'source': 'deedkit:calls', 'scope': 'calls:own', 'kinds': kinds,
+        'create': 'create_subscription', 'argument': 'module_sources', 'consume': 'fetch_subscription_events',
+        'refused_without_link': 'module_not_linked'}}
+    assert store.capabilities(token, sections=['subscriptions'])['subscriptions']['module_events'] == block
+    # Exactly the kinds a subscription admits: every kind the module journal knows is advertised iff it is admitted.
+    for kind in module_events.KINDS:
+        if kind in kinds:
+            calls_subscription(store, token, types=(kind,))
+        else:
+            with pytest.raises(APIError, match='invalid_filter'):
+                calls_subscription(store, token, types=(kind,))
+    assert not any(kind.startswith(('calendar.', 'recording.')) for kind in kinds)
+    # A key of another principal that has no link still sees nothing (the link is the principal's, not the service's).
+    assert module_events_block(store, key(store, 'other-reader')) == (None, False)
+    # A stale link (the calls side journaled an access change after the grant) and a revoked one advertise nothing.
+    publish(store, access_changed(566), scope='owner-a')  # a number no other test publishes: the journal outlives a test
+    assert module_events_block(store, token) == (None, False)
+    store.link_module('module-reader', 'calls', 'owner-a')
+    assert module_events_block(store, token)[0] == block
+    store.unlink_module('module-reader', 'calls')
+    assert module_events_block(store, token) == (None, False)
+
+
+# spec: ANYM-566
+def test_a_failed_link_read_leaves_capabilities_answering_without_the_block(modules, monkeypatch):
+    store = modules[0]
+    token = key(store, 'module-reader')
+    store.link_module('module-reader', 'calls', 'owner-a')
+    monkeypatch.setattr(module_links, 'active_link', lambda c, principal: c.execute('SELECT 1/0'))
+    full = store.capabilities(token, detail='full')
+    assert full['subscriptions']['implemented'] is True and 'module_events' not in full['subscriptions']
+    assert 'call.' not in json.dumps(full) and full['events']['fetch'] == 'fetch_subscription_events'
+
+
+# spec: ANYM-566
+@pytest.mark.parametrize('transport', ['rest', 'mcp'])
+def test_create_subscription_takes_module_sources_over_rest_and_mcp_and_refuses_without_a_link(modules, transport):
+    store = modules[0]
+    token = key(store, 'module-reader')
+    wanted = {'chat_ids': ['telegram-demo-chat'], 'module_sources': [{'scope': 'calls:own', 'types': ['call.finished']}]}
+    with TestClient(create_app(store, ['testserver'])) as client:
+        def call(**arguments):
+            if transport == 'mcp':
+                response = rpc(client, token, 'create_subscription', arguments)
+                if 'error' in response.json():  # a schema violation is a protocol error before any operation
+                    error = response.json()['error']
+                    assert error['code'] == -32602
+                    return 400, {'error': 'invalid_parameters', 'fields': error['data']['fields']}
+                if response.json()['result'].get('isError'):
+                    refused = tool_error(response)
+                    return refused.get('status', 409), refused
+                return 200, structured(response)
+            response = client.post('/v1/create_subscription', headers={'Authorization': 'Bearer ' + token}, json=arguments)
+            return response.status_code, response.json()
+        status, refused = call(**wanted)
+        assert (status, refused['error']) == (409, 'module_not_linked') and 'link calls for this key' in refused['next']
+        # The gateway relays the owner step as a reviewed hint (dispatch_shaping.REVIEWED_HINTS holds this exact text).
+        assert refused['hint'] == module_links.NEXT_LINK == (
+            'Ask the owner to link calls for this key: deedkit admin module-links link --principal <principal> '
+            '--module calls --module-principal <calls principal>; then create the subscription again.')
+        store.link_module('module-reader', 'calls', 'owner-a')
+        # The schema is closed: a scope of the request's own, an unknown key or a non-list is refused before the store.
+        for bad in ([{'scope': 'calls:own', 'types': ['call.finished'], 'scope_ref': 'owner-b'}],
+                {'scope': 'calls:own', 'types': ['call.finished']}, [{'scope': 'calls:own'}],
+                [{'scope': 'calls:own', 'types': ['call.finished']}] * 2):
+            status, invalid = call(chat_ids=['telegram-demo-chat'], module_sources=bad)
+            assert status == 400 and invalid['error'] == 'invalid_parameters' and 'module_sources' in invalid['fields']
+        status, created = call(**wanted)
+        assert status == 200
+        sid = created['subscription_id']
+    assert sources(store, token, sid) == [('owner-a', 'active')]
 
 
 # spec: ANYM-564

@@ -199,6 +199,7 @@ CONSUMPTION_ERRORS = frozenset({
     "delivery_disabled", "delivery_policy_unset", "unsafe_endpoint", "invalid_signing_secret", "invalid_header",
     "reserved_header", "rotation_in_progress", "endpoint_limit", "endpoint_conflict", "operator_disabled",
     "invalid_endpoint_state", "endpoint_paused", "endpoint_auto_paused", "endpoint_test_failed", "invalid_limit",
+    "module_not_linked",  # ANYM-566: a call source needs the owner's module link (ANYM-564)
 })
 # ANYM-519: the endpoint errors' bounded extras. Values are reviewed constants, counters or a header name
 # (never a header value or secret); anything else is dropped.
