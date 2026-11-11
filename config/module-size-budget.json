@@ -6,7 +6,7 @@
     "scripts/calendar_rotate.py": {"lines": 1167, "longest_function": 52},
     "scripts/deedkit_admin.py": {"lines": 2231, "longest_function": 103},
     "scripts/feedback_sync.py": {"lines": 954, "longest_function": 100},
-    "scripts/production.py": {"lines": 9225, "longest_function": 147},
+    "scripts/production.py": {"lines": 9234, "longest_function": 147},
     "scripts/seamless_release.py": {"lines": 1091, "longest_function": 76},
     "scripts/tiden_ci.py": {"lines": 1454, "longest_function": 103},
     "services/calendar/family_calendar/service/core.py": {"lines": 1198, "longest_function": 101},

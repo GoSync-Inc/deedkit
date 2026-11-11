@@ -324,6 +324,34 @@ def test_a_pair_failing_in_apply_is_restored_holder_first_before_apply_ends_and_
 
 
 # spec: ANYM-896
+@pytest.mark.parametrize("step", ["collector stop", "holder up"])
+def test_a_failed_step_after_a_paired_collector_stopped_restores_the_pair_before_apply_ends(tmp_path, monkeypatch, step):
+    host = first(tmp_path, monkeypatch)
+    previous = {service: host.containers[service]["Image"] for service in (HOLDER, COLLECTOR)}
+    host.change_holder("serve 2")
+    host.files["whatsapp/whatsmeow/main.go"] = ("100644", "package main // both\n")
+    host.now, host.order, host.main = wita(11, 3, 40), [], SHAS[1]
+    p.prepare(host.settings, SHAS[1])
+    real, failed = host.run, []
+    def flaky(argv, **kwargs):
+        release_file = str(host.state / SHAS[1] / "synthetic.json")
+        if not failed and release_file in argv and (
+                step == "collector stop" and argv[-2:] == ["stop", COLLECTOR] or step == "holder up" and "up" in argv):
+            failed.append(argv)
+            if step == "collector stop":
+                real(argv, **kwargs)  # the collector stopped, then the command failed
+                raise p.Refused("docker failed (exit 1); production was not accepted")
+            raise subprocess.TimeoutExpired(argv, 1800)
+        return real(argv, **kwargs)
+    monkeypatch.setattr(p, "run", flaky)
+    with pytest.raises(p.Refused):
+        p.apply(host.settings, SHAS[1])
+    assert failed and {service: host.containers[service]["Image"] for service in (HOLDER, COLLECTOR)} == previous
+    assert all(host.containers[service]["State"]["Running"] for service in (HOLDER, COLLECTOR))
+    assert host.ups()[-2:] == [HOLDER, COLLECTOR]
+
+
+# spec: ANYM-896
 def test_a_holder_only_attach_failure_beside_a_pair_restores_the_stopped_collector_and_records_unhealthy(
         tmp_path, monkeypatch):
     host = first(tmp_path, monkeypatch, ("1", "2"))

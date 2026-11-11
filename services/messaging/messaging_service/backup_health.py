@@ -36,9 +36,9 @@ HALT_CODES = ('attempt_unresolved', 'call_wait_exhausted', 'configuration_drift'
               'manifest_invalid', 'migration_by_hand', 'migration_refused', 'migration_unsettled',
               'migration_wait_exhausted', 'plan_a_preparation_unfinished', 'plan_a_refused', 'plan_a_rolled_back',
               'plan_a_unknown_state', 'plan_b_preparation_unfinished', 'plan_b_stopped', 'registry_unreachable',
-              'release_not_applied', 'release_not_on_main', 'rollback_failed', 'tool_blob_mismatch', 'tool_by_hand',
-              'tool_not_descended', 'tool_release_mismatch', 'tool_rolled_back', 'tool_self_test_failed',
-              'tool_switch_failed', 'tool_update_stopped', 'tool_update_unresolved', 'other')
+              'release_not_applied', 'release_not_on_main', 'rollback_failed', 'session_pass_failed',
+              'tool_blob_mismatch', 'tool_by_hand', 'tool_not_descended', 'tool_release_mismatch', 'tool_rolled_back',
+              'tool_self_test_failed', 'tool_switch_failed', 'tool_update_stopped', 'tool_update_unresolved', 'other')
 DEPLOY_CODES = frozenset(f'deploy_halted.{code}' for code in HALT_CODES)
 PAUSE_FILE = '/etc/deedkit/autodeploy.pause'
 # Policy limits from capture, the normal day plus margin (ANYM-807 criterion 6); BACKUP.md, Backup alerts. Calls 30 h, not

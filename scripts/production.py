@@ -3153,15 +3153,24 @@ def holder_apply(project, item, release, services, command, receipt, failed):
         if later:
             holder_restore(project, item, release, pairs, later, exc)
         failed(exc)
+    def failing(exc):  # without a paired collector stopped, exactly what apply did before ANYM-896
+        if not isinstance(exc, Refused) and not later:
+            raise exc
+        fail(exc if isinstance(exc, Refused) else Refused(f"a session step failed: {type(exc).__name__}"))
     # Stop the existing owners before replacements can connect to their sessions.
-    if later:
-        run(command + ["stop", *later])
-    run(command + ["stop", *first])
+    try:
+        if later:
+            run(command + ["stop", *later])
+        run(command + ["stop", *first])
+    except Exception as exc:
+        if not later:
+            raise
+        failing(exc)
     since = holder_since()
     try:
         run(up + first)
-    except Refused as exc:
-        fail(exc)
+    except Exception as exc:
+        failing(exc)
     try:
         if holders:
             holder_steady(command, project, item["running"], {holder: receipt["images"][project["services"][holder]]
