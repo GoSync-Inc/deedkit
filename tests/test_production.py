@@ -7804,6 +7804,48 @@ def test_a_third_tool_file_that_does_not_compile_fails_the_staged_self_test(tmp_
 
 
 # spec: ANYM-443
+def test_a_candidate_that_drops_a_tool_file_the_running_tool_lists_installs_its_own_list(tmp_path, monkeypatch):
+    host = ToolHost(tmp_path, monkeypatch)
+    host.serve(three_file_tool(host.verifier))
+    assert host.deploy()["status"] == "tool-updated"
+    host.restart()
+    # The next commit removes scripts/tool_extra.py and lists the pair again: git has no blob for the removed path.
+    dropped = "3" * 40
+    host.history.append(dropped)
+    host.green.add(dropped)
+    host.changes[dropped], host.candidate = ["scripts/production.py", "scripts/tool_extra.py"], dropped
+    host.serve(candidate_tool(host.verifier, inject=b"# the pair again\n"))
+    run = host.p.run
+    def deleted(argv, **kwargs):
+        if argv[3:] == ["rev-parse", f"{dropped}:scripts/tool_extra.py"]:
+            raise p.Refused("git failed (exit 128); production was not accepted")
+        return run(argv, **kwargs)
+    monkeypatch.setattr(host.p, "run", deleted)
+    outcome = host.deploy()
+    assert outcome["status"] == "tool-updated" and host.current_tool() == f"releases/{dropped}"
+    assert sorted(path.name for path in (host.tool / "releases" / dropped).iterdir()) == [
+        "production.py", "seamless_release.py", "tool.json"]
+    assert p.installed_tool()["sha"] == dropped and host.paused() is None
+
+
+# spec: ANYM-443
+@pytest.mark.parametrize("value", ["[]", "{}", "{1}", "None"])
+def test_a_tool_files_value_that_is_no_file_name_is_refused_and_retention_skips_its_release(tmp_path, monkeypatch,
+                                                                                            value):
+    host = ToolHost(tmp_path, monkeypatch)
+    manifest = (b'TOOL_FILES = {"scripts/production.py": "production.py", "scripts/seamless_release.py": '
+                b'"seamless_release.py", "scripts/tool_extra.py": %s}' % value.encode())
+    files = three_file_tool(host.verifier, manifest)
+    with pytest.raises(p.Refused, match="names no TOOL_FILES"):
+        p.tool_manifest(files["scripts/production.py"], "synthetic")
+    # A release on the host with such a list is no checked release: retention keeps it and removes the others.
+    odd = "4" * 40
+    install_release(host.tool, odd, {path: content for path, content in files.items() if "extra" not in path})
+    install_release(host.tool, "5" * 40, TOOL, "2026-10-19T00:00:00Z")
+    assert p.retain_tools([BASE]) == ["5" * 40] and (host.tool / "releases" / odd).is_dir()
+
+
+# spec: ANYM-443
 @pytest.mark.parametrize("manifest", [
     b'TOOL_FILES = dict(production="production.py")',
     b'TOOL_FILES = {"scripts/production.py": "production.py", "scripts/seamless_release.py": "seamless_release.py", '

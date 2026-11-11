@@ -5072,7 +5072,12 @@ def range_changes(mirror, base, candidate, installed):
         if path in installed:
             if path in UNITS and not os.path.lexists(installed[path]):
                 return True
-            return run(["git", "-C", str(mirror), "rev-parse", f"{candidate}:{path}"]).strip() == blob(installed[path])
+            try:
+                return run(["git", "-C", str(mirror), "rev-parse", f"{candidate}:{path}"]).strip() == blob(installed[path])
+            except Refused:
+                if path in TOOL_FILES:  # a tool file the candidate deletes waits for the tool update, which installs
+                    return False        # the candidate's own list
+                raise
         # The verifier is the candidate's when the installed binary is this tool's pinned build and the candidate
         # records that same build (tests keep each commit's two pins equal to its recorded file): a later tool change
         # with an unchanged verifier then installs itself instead of pausing (ANYM-618).
@@ -6779,9 +6784,10 @@ def tool_manifest(source, where):
                 files = ast.literal_eval(body[0].value)
     except (ValueError, TypeError, MemoryError, RecursionError):
         files = None
-    if (not isinstance(files, dict) or not set(TOOL_LINKS) <= set(files.values())
-            or not all(isinstance(path, str) and (match := TOOL_FILE.fullmatch(path)) and match[1] == name
-                       for path, name in files.items())):
+    if (not isinstance(files, dict)
+            or not all(isinstance(path, str) and isinstance(name, str) and (match := TOOL_FILE.fullmatch(path))
+                       and match[1] == name for path, name in files.items())
+            or not set(TOOL_LINKS) <= set(files.values())):
         raise Refused(f"{where} names no TOOL_FILES: one literal dict of scripts/<module>.py paths to their file "
                       "names, production.py and seamless_release.py among them")
     return files
