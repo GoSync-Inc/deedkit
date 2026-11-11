@@ -1494,8 +1494,9 @@ no message content.
 
 The module stream. A subscription gets module sources `(source, scope_ref, types)` and a module
 stream (`subscription_module_streams`) through `module_events.attach_sources`. A call source
-comes only from `create_subscription(module_sources=[{scope: "calls:own", types}])` (store API; the MCP
-tool and gateway catalog follow in ANYM-566) and only through the principal's active calls link (ANYM-564,
+comes only from `create_subscription(module_sources=[{scope: "calls:own", types}])` (REST, MCP and the
+gateway's `messages_create_subscription` take it, ANYM-566; see "Module event kinds in capabilities" below)
+and only through the principal's active calls link (ANYM-564,
 ACCESS.md "Module links"); its scope is the link's calls principal. A call source whose link is revoked,
 stale or regranted is `access_changed`: it matches, pages and announces nothing more (hints are cancelled
 with `module_not_linked`). Other modules have no API path yet (ANYM-577). Each
@@ -1518,7 +1519,8 @@ subscription that has one; message-only responses are unchanged. `get_subscripti
 next_after, gap}`; each item is the envelope above plus `module_event_id` and `expired`. The
 passive `get_subscription_events` reads the module stream from the consumer's ACK position, so a
 pruned range is never served again; `Store.get_subscription_events(module_after=)` pages it
-explicitly (the MCP and gateway parameter comes with the module catalog, ANYM-566). One fetch receipt
+explicitly (a store parameter only: no MCP or gateway argument, since `fetch_subscription_events` pages both
+streams under one receipt, ANYM-566). One fetch receipt
 carries both streams' positions (`module_after_position`, `module_through_position`); the ACK
 moves each position by compare-and-swap and returns `module_acked_through`. Retention prunes
 ACKed module references after the same window and with the same switch as message references,
@@ -1556,6 +1558,29 @@ writer) first, then cancel pending module hints
 WHERE kind='module_events' AND state IN ('pending','leased')`), because an older dispatcher would
 send them as message hints, then deploy. The module tables stay; an older matcher stages no module
 hint, and the fence holds every module stream an older runtime resumes.
+
+### Module event kinds in capabilities (ANYM-566)
+
+Capabilities name a module's event kinds only to a key that can use them. `subscriptions.module_events` is present
+only while the key's principal has a live calls link (ANYM-564: active, not revoked, not stale); without one the key
+reads no module name, kind or scope anywhere in `capabilities`, and the field is absent, not empty. For a linked key it is
+`{calls: {source: "deedkit:calls", scope: "calls:own", kinds: [...], create: "create_subscription", argument:
+"module_sources", consume: "fetch_subscription_events", refused_without_link: "module_not_linked"}}`. `kinds` is exactly what
+`create_subscription` admits for that scope (one function, `module_links.call_kinds`, feeds both), sorted; slice 1 lists calls
+kinds only, calendar kinds follow with their API path (ANYM-577). A failed link read advertises nothing and never fails
+`capabilities`. A revocation, a stale mark or a regrant that changes the link removes the field with the next call.
+
+`create_subscription` takes an optional `module_sources: [{scope, types}]` next to `chat_ids` or `sources`; its schema names no
+scope or kind (a key without a link reads none from the tool list either). Without a link the call is refused
+`module_not_linked` (409) with the owner step. Through the gateway the owner step arrives as `hint` (a reviewed constant,
+`dispatch_shaping.REVIEWED_HINTS`; a prose `next` is not a call the gateway can run, so it drops it), and
+`messages_capabilities` keeps `subscriptions.module_events` only while the caller's tool list holds
+`messages_create_subscription`, each named call under its public name. The gateway profile
+`config/profiles/messaging-module-events.toml` is `messaging-subscriber` plus the calls reads an agent needs after a wake
+(`calls_capabilities`, `calls_get_call_status`, `calls_get_call_result`, `calls_get_owner_requests`); no installed profile
+(`existing-readers`, `messaging-reader`, `messaging-subscriber`, the calls and calendar profiles) lists it or changes. Switching an
+agent to it is a gateway policy edit (the owner's step, listed in the PR), and a call event is delivered only to a key whose
+principal also has the link (`deedkit admin module-links link`).
 
 ### Recordings source (ANYM-732, schema 67)
 

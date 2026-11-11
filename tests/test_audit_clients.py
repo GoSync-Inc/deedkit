@@ -70,6 +70,25 @@ def test_python_audit_defaults_and_old_server_payloads():
     assert seen[8][1] == {**seen[7][1], 'wait_s': 0.25}
 
 
+# spec: ANYM-566
+def test_python_create_subscription_sends_module_sources_only_when_given_and_refuses_a_malformed_one():
+    seen = []
+    def transport(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={})
+    wanted = [{'scope': 'calls:own', 'types': ['call.finished']}]
+    with Client('https://archive.example', 'synthetic-token', transport=httpx.MockTransport(transport)) as client:
+        client.create_subscription(chat_ids=['chat_synthetic'])
+        client.create_subscription(chat_ids=['chat_synthetic'], module_sources=wanted)
+        for bad in ([], wanted * 2, {'scope': 'calls:own', 'types': ['call.finished']}, [{'scope': 'calls:own'}],
+                [{'scope': '', 'types': ['call.finished']}], [{'scope': 'calls:own', 'types': []}],
+                [{'scope': 'calls:own', 'types': [7]}], [{'scope': 'calls:own', 'types': ['x'] * 17}],
+                [{'scope': 'calls:own', 'types': ['call.finished'], 'scope_ref': 'owner-b'}]):
+            with pytest.raises(ValueError, match='invalid_parameters'):
+                client.create_subscription(chat_ids=['chat_synthetic'], module_sources=bad)
+    assert len(seen) == 2 and 'module_sources' not in seen[0] and seen[1]['module_sources'] == wanted
+
+
 def test_python_wait_defaults_allow_server_deadline_and_respect_explicit_client_timeout():
     seen = []
     def transport(request):

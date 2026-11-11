@@ -111,6 +111,9 @@ def capabilities(self, token, detail='full', sections=None):
             features['subscription-write']=['create_subscription','update_subscription','configure_subscription_delivery','test_subscription']
             from .delivery_endpoints import TOOLS as delivery_tools
             features['delivery-write']=list(delivery_tools)
+        # ANYM-566: module event kinds are named only to a key whose principal has a live module link.
+        from .module_links import advertised
+        module_events=advertised(c,p) if 'read' in p['permissions'] else None
         available=[feature for permission,names in features.items() if permission in p['permissions'] for feature in names]
         if {'read','send','upload'}<=set(p['permissions']):
             available.extend(['prepare_file_upload','upload_file_chunk','get_file_upload'])
@@ -198,6 +201,7 @@ def capabilities(self, token, detail='full', sections=None):
                 'mutation_permission':'subscription-write','read_permission_required':True,
                 'ownership':'originating_credential_and_principal','new_permission_inherited':False,
                 'source_scope_change':'masked_access_changed_recreate_required',
+                **({'module_events':module_events} if module_events else {}),
                 'ack':True,'ack_permission':'subscription-ack','push':'operator_registered_signed_hints','wait_max_seconds':25,'verified_host':False,'native_reply_preset':True,
                 'provider_polling':False,'start_boundary':'committed_archive_frontier',
                 'existing_update_consumers_unchanged':True,'transports':delivery_transports(c,p),

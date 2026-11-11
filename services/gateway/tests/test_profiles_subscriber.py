@@ -39,6 +39,28 @@ def test_subscriber_and_reader_profiles_have_exact_tool_sets():
     assert result.returncode == 0, result.stderr
 
 
+# spec: ANYM-566
+def test_module_events_profile_is_the_subscriber_profile_plus_calls_reads_and_no_installed_profile_gains_it():
+    calls_reads = ["calls_capabilities", "calls_get_call_status", "calls_get_call_result", "calls_get_owner_requests"]
+    profile = tools("messaging-module-events")
+    assert profile == tools("messaging-subscriber") + calls_reads and len(set(profile)) == len(profile)
+    assert all(name in CATALOG for name in profile)
+    assert all(CATALOG[name]["annotations"]["readOnlyHint"] for name in calls_reads)
+    result = subprocess.run([sys.executable, str(ROOT / "scripts/deedkit.py"), "resolve", "--profile",
+                             str(ROOT / "config/profiles/messaging-module-events.toml"), "--json"],
+                            capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    # Switching it on is the owner's step: no other repository profile names a calls read next to subscriptions,
+    # and the readers installed today list no subscription tool at all.
+    for other in sorted((ROOT / "config/profiles").glob("*.toml")):
+        listed = tomllib.loads(other.read_text())["exposure"]["tools"]
+        if other.stem != "messaging-module-events":
+            assert not ({"messages_create_subscription"} & set(listed) and {"calls_get_call_result"} & set(listed)), other.name
+    for installed in ("existing-readers", "messaging-reader"):
+        assert "messages_create_subscription" not in tools(installed), installed
+        assert not [name for name in tools(installed) if name.startswith("calls_")], installed
+
+
 # spec: ANYM-848
 def test_no_repository_profile_exposes_the_wake_target_tools():
     for profile in sorted((ROOT / "config/profiles").glob("*.toml")):

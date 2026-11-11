@@ -3606,6 +3606,34 @@
             "title": "ExcludedChat",
             "type": "object"
           },
+          "ModuleSource": {
+            "additionalProperties": false,
+            "properties": {
+              "scope": {
+                "maxLength": 64,
+                "minLength": 1,
+                "title": "Scope",
+                "type": "string"
+              },
+              "types": {
+                "items": {
+                  "maxLength": 64,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "maxItems": 16,
+                "minItems": 1,
+                "title": "Types",
+                "type": "array"
+              }
+            },
+            "required": [
+              "scope",
+              "types"
+            ],
+            "title": "ModuleSource",
+            "type": "object"
+          },
           "QuietHours": {
             "additionalProperties": false,
             "properties": {
@@ -3871,6 +3899,24 @@
             "pattern": "^[^\\x00-\\x1f\\x7f]*$",
             "title": "Label",
             "type": "string"
+          },
+          "module_sources": {
+            "anyOf": [
+              {
+                "description": "Optional module event source, only where the owner has linked the module for your key: [{scope, types}] as capabilities subscriptions.module_events names them; refused module_not_linked otherwise.",
+                "items": {
+                  "$ref": "#/$defs/ModuleSource"
+                },
+                "maxItems": 1,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Module Sources"
           },
           "origins": {
             "anyOf": [

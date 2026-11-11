@@ -357,6 +357,15 @@ together. `production.py` deploys both images from one SHA. An older gateway in 
 of this backend passes the transport rows through (ANYM-528 empties their `tools`
 but keeps the rows); its admission still refuses the hidden tools.
 
+The `config/profiles/messaging-module-events.toml` profile (ANYM-566) is `messaging-subscriber` plus
+`calls_capabilities`, `calls_get_call_status`, `calls_get_call_result` and `calls_get_owner_requests`, the reads an agent
+makes after a call event wakes it. `messages_create_subscription` takes an optional `module_sources`
+(`[{scope, types}]`); its schema names no scope or kind, and the backend refuses it `module_not_linked` unless the owner
+linked calls for the key's principal (`deedkit admin module-links link`). The gateway relays that refusal with the owner
+step as `hint`. `messages_capabilities` keeps `subscriptions.module_events` (the backend lists it only for a linked key)
+only while the caller's tool list holds `messages_create_subscription`. No installed profile lists the new profile's
+tools or changes: switching an agent to it is a gateway policy edit, the owner's step.
+
 Long subscription waits and sends with positive `wait_s` use a separate pool with
 2 active and 4 waiting requests; ordinary messaging reads retain their own pool.
 Both waits are bounded to 25 seconds. Cancellation releases waiting capacity.

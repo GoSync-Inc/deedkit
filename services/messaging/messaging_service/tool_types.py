@@ -150,6 +150,16 @@ class SubscriptionEndpoint(TypedDict, total=False):
     __pydantic_config__ = ConfigDict(extra='forbid')
     endpoint_id: Required[EndpointReference]
     delivery_policy: DeliveryPolicy
+class ModuleSource(TypedDict):
+    # ANYM-566: a module's scope and the event types wanted from it. The server checks both against the principal's
+    # owner-set link (module_not_linked, invalid_filter); the schema names no scope or type, so a key without a link
+    # reads nothing about any module from it.
+    __pydantic_config__ = ConfigDict(extra='forbid')
+    scope: Required[Annotated[StrictStr,Field(min_length=1,max_length=64)]]
+    types: Required[Annotated[list[Annotated[StrictStr,Field(min_length=1,max_length=64)]],Field(min_length=1,max_length=16)]]
+ModuleSources = Annotated[list[ModuleSource], Field(min_length=1,max_length=1,
+    description='Optional module event source, only where the owner has linked the module for your key: '
+        '[{scope, types}] as capabilities subscriptions.module_events names them; refused module_not_linked otherwise.')]
 
 
 def subscription_expiry(value):
