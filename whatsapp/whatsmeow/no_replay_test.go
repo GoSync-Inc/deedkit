@@ -96,6 +96,17 @@ func noReplayJob(t *testing.T, op string, d *operationDependencies) operationReq
 		job.ProviderChat = ""
 	case "open_chat_by_phone":
 		job = phoneJob(params)
+	case "vote_poll":
+		m.Message = (&whatsmeow.Client{}).BuildPollCreation("Question", []string{"a", "b"}, 1)
+		m.RawMessage = m.Message
+		job.Parameters["option_indices"] = json.RawMessage(`[0]`)
+		job.ExpectedPoll = &expectedPoll{Question: "Question", Options: []pollOption{{0, "a"}, {1, "b"}}, SelectableCount: 1}
+		d.pollVote = func(context.Context, types.JID, *types.MessageInfo, []string) (*waE2E.Message, types.JID, error) {
+			return &waE2E.Message{PollUpdateMessage: &waE2E.PollUpdateMessage{}}, d.owner, nil
+		}
+		d.putPollVote = func(string, string, string, *waE2E.PollCreationMessage, types.JID, [][]byte, time.Time) error {
+			return nil
+		}
 	}
 	return job
 }

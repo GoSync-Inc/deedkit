@@ -98,7 +98,7 @@ not a PASS result.
 | edit_message | Yes | `BuildEdit` + `SendMessage` | Own exact outgoing ID/revision, plain text, no fake new message instead of edit |
 | delete_message | No | `BuildRevoke` + `SendMessage` | Useful addition: global revoke only, never local-delete fallback; Python manifest/validation must become provider-aware |
 | send_reaction | Yes | `BuildReaction` + `SendMessage` | Empty emoji removes, exact target author/chat/key; no paid action |
-| vote_poll | No | `BuildPollVote` exists upstream | Separate scope/parameter/crypto contract; keep unsupported in this slice |
+| vote_poll | No | `EncryptMsgSecret` as `BuildPollVote`, keyed to the identity `SendMessage` sends with (LID in direct chats and LID groups; the receipt's sender is checked), + `SendMessage` | Native only (ANYM-315): the archived poll the owner confirmed, its options by index, `selectable_count` and an empty retract; a changed poll (`operation_target_changed`) or a missing secret (`poll_secret_unavailable`) sends nothing; the vote is journaled as the owner's `poll_vote` |
 | pin_message | Yes | Typed PinInChatMessage + `SendMessage` | Pin-for-all, bounded duration; not merely pin-chat app-state |
 | unpin_message | Yes | Typed PinInChatMessage UNPIN_FOR_ALL + `SendMessage` | Exact target, no pin-chat substitution |
 | mark_read | Yes | `MarkRead` + explicit app-state choice | Current contract says whole_chat; native `MarkRead` is explicit IDs. Advertise changed scope or implement whole-known-chat carefully |

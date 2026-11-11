@@ -272,6 +272,27 @@ def test_chat_link_validation():
         'field': 'chat_id', 'reason': 'unknown_field', 'expected': 'only link'}
 
 
+# spec: ANYM-315
+def test_poll_vote_is_native_only_on_whatsapp():
+    from messaging_service.messenger_operations import NATIVE_UNSUPPORTED
+    telegram = {r['operation']: r for r in operation_manifest('telegram')}
+    native = {r['operation']: r for r in operation_manifest('whatsapp', provider='whatsmeow')}
+    browser = {r['operation']: r for r in operation_manifest('whatsapp', provider='webjs')}
+    assert telegram['vote_poll']['supported'] and native['vote_poll']['supported'] and not browser['vote_poll']['supported']
+    assert 'native' in browser['vote_poll']['limitation']
+    with pytest.raises(ValueError, match='unsupported_operation'):
+        validate_operation('whatsapp', 'vote_poll', {'option_indices': [0]}, provider='webjs')
+    # The empty selection retracts the owner's vote.
+    assert validate_operation('whatsapp', 'vote_poll', {'option_indices': []}, provider='whatsmeow') == {'option_indices': []}
+    # A WhatsApp poll archives up to 12 options; a Telegram one keeps its 10 (Astra r1 M2).
+    assert validate_operation('whatsapp', 'vote_poll', {'option_indices': [11]}, provider='whatsmeow') == {'option_indices': [11]}
+    for platform, index in (('whatsapp', 12), ('telegram', 10)):
+        with pytest.raises(ValueError, match='invalid_operation_parameters'):
+            validate_operation(platform, 'vote_poll', {'option_indices': [index]},
+                               provider='whatsmeow' if platform == 'whatsapp' else None)
+    assert NATIVE_UNSUPPORTED == frozenset(('add_contact', 'delete_contact', 'get_labels', 'set_chat_labels'))
+
+
 # spec: ANYM-243
 def test_chat_link_catalog():
     check, join = operation_spec('check_chat_link'), operation_spec('join_chat')

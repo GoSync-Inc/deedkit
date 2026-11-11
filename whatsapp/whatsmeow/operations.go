@@ -28,7 +28,7 @@ var operationFields = map[string]string{
 	"get_profile": "", "list_contacts": "offset limit", "get_contact": "user_id", "list_blocked": "offset limit", "get_pinned_messages": "offset limit",
 	"send_file": "attachment_id upload_id sha256 mode caption", "forward_message": "source_message_id source_revision", "send_poll": "question options multiple",
 	"send_contact": "contact_ids", "send_location": "latitude longitude description", "edit_message": "text", "delete_message": "revoke",
-	"send_reaction": "emoji", "pin_message": "seconds", "unpin_message": "", "mark_read": "", "mark_unread": "", "archive_chat": "", "unarchive_chat": "",
+	"send_reaction": "emoji", "vote_poll": "option_indices", "pin_message": "seconds", "unpin_message": "", "mark_read": "", "mark_unread": "", "archive_chat": "", "unarchive_chat": "",
 	"mute_chat": "seconds", "unmute_chat": "", "pin_chat": "", "unpin_chat": "", "star_message": "", "unstar_message": "", "create_group": "title user_ids",
 	"rename_group": "title", "set_group_description": "description", "add_participant": "user_id", "remove_participant": "user_id", "promote_participant": "user_id",
 	"demote_participant": "user_id", "leave_group": "", "get_invite_link": "", "revoke_invite_link": "", "add_contact": "phone first_name last_name",
@@ -80,6 +80,8 @@ type operationRequest struct {
 	LookupMillis          int64                      `json:"lookup_ms"`
 	// ExpectedChat is what the owner confirmed for join_chat (ANYM-243).
 	ExpectedChat *expectedChat `json:"expected_chat"`
+	// ExpectedPoll is the archived poll the owner confirmed a vote on (ANYM-315).
+	ExpectedPoll *expectedPoll `json:"expected_poll"`
 }
 
 type expectedChat struct {
@@ -120,6 +122,8 @@ type operationDependencies struct {
 	history          func(context.Context, string, int) (any, error)
 	markRead         func(context.Context, []types.MessageID, time.Time, types.JID, types.JID) error
 	isOnWhatsApp     func(context.Context, []string) ([]types.IsOnWhatsAppResponse, error)
+	pollVote         func(context.Context, types.JID, *types.MessageInfo, []string) (*waE2E.Message, types.JID, error)
+	putPollVote      func(chat, pollID, voteID string, poll *waE2E.PollCreationMessage, voter types.JID, selected [][]byte, at time.Time) error
 	lookupTimeout    time.Duration
 	ownerName        string
 	platform         string
@@ -138,7 +142,10 @@ func (d *operationDependencies) useGroupIQ(iq groupIQ) {
 func (p *Provider) operationDependencies() operationDependencies {
 	c := p.Client
 	d := operationDependencies{sendDependencies: p.sendDependencies(), contacts: c.Store.Contacts.GetAllContacts, contact: c.Store.Contacts.GetContact,
-		settings: c.Store.ChatSettings.GetChatSettings, patch: c.SendAppState, isOnWhatsApp: c.IsOnWhatsApp,
+		settings: c.Store.ChatSettings.GetChatSettings, patch: c.SendAppState, isOnWhatsApp: c.IsOnWhatsApp, pollVote: nativePollVote(c),
+		putPollVote: func(chat, pollID, voteID string, poll *waE2E.PollCreationMessage, voter types.JID, selected [][]byte, at time.Time) error {
+			return p.Capture.putPollVote(chat, pollID, voteID, poll, voter, true, selected, at, "live")
+		},
 		markRead: func(ctx context.Context, ids []types.MessageID, stamp time.Time, chat, sender types.JID) error {
 			return c.MarkRead(ctx, ids, stamp, chat, sender)
 		}, upload: c.Upload, latest: p.Capture.Latest, page: p.Capture.Page, receipts: p.Capture.ReceiptObservations,
@@ -488,7 +495,7 @@ func executeOperation(ctx context.Context, job operationRequest, d operationDepe
 var operationErrorCodes = wordSet(`history_rate_limited history_anchor_unavailable operation_unsupported operation_invalid_parameters
 	operation_disabled operation_expired operation_target_invalid operation_target_unavailable operation_result_too_large registered_file_invalid
 	invalid_phone identity_unresolved chat_not_collected provider_timeout rate_limited operation_query_failed forbidden
-	invite_invalid invite_expired chat_full join_not_allowed already_member operation_target_changed`)
+	invite_invalid invite_expired chat_full join_not_allowed already_member operation_target_changed poll_secret_unavailable`)
 
 // operationErrorCode is the error op answers for err when no change started: a code of
 // operationErrorCodes as it is, anything else the generic code of a read or of a change.
@@ -523,6 +530,7 @@ var operationHandlers = operationTable(map[string]operationHandler{
 	},
 	"block_contact unblock_contact": (*operationEnv).blockContact,
 	"update_profile":                (*operationEnv).updateProfile,
+	"vote_poll":                     (*operationEnv).votePoll,
 })
 
 // operationTable expands each space-separated key of groups to one entry per operation.

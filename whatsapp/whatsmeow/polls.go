@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	waWeb "go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/proto"
 )
 
 // WhatsApp polls in the archive (ANYM-921). A poll creation keeps its options;
@@ -285,4 +288,150 @@ func (p *Provider) historyPollVote(poll *events.Message, creation *waE2E.PollCre
 	vote := &events.Message{Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: poll.Info.Chat, Sender: voter, IsFromMe: key.GetFromMe(), IsGroup: poll.Info.IsGroup}, ID: key.GetID()}}
 	at := pollVoteTime(u.GetSenderTimestampMS(), time.UnixMilli(u.GetServerTimestampMS()))
 	return p.Capture.putPollVote(chat, LegacyMessageID(poll), LegacyMessageID(vote), creation, voter, key.GetFromMe(), u.GetVote().GetSelectedOptions(), at, "history")
+}
+
+// expectedPoll is the archived poll block (pollBlock) the owner confirmed a vote on: the
+// collector binds the message's metadata.poll at the reviewed revision (ANYM-315).
+type expectedPoll struct {
+	Question        string       `json:"question"`
+	Options         []pollOption `json:"options"`
+	SelectableCount uint32       `json:"selectable_count"`
+	Truncated       bool         `json:"truncated"`
+}
+
+type pollOption struct {
+	Index int    `json:"index"`
+	Text  string `json:"text"`
+}
+
+// samePoll is whether the captured poll v still archives as the block the owner confirmed.
+func samePoll(v *waE2E.PollCreationMessage, want *expectedPoll) bool {
+	var got expectedPoll
+	raw, err := json.Marshal(pollBlock(v))
+	if want == nil || err != nil || json.Unmarshal(raw, &got) != nil {
+		return false
+	}
+	return reflect.DeepEqual(got, *want)
+}
+
+// pollVoteNames are the full option names of the selected positions, in the given order: each
+// once, among the poll's archived options and at most its selectable count (0: any number).
+// The empty selection retracts the owner's vote.
+func pollVoteNames(v *waE2E.PollCreationMessage, indices []int) ([]string, error) {
+	limit := min(len(v.GetOptions()), maxPollOptions)
+	if count := int(v.GetSelectableOptionsCount()); count > 0 && len(indices) > count {
+		return nil, errors.New("operation_invalid_parameters")
+	}
+	names := []string{}
+	for i, n := range indices {
+		if n < 0 || n >= limit || slices.Contains(indices[:i], n) {
+			return nil, errors.New("operation_invalid_parameters")
+		}
+		names = append(names, v.GetOptions()[n].GetOptionName())
+	}
+	return names, nil
+}
+
+// pollVoteSender is the identity whatsmeow SendMessage sends to target with (pinned send.go):
+// the owner's LID in a direct chat and in an LID-addressed group, else the phone-number ID.
+func pollVoteSender(target types.JID, lidGroup bool, pn, lid types.JID) types.JID {
+	switch target.Server {
+	case types.DefaultUserServer, types.HiddenUserServer:
+		return lid.ToNonAD()
+	case types.GroupServer:
+		if lidGroup {
+			return lid.ToNonAD()
+		}
+	}
+	return pn.ToNonAD()
+}
+
+// nativePollVote encrypts a vote as whatsmeow BuildPollVote does, but keyed to the identity
+// the send carries (Astra r1 M1): BuildPollVote keys a phone-number creator's poll to the
+// owner's phone-number ID, while SendMessage sends direct chats and LID-addressed groups as the
+// owner's LID, and a receiver derives the vote key from the identity the vote arrives from.
+// It returns that identity, which votePoll checks against the send's receipt.
+func nativePollVote(c *whatsmeow.Client) func(context.Context, types.JID, *types.MessageInfo, []string) (*waE2E.Message, types.JID, error) {
+	in := c.DangerousInternals()
+	return func(ctx context.Context, target types.JID, poll *types.MessageInfo, names []string) (*waE2E.Message, types.JID, error) {
+		lidGroup := false
+		if target.Server == types.GroupServer {
+			// The group addressing SendMessage itself reads (a group read when not cached).
+			group, err := in.GetCachedGroupData(ctx, target)
+			if err != nil || group == nil {
+				return nil, types.EmptyJID, errors.New("operation_target_unavailable")
+			}
+			lidGroup = group.AddressingMode == types.AddressingModeLID
+		}
+		voter := pollVoteSender(target, lidGroup, in.GetOwnID(), in.GetOwnLID())
+		if voter.IsEmpty() {
+			return nil, types.EmptyJID, whatsmeow.ErrNotLoggedIn
+		}
+		plaintext, err := proto.Marshal(&waE2E.PollVoteMessage{SelectedOptions: whatsmeow.HashPollOptions(names)})
+		if err != nil {
+			return nil, types.EmptyJID, err
+		}
+		payload, iv, err := in.EncryptMsgSecret(ctx, voter, poll.Chat, poll.Sender, poll.ID, whatsmeow.EncSecretPollVote, plaintext)
+		if err != nil {
+			return nil, types.EmptyJID, err
+		}
+		key := &waCommon.MessageKey{RemoteJID: proto.String(poll.Chat.String()), FromMe: proto.Bool(poll.IsFromMe), ID: proto.String(poll.ID)}
+		if poll.IsGroup {
+			key.Participant = proto.String(poll.Sender.String())
+		}
+		return &waE2E.Message{PollUpdateMessage: &waE2E.PollUpdateMessage{PollCreationMessageKey: key,
+			Vote: &waE2E.PollEncValue{EncPayload: payload, EncIV: iv}, SenderTimestampMS: proto.Int64(time.Now().UnixMilli())}}, voter, nil
+	}
+}
+
+// votePoll sends the owner's confirmed vote on a captured poll (ANYM-315). The poll must still
+// be the one the owner confirmed. whatsmeow encrypts the vote with the poll's secret from its
+// store, so a poll whose secret this session never received is refused before anything is
+// sent. The sent vote is journaled as the owner's poll_vote, never as a chat message; an
+// uncertain send answers unknown and is never retried.
+func (e *operationEnv) votePoll(string) (any, error) {
+	var indices []int
+	if decodeValue(e.job.Parameters["option_indices"], &indices) != nil || indices == nil {
+		return nil, errors.New("operation_invalid_parameters")
+	}
+	m, err := e.getMessage()
+	if err != nil {
+		return nil, err
+	}
+	m = unwrap(m)
+	poll := pollCreation(m.Message)
+	if poll == nil {
+		return nil, errors.New("operation_target_invalid")
+	}
+	if !samePoll(poll, e.job.ExpectedPoll) {
+		return nil, errors.New("operation_target_changed")
+	}
+	names, err := pollVoteNames(poll, indices)
+	if err != nil {
+		return nil, err
+	}
+	info := m.Info
+	info.Sender = info.Sender.ToNonAD() // the creator, as the vote's key names it
+	wire, voter, err := e.d.pollVote(e.ctx, e.target, &info, names)
+	if errors.Is(err, whatsmeow.ErrOriginalMessageSecretNotFound) {
+		return nil, errors.New("poll_secret_unavailable")
+	}
+	if err != nil || wire.GetPollUpdateMessage() == nil || voter.IsEmpty() {
+		return nil, errors.New("operation_target_unavailable")
+	}
+	selected := whatsmeow.HashPollOptions(names)
+	sd := e.d.sendDependencies
+	sd.put = func(sent *events.Message, _ string) error {
+		// A vote sent under another identity than the one it is keyed to cannot be
+		// opened by the chat: never journaled as the owner's vote, answered unknown.
+		if sent.Info.Sender.ToNonAD() != voter.ToNonAD() {
+			return errors.New("send_receipt_mismatch")
+		}
+		at := pollVoteTime(wire.GetPollUpdateMessage().GetSenderTimestampMS(), sent.Info.Timestamp)
+		return e.d.putPollVote(e.job.ProviderChat, e.job.ProviderMessageID, LegacyMessageID(sent), poll, sent.Info.Sender, selected, at)
+	}
+	if err = e.mutate("", func() error { _, err := sendAndCapture(e.ctx, sd, e.target, wire); return err }); err != nil {
+		return nil, err
+	}
+	return e.submitted(nil)
 }

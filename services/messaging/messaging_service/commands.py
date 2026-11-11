@@ -117,11 +117,11 @@ def permitted(p,account,chat):
     return account in p['accounts'] and (p['chat_ids'] is None or chat in p['chat_ids'])
 
 
-def _required_permissions(permission,operation,parameters=None):
+def _required_permissions(permission,operation,parameters=None,provider=None):
     values={permission}
     if operation=='send_file':
         values.update(('read','upload') if isinstance(parameters,dict) and 'upload_id' in parameters else ('download',))
-    if operation in ('forward_message','delete_member_messages'):values.add('read')  # ANYM-934: its preview shows the messages
+    if operation in ('forward_message','delete_member_messages') or (operation,provider)==('vote_poll','whatsmeow'):values.add('read')  # ANYM-934, ANYM-315: its preview shows the messages / the archived poll
     return sorted(values)
 
 
@@ -234,7 +234,7 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
         # A chat-scoped key learns nothing about chats outside its scope, existing or not.
         raise APIError('forbidden',403)
     provider=account_provider(c,account,account_row['platform'])
-    required=_required_permissions(spec['permission'],operation,parameters)
+    required=_required_permissions(spec['permission'],operation,parameters,provider)
     if set(required)-set(p['permissions']):raise APIError('forbidden',403)
     if spec['full_account'] and p['chat_ids'] is not None:raise APIError('forbidden',403)
     requested=parameters
@@ -281,6 +281,7 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
             payload['provider_message_id']=message['provider_id'];refs.append(message_id)
         elif message_id or expected_revision:raise _empty(spec,chat_id,message_id,expected_revision)
     if operation=='delete_member_messages':from . import member_messages;payload['targets']=member_messages.resolve(c,p,account,chat,parameters)
+    if operation=='vote_poll' and provider=='whatsmeow':from .polls import bind_whatsapp_vote;bind_whatsapp_vote(c,payload,message,parameters['option_indices'])
     if operation==HISTORY and account_row['platform']=='telegram':
         anchor=parameters.get('before_message') or parameters.get('around_message')
         if anchor is not None:
@@ -398,7 +399,7 @@ def manifest(c,p,account):
     items=[]
     for entry in operation_manifest(row['platform'],provider=provider):
         if not entry['supported']:continue
-        required=_required_permissions(entry['permission'],entry['operation'])
+        required=_required_permissions(entry['permission'],entry['operation'],provider=provider)
         permitted_here=(not(set(required)-set(p['permissions'])) and
                         (not entry['full_account'] or p['chat_ids'] is None) and
                         (entry['target']=='account' or p['chat_ids']!=[]))
@@ -857,7 +858,7 @@ class CommandWorker:
                 'rate_limited','provider_timeout','invalid_phone','identity_changed','sending_disabled','invite_invalid','invite_expired','chat_full',
                 'join_not_allowed','already_member','invalid_cursor','invalid_anchor','username_not_found',
                 'recipient_not_user','message_changed','password_required','press_uncertain',
-                'button_kind_unsupported','not_admin','missing_admin_right') else 'operation_rejected'
+                'button_kind_unsupported','not_admin','missing_admin_right','poll_secret_unavailable') else 'operation_rejected'
             # Nothing was sent, so a lookup that ran out of time is a retryable read.
             result={'data':{'code':code,'retry':True}} if code=='provider_timeout' else {'data':{'code':code,**exc.data}} if code in ('not_admin','missing_admin_right') and isinstance(exc.data,dict) else None
             # ANYM-676: a press refused before it left (the live message differs from the preview) returns the live
