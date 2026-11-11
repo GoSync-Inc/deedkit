@@ -320,6 +320,34 @@ deedkit admin module-links unlink --principal assistant-work --module calls
 - `deedkit admin key issue --like` copies links only with `--copy-links`; the installed gateway profile gains
   no grant from a link. `principal-info` lists a principal's links.
 
+### Calendar sources (ANYM-577, schema 93)
+
+Calendar events follow the same link rule with the calendar module's own permission model. The owner links the
+key's principal to a **calendar principal** (`deedkit admin module-links link --principal <p> --module calendar
+--module-principal <calendar principal>`). The key then names calendars in
+`module_sources=[{scope: "calendar:all" | "calendar:<calendar_ref>", types: [calendar.event.* types]}]`; a request never
+names the calendar principal, and without an active calendar link it is refused with `module_not_linked` (409) and a `next`.
+The calendar service journals `module.access.changed` (a control event, never subscribable) whenever the principal's
+effective access (`authorize(..., "agenda:read")` with `details` visibility: enabled and unexpired principal, membership,
+principal and grant scopes, agent-calendar binding, connection, neither visibility layer `busy_only`) to one calendar
+changes; messaging reads entitlement from those events alone (no remote call, no mirror table, no label from the router
+configuration). A calendar event E reaches the key only if, for the linked principal and E's calendar: the access in
+force at E was `details`, no `none` was journaled after E, and the latest state is `details` and unexpired (`until`).
+`calendar:all` is judged per event at match time; an exact calendar needs access now at admission. A loss hides what was
+queued and what follows (the hint is cancelled with `module_not_linked`, the source shows `access_changed`), a receipt
+issued before it is refused (`invalid_receipt`), and a regrant never revives an event journaled before the loss; events
+after it flow again. Another principal's events, a busy-only reader, an availability-only key and a forged scope never
+authorize anything.
+
+Ordering. Publishing an access event takes an advisory lock exclusively, and every use of a module reference (admission,
+fetch and wait polls, ACK, a webhook delivery) takes it shared before it reads, so a revocation is ordered against each
+use: the use's effect (receipt, ACK, bytes sent) commits before the revocation does, or the use reads the loss and is
+refused. `tests/test_calendar_module_access.py` proves it at database barriers for a live holder, a crashed holder and a
+late holder. Residual risk, named for the owner: bytes already leaving the process (a fetch response or webhook body after
+its transaction committed) cannot be recalled; a change at the calendar becomes known to messaging when the router reads
+its journal (the calendar journals it in the change's own transaction, so the lag is the router's polling interval, not a
+cache); and an access event pruned from the module journal would end the entitlement it carried (nothing prunes it today).
+
 ## Audit log boundaries
 
 `audit_log` contains the DB time, principal, public key UUID, db_role, actor,

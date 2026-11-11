@@ -14,11 +14,15 @@ from __future__ import annotations
 
 import re
 
-MODULES = {'calls': 'deedkit:calls'}
+MODULES = {'calls': 'deedkit:calls', 'calendar': 'deedkit:calendar'}
 CALL_SCOPE = 'calls:own'
+CALENDAR_ALL = 'calendar:all'
 _PRINCIPAL = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,255}')
 NEXT_LINK = ('Ask the owner to link calls for this key: deedkit admin module-links link --principal <principal> '
     '--module calls --module-principal <calls principal>; then create the subscription again.')
+NEXT_CALENDAR = ('Ask the owner to link calendar for this key: deedkit admin module-links link --principal <principal> '
+    '--module calendar --module-principal <calendar principal>; the linked principal must read the calendar with '
+    'details visibility; then create the subscription again.')
 
 
 def ready(c):
@@ -32,33 +36,97 @@ def stale(link):
         '.module_principal AND x.seq>' + link + '.granted_through)')
 
 
-def live(subscription, source, scope, *, linked=True):
+def _latest_access(principal, scope, before=None):
+    """SQL scalar: the data of the newest module.access.changed event the calendar journaled for (principal, scope),
+    before the module seq `before` when given."""
+    return ("(SELECT x.data FROM module_events x WHERE x.type='module.access.changed' AND x.scope_ref=" + scope +
+        ' AND x.subject=' + principal + (' AND x.seq<' + before if before else '') + ' ORDER BY x.seq DESC LIMIT 1)')
+
+
+def _holds(data):
+    """SQL: an access event's data says details and its `until` (the principal's expiry) has not passed."""
+    return ("(" + data + "->>'access'='details' AND (" + data + "->>'until' IS NULL OR (" + data +
+        "->>'until')::timestamptz>clock_timestamp()))")
+
+
+def access_holds(c, principal, scope):
+    """Whether the calendar principal's access to the calendar `scope` (`calendar:<ref>`) holds now, from the journal."""
+    return c.execute('SELECT 1 FROM (SELECT %s::text AS p,%s::text AS s) q WHERE ' + _holds(_latest_access('q.p', 'q.s')),
+        (principal, scope)).fetchone() is not None
+
+
+def _calendar_live(subscription, source, scope, seq):
+    """SQL: a calendar source (or, with `seq`, one calendar event) of a subscription is entitled (ANYM-577).
+
+    The source is live while the principal's calendar link is active with the generation it was admitted under and,
+    for a calendar named exactly, the principal's access to it holds now. `calendar:all` names no calendar: each event
+    is judged on its own calendar. An event (seq) is visible only if the access in force when it happened was details,
+    no access:none was journaled after it (so a revocation followed by a regrant never revives it) and the access
+    holds now. Everything is read from the module journal, which the calendar service stamps: nothing here trusts a
+    label of the router's configuration, and another principal's events never count (`subject` is the link's principal).
+    """
+    principal = 'ml.module_principal'
+    entitled = _holds(_latest_access(principal, scope))
+    if seq is None:
+        # Source level: `calendar:all` is judged per event; an exact calendar by its access now.
+        entitled = '(' + scope + "='calendar:all' OR " + entitled + ')'
+        named = 'sl.scope_ref=' + scope
+    else:
+        entitled += (' AND ' + _latest_access(principal, scope, seq) + "->>'access'='details'"
+            " AND NOT EXISTS(SELECT FROM module_events y WHERE y.type='module.access.changed' AND y.scope_ref=" + scope +
+            ' AND y.subject=' + principal + ' AND y.seq>' + seq + " AND y.data->>'access'='none')")
+        named = '(sl.scope_ref=' + scope + " OR sl.scope_ref='calendar:all')"
+    return ('EXISTS(SELECT FROM subscription_module_links sl JOIN subscriptions su ON su.id=sl.subscription '
+        "JOIN module_links ml ON ml.principal=su.principal AND ml.module='calendar' "
+        'WHERE sl.subscription=' + subscription + ' AND sl.source=' + source + ' AND ' + named +
+        " AND ml.state='active' AND ml.generation=sl.generation AND " + entitled + ')')
+
+
+def live(subscription, source, scope, *, linked=True, seq=None):
     """SQL: the module source (source, scope) of a subscription may match, be read and be announced.
 
-    The arguments are column expressions of the caller's query (code constants, never request values). A
-    non-calls source is not admitted by any API (ANYM-577 brings calendar scopes) and is left as it is.
+    The arguments are column expressions of the caller's query (code constants, never request values). `seq` is the
+    event's module seq column when the caller judges one event (a calendar source is entitled per event, ANYM-577).
+    Recordings and feedback sources are left as they are.
     """
+    linked_sources = "('deedkit:calls','deedkit:calendar')"
     if not linked:
-        return '(' + source + "<>'deedkit:calls')"
-    return ('(' + source + "<>'deedkit:calls' OR EXISTS(SELECT FROM subscription_module_links sl "
-        'JOIN subscriptions su ON su.id=sl.subscription '
+        return '(' + source + ' NOT IN ' + linked_sources + ')'
+    return ('(' + source + ' NOT IN ' + linked_sources + " OR " + source + "='deedkit:calls' AND EXISTS(SELECT FROM "
+        'subscription_module_links sl JOIN subscriptions su ON su.id=sl.subscription '
         "JOIN module_links ml ON ml.principal=su.principal AND ml.module='calls' "
         'WHERE sl.subscription=' + subscription + ' AND sl.source=' + source + ' AND sl.scope_ref=' + scope +
         " AND ml.state='active' AND ml.generation=sl.generation AND ml.module_principal=sl.scope_ref AND NOT " +
-        stale('ml') + '))')
+        stale('ml') + ') OR ' + source + "='deedkit:calendar' AND " + _calendar_live(subscription, source, scope, seq)
+        + ')')
 
 
-def live_sql(c, subscription, source, scope):
-    return live(subscription, source, scope, linked=ready(c))
+def live_sql(c, subscription, source, scope, seq=None):
+    return live(subscription, source, scope, linked=ready(c), seq=seq)
 
 
-def not_linked():
+def event_live(c, subscription_id, event):
+    """Whether one module event (a journal row with source, scope_ref and seq) may reach the subscription now."""
+    return c.execute('SELECT 1 FROM (SELECT %s::uuid AS sub,%s::text AS source,%s::text AS scope,%s::bigint AS seq) q '
+        'WHERE ' + live_sql(c, 'q.sub', 'q.source', 'q.scope', 'q.seq'),
+        (subscription_id, event['source'], event['scope_ref'], event['seq'])).fetchone() is not None
+
+
+def fence_use(c):
+    """Take the access fence shared: held to the end of the use's transaction, it makes a calendar access change
+    (publish takes the same lock exclusively) wait for this use, and a later use read the change (ANYM-577)."""
+    from .module_events import ACCESS_FENCE
+    c.execute('SELECT pg_advisory_xact_lock_shared(hashtextextended(%s,0))', (ACCESS_FENCE,))
+
+
+def not_linked(module='calls'):
     from .store import APIError
     error = APIError('module_not_linked', 409)
-    setattr(error, 'next', NEXT_LINK)  # error_details lists `next` (AGENT_API.md rulebook)
+    next_step = NEXT_CALENDAR if module == 'calendar' else NEXT_LINK
+    setattr(error, 'next', next_step)  # error_details lists `next` (AGENT_API.md rulebook)
     # The gateway relays a `next` only when it is a call it can run; this prose step reaches the agent as the same
     # reviewed hint (dispatch_shaping.REVIEWED_HINTS holds this exact text, ANYM-566).
-    setattr(error, 'hint', NEXT_LINK)
+    setattr(error, 'hint', next_step)
     return error
 
 
@@ -78,14 +146,18 @@ def advertised(c, p):
     import psycopg
     try:
         with c.transaction():
-            link = active_link(c, p['id'])
+            link, calendar = active_link(c, p['id']), calendar_link(c, p['id'])
     except psycopg.Error:
         return None
-    if link is None:
-        return None
-    return {'calls': {'source': MODULES['calls'], 'scope': CALL_SCOPE, 'kinds': call_kinds(),
-        'create': 'create_subscription', 'argument': 'module_sources', 'consume': 'fetch_subscription_events',
-        'refused_without_link': 'module_not_linked'}}
+    shape = {'create': 'create_subscription', 'argument': 'module_sources', 'consume': 'fetch_subscription_events',
+        'refused_without_link': 'module_not_linked'}
+    block = {}
+    if link is not None:
+        block['calls'] = {'source': MODULES['calls'], 'scope': CALL_SCOPE, 'kinds': call_kinds(), **shape}
+    if calendar is not None:  # ANYM-577: the calendar kinds, `calendar:all` or one `calendar:<calendar_ref>`
+        block['calendar'] = {'source': MODULES['calendar'], 'scope': CALENDAR_ALL + ' | calendar:<calendar_ref>',
+            'kinds': calendar_kinds(), **shape}
+    return block or None
 
 
 def call_sources(c, p, module_sources):
@@ -119,14 +191,74 @@ def active_link(c, principal):
         AND ml.module='calls' AND ml.state='active' AND NOT ''' + stale('ml'), (principal,)).fetchone()
 
 
+def calendar_kinds():
+    """The calendar types a subscription may ask for (never the access control events)."""
+    from .module_events import KINDS
+    return sorted(kind for kind in KINDS if kind.startswith('calendar.'))
+
+
+def calendar_link(c, principal):
+    """The principal's active calendar link, or None (before schema 93 too)."""
+    if not ready(c):
+        return None
+    return c.execute("SELECT ml.module_principal,ml.generation FROM module_links ml WHERE ml.principal=%s "
+        "AND ml.module='calendar' AND ml.state='active'", (principal,)).fetchone()
+
+
+def calendar_sources(c, p, module_sources):
+    """Validate an API request's calendar sources (ANYM-577): `calendar:all` or `calendar:<calendar_ref>` with
+    calendar types, only under the principal's active calendar link, and an exact calendar only while the linked
+    calendar principal's access to it holds now (read from the journal the calendar service stamps).
+
+    Returns [(source, scope_ref, types)]; the scope is the request's calendar, checked here, never a router label.
+    """
+    from .store import APIError
+    from .module_events import _REF
+    kinds = calendar_kinds()
+    seen = set()
+    for item in module_sources:
+        scope = item.get('scope') if isinstance(item, dict) else None
+        types = item.get('types') if isinstance(item, dict) else None
+        if (set(item) - {'scope', 'types'} or not isinstance(scope, str) or scope in seen or
+                scope != CALENDAR_ALL and (not scope.startswith('calendar:') or
+                    _REF.fullmatch(scope[len('calendar:'):]) is None) or
+                not isinstance(types, list) or not 1 <= len(types) <= 16 or len(set(types)) != len(types) or
+                any(not isinstance(kind, str) or kind not in kinds for kind in types)):
+            raise APIError('invalid_filter')
+        seen.add(scope)
+    link = calendar_link(c, p['id'])
+    if link is None:
+        raise not_linked('calendar')
+    result = []
+    for item in module_sources:
+        scope = item['scope']
+        if scope != CALENDAR_ALL and not access_holds(c, link['module_principal'], scope):
+            raise not_linked('calendar')
+        result.append((MODULES['calendar'], scope, sorted(item['types'])))
+    return result
+
+
+def api_sources(c, p, module_sources):
+    """The sources of create_subscription's `module_sources`: one `calls:own` item, or 1-16 calendar items."""
+    from .store import APIError
+    if (isinstance(module_sources, list) and module_sources and all(isinstance(item, dict) for item in module_sources)
+            and any(str(item.get('scope', '')).startswith('calendar:') for item in module_sources)):
+        if len(module_sources) > 16:
+            raise APIError('invalid_filter')
+        return calendar_sources(c, p, module_sources)
+    return call_sources(c, p, module_sources)
+
+
 def admit(c, subscription_id, source, scope_ref, types):
-    """Give the subscription a call source under its principal's live link and record the link's generation.
+    """Give the subscription a module source under its principal's live link and record the link's generation.
 
     The caller holds the principal's shared ACL lock (the request's or the operator's), which a revocation's
     exclusive lock waits for, so the link read here is the one in force when the source commits.
     """
     if not ready(c):
         raise not_linked()
+    if source == MODULES['calendar']:
+        return _admit_calendar(c, subscription_id, scope_ref, types)
     link = c.execute('''SELECT ml.generation FROM subscriptions s JOIN module_links ml ON ml.principal=s.principal
         AND ml.module='calls' WHERE s.id=%s AND %s=%s AND ml.state='active' AND ml.module_principal=%s AND NOT ''' +
         stale('ml'), (subscription_id, source, MODULES['calls'], scope_ref)).fetchone()
@@ -136,6 +268,25 @@ def admit(c, subscription_id, source, scope_ref, types):
         ON CONFLICT DO NOTHING''', (subscription_id, source, scope_ref, list(types)))
     c.execute('''INSERT INTO subscription_module_links(subscription,source,scope_ref,generation) VALUES(%s,%s,%s,%s)
         ON CONFLICT DO NOTHING''', (subscription_id, source, scope_ref, link['generation']))
+    return link['generation']
+
+
+def _admit_calendar(c, subscription_id, scope_ref, types):
+    """A calendar source under the subscription principal's active calendar link, with the access fence held shared
+    so an access change of the calendar principal is ordered against this admission."""
+    fence_use(c)
+    link = c.execute("SELECT ml.generation,ml.module_principal FROM subscriptions s JOIN module_links ml "
+        "ON ml.principal=s.principal AND ml.module='calendar' WHERE s.id=%s AND ml.state='active'",
+        (subscription_id,)).fetchone()
+    if link is None:
+        raise not_linked('calendar')
+    if scope_ref != CALENDAR_ALL and not access_holds(c, link['module_principal'], scope_ref):
+        raise not_linked('calendar')
+    c.execute('''INSERT INTO subscription_module_sources(subscription,source,scope_ref,types) VALUES(%s,%s,%s,%s)
+        ON CONFLICT(subscription,source,scope_ref) DO UPDATE SET types=excluded.types''',
+        (subscription_id, MODULES['calendar'], scope_ref, list(types)))
+    c.execute('''INSERT INTO subscription_module_links(subscription,source,scope_ref,generation) VALUES(%s,%s,%s,%s)
+        ON CONFLICT DO NOTHING''', (subscription_id, MODULES['calendar'], scope_ref, link['generation']))
     return link['generation']
 
 

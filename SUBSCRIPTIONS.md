@@ -1499,7 +1499,9 @@ gateway's `messages_create_subscription` take it, ANYM-566; see "Module event ki
 and only through the principal's active calls link (ANYM-564,
 ACCESS.md "Module links"); its scope is the link's calls principal. A call source whose link is revoked,
 stale or regranted is `access_changed`: it matches, pages and announces nothing more (hints are cancelled
-with `module_not_linked`). Other modules have no API path yet (ANYM-577). Each
+with `module_not_linked`). A calendar source comes from `module_sources=[{scope: "calendar:all" |
+"calendar:<calendar_ref>", types: [calendar.event.* types]}]` under the principal's active calendar link, and each event
+is judged on its own calendar (ANYM-577, ACCESS.md "Calendar sources"). Recordings and feedback have no API path. Each
 matcher pass, after the message pass and in a savepoint of its own (a failure is logged as
 `subscription_module_match_failed` and never undoes or stops the message matches), matches
 module events by `(source, scope_ref)` and type into `subscription_module_matches` with its own

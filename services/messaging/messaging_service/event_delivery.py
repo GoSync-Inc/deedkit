@@ -680,6 +680,10 @@ def _fence_hint(store, hint, lease, now, registered, refused, target, unsafe, st
             (hint['subscription'],)).fetchone()
         if owner:
             lock_principal(c, owner['principal'], shared=True)
+        if hint['kind'] == 'module_events':
+            # ANYM-577: the webhook's bytes leave under the access fence too: a calendar access change waits for the send.
+            from .module_links import fence_use
+            fence_use(c)
         # The hold starts once the principal lock is held: waiting for it is contention, not hold.
         fenced = time.monotonic()
         p = _worker_identity(c, owner) if owner else None

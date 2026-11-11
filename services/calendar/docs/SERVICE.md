@@ -368,6 +368,25 @@ four). A new or changed configuration is due at once.
   new start gets its own; a cancelled occurrence is gone and gets none. A reminder already served is not recalled:
   the `changed` or `cancelled` event that follows it tells the agent.
 
+## Module access journal (ANYM-577, schema 10)
+
+The journal also says who may read a calendar's events. `module.access.changed` (scope_ref `calendar:<calendar_ref>`,
+subject and `data.principal_ref` the calendar principal, `data.access` `details` or `none`, `data.reason`
+`granted | permission_removed | principal_removed | member_removed | connection_disabled | visibility_reduced | expired`,
+optional `data.until` the principal's expiry; `urgency` `now`, no `expires_at`) is journaled whenever a principal's
+effective access to one calendar changes. Effective access is `authorize(principal, calendar, "agenda:read")` with
+visibility `details`: the principal enabled and unexpired, its membership enabled, the calendar bound to it, the
+principal's and the grant's scopes both naming `agenda:read`, the connection enabled and neither visibility layer
+`busy_only`. A pair that never read with details is never journaled. `details` carries `until`: the consumer stops
+reading at it, because expiry is time and writes nothing; extending the principal journals a new `details`.
+
+Triggers on `principals`, `memberships`, `calendar_grants`, `agent_calendars` and `connections` journal the change in the
+writer's own transaction (SECURITY DEFINER functions; the writers hold no journal privilege), so the order of the journal is the
+commit order of the access changes and no write path, direct SQL included, can forget one. The migration journals the
+state of every existing binding once. Rows are in the same `seq` space as the other events (`module_access_events`, served
+by `GET /v1/events` to a `calendar:events` key bound to the calendar). Messaging reads its entitlement from these events
+only (ACCESS.md, "Calendar sources"); nothing here is a label a router configuration can change.
+
 ## Operations
 
 `family-calendar-local status/start/stop` manages only its own macOS launch agents; PostgreSQL remains a separate persistent container. The Docker daemon must be running. Keys/passwords are not passed in argv/env; logs are private. On other OSes, run it manually or under your own supervisor.

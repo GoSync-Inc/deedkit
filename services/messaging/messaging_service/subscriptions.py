@@ -603,8 +603,8 @@ def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=
     # module_not_linked (and a next step for the owner) before anything is written when there is none.
     calls = None
     if module_sources is not None:
-        from .module_links import call_sources
-        calls = call_sources(c, p, module_sources)
+        from .module_links import api_sources
+        calls = api_sources(c, p, module_sources)
     _check_capacity(c, p)
     # The counter is serialized by event publishers. An MVCC read sees only a
     # committed frontier and cannot skip an uncommitted event transaction.
@@ -788,6 +788,8 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
     bounded(limit)
     if type(after) is not int or not 0 <= after <= 2**53 - 1:
         raise APIError('invalid_version')
+    from .module_links import fence_use
+    fence_use(c)  # ANYM-577: a read (and every wait poll) is ordered against a calendar access change
     row = _owned(c, p, subscription_id)
     state = _view(c, row, p)
     if row['state'] == 'access_changed':
