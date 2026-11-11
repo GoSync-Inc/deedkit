@@ -637,6 +637,23 @@ def test_parser_resource_or_unexpected_error_still_fails_closed(worker,monkeypat
     assert w.rejected=={} and names(w.spool.path)==[]
 
 
+# spec: ANYM-291
+@pytest.mark.parametrize('callback,code',[('receipt','receipt_parse_failed'),('owner_read','read_parse_failed')])
+@pytest.mark.parametrize('error',[ValueError,TypeError,KeyError,AttributeError,IndexError,RecursionError])
+def test_every_parser_error_class_rejects_one_live_read_update_and_capture_goes_on(worker,monkeypatch,callback,code,error):
+    """W5-4b pin: each class of the moved PARSE_ERRORS tuple, not only AttributeError, is one counted rejection."""
+    w,_,_=worker
+    import messaging_service.reply_state as reply_state
+    import messaging_service.telegram_receipts as receipts
+    event=receipt_ready(w)
+    def boom(*a,**k):raise error('synthetic-private')
+    monkeypatch.setattr(receipts if callback=='receipt' else reply_state,
+        'telegram_receipt' if callback=='receipt' else 'telegram_read_capture',boom)
+    asyncio.run(getattr(w,callback)(event))
+    assert not w.failed.is_set() and w.capture_count==0
+    assert w.rejected=={code:1} and names(w.spool.path)==[]
+
+
 def test_an_io_error_that_is_also_a_value_error_is_never_a_rejection(worker):
     import io
     w,_,_=worker
