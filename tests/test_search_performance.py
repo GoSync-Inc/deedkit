@@ -272,6 +272,7 @@ class AttentionPlans:
         self.connection=connection;self.plans=[];self.jit=[]
         # The measured work is the rows read, not the compiling of a plan that reads a few hundred (1.5 to 3.5 s of JIT per
         # statement, past the 5 s statement timeout on a busy host).
+        connection.execute('SET LOCAL jit=off')
     def execute(self,sql,args=None):
         import traceback
         if 'thread_messages AS MATERIALIZED' in sql:

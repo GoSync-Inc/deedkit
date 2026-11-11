@@ -11,7 +11,7 @@ from messaging_service.telegram_collector import configuration
 from test_archive import archive as archive, event
 from test_collectors import worker as worker
 from test_live_media import config_path
-from test_media_claim_performance import ACCOUNT, BOUND, backlog as backlog, explained, grow_dormant, index_tables, work
+from test_media_claim_performance import ACCOUNT, BOUND, analyze, backlog as backlog, explained, grow_dormant, index_tables, work
 
 
 DAY=86400
@@ -94,7 +94,7 @@ def test_backfill_needs_a_bounded_window(backlog, days):
 def analyze_backlog(s):
     """The statistics the measured claim is planned from, read from every row (#892)."""
     with s.pool.connection() as c:
-        c.execute("SET LOCAL statement_timeout='120s'"); c.execute('ANALYZE media_jobs'); c.execute('ANALYZE messages')
+        c.execute("SET LOCAL statement_timeout='120s'"); analyze(c,'media_jobs','messages')
 
 
 def backfill_claim_work(ar, s, claim, name):

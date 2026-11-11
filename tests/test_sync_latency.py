@@ -187,7 +187,9 @@ def counted(s, monkeypatch, call):
     caller = threading.get_ident()
 
     def execute(self, query, params=None, **kw):
-        seen.append(query)
+        # Only the calling thread's statements: the wake notifier's NOTIFY runs on a thread of its own.
+        if threading.get_ident() == caller:
+            seen.append(query)
         return original(self, query, params, **kw)
     monkeypatch.setattr(psycopg.Cursor, 'execute', execute)
     try:
