@@ -12,6 +12,7 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 
 PROVIDERS = {'claude': 'Anthropic', 'codex': 'OpenAI'}
 PHONE_TOOLS = 'mcp__phone__'
@@ -174,7 +175,7 @@ def kill_by_marker(marker):
             return True
         deadline = 50
         while group_alive(pid) and deadline:
-            subprocess.run(['sleep', '0.1'], timeout=5)
+            time.sleep(0.1)
             deadline -= 1
         if not group_alive(pid):
             return True

@@ -7,6 +7,7 @@ import random
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -358,6 +359,8 @@ def test_a_restart_makes_a_running_run_lost_and_kills_its_group_by_the_marker_on
     ours = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)', run_dir.name], start_new_session=True)
     bystander = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)', 'other-process'],
                                  start_new_session=True)
+    # In service the dead service's children are reaped by init; here the test reaps its own child as soon as it dies.
+    threading.Thread(target=ours.wait, daemon=True).start()
     (run_dir / 'marker.json').write_text(json.dumps({'pid': ours.pid, 'token': run_dir.name}))
     other = state / 'agent' / ('run-' + uuid.uuid4().hex[:8])
     other.mkdir(mode=0o700)
