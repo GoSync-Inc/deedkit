@@ -46,14 +46,21 @@ class Execute(Device):
     wait_s: int = Field(default=15, ge=0, le=25)
 
 
-class CourierChat(Device):  # ANYM-975: preview a courier chat message, then send it with the preview's digest
+class CourierChat(Device):  # ANYM-975: preview, then send; ANYM-978: goal, reply, read, handover, summary
+    session_id: str | None = None  # the actions that need no phone (goal, handover, summary) take none
     request_id: str
-    action: Literal["preview", "send"]
+    action: Literal["preview", "send", "goal", "reply", "read", "handover", "summary"]
     app: Literal["gojek", "grab"]
     order: str = Field(min_length=3, max_length=80, pattern=r"^[^\r\n]+$")
-    message: str = Field(min_length=1, max_length=500, pattern=r"^[^\r\n]+$")
+    message: str | None = Field(default=None, min_length=1, max_length=500, pattern=r"^[^\r\n]+$")
     preview_digest: str | None = Field(default=None, max_length=200)
     owner_instruction: str | None = Field(default=None, min_length=3, max_length=1500)
+    goal: str | None = Field(default=None, min_length=1, max_length=300)
+    max_messages: int | None = Field(default=None, ge=1, le=12)
+    ttl_min: int | None = Field(default=None, ge=1, le=10080)
+    min_interval_s: int | None = Field(default=None, ge=10, le=300)
+    standing: bool = False
+    reason: str | None = Field(default=None, min_length=1, max_length=200)
     timeout_s: int = Field(default=60, ge=10, le=180)
     wait_s: int = Field(default=15, ge=0, le=25)
 
@@ -209,11 +216,7 @@ def create_app(config_path):
             result = await devices.execute(owner, device, args["session_id"], identifier(args["request_id"]),
                                            args["argv"], args["timeout_s"], args["wait_s"])
         elif operation == "courier_chat":
-            courier_chat.check_request(owner, args)
-            request_id = identifier(args["request_id"])
-            job = courier_chat.CourierChat(devices, owner, device, {**args, "request_id": request_id})
-            result = await devices.execute(owner, device, args["session_id"], request_id, None,
-                                           args["timeout_s"], args["wait_s"], job=job)
+            result = await courier_chat.handle(devices, owner, args)
         elif operation == "maestro":
             if args["action"] == "reference":
                 result = ui_reference()
