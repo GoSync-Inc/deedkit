@@ -158,12 +158,13 @@ def tg_group(archive):
     return GROUP
 
 
-def members_read(s, key, account, chat, ids, *, minutes_ago=0, complete=True, request_id='synthetic-members-0001'):
-    """A finished list_participants read of the chat by this key (synthetic: the row a collector would leave)."""
+def members_read(s, key, account, chat, ids, *, minutes_ago=0, offset=0, next_offset=None,
+                 request_id='synthetic-members-0001'):
+    """A finished list_participants page of the chat by this key (synthetic: the row a collector would leave)."""
     s.set_messenger_operations(account, ['list_participants'])
-    queued = s.execute_messenger_operation(key, account, 'list_participants', chat, parameters={'limit': 100},
-                                           request_id=request_id)
-    data = {'participants': [{'id': i, 'first_name': 'Member'} for i in ids], 'next_offset': None if complete else 100}
+    queued = s.execute_messenger_operation(key, account, 'list_participants', chat,
+                                           parameters={'limit': 100, 'offset': offset}, request_id=request_id)
+    data = {'participants': [{'id': i, 'first_name': 'Member'} for i in ids], 'next_offset': next_offset}
     with s.pool.connection() as c:
         c.execute('''UPDATE messenger_commands SET status='succeeded',result=%s,finished_at=clock_timestamp(),
             created_at=clock_timestamp()-make_interval(mins=>%s) WHERE id=%s''',
@@ -292,6 +293,64 @@ def test_membership_is_the_participants_read_and_only_without_one_the_archive(se
 
 
 # spec: ANYM-928
+def test_only_a_complete_participants_read_of_this_key_decides_membership(sender):
+    """Astra r1: a partial page or another key's read is no participants read; every page of a complete one counts."""
+    s, archive, _, _, _ = sender
+    tg_group(archive)
+    key = group_key(s)
+    newcomer, gone = [{'sender': '77', 'offset': 3, 'length': 5}], [{'sender': '99', 'offset': 3, 'length': 5}]
+    # One page of a larger group proves nobody's absence: it is no read, and the archive decides.
+    members_read(s, key, 'send-fixture', GROUP, ['42'], next_offset=100)
+    assert mention_preview(s, key, 'Hi @Анна', [{'sender': '42', 'offset': 3, 'length': 5}])['membership_basis'] == 'archive'
+    # Its second page completes it: a member listed only there passes, the former member fails.
+    members_read(s, key, 'send-fixture', GROUP, ['77'], offset=100, request_id='synthetic-members-0002')
+    assert mention_preview(s, key, 'Hi @Вова', newcomer)['membership_basis'] == 'participants'
+    with pytest.raises(APIError, match='mention_not_member'):
+        mention_preview(s, key, 'Hi @Боря', gone)
+    # Another key of the same principal holds no read: its own preview is decided by the archive.
+    sibling = s.issue_key('mention-agent', ['send-fixture'], permissions=['read', 'send'])
+    with pytest.raises(APIError, match='mention_not_member'):
+        mention_preview(s, key=sibling, text='Hi @Вова', mentions=newcomer)
+    assert mention_preview(s, sibling, 'Hi @Боря', gone)['membership_basis'] == 'archive'
+
+
+# spec: ANYM-928
+def test_the_preview_reads_every_participants_page_through_its_own_key():
+    from messaging_service import group_mentions
+
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    class Store:
+        def __init__(self): self.calls = []
+        @contextmanager
+        def authorized(self, token):
+            # This key holds no participants read yet.
+            yield SimpleNamespace(execute=lambda *a: SimpleNamespace(fetchall=lambda: [])), {'id': 'p', 'key_id': 'k'}
+        def execute_messenger_operation(self, token, account, operation, chat_id, parameters, request_id):
+            self.calls.append((token, operation, parameters['offset'], request_id))
+            following = {0: 50, 50: 100, 100: None}[parameters['offset']]
+            return {'status': 'succeeded', 'result': {'outcome': 'confirmed', 'data': {
+                'participants': [], 'next_offset': following}}}
+
+    store = Store()
+    # Page after page until next_offset is null, each with its own request_id.
+    asyncio.run(group_mentions.refresh(store, 'key-token', 'send-fixture', GROUP))
+    assert [call[2] for call in store.calls] == [0, 50, 100]
+    assert all(call[0] == 'key-token' and call[1] == 'list_participants' for call in store.calls)
+    assert [call[3].rsplit(':', 1)[1] for call in store.calls] == ['0', '1', '2']
+
+
+# spec: ANYM-928
+def test_every_plain_telegram_username_is_named_in_the_preview(sender):
+    s, archive, _, _, _ = sender
+    tg_group(archive)
+    names = [f'synthetic_user{i:02d}' for i in range(25)]
+    draft = mention_preview(s, group_key(s), 'Hi @Анна ' + ' '.join('@' + n for n in names),
+                            [{'sender': '42', 'offset': 3, 'length': 5}])
+    assert draft['notified_by_username'] == names
+
+# spec: ANYM-928
 def test_a_preview_with_mentions_queues_one_participants_read_per_chat_and_ten_minutes(sender, monkeypatch):
     from messaging_service import group_mentions
     s, archive, _, _, _ = sender
@@ -351,7 +410,22 @@ def test_a_telegram_mention_reaches_telethon_as_input_message_entity_mention_nam
 
     provider = TelethonProvider.__new__(TelethonProvider)
     provider.client = Client()
-    asyncio.run(provider.send_text(job))
+
+    class Governor:
+        async def call(self, operation, phase, *, before=None):
+            calls.append(('governor', phase, before is not None))
+            if before is not None: await before()
+            return await operation()
+
+    async def preflight(): calls.append(('preflight',))
+    provider.governor = Governor()
+    asyncio.run(provider.send_text({**job, '_preflight': preflight}))
+    # Each resolution step is its own paced request; the access check runs after them, right before the send.
+    assert [c[:3] if c[0] == 'governor' else c[:1] for c in calls] == [
+        ('governor', 'provider_send', False), ('governor', 'provider_send', False), ('participants',),
+        ('governor', 'provider_send', False), ('governor', 'provider_send', True), ('preflight',), ('send',)]
+    calls[:] = [c for c in calls if c[0] not in ('governor', 'preflight')]
+    provider.governor = None
     assert calls[0] == ('participants', -500, 200)
     _, chat, text, options = calls[1]
     assert (chat, text) == (-500, '@Анна и @Вова')
@@ -399,6 +473,10 @@ def test_a_whatsapp_mention_becomes_at_number_with_mentioned_jid_and_plain_at_di
     assert draft['mentions_notified'] == [{'sender': '15559876543@c.us', 'display_name': 'Анна', 'span_text': 'Анна'}]
     assert 'warning' not in draft
     assert mention_preview(s, key, 'Позвони @15550001111', None, **common)['warning'] == 'plain_at_is_not_a_mention'
+    # Astra r1: a mention inside italics; the generated `_` delimiter touches the token and is no word.
+    italic = mention_preview(s, key, 'Привет, *Анна*!', [{'sender': '15559876543@c.us', 'offset': 9, 'length': 4}],
+                             format='markdown', **common)
+    assert italic['provider_text'] == 'Привет, _@15559876543_!' and italic['mentions'][0]['offset'] == 9
     with pytest.raises(APIError, match='mention_overlap'):
         mention_preview(s, key, 'mailАнна', [{'sender': '15559876543@c.us', 'offset': 4, 'length': 4}], **common)
     receipt = mention_send(s, key, 'Привет, Анна!', [{'sender': '15559876543@c.us', 'offset': 8, 'length': 4}],

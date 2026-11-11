@@ -169,6 +169,11 @@ func TestNativeTextMentionsSetMentionedJIDOnTheWireTextAndKeepTheQuote(t *testin
 	if len(wires) != 2 {
 		t.Fatalf("want 2 sends, got %d", len(wires))
 	}
+	// A mention inside WhatsApp italics or bold: the delimiter touching the token is formatting, not a word.
+	r.ReplyProviderID, r.Text = "", "_@15559876543_ и *@123456789012345*"
+	if _, err := sendText(context.Background(), r, d); err != nil || len(wires) != 3 {
+		t.Fatalf("formatted mention refused: %v", err)
+	}
 }
 
 // spec: ANYM-928
