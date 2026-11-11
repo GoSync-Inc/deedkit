@@ -101,7 +101,7 @@ def test_migration_068_refuses_an_unusable_index_of_its_name_and_builds_it_once_
             c.execute('DROP INDEX attachment_digest_bytes')
         store.migrate();store.migrate()
         with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='89'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='90'
             assert c.execute('''SELECT i.indisvalid,pg_get_indexdef(i.indexrelid) AS d FROM pg_index i
                 WHERE i.indexrelid='attachment_digest_bytes'::regclass''').fetchone()=={'indisvalid':True,
                 'd':'CREATE INDEX attachment_digest_bytes ON public.attachments USING btree (digest, bytes)'}
@@ -173,7 +173,7 @@ def test_migration_072_refuses_an_unusable_index_of_its_name_and_builds_it_once_
                 else 'DROP INDEX attachment_message')
         store.migrate();store.migrate()
         with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='89'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='90'
             assert c.execute('''SELECT i.indisvalid,pg_get_indexdef(i.indexrelid) AS d FROM pg_index i
                 WHERE i.indexrelid='attachment_message'::regclass''').fetchone()=={'indisvalid':True,'d':MESSAGE_INDEX}
         seed_attachments(store,1,per_message=2)
