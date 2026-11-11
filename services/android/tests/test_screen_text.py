@@ -267,6 +267,151 @@ def test_mask_images_option_is_validated_before_admission():
                                    {}, fields=UI_FIELDS))
 
 
+def crowded(extra):
+    """A flat tree of exactly 5000 + extra nodes: an image first, then text nodes, an image last."""
+    nodes = [(IMAGE, '[20,20][120,100]', {})] + [(TEXT, '[0,0][0,0]', {})] * (4997 + extra) + [(IMAGE, '[130,20][190,60]', {})]
+    return tree(*nodes)
+
+
+# spec: ANYM-981
+def test_hierarchy_option_sets_the_dump_and_a_tree_past_5000_nodes_is_cut(monkeypatch):
+    from deedkit_android.ui_worker import execute
+
+    recording_engine(monkeypatch)
+    _, data = textured()
+    for options, dump in (({}, (True, 50)), ({'hierarchy': {'compressed': False, 'max_depth': 120}}, (False, 120)),
+                          ({'hierarchy': {'max_depth': 80}}, (True, 80)), ({'hierarchy': {'compressed': False}}, (False, 50))):
+        device = TreeDevice(tree((IMAGE, '[20,20][120,100]', {})), data)
+        execute(device, {'readScreenText': {'structure': True, **options}}, ocr=OCR)
+        assert device.dumps == [('dumpWindowHierarchy', dump)], options
+    whole = execute(TreeDevice(crowded(0), data), {'readScreenText': {'structure': True}}, ocr=OCR)  # 5000 nodes: all read
+    assert whole['ocr']['masked'] == {'regions': 2, 'skipped_large': 0, 'tree': 'ok'} and whole['structure']['tree'] == 'merged'
+    cut = execute(TreeDevice(crowded(1), data), {'readScreenText': {'structure': True}}, ocr=OCR)  # the 5001st node is dropped
+    assert cut['ocr']['masked'] == {'regions': 1, 'skipped_large': 0, 'tree': 'truncated'} and cut['structure']['tree'] == 'truncated'
+
+
+# spec: ANYM-981
+def test_hierarchy_and_card_options_are_validated_before_admission():
+    from deedkit_android.uiautomator import validate_commands
+
+    for value in ('{hierarchy: 5}', '{hierarchy: {depth: 3}}', '{hierarchy: {max_depth: 0}}', '{hierarchy: {max_depth: 201}}',
+                  '{hierarchy: {max_depth: "5"}}', '{hierarchy: {compressed: "no"}}', '{per_card: 1}', '{per_card: "yes"}',
+                  '{max_cards: 0}', '{max_cards: 51}', '{max_cards: "3"}', '{max_cards: true}'):
+        with pytest.raises(Refused) as failure:
+            validate_commands(compile_base('- readScreenText: %s' % value, {}, fields=UI_FIELDS))
+        assert failure.value.code == 'invalid_screen_text_options', value
+    validate_commands(compile_base('- readScreenText: {hierarchy: {compressed: false, max_depth: 200}, per_card: true, max_cards: 50}\n'
+                                   '- readScreenText: {hierarchy: {}, per_card: false, max_cards: 1}', {}, fields=UI_FIELDS))
+
+
+PHOTO_CARD = '<node class="android.view.ViewGroup" clickable="true" bounds="[0,0][400,140]"><node class="android.widget.ImageView" bounds="[0,0][400,100]"/></node>'
+TEXT_CARD = ('<node class="android.view.ViewGroup" clickable="true" bounds="[0,150][400,290]">'
+             '<node class="android.widget.TextView" text="Sepatu Lari" bounds="[10,160][200,190]"/>'
+             '<node class="android.widget.TextView" text="Rp 125.000" bounds="[10,200][200,230]"/></node>')
+
+
+def cards_tree(*cards):
+    return ('<hierarchy><node class="android.widget.FrameLayout" bounds="[0,0][400,300]">'
+            '<node class="androidx.recyclerview.widget.RecyclerView" scrollable="true" bounds="[0,0][400,300]">' + ''.join(cards)
+            + '</node></node></hierarchy>')
+
+
+def card_engine(monkeypatch, fail=()):
+    """An engine that answers every call with one line named after the call's origin; records (size, origin, min_confidence, pixels)."""
+    from deedkit_android import screen_text
+
+    calls = []
+
+    def recognize(image, ocr, origin=(0, 0), min_confidence=None):
+        calls.append((image.size, origin, min_confidence, image.copy()))
+        if origin in fail:
+            raise Refused('ocr_failed')
+        left, top = origin
+        return ([{'text': f'read@{left},{top}', 'bounds': f'[{left},{top}][{left + 50},{top + 10}]', 'confidence': 91.0,
+                  'box': (left, top, left + 50, top + 10), 'words': []}],
+                {'engine': 'tesseract', 'preprocess': 'local_contrast'})
+    monkeypatch.setattr(screen_text, 'recognize_with', recognize)
+    return calls
+
+
+# spec: ANYM-981
+def test_per_card_reads_a_card_without_tree_text_from_its_own_crop_and_takes_the_rest_from_the_tree(monkeypatch):
+    from deedkit_android.ui_worker import execute
+
+    calls = card_engine(monkeypatch)
+    _, data = textured(400, 300)
+    result = execute(TreeDevice(cards_tree(PHOTO_CARD, TEXT_CARD), data), {'readScreenText': {'per_card': True, 'min_confidence': 70}}, ocr=OCR)
+    assert [(size, origin, minimum) for size, origin, minimum, _ in calls] == [((400, 300), (0, 0), 70), ((400, 140), (0, 0), 70)]
+    assert [line['text'] for line in result['lines']] == ['read@0,0']  # the whole-screen read is what it was without per_card
+    first, second = result['cards']
+    assert (first['list'], first['bounds'], first['source']) == (0, '[0,0][400,140]', 'ocr') and first['node']['class'] == 'android.view.ViewGroup'
+    assert first['lines'] == [{'text': 'read@0,0', 'bounds': '[0,0][50,10]', 'confidence': 91.0, 'source': 'ocr'}]
+    assert (second['bounds'], second['source']) == ('[0,150][400,290]', 'tree') and 'node' in second
+    assert second['lines'] == [{'text': 'Sepatu Lari', 'bounds': '[10,160][200,190]', 'confidence': 100.0, 'source': 'tree'},
+                               {'text': 'Rp 125.000', 'bounds': '[10,200][200,230]', 'confidence': 100.0, 'source': 'tree'}]
+    assert result['cards_truncated'] is False and result['ocr']['cards'] == {'tree': 'ok', 'from_tree': 1, 'from_ocr': 1}
+    assert calls[1][3].crop((0, 0, 400, 100)).getcolors(1) is not None  # the crop is cut from the copy with the photo painted out
+
+
+# spec: ANYM-981
+def test_per_card_bounds_the_cards_read_and_keeps_the_result_shape_without_it(monkeypatch):
+    from deedkit_android.ui_worker import execute
+
+    calls = card_engine(monkeypatch)
+    _, data = textured(400, 300)
+    three = cards_tree(*(f'<node class="android.view.ViewGroup" bounds="[0,{100 * i}][400,{100 * i + 90}]"/>' for i in range(3)))
+    result = execute(TreeDevice(three, data), {'readScreenText': {'per_card': True, 'max_cards': 2}}, ocr=OCR)
+    assert [card['bounds'] for card in result['cards']] == ['[0,0][400,90]', '[0,100][400,190]'] and result['cards_truncated'] is True
+    assert result['ocr']['cards'] == {'tree': 'ok', 'from_tree': 0, 'from_ocr': 2} and len(calls) == 3
+    plain = execute(TreeDevice(three, data), {'readScreenText': {}}, ocr=OCR)
+    assert 'cards' not in plain and 'cards_truncated' not in plain and 'cards' not in plain['ocr']
+    assert len(execute(TreeDevice(three, data), {'readScreenText': {'per_card': True}}, ocr=OCR)['cards']) == 3  # default 12
+
+
+# spec: ANYM-981
+def test_one_failed_card_crop_does_not_fail_the_others_but_all_failing_does(monkeypatch):
+    from deedkit_android.ui_worker import execute
+
+    _, data = textured(400, 300)
+    three = cards_tree(*(f'<node class="android.view.ViewGroup" bounds="[0,{10 + 100 * i}][400,{100 + 100 * i}]"/>' for i in range(3)))
+    card_engine(monkeypatch, fail={(0, 110)})
+    result = execute(TreeDevice(three, data), {'readScreenText': {'per_card': True}}, ocr=OCR)
+    assert [(card['source'], card.get('error'), len(card['lines'])) for card in result['cards']] == [
+        ('ocr', None, 1), ('ocr', 'ocr_failed', 0), ('ocr', None, 1)] and len(result['lines']) == 1
+    card_engine(monkeypatch, fail={(0, 10), (0, 110), (0, 210)})
+    with pytest.raises(Refused) as failure:  # every card read failed: a definite failure, as a failed whole-screen read is
+        execute(TreeDevice(three, data), {'readScreenText': {'per_card': True}}, ocr=OCR)
+    assert failure.value.code == 'ocr_failed'
+
+
+# spec: ANYM-981
+def test_per_card_without_a_hierarchy_or_a_list_reads_the_whole_screen_with_no_cards(monkeypatch):
+    from deedkit_android.ui_worker import execute
+
+    calls = card_engine(monkeypatch)
+    _, data = textured(400, 300)
+    result = execute(TreeDevice(RuntimeError('secure screen'), data), {'readScreenText': {'per_card': True}}, ocr=OCR)
+    assert result['cards'] == [] and result['cards_truncated'] is False and len(result['lines']) == 1 and len(calls) == 1
+    assert result['ocr']['cards'] == {'tree': 'unavailable', 'from_tree': 0, 'from_ocr': 0}
+    no_list = tree((TEXT, '[10,10][100,40]', {'text': 'Sepatu Lari'}))
+    result = execute(TreeDevice(no_list, data), {'readScreenText': {'per_card': True}}, ocr=OCR)
+    assert result['cards'] == [] and result['ocr']['cards'] == {'tree': 'ok', 'from_tree': 0, 'from_ocr': 0} and len(calls) == 2
+
+
+# spec: ANYM-981
+def test_per_card_reads_cards_clipped_to_a_region_in_full_screen_coordinates(monkeypatch):
+    from deedkit_android.ui_worker import execute
+
+    calls = card_engine(monkeypatch)
+    original, data = textured(400, 300)
+    three = cards_tree(*(f'<node class="android.view.ViewGroup" bounds="[0,{100 * i}][400,{100 * i + 90}]"/>' for i in range(3)))
+    result = execute(TreeDevice(three, data), {'readScreenText': {'per_card': True, 'region': {'x': 100, 'y': 50, 'w': 200, 'h': 150}}}, ocr=OCR)
+    assert calls[1][3].tobytes() == original.crop((100, 50, 300, 90)).tobytes()  # each crop holds its own card's pixels
+    assert calls[2][3].tobytes() == original.crop((100, 100, 300, 190)).tobytes()
+    assert [card['bounds'] for card in result['cards']] == ['[100,50][300,90]', '[100,100][300,190]']  # the third card starts at 200: outside
+    assert [(size, origin) for size, origin, _, _ in calls] == [((200, 150), (100, 50)), ((200, 40), (100, 50)), ((200, 90), (100, 100))]
+
+
 # spec: ANYM-955
 @pytest.mark.skipif(shutil.which('tesseract') is None, reason='Tesseract is not installed on this runner')
 def test_screen_text_parses_real_tesseract_output():

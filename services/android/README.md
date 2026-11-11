@@ -377,6 +377,29 @@ consecutive blocks of the same shape form `lists` of item block indexes. `tree`
 says whether the hierarchy was merged.
 The receipt then keeps `{lines, blocks, lists, tree, truncated}` under the key.
 
+`per_card: true` adds `cards` beside the whole-screen read, which keeps its shape (`lines`
+and `structure` are as without it). A card is a child of a scrolling container with two or
+more visible children (the rule `structure.lists` uses; a list inside a card is part of that
+card), clipped to the read region, in reading order. Each record is `{list, bounds, node,
+source, lines}`. A card whose visible part holds tree text is built from the tree
+(`source: tree`: the leaf-most `text` or `content-desc` nodes in tree order, never a
+password node, each line with confidence 100) and is not recognized. A card without tree
+text is read by the engine from its own crop, cut from the OCR copy with the photo
+regions already painted out (`source: ocr`). `limit` caps the lines of each card,
+`min_confidence` applies to each crop, `max_cards` (1-50, default 12) bounds the cards read
+and `cards_truncated` says when more exist. A crop that fails to read gives that card
+`error: ocr_failed` and no lines; if every card that needed the engine failed, the step fails
+with `ocr_failed`. Without a hierarchy, or without a list in it, `cards` is `[]`. The receipt's
+`ocr.cards` is `{tree, from_tree, from_ocr}`. A tree card needs no OCR; each other card costs
+one engine call (0.7-1.0 s with Vision), on top of the whole-screen read.
+
+`hierarchy: {compressed, max_depth}` sets the dump that `mask_images`, `structure` and
+`per_card` share, as an app map's `hierarchy` option does for its snapshots (compressed true
+and depth 50 when omitted; `max_depth` 1-200). A tree of more than 5,000 nodes is read only to
+the 5,000th node in document order, and `tree` says `truncated` in `ocr.masked`, `ocr.cards`
+and `structure`. The dump holds what the accessibility service reports; an app that exposes
+nothing (for example a Flutter app with Semantics off) stays empty in any mode.
+
 **Engine.** There is no engine option for callers; the host decides and `ocr.engine`
 names the one that read. Install the service with `uv sync --locked --extra vision`
 on macOS to read with Apple Vision (VNRecognizeTextRequest, accurate, language

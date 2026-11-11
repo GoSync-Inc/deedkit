@@ -37,7 +37,8 @@ UI_FIELDS = {
     'setOrientation': {'orientation', 'label'},
     'runFlow': {'commands', 'when', 'label', 'name', 'version'}, 'repeat': {'commands', 'times', 'while', 'label'},
     'retry': {'commands', 'maxRetries', 'label'}, 'checkpoint': set(),
-    'readScreenText': {'region', 'within', 'min_confidence', 'limit', 'key', 'structure', 'mask_images', 'label'},
+    'readScreenText': {'region', 'within', 'min_confidence', 'limit', 'key', 'structure', 'mask_images', 'per_card', 'max_cards',
+                       'hierarchy', 'label'},
     'sleep': set(),
 }
 DATA_KEY = re.compile(r'[A-Za-z][A-Za-z0-9_]{0,63}')
@@ -81,10 +82,16 @@ def validate_screen_text(value):
             raise Refused('invalid_screen_text_region', 422)
     if 'within' in options:
         validate_selector(options['within'])
-    for key in ('structure', 'mask_images'):
+    for key in ('structure', 'mask_images', 'per_card'):
         if key in options and type(options[key]) is not bool:
             raise Refused('invalid_screen_text_options', 422)
-    for key, low, high in (('min_confidence', 0, 100), ('limit', 1, 300)):
+    if 'hierarchy' in options:
+        dump = options['hierarchy']
+        if (not isinstance(dump, dict) or set(dump) - {'compressed', 'max_depth'}
+                or ('compressed' in dump and type(dump['compressed']) is not bool)
+                or ('max_depth' in dump and (type(dump['max_depth']) is not int or not 1 <= dump['max_depth'] <= 200))):
+            raise Refused('invalid_screen_text_options', 422)
+    for key, low, high in (('min_confidence', 0, 100), ('limit', 1, 300), ('max_cards', 1, 50)):
         if key in options and (type(options[key]) is not int or not low <= options[key] <= high):
             raise Refused('invalid_screen_text_options', 422)
     if 'key' in options and (not isinstance(options['key'], str) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', options['key'])):
@@ -240,7 +247,7 @@ def reference():
                        'validation (secret_reference_not_allowed, secret_unknown). A PIN screen, a protected app or a messenger still '
                        'stops the run. The value is in no request, saved flow, receipt or log: reads after it was typed (copyTextFrom, '
                        'readScreenText, readList, the failure observation) show ${secret:NAME} instead, and that observation has no screenshot.',
-            'screen_text': 'readScreenText: {region: {x, y, w, h} | within: <selector>, min_confidence: 0-100 (engine default: Apple Vision 50, Tesseract 60), limit: 1-300 (100), key: name (screen_text), mask_images: true|false (true)} '
+            'screen_text': 'readScreenText: {region: {x, y, w, h} | within: <selector>, min_confidence: 0-100 (engine default: Apple Vision 50, Tesseract 60), limit: 1-300 (100), key: name (screen_text), mask_images: true|false (true), hierarchy: {compressed: bool (true), max_depth: 1-200 (50)}, per_card: true|false, max_cards: 1-50 (12)} '
                            'recognizes text in one screenshot on the USB host when the host config sets ocr_command: Apple Vision on a macOS host with the vision extra, else Tesseract; ocr.engine names the one used. '
                            'Use it when the hierarchy has no text, e.g. canvas-drawn list cards. It returns lines {text, bounds, confidence} in full-screen '
                            'device pixels, top to bottom, also under receipt.data.<key>. Read-only; it never taps. ocr_unavailable or ocr_failed is a definite failure. '
@@ -250,7 +257,10 @@ def reference():
                            'Repeated blocks of the same shape form lists, e.g. order cards. receipt.data.<key> then holds {lines, blocks, lists, tree, truncated}. '
                            'mask_images (default true) paints the bounds of ImageView and TextureView nodes solid in the OCR copy only, so text printed inside photos is not read: '
                            'a node with its own text drawn over a photo stays readable, an image over 60% of the read region is not painted, and ocr.masked {regions, skipped_large, tree: ok|unavailable} reports it '
-                           '(null with false; an unreadable hierarchy leaves the capture unpainted).',
+                           '(null with false; an unreadable hierarchy leaves the capture unpainted). '
+                           'per_card: true adds cards: [{list, bounds, node, source: tree|ocr, lines}] beside the unchanged whole-screen read: the children of each scrolling container with two or more visible children, in reading order, '
+                           'a card with tree text built from the tree (not recognized), any other read from its own crop; cards_truncated and ocr.cards {tree, from_tree, from_ocr} report it. '
+                           'hierarchy sets the dump that mask_images, structure and per_card share; more than 5000 nodes are cut and tree says truncated.',
             'limits': {'source_bytes': 32768, 'expanded_commands': 200, 'reference_depth': 8, 'executed_steps': 2000}}
 
 
