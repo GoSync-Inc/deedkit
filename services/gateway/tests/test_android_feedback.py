@@ -57,6 +57,13 @@ def test_loading_waits_and_phases_are_discoverable_in_descriptions():
     assert 'waitSettled' in run and 'settle_ms' in run and 'phases' in run and 'sleep' in run
 
 
+# spec: ANYM-970
+def test_progress_and_named_reads_are_discoverable_in_the_run_description():
+    run = CATALOG['android_run_flow']['description']
+    assert 'progress' in run and 'step_path' in run and 'finished_steps' in run and 'android_get_operation' in run
+    assert 'copyTextFrom' in run and 'key' in run and 'duplicate_data_key' in run
+
+
 # spec: ANYM-957
 def test_image_parts_and_download_chunks_are_described():
     observe, download = CATALOG['android_observe']['description'], CATALOG['android_download']['description']
