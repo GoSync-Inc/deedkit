@@ -101,7 +101,7 @@ def test_migration_068_refuses_an_unusable_index_of_its_name_and_builds_it_once_
             c.execute('DROP INDEX attachment_digest_bytes')
         store.migrate();store.migrate()
         with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='88'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='89'
             assert c.execute('''SELECT i.indisvalid,pg_get_indexdef(i.indexrelid) AS d FROM pg_index i
                 WHERE i.indexrelid='attachment_digest_bytes'::regclass''').fetchone()=={'indisvalid':True,
                 'd':'CREATE INDEX attachment_digest_bytes ON public.attachments USING btree (digest, bytes)'}
@@ -173,7 +173,7 @@ def test_migration_072_refuses_an_unusable_index_of_its_name_and_builds_it_once_
                 else 'DROP INDEX attachment_message')
         store.migrate();store.migrate()
         with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='88'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='89'
             assert c.execute('''SELECT i.indisvalid,pg_get_indexdef(i.indexrelid) AS d FROM pg_index i
                 WHERE i.indexrelid='attachment_message'::regclass''').fetchone()=={'indisvalid':True,'d':MESSAGE_INDEX}
         seed_attachments(store,1,per_message=2)
@@ -188,7 +188,10 @@ def test_migration_072_builds_on_a_production_sized_table_in_one_expand_transact
     import hashlib
     from messaging_service import store as store_module
     from test_extend_key import old_schema_store
-    root=Path(store_module.__file__).parent
+    from test_migrate_expand import image_at, unattended_head
+    # A critical file (089) is a hand release: the unattended range from 71 ends before it, in its own image.
+    head=unattended_head(71)
+    root=image_at(tmp_path,head)
     roles={p.name:{'bytes':len(p.read_bytes()),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
         for p in sorted(root.glob('*_role.sql'))}
     with old_schema_store(database,tmp_path,71) as store:
@@ -196,11 +199,12 @@ def test_migration_072_builds_on_a_production_sized_table_in_one_expand_transact
         with store.pool.connection() as c:
             assert c.execute('SELECT count(*) AS n FROM attachments').fetchone()['n']==56523
         timing={}
-        found=store_module.migrate_expand(store.pool.conninfo,{'base':71,'target':88,'roles':roles},timing=timing)
+        found=store_module.migrate_expand(store.pool.conninfo,{'base':71,'target':head,'roles':roles},root=root,
+            timing=timing)
         record_property('transaction_ms',timing['transaction_ms'])
-        assert found=={'schema_version':88}
+        assert found=={'schema_version':head}
         with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='88'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']==str(head)
             assert c.execute("SELECT pg_get_indexdef('public.attachment_message'::regclass) AS d").fetchone()['d']==MESSAGE_INDEX
 
 

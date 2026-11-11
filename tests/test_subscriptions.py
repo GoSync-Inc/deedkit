@@ -1064,13 +1064,13 @@ def test_migration_70_runs_twice_and_keeps_the_counts_and_every_grant(seeded):
     emit(store)
     match_subscriptions(store)
     with store.pool.connection() as c:
-        c.execute('DELETE FROM archive_migrations WHERE version IN (70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88)')
+        c.execute('DELETE FROM archive_migrations WHERE version IN (70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89)')
         c.execute("UPDATE probe_metadata SET value='69' WHERE name='schema_version'")
         grants = c.execute("SELECT oid,relacl::text FROM pg_class WHERE relnamespace='public'::regnamespace ORDER BY oid").fetchall()
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '88'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '89'
         assert c.execute('SELECT count(*) AS n FROM archive_migrations WHERE version=70').fetchone()['n'] == 1
         assert c.execute("SELECT oid,relacl::text FROM pg_class WHERE relnamespace='public'::regnamespace ORDER BY oid").fetchall() == grants
     assert activity(store, token, sid) == {'telegram': {'scanned': 1, 'matched': 1}}
@@ -1094,7 +1094,7 @@ def failure_event(store, kind, token):
 
 
 def birthday_event(store, chat='telegram-demo-chat', day='2026-11-12'):
-    """A synthetic contact.birthday row as schema 87's journal function writes it: account, chat and date only."""
+    """A synthetic contact.birthday row as schema 89's journal function writes it: account, chat and date only."""
     with store.pool.connection() as c:
         value = c.execute('UPDATE feed_counter SET value=value+1 WHERE id=1 RETURNING value').fetchone()['value']
         c.execute('''INSERT INTO events(id,account,message,kind,revision,origin,snapshot,event_key)
@@ -1119,6 +1119,55 @@ def test_a_contact_birthday_reaches_only_a_definition_that_names_the_kind_in_the
     # Default subscriptions never receive it, nor does a definition of another chat.
     assert store.get_subscription_events(token, default)['items'] == []
     assert store.get_subscription_events(token, elsewhere)['items'] == []
+
+
+# spec: ANYM-919
+def test_a_birthday_hint_fires_once_from_nine_owner_time_the_day_before_and_never_by_default(seeded):
+    from messaging_service import birthdays
+    store, _, _ = seeded
+    with store.pool.connection() as c:
+        # The database clock decides: a zone where it is 10:00-22:59 now (the hint is due for tomorrow there) and one
+        # where it is 01:00-07:59 now (not yet due). Offsets from -12 to +14 always hold both.
+        def zone(low, high):
+            return c.execute("""SELECT name, ((now() AT TIME ZONE name)::date + 1) AS due FROM pg_timezone_names
+                WHERE name LIKE '%%/%%' AND extract(hour FROM now() AT TIME ZONE name) BETWEEN %s AND %s
+                ORDER BY name LIMIT 1""", (low, high)).fetchone()
+        late, early = zone(10, 22), zone(1, 7)
+        c.execute("""INSERT INTO chats(id,account,provider_chat,title,chat_type)
+            VALUES('telegram-demo-birthday','telegram-demo','424242','Синтетик','private')""")
+        birthdays.store(c, 'telegram-demo', '424243', None)  # hidden: never a hint
+        # Before 09:00 in the given zone the function itself journals nothing, whatever the caller's clock says.
+        birthdays.store(c, 'telegram-demo', '424242', (early['due'].day, early['due'].month, 1990))
+        assert c.execute('SELECT public.journal_contact_birthdays(%s) AS n', (early['name'],)).fetchone()['n'] == 0
+        birthdays.store(c, 'telegram-demo', '424242', (late['due'].day, late['due'].month, 1990))
+        # Only a named zone; the caller cannot pick a date or a raw offset.
+        for bad in ('UTC+14', '+14', 'Mars/Olympus'):
+            with pytest.raises(Exception, match='invalid_owner_zone'):
+                with c.transaction():
+                    c.execute('SELECT public.journal_contact_birthdays(%s)', (bad,))
+        assert c.execute("SELECT to_regprocedure('public.journal_contact_birthdays(date)') AS f").fetchone()['f'] is None
+    token = key(store, 'birthday-hints')
+    named = store.create_subscription(token, ['telegram-demo-birthday'], kinds=['contact.birthday'])['subscription_id']
+    default = store.create_subscription(token, ['telegram-demo-birthday'])['subscription_id']
+    zone_setting = {'ANYMSG_OWNER_TIMEZONE': late['name']}
+    assert birthdays.journal_birthday_hints(store, environ=zone_setting) == 1
+    # A re-run of the scheduler the same day sends no second hint (key: account, user, year).
+    assert birthdays.journal_birthday_hints(store, environ=zone_setting) == 0
+    match_subscriptions(store)
+    items = store.get_subscription_events(token, named)['items']
+    due = late['due'].isoformat()
+    assert [(i['kind'], i['chat'], i['date']) for i in items] == [('contact.birthday', 'telegram-demo-birthday', due)]
+    assert not {'message', 'sender', 'name', 'year'} & set(items[0])
+    assert store.get_subscription_events(token, default)['items'] == []
+    with store.pool.connection() as c:
+        row = c.execute('SELECT event_key,snapshot FROM events WHERE kind=%s', ('contact.birthday',)).fetchone()
+        assert row['event_key'] == 'contact.birthday:telegram-demo:424242:%d' % late['due'].year
+        assert row['snapshot'] == {'account': 'telegram-demo', 'chat': 'telegram-demo-birthday', 'date': due}
+        # The pushed hint's reference carries the chat and the date only.
+        refs = c.execute('SELECT kind,evidence FROM public.subscription_hint_references(%s,0,%s,%s,NULL)',
+            (named, 2**53, ['telegram-demo'])).fetchall()
+        assert [(r['kind'], {k: v for k, v in r['evidence'].items() if v}) for r in refs] == [
+            ('contact.birthday', {'chat': 'telegram-demo-birthday', 'date': due})]
 
 
 # spec: ANYM-824
