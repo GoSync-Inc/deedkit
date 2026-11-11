@@ -3,13 +3,15 @@
 
 Usage (on the USB host, from services/android or the installed release's venv):
   python tools/evaluate_ocr.py SET_DIR --command /opt/homebrew/bin/tesseract [--languages eng+ind+rus]
+  python tools/evaluate_ocr.py SET_DIR --command /opt/homebrew/bin/tesseract --engine vision
   python tools/evaluate_ocr.py SET_DIR --tsv-command '/path/vision_tsv {image} {languages}'
 
 SET_DIR holds <name>.png and <name>.json ground truth (deedkit_android.ocr_quality). The private set
 lives only in the host's private state directory: never in Git, images or logs. Output is one JSON
 object of counts, percentages, seconds and screen names; no recognised or expected text is printed.
---tsv-command runs another local engine that prints Tesseract TSV word rows for the bake-off; it gets
-the raw screen, without the Tesseract preprocessing.
+--engine vision measures Apple Vision as readScreenText runs it (macOS with the vision extra; a Vision
+failure falls back to --command). --tsv-command runs another local engine that prints Tesseract TSV
+word rows for the bake-off; it gets the raw screen, without the Tesseract preprocessing.
 """
 
 import argparse
@@ -45,11 +47,15 @@ def main(argv=None):
     engine.add_argument('--command', help='absolute Tesseract path (the service engine and preprocessing)')
     engine.add_argument('--tsv-command', help='another local engine; {image} and {languages} are filled in')
     parser.add_argument('--languages', help='override every screen\'s languages, for example eng+ind')
+    parser.add_argument('--engine', choices=('tesseract', 'vision'), default='tesseract',
+                        help='with --command: the readScreenText engine to measure')
     args = parser.parse_args(argv)
     if args.tsv_command:
         summary = evaluate(args.set_dir, None, args.languages, tsv_engine(args.tsv_command))
     else:
-        summary = evaluate(args.set_dir, args.command, args.languages, recognize)
+        engine = args.engine
+        summary = evaluate(args.set_dir, args.command, args.languages,
+                           lambda image, ocr: recognize(image, {**ocr, 'engine': engine}))
     json.dump(summary, sys.stdout)
     sys.stdout.write('\n')
 

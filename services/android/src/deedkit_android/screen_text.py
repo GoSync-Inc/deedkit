@@ -11,8 +11,8 @@ from PIL import Image, ImageChops, ImageFilter, ImageOps
 from .config import Refused
 
 PNG = b'\x89PNG\r\n\x1a\n'
-HINT = ('Text recognition needs ocr_command (absolute Tesseract path) and optional ocr_languages, '
-        'for example eng+ind, in the USB host configuration.')
+HINT = ('Text recognition needs ocr_command (absolute Tesseract path, also the fallback when Apple Vision is the '
+        'engine) and optional ocr_languages, for example eng+ind, in the USB host configuration.')
 
 
 def lines(tsv, origin, min_confidence):
@@ -71,8 +71,8 @@ def normalize(image):
     return ImageOps.autocontrast(ImageOps.invert(nearest))
 
 
-def recognize(image, ocr, origin=(0, 0), min_confidence=60):
-    """Engine lines of one image in full-screen pixels. Raises Refused('ocr_failed')."""
+def tesseract_lines(image, ocr, origin=(0, 0), min_confidence=60):
+    """Tesseract engine lines of one image in full-screen pixels. Raises Refused('ocr_failed')."""
     # A private directory per call; removed on success, failure and timeout.
     with tempfile.TemporaryDirectory(prefix='deedkit-ocr-') as directory:
         path = Path(directory) / 'screen.png'
@@ -85,6 +85,29 @@ def recognize(image, ocr, origin=(0, 0), min_confidence=60):
     if done.returncode:
         raise Refused('ocr_failed')
     return engine_lines(done.stdout.decode('utf-8', 'replace'), origin, min_confidence)
+
+
+def recognize_with(image, ocr, origin=(0, 0), min_confidence=None):
+    """(lines, report) with the host's engine: Apple Vision when ocr['engine'] is vision, else Tesseract.
+
+    A Vision failure falls back to Tesseract when the host has ocr_command; the report names the engine that read."""
+    if ocr.get('engine') == 'vision':
+        from . import screen_vision
+        try:
+            lines = screen_vision.engine_lines(
+                image, ocr['languages'], origin,
+                screen_vision.DEFAULT_MIN_CONFIDENCE if min_confidence is None else min_confidence, normalize)
+            return lines, {'engine': 'apple-vision', 'preprocess': 'none', 'bounds': 'ink'}
+        except Exception:  # noqa: BLE001 - Vision is replaceable; Tesseract below or ocr_failed
+            if not ocr.get('command'):
+                raise Refused('ocr_failed') from None
+    lines = tesseract_lines(image, ocr, origin, 60 if min_confidence is None else min_confidence)
+    return lines, {'engine': 'tesseract', 'preprocess': 'local_contrast'}
+
+
+def recognize(image, ocr, origin=(0, 0), min_confidence=None):
+    """Engine lines of one image in full-screen pixels. Raises Refused('ocr_failed')."""
+    return recognize_with(image, ocr, origin, min_confidence)[0]
 
 
 def read_screen_text(device, options, ocr, locate):
@@ -108,7 +131,7 @@ def read_screen_text(device, options, ocr, locate):
         if region['w'] < 1 or region['h'] < 1 or region['x'] + region['w'] > width or region['y'] + region['h'] > height:
             raise Refused('region_outside_screen')
         image = screen.crop((region['x'], region['y'], region['x'] + region['w'], region['y'] + region['h']))
-    found = recognize(image, ocr, (region['x'], region['y']), options.get('min_confidence', 60))
+    found, engine = recognize_with(image, ocr, (region['x'], region['y']), options.get('min_confidence'))
     limit = options.get('limit', 100)
     result = {'key': options.get('key', 'screen_text'), 'region': region,
               'lines': [{key: line[key] for key in ('text', 'bounds', 'confidence')} for line in found[:limit]],
@@ -126,5 +149,5 @@ def read_screen_text(device, options, ocr, locate):
             'tree': 'unavailable' if root is None else 'merged' if any(True for _ in root.iter('node')) else 'none',
             'truncated': len(found) > limit or any(len(item['items']) >= MAX_ITEMS for item in lists)}
     return {**result,
-            'ocr': {'engine': 'tesseract', 'languages': ocr['languages'], 'preprocess': 'local_contrast',
+            'ocr': {**engine, 'languages': ocr['languages'],
                     'elapsed_ms': round((time.monotonic() - started) * 1000, 2)}}

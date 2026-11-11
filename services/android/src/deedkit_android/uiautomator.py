@@ -1,6 +1,7 @@
 """Persistent, single-attempt UI worker behind the existing device lease."""
 
 import asyncio
+import functools
 import json
 import os
 import re
@@ -57,6 +58,13 @@ def validate_selector(value):
             'enabled', 'selected', 'checked', 'focused', 'clickable', 'scrollable'} else str
         if type(item) is not expected or (key == 'index' and item < 0):
             raise Refused('invalid_uiautomator_selector', 422)
+
+
+@functools.cache
+def ocr_engine():
+    """The host's readScreenText engine: Apple Vision where the `vision` extra is installed on macOS, else Tesseract."""
+    from .screen_vision import available
+    return 'vision' if available() else 'tesseract'
 
 
 def validate_screen_text(value):
@@ -181,8 +189,8 @@ def reference():
             'compatibility': 'Saved command lists and literal parameters remain usable. Unsupported commands fail validation before execution. Legacy retryTapIfNoChange is accepted but never repeats a tap. waitToSettleTimeoutMs is an explicit post-tap wait.',
             'receipts': 'steps contains path, command name, elapsed_ms and result. First failure has a durable screenshot and compact hierarchy. Poll running/unknown with the same request_id; never replay uncertain mutations.',
             'parameters': 'Literal ${UPPER_CASE} substitution, including saved subflows.',
-            'screen_text': 'readScreenText: {region: {x, y, w, h} | within: <selector>, min_confidence: 0-100 (60), limit: 1-300 (100), key: name (screen_text)} '
-                           'recognizes text in one screenshot on the USB host with Tesseract when the host config sets ocr_command. '
+            'screen_text': 'readScreenText: {region: {x, y, w, h} | within: <selector>, min_confidence: 0-100 (engine default: Apple Vision 50, Tesseract 60), limit: 1-300 (100), key: name (screen_text)} '
+                           'recognizes text in one screenshot on the USB host when the host config sets ocr_command: Apple Vision on a macOS host with the vision extra, else Tesseract; ocr.engine names the one used. '
                            'Use it when the hierarchy has no text, e.g. canvas-drawn list cards. It returns lines {text, bounds, confidence} in full-screen '
                            'device pixels, top to bottom, also under receipt.data.<key>. Read-only; it never taps. ocr_unavailable or ocr_failed is a definite failure. '
                            'structure: true adds structure {blocks: [{bounds, confidence, node?, lines: [{text, bounds, confidence, row, source: ocr|tree, node?, words: [{text, bounds, confidence}]}]}], '
@@ -297,7 +305,8 @@ class Uiautomator:
                         limit=4 * 1024 * 1024, pass_fds=(self.lock_fd,))
                     self.processes[device] = process
                 if getattr(self.config, 'ocr_command', None):
-                    options = {**options, 'ocr': {'command': self.config.ocr_command, 'languages': self.config.ocr_languages}}
+                    ocr = {'command': self.config.ocr_command, 'languages': self.config.ocr_languages}
+                    options = {**options, 'ocr': ocr | ({'engine': 'vision'} if ocr_engine() == 'vision' else {})}
                 process.stdin.write(json.dumps({'command': command, **options}).encode() + b'\n')
                 await process.stdin.drain()
                 response = await process.stdout.readline()

@@ -182,9 +182,10 @@ Some apps draw text that the accessibility tree does not expose. Two read-only
 tools help. An app map may set `hierarchy: {compressed: false, max_depth: 120}`;
 every snapshot for that map then dumps the full tree instead of the default
 compressed tree of depth 50. When the text is still missing, `readScreenText`
-captures one PNG and recognizes it on the USB host with Tesseract
-(`--psm 11 tsv`). It accepts `region: {x, y, w, h}` or `within: <selector>`,
-`min_confidence` (default 60), `limit` (default 100, at most 300) and `key`
+captures one PNG and recognizes it on the USB host: with Apple Vision on a
+macOS host that has the `vision` extra, otherwise with Tesseract (`--psm 11 tsv`).
+It accepts `region: {x, y, w, h}` or `within: <selector>`, `min_confidence`
+(default 50 with Vision, 60 with Tesseract), `limit` (default 100, at most 300) and `key`
 (default `screen_text`). It returns lines with `text`, device-pixel `bounds` and
 `confidence`, top to bottom, in the step result and in `receipt.data.<key>`. The
 PNG lives in a private temporary directory removed after each call; nothing leaves
@@ -210,6 +211,18 @@ consecutive blocks of the same shape form `lists` of item block indexes. `tree`
 says whether the hierarchy was merged.
 The receipt then keeps `{lines, blocks, lists, tree, truncated}` under the key.
 
+**Engine.** There is no engine option for callers; the host decides and `ocr.engine`
+names the one that read. Install the service with `uv sync --locked --extra vision`
+on macOS to read with Apple Vision (VNRecognizeTextRequest, accurate, language
+correction on, in the worker process; PyObjC pinned in `pyproject.toml`). The
+config's `ocr_languages` codes map to Vision's (`eng+ind` to en-US and id-ID), and
+`ocr_command` stays required: a Vision error or a call over 20 s falls back to
+Tesseract. Vision's word boxes are tightened to their ink (`ocr.bounds: ink`) so
+the structure below groups rows as with Tesseract. Vision reports confidence 30,
+50 or 100. Bake-off on the mini, 11-11, four real Tokopedia screens, 31 expected
+strings: Tesseract 27, Vision 30; 0.7-1.0 s per screen warm on the mini (first call about 8 s), Tesseract 1.3-1.9 s. Without the extra
+(Linux, CI) nothing changes. Roll back by installing the previous release.
+
 Before Tesseract, the screenshot is normalized on the host (`ocr.preprocess:
 local_contrast`): each pixel's distance from its local background, so light text
 on coloured buttons and dark themes becomes dark on white at the same size and
@@ -217,7 +230,7 @@ coordinates. Quality is measured on the committed synthetic corpus
 (`tests/fixtures/screens`, rendered by `tools/make_screen_corpus.py`):
 `tests/test_screen_quality.py` holds character error rate at most 2% and exact
 list item counts. For real screens, `tools/evaluate_ocr.py SET_DIR --command
-<tesseract>` prints the same numbers, never text, for a labelled set kept only in
+<tesseract> [--engine vision]` prints the same numbers, never text, for a labelled set kept only in
 the host's private state directory; `--tsv-command` runs another local engine
 that prints Tesseract TSV for a bake-off.
 

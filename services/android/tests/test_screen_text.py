@@ -140,6 +140,90 @@ def test_screen_text_engine_failure_is_definite_and_removes_the_image(tmp_path):
     assert failure.value.code == 'region_outside_screen'
 
 
+def inked_png():
+    """Two black word shapes and a faint third line on white, for a fake Vision that pads its boxes."""
+    from PIL import ImageDraw
+
+    image = Image.new('RGB', (300, 160), 'white')
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((20, 40, 79, 59), fill='black')
+    draw.rectangle((100, 40, 159, 59), fill='black')
+    draw.rectangle((20, 110, 79, 129), fill='black')
+    target = io.BytesIO()
+    image.save(target, format='PNG')
+    return target.getvalue()
+
+
+def fake_vision(monkeypatch, error=None, delay=0):
+    from deedkit_android import screen_vision
+
+    calls = []
+
+    def observe(image, codes):
+        calls.append((image.size, codes))
+        if delay:
+            import time
+            time.sleep(delay)
+        if error:
+            raise error
+        return [('Lacak Rp68.310', 50.0, [('Lacak', (12, 30, 88, 70)), ('Rp68.310', (92, 30, 168, 70))]),
+                ('PLUS', 30.0, [('PLUS', (12, 100, 88, 140))])]
+    monkeypatch.setattr(screen_vision, 'observations', observe)
+    return calls
+
+
+# spec: ANYM-966
+def test_vision_engine_reads_lines_with_ink_tight_boxes_and_its_own_confidence_default(tmp_path, monkeypatch):
+    from deedkit_android.ui_worker import execute
+
+    calls = fake_vision(monkeypatch)
+    ocr, record = fake_tesseract(tmp_path)
+    result = execute(Device(inked_png()), {'readScreenText': {'region': {'x': 0, 'y': 0, 'w': 300, 'h': 160}, 'structure': True}},
+                     ocr={**ocr, 'engine': 'vision'})
+    assert calls == [((300, 160), 'eng+ind')] and not record.exists()
+    assert result['ocr']['engine'] == 'apple-vision' and result['ocr']['bounds'] == 'ink'
+    assert [line['text'] for line in result['lines']] == ['Lacak Rp68.310']  # 30 is under Vision's default of 50
+    left, top, right, bottom = (int(v) for v in result['lines'][0]['bounds'].replace('][', ',').strip('[]').split(','))
+    assert abs(left - 20) <= 2 and abs(top - 40) <= 2 and abs(right - 160) <= 2 and abs(bottom - 60) <= 2
+    words = result['structure']['blocks'][0]['lines'][0]['words']
+    assert [word['text'] for word in words] == ['Lacak', 'Rp68.310'] and words[1]['bounds'].startswith('[10')
+    every = execute(Device(inked_png()), {'readScreenText': {'min_confidence': 0}}, ocr={**ocr, 'engine': 'vision'})
+    assert [line['text'] for line in every['lines']] == ['Lacak Rp68.310', 'PLUS']
+
+
+# spec: ANYM-966
+def test_vision_failure_or_timeout_falls_back_to_tesseract(tmp_path, monkeypatch):
+    from deedkit_android import screen_vision
+    from deedkit_android.ui_worker import execute
+
+    ocr, record = fake_tesseract(tmp_path)
+    fake_vision(monkeypatch, error=RuntimeError('framework'))
+    result = execute(Device(), {'readScreenText': {}}, ocr={**ocr, 'engine': 'vision'})
+    assert result['ocr']['engine'] == 'tesseract' and result['ocr']['preprocess'] == 'local_contrast'
+    assert [line['text'] for line in result['lines']] == ['Selesai', 'Rp 125.000'] and record.exists()
+    monkeypatch.setattr(screen_vision, 'TIMEOUT_SECONDS', 0.05)
+    fake_vision(monkeypatch, delay=1)
+    assert execute(Device(), {'readScreenText': {}}, ocr={**ocr, 'engine': 'vision'})['ocr']['engine'] == 'tesseract'
+    fake_vision(monkeypatch, error=RuntimeError('framework'))
+    with pytest.raises(Refused) as failure:
+        execute(Device(), {'readScreenText': {}}, ocr={'command': None, 'languages': 'eng', 'engine': 'vision'})
+    assert failure.value.code == 'ocr_failed'
+
+
+# spec: ANYM-966
+def test_host_engine_is_vision_only_where_the_extra_is_installed_and_languages_map(monkeypatch):
+    from deedkit_android import screen_vision, uiautomator
+
+    for installed, engine in ((True, 'vision'), (False, 'tesseract')):
+        monkeypatch.setattr(screen_vision, 'available', lambda: installed)
+        uiautomator.ocr_engine.cache_clear()
+        assert uiautomator.ocr_engine() == engine
+    uiautomator.ocr_engine.cache_clear()
+    monkeypatch.setattr(screen_vision.sys, 'platform', 'linux')
+    assert screen_vision.available() is False
+    assert screen_vision.languages('eng+ind+xyz') == ['en-US', 'id-ID'] and screen_vision.languages('xyz') == ['en-US']
+
+
 # spec: ANYM-955
 def test_screen_text_options_are_validated_before_admission():
     from deedkit_android.uiautomator import validate_commands
@@ -199,7 +283,7 @@ def test_screen_text_failure_keeps_the_worker_and_fails_the_receipt(tmp_path, mo
 
 # spec: ANYM-955
 def test_uiautomator_keeps_its_worker_after_a_definite_ocr_failure(tmp_path):
-    from deedkit_android.uiautomator import Uiautomator
+    from deedkit_android.uiautomator import Uiautomator, ocr_engine
 
     config = SimpleNamespace(devices={'phone': 'SERIAL'}, uiautomator2_jar='/synthetic', adb='/synthetic/adb',
                              state_dir=str(tmp_path), ocr_command='/opt/ocr/tesseract', ocr_languages='eng+ind')
@@ -218,7 +302,9 @@ def test_uiautomator_keeps_its_worker_after_a_definite_ocr_failure(tmp_path):
         assert failure.value.hint == 'check the host'
     asyncio.run(scenario())
     assert 'phone' in ui.processes
-    assert json.loads(written[0])['ocr'] == {'command': '/opt/ocr/tesseract', 'languages': 'eng+ind'}
+    ocr = json.loads(written[0])['ocr']
+    assert {key: ocr[key] for key in ('command', 'languages')} == {'command': '/opt/ocr/tesseract', 'languages': 'eng+ind'}
+    assert ocr.get('engine', 'tesseract') == ocr_engine()  # vision on a macOS host with the vision extra
 
 
 # spec: ANYM-955
