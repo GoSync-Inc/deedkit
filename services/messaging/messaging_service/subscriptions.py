@@ -536,12 +536,15 @@ def _check_capacity(c, p):
 
 def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=None, kinds=None,
         direction='incoming', origins=None, label='', expires_at=None, wake_rules=None, reply_to_send=None,
-        delivery=None, module_sources=None):
+        delivery=None, module_sources=None, feedback=None):
     from .store import APIError, date_bound
     if 'read' not in p['permissions']:
         raise APIError('forbidden', 403)
-    if (chat_ids is None) == (sources is None):
+    # ANYM-962: feedback (this key's own report statuses) alone, or beside chat_ids or sources.
+    if chat_ids is not None and sources is not None or chat_ids is None and sources is None and feedback is None:
         raise APIError('invalid_filter')
+    from .feedback_events import attach, subscription_types
+    if feedback is not None: subscription_types(feedback)  # invalid_filter before anything is written
     if delivery is not None:
         # ANYM-519: bind a self-service endpoint in the same transaction (configure_subscription_delivery's checks).
         if not isinstance(delivery, dict) or 'endpoint_id' not in delivery or set(delivery) - {'endpoint_id', 'delivery_policy'}:
@@ -552,7 +555,7 @@ def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=
         if not gate_on(c):
             raise APIError('delivery_disabled', 409)
     dynamic_sources = None if sources is None else _sources(p, sources, sender_ids, reply_to_send)
-    chats = [] if dynamic_sources else _ids(chat_ids, required=True)
+    chats = [] if dynamic_sources or chat_ids is None else _ids(chat_ids, required=True)
     senders = _ids(sender_ids)
     kinds = _ids(['message.created'] if kinds is None else kinds, required=True)
     origins = _ids(['live'] if origins is None else origins, required=True)
@@ -646,6 +649,8 @@ def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=
     if calls:
         from .module_events import attach_sources
         attach_sources(c, row['id'], calls)
+    if feedback is not None:
+        attach(c, p, row['id'], feedback)  # its module stream starts at the module journal's head
     targets(p, [str(row['id'])])
     result = None
     if delivery is not None:
