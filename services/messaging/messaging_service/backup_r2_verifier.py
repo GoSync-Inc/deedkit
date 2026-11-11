@@ -1178,6 +1178,46 @@ def record_verified(engine,journal,fd,rebaselined=None):
     return status
 
 
+# The profiles whose `restore_schema_failed` means the pinned helper is older than the bundle (backup_health.LAG_PROFILES;
+# calendar's code of that name is a restored-schema mismatch).
+LAG_PROFILES=('messaging','recordings')
+
+
+class HelperBehind(ValueError):
+    """The candidate a run of this pinned helper already refused for its newer schema (incident 11-11)."""
+    def __init__(self,backup_id,revision):super().__init__('restore_schema_failed');self.backup_id,self.revision=backup_id,revision
+
+
+def refuse_known_lag(fd,config,profile,journal,candidate):
+    """`candidate`, unless a run of this same helper already refused it for its newer schema: then HelperBehind before
+    any journal, admission or download, so the receiver lock is not held for a whole stream that ends at the same
+    refusal (incident 11-11: ~21 GB every 10 min, then `receiver_busy` for production's upload). New pins or a new
+    capture run in full; an unreadable record changes nothing."""
+    if journal is not None or candidate is None or profile not in LAG_PROFILES:return candidate
+    try:last=read_private(fd,'last-failure.json',65536)
+    except (OSError,ValueError):return candidate
+    if (isinstance(last,dict) and last.get('error')=='restore_schema_failed' and
+            last.get('helper_revision')==config['helper_revision'] and last.get('backup_id')==candidate['wire']['id']):
+        raise HelperBehind(candidate['wire']['id'],config['helper_revision'])
+    return candidate
+
+
+def schema_lag(error,journal,profile,cleanup_ok,fd):
+    """The candidate and helper of a helper-behind refusal, else None. Only a cleaned-up run still restoring counts:
+    its retry journal goes (drop_lag_journal), because a retry is held to the journal's pins and the receiver update
+    follow never moves pins under a journal (incident 11-11: the two waited on each other)."""
+    if isinstance(error,HelperBehind):return {'backup_id':error.backup_id,'helper_revision':error.revision}
+    if (profile not in LAG_PROFILES or journal is None or str(error)!='restore_schema_failed' or not cleanup_ok or
+            durable_phase(fd)!='restoring'):return None
+    return {'backup_id':journal['receipt']['wire']['id'],'helper_revision':journal['helper_revision']}
+
+
+def drop_lag_journal(fd):
+    """Remove a helper-behind run's retry journal; one that cannot be removed stays (the follow then reports waiting)."""
+    try:os.unlink('active.json',dir_fd=fd);local.fsync_dir(fd)
+    except OSError:pass
+
+
 def run_failure(error,engine,config,journal,admitted,profile,fd):
     """A failed run's record under its control directory. Returns the `busy` status of a wait that ran out before
     anything was journaled; otherwise None, and the caller raises `error`."""
@@ -1206,6 +1246,7 @@ def run_failure(error,engine,config,journal,admitted,profile,fd):
     failure={'v':1,'status':'failed','error':failure_code(error),'failed_at':now(),
              'cleanup_complete':cleanup_ok,'diagnostic':describe(error)}
     if isinstance(error,HelperFailure) and error.detail:failure['detail']=error.detail
+    if (lag:=schema_lag(error,journal,profile,cleanup_ok,fd)) is not None:failure.update(lag)
     # The calls discard's evidence: which run was refused (a status otherwise outlives its candidate).
     if profile=='calls' and journal is not None:failure['run']=journal['run']
     # Counts and Docker's fixed state words only (ANYM-633): the stream's ranged GETs and the helper's end.
@@ -1217,6 +1258,8 @@ def run_failure(error,engine,config,journal,admitted,profile,fd):
     # A later busy/idle/verified run overwrites status.json; keep the last failure's cause.
     try:local.write_maintenance_json('last-failure.json',failure,dir_fd=fd)
     except Exception:pass
+    else:
+        if lag is not None and journal is not None:drop_lag_journal(fd)
     return None
 
 
@@ -1245,7 +1288,7 @@ def run(config,*,client=None,engine=None,path=None):
                     # Only a run that journaled nothing waits out an upload (ANYM-632); a retry fails as before.
                     untimed(engine,held,receiver_lock(state_fd,busy_wait(config) if journal is None else None))
                     prior,marker=read_marker(receiver,config['protected_file'])
-                    candidate=select_candidate(receiver,client,state_fd,marker)
+                    candidate=refuse_known_lag(fd,config,profile,journal,select_candidate(receiver,client,state_fd,marker))
                     pending=journal
                     if journal is None:
                         if candidate is None:

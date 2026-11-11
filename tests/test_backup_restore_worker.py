@@ -141,6 +141,20 @@ def test_worker_names_a_bundle_schema_beyond_its_own_as_schema_not_decryption(tm
         assert str(run_with(tmp_path,monkeypatch,decoder,broken).value)=='restore_decryption_failed'
 
 
+# spec: ANYM-597
+@pytest.mark.parametrize('refusal,code',[('recordings_schema_unsupported','restore_schema_failed'),
+                                         ('recordings_snapshot_corrupt','restore_decryption_failed')])
+def test_a_recordings_archive_schema_refused_inside_decryption_is_a_schema_failure(monkeypatch,refusal,code):
+    # backup_crypto checks the recordings archive's schema while it decrypts: that refusal is the helper being older
+    # than the bundle, the code the verifier's journal drop and backup_receiver_behind read, not a key fault.
+    from messaging_service import backup_restore_worker as worker
+    def refuse(source,identity,destination,max_bytes):raise ValueError(refusal)
+    monkeypatch.setattr(worker,'decrypt_snapshot_stream',refuse)
+    with pytest.raises(worker.RestoreStageError) as caught:
+        worker.run({**calendar_worker_config(b'synthetic'),'profile':'recordings'},io.BytesIO(b''))
+    assert str(caught.value)==code
+
+
 def run_with(tmp_path,monkeypatch,decoder,manifest):
     from messaging_service import backup_restore_worker as worker
     raw=json.dumps(manifest).encode();out=io.BytesIO()

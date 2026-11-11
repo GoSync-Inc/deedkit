@@ -1513,11 +1513,13 @@ stack's resolved Compose file; no copy). On backup-1 the same DSN is copied to `
 `0600`) over the tailnet without printing it; read back by comparing the sha256 of both files. The agents'
 secret-read hook refuses that copy (11-08), so the owner runs it. Read back:
 `systemctl start deedkit-backup-health.service` exits 0, `production.py status` prints the five `backup` lines,
-`--print` on backup-1 prints four. The copy does not follow later releases: reinstall it when `backup_health.py`
-changes (ci-deploy-speed 11-09: the production copy also raises `deploy_halted.<code>` for an autodeploy halt, so an
-agent sees a pause within the hour; reinstall on the production host only, then read back with one
-`systemctl start deedkit-backup-health.service` and its `due` line; undo: the previous copy, kept beside it as
-`backup_health.py.before-<sha>`). Incident 11-11: the backup-1 copy also raises `backup_receiver_behind` (BACKUP.md,
+`--print` on backup-1 prints four. On the production host the checker then follows the releases (incident 11-11): a
+healthy `apply` (both routes) installs the release's `backup_health.py` and sets `release_sha` to the release, each by
+one rename after a `<file>.before-<sha>` copy (owner and mode kept), once the staged pair's `--print` exits 0. Its
+receipt is `<sha>/backup-health.json` (`installed`, `current` or `refused` with the reason); a refusal leaves both files
+as they were and never fails the release. A host without both files gets none (the first install is this one). A
+rollback keeps the newer checker, which names the rolled-back release until the next apply; undo of one install: the
+two `.before-<sha>` copies back. The backup-1 copy does not follow: reinstall it when `backup_health.py` changes. Incident 11-11: the backup-1 copy also raises `backup_receiver_behind` (BACKUP.md,
 Backup alerts); reinstall it there and add `"follow": true` to its configuration once
 `deedkit-backup-r2-follow.timer` is enabled (BACKUP_R2.md, Receiver update follow); undo: remove the key and put the
 previous copy back. Undo per host: `systemctl disable --now deedkit-backup-health.timer`; remove the two unit files,

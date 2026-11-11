@@ -2308,6 +2308,7 @@ def apply(settings, sha, *, backup_waited=0, pre_claim=None):
         result["pre_claim_rollback"] = pre_claim
     write(release / "result.json", result)
     write(state / "current.json", result)
+    install_backup_health(sha, release)  # the release's backup checker names it (incident 11-11); never raises
     if (release / "source" / SESSION_CLAIM).is_file() and not (state / CLAIM_RECORD).exists():
         write(state / CLAIM_RECORD, {"sha": sha, "recorded_at": now()})
     return result
@@ -4408,6 +4409,8 @@ from release_migrations import (  # noqa: E402, F401  every name, re-exported: t
     calendar_backup_line, INFERENCE_WORKER_RECEIPT, BACKUP_HEALTH_RESULT, BACKUP_HEALTH_PROFILES, BACKUP_HEALTH_WORDS,
     backup_health_lines, inference_worker_line, negotiation_worker_line, leaf_identity, leaf_read, leaf_write,
     stage_leaf, settle_pin, follow_producer, RUNNER_CONFIGS, RUNNER_UNITS, RUNNER_PYTHON, install_backup_runner,
+    BACKUP_HEALTH_PROGRAM, BACKUP_HEALTH_CONFIG, BACKUP_HEALTH_SOURCE, install_backup_health, backup_health_files,
+    BACKUP_HEALTH_PROBE_S, restore_leaves,
     migration_gate, calendar_gate, migration_receipt, migration_image, NO_CHANGE, step_name, container_name,
     evidence_file, expand_answer, migration_outcome, outcome_text, Progress, resumed_migration, unsettled_outcomes,
     unsettled_migrations, migrate_rehearse, migrate_gate, migrate_expand)

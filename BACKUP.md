@@ -798,7 +798,8 @@ A failed, undelivered or unverified daily backup raises a Tiden issue within an 
 one line per backup. `deploy/deedkit-backup-health.timer` runs `deploy/deedkit-backup-health.service` hourly at :37 on
 both hosts. The service runs the standard-library checker `services/messaging/messaging_service/backup_health.py`
 (host copy `/opt/deedkit/backup-health/backup_health.py`) with `/etc/deedkit-backup-health/config.json`. Host install
-and undo: `docs/operations/production.md`, "Backup alerts".
+and undo: `docs/operations/production.md`, "Backup alerts". On the production host each healthy `apply` installs the
+release's copy and sets the config's `release_sha` to the release, so an issue names the deployed release.
 
 - **Production host** (`side: producer`, the four runners):
   - `backup_failed.<profile>` when `status.json` reads `error`, or when one of the profile's units is `failed` at or

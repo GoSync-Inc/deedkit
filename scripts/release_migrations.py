@@ -976,7 +976,8 @@ def leaf_identity(found):
 
 def leaf_read(directory, name):
     """The bytes and stat of `name` in the open `directory`, never through a link."""
-    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+    # Non-blocking: a FIFO in its place is refused below instead of waiting for a writer.
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
     with os.fdopen(fd, "rb") as handle:
         found = os.fstat(handle.fileno())
         if not stat.S_ISREG(found.st_mode):
@@ -1248,6 +1249,115 @@ def install_backup_runner(settings, candidate, release):
             os.close(directory)
     p.write_record(receipt, {**record, "status": "installed", "installed_at": p.now()})
     print(f"backup runner: installed {expected[:12]}, image {image[:19]}", file=sys.stderr, flush=True)
+
+
+# Incident 11-11: the hourly backup checker (deploy/deedkit-backup-health.service, ANYM-807) was a hand copy that kept
+# naming release 634227af, so its Tiden issues landed on an old release. A healthy `apply` now installs the release's
+# checker and names the release in its config's `release_sha`. A host without both files keeps none: the first install
+# is production.md's (the config names the ingest DSN file).
+BACKUP_HEALTH_PROGRAM = Path("/opt/deedkit/backup-health/backup_health.py")
+BACKUP_HEALTH_CONFIG = Path("/etc/deedkit-backup-health/config.json")
+BACKUP_HEALTH_SOURCE = "services/messaging/messaging_service/backup_health.py"
+
+
+def install_backup_health(sha, release):
+    """After a healthy apply: the release's backup checker and `release_sha`, recorded in `<sha>/backup-health.json`.
+    Never raises, also not from its receipt or its stderr line (a closed pipe after `current.json` names the release
+    would read as plan A in an unknown state): the checker reads backups and never gates one, so a refusal is the
+    receipt and a line, and the release stands with the previous checker. Bounded: non-blocking reads of regular files
+    only and one probe of BACKUP_HEALTH_PROBE_S. Returns the receipt, or None on a host without the checker."""
+    try:
+        try:
+            result = backup_health_files(sha, release / "source")
+        except Exception as exc:
+            result = {"sha": sha, "status": "refused", "at": p.now(),
+                      "reason": str(exc) if isinstance(exc, (p.Refused, MigrationRefused)) else type(exc).__name__}
+        if result is None:
+            return None
+        with suppress(Exception):
+            p.write_record(release / "backup-health.json", result)
+        with suppress(Exception):
+            print(f"backup health: {result['status']}" + (f" ({result['reason']})" if "reason" in result else ""),
+                  file=sys.stderr, flush=True)
+        return result
+    except Exception:
+        return None
+
+
+# The staged checker's read-only `--print`: one `systemctl show` of 10 s and file reads (BACKUP.md, Backup alerts).
+BACKUP_HEALTH_PROBE_S = 30
+
+
+def backup_health_files(sha, source):
+    """Replace the checker and its config by one rename each after a `.before-<sha>` copy (owner and mode kept), once
+    the staged pair's read-only `--print` exits 0; any failure before the first rename leaves both files as they were,
+    and a failed second rename puts the first file back. The program goes first."""
+    paths = (p.BACKUP_HEALTH_PROGRAM, p.BACKUP_HEALTH_CONFIG)
+    if not all(os.path.lexists(path) for path in paths):
+        return None
+    program = p.run(["git", "-C", str(source), "cat-file", "blob", f"{sha}:{p.BACKUP_HEALTH_SOURCE}"], binary=True,
+                    timeout=60)
+    directories, staged, temporary, copies, replaced = {}, [], {}, [], []
+    try:
+        for path in paths:
+            directories[path] = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        found = {path: leaf_read(directories[path], path.name) for path in paths}
+        config = json.loads(found[paths[1]][0])
+        if not isinstance(config, dict) or not isinstance(config.get("release_sha"), str):
+            raise p.Refused(f"{paths[1]} names no release_sha; install the backup checker by hand (production.md)")
+        wanted = {paths[0]: program, paths[1]: (json.dumps({**config, "release_sha": sha}, indent=2) + "\n").encode()}
+        files = [{"path": str(path), "before": p.git_blob(found[path][0]), "after": p.git_blob(wanted[path]),
+                  "undo": f"{path}.before-{sha}"} for path in paths if found[path][0] != wanted[path]]
+        if not files:
+            return {"sha": sha, "status": "current", "at": p.now()}
+        for path in paths:
+            if found[path][0] != wanted[path]:
+                temporary[path], wrote = stage_leaf(directories[path], path, *found[path], wanted[path], sha,
+                                                    "the backup checker")
+                staged.append(path)
+                copies += [path] if wrote else []
+        live = {path: path.parent / temporary.get(path, path.name) for path in paths}
+        try:
+            p.run([p.RUNNER_PYTHON, "-I", str(live[paths[0]]), "--config", str(live[paths[1]]), "--print"],
+                  timeout=p.BACKUP_HEALTH_PROBE_S)
+        except p.Refused as exc:
+            raise p.Refused(f"the release's backup checker refused its configuration: {exc}") from exc
+        copies.clear()  # from here on the copies are the undo
+        try:
+            for path in [*staged]:
+                os.replace(temporary[path], path.name, src_dir_fd=directories[path], dst_dir_fd=directories[path])
+                os.fsync(directories[path])
+                staged.remove(path)
+                replaced.append(path)
+        except OSError as exc:
+            raise p.Refused(f"the backup checker stopped after {len(replaced)} of {len(files)} renames "
+                            f"({type(exc).__name__}); {restore_leaves(directories, found, replaced, sha)}") from exc
+    finally:
+        # A refusal before the first rename: the files this run wrote go, so the host is as it was.
+        for path in staged:
+            with suppress(OSError):
+                os.unlink(temporary[path], dir_fd=directories[path])
+        for path in copies:
+            with suppress(OSError):
+                os.unlink(f"{path.name}.before-{sha}", dir_fd=directories[path])
+        for directory in directories.values():
+            os.close(directory)
+    return {"sha": sha, "status": "installed", "at": p.now(), "files": files}
+
+
+def restore_leaves(directories, found, replaced, sha):
+    """Put the replaced files' previous bytes back (owner and mode kept), each by one rename; says what it did."""
+    try:
+        for path in replaced:
+            name = f".{path.name}.{sha}.restore.tmp"
+            with suppress(FileNotFoundError):
+                os.unlink(name, dir_fd=directories[path])
+            p.leaf_write(directories[path], name, *found[path])
+            os.replace(name, path.name, src_dir_fd=directories[path], dst_dir_fd=directories[path])
+            os.fsync(directories[path])
+    except OSError as exc:
+        return f"putting the previous files back failed too ({type(exc).__name__}): restore them from `.before-{sha}`"
+    return "the previous files are back"
 
 
 def migration_gate(settings, http, plan, mirror, base, serving, *, admission=False):
