@@ -71,3 +71,13 @@ DO $$ BEGIN
   GRANT INSERT, UPDATE, DELETE ON fcs.event_states TO fcs_worker;
  END IF;
 END $$;
+-- Migration 9 (scheduled refresh, ANYM-576): only the owner CLI sets the configuration; the worker writes its
+-- schedule and health columns and appends starting reminders to the journal; the gateway serves them and refuses
+-- the journal page while a bound calendar's provider authorization keeps failing. Skipped before migration 9.
+DO $$ BEGIN
+ IF to_regclass('fcs.refresh_calendars') IS NOT NULL THEN
+  GRANT SELECT ON fcs.refresh_calendars, fcs.starting_reminders TO fcs_gateway, fcs_worker;
+  GRANT UPDATE (next_at, last_ok_at, failures, auth_failures, error, health, health_since) ON fcs.refresh_calendars TO fcs_worker;
+  GRANT INSERT ON fcs.starting_reminders TO fcs_worker;
+ END IF;
+END $$;

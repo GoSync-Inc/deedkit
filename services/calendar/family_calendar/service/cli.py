@@ -123,6 +123,14 @@ def parser():
     settings.add_argument("--group", default="family")
     settings.add_argument("--timezone")
     settings.add_argument("--default-calendar")
+    # Scheduled refresh and starting reminders (ANYM-576): only the operator names the calendars; --off is the undo.
+    scheduled = sub.add_parser("refresh-calendar")
+    scheduled.add_argument("--calendar", required=True)
+    scheduled.add_argument("--window-days", type=int, help="Read now to +N days, 1-60 (default 14)")
+    scheduled.add_argument("--cadence-minutes", type=int, help="Refresh every N minutes, 1-1440 (default 5)")
+    scheduled.add_argument("--lead", type=int, action="append", help="Minutes before a start, 1-1440; up to 4 (default 15)")
+    scheduled.add_argument("--off", action="store_true")
+    sub.add_parser("refresh-list")
     agent = sub.add_parser("agent-key")
     agent.add_argument("--id", required=True)
     agent.add_argument("--group", default="family")
@@ -412,6 +420,16 @@ def dispatch(args, home, root, config, store):
         return store.member_person(args.group, args.member, None if args.unlink else args.person)
     if args.action == "family-settings":
         return store.family_settings(args.group, args.timezone, args.default_calendar)
+    if args.action == "refresh-calendar":
+        from . import refresh
+
+        if args.off:
+            return refresh.unconfigure(store, args.calendar)
+        return refresh.configure(store, args.calendar, args.window_days, args.cadence_minutes, args.lead)
+    if args.action == "refresh-list":
+        from . import refresh
+
+        return refresh.listing(store)
     if args.action in ("allow-write", "disable-write"):
         store.write_opt_in(args.calendar, args.action == "allow-write")
         return {"write_enabled": args.action == "allow-write"}

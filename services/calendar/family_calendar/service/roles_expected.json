@@ -72,5 +72,17 @@
       "UPDATE fcs.event_states",
       "DELETE fcs.event_states"
     ]
+  },
+  "9": {
+    "fcs_gateway": ["SELECT fcs.refresh_calendars", "SELECT fcs.starting_reminders"],
+    "fcs_worker": [
+      "SELECT fcs.refresh_calendars",
+      "SELECT fcs.starting_reminders",
+      "UPDATE fcs.refresh_calendars(next_at)", "UPDATE fcs.refresh_calendars(last_ok_at)",
+      "UPDATE fcs.refresh_calendars(failures)", "UPDATE fcs.refresh_calendars(auth_failures)",
+      "UPDATE fcs.refresh_calendars(error)", "UPDATE fcs.refresh_calendars(health)",
+      "UPDATE fcs.refresh_calendars(health_since)",
+      "INSERT fcs.starting_reminders"
+    ]
   }
 }

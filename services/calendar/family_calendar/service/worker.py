@@ -1,9 +1,10 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
+import time
 import psycopg
 from psycopg.types.json import Jsonb
 from family_calendar.errors import CalendarError
-from . import journal
+from . import journal, refresh
 from .core import FamilyService
 from .providers import created_event_ref
 from .store import instant
@@ -20,6 +21,8 @@ class Worker:
     def __init__(self, store, providers):
         self.store, self.providers = store, providers
         self.service = FamilyService(store)
+        # The scheduled refresh's spacing across calendars (ANYM-576), on this process's monotonic clock.
+        self.clock, self.refresh_spacing, self.refreshed_at = time.monotonic, refresh.SPACING_S, None
 
     async def run_operation(self, operation_id, reconcile=False):
         # Transaction-scoped lock remains held across the network call. A second process cannot send this operation.
@@ -523,6 +526,19 @@ class Worker:
         )
         if op:
             await self.run_operation(op["id"])
+        # ANYM-576: after the operation, one bounded scheduled refresh and the due starting reminders; neither ever
+        # stops syncs or operations.
+        try:
+            await self.refresh_one()
+        except Exception:
+            pass
+        try:
+            refresh.remind(self.store)
+        except Exception:
+            pass
+
+    async def refresh_one(self, now=None):
+        return await refresh.refresh_one(self, now)
 
     async def run(self):
         try:
