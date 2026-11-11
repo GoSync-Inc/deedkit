@@ -647,19 +647,29 @@ class Hanging(Telegram):
         await asyncio.Event().wait()
 
 
+class Loaded(Telegram):
+    """A lookup on a loaded runner: its work before the request takes half a second, within the 30 s timeout."""
+    async def __call__(self, request):
+        await asyncio.sleep(0.5)
+        return await super().__call__(request)
+
+
 # spec: ANYM-643
 def test_a_hanging_lookup_is_cut_at_the_operation_timeout_and_frees_the_lane(telegram, monkeypatch):
     from messaging_service import commands
     from messaging_service.outgoing import OutgoingWorker
     s, archive, state, key = telegram
     wait_for = asyncio.wait_for
-    monkeypatch.setattr(commands.asyncio, 'wait_for', lambda aw, timeout: wait_for(aw, min(timeout, 0.3)))
     governor = RequestGovernor(state, interval=0)
     s.username_preview_lookup(key, **draft(username='synthetic_hang'))
-    collector(state, Hanging(), governor)
+    # Only the hanging lookup runs under the shortened timeout: the next one keeps the real 30 s, so its work
+    # before the request is not cut on a loaded runner (merge-group run 43014669848, `0 == 1` calls).
+    with monkeypatch.context() as short:
+        short.setattr(commands.asyncio, 'wait_for', lambda aw, timeout: wait_for(aw, min(timeout, 0.3)))
+        collector(state, Hanging(), governor)
     assert rows(s, 'SELECT status FROM messenger_commands')[0]['status'] == 'failed'
     assert not governor.lock.locked()
-    client = Telegram()
+    client = Loaded()
     s.username_preview_lookup(key, **draft())
     collector(state, client, governor)
     assert len(client.calls) == 1
