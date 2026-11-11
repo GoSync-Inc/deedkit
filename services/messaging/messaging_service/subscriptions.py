@@ -536,7 +536,7 @@ def _check_capacity(c, p):
 
 def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=None, kinds=None,
         direction='incoming', origins=None, label='', expires_at=None, wake_rules=None, reply_to_send=None,
-        delivery=None):
+        delivery=None, module_sources=None):
     from .store import APIError, date_bound
     if 'read' not in p['permissions']:
         raise APIError('forbidden', 403)
@@ -596,6 +596,12 @@ def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=
             if len(accounts) != 1:
                 raise APIError('ambiguous_reference', 409)
             sender_accounts[sender] = next(iter(accounts))
+    # ANYM-564: [{scope: 'calls:own', types}] adds a call source scoped by the principal's calls link; refused with
+    # module_not_linked (and a next step for the owner) before anything is written when there is none.
+    calls = None
+    if module_sources is not None:
+        from .module_links import call_sources
+        calls = call_sources(c, p, module_sources)
     _check_capacity(c, p)
     # The counter is serialized by event publishers. An MVCC read sees only a
     # committed frontier and cannot skip an uncommitted event transaction.
@@ -637,6 +643,9 @@ def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=
         selected = None if senders is None else [sid for sid in senders if sender_accounts[sid] == source['account']]
         c.execute('INSERT INTO subscription_sources(subscription,account,chat,sender_ids) VALUES(%s,%s,%s,%s)',
             (row['id'], source['account'], source['id'], selected))
+    if calls:
+        from .module_events import attach_sources
+        attach_sources(c, row['id'], calls)
     targets(p, [str(row['id'])])
     result = None
     if delivery is not None:

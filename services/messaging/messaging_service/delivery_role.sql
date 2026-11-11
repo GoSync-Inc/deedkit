@@ -47,3 +47,5 @@ GRANT SELECT(subscription,event,account,chat,hidden,own_send_reply) ON subscript
 -- an endpoint that keeps failing moves from enabled to auto_paused; nothing else of the endpoint row is writable.
 GRANT SELECT,INSERT,DELETE ON delivery_attempts TO messaging_event_delivery;
 GRANT UPDATE(state,version,updated_at) ON delivery_endpoints TO messaging_event_delivery;
+-- Schema 90 (ANYM-564): under the fence, a module hint announces only call references whose link is live.
+GRANT SELECT ON module_links,subscription_module_links TO messaging_event_delivery;

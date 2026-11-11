@@ -101,7 +101,21 @@ def handle(state: dict, service: str, args: list[str], stdin: str):
                               "effective_permissions": sorted(set(principals[name]["permissions"])
                                                               & set(LEGACY if v["permissions"] is None
                                                                     else v["permissions"]))}
-                             for k, v in keys.items() if v["principal"] == name]}
+                             for k, v in keys.items() if v["principal"] == name],
+                    "module_links": state["messaging"].get("links", {}).get(name, [])}
+        if command == "link-module":
+            # ANYM-564: the owner's link; an unchanged active link is returned as is.
+            name, module, target = o["principal"][0], o["module"][0], o["module-principal"][0]
+            if name not in principals:
+                raise Refusal("unknown_principal")
+            links = state["messaging"].setdefault("links", {}).setdefault(name, [])
+            row = next((item for item in links if item["module"] == module), None)
+            if row is None:
+                row = {"module": module, "generation": 0}
+                links.append(row)
+            if row.get("state") != "active" or row.get("module_principal") != target:
+                row.update(module_principal=target, state="active", generation=row["generation"] + 1)
+            return {"principal": name, **row}
         if command == "issue-key":
             name, operation, token = o["principal"][0], o["operation-id"][0], stdin.strip()
             done = next((k for k, v in keys.items() if v["operation_id"] == operation), None)

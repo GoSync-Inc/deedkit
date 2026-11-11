@@ -114,6 +114,28 @@ def test_issue_like_clones_the_source_in_every_store(site, capsys):
     assert gateway["key_sha256"] == admin.hashlib.sha256(token.read_text().strip().encode()).hexdigest()
 
 
+# spec: ANYM-564
+def test_issue_like_copies_module_links_only_with_copy_links(site, capsys):
+    def seed(state):
+        state["messaging"]["links"] = {"src": [{"module": "calls", "module_principal": "src-calls", "generation": 3,
+                                                "state": "active"}]}
+    site.operator.change(seed)
+    code, result, err = issue(site, capsys)
+    assert code == 0, err
+    state = site.operator.state
+    assert "clone" not in state["messaging"]["links"]
+    assert not any(entry["argv"][0] == "link-module" for entry in state["log"] if entry["service"] == "messaging")
+    code, result, err = issue(site, capsys, "--copy-links", new="clone2")
+    assert code == 0, err
+    state = site.operator.state
+    assert [(row["module"], row["module_principal"], row["state"]) for row in state["messaging"]["links"]["clone2"]] == [
+        ("calls", "src-calls", "active")]
+    assert state["messaging"]["links"]["src"][0]["generation"] == 3  # the source's link is untouched
+    code, plan, err = issue(site, capsys, "--copy-links", "--dry-run", new="clone3")
+    assert code == 0, err
+    assert plan["steps"][-1] == "module link calls" and "clone3" not in site.operator.state["messaging"]["links"]
+
+
 # spec: ANYM-496
 def test_issue_like_shows_the_clone_the_sources_tools_and_actions(site, capsys):
     assert issue(site, capsys)[0] == 0

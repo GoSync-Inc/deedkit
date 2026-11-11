@@ -866,8 +866,19 @@ def messaging_scope(run, token: str, what: str) -> dict:
         raise AdminError(f"the source's {what} principal is unknown, disabled or has no account; nothing changed")
     # The clone's key repeats this key's stored ceiling as is (issue-key --key-permissions-of), a NULL legacy one
     # included; "key_permissions" is only shown in the plan.
+    # "principal" (not part of an operation's identity) names whose module links --copy-links reads (ANYM-564).
     return {"accounts": info["accounts"], "chat_ids": info["chat_ids"], "permissions": info["permissions"],
-            "key_of": str(record.get("key_id")), "key_permissions": key.get("permissions")}
+            "key_of": str(record.get("key_id")), "key_permissions": key.get("permissions"),
+            "principal": str(record.get("principal"))}
+
+
+def source_links(run, scope: dict) -> list[dict]:
+    """The source principal's active module links (ANYM-564), copied only with --copy-links."""
+    if "messaging" not in scope:
+        raise AdminError("--copy-links: the source has no messaging key; nothing changed")
+    info = ask(run, "messaging", ["principal-info", "--principal", scope["messaging"]["principal"]])
+    return [{"module": item["module"], "module_principal": item["module_principal"]}
+            for item in (info.get("module_links") or []) if item.get("state") == "active"]
 
 
 def source_scope(config: dict, run, policy: Document, registry: Document | None, source: str) -> dict:
@@ -1008,6 +1019,10 @@ def identity(scope: dict) -> dict:
     """The source's access a clone copies, without the source's own file locations (never copied to the clone), so
     moving a source key file does not change an operation's identity."""
     scope = masked(scope)
+    scope.pop("links", None)
+    for part in [scope] + ([scope["archive"]] if "archive" in scope else []):
+        if "messaging" in part:
+            part["messaging"] = {k: v for k, v in part["messaging"].items() if k != "principal"}
     scope["gateway"] = {**scope["gateway"], "credentials": {
         backend: {k: v for k, v in credential.items() if k != "key_file"}
         for backend, credential in scope["gateway"].get("credentials", {}).items()}}
@@ -1072,7 +1087,8 @@ def issue(config: dict, run, docker, host_factory, args) -> dict:
         raise AdminError(f"--days is {DAYS[0]}-{DAYS[1]} for every store; nothing changed")
     if args.label is not None and not (1 <= len(args.label) <= 80 and args.label.isprintable()):
         raise AdminError("a label is 1-80 printable characters; nothing changed")
-    command = {"verb": "issue", "id": new, "like": source, "days": days, "label": args.label}
+    command = {"verb": "issue", "id": new, "like": source, "days": days, "label": args.label,
+               **({"copy_links": True} if getattr(args, "copy_links", False) else {})}
     operation = args.operation or f"issue-{new}-{datetime.now(timezone.utc):%Y%m%dt%H%M%S}-{secrets.token_hex(3)}"
     journal = Journal(config, operation)
     if args.operation:
@@ -1100,6 +1116,8 @@ def issue(config: dict, run, docker, host_factory, args) -> dict:
             if config.get(service):
                 checked(run, service, read)
         scope = source_scope(config, run, policy, registry, source)
+        if command.get("copy_links"):
+            scope["links"] = source_links(run, scope)
         # A rerun keeps the operation's identity: the file layout it journaled, and the source's access unchanged.
         shape = entry_digest(identity(scope))
         files = journal.data["layout"] if args.operation else layout(config, new, scope)
@@ -1118,7 +1136,8 @@ def issue(config: dict, run, docker, host_factory, args) -> dict:
             return {"dry_run": True, "principal": new, "like": source, "days": days,
                     "steps": ["key files"] + [step for step, *_ in steps]
                     + (["calls archive configuration"] if "archive" in scope else [])
-                    + (["calls registry"] if calls else []) + ["gateway policy"],
+                    + (["calls registry"] if calls else []) + ["gateway policy"]
+                    + [f"module link {link['module']}" for link in scope.get("links", [])],
                     "files": sorted(file["host"] for file in files.values()),
                     "gateway_policy": {"revision": policy.value["revision"] + 1, "add": masked(gateway)},
                     **({"calls_registry": {"revision": registry.value["revision"] + 1, "add": masked(calls)}}
@@ -1192,6 +1211,15 @@ def run_issue(config, run, docker, host, journal: Journal, scope, files, tokens,
         elif entry_digest(current) != entry_digest(entry):
             raise AdminError(f"the {name} entry {new!r} differs from what this operation wrote")
         journal.step(name, "done", entry=entry_digest(entry))
+    for link in scope.get("links", []):
+        # ANYM-564: only with --copy-links; link-module is idempotent, so a rerun repeats it safely.
+        name = f"module link {link['module']}"
+        journal.step(name, "started")
+        reply = ask(run, "messaging", ["link-module", "--principal", new, "--module", link["module"],
+                                       "--module-principal", link["module_principal"]])
+        if not isinstance(reply, dict) or reply.get("state") != "active":
+            raise AdminError(f"messaging: link-module returned no active link for {link['module']}")
+        journal.step(name, "done", generation=reply.get("generation"))
     if data["command"]["label"]:
         set_label(config, new, data["command"]["label"])
     token, url = files["gateway"]["host"], host.http["http_release"]["gateway_public_url"].rstrip("/") + "/mcp"
@@ -2126,6 +2154,23 @@ def session_claim(run, args, config: dict | None = None) -> dict:
     return {"account": account, "released": True, "previous": previous}
 
 
+def add_module_links(nouns) -> None:
+    links = nouns.add_parser("module-links", help="a principal's link to a module principal: calls:own (ANYM-564)")
+    link_verbs = links.add_subparsers(dest="verb", required=True)
+    for verb in ("link", "unlink"):
+        linking = link_verbs.add_parser(verb, help=f"{verb} one principal's calls events (the owner's step)")
+        linking.add_argument("--principal", required=True)
+        linking.add_argument("--module", required=True, choices=["calls"])
+        if verb == "link":
+            linking.add_argument("--module-principal", required=True, help="the calls principal whose calls wake it")
+
+
+def module_links(run, args) -> dict:
+    """The owner's link or revocation (ANYM-564): messaging's link-module/unlink-module; revoking is immediate."""
+    argv = [args.verb + "-module", "--principal", args.principal, "--module", args.module]
+    return ask(run, "messaging", argv + (["--module-principal", args.module_principal] if args.verb == "link" else []))
+
+
 def main(argv: list[str] | None = None, run=None, docker=None, host=None) -> int:
     parser = argparse.ArgumentParser(prog="deedkit admin", description="DeedKit admin CLI (ANYM-491)")
     parser.add_argument("--config", type=Path, default=CONFIG, help=f"private admin configuration (default {CONFIG})")
@@ -2149,6 +2194,9 @@ def main(argv: list[str] | None = None, run=None, docker=None, host=None) -> int
     issuing.add_argument("--label")
     issuing.add_argument("--dry-run", action="store_true", help="print the plan, write nothing")
     issuing.add_argument("--operation", help="rerun a stopped operation: finished steps replay, the rest continue")
+    issuing.add_argument("--copy-links", action="store_true",
+                         help="also link the clone to the source's module principals (ANYM-564); default: none")
+    add_module_links(nouns)
     extending = verbs.add_parser("extend", help="extend a principal's key in every store (ANYM-497)")
     extending.add_argument("principal")
     extending.add_argument("--days", type=int, required=True, help=f"{EXTEND_DAYS[0]}-{EXTEND_DAYS[1]}, for every store")
@@ -2199,6 +2247,9 @@ def main(argv: list[str] | None = None, run=None, docker=None, host=None) -> int
             return 0
         if args.noun == "wake-targets":
             print(json.dumps(wake_targets(run or runner(config), args, config), ensure_ascii=False, indent=2))
+            return 0
+        if args.noun == "module-links":
+            print(json.dumps(module_links(run or runner(config), args), ensure_ascii=False, indent=2))
             return 0
         if args.noun == "session-claim":
             print(json.dumps(session_claim(run or runner(config), args, config), ensure_ascii=False, indent=2))

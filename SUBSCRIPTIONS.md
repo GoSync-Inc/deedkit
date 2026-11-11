@@ -1379,6 +1379,7 @@ attribute names, not the CloudEvents HTTP binding:
 | `call.not_answered` | `call_id`, `end_reason` (`no_answer`, `busy`, `canceled`) |
 | `call.interrupted` | `call_id`, `end_reason` (`service_restart`) |
 | `call.owner_request` | `call_id`, `decision_id`, `state` (`pending`); `urgency=now` and `expires_at` = the decision's stored deadline |
+| `call.access.changed` | `principal_ref`, `reason` (`permission_removed`, `principal_removed`, `owner_changed`); `urgency=now`, no expiry; `scope_ref` the calls principal. Publishing it marks every active module link naming that principal stale (ANYM-564, schema 90; ACCESS.md "Module links") |
 
 | `recording.text.archived` | `recording_ref`, `account_ref`, `revision` (producer: recordings, ANYM-726; `urgency=batch`; `scope_ref` `recordings:<account>.<namespace16>`) |
 | `recording.access.changed` | `account_ref`, `principal_ref`, `reason` (`permission_removed`, `account_removed`, `namespace_replaced`); `urgency=now`, `scope_ref` the old scope (producer: recordings, ANYM-726) |
@@ -1463,8 +1464,12 @@ table privilege, so it can write no message event, change no subscription source
 no message content.
 
 The module stream. A subscription gets module sources `(source, scope_ref, types)` and a module
-stream (`subscription_module_streams`) through `module_events.attach_sources`; the link check
-that lets a key name a scope is ANYM-564, so no public API creates module sources yet. Each
+stream (`subscription_module_streams`) through `module_events.attach_sources`. A call source
+comes only from `create_subscription(module_sources=[{scope: "calls:own", types}])` (store API; the MCP
+tool and gateway catalog follow in ANYM-566) and only through the principal's active calls link (ANYM-564,
+ACCESS.md "Module links"); its scope is the link's calls principal. A call source whose link is revoked,
+stale or regranted is `access_changed`: it matches, pages and announces nothing more (hints are cancelled
+with `module_not_linked`). Other modules have no API path yet (ANYM-577). Each
 matcher pass, after the message pass and in a savepoint of its own (a failure is logged as
 `subscription_module_match_failed` and never undoes or stops the message matches), matches
 module events by `(source, scope_ref)` and type into `subscription_module_matches` with its own
