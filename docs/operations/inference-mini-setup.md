@@ -4,7 +4,7 @@
 Tailscale Serve, reachable from production only. This is the install runbook, in the form of
 `remote-test-mini-setup.md`: every step has a check and an undo, and a ledger records each resource *before* the
 command that creates it, so the undo removes exactly what this setup made. An agent runs it over ssh with `sudo -n`
-(owner D44) after the card's Astra r1 (keys and access), **from a checkout of a green `main` SHA that contains
+(owner D44) (no review: owner 11-11), **from a checkout of a green `main` SHA that contains
 ANYM-682**, one block at a time. Stop at the first failing block, run the undo of that block, report.
 
 Hard rules: Between comes first (owner D42). Never touch Between, colima, or a running remote test; run the busy
@@ -224,7 +224,7 @@ and recorded on the card: a `pf` rule that drops every outbound packet of the se
 (never by editing the system rules): `block drop out quick all user _deedkitinf` after `pass out quick on lo0 proto tcp
 from any port 8090 user _deedkitinf keep state`, in `/etc/pf.anchors/deedkit-inference`, referenced from a new `anchor`
 line in `/etc/pf.conf` (copy of the original kept in the ledger as `pf-conf-backup`, undo: restore it and `pfctl -f
-/etc/pf.conf`). A host firewall change gets its own Astra look before it is applied; do not start the service without
+/etc/pf.conf`). A host firewall change is applied with its undo noted; do not start the service without
 one of the two (the file rules of the profile stay either way). `/usr/bin/python3` is the system stub: if it does not run here, use the python of section 6 for the proof.
 
 ## 6. First release, config, keys (the service is not started yet)
@@ -590,7 +590,7 @@ ssh "$PROD" "python3 $PRIVATE/../scripts/inference_probe.py --url https://<mini>
 
 Go on only if step 3 prints `reachable=yes` and a `key_days_left=` value (the deployed checkout's `scripts/` path in
 step 3 is the one production.md names). Then, on production (this writes a production file: AGENTS.md section 2 gates
-apply, and the key is covered by this card's Astra r1):
+apply, and the key follows the access gates):
 
 ```bash
 ssh "$PROD" "set -e; cd $PRIVATE/inference; chown 10001:10001 . .inference.key.new; chmod 700 .; chmod 600 .inference.key.new

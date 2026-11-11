@@ -1,8 +1,8 @@
 # Recordings archive: install, activation and restore drill (ANYM-731)
 
-Status: a plan, **not applied**. It is the production operation plan of ANYM-731 (one review round, harness reviews.md
-Rounds 7, owner 11-04). An agent executes it only on the orchestrator's GO, under AGENTS.md section 2 and harness process.md section 2:
-Astra-reviewed plan, a read-back and an undo for every step, no step during an active call. It contains no send, call, ACK,
+Status: a plan, **not applied**. It is the production operation plan of ANYM-731 (no review: owner 11-11). An agent
+executes it only on the orchestrator's GO, under AGENTS.md section 2 and harness process.md section 2:
+a read-back and an undo for every step, no step during an active call. It contains no send, call, ACK,
 pairing, provider-session start or stop, or allowlist change, and it never touches the on-demand grants (ANYM-713). Receipts
 hold digests, modes, ids and counts, never a key, a transcript or any text of the archive.
 
@@ -69,7 +69,7 @@ Polling may start once milestone I is verified (docs/DATA-POLICY.md), not before
   lists the two configs (messaging first), and `receiver_schema_max` is current. The follow units are not installed there
   (the receiver's wheel moves by hand). `/usr/local/libexec/deedkit/attest-verify` exists and runs, Docker works, and the Docker
   data root has the verifier's `reserve_bytes` plus 4 GiB free (the helper image pull of I1.6).
-- P8. Decisions to confirm in the receipt before starting (section "Decisions to review"): receiver limits, the R2 prefix, the age
+- P8. Decisions to confirm in the receipt before starting (section "Decisions to confirm"): receiver limits, the R2 prefix, the age
   recovery key custody and the archive `max_bytes` start value.
 
 ## Step R. The host backup runner and the pins (one host step, one lock window; milestone I, part 1)
@@ -182,7 +182,7 @@ Nothing here touches the messaging or calendar instance, except the shared `inst
    (upload-owned `0700`, ancestors root-owned), `/etc/deedkit-recordings-backup-r2/` with the upload-owned `receive.json` and its
    credentials, the root `operator.json` and its credentials (both `"profile": "recordings"`, messaging's bucket and endpoint, the
    prefix `deedkit-recordings/egor-<date>`; the credential files copy messaging's token), `control/`, `proofs/`, `restore/`, and
-   `/var/lib/deedkit-recordings-backup-r2/verification` (root `0700`). Receiver limits: see "Decisions to review". The first
+   `/var/lib/deedkit-recordings-backup-r2/verification` (root `0700`). Receiver limits: see "Decisions to confirm". The first
    receive initializes `.receiver.lock`, or provision it as the upload user `0600`.
 4. **Recovery key.** Generate the instance's own age identity into `/etc/deedkit-recordings-backup-r2/restore/identity.agekey`
    (root `0600`, never printed); the public line (the recipient) is what step I2 installs on `prod`. The key is not copied to
@@ -386,7 +386,7 @@ the evidence, stop polling if the cause is the archive (Undo A), report.
 
 Undo V: nothing to remove on `prod`. If the first point must be withdrawn: `systemctl disable --now` the recordings verifier timer
 and the two recordings producer timers, preserve `protected.json`, the proof, the journal and `continuity.json`, and move the
-recordings prefix's single object aside only under a reviewed deletion operation (data deletion keeps its own gates); the archive
+recordings prefix's single object aside only under a deletion operation with a fresh verified backup and undo (data deletion keeps its own gates); the archive
 itself is untouched.
 
 ## Milestone D. The restore drill (closes the card)
@@ -478,7 +478,7 @@ nothing is left half-installed (each step writes new files beside the live ones 
 - Principal: the executing agent, on the orchestrator's GO; owner decision D25 (AGENTS.md section 2). Budget: R2 storage for one
   point plus one candidate (a few GiB) is inside the monthly cap.
 
-## Decisions to review
+## Decisions to confirm
 
 1. Receiver limits for the instance: `max_bytes` 8 GiB per object, `quota_bytes` 16 GiB, `max_objects` 2, `part_bytes` 64 MiB,
    `timeout_seconds` 3600 (the archive is about 1.3 GiB at the 4 GiB page budget; the example's 40/80 GiB are messaging's).
