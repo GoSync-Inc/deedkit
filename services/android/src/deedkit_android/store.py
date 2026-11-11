@@ -132,6 +132,18 @@ class Store:
                                 (owner, request_id, hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()))
         return True
 
+    def progress(self, owner, request_id, progress, data):
+        """Step progress and the keys read so far of a running operation. A finished or unknown row is left alone,
+        and finish() never carries either into the final receipt."""
+        row = self.db.execute("SELECT result FROM operations WHERE owner=? AND id=? AND state='running'",
+                              (owner, request_id)).fetchone()
+        if row is None:
+            return
+        result = {**json.loads(row["result"] or "{}"), "progress": progress, "data": data}
+        self.db.execute("UPDATE operations SET result=? WHERE owner=? AND id=? AND state='running'",
+                        (json.dumps(result), owner, request_id))
+        self.db.commit()
+
     def finish(self, owner, request_id, state, result):
         previous = self.operation(owner, request_id)
         metadata = {'library': previous['library']} if 'library' in previous else {}

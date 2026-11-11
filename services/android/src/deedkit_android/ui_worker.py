@@ -192,7 +192,7 @@ def execute(device, command, element_timeout_ms=5000, optional_timeout_ms=1000, 
         if name in {'assertVisible', 'assertNotVisible'}:
             return {'matched': True}
         if name == 'copyTextFrom':
-            return {'text': target.get_text(timeout=0)}
+            return {'text': target.get_text(timeout=0), **({'key': options['key']} if 'key' in options else {})}
         if name == 'setText':
             # A reference types the secret only into a focused editable field of its own app (typed_text).
             field = field_attributes(target.info) if REFERENCE.fullmatch(value['value']) else None

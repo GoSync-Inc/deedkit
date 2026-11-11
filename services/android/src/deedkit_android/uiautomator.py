@@ -26,7 +26,7 @@ OPTIONS = SELECTORS | {'point', 'optional', 'timeout', 'label', 'retryTapIfNoCha
 UI_FIELDS = {
     **{name: OPTIONS for name in ('tapOn', 'doubleTapOn', 'longPressOn', 'assertVisible',
                                  'assertNotVisible', 'copyTextFrom', 'exists')},
-    'setText': OPTIONS | {'value'}, 'inputText': {'text', 'label'},
+    'copyTextFrom': OPTIONS | {'key'}, 'setText': OPTIONS | {'value'}, 'inputText': {'text', 'label'},
     'eraseText': {'charactersToErase', 'label'}, 'pressKey': {'key', 'label'},
     'launchApp': {'appId', 'stopApp', 'clearState', 'clearKeychain', 'permissions', 'label'},
     'stopApp': {'appId', 'label'}, 'killApp': {'appId', 'label'}, 'clearState': {'appId', 'label'},
@@ -40,7 +40,8 @@ UI_FIELDS = {
     'readScreenText': {'region', 'within', 'min_confidence', 'limit', 'key', 'structure', 'label'},
     'sleep': set(),
 }
-UNSUPPORTED_HINT = 'Use android_execute for this operation. The reference lists supported UI commands.'
+DATA_KEY = re.compile(r'[A-Za-z][A-Za-z0-9_]{0,63}')
+UNSUPPORTED_HINT ='Use android_execute for this operation. The reference lists supported UI commands.'
 # Definite read/lookup failures: nothing acted, so the persistent worker stays.
 DEFINITE = {'element_not_found', 'screen_not_found', 'ambiguous_selector', 'invalid_element_bounds',
             'ocr_unavailable', 'ocr_failed', 'screenshot_unavailable', 'region_outside_screen',
@@ -162,6 +163,9 @@ def validate_commands(commands):
                 raise Refused('invalid_wait_condition', 422)
         if name == 'readScreenText':
             validate_screen_text(value)
+        if name == 'copyTextFrom' and 'key' in options and not (
+                isinstance(options['key'], str) and DATA_KEY.fullmatch(options['key'])):
+            raise Refused('invalid_data_key', 422)
         if name == 'sleep' and (type(value) is not int or not 0 <= value <= 10000):
             raise Refused('invalid_sleep_ms', 422)
         if name in {'repeat', 'retry', 'runFlow'}:
@@ -172,6 +176,41 @@ def validate_commands(commands):
             package = value.get('appId') if isinstance(value, dict) else value
             if not isinstance(package, str) or not re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_.]+', package):
                 raise Refused('invalid_app_id', 422)
+
+
+def check_data_keys(commands):
+    """One flow, one writer per data key (ANYM-970). copyTextFrom and readScreenText may name their key; the same key
+    twice, or one that a keyless readScreenText (screen_text) or a readList (its list name) already writes, is refused.
+    Reads that never named a key keep the old behavior: the later one replaces the earlier."""
+    named, implicit = [], []
+
+    def walk(items):
+        for command in items:
+            if not isinstance(command, dict):
+                continue
+            name, options = next(iter(command.items()))
+            if name in {'runFlow', 'repeat', 'retry'}:
+                walk(options['commands'])
+            elif name in {'copyTextFrom', 'readScreenText'} and isinstance(options, dict) and 'key' in options:
+                named.append(options['key'])
+            elif name == 'readScreenText':
+                implicit.append('screen_text')
+            elif name == 'readList':
+                implicit.append(options['list'])
+    walk(commands)
+    if len({*named}) != len(named) or {*named} & {*implicit}:
+        raise Refused('duplicate_data_key', 422)
+
+
+def collect_data(steps):
+    """What the flow has read so far, by key: readList rows, readScreenText lines and copyTextFrom text."""
+    results = [step['result'] for step in steps if 'result' in step]
+    data = {result['list']: result['rows'] for result in results if 'rows' in result}
+    data.update({result['key']: {'lines': result['lines'], **result['structure']} if 'structure' in result
+                else result['lines'] for result in results if 'lines' in result})
+    data.update({result['key']: result['text'] for result in results
+                 if 'key' in result and 'text' in result and 'lines' not in result})
+    return data
 
 
 def reference():
@@ -189,7 +228,9 @@ def reference():
             'lookup_timeouts': {'element_timeout_ms': 5000, 'optional_timeout_ms': 1000,
                                 'override': 'selector.timeout or when/while.timeout, in milliseconds'},
             'compatibility': 'Saved command lists and literal parameters remain usable. Unsupported commands fail validation before execution. Legacy retryTapIfNoChange is accepted but never repeats a tap. waitToSettleTimeoutMs is an explicit post-tap wait.',
-            'receipts': 'steps contains path, command name, elapsed_ms and result. First failure has a durable screenshot and compact hierarchy. Poll running/unknown with the same request_id; never replay uncertain mutations.',
+            'receipts': 'steps contains path, command name, elapsed_ms and result. First failure has a durable screenshot and compact hierarchy. Poll running/unknown with the same request_id; never replay uncertain mutations. '
+                        'While a flow runs, android_get_operation and the wait_s reply of android_run_flow also carry progress {step_path, step_name, finished_steps, elapsed_ms} (the step that started last) and data, the keys read so far; the final receipt has data only.',
+            'named_reads': 'copyTextFrom: {<selector>, key: name} puts its text in receipt.data.<name>; readScreenText {key} and readList (its list name) do the same. A key names one read: two reads with one key in one flow fail validation (duplicate_data_key); keys match [A-Za-z][A-Za-z0-9_]{0,63}.',
             'parameters': 'Literal ${UPPER_CASE} substitution, including saved subflows.',
             'secrets': 'inputText: ${secret:NAME} (also setText value and a map typeInto text, as the whole value only) types a secret '
                        'the owner stored on the USB host with `deedkit-android secret set NAME --package PKG`; android_capabilities.secrets '
@@ -219,9 +260,18 @@ def stop_script(pid, token):
 
 
 class UiRunner(FlowRunner):
-    def __init__(self, call, element_timeout_ms, optional_timeout_ms):
+    def __init__(self, call, element_timeout_ms, optional_timeout_ms, on_step=None):
         super().__init__(call, element_timeout_ms, optional_timeout_ms)
         self.steps = []
+        # on_step(path, name, finished_steps) at each step boundary: progress is advisory and never fails a step.
+        self.on_step = on_step
+
+    def boundary(self, path, name):
+        if self.on_step is not None:
+            try:
+                self.on_step(path, name, len(self.steps))
+            except Exception:  # noqa: BLE001
+                pass
 
     async def probe(self, selector, timeout, visible=True):
         result = await self.call({'extendedWaitUntil': {
@@ -239,6 +289,7 @@ class UiRunner(FlowRunner):
         step = {'path': path, 'command': name}
         if isinstance(command, dict) and isinstance(command[name], dict) and command[name].get('map_ref'):
             step['map'] = command[name]['map_ref']
+        self.boundary(path, name)
         try:
             step['result'] = await self.call(command, element_timeout_ms=self.element_timeout_ms,
                                              optional_timeout_ms=self.optional_timeout_ms)
@@ -252,6 +303,7 @@ class UiRunner(FlowRunner):
         finally:
             step['elapsed_ms'] = round((time.monotonic() - started) * 1000, 2)
             self.steps.append(step)
+            self.boundary(path, name)
 
 
 class Uiautomator:

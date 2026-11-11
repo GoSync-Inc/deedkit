@@ -307,7 +307,7 @@ steps:
   - tapOn: Large
   - tapOn: Add to basket
   - tapOn: {id: "example.food:id/note"}
-  - typeInto: {selector: note, text: ${NOTE}}
+  - typeInto: {selector: note, text: "${NOTE}"}
   - tapElement: {selector: basket}
   - extendedWaitUntil: {visible: {id: "example.food:id/total"}, timeout: 5000}
   - copyTextFrom: {id: "example.food:id/total", key: total}

@@ -241,6 +241,27 @@ Observation PNGs have a separate 16 MiB ceiling, to preserve full-resolution pho
 Receipts persist in SQLite. Preserve the state directory across upgrades to retain
 duplicate-request protection.
 
+### Progress and named reads
+
+While `android_run_flow` runs, the `wait_s` reply and `android_get_operation` return
+`progress: {step_path, step_name, finished_steps, elapsed_ms}` and `data` with the keys
+read so far (ANYM-970). `step_path` and `step_name` are the step that started last,
+`finished_steps` counts the steps already done and `elapsed_ms` is the run's time at that
+boundary. The service writes it at each step boundary, at most every 250 ms (a slow step is
+reported within a quarter second), into the running operation row, so a long run is not
+mistaken for a hung one. Values pass the secret masking. The final receipt has no
+`progress` and is the same as before. A restart marks the run `unknown` and leaves the last
+progress in it. A failing progress write is dropped and never fails the run.
+
+`copyTextFrom` accepts `key` (`[A-Za-z][A-Za-z0-9_]{0,63}`) and puts its text in
+`data.<key>`, like `readScreenText` (`key`, default `screen_text`) and `readList` (its
+list name). The step result is `{text, key}`. A key names one read: the same key twice in
+one flow, or a key that a keyless `readScreenText` or a `readList` already writes, fails
+validation before admission with `duplicate_data_key`. Reads that never named a key behave
+as before. A composite scenario (open an app, search, add an item with a typed note, open
+the basket, wait for the total by selector, `copyTextFrom` it as `total`) runs in one call
+and returns `data.total` and every step's `elapsed_ms` in one receipt.
+
 ## Device workflows
 
 The recommended engine is persistent uiautomator2 3.7.1. Build the patched device

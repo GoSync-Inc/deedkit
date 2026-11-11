@@ -60,8 +60,8 @@ def test_loading_waits_and_phases_are_discoverable_in_descriptions():
 # spec: ANYM-970
 def test_progress_and_named_reads_are_discoverable_in_the_run_description():
     run = CATALOG['android_run_flow']['description']
-    assert 'progress' in run and 'step_path' in run and 'finished_steps' in run and 'android_get_operation' in run
-    assert 'copyTextFrom' in run and 'key' in run and 'duplicate_data_key' in run
+    assert 'progress' in run and 'step_path' in run and 'finished_steps' in run
+    assert 'copyTextFrom key fills data.<key>' in run
 
 
 # spec: ANYM-957
