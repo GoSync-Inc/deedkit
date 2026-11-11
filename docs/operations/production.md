@@ -391,7 +391,7 @@ host never builds it, and agents do not install it.
 
 1. On a development machine, at the `main` commit to deploy, build it with the
    pinned toolchain exactly as `tools/attest-verify/README.md` states
-   (`GOTOOLCHAIN=go1.26.10 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath
+   (`GOTOOLCHAIN=go1.26.11 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath
    -buildvcs=false -ldflags=-buildid= -o attest-verify .`). The build is
    reproducible: its SHA-256 must equal `tools/attest-verify/attest-verify.linux-amd64.sha256`,
    which a CI test rebuilds and compares.

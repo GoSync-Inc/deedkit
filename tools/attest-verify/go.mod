@@ -1,6 +1,6 @@
 module github.com/GoSync-Inc/deedkit/tools/attest-verify
 
-go 1.26.10
+go 1.26.11
 
 require (
 	github.com/google/certificate-transparency-go v1.3.3
