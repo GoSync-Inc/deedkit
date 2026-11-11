@@ -257,7 +257,7 @@ def test_screen_text_failure_keeps_the_worker_and_fails_the_receipt(tmp_path, mo
         monkeypatch.setattr(devices, 'capture_hierarchy', capture)
         lines = [{'text': 'Selesai', 'bounds': '[0,0][1,1]', 'confidence': 90.0}]
         async def answer(command, **options):
-            if command == 'back':
+            if command in ('back', '__guard__'):
                 return {'success': True}
             if command == {'readScreenText': {'key': 'orders'}}:
                 return {'key': 'orders', 'lines': lines}

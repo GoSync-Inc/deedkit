@@ -133,10 +133,12 @@ def wait_element(device, candidates, timeout, app_map=None):
         time.sleep(min(0.1, max(0, deadline - time.monotonic())))
 
 
-def tap(device, node):
+def tap(device, node, guard=None, dump=None):
     if isinstance(node, dict):
         from .ui_worker import point
         x, y = point(device, node['point'])
+        if guard is not None:
+            guard.tap(device, [(x, y)], dump=dump)
     else:
         bounds = re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.get('bounds', ''))
         if not bounds:
@@ -145,6 +147,8 @@ def tap(device, node):
         if right <= left or bottom <= top:
             raise Refused('invalid_element_bounds')
         x, y = (left + right) // 2, (top + bottom) // 2
+        if guard is not None:
+            guard.tap(device, [(x, y)], node, dump)
     device.click(x, y)
 
 
@@ -162,9 +166,10 @@ def extract_list(root, listing, fields, limit):
     return rows
 
 
-def execute_map(device, name, options, native):
+def execute_map(device, name, options, native, guard=None):
     app_map = options['app_map']
     timeout = options.get('timeout', 3000)
+    dump = lambda: snapshot(device, app_map)  # noqa: E731 - the map's own hierarchy options
     result = {'success': True}
     if name == 'openApp':
         native(device, {'launchApp': {'appId': app_map['package'], 'stopApp': options.get('cold', False)}})
@@ -187,7 +192,7 @@ def execute_map(device, name, options, native):
         node, trace = wait_element(device, app_map['selectors'][options['selector']], timeout, app_map)
         result.update(selector=options['selector'], candidates=trace)
         if name == 'tapElement':
-            tap(device, node)
+            tap(device, node, guard, dump)
         else:
             # An explicit ordinal selects the exact node from this snapshot.
             # Direct accessibility setText avoids keyboard/clipboard fallbacks.
@@ -255,7 +260,7 @@ def execute_map(device, name, options, native):
                     device.press(popup['press'])
                 else:
                     node, _ = wait_element(device, app_map['selectors'][popup['dismiss']], timeout, app_map)
-                    tap(device, node)
+                    tap(device, node, guard, dump)
                 dismissed.append(key)
                 break
             if not present:

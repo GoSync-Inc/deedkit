@@ -304,6 +304,10 @@ class Uiautomator:
                         stderr=asyncio.subprocess.DEVNULL, env=env, start_new_session=True,
                         limit=4 * 1024 * 1024, pass_fds=(self.lock_fd,))
                     self.processes[device] = process
+                guard = getattr(self.config, 'guard', None)
+                if guard is not None:
+                    # Host additions only; the worker always applies the built-in rules.
+                    options = {**options, 'guard': guard.model_dump()}
                 if getattr(self.config, 'ocr_command', None):
                     ocr = {'command': self.config.ocr_command, 'languages': self.config.ocr_languages}
                     options = {**options, 'ocr': ocr | ({'engine': 'vision'} if ocr_engine() == 'vision' else {})}
@@ -319,10 +323,12 @@ class Uiautomator:
                         error.details = result['details']
                     if 'hint' in result:
                         error.hint = result['hint']
+                    if 'guard' in result:
+                        error.guard = result['guard']
                     raise error
                 return result
             except Refused as error:
-                if error.code not in DEFINITE | {'unsupported_uiautomator_command', 'invalid_point'}:
+                if error.code not in DEFINITE | {'unsupported_uiautomator_command', 'invalid_point', 'guard_stopped'}:
                     await self.close(device)
                 raise
             except BaseException:

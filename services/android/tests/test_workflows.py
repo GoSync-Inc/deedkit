@@ -134,9 +134,9 @@ def test_workflow_execution_checkpoint_and_replay_use_one_device_lock(tmp_path, 
                 await devices.execute('one', 'phone', token, str(uuid.uuid4()), None, 3, 0, flow)
             completed = await devices.receipt('one', request_id, 3)
             assert completed['state'] == 'paused' and completed['remaining_yaml'].strip() == '- back'
-            assert calls == [{'inputText': 'hello'}]
+            assert calls == [{'inputText': 'hello'}, '__guard__']  # Then the guard's screen check.
             repeated = await devices.execute('one', 'phone', token, request_id, None, 3, 3, flow)
-            assert repeated == completed and len(calls) == 1
+            assert repeated == completed and len(calls) == 2  # A replay calls the device no more.
         finally:
             await devices.close()
             store.close()

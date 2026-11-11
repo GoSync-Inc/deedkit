@@ -345,13 +345,25 @@ class Devices:
         result.update(hierarchy)
         return result
 
+    async def stop_observation(self, owner, device, package, sensitive):
+        """The stop screen; on a protected or secure screen only its package: no text, no image."""
+        withheld = {"device_id": device, "observed_at": time.time(), "package": package,
+                    "withheld": "protected_screen"}
+        if sensitive:
+            return withheld
+        observation = await self.failure_observation(owner, device)
+        if "screenshot_error" in observation:
+            # A secure window refuses capture: keep its text out of the receipt as well.
+            return {**withheld, "withheld": "secure_screen"}
+        return {**observation, "package": package}
+
     def remaining(self, commands):
         from .app_maps import continuation
         return continuation(commands)
 
     async def perform_flow(self, owner, device, request_id, commands, timeout, temporary, lock,
                            element_timeout_ms=5000, optional_timeout_ms=1000):
-        state, result = "unknown", {}
+        state, result, stop = "unknown", {}, {}
         started = time.monotonic()
         runner = UiRunner(lambda command, **options: self.ui.call(device, command, **options),
                           element_timeout_ms, optional_timeout_ms)
@@ -362,6 +374,8 @@ class Devices:
             if checkpoint:
                 async with asyncio.timeout(timeout):
                     await runner.run(commands[:checkpoint])
+                    # The guard's screen rule after the last step too (ANYM-968).
+                    await self.ui.call(device, '__guard__')
             result = {"commands_executed": checkpoint, "device_id": device}
             state = "succeeded"
             if checkpoint < len(commands):
@@ -371,7 +385,14 @@ class Devices:
                                "next_action": "observe_then_resolve_checkpoint_and_submit_remaining_yaml"})
         except Refused as error:
             result = {"error": error.code, "next_action": "inspect_device_before_any_new_request"}
-            if error.code in DEFINITE:
+            if error.code == 'guard_stopped' and getattr(error, 'guard', None):
+                # A definite stop: the guard sent no input for the stopped action.
+                state, stop = 'stopped', dict(error.guard)
+                result = {'stop_reason': 'guard', 'next_action': 'show_the_owner_this_screen_never_retry_or_work_around',
+                          'guard': {'rule': stop['rule'], 'matched': stop['matched'], 'when': stop['when'],
+                                    'step_path': getattr(error, 'command_path', None)},
+                          'package': stop.get('package')}
+            elif error.code in DEFINITE:
                 state = 'failed'
                 result['next_action'] = 'inspect_failure_observation_and_correct_flow'
             if hasattr(error, 'command_path'):
@@ -392,7 +413,11 @@ class Devices:
             result = {"error": "ui_engine_unavailable", "next_action": "inspect_device_before_any_new_request"}
         finally:
             try:
-                if state not in {'succeeded', 'paused'}:
+                if state == 'stopped':
+                    result.update(device_id=device, commands_executed=runner.completed, automatic_retry=False)
+                    result['observation'] = await self.stop_observation(owner, device, result.get('package'),
+                                                                        stop.get('sensitive', True))
+                elif state not in {'succeeded', 'paused'}:
                     result.update(device_id=device, commands_executed=runner.completed,
                                   automatic_retry=False, side_effects='may_have_occurred')
                     if runner.current_path is not None and 'failed_command_path' not in result:

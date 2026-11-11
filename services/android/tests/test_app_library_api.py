@@ -55,7 +55,7 @@ def test_draft_test_publish_and_replay_after_repair_through_http(tmp_path):
         # Replay precedes all mutable head reads and lease checks.
         post('session', {'action': 'release', 'device_id': 'home', 'session_id': session})
         assert post('run_flow', args) == result
-        assert len(seen) == 1
+        assert len(seen) == 2 and seen[-1] == '__guard__'  # The guard's screen check after the last step.
         post('run_flow', {**args, 'name': 'different'}, 409)
 
 
