@@ -256,10 +256,13 @@ class Devices:
         return [*self.adb(device), *argv], output
 
     async def execute(self, owner, device, session, request_id, argv, timeout, wait, flow=None,
-                      element_timeout_ms=5000, optional_timeout_ms=1000, identity=None, metadata=None):
+                      element_timeout_ms=5000, optional_timeout_ms=1000, identity=None, metadata=None, job=None):
         # A known request is read before reservation checks: its receipt survives lease expiry.
         payload = {"device_id": device, "timeout_s": timeout}
-        payload["flow" if flow is not None else "argv"] = flow if flow is not None else argv
+        if job is not None:
+            payload["job"] = job.identity  # courier_chat.CourierChat (ANYM-975)
+        else:
+            payload["flow" if flow is not None else "argv"] = flow if flow is not None else argv
         # Keep the default payload hash compatible with already persisted receipts.
         if flow is not None and (element_timeout_ms, optional_timeout_ms) != (5000, 1000):
             payload.update(element_timeout_ms=element_timeout_ms, optional_timeout_ms=optional_timeout_ms)
@@ -281,7 +284,10 @@ class Devices:
         temporary = None
         try:
             temporary = tempfile.TemporaryDirectory(dir=self.store.directory)
-            if flow is None:
+            if job is not None:
+                if not self.ui:
+                    raise Refused("ui_engine_not_configured", 503)
+            elif flow is None:
                 command, output = self.prepare(owner, device, argv, Path(temporary.name))
             elif not self.ui:
                 raise Refused("ui_engine_not_configured", 503)
@@ -291,7 +297,9 @@ class Devices:
                 temporary.cleanup()
             lock.release()
             raise
-        if flow is None:
+        if job is not None:
+            operation = self.perform_job(owner, request_id, job, timeout, temporary, lock)
+        elif flow is None:
             operation = self.perform(owner, request_id, command, output, timeout, temporary, lock)
         else:
             operation = self.perform_flow(owner, device, request_id, flow, timeout, temporary, lock,
@@ -445,6 +453,28 @@ class Devices:
                               elapsed_ms=round((time.monotonic() - started) * 1000, 2))
                 # Every typed value is its reference in what the caller reads and what is stored.
                 self.store.finish(owner, request_id, state, run.mask(result))
+            finally:
+                temporary.cleanup()
+                lock.release()
+
+    async def perform_job(self, owner, request_id, job, timeout, temporary, lock):
+        """Run a single-step job (courier_chat.CourierChat); its `failure` decides stopped, failed or unknown."""
+        state, result = "unknown", {}
+        try:
+            try:
+                async with asyncio.timeout(timeout):
+                    state, result = await job.run()
+            except TimeoutError:
+                state, result = await job.failure("command_timeout")
+            except Refused as error:
+                state, result = await job.failure(error)
+            except asyncio.CancelledError:
+                state, result = await job.failure("service_stopped", observe=False)
+            except (OSError, ValueError):
+                state, result = await job.failure("ui_engine_unavailable")
+        finally:
+            try:
+                self.store.finish(owner, request_id, state, result)
             finally:
                 temporary.cleanup()
                 lock.release()

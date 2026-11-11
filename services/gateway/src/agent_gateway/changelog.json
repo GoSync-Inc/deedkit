@@ -1,3 +1,4 @@
 [
-  {"revision": 1, "date": "2026-11-11", "module": "gateway", "added": [], "changed": [], "removed": [], "note": "Baseline: the reviewed catalog when the changelog began. Later entries list the tools added, changed or removed.", "catalog_sha256": "9a1de235a0207a245e77955be6315959172be67a921f06f64a584295315c2c2c"}
+  {"revision": 1, "date": "2026-11-11", "module": "gateway", "added": [], "changed": [], "removed": [], "note": "Baseline: the reviewed catalog when the changelog began. Later entries list the tools added, changed or removed.", "catalog_sha256": "9a1de235a0207a245e77955be6315959172be67a921f06f64a584295315c2c2c"},
+  {"revision": 2, "date": "2026-11-11", "module": "android", "added": ["android_courier_chat"], "changed": [], "removed": [], "note": "A courier chat for delivery orders in two steps: a preview of the message, then a send bound to the preview's digest after the owner confirms.", "catalog_sha256": "44d40a1d24d78f6ceea77c1eb84d628ec7f62afa5711c8ecf523dec19631ab61"}
 ]

@@ -6,6 +6,7 @@
   {"name": "agents_start_task", "read_only": false},
   {"name": "agents_stop_task", "read_only": false},
   {"name": "android_capabilities", "read_only": true},
+  {"name": "android_courier_chat", "read_only": false},
   {"name": "android_delete_file", "read_only": false},
   {"name": "android_download", "read_only": true},
   {"name": "android_execute", "read_only": false},
