@@ -171,8 +171,29 @@ yields before each statement when capture has queued work, and writes nothing un
 nothing; its only write is one `repair_progress` row in `capture.sqlite`, and
 `.repair-status` carries counts and a fixed error code (`repair_read`,
 `repair_storage`) to `get_sync_status` (detail=full, `native_repair`). A
-rollback to the previous adapter ignores the table. The repair itself is a
-follow-up.
+rollback to the previous adapter ignores the table.
+Once that count is done, the republish pass (`republish.go`, ANYM-963) walks
+the same cohort once per `REPUBLISH_VERSION` under the same bounds (at most 32
+journal rows a tick, the time slice, capture priority, the page reserve before
+every write, a stop on disconnect, lost lease or shutdown). For a
+`would_add_content` row whose rebuilt envelope the archive's completion rules
+take (business text with a body and no file, or one photo, video or document)
+it builds the envelope from the retained raw with origin `reconcile` and
+stores and exports it through the journal's own `append`: a new journal row
+with a new digest and the raw kept for the media download; the original row is
+never rewritten. Location, contact, poll and other rows are counted
+`unsupported` and left alone; placeholders and rows without raw are not
+touched. Progress is one `republish_progress(version,last_seq,counts)` row; a
+crash after `append` and before that write repeats the envelope, which
+`append` skips by digest or the archive answers `duplicate`. The archive adds
+a new revision and keeps the empty one readable; a deleted message stays
+deleted (`tombstoned`), an excluded chat gives `excluded`, and a default
+`origins=['live']` subscription is not woken. `.repair-status` gains a
+`republish` block (version, done, rows scanned, `published`, `unsupported`,
+`parse_error`, a fixed code `republish_read`, `republish_storage` or
+`republish_spool`) shown under `native_repair.republish` in `get_sync_status`
+(detail=full). A rollback to the previous adapter ignores the table; the new
+journal rows are ordinary captures it replays.
 An exhausted local cache is not a complete WhatsApp history.
 History is partial by contract: the phone's batch after pairing (device props:
 7 recent days, 50 messages per chat), live capture since, and explicit
