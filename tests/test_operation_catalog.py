@@ -241,6 +241,70 @@ def operation_manifest_format(name):
     return rows['delete_member_messages']['parameters_schema'][name]['format']
 
 
+def ahead(**delta):
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) + timedelta(**delta)).isoformat().replace('+00:00', 'Z')
+
+
+# spec: ANYM-935
+def test_ban_and_unban_are_telegram_mutations_behind_groups_moderate():
+    from messaging_service.messenger_operations import ADVANCED_ONLY, OPERATION_TOOLS
+    for name in ('ban_member', 'unban_member'):
+        spec = operation_spec(name)
+        assert (spec['permission'], spec['target'], spec['mutation'], spec['full_account'], spec['platforms']) == (
+            'groups-moderate', 'chat', True, False, ['telegram'])
+        assert name in OPERATION_TOOLS['manage_chat']
+    state = operation_spec('get_member_state')
+    assert (state['permission'], state['mutation'], state['platforms']) == ('groups-moderate', False, ['telegram'])
+    assert 'get_member_state' in ADVANCED_ONLY
+    telegram = {r['operation']: r for r in operation_manifest('telegram')}
+    assert set(telegram['ban_member']['parameters_schema']) == {'user', 'until', 'forever', 'message_ids',
+                                                                'expected_revisions'}
+    assert set(telegram['unban_member']['parameters_schema']) == {'user'}
+    assert all(word in telegram['ban_member']['limitation'] for word in (
+        'not_admin', 'missing_admin_right', 'target_protected', 'unsupported_chat_type', 'changed', 'unknown'))
+    assert 'rejoin' in telegram['unban_member']['limitation']
+    for provider in ('whatsmeow', 'webjs'):
+        rows = {r['operation']: r for r in operation_manifest('whatsapp', provider=provider)}
+        for name in ('ban_member', 'unban_member'):
+            assert not rows[name]['supported'] and 'ban_unsupported' in rows[name]['limitation']
+            assert 'remove_participant' in rows[name]['limitation']
+            with pytest.raises(ValueError, match='^ban_unsupported$'):
+                validate_operation('whatsapp', name, {'user': '1234567890@c.us', 'forever': True}, provider=provider)
+
+
+# spec: ANYM-935
+def test_ban_member_takes_until_or_forever_and_optional_messages_of_that_person():
+    from messaging_service.messenger_operations import ParameterError
+    def errors(parameters):
+        with pytest.raises(ParameterError, match='^invalid_operation_parameters$') as failure:
+            validate_operation('telegram', 'ban_member', parameters)
+        return [(e['field'], e['reason']) for e in failure.value.field_errors]
+    assert validate_operation('telegram', 'ban_member', {'user': '42', 'forever': True}) == {'user': '42',
+                                                                                             'forever': True}
+    until = ahead(days=3)
+    assert validate_operation('telegram', 'ban_member', {'user': '42', 'until': until.replace('Z', '+00:00')}) == {
+        'user': '42', 'until': until}
+    assert validate_operation('telegram', 'ban_member', {'user': '42', 'until': ahead(days=365, hours=23)})
+    assert errors({'user': '42'}) == [('until', 'required')]
+    assert errors({'user': '42', 'until': until, 'forever': True}) == [('forever', 'unique')]
+    assert errors({'user': '42', 'forever': False}) == [('forever', 'enum')]
+    assert errors({'user': '42', 'until': ahead(seconds=50)}) == [('until', 'minimum')]
+    assert errors({'user': '42', 'until': ahead(days=366, minutes=5)}) == [('until', 'maximum')]
+    assert errors({'user': '42', 'until': '2026-11-11 10:00'}) == [('until', 'format')]
+    assert errors({'user': 'person_1', 'forever': True}) == [('user', 'format')]
+    ids = MEMBER_IDS[:2]
+    ok = {'user': '42', 'forever': True, 'message_ids': ids, 'expected_revisions': [1, 2]}
+    assert validate_operation('telegram', 'ban_member', ok) == ok
+    assert errors({'user': '42', 'forever': True, 'message_ids': ids}) == [('expected_revisions', 'required')]
+    assert errors({'user': '42', 'forever': True, 'expected_revisions': [1]}) == [('message_ids', 'required')]
+    assert errors({**ok, 'expected_revisions': [1]}) == [('expected_revisions', 'min_items')]
+    assert errors({**ok, 'message_ids': MEMBER_IDS}) == [('message_ids', 'max_items')]
+    assert validate_operation('telegram', 'unban_member', {'user': '42'}) == {'user': '42'}
+    with pytest.raises(ParameterError):
+        validate_operation('telegram', 'unban_member', {'user': '42', 'forever': True})
+
+
 # spec: ANYM-243
 def test_chat_link_validation():
     from messaging_service.messenger_operations import ParameterError

@@ -487,6 +487,174 @@ def test_a_rights_refusal_fails_the_operation_with_its_evidence_and_deletes_noth
         assert not c.execute('SELECT deleted FROM messages WHERE id=%s',(ids['spam'],)).fetchone()['deleted']
 
 
+def banning(operator):
+    """moderation()'s chats plus a second message of sender 42, a basic group and a private chat."""
+    s,archive,key,state,ids=moderation(operator)
+    def message(chat,provider_id,kind,**changes):
+        archive.ingest(event(account='command-fixture',chat=chat,provider_id=provider_id,metadata={'chat_type':kind},
+                             **changes))
+        return stable_id('msg','command-fixture',chat,provider_id)
+    ids['spam3']=message('-1001','15','group',sender='42',body='Third synthetic spam')
+    ids['basic']=message('-4242','1','group',sender='42',body='Basic group synthetic text')
+    ids['private']=message('42','1','private',sender='42',body='Private synthetic text')
+    s.set_messenger_operations('command-fixture',['delete_member_messages','ban_member','unban_member','get_member_state'])
+    return s,archive,key,state,ids
+
+
+def ban_args(chat,operation='ban_member',**parameters):
+    return {'account':'command-fixture','operation':operation,'chat_id':stable_id('chat','command-fixture',chat),
+            'parameters':{'user':'42',**({'forever':True} if operation=='ban_member' and 'until' not in parameters
+                                         else {}),**parameters}}
+
+
+def ban_until(**delta):
+    from datetime import datetime,timedelta,timezone
+    return (datetime.now(timezone.utc)+timedelta(**delta)).replace(microsecond=0).isoformat().replace('+00:00','Z')
+
+
+# spec: ANYM-935
+def test_ban_preview_names_the_person_chat_duration_messages_and_that_a_ban_removes(operator):
+    s,_,key,_,ids=banning(operator)
+    until=ban_until(days=3,hours=4,minutes=1)
+    draft=s.preview_messenger_operation(key,**ban_args('-1001',until=until,message_ids=[ids['spam'],ids['spam3']],
+                                                       expected_revisions=[1,1]))
+    shown=draft['moderation']
+    assert shown['person']=={'sender_id':'42','display_name':'Synthetic Seller','username':'synthetic_seller',
+                             'state':'unknown','state_basis':'not_read'}
+    assert shown['chat']['chat_type']=='supergroup' and shown['chat']['chat_id']==stable_id('chat','command-fixture','-1001')
+    assert shown['duration']=='for 3 days 4 hours' and shown['until']==until and until in shown['effect']
+    assert shown['effect'].startswith('A ban removes this person')
+    assert [m['message_id'] for m in shown['messages']]==[ids['spam'],ids['spam3']] and shown['count']==2
+    assert shown['order'].startswith('the listed messages are deleted first')
+    assert draft['required_permissions']==['groups-moderate','read'] and draft['mutation'] is True
+    assert draft['person']=={'user':'42','provider_message_id':'11'}
+    assert [t['provider_message_id'] for t in draft['targets']]==['11','15']
+    forever=s.preview_messenger_operation(key,**ban_args('-1001'))
+    assert forever['moderation']['duration']=='forever' and 'targets' not in forever
+    assert forever['person']=={'user':'42','provider_message_id':'11'}
+    unban=s.preview_messenger_operation(key,**ban_args('-1001','unban_member'))['moderation']
+    assert 'not add this person back' in unban['effect'] and 'rejoin' in unban['effect'] and 'duration' not in unban
+    comments=s.preview_messenger_operation(key,**{**ban_args('-1003'),'parameters':{'user':'44','forever':True}})
+    assert comments['moderation']['chat']['chat_type']=='discussion group of Synthetic news'
+
+
+# spec: ANYM-935
+def test_ban_preview_digest_binds_user_chat_end_and_message_revisions(operator):
+    s,archive,key,_,ids=banning(operator)
+    until=ban_until(days=1)
+    args=ban_args('-1001',until=until,message_ids=[ids['spam']],expected_revisions=[1])
+    draft=s.preview_messenger_operation(key,**args)
+    for n,changed in enumerate((ban_args('-1001',until=ban_until(days=2),message_ids=[ids['spam']],expected_revisions=[1]),
+                                ban_args('-1001',message_ids=[ids['spam']],expected_revisions=[1]),
+                                ban_args('-1001',until=until))):
+        with pytest.raises(APIError,match='^preview_mismatch$'):
+            s.execute_messenger_operation(key,**changed,request_id='synthetic-ban-%d'%n,preview_digest=draft['preview_digest'])
+    archive.ingest(event(account='command-fixture',chat='-1001',provider_id='11',sender='42',body='Edited synthetic spam',
+                         metadata={'chat_type':'group'},updated_at='2026-10-01T12:01:00Z'))
+    with pytest.raises(APIError,match='^operation_target_changed$'):
+        s.execute_messenger_operation(key,**args,request_id='synthetic-ban-9',preview_digest=draft['preview_digest'])
+
+
+# spec: ANYM-935
+def test_ban_refuses_a_basic_group_a_private_chat_an_unknown_sender_and_another_persons_message(operator):
+    s,_,key,_,ids=banning(operator)
+    for chat in ('-4242','42'):
+        with pytest.raises(APIError,match='^unsupported_chat_type$'):
+            s.preview_messenger_operation(key,**ban_args(chat))
+    assert [(e['field'],e['reason']) for e in refused_fields(s,key,{**ban_args('-1001'),'parameters':{
+        'user':'99','forever':True}}).field_errors]==[('user','sender_not_found')]
+    failure=refused_fields(s,key,ban_args('-1001',message_ids=[ids['spam'],ids['spam2']],expected_revisions=[1,1]))
+    assert [(e['field'],e['reason']) for e in failure.field_errors]==[('message_ids/1','message_from_other_sender')]
+    failure=refused_fields(s,key,ban_args('-1001',message_ids=[ids['comment']],expected_revisions=[1]))
+    assert [(e['field'],e['reason']) for e in failure.field_errors]==[('message_ids/0','message_from_other_chat')]
+    with pytest.raises(APIError,match='^target_protected$') as protected:
+        s.preview_messenger_operation(key,**{**ban_args('-1001'),'parameters':{'user':'7','forever':True}})
+    assert protected.value.reason=='owner'
+    plain=s.issue_key('command-agent',['command-fixture'],permissions=['read','read-live','groups-manage'])
+    with pytest.raises(APIError,match='^forbidden$'):
+        s.preview_messenger_operation(plain,**ban_args('-1001'))
+
+
+# spec: ANYM-935
+def test_ban_preview_shows_the_live_state_and_a_channels_discussion_group(operator,monkeypatch):
+    from messaging_service import member_ban
+    s,_,key,_,ids=banning(operator)
+    reads=[]
+    def answer(data):
+        def execute(token,account,operation,chat_id,parameters=None,request_id=''):
+            reads.append((operation,chat_id,parameters,request_id))
+            return {'status':'succeeded','result':{'data':data}}
+        monkeypatch.setattr(s,'execute_messenger_operation',execute)
+    answer({'state':'banned','banned_until':None,'role':None,'linked_chat':None})
+    draft=asyncio.run(member_ban.preview_with_state(s,key,ban_args('-1001','unban_member')))
+    assert draft['moderation']['person']['state']=='banned forever'
+    assert draft['moderation']['person']['state_basis']=='live_provider_observation'
+    assert reads[0][:3]==('get_member_state',stable_id('chat','command-fixture','-1001'),{'user':'42'})
+    until=ban_until(days=4)
+    answer({'state':'banned','banned_until':until,'role':None,'linked_chat':None})
+    assert asyncio.run(member_ban.preview_with_state(s,key,ban_args('-1001')))['moderation']['person'][
+        'state']=='banned until '+until
+    answer({'state':'left','banned_until':None,'role':None,'linked_chat':None})
+    assert asyncio.run(member_ban.preview_with_state(s,key,ban_args('-1001')))['moderation']['person']['state']=='left'
+    assert asyncio.run(member_ban.preview_with_state(s,key,ban_args('-1001','unban_member')))['moderation'][
+        'person']['state']=='not_banned'
+    answer({'state':'member','banned_until':None,'role':'admin','linked_chat':None})
+    person=asyncio.run(member_ban.preview_with_state(s,key,ban_args('-1001')))['moderation']['person']
+    assert person['state']=='member' and person['protected'].startswith('target_protected')
+    # A channel: the ban acts on subscribers; the linked discussion group is named by its archive chat ID.
+    archive_chat=stable_id('chat','command-fixture','-1003')
+    answer({'state':'member','banned_until':None,'role':'member','linked_chat':'-1003'})
+    with s.pool.connection() as c:
+        c.execute("UPDATE messages SET sender='45' WHERE id=%s",(ids['post'],))
+    channel=asyncio.run(member_ban.preview_with_state(s,key,{**ban_args('-1002'),'parameters':{
+        'user':'45','forever':True}}))['moderation']
+    assert channel['chat']['chat_type']=='channel' and 'subscribers only' in channel['channel_scope']
+    assert channel['discussion_group_chat_id']==archive_chat
+    scoped=s.issue_key('command-agent',['command-fixture'],chats=[stable_id('chat','command-fixture','-1002')],
+                       permissions=MODERATOR)
+    hidden=asyncio.run(member_ban.preview_with_state(s,scoped,{**ban_args('-1002'),'parameters':{
+        'user':'45','forever':True}}))['moderation']
+    assert hidden['discussion_group_chat_id'] is None and 'cannot read' in hidden['discussion_group']
+
+
+# spec: ANYM-935
+def test_ban_preview_without_a_live_read_names_why_the_state_is_unknown(operator,monkeypatch):
+    from messaging_service import member_ban
+    monkeypatch.setattr(member_ban,'STATE_WAIT_S',0.2)  # no collector runs here: the read stays queued
+    s,_,key,_,_=banning(operator)
+    s.set_messenger_operations('command-fixture',['ban_member','unban_member'])
+    person=asyncio.run(member_ban.preview_with_state(s,key,ban_args('-1001')))['moderation']['person']
+    assert (person['state'],person['state_unavailable'])==('unknown','operation_disabled')
+    s.set_messenger_operations('command-fixture',['ban_member','unban_member','get_member_state'])
+    with pytest.raises(APIError,match='^unsupported_chat_type$'):  # a refused preview reads nothing live
+        asyncio.run(member_ban.preview_with_state(s,key,ban_args('-4242')))
+    with s.pool.connection() as c:
+        assert not c.execute("SELECT 1 FROM messenger_commands WHERE operation='get_member_state'").fetchone()
+    person=asyncio.run(member_ban.preview_with_state(s,key,ban_args('-1001')))['moderation']['person']
+    assert (person['state'],person['state_unavailable'])==('unknown','state_read_pending')
+
+
+# spec: ANYM-935
+def test_a_confirmed_ban_runs_its_reviewed_messages_even_once_the_archive_marks_them_deleted(operator):
+    from messaging_service.commands import CommandWorker
+    s,archive,key,state,ids=banning(operator)
+    args=ban_args('-1001',message_ids=[ids['spam']],expected_revisions=[1])
+    draft=s.preview_messenger_operation(key,**args)
+    queued=s.execute_messenger_operation(key,**args,request_id='synthetic-ban-run',preview_digest=draft['preview_digest'])
+    # The provider's deletion event can reach the archive between the delete step and the ban.
+    archive.ingest(event(account='command-fixture',chat='-1001',provider_id='11',sender='42',body='',deleted=True,
+                         metadata={'chat_type':'group'},updated_at='2026-10-01T12:01:00Z'))
+    jobs=[]
+    async def provider(job):
+        jobs.append(job);await job['_preflight']()
+        return {'outcome':'confirmed','data':{'changed':True,'ban_request':'applied','state':'banned',
+            'banned_until':None,'results':[{'message_id':ids['spam'],'state':'deleted'}],'deleted':1,'all_deleted':True}}
+    assert asyncio.run(CommandWorker(state,provider).once())
+    receipt=s.get_messenger_operation(key,queued['operation_id'])
+    assert receipt['status']=='succeeded' and receipt['result']['data']['state']=='banned'
+    assert jobs[0]['person']=={'user':'42','provider_message_id':'11'} and jobs[0]['targets'][0]['message_id']==ids['spam']
+
+
 def test_status_is_bound_to_originating_key(operator):
     s,_,key,_=operator
     queued=queue(s,key)

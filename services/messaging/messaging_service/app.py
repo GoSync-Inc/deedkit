@@ -678,10 +678,10 @@ def register_messenger_operation_tools(mcp, call, async_call, read):
         return call(ctx, 'list_messenger_operations', account=account)
 
     @mcp.tool(structured_output=True, annotations=read)
-    def preview_messenger_operation(ctx: Context, account: StrictStr, operation: StrictStr,
+    async def preview_messenger_operation(ctx: Context, account: StrictStr, operation: StrictStr,
         chat_id: StrictStr='', message_id: StrictStr='', expected_revision: StrictInt=0,
         parameters: dict[StrictStr, Any]={}, request_id: StrictStr='') -> dict[str, Any]:
-        """Validate an allowlisted intent without queueing or contacting a provider.
+        """Validate an allowlisted intent without queueing it; ban_member/unban_member add one live state read.
 
         Call list_messenger_operations(account) first for each operation's
         parameters_schema and ID formats; rejected parameters return
@@ -698,7 +698,7 @@ def register_messenger_operation_tools(mcp, call, async_call, read):
         request_id is accepted so preview and execute take the same arguments; it
         is ignored here and never reserves the ID.
         """
-        return call(ctx, 'preview_messenger_operation', account=account, operation=operation,
+        return await async_call(ctx, 'preview_messenger_operation', account=account, operation=operation,
             chat_id=chat_id, message_id=message_id, expected_revision=expected_revision,
             parameters=parameters)
 
@@ -864,7 +864,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
             return await send(store,token,arguments)
         if method == 'preview_messenger_operation':
             # ANYM-549: accepted for parity with execute, ignored for idempotency.
-            arguments.pop('request_id',None)
+            arguments.pop('request_id',None)  # ANYM-935: a ban or unban preview adds one live read of the person's state
+            if arguments.get('operation') in ('ban_member','unban_member'):from .member_ban import preview_with_state;return await preview_with_state(store,token,arguments)
         if method == 'execute_messenger_operation':
             from .send_wait import validate_wait_s, wait_for_operation
             wait_s=validate_wait_s(arguments.pop('wait_s', 0))

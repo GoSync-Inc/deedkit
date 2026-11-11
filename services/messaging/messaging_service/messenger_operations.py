@@ -113,6 +113,27 @@ MODERATION_LIMITATION = ('Telegram only: deletes for everyone 1-20 archived mess
     'deleted, failed or unknown and is never retried; a flood wait before the request was sent is failed with '
     'retry_after_s, after it unknown. The archive copy of each confirmed deletion is purged as well (a content-free '
     'tombstone stays).')
+# ANYM-935: banning a person from a supergroup, discussion group or channel, and lifting it; get_member_state is the
+# live read of that person's state the ban preview shows.
+BAN, UNBAN, MEMBER_STATE = 'ban_member', 'unban_member', 'get_member_state'
+BAN_FAMILY = (BAN, UNBAN, MEMBER_STATE)
+BAN_MIN_S, BAN_MAX_DAYS = 60, 366
+_person = {'user': _field('contact_id', required=True)}
+BAN_LIMITATION = ('Telegram only: bans user (an archived sender of this supergroup, discussion group or channel; '
+    'members and people who left alike) until a time 1 minute to 366 days ahead or forever, after the owner\'s exact '
+    'confirmation; a ban removes the person and keeps them out. With message_ids (1-20 of that person\'s archived '
+    'messages here, with expected_revisions) the messages are deleted first, as delete_member_messages, then the ban '
+    'is one request. The owner must be the creator or an admin with ban_users (and delete_messages for message_ids): '
+    'else not_admin or missing_admin_right. The owner, an admin or the creator is target_protected (demote in the app '
+    'first); a basic group or private chat is unsupported_chat_type. A person already banned so is confirmed with '
+    'changed false and nothing is written; a timeout is unknown and never retried; a flood wait is rate_limited '
+    'with retry_after. A read-back reports the state. A channel\'s ban acts on its subscribers; comments are stopped '
+    'in its discussion group, a chat with its own ban list.')
+UNBAN_LIMITATION = ('Telegram only: lifts the ban of user in this supergroup, discussion group or channel after the '
+    'owner\'s exact confirmation. The person is not added back; they may rejoin by link or search. Rights, refusals, '
+    'changed false, unknown and the read-back as ban_member.')
+MEMBER_STATE_LIMITATION = ('Telegram only: one live read of user in this supergroup, discussion group or channel: '
+    'member, left or banned (with banned_until, null for forever), role and the channel\'s linked discussion group.')
 OPERATIONS = {
     'chat_info': _spec('read-live'),
     'list_participants': _spec('groups-read', fields=_page),
@@ -208,6 +229,11 @@ OPERATIONS = {
     MODERATION: _spec('groups-moderate', mutation=True, platforms=('telegram',), fields={
         'message_ids': _field('message_ids', required=True),
         'expected_revisions': _field('revisions', required=True)}, limitation=MODERATION_LIMITATION),
+    BAN: _spec('groups-moderate', mutation=True, platforms=('telegram',), fields={**_person,
+        'until': _field('ban_until'), 'forever': _field('boolean'),
+        'message_ids': _field('message_ids'), 'expected_revisions': _field('revisions')}, limitation=BAN_LIMITATION),
+    UNBAN: _spec('groups-moderate', mutation=True, platforms=('telegram',), fields=_person, limitation=UNBAN_LIMITATION),
+    MEMBER_STATE: _spec('groups-moderate', platforms=('telegram',), fields=_person, limitation=MEMBER_STATE_LIMITATION),
     'check_chat_link': _spec('groups-read', 'account', full_account=True, fields=_link,
         limitation='Passive live read of an invite or public link; no member list, inviter or description.'),
     'join_chat': _spec('groups-manage', 'account', mutation=True, full_account=True, fields=_link,
@@ -257,7 +283,7 @@ OPERATION_TOOLS = {
                     'promote_participant', 'demote_participant', 'leave_group', 'get_invite_link',
                     'revoke_invite_link', 'set_group_messages_admins_only', 'set_group_info_admins_only',
                     'set_slow_mode', 'set_join_approval', 'approve_join_requests', 'reject_join_requests', 'join_chat',
-                    MODERATION),
+                    MODERATION, BAN, UNBAN),
     'change_contacts': ('add_contact', 'delete_contact', 'block_contact', 'unblock_contact'),
     'read_contacts': ('list_contacts', 'get_contact', 'list_blocked', 'get_labels'),
 }
@@ -275,6 +301,7 @@ ADVANCED_ONLY = {
     HISTORY: 'an archive backfill request, not a chat or contact change',
     INSPECT_BUTTONS: 'a live read of one message\'s keyboard for a later press (ANYM-681); no risk-class tool reads chats',
     'get_profile': 'the owner\'s own account profile, not a contact',
+    MEMBER_STATE: 'a live read of one person\'s membership and ban state, which the ban preview runs (ANYM-935)',
     'update_profile': 'changes the owner\'s own profile seen by every contact; kept advanced',
 }
 
@@ -374,6 +401,8 @@ def operation_manifest(platform, *, provider=None):
             row['limitation'] = 'Unsupported: upstream global revoke can silently fallback to local deletion.'
         elif platform == 'whatsapp' and name == MODERATION:
             row['limitation'] = 'Unsupported: no WhatsApp moderation (moderation_unsupported); Telegram accounts only.'
+        elif platform == 'whatsapp' and name in BAN_FAMILY:
+            row['limitation'] = 'Unsupported: no WhatsApp ban (ban_unsupported); remove_participant is the WhatsApp action.'
         elif platform not in spec['platforms']:
             row['limitation'] = 'No implemented adapter for this provider-specific operation.'
         rows.append(row)
@@ -465,6 +494,8 @@ def parameter_format(platform, kind):
         'search_filter': 'one of ' + ', '.join(LIVE_FILTERS),
         'timestamp': 'ISO 8601 date and time with a UTC offset, such as 2026-10-22T08:00:00Z; from_time is inclusive, '
             'to_time exclusive',
+        'ban_until': ('RFC 3339 date and time with a UTC offset, such as 2026-10-22T08:00:00Z, 1 minute to 366 days '
+            'ahead; exactly one of until or forever: true'),
         'search_cursor': 'next_cursor of an earlier search_messages_live with the same account, chat_id and parameters',
         'label_ids': 'up to 20 unique label IDs of 1-64 letters, digits, _ or -, from get_labels'}.get(kind)
 
@@ -563,7 +594,7 @@ def _problem(platform, descriptor, value, field):
     if kind == 'search_filter':
         if not isinstance(value, str): return fail('type', 'string')
         return None if value in LIVE_FILTERS else fail('enum', allowed=list(LIVE_FILTERS))
-    if kind == 'timestamp':
+    if kind in ('timestamp', 'ban_until'):
         if not isinstance(value, str): return fail('type', 'string')
         return None if timestamp(value) else fail('format', parameter_format(platform, kind))
     if kind == 'search_cursor':
@@ -584,6 +615,31 @@ def timestamp(value):
     return parsed.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
 
 
+def ban_window(until, now=None):
+    """None when a ban end lies 1 minute to 366 days after now, else 'minimum' or 'maximum'."""
+    left = (datetime.fromisoformat(until.replace('Z', '+00:00')) - (now or datetime.now(timezone.utc))).total_seconds()
+    return 'minimum' if left < BAN_MIN_S else 'maximum' if left > BAN_MAX_DAYS * 86400 else None
+
+
+def _check_ban(output):
+    """ANYM-935: exactly one of until or forever: true; message_ids and expected_revisions together, one each."""
+    if output.get('forever') is False:
+        raise ParameterError(field_error('forever', 'enum', 'true, or until instead', [True]))
+    if ('until' in output) == ('forever' in output):
+        raise ParameterError(field_error('forever' if 'until' in output else 'until',
+                                         'unique' if 'until' in output else 'required', 'exactly one of until or forever: true'))
+    if 'until' in output and (reason := ban_window(output['until'])):
+        raise ParameterError(field_error('until', reason, parameter_format('telegram', 'ban_until')))
+    if ('message_ids' in output) != ('expected_revisions' in output):
+        missing = 'expected_revisions' if 'message_ids' in output else 'message_ids'
+        raise ParameterError(field_error(missing, 'required', parameter_format('telegram',
+                                         'revisions' if missing == 'expected_revisions' else 'message_ids')))
+    if 'message_ids' in output and len(output['expected_revisions']) != len(output['message_ids']):
+        short = len(output['expected_revisions']) < len(output['message_ids'])
+        raise ParameterError(field_error('expected_revisions', 'min_items' if short else 'max_items',
+                                         'one revision per message_ids item'))
+
+
 def live_cursor_binding(account, chat_id, parameters):
     """The account, operation, chat and every other normalized field a live-search cursor was issued for.
 
@@ -596,6 +652,7 @@ def validate_operation(platform, operation, parameters, *, provider=None):
     spec = operation_spec(operation, platform)
     # ANYM-934: WhatsApp has no moderation of other people's messages here; named, not a generic unsupported.
     if operation == MODERATION and platform != 'telegram': raise ValueError('moderation_unsupported')
+    if operation in BAN_FAMILY and platform != 'telegram': raise ValueError('ban_unsupported')  # ANYM-935
     if not _supported(platform, operation, spec, provider): raise ValueError('unsupported_operation')
     if parameters is None: parameters = {}
     if not isinstance(parameters, dict): raise ParameterError(field_error('parameters', 'type', 'object'))
@@ -624,7 +681,7 @@ def validate_operation(platform, operation, parameters, *, provider=None):
             else: output[name] = (value.strip() if (operation, name) == ('list_contacts', 'query') else phone_digits(value)[0] if descriptor['type'] == 'phone_number' else
                 chat_link_key(platform, value) if descriptor['type'] == 'chat_link' else
                 telegram_username(value) if descriptor['type'] == 'telegram_username' else
-                timestamp(value) if descriptor['type'] == 'timestamp' else value)
+                timestamp(value) if descriptor['type'] in ('timestamp', 'ban_until') else value)
         # Only a bounded identifier name is returned; the submitted value never is.
         allowed = 'only ' + ', '.join(fields) if fields else 'no parameters'
         for name in parameters:
@@ -642,6 +699,7 @@ def validate_operation(platform, operation, parameters, *, provider=None):
         for name, default in EDIT_DEFAULTS.items():
             if output.get(name, default) == default and type(output.get(name, default)) is type(default):
                 output.pop(name, None)
+    if operation == BAN: _check_ban(output)
     if operation == MODERATION and len(output['expected_revisions']) != len(output['message_ids']):
         short = len(output['expected_revisions']) < len(output['message_ids'])
         raise ParameterError(field_error('expected_revisions', 'min_items' if short else 'max_items',

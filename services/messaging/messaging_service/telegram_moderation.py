@@ -83,7 +83,6 @@ async def delete_member_messages(op):
     items = targets(op.job)
     if op.channel is None and op.basic_chat is None:
         refuse('unsupported_operation')
-    ids = [provider for _, provider in items]
     try:
         entity = await op.rpc(lambda: op.client.get_entity(op.peer))
     except ProviderRateLimited as error:
@@ -94,6 +93,13 @@ async def delete_member_messages(op):
     refusal = rights_refusal(entity)
     if refusal is not None:
         refuse(refusal[0], **refusal[1])
+    return await delete_targets(op, items)
+
+
+async def delete_targets(op, items):
+    """The one delete request and its read-back, after the rights check; ban_member (ANYM-935) runs it first."""
+    from .telegram_governor import ProviderRateLimited
+    ids = [provider for _, provider in items]
     attempted = False
 
     def delete():

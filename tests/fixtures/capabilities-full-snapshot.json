@@ -191,7 +191,7 @@
   "independent_key_permissions": true,
   "mutation_preview_digest_required": true,
   "new_permissions_inherited_by_existing_keys": false,
-  "operation_count": 64,
+  "operation_count": 67,
   "platform_counts_basis": "legacy_defaults_use_account_manifest_for_actual_support",
   "preview_accepts_request_id": true,
   "preview_digest_proves_owner_approval": false,
@@ -201,12 +201,13 @@
   "supported_by_account": {
    "telegram-demo": {
     "available_operations": [],
-    "count": 55,
+    "count": 58,
     "operations": [
      "add_contact",
      "add_participant",
      "approve_join_requests",
      "archive_chat",
+     "ban_member",
      "block_contact",
      "chat_info",
      "check_chat_link",
@@ -219,6 +220,7 @@
      "forward_message",
      "get_contact",
      "get_invite_link",
+     "get_member_state",
      "get_message_info",
      "get_profile",
      "get_reactions",
@@ -253,6 +255,7 @@
      "set_group_messages_admins_only",
      "set_slow_mode",
      "unarchive_chat",
+     "unban_member",
      "unblock_contact",
      "unmute_chat",
      "unpin_message",
@@ -315,7 +318,7 @@
    }
   },
   "supported_count_by_platform": {
-   "telegram": 55,
+   "telegram": 58,
    "whatsapp": 45
   },
   "tools": [

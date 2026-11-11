@@ -63,6 +63,33 @@ def test_operation_rest_and_mcp_match_exact_payload(method):
     assert store.calls == [(method, params), (method, params)]
 
 
+class BanStore(RecordingStore):
+    """A ban preview's archive draft, then the live get_member_state read the server adds to it."""
+    def preview_messenger_operation(self, token, **params):
+        self.calls.append((METHODS[1], params))
+        return {'operation': params['operation'], 'account': params['account'], 'chat_id': params['chat_id'],
+                'parameters': params['parameters'], 'moderation': {'person': {'state': 'unknown'}}}
+    def execute_messenger_operation(self, token, account, operation, chat_id='', parameters=None, request_id='', **_):
+        self.calls.append((operation, parameters))
+        return {'status': 'succeeded', 'result': {'data': {'state': 'left', 'banned_until': None, 'role': None,
+                                                           'linked_chat': None}}}
+
+
+# spec: ANYM-935
+def test_a_ban_preview_over_rest_and_mcp_adds_one_live_state_read():
+    store = BanStore()
+    params = {'account': 'synthetic', 'operation': 'ban_member', 'chat_id': 'chat_synthetic',
+              'parameters': {'user': '42', 'forever': True}}
+    with TestClient(create_app(store, ['testserver'])) as client:
+        rest = client.post('/v1/preview_messenger_operation', headers={'Authorization': 'Bearer synthetic-token'},
+                           json=params).json()
+        mcp = rpc(client, 'preview_messenger_operation', params).json()['result']['structuredContent']
+    for body in (rest, mcp):
+        assert body['moderation']['person']['state'] == 'left'
+    assert [call[0] for call in store.calls] == [METHODS[1], 'get_member_state'] * 2
+    assert store.calls[1][1] == store.calls[3][1] == {'user': '42'}
+
+
 # spec: ANYM-306
 @pytest.mark.parametrize('body', [b'\xff', b'\xff\xfe\x00', b'{"query": "\xc3\x28"}', b'{"query": ', b'[]', b'{"token": "x"}',
     b'{"limit": '+b'1'*4400+b'}'])

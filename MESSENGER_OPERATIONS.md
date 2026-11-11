@@ -449,7 +449,9 @@ python -m messaging_service set-messenger-operations --account telegram-demo --o
 
 Moderation acts on other people in the owner's name and cannot be undone: each call is destructive, needs the
 owner's exact confirmation of that call (the preview), acts on at most the targets it lists and is never retried
-when its outcome is unknown. It is Telegram only; on WhatsApp the operation answers `moderation_unsupported`.
+when its outcome is unknown. It is Telegram only; on WhatsApp `delete_member_messages` answers
+`moderation_unsupported` and `ban_member`, `unban_member` answer `ban_unsupported` (`remove_participant` stays the
+WhatsApp action).
 
 ### Deleting other people's messages (ANYM-934)
 
@@ -492,12 +494,62 @@ Each deletion the read-back confirms goes through the archive's provider-deletio
 purged within minutes and a content-free tombstone stays. This is the service-run deletion the card names.
 
 The operation ships opted out. Enabling it is one owner confirmation for the agent key's `groups-moderate`
-permission and the account opt-in; the moderation feature's ban story documents the command sequence for all three
-moderation operations. For one key and account (`--permissions` is the key's whole list: keep its other permissions):
+permission and the account opt-in; the command sequence for all the moderation operations is at the end of the
+ban section below.
+
+### Banning and lifting a ban (ANYM-935)
+
+`ban_member` bans one person from a supergroup, discussion group or channel (`chat_id`); `unban_member` lifts it.
+They are separate, explicit operations: no other operation hides a ban. Telegram's supergroup "remove" is a ban
+followed by an unban, and a failure between the two would leave a hidden ban, so `remove_participant` keeps refusing
+supergroups and channels; `ban_member` then `unban_member` is the explicit way to remove someone and let them back.
+
+`parameters`: `user`, the person's archive sender ID (`sender_id` from `get_messages` or search) of someone whose
+messages this chat's archive holds; they need not be a member now (spam bots post and leave). For `ban_member`
+exactly one of `until` (RFC 3339 with an offset, 1 minute to 366 days ahead) or `forever: true`, and optionally
+`message_ids` with `expected_revisions` (1-20 of that person's archived messages in this chat, with the checks of
+`delete_member_messages`). Both need `groups-moderate` (with `read`, because the preview shows archive data) and the
+account opt-in for the operation and for `get_member_state`, the live read the preview runs.
+
+The owner must be the creator or an admin with the `ban_users` right, and `delete_messages` when `message_ids` is
+given: else `missing_admin_right` with `evidence.missing_right`, or `not_admin`. Banning the owner, another admin or
+the creator is `target_protected` with `reason` `owner`, `admin` or `creator`: demote that person in the Telegram app
+first. A basic group or a private chat is `unsupported_chat_type`. Field refusals: `user` `sender_not_found`;
+`message_ids/<n>` `message_from_other_sender` (another person's message) besides the `delete_member_messages` ones.
+
+The preview names the person (`moderation.person`: display name, username if any, sender ID) and their current
+state, read live once (`member`, `left`, `banned until <UTC>`, `banned forever`; `not_banned` for an unban;
+`unknown` with `state_unavailable` when the read could not answer, such as `operation_disabled`), with `protected`
+when the ban would be refused; the chat and its type; for a ban the duration in words (`for 3 days 4 hours` or
+`forever`), the UTC end and the line that a ban removes the person and keeps them out; each listed message as
+`delete_member_messages` shows it. In a channel the ban acts on subscribers only: `channel_scope` says so and
+`discussion_group_chat_id` names the linked discussion group's chat ID, the chat where a ban stops comments (null
+when the key cannot read it or the archive does not collect it). The unban preview says the person is not added back
+and may rejoin by link or search. `preview_digest` binds the person, the chat, `until` or `forever` and the message
+IDs with their revisions; the live state is shown, not bound.
+
+Execution reads the chat and the person's participant state, deletes the listed messages first (one request and its
+read-back, so a ban failure never leaves the spam standing), then sends one `channels.EditBanned` with
+`view_messages` and the end (`unban_member`: empty rights), then reads the participant state back.
+`result.data` has `changed`, `ban_request` (`applied`, `not_needed`, `refused` with `provider_code`, `not_attempted`
+or `unknown`), `state` (`banned` or `not_banned`), `banned_until` (null for forever), `evidence` and, with messages,
+the `results` rows of `delete_member_messages`. A person already in the requested state is `confirmed` with `changed:
+false` and no ban request. An uncertain delete or a flood wait in the delete step sends no ban. A timeout is
+`unknown` and never retried: check with `get_member_state` (the receipt's `verify`). A flood wait before any request
+fails with `rate_limited` and `retry_after`; after the request it is `unknown` with `evidence.retry_after_s`. An end
+that came within 35 seconds before the request is sent fails with `operation_expired` (Telegram would read it as
+forever). Each ban and unban is a destructive live action on another person and needs the owner's exact confirmation.
+
+`get_member_state` (advanced, `groups-moderate`, `parameters.user`) is that live read on its own: `state` (`member`,
+`left`, `banned`), `banned_until`, `role` (`owner`, `creator`, `admin`, `member`), `chat_kind` and, for a channel,
+`linked_chat`.
+
+All the moderation operations ship opted out. For one key and account, after the owner's confirmation
+(`--permissions` is the key's whole list: keep its other permissions):
 
 ```sh
 python -m messaging_service set-key-permissions --key-id <credential-uuid> --permissions read read-live groups-moderate
-python -m messaging_service set-messenger-operations --account telegram-demo --operations delete_member_messages
+python -m messaging_service set-messenger-operations --account telegram-demo --operations delete_member_messages ban_member unban_member get_member_state
 ```
 
 ## Group restrictions and join requests
