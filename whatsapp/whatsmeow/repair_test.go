@@ -270,6 +270,9 @@ func TestRepairResumesAfterLastSeqAndAFinishedVersionDoesNotRunAgain(t *testing.
 		t.Fatal(err)
 	}
 	first := newRepairPass(s)
+	// repro: a loaded host, where every clock read is one second later.
+	clock := time.Unix(1700000000, 0)
+	first.now = func() time.Time { clock = clock.Add(time.Second); return clock }
 	first.tick(context.Background())
 	if first.lastError != "" || first.scanned != repairWindowSeqs || first.done {
 		t.Fatalf("first tick: scanned=%d done=%v err=%s", first.scanned, first.done, first.lastError)

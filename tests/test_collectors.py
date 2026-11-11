@@ -1590,7 +1590,7 @@ def test_telegram_poll_updates_replace_the_counts_and_an_older_observation_never
     assert w.state.apply(tg_poll_update((3,2,1),base+timedelta(minutes=4)))['outcome']=='poll_updated'
     assert tg_poll_state(store)[1]['chosen']==[1]
     # A replay of the capture (an older observation of its counts) changes nothing.
-    assert w.state.apply(tg_poll_capture())['outcome'] in ('duplicate','unchanged') and tg_poll_state(store)[0]=={0:3,1:2,2:1}
+    assert w.state.apply(tg_poll_capture(sent=datetime.now(timezone.utc).replace(microsecond=0)+timedelta(seconds=1)))['outcome'] in ('duplicate','unchanged') and tg_poll_state(store)[0]=={0:3,1:2,2:1}  # repro: the replay's capture lands one second later
     unknown=tg_poll_update((1,),base+timedelta(minutes=5),poll_id=999)
     assert w.state.apply(unknown)['outcome']=='poll_update_unknown' and w.state.poll_counts['poll_update_unknown']==1
     assert tg_poll_state(store)[2]==3
