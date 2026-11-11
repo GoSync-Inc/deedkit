@@ -216,7 +216,7 @@ config's `ocr_languages` codes map to Vision's (`eng+ind` to en-US and id-ID), a
 Tesseract. Vision's word boxes are tightened to their ink (`ocr.bounds: ink`) so
 the structure below groups rows as with Tesseract. Vision reports confidence 30,
 50 or 100. Bake-off on the mini, 11-11, four real Tokopedia screens, 31 expected
-strings: Tesseract 25, Vision 30; about 0.1 s per screen warm. Without the extra
+strings: Tesseract 27, Vision 30; 0.7-1.0 s per screen warm on the mini (first call about 8 s), Tesseract 1.3-1.9 s. Without the extra
 (Linux, CI) nothing changes. Roll back by installing the previous release.
 
 Before Tesseract, the screenshot is normalized on the host (`ocr.preprocess:
