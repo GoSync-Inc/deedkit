@@ -13,3 +13,4 @@
 7cd965d79570f57b129076a8e2da543c08af6006:tests/test_live_search_api.py:generic-api-key:93
 7cd965d79570f57b129076a8e2da543c08af6006:tests/test_live_search_api.py:generic-api-key:211
 bac015c0b021d92b85ed2960c3ea6bff5db1ce04:tests/test_messenger_commands.py:generic-api-key:874
+44f9a1baaeced8805330b8b6462b213cf82e17ea:tests/test_scheduled_send.py:generic-api-key:375

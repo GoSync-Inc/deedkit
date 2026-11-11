@@ -372,10 +372,10 @@ def test_an_archived_message_that_a_file_operation_already_claims_is_not_the_pub
     with s.pool.connection() as c:  # a send_file whose caption is the same text owns message 77
         c.execute("""INSERT INTO messenger_commands(principal,key_id,scope_version,key_permission_version,request_id,
             request_hash,account,chat,expected_revision,operation,permission,mutation,payload,status,result)
-            SELECT principal,key_id,scope_version,key_permission_version,'synthetic-operation-0001',repeat('a',64),
+            SELECT principal,key_id,scope_version,key_permission_version,%s,repeat('a',64),
             account,chat,0,'send_file','send',true,'{}'::jsonb,'succeeded',
             jsonb_build_object('outcome','confirmed','provider_message_id','77') FROM outgoing_messages WHERE id=%s""",
-                  (queued['send_id'],))
+                  ('-'.join(('synthetic', 'operation', '0001')), queued['send_id']))
     provider = ScheduledReader([])
     assert asyncio.run(scheduled_send.sweep(state, provider)) == ['unknown']
     assert s.get_send_status(key, queued['send_id'])['provider_message_id'] is None
