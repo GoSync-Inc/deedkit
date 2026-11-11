@@ -259,8 +259,8 @@ def refuse_duplicate(c, p, account, chat_id, request_id, text, format, policy, r
     failure = APIError('duplicate_scheduled', 409)
     fields = {'earlier_request_id': earlier['request_id']} if earlier['principal'] == p['id'] else {}
     fields.update(scheduled_message_id=earlier['scheduled_message_id'], next_action='check_scheduled_list_or_ask_owner',
-                  next_call={'tool': 'list_scheduled', 'arguments': {'account': account, 'chat_id': chat_id},
-                             'caller_supplies': []})
+                  next_call={'tool': 'execute_messenger_operation', 'arguments': {  # ANYM-929
+                      'account': account, 'operation': 'list_scheduled', 'chat_id': chat_id}, 'caller_supplies': ['request_id']})
     for name, value in fields.items():
         setattr(failure, name, value)
     raise failure
@@ -298,6 +298,26 @@ RETURNING = 'RETURNING id,account,chat,principal,key_id,status,schedule_at,sched
 # receipt commits (r1 M4). One lock orders the lookup-and-keep against the commit-and-replay.
 _pending = {}
 _pending_lock = threading.Lock()
+
+
+# ANYM-929: scheduled-list IDs an agent's confirmed cancel_scheduled is deleting, by (account, chat, ID), so the pushed
+# delete records the agent as the reason even when it lands before the cancel's receipt.
+_agent_cancels = {}
+AGENT_CANCEL_S = 300
+
+
+def expect_agent_cancel(account, chat, scheduled_id):
+    with _pending_lock:
+        cutoff = time.monotonic() - AGENT_CANCEL_S
+        for key in [key for key, at in _agent_cancels.items() if at < cutoff]:
+            del _agent_cancels[key]
+        if len(_agent_cancels) < PENDING_UPDATE_CAP:
+            _agent_cancels[(account, str(chat), str(scheduled_id))] = time.monotonic()
+
+
+def _cancel_reason(account, chat, scheduled_id):
+    at = _agent_cancels.get((account, str(chat), str(scheduled_id)))
+    return 'agent' if at is not None and at >= time.monotonic() - AGENT_CANCEL_S else 'owner_app'
 
 
 def _keep(account, update, ids):
@@ -396,7 +416,8 @@ def _apply(state, update):
                 matched.add(row['scheduled_message_id'])
                 provider_id = published.get(row['scheduled_message_id'])
                 changed += _settle(c, row['table'], row, 'sent', provider_id) if provider_id else \
-                    _settle(c, row['table'], row, 'scheduled_cancelled', reason='owner_app')
+                    _settle(c, row['table'], row, 'scheduled_cancelled',
+                            reason=_cancel_reason(state.account, update['chat'], row['scheduled_message_id']))
             return changed, matched
         for row in _rows(c, state.account, update['chat'], [str(update['id'])]):
             matched.add(row['scheduled_message_id'])

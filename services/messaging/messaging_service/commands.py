@@ -127,7 +127,7 @@ def _required_permissions(permission,operation,parameters=None,provider=None):
     values={permission}
     if operation in ('send_file','post_story'):  # ANYM-932: a story's upload is the key's own, as a send_file's
         values.update(('read','upload')+(('send',) if operation=='post_story' else ()) if isinstance(parameters,dict) and 'upload_id' in parameters else ('download',))
-    if operation in ('forward_message','delete_member_messages','ban_member','unban_member') or (operation,provider)==('vote_poll','whatsmeow'):values.add('read')  # ANYM-934, ANYM-315: its preview shows the messages / the archived poll
+    if operation in ('forward_message','delete_member_messages','ban_member','unban_member','list_scheduled','cancel_scheduled') or (operation,provider)==('vote_poll','whatsmeow'):values.add('read')  # ANYM-934, ANYM-315: its preview shows the messages / the archived poll
     return sorted(values)
 
 
@@ -237,6 +237,7 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
     if operation==LIVE_SEARCH and not chat_id:
         # ANYM-475: without a chat the live search spans every chat of the account.
         spec.update(target='account',full_account=True)
+    if operation=='list_scheduled' and not chat_id:spec.update(target='account')  # ANYM-929: DeedKit's own, archive only
     if operation==LIVE_SEARCH and chat_id and p['chat_ids'] is not None and chat_id not in p['chat_ids']:
         # A chat-scoped key learns nothing about chats outside its scope, existing or not.
         raise APIError('forbidden',403)
@@ -289,6 +290,7 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
         elif message_id or expected_revision:raise _empty(spec,chat_id,message_id,expected_revision)
     if operation in ('delete_member_messages','ban_member','unban_member','get_member_state'):from .member_ban import bind;bind(c,p,account,chat,operation,parameters,payload,saved)  # ANYM-934/935
     if operation in ('post_story','delete_story'):from .stories import bind as story;more_refs,more_chats=story(store,c,p,account,operation,parameters,payload,saved,verify_file=verify_file,retained_upload=retained_upload);refs+=more_refs;provider_chats+=more_chats  # ANYM-932
+    if operation=='cancel_scheduled':from .scheduled_manage import bind as scheduled;scheduled(c,p,account,chat,operation,parameters,payload,saved)  # ANYM-929
     if operation=='vote_poll' and provider=='whatsmeow':from .polls import bind_whatsapp_vote;bind_whatsapp_vote(c,payload,message,parameters['option_indices'])
     if operation==HISTORY and account_row['platform']=='telegram':
         anchor=parameters.get('before_message') or parameters.get('around_message')
@@ -394,6 +396,7 @@ def preview(store,c,p,account,operation,chat_id='',message_id='',expected_revisi
     if operation in ('delete_member_messages','ban_member','unban_member'):from .member_ban import shown as moderation;shown['moderation']=moderation(c,p,account,_chat(c,p,account,chat_id),operation,payload)
     from .scheduled_send import operation_preview;shown.update(operation_preview(operation,parameters))  # ANYM-464
     if operation in ('post_story','delete_story'):from .stories import shown as story;shown['story_preview']=story(payload)  # ANYM-932
+    if operation=='cancel_scheduled':from .scheduled_manage import shown as scheduled;shown.update(scheduled(c,account,payload))  # ANYM-929
     return serial({**payload,**shown,'permission':spec['permission'],'mutation':spec['mutation'],
         'required_permissions':payload['authorization_binding']['required_permissions'],
         'preview_digest':_digest(p,payload),'owner_approval_verified_by_server':False,

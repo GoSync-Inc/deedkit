@@ -38,6 +38,7 @@ from .collector_capture import (CAPTURE_WAITERS as CAPTURE_WAITERS,CAPTURE_WAIT_
 from .telegram_polls import PollCollector,PollProvider
 from .telegram_live_reads import LiveReadsCollector
 from .telegram_birthdays import BirthdayCollector,BirthdayProvider
+from .scheduled_manage import OPERATIONS as SCHEDULED_OPERATIONS,ScheduledCollector
 from .telegram_governor import LIVE_BUDGETS,LIVE_STATE,ProviderRateLimited,RequestGovernor
 from .operational import CONNECTION_ERRORS,collector_stop
 from .storage_admission import MEDIA_RESERVE_BYTES
@@ -690,7 +691,7 @@ CHAT_ATTEMPTS=3; CHAT_RETRY_DELAYS=(1,2,4)
 TOMBSTONE_SWEEP_SECONDS=60
 
 
-class TelegramCollector(LiveReadsCollector,CaptureCollector,MediaCollector,PollCollector,BirthdayCollector):
+class TelegramCollector(LiveReadsCollector,CaptureCollector,MediaCollector,PollCollector,BirthdayCollector,ScheduledCollector):
     state_class=CollectorState
     head_pages=HEAD_PAGES_PER_PASS
     _tops_trusted=True  # this pass may skip head pages by the catalog's tops (not after a failed discovery)
@@ -1236,6 +1237,7 @@ class TelegramCollector(LiveReadsCollector,CaptureCollector,MediaCollector,PollC
             job['_policy']=await asyncio.to_thread((live or self.state).policy)
             if job.get('operation')=='request_chat_history': return await self.chat_history(job)
             if job.get('operation')=='list_birthdays': return await self.list_birthdays(job)  # ANYM-919: archive only
+            if job.get('operation') in SCHEDULED_OPERATIONS: return await self.scheduled_operation(job)  # ANYM-929
             if job.get('operation') in NEW_CHAT_OPERATIONS:
                 answer=await self.provider.execute_operation(job)
                 await self.catalog_new_chat(job,answer)

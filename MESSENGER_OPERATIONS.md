@@ -804,6 +804,18 @@ provider request; `days_ahead` 0-31 (default 14). The active rule, the backgroun
 fields are in PEOPLE.md "Birthdays of active contacts". It adds nothing to any calendar. Enable it per account like
 any operation (`operations_enabled`) and grant the `list_birthdays` action to the agents that should read it.
 
+## Scheduled Telegram sends (ANYM-929)
+
+`list_scheduled` (read) and `cancel_scheduled` (mutation) are Telegram-only operations under the `send` permission;
+both also need `read` because they show message text. They are advanced operations, reached through
+`preview_messenger_operation` / `execute_messenger_operation` beside `send_file`. `list_scheduled` takes an optional
+`chat_id`: without it, DeedKit's own scheduled sends from the archive (no provider request, a chat-scoped key sees
+only its chats); with it, one live read of that chat's Scheduled messages with `made_by_deedkit` per message.
+`cancel_scheduled` takes `chat_id` and `scheduled_message_id`; its preview binds DeedKit's send of that ID and
+shows its text and time, and only DeedKit's own can be cancelled (`not_scheduled_here` for the owner's). Results,
+states and refusals are in SENDING.md "Listing and cancelling scheduled sends". Enable both per account
+(`operations_enabled`) and grant the `list_scheduled` and `cancel_scheduled` actions to the agents that send.
+
 ## Finding a Telegram contact by name (ANYM-673)
 
 `list_contacts` on a Telegram account takes an optional `query` besides `limit` and `offset`

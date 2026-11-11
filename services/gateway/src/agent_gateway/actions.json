@@ -17,6 +17,10 @@
   "block_contact": [
     "contacts-manage"
   ],
+  "cancel_scheduled": [
+    "read",
+    "send"
+  ],
   "chat_info": [
     "read-live"
   ],
@@ -101,6 +105,10 @@
   ],
   "list_participants": [
     "groups-read"
+  ],
+  "list_scheduled": [
+    "read",
+    "send"
   ],
   "list_topics": [
     "groups-read"

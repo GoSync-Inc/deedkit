@@ -10,6 +10,7 @@ import math
 import re
 import unicodedata
 
+from . import scheduled_manage as _scheduled
 from .field_errors import FIELD_NAME, field_error, one_per_field
 from .name_variants import normalize
 
@@ -186,6 +187,10 @@ OPERATIONS = {
     # ANYM-919: read from the archive, no provider request; a chat-scoped key sees its own chats' contacts only.
     'list_birthdays': _spec('contacts-read', 'account', platforms=('telegram',), fields={
         'days_ahead': _field('integer', default=14, minimum=0, maximum=31)}, limitation=BIRTHDAYS_LIMITATION),
+    # ANYM-929: DeedKit's scheduled Telegram sends (scheduled_manage.py); chat_id is optional for the list.
+    'list_scheduled': _spec('send', platforms=('telegram',), limitation=_scheduled.LIST_LIMITATION),
+    'cancel_scheduled': _spec('send', mutation=True, platforms=('telegram',), fields={
+        'scheduled_message_id': _field('scheduled_message_id', required=True)}, limitation=_scheduled.CANCEL_LIMITATION),
     'send_file': _spec('send', mutation=True, fields={
         'attachment_id': _field('attachment_id'),
         'upload_id': _field('upload_id'),
@@ -337,7 +342,7 @@ _LIVE_READ = 'a live chat read; no risk-class tool of this story reads chats (AN
 # Reached only through execute_messenger_operation, each with its reason.
 ADVANCED_ONLY = {
     'send_file': _SEND, 'forward_message': _SEND, 'send_poll': _SEND, 'send_contact': _SEND,
-    'send_location': _SEND,
+    'send_location': _SEND, 'list_scheduled': _scheduled.REASON, 'cancel_scheduled': _scheduled.REASON,
     'chat_info': _LIVE_READ, 'list_participants': _LIVE_READ, 'get_reactions': _LIVE_READ,
     'get_message_info': _LIVE_READ, 'get_pinned_messages': _LIVE_READ, 'list_topics': _LIVE_READ,
     'list_join_requests': _LIVE_READ, 'check_chat_link': _LIVE_READ,
@@ -551,6 +556,7 @@ def parameter_format(platform, kind):
             'ahead; Telegram holds the file in the owner\'s Scheduled messages until then',
         'story_audience': ('one of ' + ', '.join(STORY_AUDIENCES) + ': who can see the story; no default, the owner '
             'confirms it'),
+        'scheduled_message_id': _scheduled.ID_FORMAT,
         'search_cursor': 'next_cursor of an earlier search_messages_live with the same account, chat_id and parameters',
         'label_ids': 'up to 20 unique label IDs of 1-64 letters, digits, _ or -, from get_labels'}.get(kind)
 
@@ -617,11 +623,12 @@ def _problem(platform, descriptor, value, field):
         return None if value in MESSAGE_FORMATS else fail('enum', allowed=list(MESSAGE_FORMATS))
     pattern = {'upload_id': r'up_[a-f0-9]{32}', 'attachment_id': r'att_[a-f0-9]{32}', 'message_id': r'msg_[a-f0-9]{32}',
         'sha256': r'[a-f0-9]{64}', 'phone': r'\+?[1-9][0-9]{4,19}', 'button_fp': r'[a-f0-9]{32}',
-        'operation_id': r'op_[a-f0-9]{32}',
+        'operation_id': r'op_[a-f0-9]{32}', 'scheduled_message_id': _scheduled.SCHEDULED_ID.pattern,
         'contact_id': r'[1-9][0-9]{0,18}' if platform == 'telegram' else r'[0-9]{1,30}@(c\.us|lid)'}.get(kind)
     if pattern:
         if not isinstance(value, str): return fail('type', 'string')
-        if not re.fullmatch(pattern, value) or kind == 'contact_id' and platform == 'telegram' and int(value) >= 2**63:
+        if not re.fullmatch(pattern, value) or kind == 'contact_id' and platform == 'telegram' and int(value) >= 2**63 or (
+                kind == 'scheduled_message_id' and int(value) > 2**31 - 1):
             return fail('format', parameter_format(platform, kind))
         return None
     if kind in ('contact_ids', 'poll_options', 'poll_indices', 'label_ids', 'message_ids', 'revisions'):
