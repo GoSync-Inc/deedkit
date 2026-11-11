@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import stat
 
+from typing import Annotated
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -21,6 +23,23 @@ class Principal(Strict):
     permissions: list[str]
 
 
+PACKAGE = r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$"
+Package = Annotated[str, Field(pattern=PACKAGE, max_length=256)]
+Phrase = Annotated[str, Field(min_length=1, max_length=128)]
+
+
+class GuardRules(Strict):
+    """Additions to the built-in guard (guard.py). No field removes or disables a built-in rule."""
+    stop_phrases: list[Phrase] = Field(default_factory=list, max_length=500)
+    pin_phrases: list[Phrase] = Field(default_factory=list, max_length=500)
+    stop_ids: dict[Package, list[Annotated[str, Field(min_length=1, max_length=256)]]] = Field(
+        default_factory=dict, max_length=200)
+    protected_packages: list[Package] = Field(default_factory=list, max_length=500)
+    write_denied_packages: list[Package] = Field(default_factory=list, max_length=500)
+    stop_activities: list[Annotated[str, Field(pattern=r"^[A-Za-z0-9_.$/]+$", max_length=256)]] = Field(
+        default_factory=list, max_length=500)
+
+
 class Config(Strict):
     adb: str
     state_dir: str
@@ -33,6 +52,7 @@ class Config(Strict):
     ocr_languages: str = Field(default="eng", pattern=r"^[A-Za-z_]{3,16}(\+[A-Za-z_]{3,16}){0,7}$")
     devices: dict[str, str]
     principals: list[Principal]
+    guard: GuardRules = Field(default_factory=GuardRules)
 
 
 class Refused(Exception):
@@ -86,9 +106,9 @@ class Configuration:
         except (OSError, ValueError):
             raise Refused("configuration_unavailable", 503) from None
         if (config.adb, config.state_dir, config.devices, config.uiautomator2_jar, config.uiautomator2_jar_sha256,
-            config.ocr_command, config.ocr_languages) != (
+            config.ocr_command, config.ocr_languages, config.guard) != (
             self.initial.adb, self.initial.state_dir, self.initial.devices, self.initial.uiautomator2_jar, self.initial.uiautomator2_jar_sha256,
-            self.initial.ocr_command, self.initial.ocr_languages,
+            self.initial.ocr_command, self.initial.ocr_languages, self.initial.guard,
         ):
             raise Refused("runtime_configuration_changed", 503)
         if not authorization.startswith("Bearer "):

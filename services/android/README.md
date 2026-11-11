@@ -113,6 +113,46 @@ principal. Receipts, reservations and files are scoped to that backend identity.
 Grant both scopes to an agent that operates the phone. A read-only principal can
 inspect capabilities and its previously created receipts and files.
 
+## Run guard
+
+Every action of `android_run_flow` (inline YAML, saved flows of either stage,
+nested `runFlow`/`repeat`/`retry`, map actions) passes the guard in the worker
+(`guard.py`, ANYM-968). It stops the run before input is sent:
+
+- Tap rule: before `tapOn`, `doubleTapOn`, `longPressOn`, `tapElement`, a point tap
+  and a `swipe` whose start and end are within 10 px, the guard reads the node the
+  selector matched and the deepest node under the point, with their nearest
+  clickable ancestor and all descendants. Text, content-desc and resource-id entry
+  names are compared case-folded with amounts removed (`Bayar Rp45.000` reads
+  `bayar`) against the stop phrases: `pay`, `place order`, `bayar`, `pesan
+  sekarang`, `kirim`, `оплатить`, `отправить` and the rest that
+  `android_capabilities.guard` lists. A point with no node or no text is read by
+  OCR in a 400x240 px box when `ocr_command` is set; otherwise it stops.
+- Screen rule, before every action and after the last one: a protected package
+  (authenticators, password managers, Indonesian and Russian banks and wallets), a
+  configured stop activity, a PIN or payment-code prompt, or a visible password field.
+- Write-denied apps: in WhatsApp, Telegram, Signal, Messages, Gmail, Messenger and
+  the dialer every tap, type, key, swipe and `setText` stops; `launchApp`,
+  `clearState`, `openLink` and `openDeepLink` into one stop before they run.
+  Reading (`assertVisible`, `copyTextFrom`, `readList`, `readScreenText`) works.
+- Fail closed: an unreadable hierarchy, foreground, link target or point text stops
+  with `rule=unresolved_target`.
+
+A stop is definite: `state=stopped`, `stop_reason=guard`, `guard: {rule, matched,
+when, step_path}`, the steps that ran and an `observation` of the stop screen
+(compact hierarchy and screenshot `file_id`). On a protected, PIN, password or
+secure screen the observation keeps only the package name. The device lock is
+released and the phone stays on that screen: show it to the owner; never retry or
+route around a stop. `android_execute`, `android_observe` and `android_session` are
+not guarded.
+
+The host config can only add rules, in an optional `guard` object:
+`stop_phrases`, `pin_phrases`, `stop_ids` (package to exact resource-ids),
+`protected_packages`, `write_denied_packages` and `stop_activities`
+(`package/.Activity` or full class names). It has no field that removes or
+disables a built-in rule; changing it needs a service restart. Older service
+versions reject the `guard` key, so roll back the config with the executable.
+
 ## Execution and recovery
 
 1. Read capabilities and acquire a session for the chosen device.
@@ -277,7 +317,7 @@ and restart it.
 
 Use a saved `runFlow: {name: dismiss-known-dialog}` for a reusable handler of
 known dialogs. The service does not dismiss arbitrary permission or payment
-screens automatically. Input is a command list, without native `appId`/`---`
+screens automatically; the run guard stops at them (see Run guard). Input is a command list, without native `appId`/`---`
 headers, and checkpoints use the scalar form `- checkpoint: review`.
 
 ```yaml

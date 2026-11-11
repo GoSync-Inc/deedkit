@@ -51,7 +51,7 @@ def reference():
         'parameters': 'params maps UPPER_CASE names to {type: string|integer|boolean, default?, required?, enum?, max_length?}. Values substitute literally as ${NAME}. Existing string parameters work without declarations.',
         'continuation': 'A checkpoint returns runnable remaining_yaml with explicit historical map versions. Submit it under a new request_id after resolving the checkpoint. Returned runFlow groups may contain map, map_version and commands to retain their map context.',
         'versions': 'Every run records library.pins. Unversioned references resolve once at admission. stage=draft uses current drafts with published fallback. Explicit map_version and runFlow.version pin historical dependencies. Publication rejects stale floating dependencies.',
-        'effects': 'side_effects is advisory metadata (none, purchase, payment, send, account). The caller decides when user approval is required.',
+        'effects': 'side_effects is advisory metadata (none, purchase, payment, send, account). The caller decides when user approval is required. Independently, the run guard stops every run before a pay, order, confirm or send tap, on PIN, password and protected screens and on any input in a messenger (receipt state=stopped; rules in android_capabilities.guard).',
     }
 
 

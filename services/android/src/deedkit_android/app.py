@@ -13,6 +13,7 @@ from typing import Literal
 from .app_maps import compile_scenario, load, validate_map
 from .config import Configuration, Refused, Strict
 from .device import COMMANDS, Devices
+from .guard import Rules
 from .store import Store, identifier
 from .uiautomator import reference as ui_reference
 
@@ -166,6 +167,8 @@ def create_app(config_path):
                       "input_schemas": {name: schema.model_json_schema() for name, schema in SCHEMAS.items()},
                       "ui": {"engine": "uiautomator2", "configured": bool(devices.ui),
                              "reference_tool": "android_maestro", "batch_tool": "android_run_flow"},
+                      # Where a run stops (ANYM-968): built-in rules plus the host's additions.
+                      "guard": Rules(configuration.initial.guard.model_dump()).describe(),
                       # Compatibility key: the Maestro engine was removed (owner 11-11).
                       "maestro": {"configured": False, "removed": True, "engine": "uiautomator2"},
                       "session_policy": {"renew_on_activity": True, "release_explicitly": True,

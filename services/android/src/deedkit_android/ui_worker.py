@@ -1,8 +1,10 @@
 """Private UIA2 child. JSON lines are local IPC, never caller-supplied Python."""
 
 import atexit
+import functools
 import json
 import logging
+import math
 from pathlib import Path
 import re
 import signal
@@ -18,6 +20,7 @@ from uiautomator2.core import _jsonrpc_call
 from uiautomator2.exceptions import HTTPError as HTTPError, UiObjectNotFoundError
 
 from .config import Refused
+from .guard import POINT_TAP_PX, Guard, Rules, Stop
 from .uiautomator import SELECTORS, stop_script
 
 # Accessibility classes of editable fields (EditText subclasses report EditText).
@@ -150,12 +153,15 @@ def element_region(device, value, timeout):
     return region
 
 
-def execute(device, command, element_timeout_ms=5000, optional_timeout_ms=1000, ocr=None):
+def execute(device, command, element_timeout_ms=5000, optional_timeout_ms=1000, ocr=None, guard=None):
     from .app_maps import MAP_ACTIONS
     from .map_runtime import execute_map
+    if guard is not None:
+        # Screen and write rules before the action; the tap rule runs at each tap below.
+        guard.before(device, command)
     if isinstance(command, dict) and next(iter(command)) in MAP_ACTIONS:
         name, options = next(iter(command.items()))
-        return execute_map(device, name, options, execute)
+        return execute_map(device, name, options, functools.partial(execute, guard=guard), guard)
     name, value = next(iter(command.items())) if isinstance(command, dict) else (command, None)
     options = value if isinstance(value, dict) else {}
     timeout = options.get('timeout', optional_timeout_ms if options.get('optional') else element_timeout_ms)
@@ -186,6 +192,8 @@ def execute(device, command, element_timeout_ms=5000, optional_timeout_ms=1000, 
             target.set_text(value['value'], timeout=0)
         else:
             x, y = point(device, options['point']) if 'point' in options else target.center()
+            if guard is not None:
+                guard.tap(device, [(x, y)], None if 'point' in options else target.info)
             if name == 'longPressOn' or options.get('longPress'):
                 device.long_click(x, y)
             elif name == 'doubleTapOn':
@@ -253,8 +261,10 @@ def execute(device, command, element_timeout_ms=5000, optional_timeout_ms=1000, 
         shell(device, ['am', 'start', '-W', '-a', 'android.intent.action.VIEW', '-d', options.get('link', value)])
     elif name in {'swipe', 'scroll'}:
         if 'start' in options and 'end' in options:
-            device.swipe(*point(device, options['start']), *point(device, options['end']),
-                         duration=options.get('duration', 400) / 1000)
+            start, end = point(device, options['start']), point(device, options['end'])
+            if guard is not None and math.dist(start, end) <= POINT_TAP_PX:
+                guard.tap(device, [start, end])  # A swipe that barely moves is a tap.
+            device.swipe(*start, *end, duration=options.get('duration', 400) / 1000)
         else:
             device.swipe_ext(str(options.get('direction', 'UP')).lower(), scale=0.6,
                              duration=options.get('duration', 400) / 1000)
@@ -293,10 +303,17 @@ def main():
                 if device is None:
                     device = Device(*sys.argv[1:])
                 args = json.loads(line)
+                # Built-in rules always apply; the parent's host configuration may only add to them.
+                guard = Guard(Rules(args.pop('guard', None)), args.get('ocr'))
                 if args['command'] == '__hierarchy__':
                     result = {'xml': device.jsonrpc_call('dumpWindowHierarchy', (True, 50))}
+                elif args['command'] == '__guard__':
+                    guard.screen(device, when='after')
+                    result = {'success': True}
                 else:
-                    result = execute(device, **args)
+                    result = execute(device, guard=guard, **args)
+            except Stop as error:
+                result = {'error': error.code, 'guard': error.guard}
             except Refused as error:
                 result = {'error': error.code, **({'details': error.details} if hasattr(error, 'details') else {}),
                           **({'hint': error.hint} if getattr(error, 'hint', None) else {})}
