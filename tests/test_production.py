@@ -4849,6 +4849,7 @@ def test_every_halt_call_has_a_literal_code_of_the_table_and_the_table_no_unused
     # reads: scripts/seamless_release.py
     # reads: scripts/release_enroll.py
     # reads: scripts/release_copies.py
+    # reads: scripts/release_migrations.py
     calls, problems = halt_call_problems([(ROOT / path).read_text() for path in p.TOOL_FILES], p.HALTS)
     assert problems == [] and calls == HALT_CALLS
 
@@ -7589,6 +7590,7 @@ def test_a_snapshot_service_entry_that_is_not_a_mapping_removes_nothing(tmp_path
 # reads: scripts/seamless_release.py
 # reads: scripts/release_enroll.py
 # reads: scripts/release_copies.py
+# reads: scripts/release_migrations.py
 TOOL = {path: (ROOT / path).read_bytes() for path in p.TOOL_FILES}  # this checkout's tool files
 SYNTHETIC_VALUES = ("https://example.invalid/deedkit", "legacy-api:8080", "legacy-gateway:13240", "synthetic-router",
                     "synthetic-frontend", "synthetic-policy-secret")
@@ -7706,7 +7708,7 @@ class ToolHost(Deployer):
         spec = importlib.util.spec_from_file_location(f"installed_tool_{script.parent.name}", script)
         module = importlib.util.module_from_spec(spec)
         # Its tool_module() registers the release's tool modules; this checkout's entries return at teardown.
-        for name in ("release_enroll", "release_copies"):
+        for name in ("release_enroll", "release_copies", "release_migrations"):
             self.monkeypatch.setitem(sys.modules, name, sys.modules[name])
         spec.loader.exec_module(module)
         for name, value in vars(p).items():
@@ -7768,7 +7770,8 @@ def three_file_tool(verifier, manifest=None, extra=b'"""A synthetic third tool m
     files = candidate_tool(verifier)
     manifest = manifest or (b'TOOL_FILES = {"scripts/production.py": "production.py", "scripts/seamless_release.py": '
                             b'"seamless_release.py", "scripts/release_enroll.py": "release_enroll.py", '
-                            b'"scripts/release_copies.py": "release_copies.py", "scripts/tool_extra.py": "tool_extra.py"}')
+                            b'"scripts/release_copies.py": "release_copies.py", '
+                            b'"scripts/release_migrations.py": "release_migrations.py", "scripts/tool_extra.py": "tool_extra.py"}')
     source, count = re.subn(rb"(?ms)^TOOL_FILES = \{.*?\}$", manifest.replace(b"\\", b"\\\\"), files["scripts/production.py"])
     assert count == 1
     return {**files, "scripts/production.py": source, "scripts/tool_extra.py": extra}
@@ -7783,7 +7786,8 @@ def test_a_candidate_listing_a_third_tool_file_installs_it_deploys_with_it_and_r
     assert outcome["status"] == "tool-updated" and host.current_tool() == f"releases/{NEWEST}"
     release = host.tool / "releases" / NEWEST
     assert sorted(path.name for path in release.iterdir()) == ["production.py", "release_copies.py", "release_enroll.py",
-                                                               "seamless_release.py", "tool.json", "tool_extra.py"]
+                                                               "release_migrations.py", "seamless_release.py",
+                                                               "tool.json", "tool_extra.py"]
     assert p.read(release / "tool.json")["blobs"] == {path: git_blob(content) for path, content in host.files.items()}
     # The release's own list decides its layout, whatever the running tool lists: still an exact set.
     assert p.installed_tool()["sha"] == NEWEST
@@ -7838,7 +7842,8 @@ def test_a_candidate_that_drops_a_tool_file_the_running_tool_lists_installs_its_
     outcome = host.deploy()
     assert outcome["status"] == "tool-updated" and host.current_tool() == f"releases/{dropped}"
     assert sorted(path.name for path in (host.tool / "releases" / dropped).iterdir()) == [
-        "production.py", "release_copies.py", "release_enroll.py", "seamless_release.py", "tool.json"]
+        "production.py", "release_copies.py", "release_enroll.py", "release_migrations.py", "seamless_release.py",
+        "tool.json"]
     assert p.installed_tool()["sha"] == dropped and host.paused() is None
 
 
@@ -7863,7 +7868,8 @@ def test_a_tool_files_value_that_is_no_file_name_is_refused_and_retention_skips_
 def test_a_production_py_loaded_by_its_path_runs_with_the_release_enroll_py_beside_it(tmp_path, monkeypatch):
     for path, content in TOOL.items():
         (tmp_path / Path(path).name).write_bytes(content)
-    for name in ("release_enroll", "release_copies"):  # this checkout's entries return at teardown
+    # this checkout's entries return at teardown
+    for name in ("release_enroll", "release_copies", "release_migrations"):
         monkeypatch.setitem(sys.modules, name, sys.modules[name])
     def load():
         # Unregistered, as some readers load it (deedkit admin and calendar_rotate.py register it, others do not).
@@ -7885,7 +7891,8 @@ def test_a_production_py_loaded_by_its_path_runs_with_the_release_enroll_py_besi
 def test_a_production_py_loaded_by_its_path_runs_with_the_release_copies_py_beside_it(tmp_path, monkeypatch):
     for path, content in TOOL.items():
         (tmp_path / Path(path).name).write_bytes(content)
-    for name in ("release_enroll", "release_copies"):  # this checkout's entries return at teardown
+    # this checkout's entries return at teardown
+    for name in ("release_enroll", "release_copies", "release_migrations"):
         monkeypatch.setitem(sys.modules, name, sys.modules[name])
     def load():
         # Unregistered, as some readers load it (deedkit admin and calendar_rotate.py register it, others do not).
@@ -7902,6 +7909,30 @@ def test_a_production_py_loaded_by_its_path_runs_with_the_release_copies_py_besi
         module.copies_root(tmp_path, root=tmp_path / "volume" / "copies")
     (tmp_path / "release_copies.py").unlink()
     with pytest.raises(ImportError, match="release_copies.py is missing"):
+        load()
+
+
+# spec: ANYM-443
+def test_a_production_py_loaded_by_its_path_runs_with_the_release_migrations_py_beside_it(tmp_path, monkeypatch):
+    for path, content in TOOL.items():
+        (tmp_path / Path(path).name).write_bytes(content)
+    # this checkout's entries return at teardown
+    for name in ("release_enroll", "release_copies", "release_migrations"):
+        monkeypatch.setitem(sys.modules, name, sys.modules[name])
+    def load():
+        # Unregistered, as some readers load it (deedkit admin and calendar_rotate.py register it, others do not).
+        spec = importlib.util.spec_from_file_location("production_by_path", tmp_path / "production.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    module, migrations = load(), sys.modules["release_migrations"]
+    assert Path(migrations.__file__) == tmp_path / "release_migrations.py" and module.migrate_expand is migrations.migrate_expand
+    assert migrations.p.Refused is module.Refused and issubclass(module.MigrationRefused, module.Refused)
+    module.range_changes = lambda mirror, base, candidate, installed: ([], ["scripts/production.py"])  # read at call time
+    assert module.pause_reasons(tmp_path, "a" * 40, "b" * 40, {}) == [
+        "deploy tools changed (scripts/production.py); install them by hand (production.md)"]
+    (tmp_path / "release_migrations.py").unlink()
+    with pytest.raises(ImportError, match="release_migrations.py is missing"):
         load()
 
 

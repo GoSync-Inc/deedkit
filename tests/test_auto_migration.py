@@ -1799,3 +1799,19 @@ def test_the_calendar_ledger_and_identity_read_the_live_calendar_database(source
     reached = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True).stdout
     found = json.loads(p.live_lines(source, "calendar identity", p.IDENTITY_SQL + ";")[0])
     assert json.loads(reached) == found and found[1] == source_db
+
+
+# spec: ANYM-449
+def test_the_moved_migration_code_calls_the_production_names_a_test_patches(monkeypatch):
+    # W5-1d: migration planning lives in scripts/release_migrations.py; `production.bounded` patched is the one it calls.
+    calls = []
+    def bounded(argv, *, timeout, text):
+        calls.append((argv[:5], timeout, text))
+        return calls[-1][0] == ["docker", "exec", "-i", "-e", "PGAPPNAME=deedkit-migration-fail"], "a\n\nb\n"
+    monkeypatch.setattr(p, "bounded", bounded)
+    source = {"container": "synthetic-db", "owner": "synthetic", "database": "synthetic"}
+    assert p.live_lines(source, "read", "SELECT 1") == ["a", "b"]
+    with pytest.raises(p.MigrationRefused, match="could not be read"):
+        p.live_lines(source, "fail", "SELECT 1")
+    assert [call[0][4] for call in calls] == ["PGAPPNAME=deedkit-migration-read", "PGAPPNAME=deedkit-migration-fail"]
+    assert p.live_lines.__globals__["__file__"] == str(Path(__file__).resolve().parents[1] / "scripts" / "release_migrations.py")

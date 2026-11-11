@@ -100,9 +100,9 @@ Keep administration behind the existing Tailscale/OpenSSH route. CI needs no SSH
 key, tailnet enrollment, provider token or production database access.
 
 Install reviewed copies of the tool's files (`TOOL_FILES`: `scripts/production.py`,
-`scripts/seamless_release.py`, `scripts/release_enroll.py` and `scripts/release_copies.py`) from one `main`
-commit in the self-updating layout ("Deploy tool updates" below): `/usr/local/lib/deedkit/production.py`
-and `seamless_release.py` are symlinks into `current/`, `current` points at
+`scripts/seamless_release.py`, `scripts/release_enroll.py`, `scripts/release_copies.py` and
+`scripts/release_migrations.py`) from one `main` commit in the self-updating layout ("Deploy tool updates"
+below): `/usr/local/lib/deedkit/production.py` and `seamless_release.py` are symlinks into `current/`, `current` points at
 `releases/<sha>/`, everything owned by root and writable only by root.
 Use Python 3.12+, Git, Docker and Compose v2 on the Linux host. Do not execute
 the deployment tool from an unreviewed feature branch on the host.
@@ -3240,7 +3240,8 @@ Otherwise it:
 3. pauses with a reason when the range changes the SQL inventory (any `*.sql`,
    `services/*/migrations/**`) or a deploy tool (`scripts/production.py`,
    `scripts/seamless_release.py`, any other file the running tool's `TOOL_FILES` lists such as
-   `scripts/release_enroll.py` or `scripts/release_copies.py`, `tools/attest-verify/**`,
+   `scripts/release_enroll.py`, `scripts/release_copies.py` or `scripts/release_migrations.py`,
+   `tools/attest-verify/**`,
    `services/release-router/**`, `deploy/deedkit-autodeploy.service` and
    `.timer`) that is not installed yet (the running tool file, or the unit in
    `/etc/systemd/system/`, equals the candidate's; a host without the unit
@@ -3383,8 +3384,8 @@ them. Every check below reads that list from the release it checks (the
 candidate's blob for an update, the older release's file for a rollback), so a
 release may add a module; the two compatibility links stay the only links.
 Python takes `sys.path[0]` from the resolved script, and `production.py` loads
-its other listed modules (`release_enroll.py`, `release_copies.py`) by path from its own resolved
-directory, so all modules always come from one release directory, also for a
+its other listed modules (`release_enroll.py`, `release_copies.py`, `release_migrations.py`) by path from its
+own resolved directory, so all modules always come from one release directory, also for a
 reader that loads `production.py` by its path (deedkit admin,
 `calendar_rotate.py`, the inference worker), and every documented command and
 the unit keep working. `tool.json` is `{"sha", "blobs": {"scripts/production.py": <git
@@ -3466,14 +3467,15 @@ with the timer paused (`<mirror>` is `<plan A state>/deploy-source.git`):
 ```sh
 sha=<40-character main sha>; root=/usr/local/lib/deedkit; release=$root/releases/$sha
 sudo install -d -o root -g root -m 0755 $root/releases $release
-for f in production.py seamless_release.py release_enroll.py release_copies.py; do  # the commit's TOOL_FILES
+for f in production.py seamless_release.py release_enroll.py release_copies.py release_migrations.py; do  # TOOL_FILES
   sudo git -C <mirror> cat-file blob $sha:scripts/$f | sudo tee $release/$f >/dev/null
 done
-printf '{"sha": "%s", "blobs": {"scripts/production.py": "%s", "scripts/seamless_release.py": "%s", "scripts/release_enroll.py": "%s", "scripts/release_copies.py": "%s"}, "installed_at": "%s"}\n' \
+printf '{"sha": "%s", "blobs": {"scripts/production.py": "%s", "scripts/seamless_release.py": "%s", "scripts/release_enroll.py": "%s", "scripts/release_copies.py": "%s", "scripts/release_migrations.py": "%s"}, "installed_at": "%s"}\n' \
   $sha $(sudo git -C <mirror> rev-parse $sha:scripts/production.py) \
   $(sudo git -C <mirror> rev-parse $sha:scripts/seamless_release.py) \
   $(sudo git -C <mirror> rev-parse $sha:scripts/release_enroll.py) \
-  $(sudo git -C <mirror> rev-parse $sha:scripts/release_copies.py) $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  $(sudo git -C <mirror> rev-parse $sha:scripts/release_copies.py) \
+  $(sudo git -C <mirror> rev-parse $sha:scripts/release_migrations.py) $(date -u +%Y-%m-%dT%H:%M:%SZ) \
   | sudo tee $release/tool.json >/dev/null
 sudo chmod 0644 $release/*
 sudo python3 -B -E -s $release/production.py self-test     # {"self_test": "ok", "sha": "<sha>"}
