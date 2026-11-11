@@ -101,6 +101,10 @@ def arguments(tool, value, known_tools):
         # defaults; injecting new optional fields breaks older strict backends.
         if tool.get('name') == 'android_run_flow' and key in {'element_timeout_ms', 'optional_timeout_ms'}:
             continue
+        # ANYM-972: the agent's fields belong to one action each; a start-only default injected into a get or stop
+        # would be refused, so the backend alone applies them.
+        if tool.get('name') == 'android_agent':
+            continue
         if key not in result and "default" in prop:
             result[key] = deepcopy(prop["default"])
     return result

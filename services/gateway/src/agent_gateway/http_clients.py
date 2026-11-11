@@ -28,6 +28,7 @@ WAIT_ADMISSION = {
     ("android", "run_flow"): ("waits", lambda a: a.get("wait_s", 15) > 0),
     ("android", "execute"): ("waits", lambda a: a.get("wait_s", 15) > 0),
     ("android", "courier_chat"): ("waits", lambda a: a.get("wait_s", 15) > 0),  # ANYM-975
+    ("android", "agent"): ("waits", lambda a: a.get("wait_s", 0) > 0),  # ANYM-972: a get long-poll, wait_s <= 25
     ("android", "get_operation"): ("waits", lambda a: a.get("wait_s", 0) > 0),
     ("android", "observe"): ("waits", lambda a: True),
     # ANYM-532, ANYM-643: a phone or username recipient also waits, for its open_chat_by_* lookup.

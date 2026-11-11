@@ -53,7 +53,7 @@ def setup(tmp_path, scopes=SCOPES, backend_scopes=SCOPES, unavailable=False, int
         calls.append((module, operation, args))
         if module == 'android' and refusal is not None:
             return httpx.Response(422, json=refusal)
-        if module == 'android' and operation in {'execute', 'courier_chat'} and interrupted:
+        if module == 'android' and operation in {'execute', 'courier_chat', 'agent'} and interrupted:
             raise httpx.ReadTimeout('reply lost', request=request)
         if operation == 'observe':
             return httpx.Response(200, json={'elements': [{'text': 'Search'}], 'image': image or {
@@ -68,7 +68,7 @@ def test_android_tools_and_native_image_preserve_structured_screen(tmp_path):
     app, calls = setup(tmp_path)
     with TestClient(app) as client:
         names = {tool['name'] for tool in rpc(client, 'tools/list').json()['result']['tools']}
-        assert len(TOOLS) == 12 and set(TOOLS) <= names
+        assert len(TOOLS) == 13 and set(TOOLS) <= names
         result = rpc(client, 'tools/call', {'name': 'android_observe', 'arguments': {
             'device_id': 'home', 'session_id': 'session'}}).json()['result']
         assert not result.get('isError'), result

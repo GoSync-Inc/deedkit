@@ -5,6 +5,7 @@
   {"name": "agents_read_task_log", "read_only": true},
   {"name": "agents_start_task", "read_only": false},
   {"name": "agents_stop_task", "read_only": false},
+  {"name": "android_agent", "read_only": false},
   {"name": "android_capabilities", "read_only": true},
   {"name": "android_courier_chat", "read_only": false},
   {"name": "android_delete_file", "read_only": false},

@@ -134,11 +134,8 @@ class Download(FileRef):
 SCHEMAS = {
     "capabilities": Strict, "maestro": MaestroInfo, "observe": Observe, "execute": Execute, "get_operation": Receipt,
     "run_flow": RunFlow, "flows": Flows, "session": Session, "upload": Upload, "download": Download, "delete_file": FileRef,
-    "courier_chat": CourierChat,
+    "courier_chat": CourierChat, "agent": AgentCall,
 }
-# The local agent's operation joins SCHEMAS (and the gateway catalog, which test_device_service pins to it) with the
-# android_agent tool (ANYM-972); until then it is served here and described in android_capabilities.agent.
-OPERATIONS = {**SCHEMAS, "agent": AgentCall}
 # Where runs reach this service; the command line sets it from --host and --port.
 AGENT_URL = None
 READS = {"capabilities", "observe", "get_operation", "download", "maestro"}
@@ -183,7 +180,7 @@ def create_app(config_path, agent_url=None):
         # The stored secret names, read once and only when a flow holds a reference (ANYM-969).
         known = functools.cache(devices.secrets.packages)
         principal = configuration.authenticate(request.headers.get("authorization", ""))
-        if operation not in OPERATIONS:
+        if operation not in SCHEMAS:
             raise Refused("not_found", 404)
         permission = "android:read" if operation in READS else "android:control"
         if permission not in principal.permissions:
@@ -195,9 +192,9 @@ def create_app(config_path, agent_url=None):
                 raise Refused("request_too_large", 413)
         try:
             raw = json.loads(body)
-            args = OPERATIONS[operation].model_validate(raw).model_dump()
+            args = SCHEMAS[operation].model_validate(raw).model_dump()
         except ValidationError as invalid:
-            raise Refused("invalid_arguments", 422, field_errors(invalid, OPERATIONS[operation])) from None
+            raise Refused("invalid_arguments", 422, field_errors(invalid, SCHEMAS[operation])) from None
         except ValueError:
             raise Refused("invalid_arguments", 422, [{"field": "$", "reason": "format"}]) from None
         device = args.get("device_id")

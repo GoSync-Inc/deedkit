@@ -788,6 +788,9 @@ class Dispatch:
             if module == "android" and tool["operation"] in {"execute", "run_flow", "courier_chat"}:  # ANYM-975
                 error.detail.update(request_id=values["request_id"],
                                     next_action="read_android_get_operation_with_original_request_id")
+            if module == "android" and tool["operation"] == "agent":  # ANYM-972: read the run back, never start anew
+                error.detail.update(request_id=values["request_id"],
+                                    next_action="read_android_agent_get_with_original_request_id")
         elif error.code == "backend_unavailable":
             error.detail = unavailable(tool["operation"], getattr(error, "detail", None),
                                        phase="operation", read_only=True)
