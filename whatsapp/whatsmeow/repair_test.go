@@ -711,6 +711,10 @@ func TestRepairCaptureArrivingMidTickWaitsForAtMostOneRowRead(t *testing.T) {
 		t.Fatal("fixture rows lost their raw", withRaw)
 	}
 	p := newRepairPass(s)
+	// A loaded runner: every clock read below is a second later. Under -race the first 300 KB row alone outlasted
+	// the 200 ms slice, the tick ended before the second row and the capture never started (#916's PR run).
+	clock := time.Unix(1700000000, 0)
+	p.now = func() time.Time { clock = clock.Add(time.Second); return clock }
 	type result struct {
 		err     error
 		latency time.Duration
