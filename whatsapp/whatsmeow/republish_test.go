@@ -194,6 +194,8 @@ func TestRepublishCrashBetweenAppendAndProgressResumesAndTheSpoolHoldsTheEnvelop
 	// shared 200 ms slice and the setup tick ended with one envelope of two (#921's PR run).
 	clock := time.Unix(1700000000, 0)
 	count.now = func() time.Time { clock = clock.Add(time.Second); return clock }
+	// The setup's one tick covers both rows; the slice that bounds a tick is not what this test checks.
+	count.slice = time.Hour
 	// The process dies after append, before the progress write.
 	again.progress = func(context.Context, int64, []byte) error { return errors.New("crash") }
 	count.tick(context.Background())
