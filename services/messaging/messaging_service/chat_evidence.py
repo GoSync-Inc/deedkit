@@ -1,11 +1,16 @@
 """Coverage of the requested chats; traversal evidence is not provider completeness."""
 import logging
+from datetime import datetime,timedelta,timezone
 
 from .policy import scope_filter, targets
 from .search_query import valid_text
 
 # ANYM-756: one request_chat_history page, Telegram's maximum (messenger_operations.TELEGRAM_HISTORY_FIELDS).
 HISTORY_PAGE=100
+# ANYM-983: a history still loading with no successful page for this long is `stalled`, not `loading`.
+HISTORY_STALL=timedelta(minutes=15)
+# reason -> next_action of a stalled history: the collector is not trying, or it tries and no page lands.
+STALLS={'no_recent_attempt':'check_sync_status','no_successful_page':'wait_and_recheck'}
 
 
 def backfill(c):
@@ -79,7 +84,12 @@ def rows(c,p,chat_ids=None,accounts=None,chat_types=None):
         WHERE '''+where+' ORDER BY c.id',args).fetchall()
 
 
-def history(row,lower=None,upper=None):
+def stale(now,moment):
+    """True for a timezone-aware moment older than HISTORY_STALL at `now`; None, a naive or a future moment is not."""
+    return isinstance(moment,datetime) and moment.tzinfo is not None and now-moment>HISTORY_STALL
+
+
+def history(row,lower=None,upper=None,now=None):
     scanned=row['last_head_scan_at']
     gaps=[];floor=row['history_since'];complete=False;attempt=row['last_attempt_at']
     if row['platform']=='telegram':
@@ -100,15 +110,23 @@ def history(row,lower=None,upper=None):
         span=unverified_span(row['wa_progress'])
     error=row['last_error_code']
     if error:state='provider_unavailable' if error=='provider_unavailable' else 'rate_limited'
+    page=row['wa_scan_at'] if row['platform']=='whatsapp' and type((row['wa_progress'] or {}).get('history_exhausted')) is bool \
+        else row['last_scan_at'] if row['platform']=='telegram' else None
+    stall=None
+    if state=='loading':
+        # Only a page that is known and older than the bound, or no page and an attempt older than it, is evidence;
+        # nothing known, or a timestamp ahead of the clock, reads as loading (never an invented stall).
+        now=now or datetime.now(timezone.utc)
+        if stale(now,page) or page is None and stale(now,attempt):
+            stall='no_successful_page' if attempt is not None and not stale(now,attempt) else 'no_recent_attempt'
+            state='stalled'
     range_inside=complete and scanned is not None and not gaps and not row['synthetic'] and not error
     if floor is not None and (lower is None or lower<floor):range_inside=False
     # Only an explicit finite interval can be marked traversed. An open upper
     # bound includes changes after the last scan; an open lower bound does not
     # define the requested history floor even after provider exhaustion.
     if lower is None or upper is None or scanned is None or upper>scanned:range_inside=False
-    return {'state':state,'synthetic':row['synthetic'],'configured_since':floor,'last_successful_page_at':row['wa_scan_at']
-        if row['platform']=='whatsapp' and type((row['wa_progress'] or {}).get('history_exhausted')) is bool
-        else row['last_scan_at'] if row['platform']=='telegram' else None,
+    return {'state':state,'synthetic':row['synthetic'],'configured_since':floor,'last_successful_page_at':page,
         'last_head_scan_at':scanned,'last_attempt_at':attempt,
         'archived_through_provider_message_id':str(row['high_water']) if row['platform']=='telegram' and row['high_water'] else None,
         'older_page_before_provider_message_id':str(row['history_before']) if row['platform']=='telegram' and row['history_before'] else None,
@@ -117,7 +135,8 @@ def history(row,lower=None,upper=None):
         'requested_range_traversed':bool(range_inside),'full_history_verified':False,
         'older_edits_and_deletions_verified':False,
         # ANYM-813: the native catch-up's unverified span; not a gap and no answer caveat.
-        **({'unverified_span':span} if span else {})}
+        **({'unverified_span':span} if span else {}),
+        **({'reason':stall,'next_action':STALLS[stall]} if stall else {})}
 
 
 def history_pointer(c,p,row,h):
@@ -157,7 +176,7 @@ def chat_statuses(c,p,chat_ids,lower=None,upper=None,*,conflict_items=False):
     `history` (get_sync_status with a chat_id only)."""
     from .sync_status import _files,empty_files
     from .conflict_classes import grouped,listing,report
-    records=rows(c,p,chat_ids);result={}
+    records=rows(c,p,chat_ids);result={};now=datetime.now(timezone.utc)
     ids=[r['chat_id'] for r in records]
     if not ids:return result
     counts={r['chat']:r for r in c.execute('''SELECT chat,count(*) AS messages,
@@ -166,7 +185,7 @@ def chat_statuses(c,p,chat_ids,lower=None,upper=None,*,conflict_items=False):
     conflicts=grouped(c,'chat',ids)
     downloads,files=_files(c,{**p,'chat_ids':ids},group_by_chat=True)
     for row in records:
-        chat=row['chat_id'];h=history(row,lower,upper)
+        chat=row['chat_id'];h=history(row,lower,upper,now)
         count=counts.get(chat,{'messages':0,'oldest_message_at':None,'newest_message_at':None})
         open_by_class,active,historical=conflicts.get(chat,({},0,0))
         line=report(open_by_class)
@@ -186,6 +205,7 @@ def chat_statuses(c,p,chat_ids,lower=None,upper=None,*,conflict_items=False):
             'next_action':'check_provider_access' if h['last_error_code']=='provider_unavailable' else
                 'wait_for_provider_cooldown' if h['last_error_code']=='rate_limited' else
                 'inspect_chat' if line['attention'] else
+                h['next_action'] if h['state']=='stalled' else
                 'wait_for_history' if not h['history_traversal_complete'] else 'read_archived_history'}
     return result
 
@@ -213,7 +233,7 @@ def query_evidence(c,p,normalized,items,*,paged=False,include=True):
     # Named chats keep their own evidence; otherwise totals count only chats of the searched types.
     types=normalized.get('chat_types')
     records=rows(c,p,ids,accts,types if ids is None else None)
-    histories=[history(r,lower,upper) for r in records]
+    now=datetime.now(timezone.utc);histories=[history(r,lower,upper,now) for r in records]
     missing=ids is not None and bool(set(ids)-{r['chat_id'] for r in records})
     traversed=(ids is not None or p['chat_ids'] is not None) and bool(histories) and all(h['requested_range_traversed'] for h in histories) and not missing
     conflicts=attention=0
@@ -251,7 +271,7 @@ def query_evidence(c,p,normalized,items,*,paged=False,include=True):
         result.update(empty_fields=empty_fields(chat,chats,account,accounts,types),next_action='fix_filter')
     if include:
         result.update(chats_considered=len(records),chats_not_scanned=sum(h['state']=='not_scanned' for h in histories),
-            chats_loading=sum(h['state']=='loading' for h in histories),chats_with_gaps=sum(bool(h['gaps']) for h in histories))
+            chats_loading=sum(h['state'] in('loading','stalled') for h in histories),chats_with_gaps=sum(bool(h['gaps']) for h in histories))
         if ids is not None and len(ids)<=20:
             permitted=[r['chat_id'] for r in records]
             result['chats']=list(chat_statuses(c,p,permitted,lower,upper).values())

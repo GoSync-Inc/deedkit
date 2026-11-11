@@ -150,6 +150,15 @@ the operation's `read-live` permission gets the `traversal_incomplete` hint and
 no call. Complete, failed, synthetic and WhatsApp chats
 get neither (WhatsApp keeps its `gaps` tokens).
 
+A history that is still `loading` but has had no successful page for 15 minutes reports `state`
+`stalled` (ANYM-983) with a fixed `reason` and `next_action`: `no_recent_attempt` (the collector has not
+tried inside the bound; `next_action` `check_sync_status`) or `no_successful_page` (it tries and no page
+lands; `next_action` `wait_and_recheck`). The evidence is `last_successful_page_at` older than the bound, or,
+with no page ever recorded, an old `last_attempt_at`; nothing known, or a timestamp ahead of the clock, stays
+`loading`. `gaps`, `provider_unavailable`, `rate_limited`, `not_scanned` and the complete states win over it.
+`get_sync_status` with a chat and the `coverage` of reads show the same block; `chats_loading` counts a
+stalled chat and `empty_reason` stays `history_loading`. Nothing is repaired or re-read for the caller.
+
 `get_messages` (and a `search_messages` naming one `chat`) adds the same to
 `result_evidence.history_hint`: `{coverage: unknown, reason:
 traversal_incomplete, next_call}`, or `reason` `not_scanned`/`empty_archive`

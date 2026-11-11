@@ -27,7 +27,7 @@ _WAIT_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_WAITS)
 OPERATION = 'search_messages_live'
 # empty_reason values of chat_evidence.query_evidence for an archive answer that may be missing messages.
 THIN = frozenset(('history_loading', 'history_not_scanned', 'history_has_gaps', 'no_matches_in_partial_archive'))
-HISTORY_STATES = frozenset(('gaps', 'loading', 'not_scanned'))
+HISTORY_STATES = frozenset(('gaps', 'loading', 'stalled', 'not_scanned'))
 HISTORY_CHATS = 5
 LIVE_CHAT_TYPES = ('private', 'group', 'channel')
 PLAN_DEGRADED = frozenset(('query_timeout', 'service_busy', 'service_unavailable'))  # store.access 503 codes
