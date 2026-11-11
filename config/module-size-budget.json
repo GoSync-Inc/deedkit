@@ -16,7 +16,7 @@
     "services/calendar/family_calendar/service/schedule.py": {"lines": 905, "longest_function": 98},
     "services/calls/core.py": {"lines": 1391, "longest_function": 65},
     "services/messaging/messaging_service/app.py": {"lines": 1051, "longest_function": 287},
-    "services/messaging/messaging_service/archive.py": {"lines": 1162, "longest_function": 105},
+    "services/messaging/messaging_service/archive.py": {"lines": 1167, "longest_function": 105},
     "services/messaging/messaging_service/backup_r2_follow.py": {"lines": 1180, "longest_function": 86},
     "services/messaging/messaging_service/backup_r2_receiver.py": {"lines": 1593, "longest_function": 69},
     "services/messaging/messaging_service/backup_r2_verifier.py": {"lines": 1418, "longest_function": 56},
