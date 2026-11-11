@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	"google.golang.org/protobuf/proto"
@@ -256,6 +257,12 @@ func TestRepublishStopsOnLostLeaseOrDisconnectAndPublishesNothing(t *testing.T) 
 	}
 	consumeSpool(t, s)
 	count, again := newLinkedPasses(s)
+	// A loaded runner: every clock read below is a second later. Under -race the first row alone could outlast the
+	// 200 ms slice, and the setup tick ended before the count finished.
+	clock := time.Unix(1700000000, 0)
+	count.now = func() time.Time { clock = clock.Add(time.Second); return clock }
+	// The setup's one tick covers the count; the slice that bounds a tick is not what this test checks.
+	count.slice = time.Hour
 	connected := true
 	count.active = func() bool { return connected }
 	again.rebuild = func(r repairRow) (string, republishItem) {

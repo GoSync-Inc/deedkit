@@ -10,7 +10,7 @@ from messaging_service.event_delivery import dispatch_hints
 from messaging_service.module_events import validate_event
 from messaging_service.store import APIError
 from messaging_service.subscriptions import match_subscriptions
-from test_module_events import SOURCE, beat, bound, call_event, emit, module_hints, publish
+from test_module_events import SOURCE, beat, bound, call_event, emit, empty_module_journal, module_hints, publish
 
 PERMISSIONS = ['read', 'subscription-write', 'subscription-ack']
 
@@ -18,11 +18,7 @@ PERMISSIONS = ['read', 'subscription-write', 'subscription-ack']
 @pytest.fixture()
 def modules(seeded):
     """An empty module journal and no dispatcher heartbeat (as test_module_events' fixture)."""
-    store = seeded[0]
-    with store.pool.connection() as c:
-        c.execute('TRUNCATE module_events,module_source_health CASCADE')
-        c.execute('UPDATE module_event_counter SET value=0 WHERE id=1')
-        c.execute("DELETE FROM component_heartbeats WHERE component='dispatcher'")
+    empty_module_journal(seeded[0])
     return seeded
 
 

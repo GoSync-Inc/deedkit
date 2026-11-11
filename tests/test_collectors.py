@@ -1,7 +1,7 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-from datetime import datetime,timezone
+from datetime import datetime,timedelta,timezone
 import json
 import os
 from pathlib import Path
@@ -267,7 +267,7 @@ def test_telegram_channel_difference_fetch_logs_chat_count_and_timing_only(capsy
         self_bot=False
         def get(self,entry):return NS(id=entry,hash=99) if entry!=777 else None
         def extend(self,users,chats):pass
-    hashes=Hashes();sent=datetime(2026,1,1,10,0,tzinfo=timezone.utc)
+    hashes=Hashes();sent=datetime.now(timezone.utc)-timedelta(seconds=7770)
     def channel_message(i):
         return types.Message(id=i,peer_id=types.PeerChannel(4242),date=sent,message='synthetic private text')
     def difference(final,*ids):
@@ -317,7 +317,12 @@ def test_telegram_channel_difference_fetch_logs_chat_count_and_timing_only(capsy
     assert all(set(event)==keys for event in events)
     assert events[0]['oldest_age_s']>0 and events[4]['oldest_age_s']>0 and events[3]['oldest_age_s'] is None
     assert events[6]['elapsed_ms'] is None and all(isinstance(event['fetch_ms'],int) for event in events)
-    assert 'synthetic private text' not in out and '4242' not in out and '777' not in out
+    # The raw channel ids never appear. The measured numbers are left out of that check: a count of milliseconds or the age
+    # of a message can hold the digits 4242 or 777 by chance, and the age moves with the clock.
+    measured={'elapsed_ms','fetch_ms','oldest_age_s'}
+    logged='\n'.join(json.dumps({k:v for k,v in json.loads(line).items() if k not in measured})
+        if '"telegram_channel_difference"' in line else line for line in out.splitlines())
+    assert 'synthetic private text' not in out and '4242' not in logged and '777' not in logged
 
 
 # spec: ANYM-840
