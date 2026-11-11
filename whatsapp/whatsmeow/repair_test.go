@@ -270,6 +270,11 @@ func TestRepairResumesAfterLastSeqAndAFinishedVersionDoesNotRunAgain(t *testing.
 		t.Fatal(err)
 	}
 	first := newRepairPass(s)
+	// The first tick covers the whole window however slow the host: every clock read below is a second later
+	// (a loaded runner), and the slice that bounds a tick is not what this test checks.
+	clock := time.Unix(1700000000, 0)
+	first.now = func() time.Time { clock = clock.Add(time.Second); return clock }
+	first.slice = time.Hour
 	first.tick(context.Background())
 	if first.lastError != "" || first.scanned != repairWindowSeqs || first.done {
 		t.Fatalf("first tick: scanned=%d done=%v err=%s", first.scanned, first.done, first.lastError)
