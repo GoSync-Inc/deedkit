@@ -14,7 +14,7 @@ for recovery and route routine changes through this tool.
 
 Confirmed production incidents follow [incident recovery](incident-recovery.md)
 and AGENTS.md section 2: restore the affected path first, then finish deferred
-review and records before other tasks. A compatible service-only recovery does
+records before other tasks. A compatible service-only recovery does
 not wait for a schema migration, unrelated service updates, fresh full backups
 or a restore drill. Main/CI/artifact verification, candidate inspection, locks,
 active-call checks and session/state preservation still apply. A restart of the
@@ -62,8 +62,8 @@ auto-merge is ever disabled, `gh pr merge` cannot queue a pull request: it calls
 Never update it by a PUT of the file: the live ruleset holds fields GitHub added
 that the file lacks (for example `require_extra_approval_for_unattributed_changes`,
 `dismissal_restriction`, `required_reviewers`), and such a PUT may reset them.
-A change merges into `deploy/main-ruleset.json` first (Astra r1, process.md
-section 2); an administrator then applies the same one value to the live state:
+A change merges into `deploy/main-ruleset.json` first (no review, AGENTS.md
+section 5); an administrator then applies the same one value to the live state:
 GET, change that value, PUT, read back. The example sets the merge queue's
 `max_entries_to_build` (ANYM-626, PR #420); edit the `jq` filter for another value:
 
@@ -654,8 +654,8 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
    daily verified backup as its restore point. A store with no daily backup running keeps a restore point
    anyway: a PostgreSQL database, unattended, its pre-migration copy (Database copies), by hand
    `copy-database` first. A critical release needs the backup gate above (a fresh backup and its
-   restore proof, never a reused daily backup), an undo and one Astra review round of
-   its plan (harness process.md section 2, reviews.md Rounds 7). The release kit or PR names each file's tier.
+   restore proof, never a reused daily backup) and an undo; no plan review (owner 11-11,
+   AGENTS.md section 5). The release kit or PR names each file's tier.
 
    Accepted risk (owner 10-29 and 11-04, quoted above): if a non-critical `migrate` destroys or
    corrupts data, a restore returns the database to the latest daily backup (about 24 hours old at most
@@ -701,7 +701,7 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
 Owner 11-04 (item 3 above): backups only in critical cases. Two tiers. A release takes the tier of its
 highest-tier pending migration file, changed role file or step.
 
-- Critical (the backup gate, an undo and one Astra round on the plan first): a statement that deletes
+- Critical (the backup gate and an undo first): a statement that deletes
   or rewrites existing rows or drops stored data. DELETE, UPDATE, MERGE, TRUNCATE, INSERT ... ON CONFLICT
   DO UPDATE; DROP TABLE, COLUMN, SCHEMA or MATERIALIZED VIEW; a DROP ... CASCADE whose dependents include
   a table, a column or anything the author cannot list; ALTER COLUMN ... TYPE or SET EXPRESSION that
@@ -722,9 +722,9 @@ highest-tier pending migration file, changed role file or step.
   a plain INSERT; comments, ANALYZE and `SET LOCAL`; grants and REVOKE; a `DO` block that only grants, revokes
   or checks a precondition.
 
-The tier decides the backup and the plan review only. Expand, then contract
+The tier decides the backup only. Expand, then contract
 (`.claude/rules/migrations.md`) still keeps a DROP, RENAME or narrowing out of a release whose running
-code uses the old shape; role SQL keeps its Astra r1 in its PR; the active-call check and the release
+code uses the old shape; the active-call check and the release
 order stay. The tier is computed from the file (ANYM-743): `risk_class` in the candidate's
 `migration_rollout.py` (the calendar copy for `schema_vN.sql`) names a statement non-critical only in
 the forms listed above and everything else, text it cannot tokenize included, critical; the deploy pause
@@ -733,7 +733,7 @@ classifier failed reads `manual` with no tier: treat it as critical). It reads s
 expression calls: a DEFAULT, CHECK or `CREATE TABLE AS` may call a function that already exists. The rehearsal
 sees what such a call does on the copy (a moved write counter, row count or column number); a call that first
 runs after the release is seen by neither. A `-- Risk tier:` header is a note
-for the reviewer and cannot lower the computed tier; to take a critical statement out of a release,
+for the reader and cannot lower the computed tier; to take a critical statement out of a release,
 split it into its own file. Until
 ANYM-675 ships, the deployer still copies before every unattended range, because its rehearsal runs on
 the copy; that copy is automatic and holds no one.
@@ -1355,7 +1355,7 @@ What that means for them:
 - Eviction stays the owner's opt-in: `--apply` stays out of the Compose commands until the owner adds it. Plan A changes
   images and labels, never commands, mounts or credentials.
 
-The host change is no part of a merge. It is a production operation plan (one Astra review), run outside a cold-archive pass
+The host change is no part of a merge. It is a production operation, run outside a cold-archive pass
 (`docker logs --since 1h deedkit-file-lifecycle-cold-archive-1`), as a hand release like "Enrollment is a hand release",
 because the configuration digest changes and autodeploy otherwise halts with `configuration_drift`:
 
@@ -1887,8 +1887,8 @@ order, outside an active call:
 7. After a fresh verified backup, `purge-deleted --apply`: the point of no return for past
    deletions. `--apply` drains every due mark and exits non-zero while marks stay pending
    (contention or failures); run it again.
-Step 7 takes the deletion gate of harness process.md section 2 (a fresh verified backup, an undo, one Astra
-review); step 5's worker runs the DELETEs docs/DATA-POLICY.md names.
+Step 7 takes the deletion gate of harness process.md section 2 (a fresh verified backup and an undo; no
+review, AGENTS.md section 5); step 5's worker runs the DELETEs docs/DATA-POLICY.md names.
 The purge is irreversible: rolling back code or schema does not bring content back; only a
 restore of a backup taken before it does, and only while that backup is kept (about two days of
 daily verified backups). `purge-disable` stops the worker without a deploy.
@@ -2009,7 +2009,7 @@ stays at 128 MB, the value prod already runs, so this change adds only pg_stat_s
 each its own card.
 
 The change is not `production.py`'s: the tool never promotes `db` (and runs Compose with `--no-deps`, so no deploy
-recreates it). It is one reviewed production operation, none of it during an active call:
+recreates it). It is one production operation, none of it during an active call:
 
 All commands run in `/opt/personal-os-probe` with the project's files in place (they reference `./private/...`
 relative to the first file, so never run Compose on copies). `F` is exactly `production.py`'s own Compose arguments
@@ -2148,7 +2148,7 @@ other condition (a `-p tcp` jump carries only part of the traffic). A rules file
 chain twice, or after rules that use it, fails as `table_differs:filter` or `table_differs:v6` (restoring the late
 declaration empties the chain).
 
-Safe order for any firewall change (as root; the plan is Astra-reviewed, none runs during an active call):
+Safe order for any firewall change (as root; none runs during an active call):
 1. Back up the files that change: copy `/etc/ufw/before.rules`, `before6.rules` and `after.init` (if it exists) with
    `cp -a` to a dated directory under `/root`, and write `iptables-save` and `ip6tables-save` next to them.
 2. Build the new files without touching the old ones: `python3 scripts/inference_egress_check.py rules --mini-ip
@@ -2486,7 +2486,7 @@ mini's receive side. The measurement is a hypothesis test with an `inconclusive`
    outcome is `inconclusive`. Put the two rates, the evidence, the date and the hour on the card once.
 6. Only a confirmed container path is fixed: `com.docker.network.driver.mtu: "1280"` on `inference_egress` in
    `deploy/compose.enrichment.yaml` (bridge name unchanged), applied by stopping the worker with the normal `stop`,
-   recreating that network and starting it, under the section 2 gates with an Astra-reviewed plan; undo is the previous
+   recreating that network and starting it, under the section 2 gates; undo is the previous
    compose file and a recreate. Repeat the container probe in the same hour: at least 5 times the earlier rate, else
    revert and record `inconclusive`.
 
@@ -2596,7 +2596,7 @@ text with `--recordings-resolver`). `RECORDINGS_RESOLVER` (the host's DNS resolv
 inference-only text of before. `recordings_egress_check.py verify` prints `ok` or `<pair> <code>`; the boot receipt gets a
 `recordings` key (`not_installed` until the resolver is configured, then it decides `ok`).
 
-Order for the root activation (the plan is Astra-reviewed, none runs during an active call): install the updated
+Order for the root activation (none runs during an active call): install the updated
 `firewall_persist.py`, `inference_egress_check.py`, `recordings_egress_check.py` to `/usr/local/lib/deedkit/` FIRST (the old
 inference verifier would read the composed hook as `table_differs:raw`); then the ANYM-693 "Safe order" steps with the new
 block and hook; `verify` of all three scripts must print `ok`; only then start `recordings-api`. To remove: stop
@@ -2755,8 +2755,8 @@ mounted private configuration, the digest of the candidate policy (so a replaced
 project, the plan A gateway and the HTTP gateway, each in its own directory with its own files). Recomputing the plan gives the same digest
 only while none of them changed; `--apply` refuses a different `--plan-digest` (`plan_changed`).
 
-*Apply (ANYM-746).* `enroll --module <module> --sha <sha> --apply --plan-digest <plan_digest>` performs exactly the plan a
-reviewer approved, as root, through the release machinery `deploy` uses. Refusals (exit 2, nothing written) are the plan's
+*Apply (ANYM-746).* `enroll --module <module> --sha <sha> --apply --plan-digest <plan_digest>` performs exactly the plan
+printed for that digest, as root, through the release machinery `deploy` uses. Refusals (exit 2, nothing written) are the plan's
 codes plus `plan_changed` (the recomputed digest, or the manifest, differs), `enrollment_unfinished` (an
 `enrollment.json` that is not undone, or an unfinished apply or HTTP attempt, exists), `configuration_changed` (the
 configuration drifts from the current release before the run) and `active_call`. An external network the manifest does not
@@ -2799,10 +2799,9 @@ a higher revision (it removes the module), stops the module's services and remov
 the enroll tag stay). Autodeploy stays paused: a SHA prepared with the module can never be prepared again, so deploys
 resume at the next newer green main SHA once the pause is removed.
 
-*Review sequence.* The manifest pull request is reviewed as code like any change under `deploy/` (the review-protocol
-signal grep already matches `deploy/modules/`; Astra r1 when it adds grants or outside egress). After it merged, the plan
-output for the real host is a production operation plan and gets its own Astra r1 (harness reviews.md, Rounds 7); the apply
-step is bound to the approved digest.
+*Sequence.* The manifest pull request merges like any change under `deploy/` (the review-protocol signal grep already
+matches `deploy/modules/`; no review, AGENTS.md section 5). After it merged, the plan output for the real host is a
+production operation; the apply step is bound to the plan's digest.
 
 *Autodeploy.* When a deploy finds a manifest in its range for a module the host does not run, or a configuration that
 differs from the recorded digests only by an enrollment, it pauses with `enroll_required: <module>: production.py enroll
@@ -3627,7 +3626,7 @@ no service reads that file, so the enforced policy never changes.
 An agent runs `key issue`, `key extend`, `key revoke`, `profile tools` and their `undo` under AGENTS.md section 2 and
 the harness process.md section 2 access gate. A profile's tool list never gives a principal more than its grants, so a
 tool within the grants of the owner's own agents on that profile is an own-agent grant (the journal's before-state,
-read-back, `undo`); a profile with any other principal takes Astra r1. A tool that sends, calls, ACKs, pairs, starts or
+read-back, `undo`); a profile with any other principal takes the access gate's backup, read-back and undo (no review, AGENTS.md section 5). A tool that sends, calls, ACKs, pairs, starts or
 stops a provider session or changes an allowlist is added only on the owner's exact words (AGENTS.md section 1). Every write subcommand follows these rules
 (tests/test_deedkit_admin_rules.py proves each):
 

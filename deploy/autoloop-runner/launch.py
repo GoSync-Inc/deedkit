@@ -286,8 +286,7 @@ def logins(now, minimum, run=call):
 
 def prompt(intent, card):
     return (f'Read and follow {MOUNT}/control/common.md and {MOUNT}/control/autoloop-build.md. '
-            f'Intent: {intent}. Card: {card}. In this container there is no Codex: run each review round as an Opus '
-            'subagent; the controller\'s Astra review on the host is the review of record.')
+            f'Intent: {intent}. Card: {card}.')
 
 
 def run_argv(name, image_name, env_names, control=None, tty=False, remove=True, proxy=PROXY):

@@ -1,36 +1,10 @@
 # Review protocol
 
-Who reviews what is in harness `process.md` section 5; DeedKit's three questions are in
-[AGENTS.md](../../AGENTS.md) section 5.
-The procedure (routing, the packet, the rounds, the verdict, the Codex budget, the pull request
-lines) is harness `reviews.md`; this document holds DeedKit's values for it.
-
-## Packet
-
-- An Astra task starts with the three fixed questions of AGENTS.md section 5 (DeedKit's filled-in
-  copy of harness `process.md` section 5), verbatim.
-- A code packet names the deployed versions for question 3: the production SHA, the host
-  `production.py` SHA, the schema and the installed gateway (read-only `production.py status`,
-  or from the orchestrator).
-- `specs.md`: `scripts/spec_impact.py --body-file <body>` lists the specs with a mark and a flag
-  suggestion; both only help the author choose.
-- Fable product review prompt: docs/operations/prompts/fable-product-review.md.
-
-## Report and verdict
-
-Never downgraded as broken failure isolation: a fail-closed stop of call audio, collection or
-backup is itself a failure.
-
-## Rounds
-
-Process text here is AGENTS.md, CLAUDE.md, `.claude/`, `docs/operations/` and TIDEN-CI.md;
-AGENTS.md stays within 1,000 words.
-
-For confirmed production recovery only, AGENTS.md section 2 and
-[incident recovery](incident-recovery.md) move independent review and plan
-ceremonies after restoring the affected path. Required CI and green-main artifact
-verification remain before promotion. Finish deferred reviews and any fixes
-before unrelated work; this changes ordering, not the findings that must be fixed.
+No review on any path (AGENTS.md section 5, owner 11-11): no Astra, Fable, Codex, plan or card
+review and no Diff read. A pull request merges on green required checks with a failing-first test and
+the line `Review record: none (owner 11-11: no reviews)`; the merge keeper and the autoloop controller
+enqueue it with no approval. This document holds DeedKit's pull request lines: the change-path grep,
+the host-format rule and the autoloop protected paths.
 
 ## Codex budget
 

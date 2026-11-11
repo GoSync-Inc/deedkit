@@ -3,15 +3,12 @@ name: Merge keeper
 # pull request go to the job summary, and nothing is written to GitHub. The acting keeper is the Mac mini's launchd
 # job, because an enqueue with this GITHUB_TOKEN starts no merge_group run and would stall the queue for its 60-min
 # check timeout. The hourly run fails when the mini's heartbeat (repository variable MERGE_KEEPER_HEARTBEAT) is older
-# than 20 minutes, so a dead mini shows up as a red run. pull_request_review runs this file from the pull request's
-# merge ref: it is safe only because the job holds read permissions and no credential, so an acting (token) mode
-# must not keep that trigger. Undo: disable this workflow (gh workflow disable).
+# than 20 minutes, so a dead mini shows up as a red run. No review trigger: the keeper reads no reviews (owner 11-11).
+# Undo: disable this workflow (gh workflow disable).
 on:
   schedule:
     - cron: '*/5 * * * *'
     - cron: '17 * * * *'
-  pull_request_review:
-    types: [submitted]
   workflow_dispatch:
 permissions:
   contents: read
@@ -26,14 +23,14 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read  # checkout of main's keeper script
-      pull-requests: read  # open pull requests, reviews, comments, queue state
+      pull-requests: read  # open pull requests, keeper comments, queue state
       checks: read  # required check runs on each head
       actions: read  # failed jobs of a dequeued group run
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
-          ref: main  # main's script, also on a pull_request_review run
+          ref: main  # main's script
       - name: Decide for every open ship pull request (writes nothing)
         env:
           GH_TOKEN: ${{ github.token }}

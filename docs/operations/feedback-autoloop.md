@@ -1,7 +1,7 @@
 # Feedback autoloop (ANYM-568)
 
 Feedback from the owner's own agents runs the harness loop to production with no human step:
-triage, card, reviews, build, merge queue, autodeploy and status back on the feedback item. This
+triage, card, build, merge queue, autodeploy and status back on the feedback item. This
 document is the loop's boundary (AGENTS.md section 2, Override of harness tiden.md Card intake
 step 1, owner 10-26). Changing it is an OWNER change.
 
@@ -30,16 +30,12 @@ The loop builds and merges a card only when all hold:
 
 - a Ready defect, improvement or feature card of at most 8 SP from an owner-agent cluster;
 - not an epic; no `review/` branch (no criterion edit);
-- no OWNER change path (the PR's `Change path:` line and its review), and the real diff at the
+- no OWNER change path (the PR's `Change path:` line), and the real diff at the
   PR's exact head, renames and deletions included, hits neither the change-path signal grep nor
   the autoloop protected paths (both in docs/operations/review-protocol.md; that list is the one
   list, used as written);
-- required checks green, `Autoloop:` and `Spec:` lines present, and, when the diff touches a
-  review path (`REVIEW_PATHS` in `scripts/autoloop.py`: send, call and ACK code, collector and
-  provider-session code, keys, access policy, role SQL; owner review cut 11-09, D56), the
-  controller's own Astra review of that exact head and card text is APPROVE with no blocking or
-  major finding (the worker's review rounds do not count). Any other clean head is approved as it
-  stands, bound to that head and card text. Build workers never merge; the controller puts that head
+- required checks green, `Autoloop:` and `Spec:` lines present. No review on any path (owner
+  11-11): a clean head is approved as it stands, bound to that head and card text. Build workers never merge; the controller puts that head
   only into the merge queue.
 
 Anything else stays in the orchestrator queue; the item's note or the daily report says why.
@@ -98,8 +94,7 @@ add. Autodeploy classifies the release again before it migrates.
 
 Config defaults (owner-set): 20 items per principal per day into triage; 24 reader runs a day;
 5 card and 3 build launches a day; 2 card and 2 build workers in flight; 12 worker hours a day
-(card 2 h, build 4 h each, reserved before the start); one relaunch per card; Codex reviews also
-obey the Codex line (review-protocol.md). An interrupted or unknown run keeps its reservation; an
+(card 2 h, build 4 h each, reserved before the start); one relaunch per card. An interrupted or unknown run keeps its reservation; an
 unknown launch is reconciled from `superset workspaces list` by its stable name, never retried. A
 build reserves its card's lane and expected paths and waits while another live intent, an open PR
 or a pushed branch of a live workspace touches them (details: ANYM-569, ANYM-572).
@@ -122,15 +117,15 @@ at all: its cluster waits for the orchestrator.
 The worker writes one card, only on the projection's branch `proposal/autoloop-card-c<hash>`. A
 relaunch keeps that branch. Right after the spec exists, the worker runs `autoloop.py bind <intent>
 --card ANYM-n`. From then on, `hold ANYM-n` stops this worker and any relaunch. The card has
-`Feedback:` and `Source: autoloop <principal>` lines. The worker runs the reviews by kind and fills
+`Feedback:` and `Source: autoloop <principal>` lines. The worker runs no review (owner 11-11) and fills
 `Ready:` "asked by agent <principal> via feedback <id> (AGENTS.md autoloop override)". It
 dispatches the ready merge only when `tiden branch merge-preview` shows its one card and nothing
 else, then reads the merge back. It runs `autoloop.py gate <intent>` before each Tiden write and
 before the dispatch. It ends with `autoloop.py finish <intent>`. When no Ready card comes of it, two commands record why, and both
 pass the gate first:
 
-- `autoloop.py decline <intent> --reason not-needed|covered|out-of-scope|unclear` (a Fable
-  reject): the items become `declined`.
+- `autoloop.py decline <intent> --reason not-needed|covered|out-of-scope|unclear` (the worker's
+  own judgment): the items become `declined`.
 - `autoloop.py large <intent>` (an epic, over 8 SP, or a branch that holds more than its card):
   the items keep `received` with "queued: large card, built by the orchestrator".
 
@@ -158,10 +153,8 @@ writes no item note: its reason is in the orchestrator's queue of the daily repo
 **For the owner.** With `live: true`, a Ready card from your own agents' feedback is built by a
 worker and merged with no step of yours only when all of this holds at the PR's exact head: the
 change path is AUTO or AUTO+review, the real diff touches no change-path signal, protected path,
-existing test or path outside what the card reserved, the card text is unchanged, the
-controller's own Astra review of that head approves it where the diff touches a review path
-(sends, calls, collector sessions, keys or access; none elsewhere, owner review cut 11-09), and
-both required checks are green. Then
+existing test or path outside what the card reserved, the card text is unchanged, and both
+required checks are green (no review on any path, owner 11-11). Then
 the PR goes into the merge queue and autodeploy ships it; nothing is enabled after deploy.
 Anything else is parked: it never merges and shows in the orchestrator's queue of the daily
 report. An OWNER path, grant or other owner item found while building ends the build with
@@ -175,8 +168,7 @@ hold).
 card launches: post-merge audit, controller, new launches (live only), deploy read. When the
 audit pauses the loop, the rest of the stage is skipped. A failed GitHub or Superset read ends the
 tick with exit 1 and no heartbeat (so `status` reports it) and does not stop the card stage; a
-failed receipt probe reads as deploy `unknown`; a failed git step of a review parks that PR as
-"review failed".
+failed receipt probe reads as deploy `unknown`.
 
 **Launch.** A finished card worker with no outcome bound the card, and its cluster is still from
 an owner agent (provenance is checked here, at launch only). The card is not held, no item of it is
@@ -194,8 +186,8 @@ Unpushed local work of other workers is invisible here.
 **The worker.** A Superset workspace `autoloop-build-anym-<n>` whose terminal runs the container
 runner's launcher with the intent and the card ID (below); the worker's prompt names copies of
 `~/deedkit-orchestrator/briefs/autoloop-build.md` (outside Git) and common.md, the intent and the
-card ID, nothing else (no brief template, no start). It builds as the harness says, with its own
-review rounds. The PR carries `Autoloop: <intent>`, `Spec: ANYM-n` and `Change path: AUTO…` lines.
+card ID, nothing else (no brief template, no start). It builds as the harness says, with no review
+(owner 11-11). The PR carries `Autoloop: <intent>`, `Spec: ANYM-n` and `Change path: AUTO…` lines.
 It runs `gate` before every push and never merges, arms or enqueues. It hands in no verdict. It
 ends with `finish`, after `large` (outside the envelope) or `decline --reason` when it builds
 nothing.
@@ -218,21 +210,15 @@ someone else armed it, or when any check fails:
 - every changed name is inside the build's reserved paths and outside every other live build's
   reservation and every other open PR's files.
 
-Then, only when the diff touches a review path (`REVIEW_PATHS`), the controller reviews the head
-itself; any other clean head is approved at once, bound to that head and card digest. Each attempt (a new head, a changed card text, a
-restart) has its own ID and files under `~/.deedkit/autoloop/reviews/<intent>/`; a detached
-`autoloop.py review-run` checks that GitHub's PR ref is exactly that head and runs
-`review-codex.sh astra --risk <fixed reason>` on a clean checkout of it with the controller's own
-task (the card text as data). Its result counts only when head, attempt and card digest match the current attempt, so a
-review that ends after a push or a card change approves nothing. Over the Codex line or a parallel
-review: a new attempt later. Round cap, no verdict, CHANGES REQUIRED, a blocking or major finding,
-or no result after 75 minutes: parked.
+No review on any path (owner 11-11): a clean head is approved at once, bound to that head and card
+digest. Intents parked before 11-11 for a review (`review lost`, `review failed`, `review round cap`,
+`review: changes required`) stay parked like any parked intent, in the orchestrator's queue.
 
 **Arming.** An approved head waits for both required checks (`checks / verify`, `CI gate`, as in
 deploy/main-ruleset.json) to be SUCCESS on it. The head and card digest go into `approved.json`
 first; then GraphQL `enqueuePullRequest(expectedHeadOid)` puts the PR into the merge queue bound to
 that head (the ruleset squashes). No auto-merge request is left: a push takes the PR out of the
-queue, and a new head or a changed card is reviewed again. Disarm is dequeue, `--disable-auto`,
+queue, and a new head or a changed card is checked again. Disarm is dequeue, `--disable-auto`,
 read back; a failure keeps the PR counted as armed (tick exit 1). A PR that GitHub refuses to
 enqueue (a conflict) is not parked: each tick tries again and exits 1 until the orchestrator holds
 or closes it. The parked reason (fixed wording) and up to 20 paths stay on the intent for the
@@ -288,9 +274,8 @@ directory, Docker socket or login directory); the one mount is a read-only contr
 - **Agent.** The agent CLI runs non-interactively (`claude -p`, no saved session) and ends after
   its last answer; the launcher stops the container at the 4-hour build limit. Every wait of the
   launcher on a child process (docker, gh, the attached build client) has a time bound; a child
-  past it is killed and reaped for at most 5 s. There is no Codex in the image: the
-  worker's own review rounds run as an Opus subagent (its prompt says so), and the controller's
-  Astra review of a review-path head on the host (above) stays the review of record.
+  past it is killed and reaped for at most 5 s. There is no Codex in the image and
+  no review runs (owner 11-11).
 - **Gate and ends.** Inside the container `autoloop.py gate|finish|decline|large` work through the
   control directory and an outbox file inside the container: `gate` reads the gate file, which
   the launcher rewrites from the host state every 30 s; a stop there (`PAUSE`, a held card, a

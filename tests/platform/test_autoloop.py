@@ -1602,7 +1602,7 @@ H1, H2 = 'b' * 40, 'c' * 40
 MERGE_BASE = 'd' * 40
 BUILD = 'autoloop-build-anym-30'
 BODY = f'Autoloop: {BUILD}\nSpec: ANYM-30\nChange path: AUTO+review (code)\n'
-SENDS = 'services/messaging/messaging_service/send_intent.py'  # on a review path: the controller reviews it
+SENDS = 'services/messaging/messaging_service/send_intent.py'  # a send path: no review either (owner 11-11)
 
 
 def ready(n, text=CARD_TEXT, status='Backlog'):
@@ -1650,22 +1650,6 @@ def finished_build(a, status='finished', review_path=False):
     intent(a, BUILD, 'ANYM-30', status, [D1])
     autoloop.put(a, dict(autoloop.intents(a)[BUILD], lane='messaging',
                          paths=['services/messaging/groups.py', 'tests/test_groups.py'] + [SENDS] * review_path))
-
-
-def reviewed(a, head=H1, word='APPROVE', blocking=0, major=0, code=0, at=NOW):
-    """The controller's own review of `head` has run and left its result."""
-    card = autoloop.card_digest(ready(30))
-    autoloop.put(a, dict(autoloop.intents(a)[BUILD], review={'head': head, 'pr': 7, 'started_at': triage.stamp(at),
-                                                             'card': card, 'attempt': 'a1b2c3d4'}))
-    paths = autoloop.review_paths(a, BUILD, head, 'a1b2c3d4')
-    paths['dir'].mkdir(parents=True, exist_ok=True)
-    triage.save(paths['result'], {'head': head, 'attempt': 'a1b2c3d4', 'card': card, 'exit': code, **({'verdict': {
-        'verdict': word, 'blocking': blocking, 'major': major, 'minor': 0}} if code == 0 else {})})
-
-
-def review_files(a, head=H1):
-    """The files of the review attempt the controller recorded last."""
-    return autoloop.review_paths(a, BUILD, head, autoloop.intents(a)[BUILD]['review']['attempt'])
 
 
 def enqueued(fakes):
@@ -1773,13 +1757,12 @@ def test_reservations_are_released_on_merge_close_decline_drop_and_a_vanished_wo
 @pytest.mark.parametrize('case', [
     'workflow', 'scripts', 'lockfile', 'conftest', 'agents', 'migration', 'content signal', 'deleted',
     'rename into protected', 'changed test', 'test helper', 'no patch', 'too large',
-    'review major', 'review failed', 'outside reservation', 'reserved by open PR', 'criterion edit', 'owner path',
+    'outside reservation', 'reserved by open PR', 'criterion edit', 'owner path',
     'autoloop line', 'spec line', 'card epic now'])
 def test_the_controller_parks_a_pr_outside_the_envelope_at_its_exact_head(tmp_path, case):
     a = tmp_path / 'autoloop'
     a.mkdir(mode=0o700)
     finished_build(a, review_path=True)
-    reviewed(a, major=1 if case == 'review major' else 0, code=3 if case == 'review failed' else 0)
     body = {'criterion edit': BODY + 'Tiden branch: review/anym-30-x\n',
             'owner path': BODY.replace('AUTO+review (code)', 'OWNER (AGENTS.md)'),
             'autoloop line': BODY.replace(BUILD, 'autoloop-build-anym-31'),
@@ -1798,8 +1781,7 @@ def test_the_controller_parks_a_pr_outside_the_envelope_at_its_exact_head(tmp_pa
              'test helper': [changed_file('tests/helpers.py')],
              'no patch': [dict(changed_file('services/messaging/blob.bin'), patch=None)],
              'too large': [changed_file(f'services/messaging/f{n}.py') for n in range(300)],
-             'outside reservation': [changed_file('services/messaging/send.py', 'modified')],
-             'review major': [changed_file(SENDS, 'modified')], 'review failed': [changed_file(SENDS, 'modified')]}.get(
+             'outside reservation': [changed_file('services/messaging/send.py', 'modified')]}.get(
         case, [changed_file('services/messaging/groups.py', 'modified'), changed_file('tests/test_groups.py')])
     fakes = Fakes(open_prs=[build_pr(body=body)] + ([{'number': 5, 'id': 'PR_5', 'headRefName': 'someone-else'}]
                                                     if case == 'reserved by open PR' else []))
@@ -2014,13 +1996,12 @@ def test_the_controller_reviews_an_additive_migration_pr_and_parks_a_grant_on_an
     finished_build(a)
     autoloop.put(a, dict(autoloop.intents(a)[BUILD], paths=[MIGRATION, ROLE, 'tests/test_widget_notes.py']))
     files, texts = sql_change([(MIGRATION, EXPAND)], [(ROLE, 'GRANT SELECT ON widget_notes TO messaging_gateway;\n')])
-    fakes, started = Fakes(open_prs=[build_pr()]), []
+    fakes = Fakes(open_prs=[build_pr()])
     fakes.compares = {H1: files + [changed_file('tests/test_widget_notes.py')]}
     fakes.blobs = {f['sha']: texts[(f['filename'], H1)] for f in files}
     fakes.contents = {(ROLE, MERGE_BASE): texts[(ROLE, MERGE_BASE)]}
-    done, failed = autoloop.controller(a, cfg(), snap(ready(30)), NOW, fakes.gh, fakes.prs,
-                                       lambda *args: started.append(args))
-    assert (done, failed) == ({BUILD: 'reviewing'}, []) and started == [(a, BUILD, H1)]
+    done, failed = autoloop.controller(a, cfg(), snap(ready(30)), NOW, fakes.gh, fakes.prs)
+    assert (done, failed) == ({BUILD: 'armed'}, []) and len(enqueued(fakes)) == 1  # no review on any path, owner 11-11
     # The classifier read the compared blobs of the PR's head and the role file at the merge base, from GitHub.
     reads = {c[1][1] for c in fakes.calls if c[0] == 'gh' and re.search('/(contents|git/blobs)/', c[1][1])}
     assert reads == {f"repos/{autoloop.REPO}/git/blobs/{f['sha']}" for f in files} | \
@@ -2046,18 +2027,12 @@ def test_a_clean_pr_is_armed_for_its_exact_head_and_a_new_push_is_disarmed_and_c
     fakes = Fakes(open_prs=[build_pr(green=False)])
     fakes.compares = {H1: [changed_file(SENDS, 'modified'),
                            changed_file('tests/test_groups.py')]}
-    tiden, started = snap(ready(30, status='Active')), []
+    tiden = snap(ready(30, status='Active'))
 
     def tick(at=NOW):
-        return autoloop.controller(a, cfg(), tiden, at, fakes.gh, fakes.prs, lambda *args: started.append(args))[0]
+        return autoloop.controller(a, cfg(), tiden, at, fakes.gh, fakes.prs)[0]
     assert autoloop.controller(a, dict(cfg(), live=False), tiden, NOW, fakes.gh, fakes.prs)[0] == \
-        {BUILD: 'waiting'}  # live: false reviews and arms nothing
-    # The controller starts its own review of the exact head; the task is its own text, the card as data.
-    assert tick() == {BUILD: 'reviewing'} and started == [(a, BUILD, H1)]
-    task = review_files(a)['task'].read_text()
-    assert f'PR #7 at exactly head {H1}' in task and 'Expected paths: services/messaging/groups.py' in task
-    assert tick(NOW + timedelta(minutes=30)) == {BUILD: 'reviewing'} and len(started) == 1
-    reviewed(a)
+        {BUILD: 'waiting'}  # live: false arms nothing
     assert tick() == {BUILD: 'waiting for checks'} and enqueued(fakes) == []  # armed only on green checks
     fakes.prs[0]['commits'] = build_pr()['commits']
     assert tick() == {BUILD: 'armed'}
@@ -2065,15 +2040,13 @@ def test_a_clean_pr_is_armed_for_its_exact_head_and_a_new_push_is_disarmed_and_c
                                 f'head={H1}']]
     assert triage.load(a / 'approved.json', {})[H1]['pr'] == 7 and fakes.prs[0]['mergeQueueEntry']['head'] == H1
     assert tick() == {BUILD: 'armed'} and len(enqueued(fakes)) == 1  # checked again, never enqueued twice
-    # A new push after the approval: dequeued and read back; the new head gets a new controller review.
-    fakes.prs[0].update(headRefOid=H2, commits=build_pr(head=H2)['commits'])
+    # A new push after the approval: dequeued and read back, then the new head is checked and armed for itself.
+    fakes.prs[0].update(headRefOid=H2, commits=build_pr(head=H2, green=False)['commits'])
     fakes.compares[H2] = fakes.compares[H1]
-    assert tick() == {BUILD: 'reviewing'} and fakes.prs[0]['mergeQueueEntry'] is None
-    assert started[-1] == (a, BUILD, H2) and len(enqueued(fakes)) == 1
-    # A result for another head is never used, and a review with no result is parked after its limit.
-    assert tick(NOW + timedelta(minutes=autoloop.REVIEW_MINUTES + 31)) == {BUILD: 'parked'}
-    assert autoloop.intents(a)[BUILD]['parked'] == 'review lost'
-
+    assert tick() == {BUILD: 'waiting for checks'} and fakes.prs[0]['mergeQueueEntry'] is None
+    assert len(enqueued(fakes)) == 1 and H2 not in triage.load(a / 'approved.json', {})
+    fakes.prs[0]['commits'] = build_pr(head=H2)['commits']
+    assert tick() == {BUILD: 'armed'} and enqueued(fakes)[-1][-1] == f'head={H2}'
 
 
 # spec: ANYM-572
@@ -2084,88 +2057,55 @@ def test_a_clean_pr_off_the_review_paths_is_armed_on_green_checks_with_no_contro
     fakes = Fakes(open_prs=[build_pr(green=False)])
     fakes.compares = {H1: [changed_file('services/messaging/groups.py', 'modified'),
                            changed_file('tests/test_groups.py')]}
-    started = []
 
     def tick(card=ready(30)):
-        return autoloop.controller(a, cfg(), snap(card), NOW, fakes.gh, fakes.prs,
-                                   lambda *args: started.append(args))[0]
-    # Owner review cut 11-09 (D56): no review path in the diff, so no review starts; it waits only for its checks.
-    assert tick() == {BUILD: 'waiting for checks'} and started == [] and enqueued(fakes) == []
+        return autoloop.controller(a, cfg(), snap(card), NOW, fakes.gh, fakes.prs)[0]
+    # No review on any path (owner 11-11): it waits only for its checks.
+    assert tick() == {BUILD: 'waiting for checks'} and enqueued(fakes) == []
     fakes.prs[0]['commits'] = build_pr()['commits']
-    assert tick() == {BUILD: 'armed'} and started == [] and len(enqueued(fakes)) == 1
+    assert tick() == {BUILD: 'armed'} and len(enqueued(fakes)) == 1
     assert triage.load(a / 'approved.json', {})[H1]['card'] == autoloop.card_digest(ready(30))
     # The approval stays bound to its head and card: a card change dequeues it and approves the new card again.
     changed = ready(30, CARD_TEXT.replace('names stay after a rename', 'names stay and the old one is kept'))
-    assert tick(changed) == {BUILD: 'armed'} and started == [] and len(enqueued(fakes)) == 2
-    # A push that adds a review-path file: dequeued, and the new head waits for the controller's own review.
+    assert tick(changed) == {BUILD: 'armed'} and len(enqueued(fakes)) == 2
+    # A push that adds a send-path file: dequeued, and the new head is armed for itself with no review.
     fakes.prs[0].update(headRefOid=H2, commits=build_pr(head=H2)['commits'])
     autoloop.put(a, dict(autoloop.intents(a)[BUILD], paths=autoloop.intents(a)[BUILD]['paths'] + [SENDS]))
     fakes.compares[H2] = fakes.compares[H1] + [changed_file(SENDS, 'modified')]
-    assert tick(changed) == {BUILD: 'reviewing'} and started == [(a, BUILD, H2)]
-    assert fakes.prs[0]['mergeQueueEntry'] is None and len(enqueued(fakes)) == 2
+    assert tick(changed) == {BUILD: 'armed'} and len(enqueued(fakes)) == 3
+    assert fakes.prs[0]['mergeQueueEntry']['head'] == H2
 
 
 # spec: ANYM-572
-@pytest.mark.parametrize('path, review', [
-    ('services/messaging/messaging_service/send_intent.py', True),
-    ('services/messaging/messaging_service/outgoing.py', True),
-    ('services/messaging/messaging_service/telegram_receipts.py', True),
-    ('services/messaging/messaging_service/telegram_collector.py', True),
-    ('services/messaging/messaging_service/whatsapp_pair.py', True),
-    ('services/messaging/messaging_service/messenger_operations.py', True),
-    ('services/messaging/messaging_service/key_admin.py', True),
-    ('services/messaging/messaging_service/delivery_policy.py', True),
-    ('services/messaging/messaging_service/gateway_role.sql', True),
-    ('services/calendar/family_calendar/service/roles.sql', True),
-    ('services/calls/outbound.py', True),
-    ('services/calls/telegram_session_owner.py', True),
-    ('whatsapp/whatsmeow/client.go', True),
-    ('services/gateway/src/agent_gateway/sections.py', True),
-    ('services/messaging/messaging_service/subscription_consumption.py', True),
-    ('services/messaging/messaging_service/update_queries.py', True),
-    ('services/messaging/messaging_service/event_ack.py', True),
-    ('services/gateway/README.md', False),
-    ('services/messaging/messaging_service/feedback.py', False),
-    ('services/messaging/messaging_service/chat_titles.py', False),
-    ('services/messaging/messaging_service/negotiation_state.py', False),
-    ('services/calendar/family_calendar/service/app.py', False),
-    ('docs/SEARCH.md', False)])
-def test_the_review_paths_are_send_call_ack_collector_session_key_and_access_code(path, review):
-    assert bool(autoloop.REVIEW_PATHS.search(path)) is review
-    assert bool(autoloop.REVIEW_PATHS.search(path.upper())) is review  # any case, as the other path lists
-
-
-# spec: ANYM-572
-@pytest.mark.parametrize('row, review', [
-    ('+    def ack_updates(ctx, consumer, receipt, expected_version):', True),
-    ('-        store.ack_subscription_events(token, sid, receipt, version)', True),
-    ("+    c.execute('UPDATE update_cursors SET acked_at = now()')", True),
-    ('+def _ack(receipt):', True),
-    ('+    feedback = load_feedback()  # a fallback, not an ACK', False),
-    ('+++ b/services/messaging/messaging_service/ack_notes.py', False)])
-def test_a_changed_line_naming_an_ack_in_a_shared_module_is_a_review_path(tmp_path, row, review):
-    assert bool(autoloop.REVIEW_TEXT.search(row)) is review
+def test_a_review_path_pr_is_armed_on_green_checks_with_no_controller_review(tmp_path, monkeypatch):
+    """Owner 11-11, no reviews on any path: a send-path diff inside the envelope is armed on green checks like any
+    other, bound to its head and card; the controller starts no review of its own."""
+    started = []
+    monkeypatch.setattr(autoloop, 'spawn_review', lambda *args: started.append(args), raising=False)
     a = tmp_path / 'autoloop'
     a.mkdir(mode=0o700)
-    finished_build(a)
-    autoloop.put(a, dict(autoloop.intents(a)[BUILD], paths=['services/messaging/messaging_service/app.py']))
-    fakes, started = Fakes(open_prs=[build_pr()]), []
-    fakes.compares = {H1: [changed_file('services/messaging/messaging_service/app.py', 'modified', row)]}
-    done = autoloop.controller(a, cfg(), snap(ready(30)), NOW, fakes.gh, fakes.prs,
-                               lambda *args: started.append(args))[0]
-    assert done == ({BUILD: 'reviewing'} if review else {BUILD: 'armed'}) and bool(started) is review
+    finished_build(a, review_path=True)
+    fakes = Fakes(open_prs=[build_pr(green=False)])
+    fakes.compares = {H1: [changed_file(SENDS, 'modified'), changed_file('tests/test_groups.py')]}
+
+    def tick():
+        return autoloop.controller(a, cfg(), snap(ready(30)), NOW, fakes.gh, fakes.prs)[0]
+    assert tick() == {BUILD: 'waiting for checks'} and enqueued(fakes) == []
+    fakes.prs[0]['commits'] = build_pr()['commits']
+    assert tick() == {BUILD: 'armed'} and len(enqueued(fakes)) == 1
+    assert triage.load(a / 'approved.json', {})[H1]['card'] == autoloop.card_digest(ready(30)) and started == []
+
 
 # spec: ANYM-572
 def test_an_armed_pr_is_checked_again_each_tick_and_dequeued_when_its_lines_or_card_change(tmp_path):
     a = tmp_path / 'autoloop'
     a.mkdir(mode=0o700)
     finished_build(a)
-    reviewed(a)
     triage.save(a / 'approved.json', {H1: {'pr': 7, 'intent': BUILD, 'at': triage.stamp(NOW)}})
     fakes = Fakes(open_prs=[build_pr(mergeQueueEntry={'state': 'QUEUED'},
                                      body=BODY + 'Tiden branch: review/anym-30-x\n')])
     fakes.compares = {H1: [changed_file('services/messaging/groups.py', 'modified')]}
-    done, failed = autoloop.controller(a, cfg(), snap(ready(30)), NOW, fakes.gh, fakes.prs, lambda *args: None)
+    done, failed = autoloop.controller(a, cfg(), snap(ready(30)), NOW, fakes.gh, fakes.prs)
     assert done == {BUILD: 'parked'} and failed == [] and fakes.prs[0]['mergeQueueEntry'] is None
     assert autoloop.intents(a)[BUILD]['parked'] == 'criterion edit'
 
@@ -2175,20 +2115,19 @@ def test_a_card_changed_on_main_under_an_armed_head_dequeues_it_and_starts_a_new
     a = tmp_path / 'autoloop'
     a.mkdir(mode=0o700)
     finished_build(a, review_path=True)
-    reviewed(a)
     triage.save(a / 'approved.json', {H1: {'pr': 7, 'intent': BUILD, 'card': autoloop.card_digest(ready(30)),
                                            'at': triage.stamp(NOW)}})
     fakes = Fakes(open_prs=[build_pr(mergeQueueEntry={'state': 'QUEUED'})])
     fakes.compares = {H1: [changed_file(SENDS, 'modified')]}
-    started = []
 
     def tick(card):
-        return autoloop.controller(a, cfg(), snap(card), NOW, fakes.gh, fakes.prs, lambda *args: started.append(args))
-    assert tick(ready(30)) == ({BUILD: 'armed'}, [])
+        return autoloop.controller(a, cfg(), snap(card), NOW, fakes.gh, fakes.prs)
+    assert tick(ready(30)) == ({BUILD: 'armed'}, []) and enqueued(fakes) == []
     changed = ready(30, CARD_TEXT.replace('names stay after a rename', 'names stay and the old one is kept'))
-    assert tick(changed) == ({BUILD: 'reviewing'}, []) and fakes.prs[0]['mergeQueueEntry'] is None
-    assert started == [(a, BUILD, H1)] and 'the old one is kept' in \
-        review_files(a)['task'].read_text()
+    # No review (owner 11-11): dequeued, checked again against the new card and enqueued bound to it.
+    assert tick(changed) == ({BUILD: 'armed'}, []) and len(enqueued(fakes)) == 1
+    assert [c for c in fakes.calls if c[0] == 'gh' and c[1][:2] == ['api', 'graphql'] and 'dequeue' in c[1][3]]
+    assert triage.load(a / 'approved.json', {})[H1]['card'] == autoloop.card_digest(changed)
 
 
 # spec: ANYM-572
@@ -2196,11 +2135,10 @@ def test_an_added_test_file_outside_the_reserved_paths_parks_the_pr(tmp_path):
     a = tmp_path / 'autoloop'
     a.mkdir(mode=0o700)
     finished_build(a)
-    reviewed(a)
     fakes = Fakes(open_prs=[build_pr()])
     fakes.compares = {H1: [changed_file('services/messaging/groups.py', 'modified'),
                            changed_file('services/calls/tests/test_other.py')]}
-    assert autoloop.controller(a, cfg(), snap(ready(30)), NOW, fakes.gh, fakes.prs, lambda *args: None)[0] == \
+    assert autoloop.controller(a, cfg(), snap(ready(30)), NOW, fakes.gh, fakes.prs)[0] == \
         {BUILD: 'parked'}
     assert autoloop.intents(a)[BUILD]['parked_detail'] == ['outside reserved paths services/calls/tests/test_other.py']
 
@@ -2336,96 +2274,6 @@ def test_the_review_protocol_path_greps_are_case_insensitive_except_the_test_nam
 
 
 # spec: ANYM-572
-def test_the_controller_reviews_the_exact_head_itself_in_a_clean_worktree_and_takes_no_verdict_from_the_worker(
-        tmp_path, capsys):
-    a = tmp_path / 'autoloop'
-    a.mkdir(mode=0o700)
-    finished_build(a, review_path=True)
-    with pytest.raises(SystemExit):
-        autoloop.main(['verdict', BUILD, '--head', H1, '--report', str(tmp_path / 'r.md'), '--state', str(a)])
-    assert autoloop.main(['review-run', BUILD, '--head', H1, '--attempt', 'a1b2c3d4', '--state', str(a)]) == 1
-    assert 'no controller review' in capsys.readouterr().err  # no review was started
-    card = autoloop.card_digest(ready(30))
-    autoloop.put(a, dict(autoloop.intents(a)[BUILD], review={'head': H1, 'pr': 7, 'started_at': triage.stamp(NOW),
-                                                             'card': card, 'attempt': 'a1b2c3d4'}))
-    paths = autoloop.review_paths(a, BUILD, H1, 'a1b2c3d4')
-    paths['dir'].mkdir(parents=True)
-    calls, runs, fetched = [], [], {'head': H1}
-
-    def git(argv):
-        calls.append(argv)
-        return fetched['head'] + '\n' if argv[0] == 'rev-parse' else ''
-
-    def run(argv):
-        runs.append(argv)
-        Path(argv[3]).write_text('VERDICT: CHANGES REQUIRED — 1 blocking, 0 major, 0 minor — r1\n'
-                                 'VERDICT: APPROVE — 0 blocking, 0 major, 2 minor — r1\n')
-        return 0
-    got = autoloop.review_run(a, BUILD, H1, 'a1b2c3d4', git, run)
-    assert got == {'head': H1, 'attempt': 'a1b2c3d4', 'card': card, 'exit': 0,
-                   'verdict': {'verdict': 'APPROVE', 'blocking': 0, 'major': 0, 'minor': 2}}
-    assert calls == [['fetch', '--no-tags', 'origin', 'main'], ['fetch', '--no-tags', 'origin', 'refs/pull/7/head'],
-                     ['rev-parse', 'FETCH_HEAD^{commit}'],
-                     ['worktree', 'add', '--detach', str(paths['checkout']), H1],
-                     ['worktree', 'remove', '--force', str(paths['checkout'])]]
-    assert runs == [[str(autoloop.REVIEW_CODEX), 'astra', str(paths['task']), str(paths['report']),
-                     '--risk', autoloop.REVIEW_RISK, '--minutes', '45', '--cd', str(paths['checkout'])]]
-    assert triage.load(paths['result'], {}) == got
-    # The PR moved on GitHub: no review runs, and the result carries no verdict.
-    fetched['head'] = H2
-    assert autoloop.review_run(a, BUILD, H1, 'a1b2c3d4', git, run) == \
-        {'head': H1, 'attempt': 'a1b2c3d4', 'card': card, 'error': 'head moved'} and len(runs) == 1
-    # Over the Codex line: the controller starts the review again on a later tick, with a task of its own.
-    paths['task'].write_text('the first launch\n')
-    triage.save(paths['result'], {'head': H1, 'attempt': 'a1b2c3d4', 'card': card, 'exit': 6})
-    fakes = Fakes(open_prs=[build_pr()])
-    fakes.compares = {H1: [changed_file(SENDS, 'modified')]}
-    started = []
-    tick = lambda: autoloop.controller(a, cfg(), snap(ready(30)), NOW, fakes.gh, fakes.prs,  # noqa: E731
-                                       lambda *args: started.append(args))[0]
-    assert tick() == {BUILD: 'waiting'} and autoloop.intents(a)[BUILD]['review'] is None
-    assert tick() == {BUILD: 'reviewing'} and started == [(a, BUILD, H1)]
-    again = review_files(a)
-    assert again['task'] != paths['task'] and not again['result'].exists()
-    assert f'at exactly head {H1}' in again['task'].read_text()
-
-
-# spec: ANYM-572
-def test_a_review_that_finishes_after_its_card_changed_approves_nothing(tmp_path):
-    a = tmp_path / 'autoloop'
-    a.mkdir(mode=0o700)
-    finished_build(a, review_path=True)
-    fakes = Fakes(open_prs=[build_pr()])
-    fakes.compares = {H1: [changed_file(SENDS, 'modified')]}
-    started = []
-    changed = ready(30, CARD_TEXT.replace('names stay after a rename', 'names stay and the old one is kept'))
-
-    def tick(card):
-        return autoloop.controller(a, cfg(), snap(card), NOW, fakes.gh, fakes.prs,
-                                   lambda *args: started.append(args))[0]
-    assert tick(ready(30)) == {BUILD: 'reviewing'}
-    first = dict(autoloop.intents(a)[BUILD]['review'])
-    old = autoloop.review_paths(a, BUILD, H1, first['attempt'])
-
-    def run(argv):  # the card changes on Tiden main while the first review still runs
-        assert tick(changed) == {BUILD: 'reviewing'} and len(started) == 2
-        Path(argv[3]).write_text('VERDICT: APPROVE — 0 blocking, 0 major, 0 minor — r1\n')
-        return 0
-    git = lambda argv: H1 + '\n' if argv[0] == 'rev-parse' else ''  # noqa: E731
-    assert autoloop.review_run(a, BUILD, H1, first['attempt'], git, run)['verdict']['verdict'] == 'APPROVE'
-    second = autoloop.intents(a)[BUILD]['review']
-    new = autoloop.review_paths(a, BUILD, H1, second['attempt'])
-    assert second['attempt'] != first['attempt'] and second['card'] != first['card']
-    assert old['result'].exists() and not new['result'].exists() and new['checkout'] != old['checkout']
-    # The old approval is never read for the new card: still reviewing, nothing approved or enqueued.
-    assert tick(changed) == {BUILD: 'reviewing'} and enqueued(fakes) == []
-    assert triage.load(a / 'approved.json', {}) == {}
-    # A result in the new attempt's file that names another attempt or card is not used either.
-    triage.save(new['result'], {**triage.load(old['result'], {}), 'attempt': second['attempt']})
-    assert tick(changed) == {BUILD: 'reviewing'} and enqueued(fakes) == []
-
-
-# spec: ANYM-572
 def test_open_pr_reservations_are_keyed_by_pr_and_hold_both_names_of_a_rename(tmp_path):
     fakes = Fakes(open_prs=[{'number': 5, 'id': 'PR_5', 'headRefName': 'same'},
                             {'number': 6, 'id': 'PR_6', 'headRefName': 'same'}])
@@ -2531,6 +2379,15 @@ def test_the_image_pins_every_tool_and_runs_as_a_non_root_user():
 
 
 # spec: ANYM-574
+def test_the_build_runner_prompt_names_the_briefs_intent_and_card_and_asks_for_no_review():
+    """Owner 11-11, no reviews: the container's build worker is not told to run review rounds or wait for one."""
+    text = launcher.prompt(BUILD, 'ANYM-30')
+    assert text == ('Read and follow /run/autoloop/control/common.md and /run/autoloop/control/autoloop-build.md. '
+                    f'Intent: {BUILD}. Card: ANYM-30.')
+    assert not re.search(r'review|astra|codex', text, re.I)
+
+
+# spec: ANYM-574
 def test_the_runner_container_gets_no_owner_directory_no_secret_on_its_command_line_and_only_the_internal_network(
         tmp_path):
     values = {**{name: 'secret-value-' + name for name in launcher.SECRETS},
@@ -2550,9 +2407,7 @@ def test_the_runner_container_gets_no_owner_directory_no_secret_on_its_command_l
     env = launcher.client_env(values)
     assert env['GH_TOKEN'] == 'secret-value-GH_TOKEN' and 'SSH_AUTH_SOCK' not in env
     assert values['AUTOLOOP_PROMPT'] == ('Read and follow /run/autoloop/control/common.md and '
-                                         f'/run/autoloop/control/autoloop-build.md. Intent: {BUILD}. Card: ANYM-30. In this '
-                                         'container there is no Codex: run each review round as an Opus subagent; '
-                                         "the controller's Astra review on the host is the review of record.")
+                                         f'/run/autoloop/control/autoloop-build.md. Intent: {BUILD}. Card: ANYM-30.')
     # The proxy is the one container on both networks, and the runner's network has no route out.
     calls = []
 

@@ -39,24 +39,14 @@ per provider, and migration numbers are sequential with immutable checksums. `ci
 
 ## Merge keeper
 
-The merge keeper (`scripts/merge_keeper.py`) enqueues reviewed, green pull requests, so nothing green waits for a
-person or the morning (lead-time study 11-09: 11 green, reviewed pull requests waited 8.6-32 h to be enqueued).
+The merge keeper (`scripts/merge_keeper.py`) enqueues green pull requests, so nothing green waits for a person or the
+morning (lead-time study 11-09: 11 green, reviewed pull requests waited 8.6-32 h to be enqueued).
 It acts only on an open, non-draft, same-repository pull request into `main` that carries the label `ship`:
 
-1. **Approval on the full head SHA, by an account with write access**: its effective repository permission
-   (`collaborators/<login>/permission`) is write, maintain or admin. An organization member with read or triage
-   access does not count. Either an APPROVE review on the head commit, or a comment
-   `Diff read: <orchestrator session> <40-hex head sha>` (harness 0.80.0; the older
-   `Review: orchestrator diff read <40-hex head sha>` also counts) that was posted after the head arrived and was
-   never edited. An approval line in the description does not count: its author can edit it after a push.
-   A no-review pull request (owner review cut 11-09, or a small fix under AGENTS.md section 3) instead carries
-   the description line `Review record: none (...)`. It needs no approval when the head's diff is clean under the
-   change-path signal grep (review-protocol.md: both lines, over the complete diff `merge-base...<head SHA>` from
-   the compare API, `---`/`+++` headers included, so the scanned revision is the one enqueued; an unreadable or
-   empty diff, or a binary file, counts as a hit). A hit holds the pull request with one comment: a risk path needs its review
-   and an approval on the head. The grep is the guard here, because the line is author-written. When the approval names an older
-   SHA, the keeper does not enqueue and comments once. The trust boundary is write access, which can already arm
-   `gh pr merge --auto` directly, so the keeper adds no authority.
+1. **No review, on any path** (owner 11-11, AGENTS.md section 5). The keeper reads no review, approval
+   comment, `Review record:` line or diff. The trust boundary is write access: only it can push a
+   same-repository head (a fork's head is never enqueued), and it can already arm `gh pr merge --auto`
+   directly, so the keeper adds no authority.
 2. **Green with no required job skipped.** Each required check of the live `main` rules, matched by name and app,
    has its newest run on the head completed. `CI gate` must be `success`. The other checks may be `skipped` only
    because `CI gate` validates that skip (docs-only, reuse). All-skipped never counts. A draft's run counts:
@@ -87,11 +77,9 @@ existing `gh` login and from its own clone, which it moves to `origin/main` befo
 (`scripts/merge_keeper_mini.sh`). The keeper does not use GitHub Actions to act: an enqueue with the workflow
 `GITHUB_TOKEN` starts no `merge_group` run, because GitHub starts no workflow from that token's events. The
 entry would then hold the queue head until the 60-min check timeout. `.github/workflows/merge-keeper.yml` runs
-the same script in report mode (`--dry-run`) with read-only permissions every 5 minutes and on review
-submissions, and writes the decisions to the job summary. `pull_request_review` runs the workflow file of the
-pull request's merge ref. That is safe only while the job has read permissions and no credential. Moving the
-keeper to Actions later needs three changes: a token whose events start workflows (a GitHub App token as
-`GH_TOKEN`), dropping `--dry-run`, and dropping the `pull_request_review` trigger. The script does not change.
+the same script in report mode (`--dry-run`) with read-only permissions every 5 minutes and writes the decisions
+to the job summary. Moving the keeper to Actions later needs two changes: a token whose events start workflows (a
+GitHub App token as `GH_TOKEN`) and dropping `--dry-run`. The script does not change.
 The hourly watchdog has its own concurrency group, so a pending report never replaces it.
 
 **Heartbeat.** Each mini tick writes `~/.local/state/deedkit-merge-keeper/heartbeat.json` on the mini and the
@@ -100,10 +88,9 @@ hourly workflow run fails when `ok_at` is older than 20 minutes. Run `python3 sc
 heartbeat-check` from any checkout to get the same answer (exit 1 when stale). The tick log is
 `~/Library/Logs/deedkit-merge-keeper.log` on the mini.
 
-**Workers.** Add the label (`gh pr edit <n> --add-label ship`) once the review passed on the head. The
-orchestrator records its diff read as a comment `Diff read: <session> <full head SHA>`. Arming `gh pr merge <n> --squash --auto`
-yourself still works, and the keeper then leaves the pull request alone. A push after approval needs a new
-approval comment or review.
+**Workers.** Add the label (`gh pr edit <n> --add-label ship`) when you mark the pull request ready; no review
+or diff read comes first. Arming `gh pr merge <n> --squash --auto` yourself still works, and the keeper then
+leaves the pull request alone.
 
 **Install on the mini** (once, as the admin account):
 
