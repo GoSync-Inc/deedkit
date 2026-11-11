@@ -53,6 +53,7 @@ def connect(host, port):
 print(json.dumps({target: connect(*target.rsplit(':', 1)) for target in sys.argv[1:]}))
 '''
 READY = 'import socket, sys\nsocket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=1).close()\n'
+LISTEN_ANY = 'import socket\ns = socket.create_server(("", 0))\nprint(s.getsockname()[1], flush=True)\nwhile True: s.accept()[0].close()\n'
 
 
 def docker(*args, check=True, timeout=120):
@@ -69,6 +70,17 @@ def wait_listening(container, port, tries=60):
             return
         time.sleep(0.5)
     raise AssertionError(f'{container} never listened on {port}\n{docker("logs", container, check=False).stderr}')
+
+
+def listening_port(container, tries=60):
+    """The port a LISTEN_ANY container's kernel gave it. A port chosen by the test can be a source port of an outgoing
+    connection of the runner: the listener then dies with EADDRINUSE and every connection to it is refused."""
+    for _ in range(tries):
+        printed = docker('logs', container, check=False).stdout.strip()
+        if printed.isdigit():
+            return printed
+        time.sleep(0.5)
+    raise AssertionError(f'{container} chose no port\n{docker("logs", container, check=False).stderr}')
 
 
 # spec: ANYM-581
@@ -105,13 +117,13 @@ def test_an_isolated_internal_network_has_no_host_address_but_keeps_container_na
     assert re.search(r'@sha256:[0-9a-f]{64}$', image), 'the Python test image must be immutable'
     assert shutil.which('docker'), 'Docker is required when the network proof is enabled'
     tag = uuid.uuid4().hex[:12]
-    port = str(20000 + int(tag[:4], 16) % 20000)
     isolated, host_listener, peer = f'deedkit_t581_iso_{tag}', f'deedkit_t581_host_{tag}', f'deedkit_t581_peer_{tag}'
     try:
         docker('network', 'create', '--internal', '-o', 'com.docker.network.bridge.gateway_mode_ipv4=isolated', isolated)
-        docker('run', '-d', '--rm', '--name', host_listener, '--network', 'host', image, 'python', '-c', LISTEN, port)
+        docker('run', '-d', '--rm', '--name', host_listener, '--network', 'host', image, 'python', '-c', LISTEN_ANY)
         docker('run', '-d', '--rm', '--name', peer, '--network', isolated, '--network-alias', 'delivery-egress', image,
                'python', '-c', LISTEN, '8080')
+        port = listening_port(host_listener)
         wait_listening(host_listener, port)
         wait_listening(peer, 8080)
         ipam = json.loads(docker('network', 'inspect', isolated, '--format', '{{json .IPAM.Config}}').stdout)
