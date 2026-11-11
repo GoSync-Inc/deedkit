@@ -169,6 +169,59 @@ def module_conditions(allowed, states, capabilities):
     return unavailable, builds
 
 
+def phone_state(caps):
+    """`{device, session}` from the Android service's own capabilities (ANYM-985); a word it does not send stays out.
+
+    `device` is `attached` when any of the key's devices reports the adb word `device`. `session` is the service's
+    own `free`/`own`/`other` per device, folded as own > other > free; a build that sends none leaves it out.
+    """
+    devices = caps.get("devices") if isinstance(caps, dict) else None
+    if not isinstance(devices, list):
+        return {}
+    rows = [row for row in devices if isinstance(row, dict)]
+    result = {"device": "attached" if any(row.get("state") == "device" for row in rows) else "none"}
+    words = {row.get("session") for row in rows}
+    for word in ("own", "other", "free"):
+        if word in words:
+            result["session"] = word
+            break
+    return result
+
+
+def module_health(modules, unavailable, capabilities):
+    """The `health` word (and, for Android, the phone words) of each usable module's `modules_available` row.
+
+    `modules` are the modules with a usable tool for the key, so a module the key cannot see never appears and a down
+    backend has no row (it is in `unavailable`). `degraded` is the existing `outdated` condition: the module's build
+    lacks tools the key may use. Everything comes from data `discover` already loaded; a failure here drops those
+    words for that module only and never fails the call.
+    """
+    try:
+        outdated = {entry["module"]: entry.get("reason") for entry in unavailable
+                    if isinstance(entry, dict) and entry.get("state") == "outdated"}
+    except Exception:  # noqa: BLE001 - health is optional: without the conditions no module is called healthy
+        logging.getLogger(__name__).warning("module_health_failed conditions")
+        return {}
+    result = {}
+    for module in modules:
+        words: dict = {}
+        try:
+            reason = outdated.get(module)
+            health = {"state": "degraded", **({"reason": reason} if isinstance(reason, str) else {})} \
+                if module in outdated else {"state": "ready"}
+            words["health"] = health
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning("module_health_failed module=%s", module)
+        if module == "android":
+            try:
+                words.update(phone_state((capabilities or {}).get(module)))
+            except Exception:  # noqa: BLE001
+                logging.getLogger(__name__).warning("module_phone_failed module=%s", module)
+        if words:
+            result[module] = words
+    return result
+
+
 def failure_details(status, value, header_request_id=None):
     result = {"error": "backend_unavailable", "backend_status": status}
     value = value if isinstance(value, dict) else {}

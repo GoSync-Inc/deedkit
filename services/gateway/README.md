@@ -161,7 +161,13 @@ no tool, scope or action.
 - **REST has no selection.** `POST /v1/<tool>` ignores module paths and selections and keeps the full profile
   set. `POST /v1/platform_select_modules` records the selection of plain `/mcp`; it affects MCP only.
 - **Summary.** `platform_capabilities` adds `selection_path`, `selected_modules` and `modules_available`: for
-  each module with at least one usable tool for the key, `{id, purpose, tool_count, selected, path}`.
+  each module with at least one usable tool for the key, `{id, purpose, tool_count, selected, path, health}`.
+  `health` is `{state: "ready"}`, or `{state: "degraded", reason: "operation_not_in_module_build"}` when the module's
+  build lacks tools the key may use (the same condition `unavailable` lists as `outdated`); a module whose backend
+  is down has no row and stays in `unavailable`. The Android row adds `device` (`attached` when one of the key's
+  phones reports the adb state `device`, else `none`) and `session` (`free`, `own` or `other`, folded own > other >
+  free over the key's devices; never a principal, session id or serial; an older Android build sends none and the
+  word is left out). Both come from the capabilities read the gateway already makes.
   `tools` and `discovery` describe the current path's effective list on MCP and the full list on REST.
 
 Connector setup with a module path: keep the host's existing DeedKit connector settings and authentication and

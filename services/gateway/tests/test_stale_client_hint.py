@@ -240,6 +240,21 @@ def test_outside_the_policy_the_same_identical_body_and_no_backend_call(tmp_path
     assert mine["gateway"]["build"].keys() == {"source_sha", "started_at"}
 
 
+# spec: ANYM-985
+def test_a_module_whose_build_lacks_a_tool_the_key_may_use_is_degraded_beside_the_tools_it_still_has(tmp_path):
+    app, calls = module_app(tmp_path, OLD_MODULE, tools=(FETCH, "messages_search", "platform_capabilities"), second_key=True)
+    other = {"Authorization": "Bearer gateway-b"}
+    with TestClient(app) as client:
+        mine = client.post("/v1/platform_capabilities", json={}, headers=HEADERS).json()
+        before = list(calls)
+        theirs = client.post("/v1/platform_capabilities", json={}, headers=other).json()
+    rows = {row["id"]: row for row in mine["modules_available"]}
+    assert rows["messaging"]["health"] == {"state": "degraded", "reason": "operation_not_in_module_build"}
+    assert FETCH not in mine["tools"] and "messages_search" in mine["tools"]
+    # Key B's profile holds no messaging tool: no row, no health word, and no query to the module for it.
+    assert theirs["modules_available"] == [] and "degraded" not in json.dumps(theirs) and calls == before
+
+
 # spec: ANYM-662
 def test_a_backend_that_is_down_keeps_backend_unavailable_and_is_listed_as_unavailable(tmp_path):
     app, _ = module_app(tmp_path, httpx.ConnectError("synthetic"))

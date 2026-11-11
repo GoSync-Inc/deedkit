@@ -20,7 +20,7 @@ PNG = b'\x89PNG\r\n\x1a\nsynthetic'
 
 
 def setup(tmp_path, scopes=SCOPES, backend_scopes=SCOPES, unavailable=False, interrupted=False,
-          image=None, refusal=None):
+          image=None, refusal=None, devices=None):
     value = config()
     value['deployment'] = {'modules': ['calendar', 'android'], 'backends': {
         'calendar': {'url': 'http://calendar'}, 'android': {'url': 'http://android'}}}
@@ -47,7 +47,8 @@ def setup(tmp_path, scopes=SCOPES, backend_scopes=SCOPES, unavailable=False, int
         if operation == 'capabilities':
             permissions = backend_scopes if module == 'android' else ['availability:read']
             return httpx.Response(200, json={'permissions': permissions, 'tool_manifest': {
-                'version': 1, 'names': [CATALOG[name]['operation'] for name in TOOLS]}})
+                'version': 1, 'names': [CATALOG[name]['operation'] for name in TOOLS]},
+                **({'devices': devices} if module == 'android' and devices is not None else {})})
         args = json.loads(request.content)
         calls.append((module, operation, args))
         if module == 'android' and refusal is not None:
@@ -164,6 +165,66 @@ def test_an_android_refusal_with_a_field_list_reaches_the_agent_unchanged(tmp_pa
     assert rest.status_code == 422 and rest.json() == refusal
     assert mcp['isError'] and mcp['structuredContent'] == refusal
     assert [operation for _, operation, _ in calls] == ['session', 'session']
+
+
+def android_row(client):
+    result = rpc(client, 'tools/call', {'name': 'platform_capabilities', 'arguments': {}}).json()['result']
+    assert not result.get('isError'), result
+    body = result['structuredContent']
+    return {row['id']: row for row in body['modules_available']}.get('android'), body
+
+
+# spec: ANYM-985
+@pytest.mark.parametrize('devices,expected', [
+    ([{'device_id': 'home', 'state': 'device', 'session': 'free'}], {'device': 'attached', 'session': 'free'}),
+    ([{'device_id': 'home', 'state': 'device', 'session': 'own'}], {'device': 'attached', 'session': 'own'}),
+    ([{'device_id': 'home', 'state': 'device', 'session': 'other'}], {'device': 'attached', 'session': 'other'}),
+    ([{'device_id': 'home', 'state': 'offline', 'session': 'free'}], {'device': 'none', 'session': 'free'}),
+    ([{'device_id': 'a', 'state': 'device', 'session': 'other'}, {'device_id': 'b', 'state': 'disconnected', 'session': 'own'}],
+     {'device': 'attached', 'session': 'own'}),
+    ([{'device_id': 'a', 'state': 'unauthorized', 'session': 'other'}, {'device_id': 'b', 'state': 'device', 'session': 'free'}],
+     {'device': 'attached', 'session': 'other'}),
+    ([{'device_id': 'home', 'state': 'device'}], {'device': 'attached'}),
+    ([], {'device': 'none'}),
+    (None, {}),
+    ('garbage', {}),
+], ids=['free', 'own', 'other', 'none-attached', 'own-wins', 'other-beats-free', 'old-build-no-session', 'no-devices',
+        'no-field', 'malformed'])
+def test_the_android_row_carries_device_and_session_read_from_the_service_capabilities(tmp_path, devices, expected):
+    app, calls = setup(tmp_path, devices=devices)
+    with TestClient(app) as client:
+        row, _ = android_row(client)
+    assert row['health'] == {'state': 'ready'}
+    assert {key: row[key] for key in ('device', 'session') if key in row} == expected
+    # No new backend call and nothing but the reviewed words: no device id, session id or serial rides along.
+    assert calls == []
+    assert 'home' not in json.dumps({key: value for key, value in row.items() if key != 'path'})
+
+
+# spec: ANYM-985
+def test_a_down_android_backend_has_no_row_and_no_phone_words_and_the_call_still_answers(tmp_path):
+    app, _ = setup(tmp_path, unavailable=True, devices=[{'device_id': 'home', 'state': 'device', 'session': 'own'}])
+    with TestClient(app) as client:
+        row, body = android_row(client)
+    assert row is None and 'calendar' in {r['id'] for r in body['modules_available']}
+    assert [(e['module'], e['state']) for e in body['unavailable']] == [('android', 'unavailable')]
+    assert 'session' not in json.dumps(body['modules_available'])
+
+
+# spec: ANYM-985
+def test_a_failure_reading_the_phone_words_drops_only_those_words(tmp_path, monkeypatch):
+    from agent_gateway import diagnostics
+
+    def broken(caps):
+        raise RuntimeError('synthetic')
+
+    monkeypatch.setattr(diagnostics, 'phone_state', broken)
+    app, _ = setup(tmp_path, devices=[{'device_id': 'home', 'state': 'device', 'session': 'own'}])
+    with TestClient(app) as client:
+        row, body = android_row(client)
+        calendar = {r['id']: r for r in body['modules_available']}['calendar']
+    assert row is not None and row['health'] == {'state': 'ready'} and not {'device', 'session'} & set(row)
+    assert calendar['health'] == {'state': 'ready'}
 
 
 @pytest.mark.parametrize('options', [{'scopes': ['android:read']},

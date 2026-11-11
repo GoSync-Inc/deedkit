@@ -342,6 +342,29 @@ def test_the_reasons_and_hints_come_from_the_model_not_from_the_input(service):
     assert malformed.status_code == 422 and malformed.json()['field_errors'] == [{'field': '$', 'reason': 'format'}]
 
 
+# spec: ANYM-985
+def test_capabilities_say_whether_each_device_session_is_free_own_or_another_principals(service, monkeypatch):
+    import time as clock
+
+    def sessions(key):
+        return {row['device_id']: row['session'] for row in post(service, 'capabilities', key=key).json()['devices']}
+
+    assert sessions('one') == sessions('two') == {'home': 'free'}
+    token = session(service)
+    assert sessions('one') == {'home': 'own'}
+    assert sessions('two') == sessions('reader') == {'home': 'other'}
+    # No session id, lease or principal name leaves with the word.
+    body = json.dumps(post(service, 'capabilities', key='two').json())
+    assert token not in body and '"owner"' not in body and 'expires' not in body
+    # An expired reservation reads free, as `reserve` treats it.
+    real = clock.time
+    monkeypatch.setattr('deedkit_android.store.time.time', lambda: real() + 10000)
+    assert sessions('two') == {'home': 'free'}
+    monkeypatch.undo()
+    released = post(service, 'session', {'device_id': 'home', 'action': 'release', 'session_id': token})
+    assert released.status_code == 200 and sessions('two') == {'home': 'free'}
+
+
 # spec: ANYM-958
 def test_one_ui_engine_is_reported_and_flows_without_it_never_reach_the_device(service):
     capabilities = post(service, 'capabilities', key='reader').json()
