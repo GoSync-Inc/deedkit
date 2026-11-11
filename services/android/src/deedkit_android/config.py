@@ -74,8 +74,10 @@ class Config(Strict):
 
 
 class Refused(Exception):
-    def __init__(self, code, status=409):
+    def __init__(self, code, status=409, field_errors=None):
         self.code, self.status = code, status
+        if field_errors:  # ANYM-984: an `invalid_arguments` refusal names the fields (field_errors.entries)
+            self.field_errors = field_errors
         super().__init__(code)
 
 

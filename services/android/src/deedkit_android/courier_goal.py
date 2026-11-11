@@ -164,7 +164,8 @@ class Goals:
         ttl = args.get('ttl_min') or (DEFAULT_STANDING_TTL_MIN if standing else DEFAULT_TTL_MIN)
         limit = 10080 if standing else 480
         if not 1 <= ttl <= limit:
-            raise Refused('invalid_arguments', 422)
+            raise Refused('invalid_arguments', 422, [{'field': 'ttl_min', 'reason': 'maximum' if ttl > 0 else 'minimum',
+                                                      'expected': f'between 1 and {limit}'}])
         if not standing and self.active(owner, exclude=key) >= MAX_ACTIVE_ORDERS:
             raise Gate('too_many_active_orders')
         row = self.blank(args, key, args['goal'], args['owner_instruction'], standing, ttl,

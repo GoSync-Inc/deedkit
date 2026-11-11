@@ -87,12 +87,14 @@ def test_missing_required_field_alone_and_nested_failures_stay_quiet(tmp_path):
     rest, _ = post_both(calls_app(tmp_path, []), "calls_dial_call", DIAL)
     body = rest.json()
     assert "tool_fields" in body and "tool_list_stale" not in body and "owner_hint" not in body
-    # A type failure is neither a required nor an unknown field: the ANYM-295 shape is kept as is.
+    # A type failure is neither a required nor an unknown field: it says nothing of a stale tool list, but since
+    # ANYM-984 it carries the tool's fields like every schema refusal.
     (tmp_path / "second").mkdir()
     rest, _ = post_both(calls_app(tmp_path / "second", []), "calls_dial_call",
                         {"brief_id": 7, "destination_source": "owner_named"})
     assert rest.json() == {"error": "invalid_arguments", "next_action": "check_parameters",
-                           "field_errors": [{"field": "brief_id", "reason": "type", "expected": "string"}]}
+                           "field_errors": [{"field": "brief_id", "reason": "type", "expected": "string"}],
+                           "tool_fields": diagnostics.tool_fields(CATALOG["calls_dial_call"])}
 
 
 # spec: ANYM-452
@@ -444,7 +446,8 @@ def assert_nested_failure_keeps_the_original_shape(tmp_path, brief):
     rest, mcp = post_both(prepare_app(tmp_path), "calls_prepare_call", {"brief": brief})
     body = rest.json()
     assert rest.status_code == 422 and mcp["isError"] and mcp["structuredContent"] == body
-    assert set(body) == {"error", "next_action", "field_errors"} and body["next_action"] == "check_parameters"
+    assert set(body) == {"error", "next_action", "field_errors", "tool_fields"} and body["next_action"] == "check_parameters"
+    assert "tool_list_stale" not in body and "use_instead" not in body  # ANYM-984: the fields yes, a stale-list claim no
     return body
 
 
