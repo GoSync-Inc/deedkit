@@ -84,5 +84,8 @@
       "UPDATE fcs.refresh_calendars(health_since)",
       "INSERT fcs.starting_reminders"
     ]
+  },
+  "10": {
+    "fcs_gateway": ["SELECT fcs.module_access_events"]
   }
 }

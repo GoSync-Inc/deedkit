@@ -22,6 +22,11 @@ IN_PROCESS_SOURCES = frozenset(('deedkit:feedback',))
 # The first part of an event type that belongs to each module (calls publish `call.*`, recordings `recording.*`).
 TYPE_PREFIX = {'calendar': 'calendar', 'calls': 'call', 'recordings': 'recording', 'feedback': 'feedback'}
 URGENCIES = frozenset(('now', 'batch'))
+# ANYM-577: the one event type of the calendar source whose first part is not `calendar`.
+ACCESS_CHANGED = 'module.access.changed'
+# Publishing an access event takes this advisory lock exclusively; every use of a module reference (fetch, wait, ACK,
+# delivery, admission) takes it shared first, so a change of access and a use are ordered (module_links.fence_use).
+ACCESS_FENCE = 'module-access'
 _REF = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}')
 _SCOPE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,255}')
 _TOKEN = re.compile(r'[a-z][a-z0-9_]{0,47}')
@@ -102,6 +107,12 @@ KINDS = {
     # event's scope_ref); every link granted before it that names that principal is stale (module_links.stale).
     'call.access.changed': ({'principal_ref': _ref, 'reason': _enum('permission_removed', 'principal_removed',
         'owner_changed')}, frozenset(), 'principal_ref'),
+    # ANYM-577: the calendar service's journal of one calendar principal's effective access (agenda:read with details
+    # visibility) to the calendar named by the event's scope_ref; `until` is the principal's expiry. Control events:
+    # an agent never subscribes to them (their type has no `calendar.` prefix) and messaging reads entitlement from them.
+    ACCESS_CHANGED: ({'principal_ref': _ref, 'access': _enum('details', 'none'), 'reason': _enum('granted',
+        'permission_removed', 'principal_removed', 'member_removed', 'connection_disabled', 'visibility_reduced',
+        'expired'), 'until': _time}, frozenset(('until',)), 'principal_ref'),
     # ANYM-726/732: opaque references and an enumeration only; never a title, text, label, provider id, token or URL.
     'recording.text.archived': ({'recording_ref': _ref, 'account_ref': _ref, 'revision': _int(0, MAX_SEQ)}, frozenset(),
         'recording_ref'),
@@ -137,7 +148,8 @@ def validate_event(event):
     if match is None or match.group(1) != SOURCES[event['source']] or int(match.group(2)) > MAX_SEQ:
         _fail('invalid_id')
     kind = KINDS.get(event['type']) if isinstance(event['type'], str) else None
-    if kind is None or event['type'].split('.')[0] != TYPE_PREFIX[match.group(1)]:
+    if kind is None or (event['type'].split('.')[0] != TYPE_PREFIX[match.group(1)] and
+            not (event['type'] == ACCESS_CHANGED and match.group(1) == 'calendar')):
         _fail('invalid_type')
     checks, optional, subject = kind
     data = event['data']
@@ -156,7 +168,8 @@ def validate_event(event):
     if event['type'] in RECORDING_URGENCY and (event['urgency'] != RECORDING_URGENCY[event['type']] or
             event['expires_at'] is not None):
         _fail('recording_urgency_or_expiry')
-    if event['type'] == 'call.access.changed' and (event['urgency'] != 'now' or event['expires_at'] is not None):
+    if event['type'] in ('call.access.changed', ACCESS_CHANGED) and (event['urgency'] != 'now' or
+            event['expires_at'] is not None):
         _fail('access_changed_urgency_or_expiry')
     if event['type'].startswith('feedback.') and (event['urgency'] != 'now' or event['expires_at'] is not None or
             data['status'] == data['previous_status']):
@@ -233,6 +246,9 @@ def publish(c, event, scope_ref):
     validate_event(event)
     if not isinstance(scope_ref, str) or _SCOPE.fullmatch(scope_ref) is None:
         _fail('invalid_scope_ref')
+    if event['type'] == ACCESS_CHANGED:
+        # ANYM-577: wait for every use that read the old access to finish, and let later uses read the new one.
+        c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))', (ACCESS_FENCE,))
     return c.execute('SELECT public.publish_module_event(%s,%s,%s,%s,%s,%s,%s,%s,%s) AS seq',
         (event['id'], event['source'], event['type'], event['subject'], scope_ref, event['time'],
          Jsonb(event['data']), event['urgency'], event['expires_at'])).fetchone()['seq']
@@ -247,9 +263,9 @@ def report_reachability(c, source, reachable):
 def attach_sources(c, subscription_id, sources):
     """Give a subscription a module stream starting at the module journal's head.
 
-    sources: [(source, scope_ref, [types])]. A call source is admitted only through the subscription
-    principal's active calls link (ANYM-564, `admit_module_source`), which records the link's
-    generation; other modules have no API path yet (ANYM-577).
+    sources: [(source, scope_ref, [types])]. A call or calendar source is admitted only through the subscription
+    principal's active link of that module (ANYM-564, ANYM-577; `module_links.admit`), which records the link's
+    generation; recordings and feedback sources have no API path.
     """
     from .store import APIError
     if not isinstance(sources, (list, tuple)) or not 1 <= len(sources) <= 64:
@@ -265,9 +281,9 @@ def attach_sources(c, subscription_id, sources):
         (subscription_id, head, head, head, head))
     from . import module_links
     for source, scope_ref, types in sources:
-        if source == module_links.MODULES['calls']:
+        if source in (module_links.MODULES['calls'], module_links.MODULES['calendar']):
             if not module_links.ready(c):
-                raise module_links.not_linked()
+                raise module_links.not_linked('calendar' if source == module_links.MODULES['calendar'] else 'calls')
             module_links.admit(c, subscription_id, source, scope_ref, sorted(set(types)))
             continue
         c.execute('''INSERT INTO subscription_module_sources(subscription,source,scope_ref,types)
@@ -335,7 +351,7 @@ def match(c, row, *, batch_size, maximum, stats):
         (row['id'],)).fetchone()
     if module is None or module['rollback_hold']:
         return
-    from .module_links import live_sql
+    from .module_links import event_live, live_sql
     # ANYM-564: a call source matches only while its link is live; a revoked one matches nothing more.
     sources = c.execute('SELECT s.source,s.scope_ref,s.types FROM subscription_module_sources s WHERE s.subscription=%s'
         ' AND ' + live_sql(c, 's.subscription', 's.source', 's.scope_ref'), (row['id'],)).fetchall()
@@ -355,7 +371,10 @@ def match(c, row, *, batch_size, maximum, stats):
                 'recoverable': False, 'requires_operator': True}
             break
         # An expired event (a reminder after its start) is never matched, so never hinted late.
-        if event['type'] in lookup.get((event['source'], event['scope_ref']), ()) and not event['expired']:
+        wanted = lookup.get((event['source'], event['scope_ref'])) or lookup.get((event['source'], 'calendar:all'), ())
+        # ANYM-577: a calendar event matches only if the linked principal's access to its calendar holds for it.
+        if (event['type'] in wanted and not event['expired'] and
+                (event['source'] != 'deedkit:calendar' or event_live(c, row['id'], event))):
             if count >= maximum:
                 reason = 'match_budget'
                 gap = {'reason': reason, 'stream': 'modules', 'after': position, 'through': head,
@@ -442,7 +461,7 @@ def page(c, row, module, after, limit):
     # ANYM-564: references of a call source whose link is no longer live are never read again.
     events = c.execute('''SELECT e.*,e.expires_at IS NOT NULL AND e.expires_at<=clock_timestamp() AS expired
         FROM subscription_module_matches m JOIN module_events e ON e.seq=m.event
-        WHERE m.subscription=%s AND m.event>%s AND ''' + live_sql(c, 'm.subscription', 'e.source', 'e.scope_ref') +
+        WHERE m.subscription=%s AND m.event>%s AND ''' + live_sql(c, 'm.subscription', 'e.source', 'e.scope_ref', 'e.seq') +
         ' ORDER BY m.event LIMIT %s', (row['id'], after, limit + 1)).fetchall()
     items = [_item(event) for event in events[:limit]]
     position = items[-1]['module_event_id'] if items else after
@@ -471,7 +490,7 @@ def hint_references(c, subscription_id, through, *, linked=True):
         FROM subscription_module_matches m JOIN module_events e ON e.seq=m.event
         WHERE m.subscription=%s AND m.event>%s AND m.event<=%s
         AND (e.expires_at IS NULL OR e.expires_at>clock_timestamp()) AND ''' +
-        (live_sql(c, 'm.subscription', 'e.source', 'e.scope_ref') if linked else 'true') + ' ORDER BY m.event LIMIT 20',
+        (live_sql(c, 'm.subscription', 'e.source', 'e.scope_ref', 'e.seq') if linked else 'true') + ' ORDER BY m.event LIMIT 20',
         (subscription_id, after, through)).fetchall()
 
 

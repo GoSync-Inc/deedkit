@@ -5044,11 +5044,11 @@
         "module_sources": {
           "anyOf": [
             {
-              "description": "Optional module event source, only where the owner has linked the module for your key: [{scope, types}] as capabilities subscriptions.module_events names them; refused module_not_linked otherwise.",
+              "description": "Optional module event sources, only where the owner has linked the module for your key: [{scope, types}] as capabilities subscriptions.module_events names them (one calls source, or up to 16 calendar sources); refused module_not_linked otherwise.",
               "items": {
                 "$ref": "#/$defs/ModuleSource"
               },
-              "maxItems": 1,
+              "maxItems": 16,
               "minItems": 1,
               "type": "array"
             },
@@ -5143,7 +5143,7 @@
           "additionalProperties": false,
           "properties": {
             "scope": {
-              "maxLength": 64,
+              "maxLength": 160,
               "minLength": 1,
               "title": "Scope",
               "type": "string"

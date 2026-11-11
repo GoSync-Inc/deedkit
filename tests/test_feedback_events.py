@@ -192,7 +192,8 @@ def test_migration_091_only_widens_the_lists_and_replays_without_touching_acls(m
         WHERE connamespace='public'::regnamespace ORDER BY 1,2"""
     with store.pool.connection() as c:
         acl, constraints = c.execute(query).fetchone(), c.execute(shape).fetchall()
-        c.execute(text)  # a repeated run (the module tests re-run migrations) changes nothing
+        c.execute(text)  # a repeated run (the module tests re-run migrations) changes nothing...
+        c.execute((SOURCE / 'migrations' / '093_module_access_changed.sql').read_text())  # ...once the later one follows
         assert c.execute(query).fetchone() == acl and c.execute(shape).fetchall() == constraints
 
 

@@ -155,11 +155,12 @@ class ModuleSource(TypedDict):
     # owner-set link (module_not_linked, invalid_filter); the schema names no scope or type, so a key without a link
     # reads nothing about any module from it.
     __pydantic_config__ = ConfigDict(extra='forbid')
-    scope: Required[Annotated[StrictStr,Field(min_length=1,max_length=64)]]
+    scope: Required[Annotated[StrictStr,Field(min_length=1,max_length=160)]]
     types: Required[Annotated[list[Annotated[StrictStr,Field(min_length=1,max_length=64)]],Field(min_length=1,max_length=16)]]
-ModuleSources = Annotated[list[ModuleSource], Field(min_length=1,max_length=1,
-    description='Optional module event source, only where the owner has linked the module for your key: '
-        '[{scope, types}] as capabilities subscriptions.module_events names them; refused module_not_linked otherwise.')]
+ModuleSources = Annotated[list[ModuleSource], Field(min_length=1,max_length=16,
+    description='Optional module event sources, only where the owner has linked the module for your key: '
+        '[{scope, types}] as capabilities subscriptions.module_events names them (one calls source, or up to 16 '
+        'calendar sources); refused module_not_linked otherwise.')]
 
 
 def subscription_expiry(value):

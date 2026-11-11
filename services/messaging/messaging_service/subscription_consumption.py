@@ -177,6 +177,8 @@ def _active(row):
 def fetch_subscription_events(store, c, p, subscription_id, *, limit=50):
     from .store import bounded
     bounded(limit)
+    from .module_links import fence_use
+    fence_use(c)  # ANYM-577: a calendar access change waits for this fetch, or this fetch reads the change
     row = _owned(c, p, subscription_id)
     _active(row)
     c.execute('''INSERT INTO subscription_consumption(subscription,acked_through)
@@ -225,6 +227,8 @@ def ack_subscription_events(store, c, p, subscription_id, receipt, version):
         raise APIError('forbidden', 403)
     if type(version) is not int or not 1 <= version <= 2**53 - 1:
         raise APIError('invalid_version')
+    from .module_links import fence_use
+    fence_use(c)  # ANYM-577: the ACK's commit is ordered against a calendar access change
     row = _owned(c, p, subscription_id)
     _active(row)
     if not isinstance(receipt, str) or not 32 <= len(receipt) <= 128:

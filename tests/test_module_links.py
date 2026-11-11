@@ -160,10 +160,13 @@ def test_create_subscription_takes_module_sources_over_rest_and_mcp_and_refuses_
         store.link_module('module-reader', 'calls', 'owner-a')
         # The schema is closed: a scope of the request's own, an unknown key or a non-list is refused before the store.
         for bad in ([{'scope': 'calls:own', 'types': ['call.finished'], 'scope_ref': 'owner-b'}],
-                {'scope': 'calls:own', 'types': ['call.finished']}, [{'scope': 'calls:own'}],
-                [{'scope': 'calls:own', 'types': ['call.finished']}] * 2):
+                {'scope': 'calls:own', 'types': ['call.finished']}, [{'scope': 'calls:own'}]):
             status, invalid = call(chat_ids=['telegram-demo-chat'], module_sources=bad)
             assert status == 400 and invalid['error'] == 'invalid_parameters' and 'module_sources' in invalid['fields']
+        # ANYM-577: the schema takes up to 16 sources (calendar); a second calls source is refused by the server.
+        status, invalid = call(chat_ids=['telegram-demo-chat'],
+            module_sources=[{'scope': 'calls:own', 'types': ['call.finished']}] * 2)
+        assert invalid['error'] == 'invalid_filter'
         status, created = call(**wanted)
         assert status == 200
         sid = created['subscription_id']

@@ -81,3 +81,11 @@ DO $$ BEGIN
   GRANT INSERT ON fcs.starting_reminders TO fcs_worker;
  END IF;
 END $$;
+-- Migration 10 (module access journal, ANYM-577): the triggers' definer functions write module_access_state and
+-- module_access_events and take journal_head's row; the gateway only serves the events (GET /v1/events). Skipped
+-- before migration 10.
+DO $$ BEGIN
+ IF to_regclass('fcs.module_access_events') IS NOT NULL THEN
+  GRANT SELECT ON fcs.module_access_events TO fcs_gateway;
+ END IF;
+END $$;

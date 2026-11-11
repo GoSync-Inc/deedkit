@@ -505,9 +505,11 @@ def test_events_endpoint_checks_arguments_and_scope(household):
         assert c.get("/v1/events/head", headers=auth).json() == {"error": "journal_not_ready"}
         read(s, [LESSON])
         read(s, [dict(LESSON, location="Pool 2")])
-        assert c.get("/v1/events/head", headers=auth).json()["head"] == 1
+        # The journal's first write also journals the baseline access of the one reader (ANYM-577), ahead of the change.
+        assert c.get("/v1/events/head", headers=auth).json()["head"] == 2
         r = c.get("/v1/events?after=0&limit=100", headers=auth)
-        assert r.status_code == 200 and r.json()["events"][0]["type"] == "calendar.event.changed"
+        assert r.status_code == 200
+        assert [e["type"] for e in r.json()["events"]] == ["module.access.changed", "calendar.event.changed"]
         for query in ("after=-1", "limit=0", "limit=201", "after=1&after=2", "cursor=1", "after=99999999999999999"):
             assert c.get("/v1/events?" + query, headers=auth).status_code == 422
         assert c.get("/v1/events", headers={"Authorization": "Bearer " + agent}).status_code == 403

@@ -266,10 +266,30 @@ def rfc3339(value):
     return value.strftime("%Y-%m-%dT%H:%M:%S") + (".%06d" % value.microsecond if value.microsecond else "") + "Z"
 
 
+def access_envelope(row):
+    """A `module.access.changed` row (ANYM-577): the principal's effective access to one calendar, details with its
+    expiry as `until`, or none with the reason. Urgent, never expires; scope_ref names the calendar as every event does."""
+    data = {"principal_ref": row["principal_id"], "access": row["access"], "reason": row["reason"]}
+    if row["until_at"] is not None:
+        data["until"] = rfc3339(row["until_at"])
+    return {"specversion": "1.0", "id": "calendar:%d" % row["seq"], "source": SOURCE, "type": "module.access.changed",
+            "subject": row["principal_id"], "time": rfc3339(row["at"]), "data": data, "urgency": "now",
+            "expires_at": None, "scope_ref": "calendar:" + row["calendar_ref"]}
+
+
+def access_ready(c):
+    """Migration 10 and its grant are in place for this reader (ANYM-577)."""
+    return c.execute(
+        "SELECT coalesce(has_table_privilege(to_regclass('module_access_events'),'SELECT'),false) AS ok"
+    ).fetchone()["ok"]
+
+
 def envelope(row):
     """One event of the cursor contract: ANYM-562's envelope, its calendar data keys and a top-level scope_ref.
     series_ref, occurrences and origin stay in the journal until the contract accepts them. A `starting` reminder
     (ANYM-576) is urgent and expires at the start it announces."""
+    if row["type"] == "access":
+        return access_envelope(row)
     start = rfc3339(row["start_at"])
     data = {"calendar_ref": row["calendar_ref"], "event_ref": row["event_ref"], "start_at": start}
     if row["type"] == "starting":
@@ -323,10 +343,15 @@ def page(c, after, limit, calendars):
     if after >= last:
         return dict(shell, events=[])
     columns = "seq,calendar_ref,type,event_ref,start_at,version,changed,at"
+    # Every branch has the same twelve columns: the last four (ANYM-577) belong to a module.access.changed row.
+    no_access = ",NULL::text AS principal_id,NULL::text AS access,NULL::text AS reason,NULL::timestamptz AS until_at"
     rows = c.execute(
-        "SELECT " + columns + ",NULL::int AS lead_minutes FROM change_journal WHERE seq>%(a)s AND seq<=%(b)s"
-        + (" UNION ALL SELECT seq,calendar_ref,'starting',event_ref,start_at,NULL,NULL,at,lead_minutes "
+        "SELECT " + columns + ",NULL::int AS lead_minutes" + no_access
+        + " FROM change_journal WHERE seq>%(a)s AND seq<=%(b)s"
+        + (" UNION ALL SELECT seq,calendar_ref,'starting',event_ref,start_at,NULL,NULL,at,lead_minutes,NULL,NULL,NULL,NULL "
            "FROM starting_reminders WHERE seq>%(a)s AND seq<=%(b)s" if reminders else "")
+        + (" UNION ALL SELECT seq,calendar_ref,'access',NULL,NULL,NULL,NULL,at,NULL,principal_id,access,reason,until_at "
+           "FROM module_access_events WHERE seq>%(a)s AND seq<=%(b)s" if access_ready(c) else "")
         + " ORDER BY seq LIMIT %(n)s", {"a": after, "b": last, "n": SCAN_ROWS}
     ).fetchall()
     events, position = [], after
