@@ -685,6 +685,8 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
    4. Start the timers recorded in step 1. A daily backup the stop skipped runs at its next time; that is a
       backup follow-up, never a release hold. So is a backup receiver that does not read the new schema
       yet: a hand release does not read `receiver_schema_max`; raise it once the receiver reads the target.
+      The receiver's update follow (BACKUP_R2.md) keeps it at main's head; backup-1's backup health raises
+      `backup_receiver_behind` when it stops or a helper refuses a bundle's schema (incident 11-11).
 
    Merges never wait for a release: the candidate is one SHA ("Prepare and inspect"), so there is no merge
    freeze. No release has a time window: the waits are an active call (the tool checks it) and a running
@@ -1515,7 +1517,10 @@ secret-read hook refuses that copy (11-08), so the owner runs it. Read back:
 changes (ci-deploy-speed 11-09: the production copy also raises `deploy_halted.<code>` for an autodeploy halt, so an
 agent sees a pause within the hour; reinstall on the production host only, then read back with one
 `systemctl start deedkit-backup-health.service` and its `due` line; undo: the previous copy, kept beside it as
-`backup_health.py.before-<sha>`). Undo per host: `systemctl disable --now deedkit-backup-health.timer`; remove the two unit files,
+`backup_health.py.before-<sha>`). Incident 11-11: the backup-1 copy also raises `backup_receiver_behind` (BACKUP.md,
+Backup alerts); reinstall it there and add `"follow": true` to its configuration once
+`deedkit-backup-r2-follow.timer` is enabled (BACKUP_R2.md, Receiver update follow); undo: remove the key and put the
+previous copy back. Undo per host: `systemctl disable --now deedkit-backup-health.timer`; remove the two unit files,
 `/opt/deedkit/backup-health`, `/etc/deedkit-backup-health` (on backup-1 the DSN copy with it) and
 `/var/lib/deedkit-backup-health`; `daemon-reload`. No backup is touched, so nothing else is undone.
 

@@ -41,6 +41,15 @@ HALT_CODES = ('attempt_unresolved', 'call_wait_exhausted', 'configuration_drift'
               'tool_self_test_failed', 'tool_switch_failed', 'tool_update_stopped', 'tool_update_unresolved', 'other')
 DEPLOY_CODES = frozenset(f'deploy_halted.{code}' for code in HALT_CODES)
 PAUSE_FILE = '/etc/deedkit/autodeploy.pause'
+# Incident 11-11: the receiver's helper stayed at schema 67 (its update follow never enabled) while production moved to
+# 84, and every messaging verification failed for two days. On the backup server, component `backup`.
+RECEIVER_CODES = frozenset({'backup_receiver_behind'})
+FOLLOW_STATUS = 'follow-status.json'
+# The follow runs an hour after its previous run ends (BACKUP_R2.md, Receiver update follow); a day plus margin.
+FOLLOW_LIMIT_HOURS = 26
+FOLLOW_PROGRESS = 'follow.json'
+# The profiles whose `restore_schema_failed` can only mean a helper older than the bundle.
+LAG_PROFILES = ('messaging', 'recordings')
 # Policy limits from capture, the normal day plus margin (ANYM-807 criterion 6); BACKUP.md, Backup alerts. Calls 30 h, not
 # 36 (11-09): a missed night shows the next morning; the 04:15 catch-up plus 2 h of verification is 29.5 h.
 LIMIT_HOURS = {'messaging': 30, 'calendar': 32, 'recordings': 30, 'calls': 30}
@@ -74,13 +83,16 @@ def load_config(path):
             data = json.loads(handle.read(READ_LIMIT))
     except (OSError, ValueError, RecursionError):
         raise ConfigError('configuration unreadable') from None
-    if not isinstance(data, dict) or set(data) != CONFIG_KEYS:
+    if not isinstance(data, dict) or set(data) - {'follow'} != CONFIG_KEYS:
         raise ConfigError('configuration keys')
     side, environment, sha = data['side'], data['environment'], data['release_sha']
     if type(side) is not str or side not in KINDS or type(environment) is not str or environment not in ENVIRONMENTS:
         raise ConfigError('side or environment')
     if not isinstance(sha, str) or not re.fullmatch('[0-9a-f]{40}', sha):
         raise ConfigError('release_sha')
+    # Optional, backup server only: also watch the receiver update follow's status (incident 11-11).
+    if 'follow' in data and (side != 'verifier' or type(data['follow']) is not bool):
+        raise ConfigError('follow')
     for key in ('dsn_file', 'state_directory'):
         if not isinstance(data[key], str) or not data[key].startswith('/'):
             raise ConfigError(key)
@@ -250,6 +262,59 @@ def halted(path=None):
     return 'deploy_halted.' + (code if code in HALT_CODES else 'other')
 
 
+def follow_progress(state_directory, status, now, write):
+    """When the follow last proved the pins (`current` or `switched`), kept by this checker in `follow.json`, since
+    the follow's own status only says when it last ran. A `waiting` with no record starts the clock now."""
+    path = Path(state_directory) / FOLLOW_PROGRESS
+    try:
+        last = parse_time((read_object(path) or {}).get('following_at'))
+    except ValueError:
+        last = None
+    if last is not None and status not in ('current', 'switched') and (now - last).total_seconds() >= -FUTURE_GRACE_S:
+        return last
+    if write:
+        write_json(path, {'v': 1, 'following_at': now.isoformat()}, 0o600)
+    return now
+
+
+def receiver_behind(config, now, write=False):
+    """`backup_receiver_behind` when the newest messaging or recordings verification failure is their helper refusing
+    a newer bundle schema (`restore_schema_failed`; calendar's code of that name is a restored-schema mismatch), or,
+    with `follow: true` in the configuration, when the receiver update follow (ANYM-597; its status in messaging's
+    verifier directory) is missing, unreadable, refused, has not run within FOLLOW_LIMIT_HOURS, or has only waited
+    (`verification_pending` behind a stuck retry journal) for that long since it last proved the pins; else None. An
+    unreadable verifier file is verifier()'s to report. `write` keeps the follow's progress time (not under --print)."""
+    code, = RECEIVER_CODES
+    entries = config['profiles']
+    for profile in LAG_PROFILES:
+        if profile not in entries:
+            continue
+        try:
+            directory = Path(entries[profile]['directory'])
+            success, failure = read_object(directory / 'last-success.json'), read_object(directory / 'last-failure.json')
+        except ValueError:
+            continue
+        failed_at = parse_time((failure or {}).get('failed_at'))
+        verified_at = parse_time((success or {}).get('verified_at'))
+        if ((failure or {}).get('error') == 'restore_schema_failed' and failed_at is not None and
+                (verified_at is None or failed_at > verified_at)):
+            return code
+    if not config.get('follow') or 'messaging' not in entries:
+        return None
+    try:
+        follow = read_object(Path(entries['messaging']['directory']) / FOLLOW_STATUS) or {}
+    except ValueError:
+        return code
+    checked, status = parse_time(follow.get('checked_at')), follow.get('status')
+    if status not in ('current', 'switched', 'waiting') or checked is None:
+        return code
+    age = (now - checked).total_seconds()
+    if age > FOLLOW_LIMIT_HOURS * 3600 or age < -FUTURE_GRACE_S:
+        return code
+    since = follow_progress(config['state_directory'], status, now, write)
+    return code if (now - since).total_seconds() > FOLLOW_LIMIT_HOURS * 3600 else None
+
+
 def evaluate(config, now, run=None):
     """{profile: reading}; one profile's failure leaves it UNKNOWN and the others evaluated."""
     side, entries = config['side'], config['profiles']
@@ -287,7 +352,7 @@ def ingest_url(dsn):
 
 def build_event(code, config, timestamp):
     """The event telemetry.safe_event + before_send produce for this code (ANYM-807 criterion 8)."""
-    if code not in CODES and code not in DEPLOY_CODES:
+    if code not in CODES and code not in DEPLOY_CODES and code not in RECEIVER_CODES:
         raise ValueError('unknown code')
     component = 'deploy' if code in DEPLOY_CODES else 'backup'
     try:
@@ -361,7 +426,7 @@ def read_state(path):
         return {}
     good = {}
     for code, entry in codes.items():
-        if (code not in CODES and code not in DEPLOY_CODES) or not isinstance(entry, dict):
+        if (code not in CODES and code not in DEPLOY_CODES and code not in RECEIVER_CODES) or not isinstance(entry, dict):
             continue
         sent, attempted = (moment_value(entry.get(k)) for k in ('sent', 'attempted'))
         if (sent is None) != (entry.get('sent') is None) or (attempted is None) != (entry.get('attempted') is None):
@@ -415,6 +480,13 @@ def check(config, *, now=None, clock=time.monotonic, run=None, send=None, wall=t
     active = active_codes(readings, previous)
     if config['side'] == 'producer' and (code := halted()):
         active.add(code)
+    if config['side'] == 'verifier':
+        try:
+            behind = receiver_behind(config, moment, write=True)
+        except Exception:
+            behind = next((c for c in RECEIVER_CODES if c in previous), None)
+        if behind:
+            active.add(behind)
     state = {code: previous.get(code, {'sent': None, 'attempted': None}) for code in active}
     stamp = moment.timestamp()
     due = due_codes(active, state, stamp)
@@ -451,6 +523,9 @@ def main(argv=None, out=print):
             now = datetime.now(timezone.utc)
             for profile, reading in evaluate(config, now).items():
                 out(line(profile, reading, now.strftime(TIME_FORMAT)))
+            if config.get('follow'):
+                out(f"backup receiver: {'BEHIND' if receiver_behind(config, now) else 'following'} "
+                    f"(checked {now.strftime(TIME_FORMAT)})")
             return 0
         readings, due = check(config)
         out(json.dumps({'checked': sorted(readings), 'due': sorted(due)}))

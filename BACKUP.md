@@ -811,6 +811,14 @@ and undo: `docs/operations/production.md`, "Backup alerts".
   - `backup_unverified.<profile>` when the last verified backup's capture is older than the limit. Recordings and
     calls read `captured_at` from the proof. Messaging and calendar read the `backup_id` time, which is the job's
     creation time and which a resumed job keeps. That is conservative: the age can only read too large.
+- **Receiver behind** (backup server only, component `backup`): `backup_receiver_behind` when the messaging or
+  recordings verifier's newest failure is `restore_schema_failed` (its pinned helper refuses a well-formed bundle
+  newer than itself; calendar's code of that name is a restored-schema mismatch and does not count), or, with
+  `"follow": true` in the configuration, when the receiver update follow's `follow-status.json` in messaging's
+  verifier directory is missing, unreadable, `refused`, older than 26 hours, or only `waiting` for 26 hours since it
+  last read `current` or `switched` (a retry journal it cannot pass; the checker keeps that time in its own
+  `follow.json`). See BACKUP_R2.md, Receiver update follow. `--print` then adds `backup receiver: following|BEHIND`. Incident 11-11: the follow was never enabled, the helper stayed at schema 67
+  while production moved to 84, and two days of dailies failed verification under `restore_decryption_failed`.
 - **Autodeploy halts** (production host only): `deploy_halted.<code>` while `/etc/deedkit/autodeploy.pause` names
   a halt code `deploy` wrote (`deploy_halted.other` for a code this copy does not know), component `deploy`. A
   hand-written pause raises nothing; removing the pause ends the episode. Only the code leaves the host

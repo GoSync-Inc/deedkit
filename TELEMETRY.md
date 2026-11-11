@@ -81,7 +81,9 @@ the fingerprint `["backup-health", "backup", <code>]`, one event per episode and
 every 24 hours: `backup_failed.<profile>` (a run failed), `backup_stale.<profile>`
 (no delivered capture within the limit), `backup_verify_failed.<profile>` (an isolated
 restore failed) and `backup_unverified.<profile>` (no verified capture within the
-limit), for the profiles `messaging`, `calendar`, `recordings` and `calls`. The release
+limit), for the profiles `messaging`, `calendar`, `recordings` and `calls`, and on the backup
+server `backup_receiver_behind` (the receiver's helper refuses a bundle's schema, or its update
+follow stopped; BACKUP.md, Backup alerts). The release
 is `deedkit@<sha>` of the checker's install copy, not the running product's. The event
 carries no path other than the public source frame, no unit name, backup ID, size,
 runner error code, host name or count.
