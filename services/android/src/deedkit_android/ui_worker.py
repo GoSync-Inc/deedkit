@@ -22,6 +22,8 @@ from .uiautomator import SELECTORS, stop_script
 
 # Accessibility classes of editable fields (EditText subclasses report EditText).
 TEXT_FIELDS = ('EditText', 'AutoCompleteTextView')
+# Bound for a launched app's window to take focus after `am start -W` returns.
+LAUNCH_FOREGROUND_S = 10
 
 
 class Device(u2.Device):
@@ -87,6 +89,21 @@ class Device(u2.Device):
             raise Refused('app_foreground_unavailable')
         package, activity = focused.pop()
         return {'package': package, 'activity': activity}
+
+
+def reaches_foreground(device, package):
+    """A cold start shows Android 12+'s splash window (no activity) or no focus at first."""
+    deadline = time.monotonic() + LAUNCH_FOREGROUND_S
+    while True:
+        try:
+            if device.app_current().get('package') == package:
+                return True
+        except Refused as error:
+            if error.code != 'app_foreground_unavailable':
+                raise
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
 
 
 def selector(device, value):
@@ -225,7 +242,7 @@ def execute(device, command, element_timeout_ms=5000, optional_timeout_ms=1000, 
                 permission = {'notifications': 'android.permission.POST_NOTIFICATIONS'}.get(permission, permission)
                 shell(device, ['pm', 'grant' if grant == 'allow' else 'revoke', package, permission])
         output = shell(device, ['am', 'start', '-W', '-n', component[-1]])
-        if re.search(r'(^|\n)(Error|Exception)', output) or device.app_current().get('package') != package:
+        if re.search(r'(^|\n)(Error|Exception)', output) or not reaches_foreground(device, package):
             raise Refused('app_launch_failed')
     elif name in {'stopApp', 'killApp', 'clearState'}:
         package = options.get('appId', value)
