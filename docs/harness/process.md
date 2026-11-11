@@ -30,45 +30,41 @@ box. Project owner items need those words (differences.md).
    request, package, announcement, letter, send); a new account or terms in the owner's name.
 5. The owner's hands: password, MFA, passkey, payment card, device.
 
-Agents decide everything else by consequence (reviews.md, Routing), with undo:
+Agents decide everything else by consequence, with undo:
 
-- Rulesets, required checks, secrets and access: Astra r1. Own-agent grants within
-  already-named permissions need only an affected-configuration backup, read-back and undo;
-  internet exposure, secrets leaving the owner's accounts, data deletion and CI permissions
-  remain risk paths.
+- Rulesets, required checks, secrets, access, CI permissions and internet exposure: back up the
+  affected configuration first, read it back after, keep the undo.
 - Releases and migrations ship without gates (owner 11-04): no fresh backup, restore drill, copy,
   time window or merge freeze; the daily backup is the restore point. Only deleting or rewriting
   user data (row DELETE/UPDATE beyond the service-run DELETEs a ready card or data policy names,
-  DROP TABLE/COLUMN, type-changing ALTER, restores, data-changing rollbacks) needs a fresh verified backup, undo and one
-  Astra review. Never edit applied migrations. Plans: reviews.md, Rounds 7. Never hold work over these.
+  DROP TABLE/COLUMN, type-changing ALTER, restores, data-changing rollbacks) needs a fresh verified
+  backup and undo. Never edit applied migrations. Never hold work over these.
 - Card moves, deletions and evidence-based criterion weakening: a digest line (tiden.md); other
   weakening: item 1.
 
 Incident recovery comes first: a confirmed outage or broken critical user path permits the
 smallest reversible recovery of the existing service/session, compatible rollback or verified
 green-main service-only hotfix. Preserve state, session identity and artifact verification. It
-adds no new auth, send/replay, access or destructive change. Defer intake and review until
-restored. Record before/after and undo; finish deferred reviews and process corrections first.
+adds no new auth, send/replay, access or destructive change. Defer intake until restored.
+Record before/after and undo; finish deferred checks and process corrections first.
 Project live-action restrictions apply.
 
 Urgent production setting fix (owner 11-08): hand-edit it first with undo, PR after (not secrets,
 access, internet exposure); recheck after each release until shipped.
 
-Never merge an open blocking finding: narrow, follow up or revert. Ready owner-asked
+Never merge a known blocking defect: narrow, follow up or revert. Ready owner-asked
 features ship enabled after merge/deploy, flags and grants included, listed live actions excluded.
 No production step during named live activity; check read-only first.
 
-Pre-production mode (orchestration.md): an AGENTS.md `Override:` lightens merge, review, backup and
+Pre-production mode (orchestration.md): an AGENTS.md `Override:` lightens merge, backup and
 verification gates; quality and the five stay.
 
 ## 3. Change paths
 
 Path: consequences and section 2 (reviews.md, Pull request lines); PR line
-`Change path: <path> (<rule>)`. In doubt, name the risk; Astra.
+`Change path: <path> (<rule>)`. In doubt, name the risk in the pull request.
 
-- AUTO (off section 5's review paths): green required checks, failing-first test; small
-  fix: orchestrator diff read.
-- AUTO+review (a review path, section 5); VISION.md: the B5 review (tiden.md).
+- AUTO: green required checks, failing-first test; VISION.md: the B5 ritual (tiden.md).
 - OWNER (a change, here or in a project's AGENTS.md, that lets agents decide part of section 2's
   five, drops or weakens a section 2 gate, or loosens section 3): plus the owner's words; a quoted request naming the change counts (checked against the diff).
 
@@ -89,18 +85,12 @@ Source done: green `main` evidence (orchestration.md); production done adds depl
 
 ## 5. Reviews
 
-Review paths (owner 11-09): sends/calls, collector sessions, user-data deletion/rewrite,
-access/secrets/CI permissions, live-production operation plans. One first look (Astra r1
-on code, Fable r1 on big product epics, such cards, plan r1), no r2; the orchestrator reads a
-blocking fix's diff. Elsewhere none (reviews.md; Fable on code: brief-named only). Every Astra task starts with:
-
-1. Failure isolation: can an exception, timeout or bad input in the new code break or silence an
-   existing path (`<critical paths>`)? Name the line.
-2. Data egress vs PR claims: what data leaves the process (model APIs, logs, telemetry, third
-   parties, files), and does it match the PR description and spec? Anything unlisted is
-   a finding.
-3. Deployed-version compatibility: does it work against what is deployed now (`<deployed
-   consumers>`)? Name the breaking consumer.
+None, on any path (owner 11-11: «отмени все ревью в целом», «не только текущих у всех в
+будущем»): no model, plan, card or diff review. A pull request merges on green required checks
+with a failing-first test. Kept, not reviews: section 1's live-action rule, section 2's fresh
+verified backup and undo before deleting or rewriting user data, and the author's checklist for
+process text (referring documents agree, authority/gate changes carry the owner's words, word
+caps hold, the PR names replaced rules).
 
 ## 6. Working with the orchestrator
 
