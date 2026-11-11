@@ -1301,8 +1301,8 @@ def test_the_deployed_schema66_runtime_refuses_schema67_and_its_router_validator
     assert out['schema'] == 66 and out['migrate'] == 'database_newer_than_runtime'
     assert out['config'] == 'invalid_router_config'
     assert (out['text'], out['access']) == ('invalid_envelope', 'invalid_envelope')
-    assert out['backup_max'] == 66 and backup.SCHEMAS[-1] == 91
-    assert out['backup_max'] == 66 and backup.SCHEMAS[-1] == 91
+    assert out['backup_max'] == 66 and backup.SCHEMAS[-1] == 92
+    assert out['backup_max'] == 66 and backup.SCHEMAS[-1] == 92
 
 
 # The deployed consumers never call migrate(): matcher, dispatcher, API reads and retention keep running on the
