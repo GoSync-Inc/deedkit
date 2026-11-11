@@ -4845,6 +4845,9 @@ def halt_call_problems(source, table):
 # spec: ANYM-766
 def test_every_halt_call_has_a_literal_code_of_the_table_and_the_table_no_unused_code():
     # Every tool file (TOOL_FILES): a halt moved out of production.py still counts (W5-1b).
+    # reads: scripts/production.py
+    # reads: scripts/seamless_release.py
+    # reads: scripts/release_enroll.py
     calls, problems = halt_call_problems([(ROOT / path).read_text() for path in p.TOOL_FILES], p.HALTS)
     assert problems == [] and calls == HALT_CALLS
 
@@ -7581,6 +7584,9 @@ def test_a_snapshot_service_entry_that_is_not_a_mapping_removes_nothing(tmp_path
 # and the real self-test run as a separate process with the CI Python against synthetic configurations.
 # reads: scripts/production.py
 # reads: scripts/seamless_release.py
+# reads: scripts/production.py
+# reads: scripts/seamless_release.py
+# reads: scripts/release_enroll.py
 TOOL = {path: (ROOT / path).read_bytes() for path in p.TOOL_FILES}  # this checkout's tool files
 SYNTHETIC_VALUES = ("https://example.invalid/deedkit", "legacy-api:8080", "legacy-gateway:13240", "synthetic-router",
                     "synthetic-frontend", "synthetic-policy-secret")
