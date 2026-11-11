@@ -16,6 +16,7 @@ from .diagnostics import (FAILURE_FIELDS, discovery, gateway_build, manifest_lac
                           operation_missing_detail, stale_arguments_hint, unavailable, unknown_tool_denial)
 from .http_clients import WAIT_POOL, WAIT_RETRY_AFTER_S
 from .policy import Denied, key_from_file
+from . import recipes
 from .sections import capabilities_view, subscription_blocks  # noqa: F401
 from .tiers import ADVANCED, default_list, REPLACED_BY
 from .catalog_search import search_tools
@@ -642,8 +643,14 @@ class Dispatch:
             raise Denied("invalid_arguments", 422) from None
         return snapshot, agent, tool, selected, args
 
-    async def gateway_capabilities(self, key, route):
-        """The gateway module's own answer (platform_capabilities): the caller's tools, modules and backend states."""
+    async def gateway_capabilities(self, key, route, args=None):
+        """The gateway module's own answer (platform_capabilities): the caller's tools, modules and backend states,
+        plus recipes and the changelog cut to the tools the key's policy shows it (ANYM-964)."""
+        args = args or {}
+        if args.get("since") is not None and (refused := recipes.out_of_range(args["since"])):
+            denied = Denied("invalid_arguments", 422)
+            denied.detail = refused
+            raise denied
         snapshot, agent, visible, states, selection = await self.platform(key, route)
         credential = admitted.get()
         return {
@@ -670,7 +677,7 @@ class Dispatch:
             "owner_authorization_verified": False,
             "credential": credential,
             "capability": Capability("gateway", "capabilities", snapshot["revision"]).to_dict(),
-            **selection,
+            **recipes.extend(selection, self.policy.visible(snapshot, agent), args),
         }
 
     def call_credential(self, snapshot, agent, module):
@@ -825,7 +832,7 @@ class Dispatch:
         if tool["operation"] == "select_modules":
             return await self.select_modules(key, route, args["modules"])
         if tool["module"] == "gateway":
-            return await self.gateway_capabilities(key, route)
+            return await self.gateway_capabilities(key, route, args)
         module = tool["module"]
         credential = self.call_credential(snapshot, agent, module)
         read_only = tool.get("annotations", {}).get("readOnlyHint", False)

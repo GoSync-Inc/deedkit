@@ -1,0 +1,91 @@
+{
+  "messaging": [
+    {
+      "id": "read_a_chat",
+      "title": "Find a chat and read it",
+      "when": "You need the recent messages of one person or group.",
+      "steps": [
+        {"tool": "messages_list_chats", "note": "Find the chat by name with query; keep its chat_id.", "arguments": {"query": "Anna", "limit": 5}},
+        {"tool": "messages_get_messages", "note": "Read the newest messages of that chat_id; pass before with the oldest message seen to page back."}
+      ]
+    },
+    {
+      "id": "find_a_message",
+      "title": "Search messages and open one in context",
+      "when": "You know words of a message but not its chat.",
+      "steps": [
+        {"tool": "messages_search", "note": "Search the words; narrow with accounts, chats or from_time/to_time.", "arguments": {"query": "invoice", "limit": 10}},
+        {"tool": "messages_get_context", "note": "Open a hit by its message_id to read the messages around it."}
+      ]
+    },
+    {
+      "id": "send_safely",
+      "title": "Send a message safely",
+      "when": "The owner asked you to write to someone.",
+      "steps": [
+        {"tool": "messages_send", "note": "Preview: dry_run true returns recipient, text, warnings and a confirm_token; nothing is sent.", "arguments": {"to": "+15550100", "text": "Running 10 minutes late", "dry_run": true}},
+        {"tool": "messages_send", "note": "Show the owner the preview, get their exact yes, then send the same to and text with confirm_token."},
+        {"tool": "messages_get_messages", "note": "Follow the reply: read the chat_id from the result later. On state unknown read here first and never resend."}
+      ]
+    },
+    {
+      "id": "answer_waiting_chats",
+      "title": "Answer the chats waiting for a reply",
+      "when": "The owner asks what needs an answer.",
+      "steps": [
+        {"tool": "messages_list_chats", "note": "List chats whose last message waits for the owner's reply.", "arguments": {"awaiting_reply": true, "limit": 20}},
+        {"tool": "messages_get_messages", "note": "Read each chat that matters before suggesting a reply."},
+        {"tool": "messages_send", "note": "Draft with dry_run true and send only after the owner's exact yes, as in send_safely."}
+      ]
+    }
+  ],
+  "calendar": [
+    {
+      "id": "find_free_time",
+      "title": "Find a free slot for several people",
+      "when": "You need a time that suits the owner and family members.",
+      "steps": [
+        {"tool": "calendar_members", "note": "Look up member names when unsure who people means."},
+        {"tool": "calendar_find_time", "note": "Ask for free times in a window; each slot carries a next call to schedule it.", "arguments": {"people": ["Anna"], "window": "this_week", "duration": 60}}
+      ]
+    },
+    {
+      "id": "plan_a_change",
+      "title": "Plan and apply an event change",
+      "when": "The owner asks to move, change or cancel an event.",
+      "steps": [
+        {"tool": "calendar_calendars", "note": "List calendars and keep the calendar_ref values."},
+        {"tool": "calendar_agenda", "note": "Read the agenda for the day to find the event_ref."},
+        {"tool": "calendar_plan", "note": "Prepare the change: a preview and field diff with a plan_id; nothing changes yet."},
+        {"tool": "calendar_apply", "note": "Show the owner the preview; apply plan_id with a new request_id only after their yes."}
+      ]
+    }
+  ],
+  "calls": [
+    {
+      "id": "one_call",
+      "title": "Place one call and read its result",
+      "when": "The owner asked you to call someone about one task.",
+      "steps": [
+        {"tool": "calls_call", "note": "Preflight with dry_run true: no dialing; it returns a confirm_token.", "arguments": {"to": "+12025550199", "goal": "Ask about the delivery", "owner_instruction": "Call +1 202 555 0199 about the delivery", "dry_run": true}},
+        {"tool": "calls_call", "note": "After the owner's exact yes, place the call with the same request and confirm_token; keep call_id."},
+        {"tool": "calls_call_result", "note": "Wait for the outcome with call_id and wait_s; never retry an unknown outcome."}
+      ]
+    }
+  ],
+  "android": [
+    {
+      "id": "run_saved_flow",
+      "title": "Run a saved flow and read its result",
+      "when": "A published flow does the task on the phone.",
+      "steps": [
+        {"tool": "android_capabilities", "note": "Pick the device_id."},
+        {"tool": "android_session", "note": "Acquire the device with action acquire; keep the session_id."},
+        {"tool": "android_flows", "note": "List saved flows to find the name and published version.", "arguments": {"action": "list"}},
+        {"tool": "android_run_flow", "note": "Run the flow by name with a new request_id and the session_id."},
+        {"tool": "android_get_operation", "note": "On running or unknown, poll the request_id for the result."},
+        {"tool": "android_session", "note": "Release the session with action release when done."}
+      ]
+    }
+  ]
+}

@@ -422,6 +422,19 @@ different sections concurrently. The compact path ignores the legacy principal-w
 selection set by `platform_select_modules`. Existing paths retain their selection
 behavior. Use the compact path when client software caches its tool inventory.
 
+`platform_capabilities` takes two optional arguments. `module` (a
+`modules_available` id) adds `recipes`: that module's common workflows from the
+reviewed `recipes.json`, each `{id, title, when, steps: [{tool, note,
+arguments?}]}`. Every `modules_available` entry lists its `recipe_ids`. A recipe
+with any step tool the key cannot see is left out whole. `since` (a revision)
+adds `whats_new`, the `changelog.json` entries after it, each cut to the tools
+the key can see. Every answer carries `changelog_revision`. A `since` below 0 or
+above it is `invalid_arguments` with the current revision. Each changelog entry
+pins the digest of `catalog.json`'s tool names and schemas, so a pull request
+that changes a name or schema adds its entry with
+`python3 scripts/catalog_changelog.py --add --note '...'`; a gateway test fails
+otherwise. Description-only edits need no entry.
+
 Forwarding permits only tools already granted to the caller. It cannot forward
 itself or change the legacy selection. Large message payloads retain their original
 per-tool size limits. An uncertain mutation keeps its original request ID and
