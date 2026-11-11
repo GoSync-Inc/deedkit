@@ -144,11 +144,13 @@ def tap(device, node):
 
 def extract_list(root, listing, fields, limit):
     nodes, _ = resolve_selector(root, listing['item'], multiple=True)
+    # scope: parent resolves fields in the item's parent, for cards whose fields are siblings.
+    parents = {child: parent for parent in root.iter() for child in parent} if listing.get('scope') == 'parent' else {}
     rows = []
     for node in nodes[:limit]:
         row = {}
         for name in fields:
-            child, _ = resolve_selector(node, listing['fields'][name])
+            child, _ = resolve_selector(parents.get(node, node), listing['fields'][name])
             row[name] = None if child is None or child.get('password') == 'true' else child.get('text') or child.get('content-desc') or None
         rows.append(row)
     return rows

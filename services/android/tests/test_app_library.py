@@ -328,3 +328,38 @@ def test_visible_list_keeps_distinct_identical_rows():
 
     result = execute_map(Device(), 'readList', {'app_map': validate_map(MAP), 'list': 'products'}, None)
     assert result['rows'] == [{'title': 'Tea'}, {'title': 'Tea'}]
+
+
+# spec: ANYM-954
+def test_map_point_candidates_accept_pair_and_xy_forms():
+    from deedkit_android.app_maps import validate_map
+
+    for form in ('[400, 750]', '{x: 400, y: 750}', '"400,750"'):
+        app_map = validate_map(MAP.replace('{textExact: Orders}', '{point: %s}' % form, 1))
+        assert app_map['selectors']['orders'] == [{'point': '400,750'}]
+    for form in ('[400]', '[-1, 5]', '{x: 1}', '[true, 5]', '"left"'):
+        with pytest.raises(Refused, match='invalid_point'):
+            validate_map(MAP.replace('{textExact: Orders}', '{point: %s}' % form, 1))
+
+
+# spec: ANYM-954
+def test_list_fields_can_resolve_among_the_item_siblings():
+    from deedkit_android.app_maps import validate_map
+    from deedkit_android.map_runtime import extract_list
+
+    source = MAP.replace('    item: {resourceId: example.shop:id/item}\n',
+                         '    item: {resourceId: example.shop:id/title}\n    scope: parent\n') + \
+        '      status: {resourceId: example.shop:id/status}\n'
+    listing = validate_map(source)['lists']['products']
+    root = ElementTree.fromstring('''<hierarchy><node class="list">
+      <node class="card"><node resource-id="example.shop:id/title" text="Order A"/>
+        <node resource-id="example.shop:id/status" text="Delivered"/></node>
+      <node class="card"><node resource-id="example.shop:id/title" text="Order B"/>
+        <node resource-id="example.shop:id/status" text="Out for delivery"/></node>
+    </node></hierarchy>''')
+    assert extract_list(root, listing, ['title', 'status'], 10) == [
+        {'title': 'Order A', 'status': 'Delivered'}, {'title': 'Order B', 'status': 'Out for delivery'}]
+    default = validate_map(source.replace('    scope: parent\n', ''))['lists']['products']
+    assert extract_list(root, default, ['status'], 10) == [{'status': None}, {'status': None}]
+    with pytest.raises(Refused, match='invalid_list_scope'):
+        validate_map(source.replace('scope: parent', 'scope: screen'))

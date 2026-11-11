@@ -413,7 +413,9 @@ scenarios use immutable SQLite versions and separate draft/published heads.
 historical `version`, including after deletion. `history` pages audit events.
 
 A map contains `package`, named selector candidate lists, screen signatures,
-optional `deep_links`, `popups`, `lists` and `meta`. A scenario contains `map`,
+optional `deep_links`, `popups`, `lists` and `meta`. A point candidate is `{point: "x,y"}`,
+`[x, y]` or `{x, y}`; a list with `scope: parent` reads fields that are siblings of its item
+node. A scenario contains `map`,
 optional `map_version`, `params`, advisory `side_effects`, and `steps`.
 The full schema and worked authoring sequence are returned by
 `android_maestro(action=reference).library`.

@@ -44,8 +44,8 @@ def reference():
         'inspect': 'inspectMap returns match counts per selector and screen. Add hierarchy: true for compact nodes (index, depth, class, resource-id, text, content-desc, bounds, clickable, scrollable; password text omitted; max_nodes 1-500, default 200) and suggest: true for unique selectors (resourceId, then textExact, then description) and list candidates (an id or class repeated under one parent, its count and field ids present in at least half the items; has_text false means try the map hierarchy option or readScreenText). At most 50 of each.',
         'repair': 'Get the current source with android_flows(action=get, stage=draft). Save a draft with base_version equal to the current draft version, or published version when no draft exists. Inspect with a draft scenario containing inspectMap, test the intended scenario, then publish. history returns versions and audit events; rollback takes a previously published version and the current published base_version.',
         'hierarchy': 'Optional map field hierarchy: {compressed: false, max_depth: 1-200}. Every snapshot for that map then dumps the full accessibility tree; the default (compressed true, depth 50) hides nodes that are not important for accessibility and deep subtrees. Try it when inspectMap finds no text, before readScreenText. Plain selector commands later in the same batch may then also see the full tree.',
-        'maps': 'Fields: package, selectors, screens, deep_links, popups, lists, hierarchy, meta. Named selectors are ordered candidate lists. text/id are full regular expressions, textExact/resourceId are exact. An ambiguous first matching candidate stops the action. index explicitly selects one match. A point candidate requires tapElement.expect_screen. Screens require all require conditions and no forbid conditions; each condition is a selector name or inline selector. Optional activity is a regex.',
-        'lists': 'lists.<name> has item (selector or candidate list), fields (field names mapped to selectors), and optional key (field names identifying one item across pages). Without key, every visible row is preserved. readList returns rows under both its step result and receipt.data.<list>. limit defaults to 20, at most 100; scroll_pages defaults to 0, at most 5. Password fields return null.',
+        'maps': 'Fields: package, selectors, screens, deep_links, popups, lists, hierarchy, meta. Named selectors are ordered candidate lists. text/id are full regular expressions, textExact/resourceId are exact. An ambiguous first matching candidate stops the action. index explicitly selects one match. A point candidate ({point: "x,y"}, [x, y] or {x, y}; pixels or percents) requires tapElement.expect_screen. Screens require all require conditions and no forbid conditions; each condition is a selector name or inline selector. Optional activity is a regex.',
+        'lists': 'lists.<name> has item (selector or candidate list), fields (field names mapped to selectors), and optional key (field names identifying one item across pages). scope: parent resolves fields in the parent of the item node, for cards whose fields are siblings of the item node. Without key, every visible row is preserved. readList returns rows under both its step result and receipt.data.<list>. limit defaults to 20, at most 100; scroll_pages defaults to 0, at most 5. Password fields return null.',
         'loading': 'A screen signature can match while content still loads. Prefer forbid: [<spinner selector>] on the screen so waits continue until it is gone. waitSettled {stable_ms: 100-5000 (500), timeout} waits until the hierarchy (class, id, text, description, bounds) is unchanged for stable_ms and fails with screen_not_settled. openApp and openDeepLink accept settle_ms (0-5000) to settle after their screen check. openDeepLink returns phases {open_ms, screen_ms, settle_ms} and polls. The plain sleep command (milliseconds, at most 10000) is a last resort.',
         'popups': 'popups.<name> has detect (selector name) and either dismiss (selector name) or press: back. dismissPopups is explicit and bounded by max_rounds, default 3.',
         'parameters': 'params maps UPPER_CASE names to {type: string|integer|boolean, default?, required?, enum?, max_length?}. Values substitute literally as ${NAME}. Existing string parameters work without declarations.',
@@ -94,14 +94,24 @@ def named(value):
         raise Refused('invalid_map_names', 422)
 
 
+def point_text(value):
+    """A coordinate candidate as "x,y" (pixels or percents); [x, y] and {x, y} name the same point."""
+    if isinstance(value, dict) and set(value) == {'x', 'y'}:
+        value = [value['x'], value['y']]
+    if isinstance(value, list) and len(value) == 2 and all(type(v) in (int, float) and v >= 0 for v in value):
+        value = f'{value[0]},{value[1]}'
+    if not isinstance(value, str) or not re.fullmatch(r'\d+(?:\.\d+)?%?,\s*\d+(?:\.\d+)?%?', value):
+        raise Refused('invalid_point', 422)
+    return value
+
+
 def candidates(value, point=False):
     items = value if isinstance(value, list) else [value]
     if not 1 <= len(items) <= 8:
         raise Refused('invalid_map_candidates', 422)
     for item in items:
         if point and isinstance(item, dict) and set(item) == {'point'}:
-            if not isinstance(item['point'], str) or not re.fullmatch(r'\d+(?:\.\d+)?%?,\s*\d+(?:\.\d+)?%?', item['point']):
-                raise Refused('invalid_point', 422)
+            item['point'] = point_text(item['point'])
         else:
             validate_selector(item)
             if not isinstance(item, dict):
@@ -160,7 +170,9 @@ def validate_map(source):
             if selector_name and any('point' in c for c in value['selectors'][selector_name]):
                 raise Refused('popup_requires_selector', 422)
     for listing in value['lists'].values():
-        fields(listing, {'item', 'fields', 'key'})
+        fields(listing, {'item', 'fields', 'key', 'scope'})
+        if listing.get('scope', 'item') not in ('item', 'parent'):
+            raise Refused('invalid_list_scope', 422)
         listing['item'] = candidates(listing.get('item'))
         named(listing.get('fields'))
         if not listing['fields']:
