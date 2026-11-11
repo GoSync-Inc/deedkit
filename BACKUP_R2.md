@@ -854,7 +854,13 @@ as root, an hour after the previous run ends. Each run:
 
 1. takes the verifier's lock, so it never runs while a verification runs, and
    stops (`verification_pending`) while a verification retry journal
-   (`active.json`) pins the current pair;
+   (`active.json`) pins the current pair. A messaging or recordings run that
+   the helper refused for the bundle's newer schema (`restore_schema_failed`)
+   keeps no retry journal once its cleanup completes, so the follow can move
+   the pair (incident 11-11: the journal and the follow waited on each other).
+   Its `last-failure.json` names the candidate (`backup_id`) and the helper
+   (`helper_revision`); until the pins move, a run for that candidate fails
+   with the same code before any download;
 2. reads main's head with `git ls-remote` (no API quota) and fetches its
    history treeless into `follow-main.git` in the verifier directory; it moves
    only to a descendant of the pinned revision, never to an older commit
@@ -894,7 +900,7 @@ as root, an hour after the previous run ends. Each run:
    pair;
 6. publishes `capabilities.json` for the proven installed pair. It writes only
    its own file in `/var/lib/deedkit-backup-r2/published/` (root, mode 0755,
-   created if missing), refuses to replace a file that is not a publication or
+   created if missing, its parent `/var/lib/deedkit-backup-r2` too), refuses to replace a file that is not a publication or
    to share the directory with another file, and refuses a mount point.
 
 Anything unproven keeps the current pair. The run records `follow-status.json`

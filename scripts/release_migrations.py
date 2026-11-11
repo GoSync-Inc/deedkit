@@ -1250,6 +1250,83 @@ def install_backup_runner(settings, candidate, release):
     print(f"backup runner: installed {expected[:12]}, image {image[:19]}", file=sys.stderr, flush=True)
 
 
+# Incident 11-11: the hourly backup checker (deploy/deedkit-backup-health.service, ANYM-807) was a hand copy that kept
+# naming release 634227af, so its Tiden issues landed on an old release. A healthy `apply` now installs the release's
+# checker and names the release in its config's `release_sha`. A host without both files keeps none: the first install
+# is production.md's (the config names the ingest DSN file).
+BACKUP_HEALTH_PROGRAM = Path("/opt/deedkit/backup-health/backup_health.py")
+BACKUP_HEALTH_CONFIG = Path("/etc/deedkit-backup-health/config.json")
+BACKUP_HEALTH_SOURCE = "services/messaging/messaging_service/backup_health.py"
+
+
+def install_backup_health(sha, release):
+    """After a healthy apply: the release's backup checker and `release_sha`, recorded in `<sha>/backup-health.json`.
+    Never raises: the checker reads backups and never gates one, so a refusal is a stderr line and the receipt, and the
+    release stands with the previous checker. Returns the receipt, or None on a host without the checker."""
+    try:
+        result = backup_health_files(sha, release / "source")
+    except Exception as exc:
+        result = {"sha": sha, "status": "refused", "at": p.now(),
+                  "reason": str(exc) if isinstance(exc, (p.Refused, MigrationRefused)) else type(exc).__name__}
+    if result is None:
+        return None
+    with suppress(Exception):
+        p.write_record(release / "backup-health.json", result)
+    print(f"backup health: {result['status']}" + (f" ({result['reason']})" if "reason" in result else ""),
+          file=sys.stderr, flush=True)
+    return result
+
+
+def backup_health_files(sha, source):
+    """Replace the checker and its config by one rename each after a `.before-<sha>` copy (owner and mode kept), once
+    the staged pair's read-only `--print` exits 0; any failure before the first rename leaves both files as they were.
+    The program goes first: until the config follows, the release's checker names the previous release."""
+    paths = (p.BACKUP_HEALTH_PROGRAM, p.BACKUP_HEALTH_CONFIG)
+    if not all(os.path.lexists(path) for path in paths):
+        return None
+    program = p.run(["git", "-C", str(source), "cat-file", "blob", f"{sha}:{p.BACKUP_HEALTH_SOURCE}"], binary=True)
+    directories, staged, temporary, copies = {}, [], {}, []
+    try:
+        for path in paths:
+            directories[path] = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        found = {path: leaf_read(directories[path], path.name) for path in paths}
+        config = json.loads(found[paths[1]][0])
+        if not isinstance(config, dict) or not isinstance(config.get("release_sha"), str):
+            raise p.Refused(f"{paths[1]} names no release_sha; install the backup checker by hand (production.md)")
+        wanted = {paths[0]: program, paths[1]: (json.dumps({**config, "release_sha": sha}, indent=2) + "\n").encode()}
+        files = [{"path": str(path), "before": p.git_blob(found[path][0]), "after": p.git_blob(wanted[path]),
+                  "undo": f"{path}.before-{sha}"} for path in paths if found[path][0] != wanted[path]]
+        if not files:
+            return {"sha": sha, "status": "current", "at": p.now()}
+        for path in paths:
+            if found[path][0] != wanted[path]:
+                temporary[path], wrote = stage_leaf(directories[path], path, *found[path], wanted[path], sha,
+                                                    "the backup checker")
+                staged.append(path)
+                copies += [path] if wrote else []
+        live = {path: path.parent / temporary.get(path, path.name) for path in paths}
+        try:
+            p.run([p.RUNNER_PYTHON, "-I", str(live[paths[0]]), "--config", str(live[paths[1]]), "--print"], timeout=60)
+        except p.Refused as exc:
+            raise p.Refused(f"the release's backup checker refused its configuration: {exc}") from exc
+        copies.clear()  # from here on the copies are the undo
+        for path in [*staged]:
+            os.replace(temporary[path], path.name, src_dir_fd=directories[path], dst_dir_fd=directories[path])
+            os.fsync(directories[path])
+            staged.remove(path)
+    finally:
+        # A refusal before the first rename: the files this run wrote go, so the host is as it was.
+        for path in staged:
+            with suppress(OSError):
+                os.unlink(temporary[path], dir_fd=directories[path])
+        for path in copies:
+            with suppress(OSError):
+                os.unlink(f"{path.name}.before-{sha}", dir_fd=directories[path])
+        for directory in directories.values():
+            os.close(directory)
+    return {"sha": sha, "status": "installed", "at": p.now(), "files": files}
+
+
 def migration_gate(settings, http, plan, mirror, base, serving, *, admission=False):
     """M2's read-only gates, at admission and again as the final gate: no active or unknown call, nothing
     unfinished, the base release's Store without server-side prepared statements (#352) and the live ledger exactly

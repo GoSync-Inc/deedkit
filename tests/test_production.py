@@ -542,6 +542,83 @@ def test_apply_goes_ahead_when_the_host_backup_runner_is_the_releases(tmp_path, 
     assert p.apply(settings, SHA)["status"] == "applied"
 
 
+CHECKER_SOURCE = Path(__file__).resolve().parents[1] / "services/messaging/messaging_service/backup_health.py"
+
+
+def host_checker(tmp_path, monkeypatch, release=None):
+    """An installed backup checker (an old copy naming release 6342…) and the candidate's checker, `release` bytes or
+    the repository's; its staged `--print` really runs, with this interpreter."""
+    program, config = tmp_path / "backup-health" / "backup_health.py", tmp_path / "etc" / "config.json"
+    program.parent.mkdir()
+    config.parent.mkdir()
+    program.write_bytes(b"# an older checker\n")
+    program.chmod(0o755)
+    config.write_text(json.dumps({"side": "producer", "environment": "production", "release_sha": "6342" + "0" * 36,
+                                  "dsn_file": "/synthetic/tiden.dsn", "state_directory": str(tmp_path / "health"),
+                                  "profiles": {"messaging": {"units": ["synthetic-backup.service"],
+                                                             "status": str(tmp_path / "status.json")}}}))
+    config.chmod(0o600)
+    monkeypatch.setattr(p, "BACKUP_HEALTH_PROGRAM", program)
+    monkeypatch.setattr(p, "BACKUP_HEALTH_CONFIG", config)
+    monkeypatch.setattr(p, "RUNNER_PYTHON", sys.executable)
+    content = CHECKER_SOURCE.read_bytes() if release is None else release
+    original = p.run
+    def command(argv, **kw):
+        if argv[-1] == f"{SHA}:{p.BACKUP_HEALTH_SOURCE}":
+            return content
+        if argv[:2] == [sys.executable, "-I"]:
+            done = subprocess.run(argv, capture_output=True, timeout=60)
+            if done.returncode:
+                raise p.Refused(f"exit {done.returncode}")
+            return done.stdout.decode()
+        return original(argv, **kw)
+    monkeypatch.setattr(p, "run", command)
+    return program, config, content
+
+
+# spec: ANYM-807
+def test_apply_installs_the_releases_backup_checker_naming_the_release(tmp_path, monkeypatch):
+    # Incident 11-11: the hand-installed checker kept naming 634227af, so its issues landed on an old release.
+    settings, calls, _ = fixture(tmp_path, monkeypatch)
+    p.prepare(settings, SHA)
+    program, config, content = host_checker(tmp_path, monkeypatch)
+    before = config.read_bytes()
+    assert p.apply(settings, SHA)["status"] == "applied"
+    installed = json.loads(config.read_text())
+    assert program.read_bytes() == content and installed == {**json.loads(before), "release_sha": SHA}
+    assert stat.S_IMODE(config.stat().st_mode) == 0o600 and stat.S_IMODE(program.stat().st_mode) == 0o755
+    assert config.with_name(f"config.json.before-{SHA}").read_bytes() == before
+    assert program.with_name(f"backup_health.py.before-{SHA}").read_bytes() == b"# an older checker\n"
+    receipt = json.loads((Path(settings["state_directory"]) / SHA / "backup-health.json").read_text())
+    assert receipt["status"] == "installed" and len(receipt["files"]) == 2
+    # Again: nothing to change.
+    assert p.install_backup_health(SHA, Path(settings["state_directory"]) / SHA)["status"] == "current"
+
+
+# spec: ANYM-807
+@pytest.mark.parametrize("case", ["refusing-checker", "no-release-sha", "absent"])
+def test_a_backup_checker_that_cannot_be_installed_leaves_both_files_and_the_release_stands(tmp_path, monkeypatch,
+                                                                                             case):
+    settings, calls, _ = fixture(tmp_path, monkeypatch)
+    p.prepare(settings, SHA)
+    program, config, _ = host_checker(tmp_path, monkeypatch,
+                                      b"import sys\nsys.exit(2)\n" if case == "refusing-checker" else None)
+    if case == "no-release-sha":
+        config.write_text(json.dumps({"side": "producer"}))
+    if case == "absent":
+        config.unlink()
+    files = {path: path.read_bytes() for path in (program, config) if path.exists()}
+    assert p.apply(settings, SHA)["status"] == "applied"
+    assert {path: path.read_bytes() for path in files} == files
+    assert sorted(path.name for path in (*program.parent.iterdir(), *config.parent.iterdir())) == sorted(
+        path.name for path in files)
+    receipt = Path(settings["state_directory"]) / SHA / "backup-health.json"
+    if case == "absent":
+        assert not receipt.exists()
+    else:
+        assert json.loads(receipt.read_text())["status"] == "refused"
+
+
 # spec: ANYM-488
 @pytest.mark.parametrize("case", ["symlink", "directory", "unreadable", "no-source"])
 def test_an_unverifiable_host_backup_runner_refuses_apply_before_any_stop(tmp_path, monkeypatch, case):

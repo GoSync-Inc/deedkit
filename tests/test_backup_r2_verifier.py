@@ -45,6 +45,17 @@ def test_server_verifier_proof_accepts_current_schema_and_rejects_the_next(versi
         with pytest.raises(ValueError,match='invalid_helper_result'):v.make_proof(receipt,facts,'c'*32)
 
 
+# spec: ANYM-597
+def test_the_receiver_and_its_helper_read_the_newest_migration():
+    # Incident 11-11: a receiver whose highest schema is below the newest migration refuses every backup after it.
+    v=module();from messaging_service import backup
+    names=[path.name for path in Path(backup.__file__).with_name('migrations').glob('*.sql')]
+    newest=max(int(name.split('_',1)[0]) for name in names if name.split('_',1)[0].isdigit())
+    assert newest>=86
+    assert v.SCHEMAS[-1]>=newest and backup.SCHEMAS[-1]>=newest
+    assert v.SCHEMAS==backup.SCHEMAS
+
+
 def test_server_verifier_cleanup_refuses_unowned_name_collision():
     v=module()
     class Engine:
@@ -141,6 +152,37 @@ def test_failed_restore_preserves_old_point_and_retries_exact_run(operator):
     engine.failure=None
     result=v.run(config,client=cloud,engine=engine)
     assert result['verification_id']==active['run'] and engine.runs==[active['run']]*2
+
+
+# spec: ANYM-597
+def test_a_helper_behind_the_bundles_schema_leaves_no_retry_journal_and_no_second_download(operator):
+    # Incident 11-11: the retry journal held the old helper pins, the follow never moves pins under a journal, and each
+    # retry streamed the whole bundle to the same refusal. The refusal now names its candidate and helper instead.
+    v,config,receiver,cloud,engine,write_json=operator
+    directory=Path(config['directory']);engine.failure=v.HelperFailure('restore_schema_failed')
+    with pytest.raises(v.HelperFailure,match='restore_schema_failed'):v.run(config,client=cloud,engine=engine)
+    failure=json.loads((directory/'last-failure.json').read_text())
+    assert not (directory/'active.json').exists() and not engine.resources and len(engine.runs)==1
+    assert failure['error']=='restore_schema_failed' and failure['helper_revision']==config['helper_revision']
+    backup_id=failure['backup_id']
+    # The same helper and candidate again: the same code, with no journal, admission or download.
+    with pytest.raises(ValueError,match='restore_schema_failed'):v.run(config,client=cloud,engine=engine)
+    again=json.loads((directory/'last-failure.json').read_text())
+    assert len(engine.runs)==1 and not (directory/'active.json').exists()
+    assert (again['error'],again['backup_id'],again['helper_revision'])==('restore_schema_failed',backup_id,config['helper_revision'])
+    # The follow moved the pins: the same candidate runs in full and verifies.
+    engine.failure=None;newer={**config,'helper_revision':'d'*40}
+    assert v.run(newer,client=cloud,engine=engine)['status']=='verified' and len(engine.runs)==2
+
+
+# spec: ANYM-597
+@pytest.mark.parametrize('error',['restore_quarantine_failed','restore_decryption_failed'])
+def test_other_helper_refusals_keep_their_retry_journal(operator,error):
+    v,config,receiver,cloud,engine,_=operator
+    engine.failure=v.HelperFailure(error)
+    with pytest.raises(v.HelperFailure):v.run(config,client=cloud,engine=engine)
+    directory=Path(config['directory'])
+    assert (directory/'active.json').exists() and 'backup_id' not in json.loads((directory/'last-failure.json').read_text())
 
 
 def test_failed_promotion_retries_identical_proof_without_second_restore(operator,monkeypatch):
@@ -1062,7 +1104,7 @@ def follower(operator,tmp_path,monkeypatch):
         return proofs[sha]
     state=SimpleNamespace(f=f,v=v,path=path,config=config,receiver=receiver,docker=Docker(),main=Main(),
                           images=images,served=served,proofs=proofs,tested=[],results={},write_json=write_json,
-                          directory=Path(config['directory']),cloud=cloud,profiles=[],calendar_failure=None)
+                          directory=Path(config['directory']),cloud=cloud,profiles=[],calendar_failure=None,engine=engine)
     def self_test(engine,tested,run=None):
         state.profiles.append(r2.profile(tested))
         if r2.profile(tested)!='messaging':
@@ -1255,6 +1297,17 @@ def test_follow_never_runs_during_a_verification_or_its_pending_retry(follower):
     with pytest.raises(RuntimeError,match='verification_pending'):s.run()
     assert s.path.read_bytes()==before and not s.tested and not s.docker.pulled
     with pytest.raises(RuntimeError,match='verification_pending'):s.revert()
+
+
+# spec: ANYM-597
+def test_follow_moves_the_helper_after_it_refused_a_newer_bundle_schema_and_the_bundle_then_verifies(follower):
+    # Incident 11-11: the refusal's retry journal kept the follow at `verification_pending` with the old helper.
+    s=follower;v=s.v;s.engine.failure=v.HelperFailure('restore_schema_failed')
+    with pytest.raises(v.HelperFailure):v.run(s.config,client=s.cloud,engine=s.engine)
+    assert s.run()['status']=='switched' and HEAD in s.tested
+    pinned=json.loads(s.path.read_text());assert pinned['helper_revision']==HEAD
+    s.engine.failure=None
+    assert v.run(pinned,client=s.cloud,engine=s.engine)['status']=='verified' and len(s.engine.runs)==2
 
 
 # spec: ANYM-597
@@ -1688,6 +1741,18 @@ def test_follow_creates_a_searchable_publication_directory_under_a_private_umask
     try:assert s.run()['status']=='current'
     finally:os.umask(previous)
     assert published.stat().st_mode&0o777==0o755 and r2.CAPABILITIES_FILE.stat().st_mode&0o777==0o644
+    assert s.published()['helper_revision']==s.config['helper_revision']
+
+
+# spec: ANYM-597
+def test_follow_creates_the_publications_missing_parent_root_and_searchable(follower,tmp_path,monkeypatch):
+    # Incident 11-11: no install step made /var/lib/deedkit-backup-r2, so the first follow run refused at publish.
+    s=follower;s.main.head_value=s.config['helper_revision'];parent=tmp_path/'lib'
+    monkeypatch.setattr(r2,'CAPABILITIES_FILE',parent/'published'/'capabilities.json')
+    previous=os.umask(0o077)
+    try:assert s.run()['status']=='current'
+    finally:os.umask(previous)
+    assert parent.stat().st_mode&0o777==0o755 and (parent/'published').stat().st_mode&0o777==0o755
     assert s.published()['helper_revision']==s.config['helper_revision']
 
 

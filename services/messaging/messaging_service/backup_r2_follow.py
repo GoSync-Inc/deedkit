@@ -886,6 +886,16 @@ def publish(path, record):
     value = {'v': 1, 'verifier_config': r2.config_identity(path), 'helper_revision': record['helper_revision'],
              'helper_schemas': record['helper_schemas']}
     target = r2.CAPABILITIES_FILE; directory = target.parent
+    # Its parent too (root, 0755): no install step made it (incident 11-11: the first follow run refused here).
+    with local.trusted_directory(directory.parent.parent) as root:
+        try:
+            os.mkdir(directory.parent.name, 0o700, dir_fd=root)
+        except FileExistsError:pass
+        else:
+            made = os.open(directory.parent.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
+            try:os.fchmod(made, 0o755)
+            finally:os.close(made)
+            local.fsync_dir(root)
     with local.trusted_directory(directory.parent) as parent:
         try:
             os.mkdir(directory.name, 0o700, dir_fd=parent); created = True
