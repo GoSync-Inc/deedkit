@@ -16,6 +16,8 @@ import re
 import signal
 import subprocess
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
@@ -122,6 +124,7 @@ CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 PREVIOUS_ISSUES = "tiden-previous-issues.json"
 # Inside the step's 1-minute timeout, so the script, not the runner, ends a hang and writes its fixed reason.
 ISSUES_DEADLINE = 45
+RELEASE_PAGES = 50  # 1,000 production releases at the server's 20 a page
 ISSUE_ID = re.compile(r"[0-9A-Za-z-]{1,64}")
 RELEASE_VERSION = re.compile(r"[0-9A-Za-z@._+-]{1,80}")
 # A main push run that reused the merge queue's verification of its commit (scripts/ci_reuse.py) publishes that
@@ -1220,6 +1223,57 @@ def previous_release(releases: list, release_id: str, released_at: str) -> tuple
     return (chosen[0] if chosen else None), ambiguous
 
 
+def release_page(product: str, token: str, deadline: float) -> object:
+    """One later page of the production release listing, read from the Tiden API: the CLI (0.41.0-0.43.0) sends
+    `pageSize` and no token for `release list`, while the server pages by `pagination.pageToken` (20 a page)."""
+    left, api_token = deadline - time.monotonic(), os.environ.get("TIDEN_API_TOKEN", "")
+    if left <= 0:
+        raise IssuesUnavailable("timeout")
+    if not api_token:
+        raise IssuesUnavailable("no token")
+    base = (os.environ.get("TIDEN_BASE_URL") or "https://app.tiden.ai").rstrip("/")
+    query = urllib.parse.urlencode({"environment": "production", "pagination.pageToken": token})
+    request = urllib.request.Request(f"{base}/v1/products/{urllib.parse.quote(product, safe='')}/releases?{query}",
+                                     headers={"Authorization": f"Bearer {api_token}", "Accept": "application/json",
+                                              "User-Agent": "deedkit-tiden-ci"})
+    try:
+        with urllib.request.urlopen(request, timeout=left) as response:
+            return json.loads(response.read(5_000_000))
+    except urllib.error.HTTPError as exc:
+        raise IssuesUnavailable(f"http {int(exc.code)}") from None
+    except TimeoutError:
+        raise IssuesUnavailable("timeout") from None
+    except OSError:
+        raise IssuesUnavailable("unreachable") from None
+    except ValueError:
+        raise IssuesUnavailable("malformed") from None
+
+
+def release_listing(listing: object, product: str, deadline: float) -> object:
+    """Every production release: the CLI's first page, then each later page up to RELEASE_PAGES in all. A partial,
+    looping or moving listing cannot prove the predecessor, so it ends with a fixed reason."""
+    releases, tokens = [], set()
+    for count in range(1, RELEASE_PAGES + 1):
+        page = listing.get("releases") if isinstance(listing, dict) else None
+        pagination = listing.get("pagination") if isinstance(listing, dict) else None
+        if not isinstance(pagination, dict) or not isinstance(page, list):
+            raise IssuesUnavailable("malformed")
+        releases += page
+        token, total = pagination.get("nextPageToken"), pagination.get("totalCount")
+        if not token:
+            ids = [release.get("id") for release in releases if isinstance(release, dict)]
+            if len(set(ids)) != len(ids) or (total is not None and total != len(releases)):
+                raise IssuesUnavailable("malformed")
+            return releases
+        if not isinstance(token, str) or token in tokens:
+            raise IssuesUnavailable("malformed")
+        if count == RELEASE_PAGES:
+            break
+        tokens.add(token)
+        listing = release_page(product, token, deadline)
+    raise IssuesUnavailable("more pages")
+
+
 def release_issues(directory: Path, released_at: str, product: str, cli: str = "tiden",
                    deadline: float | None = None) -> dict:
     """Project the issues first seen in the previous production release and write only that projection."""
@@ -1250,14 +1304,7 @@ def release_issues(directory: Path, released_at: str, product: str, cli: str = "
         if not isinstance(receipt, dict) or receipt.get("state") != "recorded" or not isinstance(release_id, str) \
                 or not release_id or not RELEASED_AT.fullmatch(released_at):
             raise IssuesUnavailable("no recorded release")
-        listing = read(["release", "list", "--environment", "production"])
-        releases = listing.get("releases") if isinstance(listing, dict) else None
-        pagination = listing.get("pagination") if isinstance(listing, dict) else None
-        if not isinstance(pagination, dict):
-            raise IssuesUnavailable("malformed")
-        if pagination.get("nextPageToken"):
-            # The CLI (0.41.0, 0.42.0) has no page token for `release list`; a partial list cannot prove the predecessor.
-            raise IssuesUnavailable("more pages")
+        releases = release_listing(read(["release", "list", "--environment", "production"]), product, deadline)
         if (not isinstance(releases, list)
                 or not all(isinstance(release, dict) and isinstance(release.get("id"), str) and release["id"]
                            and isinstance(release.get("version"), str)
