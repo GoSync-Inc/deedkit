@@ -37,6 +37,7 @@ from .collector_capture import (CAPTURE_WAITERS as CAPTURE_WAITERS,CAPTURE_WAIT_
     PARSE_ERRORS as PARSE_ERRORS,CaptureCollector)
 from .telegram_polls import PollCollector,PollProvider
 from .telegram_live_reads import LiveReadsCollector
+from .telegram_birthdays import BirthdayCollector,BirthdayProvider
 from .telegram_governor import LIVE_BUDGETS,LIVE_STATE,ProviderRateLimited,RequestGovernor
 from .operational import CONNECTION_ERRORS,collector_stop
 from .storage_admission import MEDIA_RESERVE_BYTES
@@ -201,7 +202,7 @@ def peer_kind(message):
     raise ValueError('unsupported_telegram_peer')
 
 
-class TelethonProvider(PollProvider):
+class TelethonProvider(PollProvider,BirthdayProvider):
     supports_receipts=True
     supports_owner_reads=True
     supports_group_receipts=True
@@ -677,7 +678,7 @@ CHAT_ATTEMPTS=3; CHAT_RETRY_DELAYS=(1,2,4)
 TOMBSTONE_SWEEP_SECONDS=60
 
 
-class TelegramCollector(LiveReadsCollector,CaptureCollector,MediaCollector,PollCollector):
+class TelegramCollector(LiveReadsCollector,CaptureCollector,MediaCollector,PollCollector,BirthdayCollector):
     state_class=CollectorState
     head_pages=HEAD_PAGES_PER_PASS
     _tops_trusted=True  # this pass may skip head pages by the catalog's tops (not after a failed discovery)
@@ -1120,7 +1121,7 @@ class TelegramCollector(LiveReadsCollector,CaptureCollector,MediaCollector,PollC
             tasks.remove(connecting)
             tasks.extend(asyncio.create_task(coro) for coro in
                 [self.drain_loop(),self.reconcile_loop(),self.media_loop(),self.outgoing_loop(),
-                 self.provider.wait_disconnected(),self.failed.wait(),*([self.poll_voters_loop()] if polls else [])])
+                 self.provider.wait_disconnected(),self.failed.wait(),*([self.poll_voters_loop()] if polls else []),*([self.birthdays_loop()] if hasattr(self.provider,'full_user_birthday') else [])])
             done,_=await asyncio.wait(tasks,return_when=asyncio.FIRST_COMPLETED)
             for task in done: task.result()
             if self.failed.is_set():
@@ -1218,6 +1219,7 @@ class TelegramCollector(LiveReadsCollector,CaptureCollector,MediaCollector,PollC
         try:
             job['_policy']=await asyncio.to_thread((live or self.state).policy)
             if job.get('operation')=='request_chat_history': return await self.chat_history(job)
+            if job.get('operation')=='list_birthdays': return await self.list_birthdays(job)  # ANYM-919: archive only
             if job.get('operation') in NEW_CHAT_OPERATIONS:
                 answer=await self.provider.execute_operation(job)
                 await self.catalog_new_chat(job,answer)

@@ -227,6 +227,7 @@
      "inspect_message_buttons",
      "join_chat",
      "leave_group",
+     "list_birthdays",
      "list_blocked",
      "list_contacts",
      "list_join_requests",

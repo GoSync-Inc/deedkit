@@ -1871,6 +1871,21 @@ Failure isolation: each message's event is written in a savepoint and tried 3 ti
 jobs stay failed without an event (set aside). The service counts them by reason code and logs one
 `attachment_failed_event_set_aside` line. The sweep, the media loop and the collector keep running.
 
+## A contact's birthday tomorrow (ANYM-919)
+
+`contact.birthday` wakes a subscriber the day before an active Telegram contact's birthday (PEOPLE.md "Birthdays of
+active contacts"): one journal row per contact and year (idempotency key: account, user, year), due from 09:00 in
+the owner's zone (`ANYMSG_OWNER_TIMEZONE` on the matcher) on the day before; a later matcher pass the same day adds
+none. It names no message: the row carries the account, the private chat ID and the birthday's date only, so a
+fetched item has `chat` and `date` and no message, name or year. Only a subscription whose `kinds` names
+`contact.birthday` receives it, in a chat it selects (a dynamic definition: a chat the key sees now and does not
+exclude); default subscriptions and `get_updates` never return it, and `wake_rules` and sender filters do not apply.
+The list covers the owner's active Telegram contacts only, and DeedKit adds nothing to any calendar.
+
+Rollout: schema 86 adds the birthday table and the reads; the matcher calls schema 87's journal function
+`journal_contact_birthdays(date)` once a minute and skips the call while that function is absent or not granted, so
+until 87 no `contact.birthday` row is written.
+
 ## Remaining extensions and verification boundaries
 
 Coalescing across subscriptions of different keys, stream resource notifications,

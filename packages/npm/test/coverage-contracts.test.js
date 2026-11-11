@@ -102,7 +102,7 @@ test('typed action definitions retain required identities and optional reviewed 
     MessageFormat:['plain','markdown','html'],
     SubscriptionEventKind:['message.created','message.edited','message.deleted','message.status',
       'attachment.ready','file.text.ready','file.transcript.ready','file.description.ready','file.processing.failed',
-      'send.failed','source.health','attachment.failed','poll.updated'],
+      'send.failed','source.health','attachment.failed','poll.updated','contact.birthday'],
     SubscriptionOrigin:['live','live_recovered','backfill','reconcile','fixture'],
   };
   for(const [name,members] of Object.entries(unions)){

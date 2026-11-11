@@ -10,6 +10,7 @@ import threading
 import time
 
 from . import heartbeats
+from .birthdays import journal_birthday_hints
 from .store import Store
 from .delivery_policy import flush_hints
 from .subscriptions import (acked_retention_days, journal_source_health, match_subscriptions,
@@ -19,6 +20,7 @@ from . import wake as wakes
 
 HEALTH_INTERVAL_S = 30
 RETIRE_INTERVAL_S = 60
+BIRTHDAY_INTERVAL_S = 60
 # ANYM-841: a pass that scanned, matched or advanced anything (messages or modules) is followed at once by the
 # next; only an empty pass sleeps.
 BUSY_KEYS = ('scanned', 'matched', 'module_scanned', 'module_matched')
@@ -58,7 +60,7 @@ def main():
     dsn = Path(os.environ['DATABASE_URL_FILE']).read_text().strip()
     store = Store(dsn, Path(os.environ.get('PROBE_FILES', '/tmp/unused-files')),
                   'http://localhost')
-    last_beat = last_health = last_retire = last_prune = None
+    last_beat = last_health = last_retire = last_prune = last_birthdays = None
     more = False
     try:
         if not args.once:
@@ -86,6 +88,10 @@ def main():
             if last_health is None or time.monotonic() - last_health >= HEALTH_INTERVAL_S:
                 journal_source_health(store)
                 last_health = time.monotonic()
+            # ANYM-919: tomorrow's birthdays from 09:00 owner time, once per contact and year; skipped before schema 87.
+            if last_birthdays is None or time.monotonic() - last_birthdays >= BIRTHDAY_INTERVAL_S:
+                journal_birthday_hints(store)
+                last_birthdays = time.monotonic()
             try:
                 result = match_subscriptions(store, batch_size=args.batch_size,
                                              max_subscriptions=args.max_subscriptions)

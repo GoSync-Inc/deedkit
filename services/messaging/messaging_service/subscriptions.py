@@ -19,11 +19,13 @@ from .policy import effective_permissions, lock_principal, targets
 
 EVENT_KINDS = frozenset(('message.created', 'message.edited', 'message.deleted', 'poll.updated',
     'message.status', 'attachment.ready', 'file.text.ready', 'file.transcript.ready',
-    'file.description.ready', 'file.processing.failed', 'send.failed', 'source.health', 'attachment.failed', 'call'))
+    'file.description.ready', 'file.processing.failed', 'send.failed', 'source.health', 'attachment.failed', 'call',
+    'contact.birthday'))
 # ANYM-867: a kind a selector receives without naming it, because it ends the same wait as a kind it names.
 IMPLIED_KINDS = {'attachment.failed': 'attachment.ready'}
-# ANYM-535: journal rows that name no archived message, matched by their own rule and never by default.
-FAILURE_KINDS = frozenset(('send.failed', 'source.health'))
+# ANYM-535: journal rows that name no archived message, matched by their own rule and never by default; ANYM-919's
+# contact.birthday names a private chat and reaches a definition that selects that chat (not a dynamic exclusion).
+FAILURE_KINDS = frozenset(('send.failed', 'source.health', 'contact.birthday'))
 # A journal write the send or collector path survived, per kind, since process start.
 JOURNAL_FAILURES = Counter()
 ORIGINS = frozenset(('live', 'live_recovered', 'fixture', 'backfill', 'reconcile'))
@@ -811,12 +813,13 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
             -- ANYM-535: IDs and codes only; the sending key stays in the journal.
             'send_id',CASE WHEN e.kind='send.failed' THEN e.snapshot->'send_id' END,
             'error_code',CASE WHEN e.kind='send.failed' THEN e.snapshot->'error_code' END,
-            'status',CASE WHEN e.kind IN ('send.failed','source.health') THEN e.snapshot->'status' END)) AS snapshot
+            'status',CASE WHEN e.kind IN ('send.failed','source.health') THEN e.snapshot->'status' END,
+            'date',CASE WHEN e.kind='contact.birthday' THEN e.snapshot->'date' END)) AS snapshot
         FROM subscription_matches sm JOIN events e ON e.id=sm.event
         WHERE sm.subscription=%s AND sm.event>%s AND ''' + where + ''' ORDER BY sm.event LIMIT %s''',
         (row['id'], after, *args, limit + 1)).fetchall()
     fields = ('message', 'account', 'chat', 'sender', 'provider_id', 'revision', 'sent_at',
-        'direction', 'deleted', 'processing', 'metadata', 'reply_evidence', 'send_id', 'error_code', 'status')
+        'direction', 'deleted', 'processing', 'metadata', 'reply_evidence', 'send_id', 'error_code', 'status', 'date')
     # ANYM-734: delivered_at is when the earliest delivered events hint covering the event finished. Retention deletes
     # finished hints as a prefix up to hints_deleted_through: for an event at or below it the first covering hint may be
     # gone, so the time is unknown (null), never the next hint's. One read per page, no per-row query.
@@ -1017,7 +1020,7 @@ def _event_verdict(event, row, p, scope):
     if failure:
         # Direction and senders describe messages; these kinds have their own audience.
         matches = (event['kind'] in selector['kinds'] and origin_selected(event['origin'], selector['origins']) and
-            _failure_audience(event, selected, row, p))
+            _failure_audience(event, selected and (event['kind'] != 'contact.birthday' or source not in excluded), row, p))
     else:
         matches = selected
         outcome = call_outcome(snapshot) if event['kind'] == 'message.created' else None
@@ -1161,7 +1164,10 @@ def _match_modules(c, row, batch_size, maximum, stats):
 
 def _failure_audience(event, selected_chat, row, p):
     """send.failed: only the key that made the send, in a selected chat. source.health: a key that
-    sees the whole account; a chat-restricted key reads no collector health (sync_status)."""
+    sees the whole account; a chat-restricted key reads no collector health (sync_status). contact.birthday: a
+    selected chat outside a dynamic definition's exclusions."""
+    if event['kind'] == 'contact.birthday':
+        return selected_chat
     if event['kind'] == 'send.failed':
         snapshot = event['snapshot']
         return (selected_chat and snapshot.get('principal') == row['principal'] and

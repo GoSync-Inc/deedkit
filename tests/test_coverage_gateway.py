@@ -605,7 +605,7 @@ def test_catalog_covers_explicit_families_and_provider_differences():
         'read-live': ['chat_info', 'get_reactions', 'get_message_info', 'get_pinned_messages', 'request_chat_history',
                       'search_messages_live', 'inspect_message_buttons'],
         'groups-read': ['list_participants', 'list_topics', 'list_join_requests', 'check_chat_link'],
-        'profile-read': ['get_profile'], 'contacts-read': ['list_contacts', 'get_contact', 'list_blocked', 'get_labels'],
+        'profile-read': ['get_profile'], 'contacts-read': ['list_contacts', 'get_contact', 'list_blocked', 'get_labels', 'list_birthdays'],
         'send': ['send_file', 'forward_message', 'send_poll', 'send_contact', 'send_location', 'open_chat_by_phone',
                  'open_chat_by_username'],
         'message-edit': ['edit_message'], 'message-delete': ['delete_message'],

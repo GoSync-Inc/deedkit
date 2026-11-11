@@ -78,6 +78,9 @@
   "leave_group": [
     "groups-manage"
   ],
+  "list_birthdays": [
+    "contacts-read"
+  ],
   "list_blocked": [
     "contacts-read"
   ],
