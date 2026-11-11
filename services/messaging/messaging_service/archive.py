@@ -910,6 +910,11 @@ class Archive:
                 candidates=' AND j.id=ANY(ARRAY('+' UNION ALL '.join(arms)+'))'
             # A cached generic plan of this repeated statement would not see the window bounds.
             c.execute("SET LOCAL plan_cache_mode=force_custom_plan")
+            # On all-visible pages (what autovacuum leaves) the window arm's rows come cheaper from an index-only skip
+            # scan of message_chat_date, one descent per chat, than from the message_scope_date range it is built for
+            # (production, telegram-primary, 5,032 chats: 339 searches). Without index-only scans both read the heap
+            # and the single range wins, as it does on pages that are not all-visible.
+            c.execute("SET LOCAL enable_indexonlyscan=off")
             row=c.execute(MEDIA_PICK_MARK+self._media_claim_query('j.id',ON_REQUEST_CHAT,candidates+'''
                 AND NOT j.id=ANY(%(lost)s::text[])
                 ORDER BY priority.requested DESC,CASE WHEN NOT priority.requested THEN j.id=ANY(%(backfill_ids)s::text[]) END,
