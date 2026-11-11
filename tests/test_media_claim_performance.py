@@ -23,6 +23,11 @@ BOUND=100
 TOUCHES=re.compile(r'\b(media_jobs|messages)\b')
 
 
+def analyze(c, *tables):
+    """The statistics the measured plans are made from."""
+    for table in tables: c.execute('ANALYZE '+table)
+
+
 def message(ar, provider_id, age, *, account=ACCOUNT, chat='100'):
     at=(datetime.now(timezone.utc)-timedelta(seconds=age)).isoformat()
     return ar.ingest(event(account=account,chat=chat,provider_id=provider_id,sent_at=at,updated_at=at,
@@ -56,7 +61,7 @@ def grow_dormant(s, count, offset=0):
                 CASE WHEN n%%2=0 THEN 'paused_storage' END,
                 CASE WHEN n%%4 IN (1,3) THEN clock_timestamp()-interval '1 hour' END
             FROM generate_series(%s::int,%s::int) n''',(ACCOUNT,offset+1,offset+count))
-        c.execute('ANALYZE messages'); c.execute('ANALYZE media_jobs'); c.execute('ANALYZE media_reservations')
+        analyze(c,'messages','media_jobs','media_reservations')
 
 
 def dormant_digest(s):
@@ -298,12 +303,28 @@ def test_claimable_job_in_a_dormant_backlog_is_claimed_with_bounded_plans(backlo
         with s.pool.connection() as c:
             c.execute("UPDATE media_jobs SET requested_until=clock_timestamp()+interval '1 hour' WHERE message=%s",(target,))
     else: target=message(ar,'recent',3600)
-    with s.pool.connection() as c: c.execute('ANALYZE media_jobs'); c.execute('ANALYZE messages')
+    with s.pool.connection() as c: analyze(c,'media_jobs','messages')
     plans=[]
     with explained(ar,plans): job=claim()
     assert job['message']==target and job['attempts']==1
     assert job['_live_media'] is (kind=='recent')
     assert_bounded(plans,index_tables(s)); selection_is_indexed(plans)
+
+
+# spec: ANYM-302
+def test_the_dormant_backlog_gets_the_same_statistics_on_every_analyze(backlog):
+    """Regression (#877 run 42953961641, the plan above without message_scope_date): ANALYZE sampled 30,000 of the
+    backlog's rows, so each run planned the claim from different statistics, and a near tie between two index paths
+    went the other way in about one CI run in many."""
+    _,s,_,_=backlog
+    grow_dormant(s,30_000)
+    def statistics():
+        with s.pool.connection() as c:
+            analyze(c,'messages','media_jobs')
+            return c.execute('''SELECT tablename,attname,null_frac,n_distinct,correlation,most_common_vals::text,
+                histogram_bounds::text FROM pg_stats WHERE tablename IN ('messages','media_jobs') ORDER BY 1,2''').fetchall()
+    first=statistics()
+    assert first and all(statistics()==first for _ in range(3))
 
 
 def grow_recent_group(s, count, chat_type='group'):
@@ -320,7 +341,7 @@ def grow_recent_group(s, count, chat_type='group'):
         c.execute('''INSERT INTO media_jobs(id,account,message,descriptor,state,next_due)
             SELECT 'group-job-'||n,%s,'group-msg-'||n,jsonb_build_object('provider_id','group-'||n,'mime','audio/ogg','bytes',4),
                 'queued',clock_timestamp()-interval '1 minute' FROM generate_series(1,%s::int) n''',(ACCOUNT,count))
-        c.execute('ANALYZE messages'); c.execute('ANALYZE media_jobs'); c.execute('ANALYZE chats')
+        analyze(c,'messages','media_jobs','chats')
     return chat
 
 
@@ -500,7 +521,7 @@ def grow_cooling(s, count):
             SELECT 'cooling-job-'||n,%s,'cooling-msg-'||n,jsonb_build_object('provider_id','cooling-'||n,'mime','audio/ogg',
                 'bytes',4),'queued',1,clock_timestamp()+interval '1 hour','network_error'
             FROM generate_series(1,%s::int) n''',(ACCOUNT,count))
-        c.execute('ANALYZE messages'); c.execute('ANALYZE media_jobs')
+        analyze(c,'messages','media_jobs')
 
 
 # spec: ANYM-839

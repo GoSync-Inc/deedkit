@@ -115,6 +115,22 @@ def test_courtesies_exclude_reads_at_most_the_depth_per_chat(seeded, record_prop
     assert counted <= base + bound, scans(closing.counts[0]['Plan'])
 
 
+# spec: ANYM-810
+def test_the_catalogue_gets_the_same_statistics_on_every_analyze(seeded):
+    """Regression (#885: extra 70204 > 63700): ANALYZE sampled 30,000 of the catalogue's messages, so the plain and
+    the exclude page statement could each take the other of two near-equal plans for the same rows (85207 or 115105
+    rows visited), and the difference counted as extra rows."""
+    s, _, _ = seeded
+    courtesy_catalogue(s)
+    def statistics():
+        with s.pool.connection() as c:
+            own_statistics(c)
+            return c.execute('''SELECT attname,null_frac,n_distinct,correlation,most_common_vals::text,
+                histogram_bounds::text FROM pg_stats WHERE tablename='messages' ORDER BY attname''').fetchall()
+    first = statistics()
+    assert first and all(statistics() == first for _ in range(3))
+
+
 
 # spec: ANYM-810
 def test_a_slow_host_during_one_measurement_leaves_the_statement_comparison_unchanged(seeded, monkeypatch):
