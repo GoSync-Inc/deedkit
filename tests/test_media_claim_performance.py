@@ -23,8 +23,15 @@ BOUND=100
 TOUCHES=re.compile(r'\b(media_jobs|messages)\b')
 
 
+# ANALYZE reads 300 x default_statistics_target rows: 300,000 here, more than any fixture below holds, so every
+# row is read and the statistics are the same on every run.
+EXACT_STATISTICS=1000
+
+
 def analyze(c, *tables):
-    """The statistics the measured plans are made from."""
+    """The statistics the measured plans are made from, read from every row: from the default 30,000-row sample a
+    near tie between two index paths went either way (#877 run 42953961641)."""
+    c.execute(f'SET LOCAL default_statistics_target={EXACT_STATISTICS}')
     for table in tables: c.execute('ANALYZE '+table)
 
 

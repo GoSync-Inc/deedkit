@@ -28,7 +28,10 @@ def own_statistics(c):
     The seeded fixture truncates the tables an earlier test filled; autovacuum may analyze them at any moment
     later, and an estimate that changes between the plain and the exclude measurement compares two plans made
     from different statistics (an extra of -63798 in CI). Analyzed here, a later autovacuum pass finds the same
-    contents and changes nothing."""
+    contents and changes nothing. ANALYZE reads every row (300 x 1000, above the catalogue's messages): from the
+    default 30,000-row sample the plain and the exclude statement could each take the other of two near-equal plans
+    (#885: extra 70204 > 63700)."""
+    c.execute('SET LOCAL default_statistics_target=1000')
     c.execute('ANALYZE')
 
 
