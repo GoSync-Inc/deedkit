@@ -181,8 +181,10 @@ def speed_store(ar, s):
 
 def counted(s, monkeypatch, call):
     import psycopg
+    import threading
     seen = []
     original = psycopg.Cursor.execute
+    caller = threading.get_ident()
 
     def execute(self, query, params=None, **kw):
         seen.append(query)
@@ -207,6 +209,25 @@ def test_one_refresh_call_runs_a_pinned_number_of_statements_with_and_without_th
         result, n = counted(s, monkeypatch, lambda: s.get_sync_status(key, refresh=True, include_latency=block))
         assert result['cache']['hit'] is False and ('latency' in result) is block
         assert n == STATUS_STATEMENTS[block], (block, n)
+
+
+# spec: ANYM-917
+def test_the_statement_count_is_the_callers_own_not_a_background_threads(cov, monkeypatch):
+    """Regression (CI: 32 statements against the pinned 31): the commit wake notifier (wake.send, a cursor statement on
+    its own thread) sends the NOTIFY of the fixture's writes whenever it gets to run, which can be inside the counted
+    call. The count is the calling thread's statements."""
+    import threading
+    _, s, _ = cov
+
+    def other_thread():
+        def run():
+            with s.pool.connection() as c, c.cursor() as cur:
+                cur.execute('SELECT 1')
+        worker = threading.Thread(target=run)
+        worker.start()
+        worker.join()
+    _, n = counted(s, monkeypatch, other_thread)
+    assert n == 0
 
 
 # spec: ANYM-917
