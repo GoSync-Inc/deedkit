@@ -92,6 +92,181 @@ def test_screen_text_limits_confidence_count_and_element_region(tmp_path):
     assert [line['text'] for line in result['lines']] == ['Selesai', 'noise'] and result['truncated'] is True
 
 
+class TreeDevice(Device):
+    """A device whose hierarchy dump is the given XML, or raises the given exception."""
+
+    def __init__(self, hierarchy, data=None):
+        super().__init__(data)
+        self.hierarchy = hierarchy
+
+    def jsonrpc_call(self, method, args, timeout=10):
+        self.dumps.append((method, tuple(args)))
+        if isinstance(self.hierarchy, Exception):
+            raise self.hierarchy
+        return self.hierarchy
+
+
+def tree(*nodes):
+    """Flat nodes (class, bounds, attributes) under one full-screen frame."""
+    body = ''.join(f'<node class="{name}" bounds="{bounds}" ' + ' '.join(f'{key}="{value}"' for key, value in attributes.items()) + ' />'
+                   for name, bounds, attributes in nodes)
+    return f'<hierarchy><node class="android.widget.FrameLayout" bounds="[0,0][200,160]">{body}</node></hierarchy>'
+
+
+def textured(width=200, height=160):
+    """A gradient screen (every painted block differs from it) and its PNG bytes."""
+    image = Image.linear_gradient('L').resize((width, height)).convert('RGB')
+    target = io.BytesIO()
+    image.save(target, format='PNG')
+    return image, target.getvalue()
+
+
+def recording_engine(monkeypatch):
+    """Replace the engine: it returns no lines and keeps a copy of each image it was given, with its origin."""
+    from deedkit_android import screen_text
+
+    seen = []
+
+    def recognize(image, ocr, origin=(0, 0), min_confidence=None):
+        seen.append((image.copy(), origin))
+        return [], {'engine': 'tesseract', 'preprocess': 'local_contrast'}
+    monkeypatch.setattr(screen_text, 'recognize_with', recognize)
+    return seen
+
+
+OCR = {'command': '/synthetic/tesseract', 'languages': 'eng'}
+IMAGE, TEXT = 'android.widget.ImageView', 'android.widget.TextView'
+
+
+def changed_within(original, image, box):
+    """The pixels that differ lie inside box (and some do)."""
+    from PIL import ImageChops
+
+    difference = ImageChops.difference(original, image).getbbox()
+    return difference is not None and difference[0] >= box[0] and difference[1] >= box[1] and difference[2] <= box[2] and difference[3] <= box[3]
+
+
+# spec: ANYM-980
+def test_mask_images_paints_image_and_texture_bounds_in_the_ocr_copy_only(monkeypatch):
+    from deedkit_android.ui_worker import execute
+
+    seen = recording_engine(monkeypatch)
+    original, data = textured()
+    hierarchy = tree((IMAGE, '[20,20][120,100]', {}), ('androidx.appcompat.widget.AppCompatImageView', '[130,10][150,30]', {}),
+                     ('android.view.TextureView', '[130,60][190,100]', {}), (TEXT, '[130,120][190,140]', {'text': 'Sepatu'}))
+    device = TreeDevice(hierarchy, data)
+    result = execute(device, {'readScreenText': {}}, ocr=OCR)
+    image, origin = seen[0]
+    assert origin == (0, 0) and image.size == original.size
+    for box in ((20, 20, 120, 100), (130, 10, 150, 30), (130, 60, 190, 100)):
+        assert image.crop(box).getcolors(1) is not None, box  # one solid colour
+    assert changed_within(original, image, (20, 10, 190, 100))
+    assert image.crop((130, 120, 190, 140)).tobytes() == original.crop((130, 120, 190, 140)).tobytes()  # text node untouched
+    assert result['ocr']['masked'] == {'regions': 3, 'skipped_large': 0, 'tree': 'ok'}
+    assert device.dumps == [('dumpWindowHierarchy', (True, 50))] and device.data == data
+
+
+# spec: ANYM-980
+def test_mask_images_paints_in_the_coordinates_of_a_region_read(monkeypatch):
+    from deedkit_android.ui_worker import execute
+
+    seen = recording_engine(monkeypatch)
+    original, data = textured()
+    hierarchy = tree((IMAGE, '[20,20][120,100]', {}), (IMAGE, '[160,120][190,150]', {}))
+    result = execute(TreeDevice(hierarchy, data), {'readScreenText': {'region': {'x': 50, 'y': 10, 'w': 100, 'h': 100}}}, ocr=OCR)
+    image, origin = seen[0]
+    assert origin == (50, 10) and image.size == (100, 100)
+    assert image.crop((0, 10, 70, 90)).getcolors(1) is not None  # the image's part inside the crop
+    assert changed_within(original.crop((50, 10, 150, 110)), image, (0, 10, 70, 90))
+    assert result['ocr']['masked'] == {'regions': 1, 'skipped_large': 0, 'tree': 'ok'}  # the second image is outside the crop
+
+
+# spec: ANYM-980
+def test_mask_images_leaves_text_the_app_draws_over_an_image(monkeypatch):
+    from deedkit_android.ui_worker import execute
+
+    seen = recording_engine(monkeypatch)
+    original, data = textured()
+    hierarchy = tree((IMAGE, '[20,20][160,120]', {}), (TEXT, '[30,30][90,50]', {'text': 'Diskon 20%'}),
+                     ('android.widget.FrameLayout', '[20,20][160,120]', {'content-desc': 'Sepatu', 'clickable': 'true'}),
+                     (TEXT, '[100,60][150,110]', {'text': 'secret', 'password': 'true'}))
+    result = execute(TreeDevice(hierarchy, data), {'readScreenText': {}}, ocr=OCR)
+    image = seen[0][0]
+    assert image.crop((30, 30, 90, 50)).tobytes() == original.crop((30, 30, 90, 50)).tobytes()  # the badge stays readable
+    assert image.crop((100, 60, 150, 110)).getcolors(1) is not None  # a password node never unpaints, a container does not either
+    assert image.crop((20, 60, 90, 120)).getcolors(1) is not None
+    assert result['ocr']['masked']['regions'] == 1
+
+
+# spec: ANYM-980
+def test_mask_images_skips_an_image_that_covers_most_of_the_read_region(monkeypatch):
+    from deedkit_android.ui_worker import execute
+
+    seen = recording_engine(monkeypatch)
+    original, data = textured()
+    viewer = TreeDevice(tree((IMAGE, '[0,0][200,150]', {})), data)  # 93.75% of the screen: a full-screen image viewer
+    result = execute(viewer, {'readScreenText': {}}, ocr=OCR)
+    assert seen[0][0].tobytes() == original.tobytes()
+    assert result['ocr']['masked'] == {'regions': 0, 'skipped_large': 1, 'tree': 'ok'}
+    # `within` an image: the region is the image itself, so it is read, not painted.
+    selected = TreeDevice(tree((IMAGE, '[10,20][60,50]', {})), data)
+    result = execute(selected, {'readScreenText': {'within': {'id': 'photo'}}}, ocr=OCR)
+    assert seen[1][0].tobytes() == original.crop((10, 20, 60, 50)).tobytes()
+    assert result['ocr']['masked'] == {'regions': 0, 'skipped_large': 1, 'tree': 'ok'}
+
+
+# spec: ANYM-980
+def test_mask_images_false_reads_the_unpainted_capture_without_a_dump(monkeypatch):
+    from deedkit_android.ui_worker import execute
+
+    seen = recording_engine(monkeypatch)
+    original, data = textured()
+    device = TreeDevice(tree((IMAGE, '[20,20][120,100]', {})), data)
+    result = execute(device, {'readScreenText': {'mask_images': False}}, ocr=OCR)
+    assert seen[0][0].tobytes() == original.tobytes() and device.dumps == []
+    assert result['ocr']['masked'] is None
+
+
+# spec: ANYM-980
+def test_mask_images_shares_one_dump_with_the_structure_option(monkeypatch):
+    from deedkit_android.ui_worker import execute
+
+    recording_engine(monkeypatch)
+    _, data = textured()
+    device = TreeDevice(tree((IMAGE, '[20,20][120,100]', {})), data)
+    result = execute(device, {'readScreenText': {'structure': True}}, ocr=OCR)
+    assert device.dumps == [('dumpWindowHierarchy', (True, 50))]
+    assert result['structure']['tree'] == 'merged' and result['ocr']['masked']['regions'] == 1
+    device = TreeDevice(tree((IMAGE, '[20,20][120,100]', {})), data)
+    assert 'structure' not in execute(device, {'readScreenText': {'structure': False}}, ocr=OCR) and len(device.dumps) == 1
+
+
+# spec: ANYM-980
+def test_an_unreadable_hierarchy_never_fails_the_read(monkeypatch):
+    from deedkit_android.ui_worker import execute
+
+    seen = recording_engine(monkeypatch)
+    original, data = textured()
+    for broken in (RuntimeError('secure screen'), '<hierarchy><node'):
+        result = execute(TreeDevice(broken, data), {'readScreenText': {}}, ocr=OCR)
+        assert seen[-1][0].tobytes() == original.tobytes()
+        assert result['lines'] == [] and result['ocr']['masked'] == {'regions': 0, 'skipped_large': 0, 'tree': 'unavailable'}
+    result = execute(TreeDevice(RuntimeError('secure screen'), data), {'readScreenText': {'structure': True}}, ocr=OCR)
+    assert result['structure']['tree'] == 'unavailable'
+
+
+# spec: ANYM-980
+def test_mask_images_option_is_validated_before_admission():
+    from deedkit_android.uiautomator import validate_commands
+
+    for value in ('"yes"', '1', '[true]', 'null'):
+        with pytest.raises(Refused) as failure:
+            validate_commands(compile_base('- readScreenText: {mask_images: %s}' % value, {}, fields=UI_FIELDS))
+        assert failure.value.code == 'invalid_screen_text_options'
+    validate_commands(compile_base('- readScreenText: {mask_images: false}\n- readScreenText: {mask_images: true, structure: true}',
+                                   {}, fields=UI_FIELDS))
+
+
 # spec: ANYM-955
 @pytest.mark.skipif(shutil.which('tesseract') is None, reason='Tesseract is not installed on this runner')
 def test_screen_text_parses_real_tesseract_output():
