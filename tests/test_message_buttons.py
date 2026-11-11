@@ -440,3 +440,19 @@ def test_button_texts_say_what_is_offered_and_how_absence_reads():
         assert text.count('is not offered')==1 and 'Mini App is' in text
         assert 'capture off (default; production on since 2026-11-02, no backfill)' in text, text
     assert len(set(passages[:3]))==1 and 'no captured keyboard' in passages[0] and passages[0] in setup and 'Nothing presses' not in setup
+
+
+# spec: ANYM-797
+def test_button_texts_name_the_tool_and_operation_that_inspect_a_live_keyboard():
+    # Feedback cfff3996: an agent read the bare name as a tool and called messages_inspect_message_buttons.
+    import ast,pathlib
+    root=pathlib.Path(__file__).parents[1]
+    flat=lambda text:' '.join(text.split())
+    package=root/'services/messaging/messaging_service'
+    trees=[ast.parse(path.read_text()) for path in (package/'app.py',*sorted((package/'app_tools').glob('*.py')))]
+    docs=[flat(ast.get_docstring(n)) for tree in trees for n in ast.walk(tree)
+          if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name in ('search','get_messages','get_context')]
+    assert len(docs)==3
+    for text in (*docs,flat((root/'SETUP.md').read_text())):
+        assert 'execute_messenger_operation(operation=inspect_message_buttons)' in text
+        assert 'evidence: inspect_message_buttons reads' not in text

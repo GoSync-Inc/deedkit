@@ -132,3 +132,15 @@ def test_message_reads_say_that_button_links_are_untrusted_and_context_states_th
         assert "untrusted data" in text and "fetch" in text, name
     text = CATALOG["messages_get_context"]["description"]
     assert "Buttons are read-only evidence" in text and "Mini App is not offered" in text and "login_url" in text
+
+
+# spec: ANYM-797
+def test_message_reads_name_the_tool_that_runs_the_button_inspection():
+    # Feedback cfff3996: the bare operation name read as a tool, and messages_inspect_message_buttons does not exist.
+    route = "messages_execute_messenger_operation(operation=inspect_message_buttons)"
+    for name in ("messages_get_messages", "messages_get_context"):
+        assert route in CATALOG[name]["description"], name
+    assert "messages_inspect_message_buttons" not in CATALOG
+    assert CATALOG["messages_execute_messenger_operation"]["action_group"] == "messenger_operations"
+    clause = CATALOG["messages_change_message"]["inputSchema"]["properties"]["parameters"]["description"]
+    assert "fp from " + route in clause
