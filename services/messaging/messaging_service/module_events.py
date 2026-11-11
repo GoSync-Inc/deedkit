@@ -1,4 +1,5 @@
-"""Module events (ANYM-562): calendar, calls and (ANYM-732) recordings events in a journal of their own.
+"""Module events (ANYM-562): calendar, calls, (ANYM-732) recordings and (ANYM-962) feedback events in a journal of
+their own.
 
 The module journal (schema 56) has its own gapless counter, so publishing never takes the
 feed_counter lock of the message journal. A subscription's module part is a second stream with
@@ -14,14 +15,17 @@ import re
 
 from psycopg.types.json import Jsonb
 
-SOURCES = {'deedkit:calendar': 'calendar', 'deedkit:calls': 'calls', 'deedkit:recordings': 'recordings'}
+SOURCES = {'deedkit:calendar': 'calendar', 'deedkit:calls': 'calls', 'deedkit:recordings': 'recordings',
+    'deedkit:feedback': 'feedback'}
+# ANYM-962: published inside messaging (feedback.set_feedback_status), never fetched by the router.
+IN_PROCESS_SOURCES = frozenset(('deedkit:feedback',))
 # The first part of an event type that belongs to each module (calls publish `call.*`, recordings `recording.*`).
-TYPE_PREFIX = {'calendar': 'calendar', 'calls': 'call', 'recordings': 'recording'}
+TYPE_PREFIX = {'calendar': 'calendar', 'calls': 'call', 'recordings': 'recording', 'feedback': 'feedback'}
 URGENCIES = frozenset(('now', 'batch'))
 _REF = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}')
 _SCOPE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,255}')
 _TOKEN = re.compile(r'[a-z][a-z0-9_]{0,47}')
-_ID = re.compile(r'(calendar|calls|recordings):([1-9][0-9]{0,15})')
+_ID = re.compile(r'(calendar|calls|recordings|feedback):([1-9][0-9]{0,15})')
 _TIME = re.compile(r'(19[7-9][0-9]|[2-9][0-9]{3})-\d{2}-\d{2}T([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d{1,6})?(Z|[+-](0\d|1[0-5]):[0-5]\d)')
 # Every time is finite and inside this range (UTC), so every reader decodes it; the definer function
 # enforces the same bounds.
@@ -58,6 +62,21 @@ def _changed(value):
 
 
 _token = lambda value: isinstance(value, str) and _TOKEN.fullmatch(value) is not None  # noqa: E731
+
+
+def _spec_ref(value):
+    from .feedback import SPEC_REF
+    return isinstance(value, str) and SPEC_REF.fullmatch(value) is not None
+
+
+def _release(value):
+    from .feedback import FIXED_IN
+    return isinstance(value, str) and len(value) <= 80 and FIXED_IN.fullmatch(value) is not None
+
+
+# ANYM-962: the operator's six statuses (feedback.STATUSES without the agent verdicts); the previous one may be any.
+FEEDBACK_STATUSES = ('received', 'accepted', 'declined', 'duplicate', 'fixed', 'verify_requested')
+_PREVIOUS = _enum(*FEEDBACK_STATUSES, 'verified', 'reopened')
 _CALENDAR = {'calendar_ref': _ref, 'event_ref': _ref, 'start_at': _time}
 # type: (data checks, optional keys, the key the CloudEvents subject names). Values are references,
 # enumerations, bounded numbers and times only: no titles, places, names, destinations or text.
@@ -88,6 +107,10 @@ KINDS = {
         'recording_ref'),
     'recording.access.changed': ({'account_ref': _ref, 'principal_ref': _ref,
         'reason': _enum('permission_removed', 'account_removed', 'namespace_replaced')}, frozenset(), 'account_ref'),
+    # ANYM-962: the feedback ID, two status words, the Tiden ID and the release; never a note, text or principal.
+    **{'feedback.' + status: ({'feedback_id': _ref, 'status': _enum(status), 'previous_status': _PREVIOUS,
+        'spec_ref': _spec_ref, 'fixed_in': _release}, frozenset(('spec_ref', 'fixed_in')), 'feedback_id')
+        for status in FEEDBACK_STATUSES},
 }
 # ANYM-732: a new archived text is batched, an access change is urgent; neither expires.
 RECORDING_URGENCY = {'recording.text.archived': 'batch', 'recording.access.changed': 'now'}
@@ -135,6 +158,9 @@ def validate_event(event):
         _fail('recording_urgency_or_expiry')
     if event['type'] == 'call.access.changed' and (event['urgency'] != 'now' or event['expires_at'] is not None):
         _fail('access_changed_urgency_or_expiry')
+    if event['type'].startswith('feedback.') and (event['urgency'] != 'now' or event['expires_at'] is not None or
+            data['status'] == data['previous_status']):
+        _fail('feedback_needs_now_and_a_change')
     if event['type'] == 'call.owner_request' and (event['urgency'] != 'now' or event['expires_at'] is None):
         # The decision's stored deadline: an owner request is never held by batching or kept past it.
         _fail('owner_request_needs_now_and_deadline')
@@ -439,7 +465,9 @@ def hint_references(c, subscription_id, through, *, linked=True):
     module = c.execute('SELECT acked_through FROM subscription_module_streams WHERE subscription=%s',
         (subscription_id,)).fetchone()
     after = module['acked_through'] if module else through
-    return c.execute('''SELECT e.seq,e.source,e.type,e.subject,e.urgency,e.expires_at,count(*) OVER () AS total
+    # ANYM-962: event_key, occurred_at and data only for feedback_reference; other modules' hints never show them.
+    return c.execute('''SELECT e.seq,e.source,e.type,e.subject,e.urgency,e.expires_at,e.event_key,e.occurred_at,e.data,
+        count(*) OVER () AS total
         FROM subscription_module_matches m JOIN module_events e ON e.seq=m.event
         WHERE m.subscription=%s AND m.event>%s AND m.event<=%s
         AND (e.expires_at IS NULL OR e.expires_at>clock_timestamp()) AND ''' +

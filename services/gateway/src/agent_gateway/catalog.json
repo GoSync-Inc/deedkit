@@ -4802,7 +4802,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Persist selection of authorized archive chats; no send or provider request.\n\nRequires read + explicit subscription-write. The subscription belongs to the\noriginating credential; another key for the same principal cannot adopt it.\nExactly one of chat_ids (1–64 archive IDs from list_chats/resolve_reference, frozen)\nor sources={all_visible_chats: true, account_ids?, include_channels?, include_bots?, chat_types?}:\nevery chat the key can see at the moment of each read, count and hint, so a scope\nchange neither invalidates it nor needs a new one; channels and bot senders stay out\nunless included. Dynamic sources need the operator's switch (dynamic_sources_disabled).\nchat_types (1-4 distinct of private, group, channel, unknown) keeps only those chats before\nany match, hint or budget; new chats of those types still join. An untyped chat is unknown,\nand WhatsApp chats are untyped today: [private] leaves out every WhatsApp chat, [private,\nunknown] keeps Telegram private chats and all WhatsApp chats. Naming channel lets channels in;\ninclude_channels without channel is invalid_filter. It needs a second operator switch\n(source_filters_disabled).\nexclude_chats (up to 40 {account, chat} pairs the key can see, 6,000 bytes) leaves those chats\nout before any match, hint or budget and hides their stored references; replace it later with\nupdate_subscription(action='set_exclusions'). It is a preference, not authorization (scope\napplies first), and needs a third operator switch (source_exclusions_disabled).\nRecommended wake_rules for them: [reply_to_owner, owner_mention, reply_to_own_send];\nreply_to_own_send (dynamic only) catches an exact native reply to any confirmed send of\nthis key. Optional sender_ids (explicit chats only) are exact account-scoped IDs from search_people.\nStarts at the committed event boundary; default message.created/incoming/live.\ncontact.birthday (named in kinds only) wakes once per contact and year, from 09:00 owner time the day\nbefore, with the chat ID and date only; it covers the owner's active Telegram contacts only\n(list_birthdays) and DeedKit adds nothing to any calendar.\nHistorical events require explicit backfill/reconcile origins; a message the live stream lost and a\nreconcile pass found within 6 hours of sending has origin live_recovered and matches live. File readiness\nis independent of message arrival. Optional expiry is a future zoned ISO time\nwithin 366 days. Label is only a correlation hint, not authority to wake a task.\nDelivery uses separate fetch/ACK and configured signed hints; no provider read-state mutation.\nOptional delivery={endpoint_id, delivery_policy?} binds your own endpoint from register_delivery_endpoint;\nit needs delivery-write and the operator's delivery switch.\nA timeout can leave creation uncertain: inspect list_subscriptions before retrying.\n",
+    "description": "Persist selection of authorized archive chats; no send or provider request.\n\nRequires read + explicit subscription-write. The subscription belongs to the\noriginating credential; another key for the same principal cannot adopt it.\nExactly one of chat_ids (1–64 archive IDs from list_chats/resolve_reference, frozen)\nor sources={all_visible_chats: true, account_ids?, include_channels?, include_bots?, chat_types?}:\nevery chat the key can see at the moment of each read, count and hint, so a scope\nchange neither invalidates it nor needs a new one; channels and bot senders stay out\nunless included. Dynamic sources need the operator's switch (dynamic_sources_disabled).\nchat_types (1-4 distinct of private, group, channel, unknown) keeps only those chats before\nany match, hint or budget; new chats of those types still join. An untyped chat is unknown,\nand WhatsApp chats are untyped today: [private] leaves out every WhatsApp chat, [private,\nunknown] keeps Telegram private chats and all WhatsApp chats. Naming channel lets channels in;\ninclude_channels without channel is invalid_filter. It needs a second operator switch\n(source_filters_disabled).\nexclude_chats (up to 40 {account, chat} pairs the key can see, 6,000 bytes) leaves those chats\nout before any match, hint or budget and hides their stored references; replace it later with\nupdate_subscription(action='set_exclusions'). It is a preference, not authorization (scope\napplies first), and needs a third operator switch (source_exclusions_disabled).\nRecommended wake_rules for them: [reply_to_owner, owner_mention, reply_to_own_send];\nreply_to_own_send (dynamic only) catches an exact native reply to any confirmed send of\nthis key. Optional sender_ids (explicit chats only) are exact account-scoped IDs from search_people.\nStarts at the committed event boundary; default message.created/incoming/live.\ncontact.birthday (named in kinds only) wakes once per contact and year, from 09:00 owner time the day\nbefore, with the chat ID and date only; it covers the owner's active Telegram contacts only\n(list_birthdays) and DeedKit adds nothing to any calendar.\nHistorical events require explicit backfill/reconcile origins; a message the live stream lost and a\nreconcile pass found within 6 hours of sending has origin live_recovered and matches live. File readiness\nis independent of message arrival. Optional expiry is a future zoned ISO time\nwithin 366 days. Label is only a correlation hint, not authority to wake a task.\nDelivery uses separate fetch/ACK and configured signed hints; no provider read-state mutation.\nOptional delivery={endpoint_id, delivery_policy?} binds your own endpoint from register_delivery_endpoint;\nit needs delivery-write and the operator's delivery switch.\nfeedback=true (alone or beside either) wakes you when your own feedback is fixed, verify_requested,\ndeclined or duplicate; {statuses} picks others (SUBSCRIPTIONS.md).\nA timeout can leave creation uncertain: inspect list_subscriptions before retrying.\n",
     "inputSchema": {
       "properties": {
         "chat_ids": {
@@ -4994,6 +4994,22 @@
             }
           ],
           "default": null
+        },
+        "feedback": {
+          "anyOf": [
+            {
+              "const": true,
+              "type": "boolean"
+            },
+            {
+              "$ref": "#/$defs/SubscriptionFeedbackStatuses"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Feedback"
         }
       },
       "type": "object",
@@ -5157,6 +5173,23 @@
             "endpoint_id"
           ],
           "title": "SubscriptionEndpoint",
+          "type": "object"
+        },
+        "SubscriptionFeedbackStatuses": {
+          "additionalProperties": false,
+          "properties": {
+            "statuses": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Statuses",
+              "type": "array"
+            }
+          },
+          "required": [
+            "statuses"
+          ],
+          "title": "SubscriptionFeedbackStatuses",
           "type": "object"
         },
         "SubscriptionSources": {

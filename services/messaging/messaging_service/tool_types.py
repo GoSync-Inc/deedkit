@@ -140,6 +140,12 @@ class SubscriptionSources(TypedDict, total=False):
     chat_types: list[StrictStr]
     # ANYM-830: chats left out before any match; behind the operator's source_exclusions switch.
     exclude_chats: list[ExcludedChat]
+class SubscriptionFeedbackStatuses(TypedDict):
+    # ANYM-962: 1-6 distinct of received, accepted, declined, duplicate, fixed, verify_requested; the values are
+    # checked by the server (invalid_filter), not by this schema.
+    __pydantic_config__ = ConfigDict(extra='forbid')
+    statuses: list[StrictStr]
+SubscriptionFeedback = Literal[True] | SubscriptionFeedbackStatuses
 class SubscriptionEndpoint(TypedDict, total=False):
     __pydantic_config__ = ConfigDict(extra='forbid')
     endpoint_id: Required[EndpointReference]

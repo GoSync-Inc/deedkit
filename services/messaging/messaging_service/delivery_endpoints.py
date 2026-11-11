@@ -1159,8 +1159,10 @@ def hint_body(c, hint, row, p):
         # data are read through the fetch.
         from .module_events import hint_references
         rows = hint_references(c, row['id'], hint['through_position'])
-        listed = [{'type': item['type'], 'source': item['source'], 'subject': item['subject']}
-            for item in rows][:MAX_REFERENCES]
+        # ANYM-962: a feedback event is its own key's report: event_id, type, occurred_at, feedback_id and status.
+        from .feedback_events import SOURCE, webhook_reference
+        listed = [webhook_reference(item) if item['source'] == SOURCE else
+            {'type': item['type'], 'source': item['source'], 'subject': item['subject']} for item in rows][:MAX_REFERENCES]
         total = rows[0]['total'] if rows else 0
         while True:
             body = _compact({**base, 'type': 'module_events', 'references': listed,
