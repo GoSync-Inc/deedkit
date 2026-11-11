@@ -28,7 +28,10 @@ def own_statistics(c):
     The seeded fixture truncates the tables an earlier test filled; autovacuum may analyze them at any moment
     later, and an estimate that changes between the plain and the exclude measurement compares two plans made
     from different statistics (an extra of -63798 in CI). Analyzed here, a later autovacuum pass finds the same
-    contents and changes nothing."""
+    contents and changes nothing. ANALYZE reads every row (300 x 1000, above the catalogue's messages): from the
+    default 30,000-row sample the plain and the exclude statement could each take the other of two near-equal plans
+    (#885: extra 70204 > 63700)."""
+    c.execute('SET LOCAL default_statistics_target=1000')
     c.execute('ANALYZE')
 
 
@@ -113,6 +116,22 @@ def test_courtesies_exclude_reads_at_most_the_depth_per_chat(seeded, record_prop
     record_property('count_message_rows_visited', counted)
     assert 0 < extra <= bound, scans(closing.plans[0]['Plan'])
     assert counted <= base + bound, scans(closing.counts[0]['Plan'])
+
+
+# spec: ANYM-810
+def test_the_catalogue_gets_the_same_statistics_on_every_analyze(seeded):
+    """Regression (#885: extra 70204 > 63700): ANALYZE sampled 30,000 of the catalogue's messages, so the plain and
+    the exclude page statement could each take the other of two near-equal plans for the same rows (85207 or 115105
+    rows visited), and the difference counted as extra rows."""
+    s, _, _ = seeded
+    courtesy_catalogue(s)
+    def statistics():
+        with s.pool.connection() as c:
+            own_statistics(c)
+            return c.execute('''SELECT attname,null_frac,n_distinct,correlation,most_common_vals::text,
+                histogram_bounds::text FROM pg_stats WHERE tablename='messages' ORDER BY attname''').fetchall()
+    first = statistics()
+    assert first and all(statistics() == first for _ in range(3))
 
 
 
