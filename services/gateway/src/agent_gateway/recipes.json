@@ -37,6 +37,18 @@
         {"tool": "messages_get_messages", "note": "Read each chat that matters before suggesting a reply."},
         {"tool": "messages_send", "note": "Draft with dry_run true and send only after the owner's exact yes, as in send_safely."}
       ]
+    },
+    {
+      "id": "read_bot_buttons",
+      "title": "Read a Telegram bot's buttons, then press one",
+      "when": "A bot's message offers inline buttons and the owner asks what they are or to press one.",
+      "steps": [
+        {"tool": "messages_get_messages", "note": "Find the bot's message in its chat; keep chat_id, message_id and its revision."},
+        {"tool": "messages_execute_messenger_operation", "note": "Read the live keyboard: operation inspect_message_buttons, a new request_id. Keep each button's row, column, label and fp.", "arguments": {"account": "telegram-synthetic", "operation": "inspect_message_buttons", "request_id": "inspect-buttons-1", "chat_id": "chat_0123456789abcdef0123456789abcdef", "message_id": "msg_0123456789abcdef0123456789abcdef"}},
+        {"tool": "messages_change_message", "note": "Preview the press: operation press_button, dry_run true, parameters row, column, label and fp from the inspection. Nothing is pressed.", "arguments": {"account": "telegram-synthetic", "operation": "press_button", "chat_id": "chat_0123456789abcdef0123456789abcdef", "message_id": "msg_0123456789abcdef0123456789abcdef", "expected_revision": 3, "parameters": {"row": 0, "column": 0, "label": "Open", "fp": "0123456789abcdef0123456789abcdef"}, "dry_run": true}},
+        {"tool": "messages_change_message", "note": "Show the owner the preview; after their exact yes repeat the same arguments with dry_run false, its preview_digest and one request_id."},
+        {"tool": "messages_get_messenger_operation", "note": "Read the receipt by operation_id. On submitted or unknown never press again; check the chat first."}
+      ]
     }
   ],
   "calendar": [
