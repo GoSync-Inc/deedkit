@@ -5,6 +5,7 @@ export type ToolName =
   | 'agents_read_task_log'
   | 'agents_start_task'
   | 'agents_stop_task'
+  | 'android_agent'
   | 'android_capabilities'
   | 'android_courier_chat'
   | 'android_delete_file'

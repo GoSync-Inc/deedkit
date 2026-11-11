@@ -1,4 +1,5 @@
-"""The build and enable probe of an engine (ANYM-971 criteria 2 and 9): `deedkit-android engine probe claude|codex`."""
+"""The build and enable probe of an engine (ANYM-971 criteria 2 and 9): `deedkit-android engine probe claude|codex`; also
+the command line of `engine login` (ANYM-972 criterion 4)."""
 
 import asyncio
 import json
@@ -80,10 +81,17 @@ def engine_main(argv):
 
     from .config import Configuration
     parser = argparse.ArgumentParser(prog='deedkit-android engine')
-    parser.add_argument('action', choices=['probe'])
+    parser.add_argument('action', choices=['probe', 'login'])
     parser.add_argument('engine', choices=['claude', 'codex'])
     parser.add_argument('--config', required=True)
     args = parser.parse_args(argv)
+    if args.action == 'login':  # the owner's step (ANYM-972): never run by an agent
+        from .engine_login import login
+        try:
+            return login(Configuration(args.config).read(), args.engine)
+        except (OSError, ValueError):
+            print('configuration_unavailable', file=sys.stderr)
+            return 2
     try:
         record = asyncio.run(probe(Configuration(args.config), args.engine))
     except (OSError, ValueError):
