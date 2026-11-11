@@ -17,14 +17,12 @@ Harness values: ruleset `deploy/main-ruleset.json`; required checks `CI gate` an
 data-policy document docs/DATA-POLICY.md; money cap `Budget: EUR 50/month without asking,
 monthly-cancellable spend only (owner D25 via harness)`; Tiden
 product and workspace: docs/operations/tiden-product-workflow.md; spec prefix `ANYM`;
-unlinked-tests list `config/tiden-unlinked-tests.json`; Tiden CI document TIDEN-CI.md; critical
-paths and deployed consumers: section 5; live actions: send, call, ACK, pairing,
+unlinked-tests list `config/tiden-unlinked-tests.json`; Tiden CI document TIDEN-CI.md; live actions: send, call, ACK, pairing,
 provider-session start/stop, allowlist changes (agents' own: an agent's webhook endpoint under
 SUBSCRIPTIONS.md Self-registration and a vendor's documented webhook host in the delivery policy,
-owner 10-28); review paths: send, call and ACK code, collector and provider-session code, user-data
-deletion/rewrite, access/secrets/CI permissions, live-production operation plans; live activity: an
-active call; review notes (Codex points, change-path grep): docs/operations/review-protocol.md;
-lanes: docs/operations/parallel-development.md.
+owner 10-28); review paths: none (section 5); live activity: an active call; pull request lines
+(change-path grep, autoloop protected paths): docs/operations/review-protocol.md; lanes:
+docs/operations/parallel-development.md.
 
 ## 1. Always
 
@@ -54,13 +52,13 @@ Releases and migrations follow harness process.md section 2 (owner 11-04: «да
 production.md "Migration risk tiers" lists what deletes or rewrites user data (critical);
 "Migration releases" item 4 is the hand route.
 
-Override: harness process.md sections 1–5 and reviews.md Rounds 7–8, incident recovery only
+Override: harness process.md sections 1–5, incident recovery only
 (owner 10-30, Telegram sends: «это быстрый hotfix», «И только после этого уже продолжаем работу
 над задачами»). A confirmed production outage or broken critical user path takes priority over
 all other work. The agent immediately performs the smallest reversible recovery: restart the
 existing service/session, compatible rollback, or a service-only hotfix from verified green main
 through the promotion tool. This is standing authority; do not ask again for those actions.
-Defer Tiden/card intake and independent review until recovery. Preserve CI, source/image checks, active-call checks,
+Defer Tiden/card intake until recovery. Preserve CI, source/image checks, active-call checks,
 state and session identity. No sends/replays, new auth, access changes or destructive actions are
 included. Enforcer: follow [incident recovery](docs/operations/incident-recovery.md), including
 before/after evidence and undo; complete deferred checks and process corrections before resuming
@@ -78,10 +76,8 @@ live action from it wait for the owner, and so does that document's boundary.
 
 ## 3. Change paths
 
-The signal grep is in docs/operations/review-protocol.md.
-
-Small fixes (owner 11-09, D55: «такую карточку не нужно ревьють, это одна строка»): harness reviews.md
-Routing "Small fix: no review"; PR lines `Review record: none (small fix)` and `Diff read: <orch> <head SHA>`.
+The signal grep is in docs/operations/review-protocol.md. AUTO+review is gone (section 5): a path is
+AUTO or OWNER.
 
 ## 4. Product context and Tiden
 
@@ -89,15 +85,14 @@ Product IDs and DeedKit's queue rules: docs/operations/tiden-product-workflow.md
 
 ## 5. Reviews
 
-Every Astra task starts with DeedKit's copy of the three questions (harness `process.md` section 5):
-  1. Failure isolation: can an exception, timeout or bad input in the new code break or silence an
-     existing path (call audio, sends, collectors, queue, backup)? Name the line.
-  2. Data egress vs PR claims: what data leaves the process (model APIs, logs, telemetry, third
-     parties, files), and does it match the PR description and spec? Anything unlisted is a
-     finding.
-  3. Deployed-version compatibility: does it work against what is deployed now (other services at
-     the current prod SHA, schema N-1, the host `production.py`, the installed gateway)? Name the
-     breaking consumer.
+Override: harness process.md sections 2, 3 and 5, reviews.md and tiden.md review steps (owner
+11-11: «отмени все ревью в целом», «мы их и так отменяли», «не только текущих у всех в будущем»).
+No review on any path: no Astra, Fable, Codex, plan or card review, no Diff read. A pull request
+merges on green required checks with a failing-first test; PR line `Review record: none (owner
+11-11: no reviews)`. Kept: section 1's exact owner confirmation of live actions, and a fresh verified
+backup and undo before deleting or rewriting user data. Enforcer: the merge keeper and the autoloop
+controller enqueue a green pull request with no approval (tests/test_merge_keeper.py,
+tests/platform/test_autoloop.py).
 
 ## 6. Working with the orchestrator
 

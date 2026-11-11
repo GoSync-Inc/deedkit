@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge keeper: enqueue reviewed, green `ship` pull requests so nothing green waits for a person or the morning.
+"""Merge keeper: enqueue green `ship` pull requests so nothing green waits for a person or the morning.
 
 Runs every 5 minutes as a launchd daemon on the Mac mini with the host's existing `gh` login, and as the
 report-only GitHub Actions workflow `.github/workflows/merge-keeper.yml` (docs/operations/parallel-development.md,
@@ -7,12 +7,8 @@ Merge keeper). Every GitHub call goes through `gh`, which takes `GH_TOKEN` from 
 so the token source is the caller's choice.
 
 For each open, non-draft, same-repository pull request into `main` that carries the label `ship`:
-  1. An approval must be recorded for the full head SHA by an account whose effective repository permission is
-     write, maintain or admin (collaborators/<login>/permission): an APPROVE review on that commit, or an unedited
-     comment, posted after the head arrived, with the line `Diff read: <orchestrator session> <40-hex sha>` (or
-     the older `Review: orchestrator diff read <40-hex sha>`). An approval of an older SHA: no enqueue, one
-     comment. A no-review pull request (description line `Review record: none (...)`, owner review cut 11-09)
-     needs no approval when its diff is clean under the change-path signal grep; a hit holds it with one comment.
+  1. No review or approval is read, on any path (owner 11-11: no reviews). Only write access can push a
+     same-repository head, so a fork's head is never enqueued.
   2. Every required check of the live `main` rules (name and app) has its newest run on the head completed: `CI
      gate` success, the others success or skipped (`CI gate` validates their skip; never all skipped).
   3. The new migrations must take the next free numbers on `main`; otherwise one comment with the exact rename.
@@ -44,23 +40,11 @@ LABEL = 'ship'
 GATE = 'CI gate'
 MIGRATIONS = 'services/messaging/messaging_service/migrations'
 MIGRATION = re.compile(r'^(\d{3})_[A-Za-z0-9_]+\.sql$')
-# The orchestrator's diff-read line, in the old form and the harness 0.80.0 form `Diff read: <session> <head SHA>`.
-# One group each; only a full 40-hex SHA equal to the head ever approves (head_approved).
-APPROVAL_LINE = re.compile(r'^\s*(?:Review:\s*orchestrator diff read\s+([0-9a-f]{7,40})'
-                           r'|Diff read:\s*\S+\s+([0-9a-f]{7,40}))\b', re.I | re.M)
 KEEPER_BOT = 'github-actions[bot]'
-# A no-review pull request (owner review cut 11-09; small fix, AGENTS.md section 3) says so in its description. It
-# approves the head only when the diff is clean under the change-path signal grep (docs/operations/review-protocol.md):
-# the line is author-written, so the grep, not the line, keeps a risk-path change from merging without its review.
-REVIEW_NONE_LINE = re.compile(r'^[ \t]*Review record:[ \t]*none\b(?:[ \t]*\([^)\n]*\))?[ \t]*\r?$', re.I | re.M)
-SIGNAL_PATH = re.compile(r'^\.github/workflows/|main-ruleset\.json|\.sql$|migrations/|gitleaks|compose|^deploy/modules/'
-                         r'|\.claude/settings\.json|^AGENTS\.md$|^docs/operations/feedback-autoloop\.md$', re.I)
-SIGNAL_LINE = re.compile(r'^[-+].*(secret|permissions|: *write|write-all|\b(GRANT|REVOKE|DROP|TRUNCATE|DELETE FROM|RENAME)\b'
-                         r'|ALTER )', re.I | re.M)
 RETRY_AFTER = 3  # minutes a failed-checks removal waits before the keeper re-enqueues
 # Off until the harness wait-merge.sh skips its re-enqueue for `ship` pull requests: one retry actor per queue.
 RETRY_FAILED_CHECKS = False
-WRITE = {'admin', 'maintain', 'write'}  # effective repository permissions that may approve
+WRITE = {'admin', 'maintain', 'write'}  # effective repository permissions whose keeper markers count
 MARK_PREFIX = '<!-- merge-keeper:'
 MARK = MARK_PREFIX + '{} -->'
 QUEUE_DONE = {'merged'}
@@ -80,9 +64,8 @@ class Facts:
     same_repository: bool = True
     base: str = BASE
     labels: tuple = (LABEL,)
-    reviews: list = field(default_factory=list)  # {'state','commit_id','user'}
-    comments: list = field(default_factory=list)  # {'body','user','created_at','updated_at'}
-    writers: frozenset = frozenset()  # logins among the authors above with write, maintain or admin permission
+    comments: list = field(default_factory=list)  # keeper-marker comments: {'body','user','created_at','updated_at'}
+    writers: frozenset = frozenset()  # logins among their authors with write, maintain or admin permission
     queued: bool = False
     auto_merge: bool = False
     mergeable: bool | None = True
@@ -96,8 +79,6 @@ class Facts:
     added_migrations: tuple = ()  # file names this pull request adds under MIGRATIONS
     main_migrations: tuple = ()  # file names on main
     failing_jobs: list = field(default_factory=list)  # jobs of the last failed group run: 'name <url>'
-    review_none: bool = False  # the description carries `Review record: none (...)`
-    signals: tuple = ()  # change-path signal grep hits of the head's diff ('path: why'); unknown diff = a hit
 
 
 @dataclass
@@ -112,44 +93,6 @@ def marked(facts, key):
     """A dedup marker counts only from a write-access account or the Actions bot, so an outsider cannot mute one."""
     return any(MARK.format(key) in (c.get('body') or '') for c in facts.comments
                if c.get('user') in facts.writers or c.get('user') == KEEPER_BOT)
-
-
-def approved_shas(facts, authorizing=True):
-    """SHAs approved by a write-access account: APPROVE reviews and diff-read comments. Authorizing comments must
-    be unedited and posted after the head arrived; `authorizing=False` keeps every one, for the stale notice."""
-    shas = [r['commit_id'] for r in facts.reviews
-            if r.get('state') == 'APPROVED' and r.get('user') in facts.writers and r.get('commit_id')]
-    for c in facts.comments:
-        fresh = c.get('updated_at') == c.get('created_at') and (c.get('created_at') or '') >= (facts.head_at or '')
-        if c.get('user') in facts.writers and (fresh or not authorizing):
-            shas += [(old or new).lower() for old, new in APPROVAL_LINE.findall(c.get('body') or '')]
-    return shas
-
-
-DIFF_NAMES = re.compile(r'^diff --git a/(.*) b/(.*)$', re.M)
-BINARY = re.compile(r'^(Binary files .* differ|GIT binary patch)$', re.M)
-
-
-def signal_hits(diff):
-    """The change-path signal grep of review-protocol.md over the head's complete Git diff (`git diff --no-renames
-    --name-only` names and `^[-+]` lines, `---`/`+++` headers included). No diff, an empty one or a binary file is a
-    hit: an unread diff is never clean."""
-    if not diff or not diff.strip():
-        return ('diff not readable',)
-    hits = [f'{name}: change-path' for pair in DIFF_NAMES.findall(diff) for name in dict.fromkeys(pair)
-            if SIGNAL_PATH.search(name)]
-    hits += [f'{line[:120]}: binary, not readable' for line in BINARY.findall(diff)]
-    hits += [f'`{m.group(0)[:120]}`' for m in SIGNAL_LINE.finditer(diff)]
-    return tuple(dict.fromkeys(hits))
-
-
-def review_none_approved(facts):
-    return facts.review_none and not facts.signals
-
-
-def head_approved(facts):
-    """Only the full head SHA approves: an abbreviation or an approval posted before this head arrived does not."""
-    return facts.head.lower() in approved_shas(facts)
 
 
 def migration_plan(added, on_main):
@@ -256,24 +199,6 @@ def decide(facts):
             'Rebase onto main, rerun the local checks, push.']))
     if conflicts and (facts.main_at or '') < conflicts[-1]['at']:
         return Decision('hold', 'queue conflict: waits for main to move past the entry ahead')
-    if facts.review_none and facts.signals and not head_approved(facts):
-        return Decision('hold', 'Review record: none on a risk path', f'risk:{facts.head}', '\n'.join([
-            MARK.format(f'risk:{facts.head}'),
-            f'Merge keeper: not enqueued. The description says `Review record: none`, but head `{facts.head[:12]}` '
-            'hits the change-path signal grep (docs/operations/review-protocol.md):',
-            *(f'- {hit}' for hit in facts.signals[:20]), '',
-            'A risk path needs its review (Astra r1) and an approval on the head: an APPROVE, or a comment '
-            f'`Diff read: <session> {facts.head}`.']))
-    if not head_approved(facts) and not review_none_approved(facts):
-        historical = [sha for sha in approved_shas(facts, authorizing=False) if not facts.head.startswith(sha)]
-        if historical:
-            old = ', '.join(sorted({s[:12] for s in historical}))
-            return Decision('hold', 'approval is for an older head', f'stale:{facts.head}', '\n'.join([
-                MARK.format(f'stale:{facts.head}'),
-                f'Merge keeper: not enqueued. The recorded approval names `{old}`, but the head is '
-                f'`{facts.head[:12]}`. The new commits need their review (an APPROVE on the head, or a new comment '
-                f'`Review: orchestrator diff read {facts.head}`).']))
-        return Decision('hold', 'no approval recorded for the head')
     pending = required_state(facts)
     if pending:
         return Decision('hold', f'required checks: {pending}')
@@ -303,7 +228,7 @@ def decide(facts):
             f'Merge keeper: dequeued once on this head (`{failures[-1].get("reason")}`); enqueued again, which reruns '
             'the whole group. Failing jobs of that group run:', jobs, '',
             'A second failure on this head stops the keeper.']))
-    return Decision('enqueue', 'approved, green and numbered')
+    return Decision('enqueue', 'green and numbered')
 
 
 class GitHub:
@@ -321,12 +246,6 @@ class GitHub:
         if paginate and isinstance(data, list) and all(isinstance(page, list) for page in data):
             return [item for page in data for item in page]
         return data
-
-    def diff(self, base, head):
-        """The complete unified diff merge-base(base, head)...head: immutable revisions, so it is exactly what an
-        enqueue of `head` would merge. GitHub refuses a diff it cannot return whole; the caller treats that as a hit."""
-        command = ['gh', 'api', '-H', 'Accept: application/vnd.github.diff', self.repo(f'compare/{base}...{head}')]
-        return subprocess.run(command, check=True, capture_output=True, text=True, timeout=CALL_TIMEOUT).stdout
 
     def graphql(self, query, **variables) -> Any:  # Any: GitHub's JSON, read by key where used
         arguments = ['-f', f'query={query}']
@@ -379,7 +298,6 @@ def collect(gh, pr, required, main_at=''):
             latest = max(runs, key=lambda r: r['id'])
             checks[name] = {k: latest.get(k) for k in ('status', 'conclusion', 'started_at')}
     files = gh.api(gh.repo(f'pulls/{number}/files?per_page=100'), paginate=True)
-    review_none = bool(REVIEW_NONE_LINE.search(pr.get('body') or ''))
     added = tuple(Path(f['filename']).name for f in files if f['status'] in ('added', 'renamed', 'copied')
                   and str(Path(f['filename']).parent) == MIGRATIONS)
     on_main = tuple(item['name'] for item in gh.api(gh.repo(f'contents/{MIGRATIONS}?ref={BASE}'))) if added else ()
@@ -387,32 +305,20 @@ def collect(gh, pr, required, main_at=''):
         number=number, head=head, open=pr['state'] == 'open', draft=pr['draft'], same_repository=pr['head']['repo'] is not None
         and pr['head']['repo']['full_name'] == gh.repository, base=pr['base']['ref'],
         labels=tuple(label['name'] for label in pr['labels']),
-        reviews=[{'state': r.get('state'), 'commit_id': r.get('commit_id'), 'user': (r.get('user') or {}).get('login')}
-                 for r in gh.api(gh.repo(f'pulls/{number}/reviews?per_page=100'), paginate=True)],
         comments=[{'body': c.get('body') or '', 'user': (c.get('user') or {}).get('login'), 'created_at': c.get('created_at'),
                    'updated_at': c.get('updated_at')}
                   for c in gh.api(gh.repo(f'issues/{number}/comments?per_page=100'), paginate=True)
-                  if MARK_PREFIX in (c.get('body') or '') or APPROVAL_LINE.search(c.get('body') or '')],
+                  if MARK_PREFIX in (c.get('body') or '')],
         queued=graph['isInMergeQueue'], auto_merge=graph['autoMergeRequest'] is not None,
         mergeable=detail.get('mergeable'), main_at=main_at, now=github_time(now()),
         head_at=min((s['created_at'] for s in suites), default=github_time(now())), removals=removals,
         labeled_at=max(labeled, default=''), required=tuple(name for name, _ in required), checks=checks, added_migrations=added,
-        main_migrations=on_main, review_none=review_none,
-        signals=head_signals(gh, pr['base']['sha'], head) if review_none else ())
-    facts.writers = frozenset(login for login in {c['user'] for c in facts.comments}
-                              | {r['user'] for r in facts.reviews if r['state'] == 'APPROVED'}
-                              if login and gh.can_write(login))
+        main_migrations=on_main)
+    facts.writers = frozenset(login for login in {c['user'] for c in facts.comments} if login and gh.can_write(login))
     failures = [r for r in removals if r['at'] >= facts.head_at and r['reason'] not in QUEUE_DONE | QUEUE_RETRYLESS]
     if failures and failures[-1]['group']:
         facts.failing_jobs = failing_jobs(gh, failures[-1]['group'])
     return facts, graph['id']
-
-
-def head_signals(gh, base, head):
-    try:
-        return signal_hits(gh.diff(base, head))
-    except subprocess.SubprocessError as error:
-        return (f'diff not readable: {type(error).__name__}',)
 
 
 def failing_jobs(gh, group_sha):
