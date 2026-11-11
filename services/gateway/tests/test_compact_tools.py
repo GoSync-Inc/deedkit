@@ -137,6 +137,50 @@ def test_exact_tool_search_does_not_return_tools_that_only_reference_it(gateway)
         assert [tool['name'] for tool in result['tools']] == ['calendar_calendars']
 
 
+def routed_search(query, actions, visible=None):
+    from agent_gateway.catalog import CATALOG
+    from agent_gateway.catalog_search import search_tools
+
+    details = {'actions': actions, 'unavailable_modules': []}
+    names = list(CATALOG) if visible is None else visible
+    return search_tools(names, details, {'query': query, 'offset': 0, 'limit': 10, 'detail': 'compact'})['tools']
+
+
+# spec: ANYM-982
+def test_search_finds_the_button_operations_a_key_may_use_through_their_routed_tools():
+    granted = ['inspect_message_buttons', 'press_button']
+    for query, expected in (('inspect buttons', ['inspect_message_buttons']),
+                            ('inline keyboard', granted), ('bot keyboard', granted), ('reply_markup', granted)):
+        rows = routed_search(query, granted)
+        assert 'messages_execute_messenger_operation' in [row['name'] for row in rows[:3]], query
+        row = next(row for row in rows if row['name'] == 'messages_execute_messenger_operation')
+        assert row['operations'] == expected, query
+    rows = routed_search('press inline button', granted)
+    assert {'messages_change_message', 'messages_execute_messenger_operation'} <= {row['name'] for row in rows[:3]}
+    assert next(row for row in rows if row['name'] == 'messages_change_message')['operations'] == ['press_button']
+    # A row that matched on its own description names no operations.
+    assert all('operations' not in row for row in routed_search('buttons', []))
+
+
+# spec: ANYM-982
+def test_search_by_operation_never_widens_what_a_key_can_see_or_do():
+    from agent_gateway.catalog import CATALOG
+
+    # The operation is not among the key's actions: the routed tool does not answer for those words.
+    for query in ('inspect buttons', 'inline keyboard', 'reply_markup'):
+        names = [row['name'] for row in routed_search(query, ['rename_group'])]
+        assert 'messages_execute_messenger_operation' not in names, query
+    # The tool is not visible to the key: no row, whatever its actions say.
+    visible = [name for name in CATALOG if name != 'messages_execute_messenger_operation']
+    granted = ['inspect_message_buttons', 'press_button']
+    assert 'messages_execute_messenger_operation' not in [r['name'] for r in routed_search('inspect buttons', granted, visible)]
+    # A routed risk-class tool answers only for the operations it routes: press_button, not inspect_message_buttons.
+    rows = routed_search('inline keyboard', granted)
+    assert next(row for row in rows if row['name'] == 'messages_change_message')['operations'] == ['press_button']
+    # Words must all match one operation: a word of another operation does not complete a match.
+    assert 'messages_execute_messenger_operation' not in [r['name'] for r in routed_search('inspect press', granted)]
+
+
 # spec: ANYM-952
 def test_compact_forwarding_preserves_native_images_and_request_ids(tmp_path):
     from test_android import setup, PNG

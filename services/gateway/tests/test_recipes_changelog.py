@@ -98,6 +98,27 @@ def test_a_recipe_is_served_whole_or_not_at_all():
         step["tool"] in CATALOG for r in recipes_for("recordings", everything) for step in r["steps"])
 
 
+# spec: ANYM-982
+def test_the_bot_buttons_recipe_reads_then_previews_then_presses_and_is_served_whole():
+    from agent_gateway.catalog import CATALOG
+    from agent_gateway.recipes import RECIPES, recipes_for
+
+    recipe = next((r for r in RECIPES["messaging"] if r["id"] == "read_bot_buttons"), None)
+    assert recipe is not None
+    tools = [step["tool"] for step in recipe["steps"]]
+    assert tools == ["messages_get_messages", "messages_execute_messenger_operation", "messages_change_message",
+                     "messages_change_message", "messages_get_messenger_operation"]
+    notes = " ".join(step["note"] for step in recipe["steps"])
+    assert "inspect_message_buttons" in notes and "press_button" in notes
+    assert recipe["steps"][2]["arguments"]["dry_run"] is True and "dry_run" not in recipe["steps"][3].get("arguments", {})
+    assert "yes" in recipe["steps"][3]["note"] and "never" in recipe["steps"][4]["note"]
+    everything = list(CATALOG)
+    assert "read_bot_buttons" in {r["id"] for r in recipes_for("messaging", everything)}
+    for missing in set(tools):
+        served = recipes_for("messaging", [n for n in everything if n != missing])
+        assert "read_bot_buttons" not in {r["id"] for r in served}, missing
+
+
 # spec: ANYM-964
 def test_a_module_recipes_part_stays_under_16_kib():
     from agent_gateway.catalog import CATALOG
