@@ -1,7 +1,7 @@
 """The owner's one login step per engine (ANYM-972 criterion 4): `deedkit-android engine login claude|codex`.
 
 Claude: runs `claude setup-token` on a pseudo-terminal, shows its output with any token redacted and writes the token it
-printed to the configured `token_file` (0600) without ever echoing it. Codex: runs `codex login` with `CODEX_HOME` set to the
+printed to the configured `token_file` (0600) without ever echoing it. Codex: runs `codex login --device-auth` (a link and a code to confirm on any device) with `CODEX_HOME` set to the
 configured private Codex home, where Codex keeps its own `auth.json`. The agent never runs this: the owner types it."""
 
 import fcntl
@@ -101,7 +101,7 @@ def login(config, name):
         home = Path(engine.codex_home)
         home.mkdir(mode=0o700, parents=True, exist_ok=True)
         home.chmod(0o700)
-        code = subprocess.run([engine.binary, 'login'], env={**os.environ, 'CODEX_HOME': str(home)}, check=False).returncode
+        code = subprocess.run([engine.binary, 'login', '--device-auth'], env={**os.environ, 'CODEX_HOME': str(home)}, check=False).returncode
         auth = home / 'auth.json'
         if auth.is_file() and not auth.is_symlink():
             auth.chmod(0o600)

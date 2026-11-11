@@ -305,7 +305,7 @@ engine's provider (Anthropic for Claude Code, OpenAI for Codex), which is the ow
   `available` and a `reason` (`not_configured`, `login_missing`, `version_mismatch`, `probe_failed`, `codex_probe_failed`).
 - **Login (the owner's step, ANYM-972).** `deedkit-android engine login claude --config FILE` runs `claude setup-token` on a
   pseudo-terminal, shows its output with the token hidden and writes the token to the configured `token_file` (0600). `engine
-  login codex --config FILE` runs `codex login` with `CODEX_HOME` set to the configured private `codex_home` (0700, `auth.json`
+  login codex --config FILE` runs `codex login --device-auth` (a link and a code to confirm on any device) with `CODEX_HOME` set to the configured private `codex_home` (0700, `auth.json`
   0600). Run each on the host in the owner's terminal, then `engine probe` for the same engine. The gateway tool
   `android_agent` (module android, scope `android:control`) carries `start`, `get` (long-poll, `wait_s` at most 25) and `stop`.
 - **Foreground gate.** After each action the run checks the foreground app: one of the run's `apps` or a neutral system

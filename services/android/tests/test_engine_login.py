@@ -20,11 +20,11 @@ time.sleep(0.3)
 sys.stdout.write(token[25:] + "\\nStore it safely.\\n")
 '''
 CODEX = '''#!{python}
-import os, pathlib
+import os, pathlib, sys
 home = pathlib.Path(os.environ["CODEX_HOME"])
 (home / "auth.json").write_text('{{"auth_mode": "chatgpt", "tokens": {{"refresh_token": "synthetic"}}}}')
 (home / "auth.json").chmod(0o644)
-pathlib.Path(os.environ["CODEX_HOME"] + ".called").write_text("login " + os.environ.get("ARGV_PROBE", ""))
+pathlib.Path(os.environ["CODEX_HOME"] + ".called").write_text("login " + " ".join(sys.argv[1:]))
 '''
 
 
@@ -77,7 +77,7 @@ def test_login_codex_runs_in_the_private_codex_home_and_leaves_auth_json_0600(tm
     home = values['codex'].codex_home
     assert engine_main(['login', 'codex', '--config', str(config)]) == 0
     assert stat.S_IMODE(os.stat(home + '/auth.json').st_mode) == 0o600 and stat.S_IMODE(os.stat(home).st_mode) == 0o700
-    assert open(home + '.called').read().startswith('login')  # the binary ran with CODEX_HOME set to the private home
+    assert open(home + '.called').read() == 'login login --device-auth'  # a link and a code to confirm on any phone
 
 
 # spec: ANYM-972
