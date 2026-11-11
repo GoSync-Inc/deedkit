@@ -1,0 +1,3 @@
+[
+  {"revision": 1, "date": "2026-11-11", "module": "gateway", "added": [], "changed": [], "removed": [], "note": "Baseline: the reviewed catalog when the changelog began. Later entries list the tools added, changed or removed.", "catalog_sha256": "9a1de235a0207a245e77955be6315959172be67a921f06f64a584295315c2c2c"}
+]

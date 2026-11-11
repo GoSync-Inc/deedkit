@@ -34,8 +34,13 @@ CATALOG["platform_capabilities"] = {
     "Frequent work uses /mcp/modules/android or /mcp/modules/messaging with the same key for direct calls. "
     "Occasional work uses /mcp/compact with platform_search_tools(detail=full) then platform_call_tool. "
     "Reuse schemas and request IDs. tool_paths lists alternatives. If discovery.catalog differs from Catalog below, "
-    "ask once to reconnect the DeedKit MCP client. Coverage may be unknown. Example: {}",
-    "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    "ask once to reconnect the DeedKit MCP client. Coverage may be unknown. "
+    "Optional module adds its workflow recipes; since (a changelog_revision) adds whats_new after it. Example: {}",
+    "inputSchema": {"type": "object", "properties": {
+        # The deployable modules, as dispatch.MODULE_PURPOSES names them (a test holds the two equal).
+        "module": {"type": "string", "enum": ["agents", "android", "calendar", "calls", "messaging", "recordings"]},
+        "since": {"type": "integer"},
+    }, "additionalProperties": False},
     "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
 }
 
