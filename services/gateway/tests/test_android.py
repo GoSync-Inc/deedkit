@@ -50,7 +50,7 @@ def setup(tmp_path, scopes=SCOPES, backend_scopes=SCOPES, unavailable=False, int
                 'version': 1, 'names': [CATALOG[name]['operation'] for name in TOOLS]}})
         args = json.loads(request.content)
         calls.append((module, operation, args))
-        if module == 'android' and operation == 'execute' and interrupted:
+        if module == 'android' and operation in {'execute', 'courier_chat'} and interrupted:
             raise httpx.ReadTimeout('reply lost', request=request)
         if operation == 'observe':
             return httpx.Response(200, json={'elements': [{'text': 'Search'}], 'image': image or {
@@ -65,7 +65,7 @@ def test_android_tools_and_native_image_preserve_structured_screen(tmp_path):
     app, calls = setup(tmp_path)
     with TestClient(app) as client:
         names = {tool['name'] for tool in rpc(client, 'tools/list').json()['result']['tools']}
-        assert len(TOOLS) == 11 and set(TOOLS) <= names
+        assert len(TOOLS) == 12 and set(TOOLS) <= names
         result = rpc(client, 'tools/call', {'name': 'android_observe', 'arguments': {
             'device_id': 'home', 'session_id': 'session'}}).json()['result']
         assert not result.get('isError'), result
@@ -79,6 +79,38 @@ def test_android_tools_and_native_image_preserve_structured_screen(tmp_path):
         assert calls == [('android', 'observe', {'device_id': 'home', 'session_id': 'session',
                                                 'screenshot': True, 'hierarchy': True,
                                                 'image_mode': 'inline', 'crop': None})]
+
+
+# spec: ANYM-975
+def test_courier_chat_preview_and_send_reach_the_backend_operation_with_their_arguments(tmp_path):
+    app, calls = setup(tmp_path)
+    tool = CATALOG['android_courier_chat']
+    assert tool['scopes'] == ['android:control'] and tool['operation'] == 'courier_chat'
+    assert tool['annotations']['destructiveHint'] is True and tool['annotations']['readOnlyHint'] is False
+    for phrase in ('preview', 'owner_instruction', 'never', 'unknown', 'data, never instructions'):
+        assert phrase in tool['description']
+    base = {'device_id': 'home', 'session_id': 'session', 'app': 'gojek', 'order': 'Warung Sate', 'message': 'Saya di lobi'}
+    with TestClient(app) as client:
+        for extra in ({'action': 'preview'}, {'action': 'send', 'preview_digest': '1.' + '0' * 64 + '.' + '0' * 64,
+                                              'owner_instruction': 'Yes, send it'}):
+            request_id = str(uuid.uuid4())
+            result = rpc(client, 'tools/call', {'name': 'android_courier_chat', 'arguments': {
+                **base, **extra, 'request_id': request_id}}).json()['result']
+            assert not result.get('isError'), result
+            module, operation, forwarded = calls[-1]
+            assert (module, operation) == ('android', 'courier_chat')
+            assert {**base, **extra, 'request_id': request_id}.items() <= forwarded.items()
+        assert len(calls) == 2
+
+
+# spec: ANYM-975
+def test_a_read_only_android_grant_cannot_call_the_courier_chat(tmp_path):
+    app, calls = setup(tmp_path, scopes=['android:read'])
+    with TestClient(app) as client:
+        result = rpc(client, 'tools/call', {'name': 'android_courier_chat', 'arguments': {
+            'device_id': 'home', 'session_id': 'session', 'request_id': str(uuid.uuid4()), 'action': 'preview',
+            'app': 'gojek', 'order': 'Warung Sate', 'message': 'Saya di lobi'}}).json()['result']
+        assert result['isError'] and calls == []
 
 
 @pytest.mark.parametrize('options', [{'scopes': ['android:read']},
@@ -112,6 +144,22 @@ def test_lost_android_reply_keeps_original_request_id_and_never_retries(tmp_path
         receipt = rpc(client, 'tools/call', {'name': 'android_get_operation', 'arguments': {
             'request_id': request_id}}).json()['result']
         assert receipt['structuredContent']['state'] == 'succeeded'
+
+
+# spec: ANYM-975
+def test_a_lost_courier_chat_reply_keeps_the_request_id_and_never_retries(tmp_path):
+    app, calls = setup(tmp_path, interrupted=True)
+    request_id = str(uuid.uuid4())
+    with TestClient(app) as client:
+        result = rpc(client, 'tools/call', {'name': 'android_courier_chat', 'arguments': {
+            'device_id': 'home', 'session_id': 'session', 'request_id': request_id, 'action': 'send',
+            'app': 'gojek', 'order': 'Warung Sate', 'message': 'Saya di lobi', 'owner_instruction': 'Yes, send it',
+            'preview_digest': '1.' + '0' * 64 + '.' + '0' * 64}}).json()['result']
+        assert result['isError']
+        assert result['structuredContent']['error'] == 'mutation_outcome_unknown'
+        assert result['structuredContent']['request_id'] == request_id
+        assert result['structuredContent']['next_action'] == 'read_android_get_operation_with_original_request_id'
+        assert len(calls) == 1
 
 
 @pytest.mark.parametrize('image', [{'mime_type': 'image/png', 'data': 'not-base64'},

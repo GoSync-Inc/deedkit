@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import AliasChoices, Field, ValidationError
 from typing import Literal
 
+from . import courier_chat
 from .app_maps import compile_scenario, load, validate_map
 from .config import Configuration, Refused, Strict
 from .device import COMMANDS, Devices
@@ -42,6 +43,18 @@ class Execute(Device):
     request_id: str
     argv: list[str] = Field(min_length=1, max_length=128)
     timeout_s: int = Field(default=30, ge=1, le=600)
+    wait_s: int = Field(default=15, ge=0, le=25)
+
+
+class CourierChat(Device):  # ANYM-975: preview a courier chat message, then send it with the preview's digest
+    request_id: str
+    action: Literal["preview", "send"]
+    app: Literal["gojek", "grab"]
+    order: str = Field(min_length=3, max_length=80, pattern=r"^[^\r\n]+$")
+    message: str = Field(min_length=1, max_length=500, pattern=r"^[^\r\n]+$")
+    preview_digest: str | None = Field(default=None, max_length=200)
+    owner_instruction: str | None = Field(default=None, min_length=3, max_length=1500)
+    timeout_s: int = Field(default=60, ge=10, le=180)
     wait_s: int = Field(default=15, ge=0, le=25)
 
 
@@ -112,6 +125,7 @@ class Download(FileRef):
 SCHEMAS = {
     "capabilities": Strict, "maestro": MaestroInfo, "observe": Observe, "execute": Execute, "get_operation": Receipt,
     "run_flow": RunFlow, "flows": Flows, "session": Session, "upload": Upload, "download": Download, "delete_file": FileRef,
+    "courier_chat": CourierChat,
 }
 READS = {"capabilities", "observe", "get_operation", "download", "maestro"}
 
@@ -136,7 +150,8 @@ def create_app(config_path):
 
     @app.exception_handler(Refused)
     async def refused(request, error):
-        return JSONResponse({"error": error.code, **({'hint': error.hint} if hasattr(error, 'hint') else {})}, status_code=error.status,
+        return JSONResponse({"error": error.code, **({'hint': error.hint} if hasattr(error, 'hint') else {}),
+                             **getattr(error, 'extra', {})}, status_code=error.status,
                             headers={"Cache-Control": "no-store"})
 
     @app.post("/v1/{operation}")
@@ -193,6 +208,12 @@ def create_app(config_path):
                 raise Refused("invalid_arguments", 422)
             result = await devices.execute(owner, device, args["session_id"], identifier(args["request_id"]),
                                            args["argv"], args["timeout_s"], args["wait_s"])
+        elif operation == "courier_chat":
+            courier_chat.check_request(owner, args)
+            request_id = identifier(args["request_id"])
+            job = courier_chat.CourierChat(devices, owner, device, {**args, "request_id": request_id})
+            result = await devices.execute(owner, device, args["session_id"], request_id, None,
+                                           args["timeout_s"], args["wait_s"], job=job)
         elif operation == "maestro":
             if args["action"] == "reference":
                 result = ui_reference()
