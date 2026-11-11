@@ -147,7 +147,7 @@ const MESSENGER_FIELDS = Object.freeze({
 });
 const SUBSCRIPTION_FIELDS = Object.freeze({
   create_subscription: [[],['chat_ids','sources','sender_ids','kinds','direction','origins','label','expires_at',
-    'wake_rules','reply_to_send','delivery']],
+    'wake_rules','reply_to_send','delivery','module_sources']],
   list_subscriptions: [[],['limit']],
   get_subscription: [['subscription_id'],['subscription_id']],
   update_subscription: [['subscription_id','version','action'],
@@ -322,6 +322,12 @@ function subscriptionArguments(method,args) {
       Object.keys(value).every(name=>['endpoint_id','delivery_policy'].includes(name)) && uuid(value.endpoint_id) &&
       (value.delivery_policy===undefined || plainObject(value.delivery_policy)) && JSON.stringify(value).length<=4096;
     else if (key==='sources') valid=subscriptionSources(value);
+    // ANYM-566: one {scope, types}; the server checks both against the owner's module link (module_not_linked).
+    else if (key==='module_sources') valid=value===null || Array.isArray(value) && value.length===1 &&
+      plainObject(value[0]) && Object.keys(value[0]).length===2 && Object.hasOwn(value[0],'scope') &&
+      Object.hasOwn(value[0],'types') && typeof value[0].scope==='string' && value[0].scope.length>=1 &&
+      value[0].scope.length<=64 && Array.isArray(value[0].types) && value[0].types.length>=1 &&
+      value[0].types.length<=16 && value[0].types.every(kind=>typeof kind==='string' && kind.length>=1 && kind.length<=64);
     else if (key==='exclude_chats') valid=excludedChats(value);
     else if (key==='exclusions_revision') valid=Number.isSafeInteger(value) && value>=0;
     // ANYM-826: subscription page projection.

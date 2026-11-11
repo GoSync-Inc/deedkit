@@ -115,6 +115,25 @@ for(const [index,extra] of [
   assert.throws(()=>client.createSubscription({chat_ids:['chat_synthetic'],...extra}),TypeError);
 });
 
+// spec: ANYM-566
+test('createSubscription sends module_sources only when given and refuses a malformed one before transport',async()=>{
+  const seen=[];
+  const client=new AnyMsgClient({...options,fetch:async(_,request)=>{
+    seen.push(JSON.parse(request.body));return Response.json({});
+  }});
+  const wanted=[{scope:'calls:own',types:['call.finished']}];
+  await client.createSubscription({chat_ids:['chat_synthetic']});
+  await client.createSubscription({chat_ids:['chat_synthetic'],module_sources:wanted});
+  for(const bad of [[],[...wanted,...wanted],{scope:'calls:own',types:['call.finished']},[{scope:'calls:own'}],
+    [{scope:'',types:['call.finished']}],[{scope:'calls:own',types:[]}],[{scope:'calls:own',types:[7]}],
+    [{scope:'calls:own',types:Array(17).fill('x')}],
+    [{scope:'calls:own',types:['call.finished'],scope_ref:'owner-b'}]]){
+    assert.throws(()=>client.createSubscription({chat_ids:['chat_synthetic'],module_sources:bad}),TypeError);
+    await assert.rejects(client.call('create_subscription',{chat_ids:['chat_synthetic'],module_sources:bad}),TypeError);
+  }
+  assert.deepEqual(seen,[{chat_ids:['chat_synthetic']},{chat_ids:['chat_synthetic'],module_sources:wanted}]);
+});
+
 for(const wait_s of [-1,25.1,false,true,'1',NaN,Infinity])test(`invalid send wait ${typeof wait_s}:${wait_s}`,async()=>{
   const client=new AnyMsgClient({...options,fetch:async()=>assert.fail('invalid input reached transport')});
   assert.throws(()=>client.sendMessage({wait_s}),TypeError);

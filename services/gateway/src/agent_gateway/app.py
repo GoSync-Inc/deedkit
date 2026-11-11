@@ -21,6 +21,7 @@ from platform_contracts.release import ReleaseRuntime
 from .catalog import CATALOG, public
 from .adapters.android import content as android_content
 from .diagnostics import with_catalog
+from .field_errors import root_refusal
 from .dispatch import Dispatch, PLAIN_PATH, Route, admitted
 from .http_clients import Clients
 from .policy import Denied, Policy
@@ -335,7 +336,7 @@ def create_app(policy_path, public_url, *, transports=None):
                                 headers=headers() if error.status != 401 else None)
         except ValueError:
             outcome = "invalid_arguments"
-            return JSONResponse({"error": "invalid_arguments"}, status_code=422, headers=headers())
+            return JSONResponse(root_refusal(), status_code=422, headers=headers())
         finally:
             admitted.reset(token)
             log_call(name, outcome, started)

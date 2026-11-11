@@ -56,7 +56,36 @@ def not_linked():
     from .store import APIError
     error = APIError('module_not_linked', 409)
     setattr(error, 'next', NEXT_LINK)  # error_details lists `next` (AGENT_API.md rulebook)
+    # The gateway relays a `next` only when it is a call it can run; this prose step reaches the agent as the same
+    # reviewed hint (dispatch_shaping.REVIEWED_HINTS holds this exact text, ANYM-566).
+    setattr(error, 'hint', NEXT_LINK)
     return error
+
+
+def call_kinds():
+    """The call types a subscription may ask for: what `call_sources` admits and `capabilities` advertises."""
+    from .module_events import KINDS
+    return sorted(kind for kind in KINDS if kind.startswith('call.'))
+
+
+def advertised(c, p):
+    """ANYM-566: the `subscriptions.module_events` block of a key's capabilities, or None.
+
+    Only a principal with a live calls link is told that calls kinds exist, and then exactly the kinds
+    `call_sources` admits. A failed read advertises nothing (a savepoint keeps the request's transaction usable):
+    capabilities never fail on a module read.
+    """
+    import psycopg
+    try:
+        with c.transaction():
+            link = active_link(c, p['id'])
+    except psycopg.Error:
+        return None
+    if link is None:
+        return None
+    return {'calls': {'source': MODULES['calls'], 'scope': CALL_SCOPE, 'kinds': call_kinds(),
+        'create': 'create_subscription', 'argument': 'module_sources', 'consume': 'fetch_subscription_events',
+        'refused_without_link': 'module_not_linked'}}
 
 
 def call_sources(c, p, module_sources):
@@ -65,7 +94,6 @@ def call_sources(c, p, module_sources):
     Returns [(source, scope_ref, types)]; the scope is the principal's link, never the request's or router
     configuration's. Refuses with module_not_linked when the principal has no live calls link.
     """
-    from .module_events import KINDS
     from .store import APIError
     if not isinstance(module_sources, list) or len(module_sources) != 1:
         raise APIError('invalid_filter')
@@ -73,9 +101,9 @@ def call_sources(c, p, module_sources):
     if not isinstance(item, dict) or set(item) - {'scope', 'types'} or item.get('scope') != CALL_SCOPE:
         raise APIError('invalid_filter')
     types = item.get('types')
+    kinds = call_kinds()
     if (not isinstance(types, list) or not 1 <= len(types) <= 16 or
-            any(not isinstance(kind, str) or kind not in KINDS or not kind.startswith('call.') for kind in types) or
-            len(set(types)) != len(types)):
+            any(not isinstance(kind, str) or kind not in kinds for kind in types) or len(set(types)) != len(types)):
         raise APIError('invalid_filter')
     link = active_link(c, p['id'])
     if link is None:

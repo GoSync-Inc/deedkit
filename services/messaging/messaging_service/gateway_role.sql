@@ -127,6 +127,10 @@ GRANT SELECT ON media_recovery TO messaging_gateway;
 GRANT SELECT,INSERT,UPDATE ON subscription_activity TO messaging_gateway;
 -- Schema 71 (ANYM-837): a send_message menu choice names its menu in outgoing_messages.menu_choice.
 GRANT INSERT(menu_choice) ON outgoing_messages TO messaging_gateway;
+-- Schema 92 (ANYM-986): a send may carry await_reply; the API-side job (await_reply.py) marks its outcome. Only the
+-- columns migration 092 adds; the send's own columns stay as granted above.
+GRANT INSERT(await_reply,await_state) ON outgoing_messages TO messaging_gateway;
+GRANT UPDATE(await_state,await_subscription_id,await_reason) ON outgoing_messages TO messaging_gateway;
 -- Schema 73 (ANYM-848): an agent's own wake targets and their subscription bindings. No DELETE on targets (a delete
 -- is a soft one); bindings are replaced and removed by the owning key's calls.
 GRANT SELECT,INSERT ON wake_targets TO messaging_gateway;

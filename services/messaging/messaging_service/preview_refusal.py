@@ -31,7 +31,7 @@ def _named(error, tool, arguments, supplies, hint):
 
 
 def send(error, principal, account, chat_id='', *, phone='', username='', reply_to='', format='plain',
-         link_preview=False, allow_lossy=False, silent=False, mentions=None, schedule_at=None):
+         link_preview=False, allow_lossy=False, silent=False, mentions=None, schedule_at=None, await_reply=None):
     """`error` with the preview_message continuation when it is a missing or changed preview; else unchanged.
     caller_supplies names every argument the refused call set that the digest binds."""
     if getattr(error, 'code', None) not in REFUSALS or not _own(principal, account):
@@ -41,7 +41,8 @@ def send(error, principal, account, chat_id='', *, phone='', username='', reply_
         arguments['chat_id'] = chat_id
     given = (('text', True), ('phone', bool(phone)), ('username', bool(username)), ('reply_to', bool(reply_to)),
              ('format', format != 'plain'), ('link_preview', link_preview is True), ('allow_lossy', allow_lossy is True),
-             ('silent', silent is True), ('mentions', bool(mentions)), ('schedule_at', schedule_at is not None))
+             ('silent', silent is True), ('mentions', bool(mentions)), ('schedule_at', schedule_at is not None),
+             ('await_reply', await_reply is not None))
     supplies = [name for name, is_set in given if is_set]
     return _named(error, 'preview_message', arguments, supplies, SEND_HINT)
 

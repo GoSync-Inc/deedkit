@@ -313,7 +313,10 @@ deedkit admin module-links unlink --principal assistant-work --module calls
   announce nothing more. Receipts issued before it are not expired (an ACK only moves the cursor past references
   already read).
 - `create_subscription(..., module_sources=[{scope: "calls:own", types: [call.* types]}])` without an active
-  link is refused with `module_not_linked` (409) and a `next` asking the owner to link calls for the key.
+  link is refused with `module_not_linked` (409) and a `next` asking the owner to link calls for the key (also
+  as `hint`, which is what the gateway relays). `capabilities.subscriptions.module_events` names the calls kinds only
+  while the key's principal has a live link, and exactly the kinds `create_subscription` admits (ANYM-566,
+  SUBSCRIPTIONS.md "Module event kinds in capabilities").
 - `deedkit admin key issue --like` copies links only with `--copy-links`; the installed gateway profile gains
   no grant from a link. `principal-info` lists a principal's links.
 

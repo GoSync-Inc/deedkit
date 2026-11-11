@@ -74,12 +74,17 @@ Arguments that fail a tool's input schema are rejected with 422 `invalid_argumen
 `required`, `unknown_field`, `type`, `enum`, `min_length`, `max_length`, `pattern`, `minimum`,
 `maximum`, `min_items`, `max_items`, `unique`, `format`, `blank`, `size`, `expected_message_unknown`. `expected` and `allowed` come
 from the schema, never from the submitted value, and an unknown key is named only when it is a short
-identifier. Other rejections (non-finite numbers, a non-object body) keep the bare
-`{"error": "invalid_arguments"}`.
+identifier. No `invalid_arguments` answer is bare (ANYM-984): a non-finite number names its top-level field
+(`{"field": "wait_s", "reason": "type", "expected": "number"}`), a body that is not an object or not JSON
+names `$` (`type` with `expected: "object"`, or `format`), and the Android service answers the same shape for a
+body its models reject (`field_errors` and `next_action`, reasons and hints from its models, never a value),
+which the gateway returns unchanged. `retry_after_seconds` is never on `invalid_arguments`: it appears only
+where a retry can help (`backend_unavailable`, recordings), because the same bad call is not retried.
 
-When a rejection has a top-level `required` or `unknown_field` entry, the body adds
+Every schema rejection of a tool with properties adds
 `tool_fields: {required: [{name, type, values?}], optional: [name]}`: the tool's top-level properties from
-the packaged catalog schema (at most 64 names; `values` only for enums of at most 8 values), so a caller with an
+the packaged catalog schema (at most 64 names; `values` only for enums of at most 8 values), so a wrong type or
+a value outside an enum is as fixable in one step as a missing field, and a caller with an
 old tool list can retry at once. An `unknown_field` entry also adds `tool_list_stale: "likely"` and an
 `owner_hint` line to relay once (reconnect the DeedKit MCP client); a missing required field alone does not.
 When every unknown field is the singular or plural of a field the tool has, the body names it instead
@@ -156,7 +161,13 @@ no tool, scope or action.
 - **REST has no selection.** `POST /v1/<tool>` ignores module paths and selections and keeps the full profile
   set. `POST /v1/platform_select_modules` records the selection of plain `/mcp`; it affects MCP only.
 - **Summary.** `platform_capabilities` adds `selection_path`, `selected_modules` and `modules_available`: for
-  each module with at least one usable tool for the key, `{id, purpose, tool_count, selected, path}`.
+  each module with at least one usable tool for the key, `{id, purpose, tool_count, selected, path, health}`.
+  `health` is `{state: "ready"}`, or `{state: "degraded", reason: "operation_not_in_module_build"}` when the module's
+  build lacks tools the key may use (the same condition `unavailable` lists as `outdated`); a module whose backend
+  is down has no row and stays in `unavailable`. The Android row adds `device` (`attached` when one of the key's
+  phones reports the adb state `device`, else `none`) and `session` (`free`, `own` or `other`, folded own > other >
+  free over the key's devices; never a principal, session id or serial; an older Android build sends none and the
+  word is left out). Both come from the capabilities read the gateway already makes.
   `tools` and `discovery` describe the current path's effective list on MCP and the full list on REST.
 
 Connector setup with a module path: keep the host's existing DeedKit connector settings and authentication and
@@ -351,6 +362,15 @@ the gateway from the same SHA as this backend, never after it, and roll the two 
 together. `production.py` deploys both images from one SHA. An older gateway in front
 of this backend passes the transport rows through (ANYM-528 empties their `tools`
 but keeps the rows); its admission still refuses the hidden tools.
+
+The `config/profiles/messaging-module-events.toml` profile (ANYM-566) is `messaging-subscriber` plus
+`calls_capabilities`, `calls_get_call_status`, `calls_get_call_result` and `calls_get_owner_requests`, the reads an agent
+makes after a call event wakes it. `messages_create_subscription` takes an optional `module_sources`
+(`[{scope, types}]`); its schema names no scope or kind, and the backend refuses it `module_not_linked` unless the owner
+linked calls for the key's principal (`deedkit admin module-links link`). The gateway relays that refusal with the owner
+step as `hint`. `messages_capabilities` keeps `subscriptions.module_events` (the backend lists it only for a linked key)
+only while the caller's tool list holds `messages_create_subscription`. No installed profile lists the new profile's
+tools or changes: switching an agent to it is a gateway policy edit, the owner's step.
 
 Long subscription waits and sends with positive `wait_s` use a separate pool with
 2 active and 4 waiting requests; ordinary messaging reads retain their own pool.

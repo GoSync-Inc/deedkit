@@ -230,3 +230,60 @@ def test_cards_under_a_scrolling_list_form_one_list_in_reading_order():
     assert len(lists) == 1 and firsts == ['Clay Tools 36pcs', 'Body Wash 200g', 'Facial Wash', 'Sabun Mandi']
     assert all(len(card) == 1 for card in lists[0]['cards'])
     assert 'Search' not in [blocks[index]['lines'][0]['text'] for index in lists[0]['items']]
+
+
+# spec: ANYM-981
+def test_cards_are_the_children_of_scrolling_containers_in_reading_order_clipped_to_the_read_region():
+    from xml.etree import ElementTree
+
+    from deedkit_android.screen_cards import find_cards
+
+    root = ElementTree.fromstring(GRID)
+    cards = find_cards(root, (0, 0, 1080, 2400))
+    assert [card['box'] for card in cards] == [(20, 220, 530, 1000), (550, 220, 1060, 900), (20, 1020, 530, 1700), (550, 1020, 1060, 1800)]
+    assert {card['list'] for card in cards} == {0} and cards[0]['node'].get('class') == 'android.view.ViewGroup'
+    assert [card['box'] for card in find_cards(root, (0, 0, 1080, 1100))] == [
+        (20, 220, 530, 1000), (550, 220, 1060, 900), (20, 1020, 530, 1100), (550, 1020, 1060, 1100)]
+    assert find_cards(root, (0, 1800, 1080, 2400)) == []  # nothing of any card lies in the region
+
+
+# spec: ANYM-981
+def test_a_single_child_no_scrolling_container_and_a_nested_carousel_make_no_extra_cards():
+    from xml.etree import ElementTree
+
+    from deedkit_android.screen_cards import find_cards
+
+    single = ('<hierarchy><node class="android.widget.ScrollView" scrollable="true" bounds="[0,0][1080,2400]">'
+              '<node class="android.view.ViewGroup" bounds="[0,0][1080,800]"/></node></hierarchy>')
+    assert find_cards(ElementTree.fromstring(single), (0, 0, 1080, 2400)) == []
+    assert find_cards(ElementTree.fromstring(TREE), (0, 0, 1080, 1200)) == []  # clickable groups, but no scrolling container
+    nested = ('<hierarchy><node class="androidx.recyclerview.widget.RecyclerView" scrollable="true" bounds="[0,0][1000,2000]">'
+              '<node class="android.view.ViewGroup" bounds="[0,0][1000,900]">'
+              '<node class="androidx.recyclerview.widget.RecyclerView" scrollable="true" bounds="[0,100][1000,500]">'
+              '<node class="android.view.ViewGroup" bounds="[0,100][500,500]"/><node class="android.view.ViewGroup" bounds="[500,100][1000,500]"/>'
+              '</node></node><node class="android.view.ViewGroup" bounds="[0,1000][1000,1900]"/>'
+              '<node class="android.view.ViewGroup" visible-to-user="false" bounds="[0,1900][1000,2000]"/></node></hierarchy>')
+    cards = find_cards(ElementTree.fromstring(nested), (0, 0, 1000, 2000))
+    assert [card['box'] for card in cards] == [(0, 0, 1000, 900), (0, 1000, 1000, 1900)]  # the carousel is part of the first card
+
+
+# spec: ANYM-981
+def test_tree_lines_take_the_leaf_most_text_in_tree_order_and_never_a_password():
+    from xml.etree import ElementTree
+
+    from deedkit_android.screen_cards import tree_lines
+
+    card = ElementTree.fromstring(
+        '<node class="android.view.ViewGroup" content-desc="Sepatu Lari Pria Rp 125.000" bounds="[0,0][500,400]">'
+        '<node class="android.widget.TextView" text="Sepatu  Lari Pria" bounds="[10,200][400,250]"/>'
+        '<node class="android.widget.TextView" content-desc="Rp 125.000" bounds="[10,260][300,310]"/>'
+        '<node class="android.widget.TextView" text=" rp 125.000 " bounds="[10,320][300,360]"/>'
+        '<node class="android.widget.EditText" text="hunter2" password="true" bounds="[10,370][300,390]"/>'
+        '<node class="android.widget.ImageView" bounds="[0,0][500,200]"/></node>')
+    assert tree_lines(card) == [
+        {'text': 'Sepatu Lari Pria', 'bounds': '[10,200][400,250]', 'confidence': 100.0, 'source': 'tree'},
+        {'text': 'Rp 125.000', 'bounds': '[10,260][300,310]', 'confidence': 100.0, 'source': 'tree'}]
+    described = ElementTree.fromstring('<node class="android.view.ViewGroup" content-desc="Sepatu Lari Pria, Rp 125.000" bounds="[0,0][500,400]">'
+                                       '<node class="android.widget.ImageView" bounds="[0,0][500,200]"/></node>')
+    assert [line['text'] for line in tree_lines(described)] == ['Sepatu Lari Pria, Rp 125.000']  # no child holds text: the card's own
+    assert tree_lines(ElementTree.fromstring('<node class="android.view.ViewGroup" bounds="[0,0][5,5]"/>')) == []

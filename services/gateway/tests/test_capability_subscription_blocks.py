@@ -224,6 +224,49 @@ def negotiations(tmp_path, tools, items):
 READER = ["messages_capabilities", "messages_list_negotiations", "messages_get_context"]
 
 
+MODULE_EVENTS = {"calls": {"source": "deedkit:calls", "scope": "calls:own", "kinds": ["call.failed", "call.finished"],
+                           "create": "create_subscription", "argument": "module_sources",
+                           "consume": "fetch_subscription_events", "refused_without_link": "module_not_linked"}}
+WITH_MODULE_EVENTS = {**SUBSCRIPTIONS, "module_events": MODULE_EVENTS}
+
+
+# spec: ANYM-566
+@pytest.mark.parametrize("extra,kept", [
+    # Both calls listed: the block stays, each call under its public gateway name.
+    (["messages_create_subscription", "messages_fetch_subscription_events"],
+     {"create": "messages_create_subscription", "consume": "messages_fetch_subscription_events"}),
+    # No fetch: the kinds stay (a push hint still reaches the key), the call it cannot make leaves.
+    (["messages_create_subscription"], {"create": "messages_create_subscription"}),
+    # No create: nothing in the block could be used, so no kind is named.
+    (["messages_fetch_subscription_events"], None),
+    ([], None),
+], ids=["both", "create_only", "fetch_only", "neither"])
+def test_module_event_kinds_follow_the_callers_tool_list(tmp_path, extra, kept):
+    tools = ["platform_capabilities", "messages_capabilities", *extra]
+    listed, blocks, platform = observed(tmp_path, tools, subscriptions=WITH_MODULE_EVENTS)
+    assert_truthful(listed, blocks, platform)
+    block = blocks["subscriptions"].get("module_events")
+    if kept is None:
+        assert block is None and "call.finished" not in json.dumps([blocks, platform])
+        return
+    expected = {k: v for k, v in MODULE_EVENTS["calls"].items() if k not in ("create", "consume")} | kept
+    assert block == {"calls": expected}
+
+
+# spec: ANYM-566
+@pytest.mark.parametrize("bad", ["calls", [MODULE_EVENTS["calls"]], {"calls": "create_subscription"},
+                                 {"calls": {"kinds": ["call.finished"]}}, {"calls": {**MODULE_EVENTS["calls"], "create": 7}},
+                                 {"calls": {**MODULE_EVENTS["calls"], "create": "create_subscription_v2"}}, None],
+                         ids=["string", "list", "string_entry", "no_create", "bad_create_type", "unknown_create", "null"])
+def test_a_malformed_module_event_block_is_dropped_and_never_breaks_capabilities(tmp_path, bad):
+    tools = ["platform_capabilities", "messages_capabilities", "messages_create_subscription",
+             "messages_fetch_subscription_events"]
+    listed, blocks, platform = observed(tmp_path, tools, subscriptions={**SUBSCRIPTIONS, "module_events": bad})
+    assert_truthful(listed, blocks, platform)
+    assert "module_events" not in blocks["subscriptions"] and "call.finished" not in json.dumps(blocks)
+    assert blocks["subscriptions"]["push"] == "operator_registered_signed_hints"
+
+
 # spec: ANYM-909
 def test_negotiation_next_keeps_only_the_callers_calls_of_any_module(tmp_path):
     item = {"id": "neg_" + "1" * 32, "next": [GET_CONTEXT, FIND_TIME]}

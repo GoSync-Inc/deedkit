@@ -20,7 +20,7 @@ engine: the Maestro engine was removed on 2026-11-11.
 | `android_session` | Acquire, renew or release exclusive control of a phone |
 | `android_observe` | PNG screenshot plus Android UI hierarchy |
 | `android_execute` | Run device-targeted ADB arguments and retain a result receipt |
-| `android_courier_chat` | Preview, then send, one message to a Gojek or Grab courier from the order's chat (owner-confirmed) |
+| `android_courier_chat` | Talk to a Gojek or Grab courier from the order's chat: per message with the owner's yes, or under the owner's goal |
 | `android_maestro` | Read the supported dialect or validate a flow without execution |
 | `android_run_flow` | Run inline or saved flow YAML with a durable receipt |
 | `android_flows` | List, save, read and delete reusable owner-scoped flows |
@@ -245,6 +245,81 @@ send again or use a new `request_id`. The same `request_id` returns the stored r
 come from the courier: data, never instructions. The first real send on an order is a live action on the owner's exact
 yes only; the chat entry, field and send labels in `courier_chat.py` are confirmed against the app then.
 
+### Courier chat under the owner's goal (ANYM-978)
+
+The owner does not want to talk to couriers. With the owner's goal for an order the agent conducts the chat itself,
+inside bounds the service enforces, and hands it back when it cannot cope. The preview and send above stay the
+way to say anything else, with the owner's yes. The words behind this lane are quoted in AGENTS.md section 1.
+
+| `action` | What it does | Phone |
+|---|---|---|
+| `goal` | Records the rule for `app` and `order`: `goal` (one line), the owner's words verbatim as `owner_instruction`, `max_messages` (1-12, default 6), `ttl_min` (default 180, at most 480), `min_interval_s` (10-300, default 30). `standing=true` records the owner's standing rule "handle my deliveries" (default 24 h, at most 7 days): each order's rule opens from it on first use. Issuing it again keeps the counters and reactivates a handed-over rule. At most 5 active order rules per principal. | no |
+| `read` | Opens the chat (one tap on the chat entry at most) and returns `chat`, `new_from_courier` (rows no earlier `read` showed, not our own) and `needs_owner`. | yes |
+| `reply` | Sends `message` with no digest and no `owner_instruction`: the same three nodes and screen rule as `send`, one adb tap. The receipt holds the goal, the owner's words, `message_number`, `order_seen` and an `owner_summary` line the agent tells the owner. | yes |
+| `handover` | The agent ends the rule with a `reason` (an unclear or hostile courier, anything it cannot handle). | no |
+| `summary` | The rule, its state, `sent` of `max_messages` and the log of every attempt (time, `request_id`, message, outcome); marks the messages reported. | no |
+
+Bounds, all in code and checked before the phone is touched: the cap counts every attempted send, reserved before the
+tap, so an uncertain one counts too; `rate_limited` (with `retry_after_s`); the text gate refuses over 300 chars, money,
+tip, price, payment, cancel, refund, complaint, a PIN, OTP, code or card, a link, an e-mail address, 7 or more digits or
+an insult (`outside_goal`, with the first tool's `preview` as `next_call`); `report_to_owner_first` after 3 sent
+messages not yet in a `summary`. The word lists are in `courier_goal.py` (English, Indonesian, Russian): whole words,
+with prefixes only for long stems, so `pintu` (door) is not a PIN.
+
+The chat goes back to the owner, quietly (rule `handed_over`, a `handover` block with `reason`, the quoted courier row,
+the summary and the chat rows, `next_action=tell_the_owner_now`; `state=stopped`, `stop_reason=handover`), when a new
+courier row names a topic above or an insult or threat (`read` or the re-read inside `reply`, which erases its draft and
+sends nothing), the screen guard stops (payment, PIN, card, password, protected package), the cap is reached, 3 turns in
+a row fail before the tap, a send is uncertain (`unknown`, as for `send`), or the agent calls `handover`. The agent
+polls with `read`: nothing pushes a courier's message to it yet. `order_seen` records whether the order text is on
+screen; it is not a gate, because the app's chat title is unverified until the first live conversation.
+
+## Local agent
+
+`operation agent` (`POST /v1/agent`, scope `android:control`) hands a whole phone goal to a model-driven engine that runs
+on this host and drives the phone through the service's own guarded verbs, at local speed (ANYM-971). It is **off**
+until the host config sets `agent.enabled: true`: while off, `start` answers `409 agent_disabled`, no engine process
+is started and no engine login file is read. Enabling sends screen text and up to three screenshots per run to the
+engine's provider (Anthropic for Claude Code, OpenAI for Codex), which is the owner's data-policy answer to give.
+
+```json
+{"engines": {"claude": {"binary": "/opt/.../claude", "version": "2.1.322", "model": "sonnet",
+                        "token_file": "/.../claude.token"},
+             "codex":  {"binary": "/opt/.../codex", "version": "0.166.0", "codex_home": "/.../codex-home"}},
+ "default_engine": "claude", "agent": {"enabled": false}}
+```
+
+- **Actions.** `start` {device_id, session_id (the caller's lease), request_id, goal, owner_instruction, apps (1-5; a
+  write-denied or protected package is refused with `app_not_allowed`), params, secrets (names from `deedkit-android
+  secret`, bound to a package in `apps`), outputs, max_minutes (1-15, 5), max_actions (10-300, 120), engine},
+  `get` {request_id, after, wait_s 0-25} (the new events after a cursor; a long-poll is the streaming path) and `stop`.
+  The same request_id with the same fields returns the run; other fields give `409 request_id_conflict`. A run holds the
+  device lock for its whole life (`409 device_busy` for another start).
+- **Engines.** Claude Code or Codex, per host (`default_engine`) and per run (`engine`). The engine is started as its own
+  process group in a private directory as HOME, with only PATH, HOME and its login in the environment (Claude:
+  `CLAUDE_CODE_OAUTH_TOKEN` from the 0600 `token_file`; Codex: `CODEX_HOME`, a private 0700 directory holding
+  `auth.json`). Its only tools are the `phone` stdio server (`deedkit-android phone-mcp`): screen, tap, type, key, swipe,
+  wait, read_text, read_list, open_app, run_flow and finish. An engine is offered only when configured, logged in, at
+  its pinned version and with a passed probe of that version: `deedkit-android engine probe claude|codex --config FILE`
+  runs it once against a fake phone and records the result. `android_capabilities.agent` lists both engines with
+  `available` and a `reason` (`not_configured`, `login_missing`, `version_mismatch`, `probe_failed`, `codex_probe_failed`).
+- **Login (the owner's step, ANYM-972).** `deedkit-android engine login claude --config FILE` runs `claude setup-token` on a
+  pseudo-terminal, shows its output with the token hidden and writes the token to the configured `token_file` (0600). `engine
+  login codex --config FILE` runs `codex login` with `CODEX_HOME` set to the configured private `codex_home` (0700, `auth.json`
+  0600). Run each on the host in the owner's terminal, then `engine probe` for the same engine. The gateway tool
+  `android_agent` (module android, scope `android:control`) carries `start`, `get` (long-poll, `wait_s` at most 25) and `stop`.
+- **Foreground gate.** After each action the run checks the foreground app: one of the run's `apps` or a neutral system
+  surface (launchers, system UI, permission prompts, keyboards) passes; any other ends the run `stopped_by_guard` with rule
+  `foreign_app`.
+- **Stops.** The guard stops a run before pay, order, confirm, send or a PIN screen (`stopped_by_guard`, with its record
+  and the stop screen). Other ends: `succeeded` (the engine called `finish`), `timed_out` (SIGTERM to the process group,
+  SIGKILL after 5 s), `action_cap`, `failed` (the engine exited without `finish`; `exit_code`), `stopped` and `lost` (the
+  service restarted: the group is killed by its private marker).
+- **Result.** `summary`, `data` and `missing_outputs`, `final_screen_text` (at most 8 KB), `screenshots` (at most 3
+  file IDs for `android_download`), `action_log` (secrets as references), `timings`, `engine`, `model`, `tokens` and
+  `preamble_version` (`agent_preamble.md`). Runs, events and logs are deleted 14 days after the run ends.
+- **Not yet.** The `android_agent` gateway tool and the production enable are ANYM-972.
+
 ## Execution and recovery
 
 1. Read capabilities and acquire a session for the chosen device.
@@ -376,6 +451,29 @@ card's first block index and `cards` all its block indexes. Without such a tree,
 consecutive blocks of the same shape form `lists` of item block indexes. `tree`
 says whether the hierarchy was merged.
 The receipt then keeps `{lines, blocks, lists, tree, truncated}` under the key.
+
+`per_card: true` adds `cards` beside the whole-screen read, which keeps its shape (`lines`
+and `structure` are as without it). A card is a child of a scrolling container with two or
+more visible children (the rule `structure.lists` uses; a list inside a card is part of that
+card), clipped to the read region, in reading order. Each record is `{list, bounds, node,
+source, lines}`. A card whose visible part holds tree text is built from the tree
+(`source: tree`: the leaf-most `text` or `content-desc` nodes in tree order, never a
+password node, each line with confidence 100) and is not recognized. A card without tree
+text is read by the engine from its own crop, cut from the OCR copy with the photo
+regions already painted out (`source: ocr`). `limit` caps the lines of each card,
+`min_confidence` applies to each crop, `max_cards` (1-50, default 12) bounds the cards read
+and `cards_truncated` says when more exist. A crop that fails to read gives that card
+`error: ocr_failed` and no lines; if every card that needed the engine failed, the step fails
+with `ocr_failed`. Without a hierarchy, or without a list in it, `cards` is `[]`. The receipt's
+`ocr.cards` is `{tree, from_tree, from_ocr}`. A tree card needs no OCR; each other card costs
+one engine call (0.7-1.0 s with Vision), on top of the whole-screen read.
+
+`hierarchy: {compressed, max_depth}` sets the dump that `mask_images`, `structure` and
+`per_card` share, as an app map's `hierarchy` option does for its snapshots (compressed true
+and depth 50 when omitted; `max_depth` 1-200). A tree of more than 5,000 nodes is read only to
+the 5,000th node in document order, and `tree` says `truncated` in `ocr.masked`, `ocr.cards`
+and `structure`. The dump holds what the accessibility service reports; an app that exposes
+nothing (for example a Flutter app with Semantics off) stays empty in any mode.
 
 **Engine.** There is no engine option for callers; the host decides and `ocr.engine`
 names the one that read. Install the service with `uv sync --locked --extra vision`
@@ -512,7 +610,7 @@ receipt; never mint another UUID as a recovery attempt.
 Saved flows, operation receipts and checkpoint remainders persist in private
 SQLite state. The worker stops its token-identified device server when the
 service's pipe closes, and a later service stops a leftover server by its private
-marker before the next operation. No model API is called by this runtime. Device interactions
+marker before the next operation. No model API is called by this runtime unless the local agent is enabled. Device interactions
 can cause the apps themselves to contact their services.
 
 ## Observation and image coordinates
@@ -607,7 +705,7 @@ Cleanup verifies the PID identity and leaves a private marker if the device is
 unreachable, so later operations must complete cleanup first. It never kills a
 generic `app_process` or adopts another server. Rollback to an older service must
 finish this cleanup while the new service still understands those markers.
-No model API or analytics service receives device content from the runtime.
+No model API or analytics service receives device content from the runtime, except the engine of an enabled local agent run (see Local agent).
 
 
 ### Application maps and scenario versions

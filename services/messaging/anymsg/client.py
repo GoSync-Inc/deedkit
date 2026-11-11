@@ -141,7 +141,7 @@ _MESSENGER_FIELDS = {
 _OMITTED = object()
 _SUBSCRIPTION_FIELDS = {
     'create_subscription': (set(), {'chat_ids','sources','sender_ids','kinds','direction','origins','label','expires_at',
-        'wake_rules','reply_to_send','delivery'}),
+        'wake_rules','reply_to_send','delivery','module_sources'}),
     'list_subscriptions': (set(), {'limit'}),
     'get_subscription': ({'subscription_id'}, {'subscription_id'}),
     'update_subscription': ({'subscription_id','version','action'},
@@ -273,6 +273,12 @@ def _subscription_parameters(operation, parameters):
                 and not value.keys()-{'endpoint_id','delivery_policy'} and _uuid(value['endpoint_id'])
                 and isinstance(value.get('delivery_policy',{}),dict) and len(json.dumps(value))<=4096)
         elif name=='sources':valid=_subscription_sources(value)
+        # ANYM-566: one {scope, types}; the server names no scope or type here and checks both against the owner's link.
+        elif name=='module_sources':
+            valid=value is None or isinstance(value,list) and len(value)==1 and isinstance(value[0],dict) and (
+                value[0].keys()=={'scope','types'} and isinstance(value[0]['scope'],str) and 1<=len(value[0]['scope'])<=64
+                and isinstance(value[0]['types'],list) and 1<=len(value[0]['types'])<=16 and all(
+                    isinstance(kind,str) and 1<=len(kind)<=64 for kind in value[0]['types']))
         elif name=='exclude_chats':valid=_excluded_chats(value)
         elif name=='exclusions_revision':valid=type(value) is int and 0<=value<=9007199254740991
         elif name=='reply_to_send':valid=value is None or isinstance(value,str) and 1<=len(value)<=128
@@ -586,18 +592,20 @@ class Client:
         return self.call('list_negotiations', arguments)
 
     def preview_message(self,*,account,chat_id,text,reply_to='',format='plain',
-                        link_preview=False,allow_lossy=False):
+                        link_preview=False,allow_lossy=False,await_reply=None):
         """Render a scoped draft without queuing or contacting a messenger.
 
         The digest binds content and policy; it is not owner approval. Review
         visible text, formatting, warnings and link destinations before a send.
+        await_reply (ANYM-986): {'within': '6h'}, shown in the preview and bound by its digest; omitted when None.
         """
         return self.call('preview_message',dict(account=account,chat_id=chat_id,text=text,
-            reply_to=reply_to,format=format,link_preview=link_preview,allow_lossy=allow_lossy))
+            reply_to=reply_to,format=format,link_preview=link_preview,allow_lossy=allow_lossy,
+            **({'await_reply':await_reply} if await_reply is not None else {})))
 
     def send_message(self,*,account,chat_id,text,request_id,reply_to='',format='plain',
                      preview_digest='',link_preview=False,allow_lossy=False,wait_s=0,
-                     expected_last_message_id=None,guard=None,allow_duplicate=None):
+                     expected_last_message_id=None,guard=None,allow_duplicate=None,await_reply=None):
         """Submit exactly confirmed content; rich sends must match a reviewed preview.
 
         Keep request_id until the result is known. The digest never proves human
@@ -607,6 +615,8 @@ class Client:
         outgoing_only. Both are omitted from the wire when None, so older servers see the old payload.
         allow_duplicate (ANYM-748): True sends even while your earlier send of the same content to this chat is
         unresolved (duplicate_send_unresolved otherwise); omitted when None.
+        await_reply (ANYM-986): {'within': '6h'} asks for a reply_to_send subscription with a silence timer once the
+        message is sent; it needs the preview that carried it (same value); omitted when None.
         """
         parameters=dict(account=account,chat_id=chat_id,text=text,
             request_id=request_id,reply_to=reply_to)
@@ -615,6 +625,7 @@ class Client:
         if expected_last_message_id is not None:parameters['expected_last_message_id']=expected_last_message_id
         if guard is not None:parameters['guard']=guard
         if allow_duplicate is not None:parameters['allow_duplicate']=allow_duplicate
+        if await_reply is not None:parameters['await_reply']=await_reply
         # Default plain calls remain compatible with older strict servers.
         # Nondefault values pass unchanged so the server can reject bad types.
         if (format!='plain' or preview_digest!='' or link_preview is not False
@@ -681,7 +692,7 @@ class Client:
 
     def create_subscription(self, *, chat_ids=None, sources=None, sender_ids=None, kinds=None,
                             direction='incoming', origins=None, label='', expires_at=None,
-                            wake_rules=None, reply_to_send=None, delivery=None):
+                            wake_rules=None, reply_to_send=None, delivery=None, module_sources=None):
         """Persist archived sources from the committed boundary; no push or provider action.
 
         Exactly one of chat_ids (explicit) or sources={'all_visible_chats': True, 'account_ids'?,
@@ -691,6 +702,8 @@ class Client:
         (source_filters_disabled). Requires read and explicit subscription-write. A timeout can leave
         creation uncertain: inspect list_subscriptions before retrying. Names are not sender IDs.
         delivery={'endpoint_id': ..., 'delivery_policy': ...} binds your own endpoint (delivery-write).
+        module_sources=[{'scope': ..., 'types': [...]}] adds events of a module the owner linked for your key
+        (capabilities subscriptions.module_events lists them; without a link: module_not_linked).
         """
         parameters=dict(sender_ids=sender_ids,kinds=kinds,direction=direction,
             origins=origins,label=label,expires_at=expires_at)
@@ -699,6 +712,7 @@ class Client:
         if wake_rules is not None:parameters['wake_rules']=wake_rules
         if reply_to_send is not None:parameters['reply_to_send']=reply_to_send
         if delivery is not None:parameters['delivery']=delivery
+        if module_sources is not None:parameters['module_sources']=module_sources
         return self.call('create_subscription',parameters)
 
     def list_subscriptions(self, *, limit=50):

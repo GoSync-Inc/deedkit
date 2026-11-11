@@ -87,12 +87,14 @@ def test_missing_required_field_alone_and_nested_failures_stay_quiet(tmp_path):
     rest, _ = post_both(calls_app(tmp_path, []), "calls_dial_call", DIAL)
     body = rest.json()
     assert "tool_fields" in body and "tool_list_stale" not in body and "owner_hint" not in body
-    # A type failure is neither a required nor an unknown field: the ANYM-295 shape is kept as is.
+    # A type failure is neither a required nor an unknown field: it says nothing of a stale tool list, but since
+    # ANYM-984 it carries the tool's fields like every schema refusal.
     (tmp_path / "second").mkdir()
     rest, _ = post_both(calls_app(tmp_path / "second", []), "calls_dial_call",
                         {"brief_id": 7, "destination_source": "owner_named"})
     assert rest.json() == {"error": "invalid_arguments", "next_action": "check_parameters",
-                           "field_errors": [{"field": "brief_id", "reason": "type", "expected": "string"}]}
+                           "field_errors": [{"field": "brief_id", "reason": "type", "expected": "string"}],
+                           "tool_fields": diagnostics.tool_fields(CATALOG["calls_dial_call"])}
 
 
 # spec: ANYM-452
@@ -236,6 +238,21 @@ def test_outside_the_policy_the_same_identical_body_and_no_backend_call(tmp_path
                                     "module_manifest": "9.9.9", "module_build": SHA_A, "required_by": [FETCH]}]
     assert mine["backend_builds"] == {"messaging": OLD_MODULE["build"]}
     assert mine["gateway"]["build"].keys() == {"source_sha", "started_at"}
+
+
+# spec: ANYM-985
+def test_a_module_whose_build_lacks_a_tool_the_key_may_use_is_degraded_beside_the_tools_it_still_has(tmp_path):
+    app, calls = module_app(tmp_path, OLD_MODULE, tools=(FETCH, "messages_search", "platform_capabilities"), second_key=True)
+    other = {"Authorization": "Bearer gateway-b"}
+    with TestClient(app) as client:
+        mine = client.post("/v1/platform_capabilities", json={}, headers=HEADERS).json()
+        before = list(calls)
+        theirs = client.post("/v1/platform_capabilities", json={}, headers=other).json()
+    rows = {row["id"]: row for row in mine["modules_available"]}
+    assert rows["messaging"]["health"] == {"state": "degraded", "reason": "operation_not_in_module_build"}
+    assert FETCH not in mine["tools"] and "messages_search" in mine["tools"]
+    # Key B's profile holds no messaging tool: no row, no health word, and no query to the module for it.
+    assert theirs["modules_available"] == [] and "degraded" not in json.dumps(theirs) and calls == before
 
 
 # spec: ANYM-662
@@ -444,7 +461,8 @@ def assert_nested_failure_keeps_the_original_shape(tmp_path, brief):
     rest, mcp = post_both(prepare_app(tmp_path), "calls_prepare_call", {"brief": brief})
     body = rest.json()
     assert rest.status_code == 422 and mcp["isError"] and mcp["structuredContent"] == body
-    assert set(body) == {"error", "next_action", "field_errors"} and body["next_action"] == "check_parameters"
+    assert set(body) == {"error", "next_action", "field_errors", "tool_fields"} and body["next_action"] == "check_parameters"
+    assert "tool_list_stale" not in body and "use_instead" not in body  # ANYM-984: the fields yes, a stale-list claim no
     return body
 
 

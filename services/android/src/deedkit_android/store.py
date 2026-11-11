@@ -58,6 +58,8 @@ class Store:
         self.db.commit()
         from .library import Library
         self.library = Library(self)
+        from .courier_goal import Goals  # ANYM-978
+        self.goals = Goals(self.db)
 
     def close(self):
         self.db.close()
@@ -82,6 +84,16 @@ class Store:
         self.db.execute("INSERT OR REPLACE INTO reservations VALUES(?,?,?,?)", (device, owner, token, expires))
         self.db.commit()
         return {"device_id": device, "session_id": token, "expires_at": expires}
+
+    def session_state(self, owner, device):
+        """`free`, `own` or `other` for one device (ANYM-985): a live reservation is the caller's or another's.
+
+        An expired reservation reads free, as `reserve` treats it. Neither the token nor the other owner leaves.
+        """
+        row = self.db.execute("SELECT owner, expires FROM reservations WHERE device=?", (device,)).fetchone()
+        if not row or row["expires"] <= time.time():
+            return "free"
+        return "own" if row["owner"] == owner else "other"
 
     def check_reservation(self, owner, device, token):
         row = self.db.execute("SELECT * FROM reservations WHERE device=?", (device,)).fetchone()

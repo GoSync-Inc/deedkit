@@ -15,6 +15,7 @@ from .screen_structure import area, box as parse_box, contains, intersection
 PNG = b'\x89PNG\r\n\x1a\n'
 IMAGE_CLASSES = ('ImageView', 'TextureView')
 LARGE_IMAGE = 0.6  # an image over this share of the read region is a viewer or the target, not a photo to blank
+MAX_NODES = 5000  # nodes of a dump the tree features read
 HINT = ('Text recognition needs ocr_command (absolute Tesseract path, also the fallback when Apple Vision is the '
         'engine) and optional ocr_languages, for example eng+ind, in the USB host configuration.')
 
@@ -114,12 +115,23 @@ def recognize(image, ocr, origin=(0, 0), min_confidence=None):
     return recognize_with(image, ocr, origin, min_confidence)[0]
 
 
-def dump_tree(device):
-    """The hierarchy as an element tree, or None: a read-only aid never fails the read."""
+def dump_tree(device, hierarchy=None):
+    """(element tree, state) for the hierarchy options {compressed, max_depth}: ok, truncated or unavailable (tree None).
+
+    A read-only aid never fails the read. Nodes past MAX_NODES in document order are dropped (state truncated)."""
+    options = hierarchy or {}
     try:
-        return ElementTree.fromstring(device.jsonrpc_call('dumpWindowHierarchy', (True, 50)))
+        root = ElementTree.fromstring(device.jsonrpc_call(
+            'dumpWindowHierarchy', (options.get('compressed', True), options.get('max_depth', 50))))
     except Exception:  # noqa: BLE001 - secure screen, timeout or a broken dump; the OCR layout still stands
-        return None
+        return None, 'unavailable'
+    nodes = list(root.iter('node'))
+    if len(nodes) <= MAX_NODES:
+        return root, 'ok'
+    parents = {child: parent for parent in root.iter() for child in parent}
+    for node in nodes[MAX_NODES:]:
+        parents[node].remove(node)
+    return root, 'truncated'
 
 
 def is_image(node):
@@ -183,15 +195,15 @@ def read_screen_text(device, options, ocr, locate):
         if region['w'] < 1 or region['h'] < 1 or region['x'] + region['w'] > width or region['y'] + region['h'] > height:
             raise Refused('region_outside_screen')
         image = screen.crop((region['x'], region['y'], region['x'] + region['w'], region['y'] + region['h']))
-    mask = options.get('mask_images', True)
-    # One dump, right after the capture, serves the masking and the structure.
-    root = dump_tree(device) if mask or options.get('structure') else None
+    mask, per_card = options.get('mask_images', True), options.get('per_card', False)
+    # One dump, right after the capture, serves the masking, the structure and the cards.
+    root, state = dump_tree(device, options.get('hierarchy')) if mask or per_card or options.get('structure') else (None, 'unavailable')
     masked = None
     if mask:
         # Only this OCR copy is painted; the capture and anything android_observe returns stay as they were.
         images, keep, skipped = mask_plan(root, region) if root is not None else ([], [], 0)
         paint(image, (region['x'], region['y']), images, keep)
-        masked = {'regions': len(images), 'skipped_large': skipped, 'tree': 'ok' if root is not None else 'unavailable'}
+        masked = {'regions': len(images), 'skipped_large': skipped, 'tree': state}
     found, engine = recognize_with(image, ocr, (region['x'], region['y']), options.get('min_confidence'))
     limit = options.get('limit', 100)
     result = {'key': options.get('key', 'screen_text'), 'region': region,
@@ -202,8 +214,17 @@ def read_screen_text(device, options, ocr, locate):
         blocks, lists = build(found[:limit], root, (0, 0, width, height))
         result['structure'] = {
             'blocks': blocks, 'lists': lists,
-            'tree': 'unavailable' if root is None else 'merged' if any(True for _ in root.iter('node')) else 'none',
+            'tree': state if state != 'ok' else 'merged' if any(True for _ in root.iter('node')) else 'none',
             'truncated': len(found) > limit or any(len(item['items']) >= MAX_ITEMS for item in lists)}
-    return {**result,
-            'ocr': {**engine, 'languages': ocr['languages'], 'masked': masked,
-                    'elapsed_ms': round((time.monotonic() - started) * 1000, 2)}}
+    receipt = {**engine, 'languages': ocr['languages'], 'masked': masked}
+    if per_card:
+        # The cards come beside the whole-screen read, which keeps its shape: lines and structure are as without per_card.
+        from .screen_cards import DEFAULT_CARDS, find_cards, read_cards
+        cards = find_cards(root, (region['x'], region['y'], region['x'] + region['w'], region['y'] + region['h'])) if root is not None else []
+        wanted = options.get('max_cards', DEFAULT_CARDS)
+        result['cards'] = read_cards(cards[:wanted], root, image, (region['x'], region['y']), ocr, options.get('min_confidence'),
+                                     limit, recognize_with) if cards else []
+        result['cards_truncated'] = len(cards) > wanted
+        receipt['cards'] = {'tree': state, 'from_tree': sum(card['source'] == 'tree' for card in result['cards']),
+                            'from_ocr': sum(card['source'] == 'ocr' for card in result['cards'])}
+    return {**result, 'ocr': {**receipt, 'elapsed_ms': round((time.monotonic() - started) * 1000, 2)}}

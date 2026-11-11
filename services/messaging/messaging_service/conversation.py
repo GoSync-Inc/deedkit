@@ -93,7 +93,7 @@ def _is_audio(file):
 
 
 def _preparing(file):
-    """A downloaded file whose words may still come; an image description never becomes an excerpt."""
+    """A downloaded file whose words may still come; an image's title and summary never become an excerpt (its visible text may, ANYM-987)."""
     return file.get('download_status')=='ready' and (file.get('extraction_status') in ('queued','leased','processing')
         or _is_audio(file) and file.get('enrichment_status') in ('queued','processing'))
 

@@ -11,10 +11,12 @@ from fastapi.responses import JSONResponse
 from pydantic import AliasChoices, Field, ValidationError
 from typing import Literal
 
+from .agent_run import AgentCall, Agents, install_routes
 from . import courier_chat
 from .app_maps import compile_scenario, load, validate_map
 from .config import Configuration, Refused, Strict
 from .device import COMMANDS, Devices
+from .field_errors import entries as field_errors
 from .guard import Rules
 from .store import Store, identifier
 from .uiautomator import reference as ui_reference
@@ -46,14 +48,21 @@ class Execute(Device):
     wait_s: int = Field(default=15, ge=0, le=25)
 
 
-class CourierChat(Device):  # ANYM-975: preview a courier chat message, then send it with the preview's digest
+class CourierChat(Device):  # ANYM-975: preview, then send; ANYM-978: goal, reply, read, handover, summary
+    session_id: str | None = None  # the actions that need no phone (goal, handover, summary) take none
     request_id: str
-    action: Literal["preview", "send"]
+    action: Literal["preview", "send", "goal", "reply", "read", "handover", "summary"]
     app: Literal["gojek", "grab"]
     order: str = Field(min_length=3, max_length=80, pattern=r"^[^\r\n]+$")
-    message: str = Field(min_length=1, max_length=500, pattern=r"^[^\r\n]+$")
+    message: str | None = Field(default=None, min_length=1, max_length=500, pattern=r"^[^\r\n]+$")
     preview_digest: str | None = Field(default=None, max_length=200)
     owner_instruction: str | None = Field(default=None, min_length=3, max_length=1500)
+    goal: str | None = Field(default=None, min_length=1, max_length=300)
+    max_messages: int | None = Field(default=None, ge=1, le=12)
+    ttl_min: int | None = Field(default=None, ge=1, le=10080)
+    min_interval_s: int | None = Field(default=None, ge=10, le=300)
+    standing: bool = False
+    reason: str | None = Field(default=None, min_length=1, max_length=200)
     timeout_s: int = Field(default=60, ge=10, le=180)
     wait_s: int = Field(default=15, ge=0, le=25)
 
@@ -125,34 +134,45 @@ class Download(FileRef):
 SCHEMAS = {
     "capabilities": Strict, "maestro": MaestroInfo, "observe": Observe, "execute": Execute, "get_operation": Receipt,
     "run_flow": RunFlow, "flows": Flows, "session": Session, "upload": Upload, "download": Download, "delete_file": FileRef,
-    "courier_chat": CourierChat,
+    "courier_chat": CourierChat, "agent": AgentCall,
 }
+# Where runs reach this service; the command line sets it from --host and --port.
+AGENT_URL = None
 READS = {"capabilities", "observe", "get_operation", "download", "maestro"}
 
 
-def create_app(config_path):
+def create_app(config_path, agent_url=None):
+    agent_url = agent_url or AGENT_URL
     configuration = Configuration(config_path)
 
     @asynccontextmanager
     async def lifespan(app):
         store = Store(configuration.initial.state_dir)
         devices = Devices(configuration.initial, store)
-        app.state.devices, app.state.store = devices, store
+        # The local agent (ANYM-971): runs reach this service on agent_url with their own per-run bearer.
+        agents = Agents(devices, store, configuration, agent_url)
+        app.state.devices, app.state.store, app.state.agents = devices, store, agents
         try:
             yield
         finally:
             try:
+                await agents.close()
                 await devices.close()
             finally:
                 store.close()
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    install_routes(app)
 
     @app.exception_handler(Refused)
     async def refused(request, error):
+        # ANYM-984: no `invalid_arguments` goes out bare; one raised without a list names the request itself.
+        fields = getattr(error, "field_errors", None) or (
+            [{"field": "$", "reason": "format"}] if error.code == "invalid_arguments" else None)
         return JSONResponse({"error": error.code, **({'hint': error.hint} if hasattr(error, 'hint') else {}),
-                             **getattr(error, 'extra', {})}, status_code=error.status,
-                            headers={"Cache-Control": "no-store"})
+                             **getattr(error, 'extra', {}),
+                             **({"field_errors": fields, "next_action": "check_parameters"} if fields else {})},
+                            status_code=error.status, headers={"Cache-Control": "no-store"})
 
     @app.post("/v1/{operation}")
     async def call(operation: str, request: Request):
@@ -171,9 +191,12 @@ def create_app(config_path):
             if len(body) > 65536:
                 raise Refused("request_too_large", 413)
         try:
-            args = SCHEMAS[operation].model_validate(json.loads(body)).model_dump()
-        except (ValidationError, ValueError):
-            raise Refused("invalid_arguments", 422) from None
+            raw = json.loads(body)
+            args = SCHEMAS[operation].model_validate(raw).model_dump()
+        except ValidationError as invalid:
+            raise Refused("invalid_arguments", 422, field_errors(invalid, SCHEMAS[operation])) from None
+        except ValueError:
+            raise Refused("invalid_arguments", 422, [{"field": "$", "reason": "format"}]) from None
         device = args.get("device_id")
         if device is not None and device not in principal.devices:
             raise Refused("not_found", 404)
@@ -184,7 +207,8 @@ def create_app(config_path):
             except Refused:
                 secrets = {"secrets": [], "secrets_error": "unavailable"}
             result = {**secrets, "service": "deedkit-android", "permissions": principal.permissions,
-                      "devices": await devices.status(principal.devices), "adb_commands": sorted(COMMANDS),
+                      "devices": [{**row, "session": store.session_state(owner, row["device_id"])}
+                                  for row in await devices.status(principal.devices)], "adb_commands": sorted(COMMANDS),
                       "tool_manifest": {"version": 1, "names": list(SCHEMAS)},
                       "input_schemas": {name: schema.model_json_schema() for name, schema in SCHEMAS.items()},
                       "ui": {"engine": "uiautomator2", "configured": bool(devices.ui),
@@ -196,6 +220,10 @@ def create_app(config_path):
                       "session_policy": {"renew_on_activity": True, "release_explicitly": True,
                                          "maximum_idle_seconds": 900},
                       "limits": {"command_seconds": 600, "file_bytes": 268435456, "chunk_bytes": 32768, "download_chunk_bytes": 4194304}}
+            try:
+                result["agent"] = await request.app.state.agents.describe()
+            except Refused:
+                result["agent"] = {"enabled": False, "reason": "unavailable"}
         elif operation == "session":
             if devices.locks[device].locked() and args["action"] != "renew":
                 raise Refused("device_busy")
@@ -205,15 +233,11 @@ def create_app(config_path):
                                            args["image_mode"], args["crop"])
         elif operation == "execute":
             if any(len(arg) > 16384 or "\x00" in arg for arg in args["argv"]):
-                raise Refused("invalid_arguments", 422)
+                raise Refused("invalid_arguments", 422, [{"field": "argv", "reason": "size"}])
             result = await devices.execute(owner, device, args["session_id"], identifier(args["request_id"]),
                                            args["argv"], args["timeout_s"], args["wait_s"])
         elif operation == "courier_chat":
-            courier_chat.check_request(owner, args)
-            request_id = identifier(args["request_id"])
-            job = courier_chat.CourierChat(devices, owner, device, {**args, "request_id": request_id})
-            result = await devices.execute(owner, device, args["session_id"], request_id, None,
-                                           args["timeout_s"], args["wait_s"], job=job)
+            result = await courier_chat.handle(devices, owner, args)
         elif operation == "maestro":
             if args["action"] == "reference":
                 result = ui_reference()
@@ -259,6 +283,8 @@ def create_app(config_path):
             else:
                 options = {key: value for key, value in args.items() if key != 'yaml'}
                 result = store.library.manage(owner, source=args['yaml'], **options)
+        elif operation == "agent":
+            result = await request.app.state.agents.handle(owner, AgentCall.model_validate(raw))
         elif operation == "get_operation":
             result = await devices.receipt(owner, identifier(args["request_id"]), args["wait_s"])
         elif operation == "upload":

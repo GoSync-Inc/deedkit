@@ -51,6 +51,11 @@ Redirects and environment proxies are off. The prompt is the usual one plus a se
 `file-description-v2-ru`. Agents search in Russian, and without that sentence a photo with no source language is
 described in English.
 
+The `text` a photo's description carries is its `visible_text` (ANYM-987): for an image it is what an agent reads
+(`get_file_text` without `content`, the message row's `text_excerpt`) and what `messages_search` matches, ahead of the
+Tesseract text, which applies only while no ready, non-blank visible text exists (FILE_INDEX.md, "Image text"). The worker
+and the stored rows are unchanged; the choice is made when the text is read, so no description is queued by a read.
+
 **What waits and what fails.** When the mini cannot take the job right now the job waits and costs nothing:
 
 - waits (`model_backpressure`): the mini is unreachable (connection refused, DNS or TLS failure, a connect

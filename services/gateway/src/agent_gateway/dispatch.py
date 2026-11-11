@@ -13,7 +13,8 @@ from .adapters import agents
 
 from .catalog import arguments, CATALOG, InvalidArguments, routed
 from .diagnostics import (FAILURE_FIELDS, discovery, gateway_build, manifest_lacks, manifest_summary, module_conditions,
-                          operation_missing_detail, stale_arguments_hint, unavailable, unknown_tool_denial)
+                          module_health, operation_missing_detail, stale_arguments_hint, unavailable, unknown_tool_denial)
+from .field_errors import root_refusal
 from .http_clients import WAIT_POOL, WAIT_RETRY_AFTER_S
 from .policy import Denied, key_from_file
 from . import recipes
@@ -383,6 +384,7 @@ class Dispatch:
         return current, principal, visible, {
             "states": states, "scopes": scopes, "actions": actions,
             "unavailable_modules": unavailable_modules, "backend_builds": builds,
+            "module_health": module_health([m for m in modules if states.get(m) == "ready"], unavailable_modules, capabilities),
             "discovery": discovery(visible, actions, current["revision"]),
             "backend_tool_manifests": manifests, "selected": selected,
         }
@@ -422,7 +424,7 @@ class Dispatch:
             "selected_modules": chosen,
             "modules_available": [
                 {"id": m, "purpose": MODULE_PURPOSES[m], "tool_count": counts[m], "selected": m in chosen,
-                 "path": MODULE_PATH + m}
+                 "path": MODULE_PATH + m, **states["module_health"].get(m, {})}
                 for m in sorted(counts)
             ],
             "connection_guidance": {
@@ -640,7 +642,9 @@ class Dispatch:
                     denied.detail["next"] = {"tool": name, "arguments": {**values, "request_id": PLACEHOLDER_REQUEST_ID}}
             raise denied from None
         except ValueError:
-            raise Denied("invalid_arguments", 422) from None
+            denied = Denied("invalid_arguments", 422)
+            denied.detail = root_refusal()
+            raise denied from None
         return snapshot, agent, tool, selected, args
 
     async def gateway_capabilities(self, key, route, args=None):
@@ -784,6 +788,9 @@ class Dispatch:
             if module == "android" and tool["operation"] in {"execute", "run_flow", "courier_chat"}:  # ANYM-975
                 error.detail.update(request_id=values["request_id"],
                                     next_action="read_android_get_operation_with_original_request_id")
+            if module == "android" and tool["operation"] == "agent":  # ANYM-972: read the run back, never start anew
+                error.detail.update(request_id=values["request_id"],
+                                    next_action="read_android_agent_get_with_original_request_id")
         elif error.code == "backend_unavailable":
             error.detail = unavailable(tool["operation"], getattr(error, "detail", None),
                                        phase="operation", read_only=True)

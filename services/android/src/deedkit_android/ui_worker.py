@@ -322,8 +322,8 @@ def main():
                 if args['command'] == '__hierarchy__':
                     result = {'xml': device.jsonrpc_call('dumpWindowHierarchy', (True, 50))}
                 elif args['command'] == '__guard__':
-                    guard.screen(device, when='after')
-                    result = {'success': True}
+                    seen = guard.screen(device, when='after')
+                    result = {'success': True, 'package': seen['package'], 'packages': sorted(seen['packages'])}
                 else:
                     result = execute(device, guard=guard, **args)
             except Stop as error:

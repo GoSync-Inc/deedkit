@@ -291,6 +291,80 @@ def test_partial_download_names_the_next_chunk_and_the_larger_limit(service):
     assert whole['eof'] and 'next_action' not in whole and 'max_length' not in whole
 
 
+CANARY = 'CANARY-4f9c'
+
+
+# spec: ANYM-984
+@pytest.mark.parametrize('operation', ['capabilities', 'maestro', 'observe', 'execute', 'get_operation', 'run_flow', 'flows',
+                                       'session', 'upload', 'download', 'delete_file'])
+def test_a_body_a_model_rejects_names_its_fields_and_never_echoes_a_value(service, operation):
+    refused = post(service, operation, {'zz_unknown': CANARY, 'device_id': [CANARY], 'x' * 200: CANARY})
+    body = refused.json()
+    assert refused.status_code == 422 and body['error'] == 'invalid_arguments' and body['next_action'] == 'check_parameters'
+    entries = body['field_errors']
+    assert 0 < len(entries) <= 20 and len({e['field'] for e in entries}) == len(entries)
+    assert {'field': 'zz_unknown', 'reason': 'unknown_field'} in entries
+    assert {'field': '$', 'reason': 'unknown_field'} in entries  # the 200-character key is not an identifier: its parent
+    assert CANARY not in refused.text and 'x' * 200 not in refused.text
+
+
+# spec: ANYM-984
+def test_an_invalid_arguments_refusal_raised_without_a_field_list_still_carries_the_error_shape(service):
+    import asyncio
+    import json
+
+    from deedkit_android.config import Refused
+    handler = service[0].app.exception_handlers[Refused]
+    body = json.loads(asyncio.run(handler(None, Refused('invalid_arguments', 422))).body)
+    assert body == {'error': 'invalid_arguments', 'next_action': 'check_parameters',
+                    'field_errors': [{'field': '$', 'reason': 'format'}]}
+    assert json.loads(asyncio.run(handler(None, Refused('not_found', 404))).body) == {'error': 'not_found'}
+
+
+# spec: ANYM-984
+def test_the_reasons_and_hints_come_from_the_model_not_from_the_input(service):
+    def refusal(operation, values):
+        return {e['field']: e for e in post(service, operation, values).json()['field_errors']}
+
+    assert refusal('session', {'action': 'nope', 'seconds': 5}) == {
+        'device_id': {'field': 'device_id', 'reason': 'required'},
+        'action': {'field': 'action', 'reason': 'pattern', 'expected': 'matching ^(acquire|renew|release)$'},
+        'seconds': {'field': 'seconds', 'reason': 'minimum', 'expected': 'at least 30'}}
+    assert refusal('flows', {'action': 'list', 'kind': 'nope', 'limit': 101})['kind'] == {
+        'field': 'kind', 'reason': 'enum', 'allowed': ['flow', 'map']}
+    assert refusal('flows', {'action': 'list', 'limit': 101})['limit'] == {
+        'field': 'limit', 'reason': 'maximum', 'expected': 'at most 100'}
+    assert refusal('download', {'file_id': 7})['file_id'] == {'field': 'file_id', 'reason': 'type', 'expected': 'string'}
+    assert refusal('maestro', {'parameters': {'a': [1]}})['parameters/a'].keys() == {'field', 'reason'}  # a union: no one type
+    assert post(service, 'execute', {'device_id': 'home', 'session_id': 'x', 'request_id': 'r' * 8, 'argv': ['a\x00b']}
+                ).json()['field_errors'] == [{'field': 'argv', 'reason': 'size'}]
+    malformed = service[0].post('/v1/session', content=b'{not json', headers={'Authorization': 'Bearer one'})
+    assert malformed.status_code == 422 and malformed.json()['field_errors'] == [{'field': '$', 'reason': 'format'}]
+
+
+# spec: ANYM-985
+def test_capabilities_say_whether_each_device_session_is_free_own_or_another_principals(service, monkeypatch):
+    import time as clock
+
+    def sessions(key):
+        return {row['device_id']: row['session'] for row in post(service, 'capabilities', key=key).json()['devices']}
+
+    assert sessions('one') == sessions('two') == {'home': 'free'}
+    token = session(service)
+    assert sessions('one') == {'home': 'own'}
+    assert sessions('two') == sessions('reader') == {'home': 'other'}
+    # No session id, lease or principal name leaves with the word.
+    body = json.dumps(post(service, 'capabilities', key='two').json())
+    assert token not in body and '"owner"' not in body and 'expires' not in body
+    # An expired reservation reads free, as `reserve` treats it.
+    real = clock.time
+    monkeypatch.setattr('deedkit_android.store.time.time', lambda: real() + 10000)
+    assert sessions('two') == {'home': 'free'}
+    monkeypatch.undo()
+    released = post(service, 'session', {'device_id': 'home', 'action': 'release', 'session_id': token})
+    assert released.status_code == 200 and sessions('two') == {'home': 'free'}
+
+
 # spec: ANYM-958
 def test_one_ui_engine_is_reported_and_flows_without_it_never_reach_the_device(service):
     capabilities = post(service, 'capabilities', key='reader').json()

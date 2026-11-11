@@ -401,6 +401,31 @@ def test_modules_available_summary(gateway):
     assert on_path["tools"] == PLATFORM + MODULE_TOOLS["messaging"]
 
 
+# spec: ANYM-985
+def test_every_usable_module_row_carries_a_ready_health_word_and_no_phone_words(gateway):
+    app, _, write, _ = gateway
+    write(lambda v: (v["principals"][0]["credentials"].pop("calls"),
+                     v["principals"][0]["grants"].update(calendar=["agenda:read"])))
+    with TestClient(app) as client:
+        plain = call(client, "platform_capabilities")["structuredContent"]
+    rows = {row["id"]: row for row in plain["modules_available"]}
+    assert set(rows) == {"calendar", "messaging"}
+    assert all(row["health"] == {"state": "ready"} for row in rows.values())
+    assert all({"device", "session"}.isdisjoint(row) for row in rows.values())
+
+
+# spec: ANYM-985
+def test_module_health_never_raises_on_malformed_conditions_or_capabilities():
+    from agent_gateway.diagnostics import module_health
+
+    conditions = [None, "x", {"module": "messaging", "state": "outdated"}, {"module": "calls", "state": "outdated", "reason": 7},
+                  {"module": "calendar", "state": "unavailable", "reason": "backend_unavailable"}]
+    result = module_health(["messaging", "calls", "calendar", "android"], conditions, {"android": "garbage"})
+    assert result == {"messaging": {"health": {"state": "degraded"}}, "calls": {"health": {"state": "degraded"}},
+                      "calendar": {"health": {"state": "ready"}}, "android": {"health": {"state": "ready"}}}
+    assert module_health(["messaging"], None, None) == {}
+
+
 TWINS = ["calls_get_call_analysis", "calls_call_result"]
 
 

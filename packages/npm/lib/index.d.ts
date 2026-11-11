@@ -42,6 +42,10 @@ export interface MessageContent {
   format?: MessageFormat;
   link_preview?: boolean;
   allow_lossy?: boolean;
+  /** ANYM-986, archive-chat sends: `{within: '6h'}` (`<n>m`, `<n>h` or `<n>d`, 60 seconds to 14 days). Once the message is sent the
+   * server creates a `reply_to_send` subscription with a silence timer on your enabled delivery endpoint. The preview shows
+   * it and its digest binds it: send the same value. */
+  await_reply?: {within: string};
 }
 /** Exactly one recipient: an archive chat_id, a phone number on a native WhatsApp account (ANYM-532), or a
  * Telegram @username of a person (ANYM-643). */
@@ -167,6 +171,8 @@ export interface SubscriptionSelection {
   reply_to_send?: string | null;
   /** Your own endpoint from registerDeliveryEndpoint; needs delivery-write. */
   delivery?: {endpoint_id: string; delivery_policy?: Record<string,unknown>} | null;
+  /** Events of a module the owner linked for your key, as capabilities subscriptions.module_events lists them; module_not_linked without a link. */
+  module_sources?: {scope: string; types: string[]}[] | null;
 }
 /** Every chat the key can see now instead of chat_ids (dynamic_sources_disabled until the operator's switch). */
 export interface DynamicSubscriptionSelection extends Omit<SubscriptionSelection,'chat_ids'|'sender_ids'|'reply_to_send'> {

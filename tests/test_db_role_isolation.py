@@ -723,7 +723,7 @@ def test_upgrade_and_rollback_keep_feed_order_and_cursors(schema36_store, monkey
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '91'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '92'
         assert c.execute('SELECT * FROM archive_migrations WHERE version<=36 ORDER BY version').fetchall() == migrations
     assert feed_state(store) == before
     try:
@@ -1134,7 +1134,11 @@ def test_activity_grants_add_only_the_new_table_to_each_role(seeded, template, b
         before, after = role_grants(store, previous), role_grants(store, role)
         # Existing ACLs are unchanged; the only addition is this table, with exactly the named privileges.
         # A later schema's block (71, ANYM-837: the gateway's INSERT of outgoing_messages.menu_choice) is not this one's.
-        later = {('outgoing_messages', 'menu_choice', 'INSERT')} if base == 'messaging_gateway' else set()
+        # Schema 92 (ANYM-986) adds the gateway's INSERT and UPDATE of outgoing_messages' four await_* columns, and only those.
+        later = {('outgoing_messages', 'menu_choice', 'INSERT'), ('outgoing_messages', 'await_reply', 'INSERT'),
+                 ('outgoing_messages', 'await_state', 'INSERT'), ('outgoing_messages', 'await_state', 'UPDATE'),
+                 ('outgoing_messages', 'await_subscription_id', 'UPDATE'),
+                 ('outgoing_messages', 'await_reason', 'UPDATE')} if base == 'messaging_gateway' else set()
         # Schema 73 (ANYM-848) adds the gateway's wake target tables; they are that block's, not this one's.
         # Schema 76 (ANYM-907) adds the gateway's read of the negotiation tables and schema 77 (ANYM-851) its structure
         # reads; schema 78 (ANYM-914) its read of session_claims; those blocks' too. Schema 90 (ANYM-564): the link

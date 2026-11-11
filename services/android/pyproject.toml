@@ -37,6 +37,10 @@ dev = ["pytest==9.1.1", "httpx==0.28.1", "ruff==0.15.7"]
 [tool.hatch.build.targets.wheel]
 packages = ["src/deedkit_android"]
 
+# The local agent's versioned preamble (ANYM-971 criterion 7) ships beside its code.
+[tool.hatch.build.targets.wheel.force-include]
+"agent_preamble.md" = "deedkit_android/agent_preamble.md"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

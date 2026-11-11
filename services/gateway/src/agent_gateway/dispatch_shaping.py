@@ -225,6 +225,9 @@ REVIEWED_HINTS = frozenset({
     # ANYM-795: the fixed hint of a refused file upload (upload_limit).
     "An upload frees its slot only when it expires (get_file_upload shows expires_at); an expired upload still being "
     "sent keeps its slot until the send ends.",
+    # ANYM-566: the owner step of a call source without a link (module_links.NEXT_LINK; the backend sends it as `next` too).
+    "Ask the owner to link calls for this key: deedkit admin module-links link --principal <principal> "
+    "--module calls --module-principal <calls principal>; then create the subscription again.",
 })
 
 

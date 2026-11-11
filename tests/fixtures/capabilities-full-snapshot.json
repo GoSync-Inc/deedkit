@@ -397,7 +397,7 @@
   "file_content_search": true,
   "file_hit_fields": {
    "content_pending_cap": 20,
-   "content_searched": "ready_non_empty_text_or_ready_voice_transcript",
+   "content_searched": "ready_non_empty_text_or_ready_voice_transcript_or_ready_image_visible_text",
    "excerpt_sources": [
     "filename",
     "caption",

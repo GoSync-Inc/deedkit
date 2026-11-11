@@ -13,7 +13,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field, StrictBool, StrictStr
 
 from ..tool_types import (AttemptLimit, DeliveryPolicy, EndpointHeaders, EndpointLabel, EndpointReference, EndpointUrl,
-    ExcludedChats, ExclusionsRevision, ReceiverReference, RequestReference, SendReference, SigningSecret,
+    ExcludedChats, ExclusionsRevision, ModuleSources, ReceiverReference, RequestReference, SendReference, SigningSecret,
     SubscriptionEndpoint, SubscriptionExpiry, SubscriptionFeedback, SubscriptionKinds, SubscriptionLimit, SubscriptionOrigins,
     SubscriptionPageDetail, SubscriptionPageInclude, SubscriptionPosition, SubscriptionReceipt, SubscriptionReference,
     SubscriptionReferences, SubscriptionSources, SubscriptionVersion, WaitSeconds, WakeConfirmationCode, WakeRules,
@@ -33,7 +33,8 @@ def register_subscription_tools(mcp, call, async_call, read, upload_write):
                                 pattern=r'^[^\x00-\x1f\x7f]*$')]='',
                             expires_at: SubscriptionExpiry | None=None,
         wake_rules: WakeRules | None=None, reply_to_send: SendReference | None=None,
-        delivery: SubscriptionEndpoint | None=None, feedback: SubscriptionFeedback | None=None) -> dict[str,Any]:
+        delivery: SubscriptionEndpoint | None=None, feedback: SubscriptionFeedback | None=None,
+        module_sources: ModuleSources | None=None) -> dict[str,Any]:
         """Persist selection of authorized archive chats; no send or provider request.
 
         Requires read + explicit subscription-write. The subscription belongs to the
@@ -73,7 +74,7 @@ def register_subscription_tools(mcp, call, async_call, read, upload_write):
         """
         return call(ctx,'create_subscription',chat_ids=chat_ids,sources=sources,sender_ids=sender_ids,
             kinds=kinds,direction=direction,origins=origins,label=label,expires_at=expires_at,wake_rules=wake_rules,reply_to_send=reply_to_send,
-            delivery=delivery,feedback=feedback)
+            delivery=delivery,feedback=feedback,module_sources=module_sources)
 
     @mcp.tool(structured_output=True,annotations=read)
     def list_subscriptions(ctx: Context,limit: SubscriptionLimit=50) -> dict[str,Any]:

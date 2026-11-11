@@ -245,7 +245,9 @@ true by default and the default lives in messaging (the gateway sends nothing it
   ready transcript (`attachment_enrichment`) matches the query, in the modes `all`, `any`, `phrase`
   and `web`. The same GIN indexes as `search_files` serve it, over the first 32,000 characters of the
   text; read whole documents with `search_files` and `get_file_text`. A filename or display name never
-  matches here, and model descriptions of images never match (ANYM-490). A deleted message, a superseded
+  matches here, and the title and summary of an image never match (ANYM-490). The text of an image is its
+  vision model's `visible_text` when that is ready (ANYM-987): its OCR text then takes no part and matches only for
+  an image without visible text. A deleted message, a superseded
   extraction (source revision changed) and an inactive attachment never match. Scope and every filter
   of the search apply as to a body match.
 - **`query_mode: exact`** skips the media arm (no index serves `LIKE`): `search.media_text_applied` is
@@ -253,11 +255,12 @@ true by default and the default lives in messaging (the gateway sends nothing it
   fallback never scans media text; a media hit is a primary hit, so fuzzy runs only when neither the body
   nor the media matched.
 - **Evidence on every hit row of a query.** `matched_in` lists what matched, in this order: `body`,
-  `contact`, `extracted`, `transcript` (an empty-query listing has none). A media hit adds `media_matches`,
+  `contact`, `extracted`, `visible_text`, `transcript` (an empty-query listing has none). A media hit adds `media_matches`,
   one entry per matching attachment in attachment order: `{attachment_id, source, snippet,
   model_generated, untrusted: true, read_more}` with a snippet of at most 200 characters around the first
   match (`[[ ]]` marks it) and `read_more` for `get_file_text` (the match lies in the first 32,000
-  characters, so the passage starts at offset 0). Photo text carries `quality` as in ANYM-669. `match_type`
+  characters, so the passage starts at offset 0). Photo OCR text carries `quality` as in ANYM-669; an entry with
+  `source: "visible_text"` (an image's vision text, `model_generated: true`, `read_more.content: "enriched"`) carries none. `match_type`
   of a row that matched only through media is `media_text`. A match whose original is unreadable
   (missing and not evicted, ANYM-490) is `{attachment_id, source, unreadable: true}` without a snippet.
   A message collapsed under ANYM-273 lists the shown copy's attachments.

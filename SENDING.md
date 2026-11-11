@@ -496,6 +496,24 @@ account) answer "what is scheduled?" and "cancel the 8 o'clock greeting":
   (`scheduled_cancelled` with its `cancel_reason`, or `sent`). A delete without Telegram's confirmation, or a
   timeout, is `unknown` and is never retried: read `list_scheduled` on the chat before asking the owner again.
 
+### Waking on silence (`await_reply`, ANYM-986, schema 92)
+
+`preview_message` and `send_message` (chat_id sends) take an optional `await_reply: {"within": "<n>m|<n>h|<n>d"}`, 60
+seconds to 14 days. After the message is `sent`, the server creates one `reply_to_send` subscription for that message
+with `expect_reply_within_s` set to the time and your key's one enabled delivery endpoint, so you stop polling: the
+endpoint is woken when a reply arrives, or when none did by then (the silence hint, SUBSCRIPTIONS.md). `wake` is not a
+parameter: waking is what the endpoint does. The preview shows `await_reply` and its digest binds it, so send the same
+value (else `preview_mismatch`; a retry of one `request_id` with another value is `idempotency_conflict`); a wrong
+`within` is `invalid_parameters` with a field entry, and a menu answer takes none. The wire payload and the send are
+unchanged.
+
+The send result and `get_send_status` carry `await_reply: {state, subscription_id?, reason?}`. `pending` lasts until
+the server's job has run after `sent` (seconds); `created` names the subscription; `refused` names a fixed reason:
+`no_delivery_endpoint`, `ambiguous_delivery_endpoint` (two enabled endpoints), `subscription_limit`,
+`permission_changed` (the key lost `read`, `subscription-write` or `delivery-write`, or its grants changed),
+`key_inactive`, `send_not_sent` (failed, expired or cancelled) or `subscription_refused`. A refusal never changes the
+send. A send that ends `unknown` stays `pending` and is never replayed.
+
 ### Mentioning group members (`mentions`, ANYM-928)
 
 `preview_message` and `send_message` (MCP and REST, chat_id recipients) take the optional `mentions`: up to 20
