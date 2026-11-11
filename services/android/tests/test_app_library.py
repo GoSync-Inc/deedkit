@@ -363,3 +363,22 @@ def test_list_fields_can_resolve_among_the_item_siblings():
     assert extract_list(root, default, ['status'], 10) == [{'status': None}, {'status': None}]
     with pytest.raises(Refused, match='invalid_list_scope'):
         validate_map(source.replace('scope: parent', 'scope: screen'))
+
+
+# spec: ANYM-954
+def test_deep_link_urls_receive_scenario_parameters(store):
+    from deedkit_android.app_maps import compile_scenario
+
+    draft(store, 'map', 'shop', MAP + 'deep_links:\n  search: {url: "example://search?q=${QUERY}", screen: orders}\n')
+    source = 'map: shop\nparams: {QUERY: {type: string}}\nsteps:\n  - openDeepLink: {name: search}\n'
+    commands, _ = compile_scenario(store.library, 'one', source, {'QUERY': 'Curaprox Enzycal 950&x=1'}, stage='draft')
+    link = commands[0]['openDeepLink']['app_map']['deep_links']['search']
+    assert link['url'] == 'example://search?q=Curaprox%20Enzycal%20950%26x%3D1'
+    child = 'map: shop\nsteps:\n  - runFlow: {name: find}\n'
+    draft(store, 'flow', 'find', source)
+    commands, _ = compile_scenario(store.library, 'one', child, {'QUERY': 'tea'}, stage='draft')
+    nested = commands[0]['runFlow']['commands'][0]['openDeepLink']['app_map']['deep_links']['search']
+    assert nested['url'] == 'example://search?q=tea'
+    with pytest.raises(Refused, match='missing_flow_parameter'):
+        compile_scenario(store.library, 'one', source.replace('{type: string}', '{type: string, required: false}'),
+                         {}, stage='draft')

@@ -4,6 +4,7 @@ from datetime import date
 import hashlib
 import math
 import re
+from urllib.parse import quote
 
 import yaml
 from yaml.tokens import AliasToken, AnchorToken
@@ -48,7 +49,7 @@ def reference():
         'lists': 'lists.<name> has item (selector or candidate list), fields (field names mapped to selectors), and optional key (field names identifying one item across pages). scope: parent resolves fields in the parent of the item node, for cards whose fields are siblings of the item node. Without key, every visible row is preserved. readList returns rows under both its step result and receipt.data.<list>. limit defaults to 20, at most 100; scroll_pages defaults to 0, at most 5. Password fields return null.',
         'loading': 'A screen signature can match while content still loads. Prefer forbid: [<spinner selector>] on the screen so waits continue until it is gone. waitSettled {stable_ms: 100-5000 (500), timeout} waits until the hierarchy (class, id, text, description, bounds) is unchanged for stable_ms and fails with screen_not_settled. openApp and openDeepLink accept settle_ms (0-5000) to settle after their screen check. openDeepLink returns phases {open_ms, screen_ms, settle_ms} and polls. The plain sleep command (milliseconds, at most 10000) is a last resort.',
         'popups': 'popups.<name> has detect (selector name) and either dismiss (selector name) or press: back. dismissPopups is explicit and bounded by max_rounds, default 3.',
-        'parameters': 'params maps UPPER_CASE names to {type: string|integer|boolean, default?, required?, enum?, max_length?}. Values substitute literally as ${NAME}. Existing string parameters work without declarations.',
+        'parameters': 'params maps UPPER_CASE names to {type: string|integer|boolean, default?, required?, enum?, max_length?}. Values substitute literally as ${NAME}. Existing string parameters work without declarations. A map deep_links URL takes ${NAME} too, percent-encoded (q=${QUERY} with tea cup opens q=tea%20cup).',
         'continuation': 'A checkpoint returns runnable remaining_yaml with explicit historical map versions. Submit it under a new request_id after resolving the checkpoint. Returned runFlow groups may contain map, map_version and commands to retain their map context.',
         'versions': 'Every run records library.pins. Unversioned references resolve once at admission. stage=draft uses current drafts with published fallback. Explicit map_version and runFlow.version pin historical dependencies. Publication rejects stale floating dependencies.',
         'effects': 'side_effects is advisory metadata (none, purchase, payment, send, account). The caller decides when user approval is required.',
@@ -232,6 +233,14 @@ def validate_action(name, options, app_map):
             raise Refused('unknown_map_list_field', 422)
 
 
+def link_url(url, values, validate_only=False):
+    def value(match):
+        if match[1] not in values and not validate_only:
+            raise Refused('missing_flow_parameter', 422)
+        return quote(values.get(match[1], 'placeholder'), safe='')
+    return VARIABLE.sub(value, url)
+
+
 def compile_scenario(library, owner, source, parameters, *, stage='published', root=None, validate_only=False):
     pins, floating, effects = {}, {}, set()
     stack = []
@@ -378,7 +387,13 @@ def compile_scenario(library, owner, source, parameters, *, stage='published', r
                     if app_map is None:
                         raise Refused('scenario_requires_map', 422)
                     validate_action(name, parsed, app_map)
-                    output.append({name: {**parsed, 'app_map': app_map, 'map_ref': map_ref}})
+                    step_map = app_map
+                    if name == 'openDeepLink':
+                        # A map's deep link URL takes the scenario's parameters, percent-encoded.
+                        link = app_map['deep_links'][parsed['name']]
+                        url = link_url(link['url'], values, validate_only)
+                        step_map = {**app_map, 'deep_links': {**app_map['deep_links'], parsed['name']: {**link, 'url': url}}}
+                    output.append({name: {**parsed, 'app_map': step_map, 'map_ref': map_ref}})
                 else:
                     if isinstance(item, dict) and name not in all_fields:
                         # Includes former Maestro-only commands: the engine was removed (owner 11-11).
