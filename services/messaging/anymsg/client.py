@@ -592,18 +592,20 @@ class Client:
         return self.call('list_negotiations', arguments)
 
     def preview_message(self,*,account,chat_id,text,reply_to='',format='plain',
-                        link_preview=False,allow_lossy=False):
+                        link_preview=False,allow_lossy=False,await_reply=None):
         """Render a scoped draft without queuing or contacting a messenger.
 
         The digest binds content and policy; it is not owner approval. Review
         visible text, formatting, warnings and link destinations before a send.
+        await_reply (ANYM-986): {'within': '6h'}, shown in the preview and bound by its digest; omitted when None.
         """
         return self.call('preview_message',dict(account=account,chat_id=chat_id,text=text,
-            reply_to=reply_to,format=format,link_preview=link_preview,allow_lossy=allow_lossy))
+            reply_to=reply_to,format=format,link_preview=link_preview,allow_lossy=allow_lossy,
+            **({'await_reply':await_reply} if await_reply is not None else {})))
 
     def send_message(self,*,account,chat_id,text,request_id,reply_to='',format='plain',
                      preview_digest='',link_preview=False,allow_lossy=False,wait_s=0,
-                     expected_last_message_id=None,guard=None,allow_duplicate=None):
+                     expected_last_message_id=None,guard=None,allow_duplicate=None,await_reply=None):
         """Submit exactly confirmed content; rich sends must match a reviewed preview.
 
         Keep request_id until the result is known. The digest never proves human
@@ -613,6 +615,8 @@ class Client:
         outgoing_only. Both are omitted from the wire when None, so older servers see the old payload.
         allow_duplicate (ANYM-748): True sends even while your earlier send of the same content to this chat is
         unresolved (duplicate_send_unresolved otherwise); omitted when None.
+        await_reply (ANYM-986): {'within': '6h'} asks for a reply_to_send subscription with a silence timer once the
+        message is sent; it needs the preview that carried it (same value); omitted when None.
         """
         parameters=dict(account=account,chat_id=chat_id,text=text,
             request_id=request_id,reply_to=reply_to)
@@ -621,6 +625,7 @@ class Client:
         if expected_last_message_id is not None:parameters['expected_last_message_id']=expected_last_message_id
         if guard is not None:parameters['guard']=guard
         if allow_duplicate is not None:parameters['allow_duplicate']=allow_duplicate
+        if await_reply is not None:parameters['await_reply']=await_reply
         # Default plain calls remain compatible with older strict servers.
         # Nondefault values pass unchanged so the server can reject bad types.
         if (format!='plain' or preview_digest!='' or link_preview is not False

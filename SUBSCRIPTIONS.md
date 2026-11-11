@@ -1787,7 +1787,8 @@ needed at creation. Recommended for a dynamic subscription, so it does not spend
 budget on every message: `wake_rules=[reply_to_owner, owner_mention, reply_to_own_send]`. Interim
 await-reply recipe: one `all_visible_chats` subscription with `wake_rules=[reply_to_own_send]`
 catches every reply to the key's confirmed sends; only a silence timer (`expect_reply_within_s`)
-still needs a per-send `reply_to_send` subscription.
+still needs a per-send `reply_to_send` subscription, which `send_message(await_reply={within: '6h'})` makes for
+you once the message is sent (SENDING.md, "Waking on silence (`await_reply`, ANYM-986, schema 92)").
 
 **Activation.** Dynamic sources return `dynamic_sources_disabled` (409) until the operator runs
 `python -m messaging_service set-dynamic-subscriptions --enable`, which refuses (and changes
