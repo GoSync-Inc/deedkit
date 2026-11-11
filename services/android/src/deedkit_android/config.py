@@ -28,6 +28,8 @@ class Config(Strict):
     java_home: str | None = None
     uiautomator2_jar: str | None = None
     uiautomator2_jar_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    ocr_command: str | None = None
+    ocr_languages: str = Field(default="eng", pattern=r"^[A-Za-z_]{3,16}(\+[A-Za-z_]{3,16}){0,7}$")
     devices: dict[str, str]
     principals: list[Principal]
 
@@ -42,7 +44,7 @@ class Configuration:
     def __init__(self, path):
         self.path = Path(path)
         self.initial = self.read()
-        for value in (self.initial.adb, self.initial.state_dir, self.initial.maestro, self.initial.java_home, self.initial.uiautomator2_jar):
+        for value in (self.initial.adb, self.initial.state_dir, self.initial.maestro, self.initial.java_home, self.initial.uiautomator2_jar, self.initial.ocr_command):
             if value is not None and not Path(value).is_absolute():
                 raise ValueError("absolute_runtime_paths_required")
 
@@ -80,8 +82,10 @@ class Configuration:
             config = self.read()
         except (OSError, ValueError):
             raise Refused("configuration_unavailable", 503) from None
-        if (config.adb, config.state_dir, config.devices, config.maestro, config.java_home, config.uiautomator2_jar, config.uiautomator2_jar_sha256) != (
+        if (config.adb, config.state_dir, config.devices, config.maestro, config.java_home, config.uiautomator2_jar, config.uiautomator2_jar_sha256,
+            config.ocr_command, config.ocr_languages) != (
             self.initial.adb, self.initial.state_dir, self.initial.devices, self.initial.maestro, self.initial.java_home, self.initial.uiautomator2_jar, self.initial.uiautomator2_jar_sha256,
+            self.initial.ocr_command, self.initial.ocr_languages,
         ):
             raise Refused("runtime_configuration_changed", 503)
         if not authorization.startswith("Bearer "):

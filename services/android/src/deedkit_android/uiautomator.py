@@ -16,7 +16,8 @@ SUPPORTED = {'tapOn', 'doubleTapOn', 'longPressOn', 'assertVisible', 'assertNotV
              'inputText', 'setText', 'eraseText', 'pressKey', 'launchApp', 'stopApp', 'killApp',
              'clearState', 'openLink', 'swipe', 'scroll', 'scrollUntilVisible',
              'extendedWaitUntil', 'waitForAnimationToEnd', 'back', 'hideKeyboard',
-             'copyTextFrom', 'exists', 'setOrientation', 'runFlow', 'repeat', 'retry', 'checkpoint'}
+             'copyTextFrom', 'exists', 'setOrientation', 'runFlow', 'repeat', 'retry', 'checkpoint',
+             'readScreenText'}
 SELECTORS = {'text', 'id', 'textExact', 'resourceId', 'description', 'className', 'index',
              'enabled', 'selected', 'checked', 'focused', 'clickable', 'scrollable'}
 OPTIONS = SELECTORS | {'point', 'optional', 'timeout', 'label', 'retryTapIfNoChange',
@@ -35,7 +36,11 @@ UI_FIELDS = {
     'setOrientation': {'orientation', 'label'},
     'runFlow': {'commands', 'when', 'label', 'name', 'version'}, 'repeat': {'commands', 'times', 'while', 'label'},
     'retry': {'commands', 'maxRetries', 'label'}, 'checkpoint': set(),
+    'readScreenText': {'region', 'within', 'min_confidence', 'limit', 'key', 'label'},
 }
+# Definite read/lookup failures: nothing acted, so the persistent worker stays.
+DEFINITE = {'element_not_found', 'screen_not_found', 'ambiguous_selector', 'invalid_element_bounds',
+            'ocr_unavailable', 'ocr_failed', 'screenshot_unavailable', 'region_outside_screen'}
 
 
 
@@ -49,6 +54,24 @@ def validate_selector(value):
             'enabled', 'selected', 'checked', 'focused', 'clickable', 'scrollable'} else str
         if type(item) is not expected or (key == 'index' and item < 0):
             raise Refused('invalid_uiautomator_selector', 422)
+
+
+def validate_screen_text(value):
+    options = {} if value is None else value
+    if not isinstance(options, dict) or ('region' in options and 'within' in options):
+        raise Refused('invalid_screen_text_options', 422)
+    if 'region' in options:
+        region = options['region']
+        if not isinstance(region, dict) or set(region) != {'x', 'y', 'w', 'h'} or any(
+                type(region[key]) is not int or region[key] < (1 if key in 'wh' else 0) or region[key] > 16384 for key in region):
+            raise Refused('invalid_screen_text_region', 422)
+    if 'within' in options:
+        validate_selector(options['within'])
+    for key, low, high in (('min_confidence', 0, 100), ('limit', 1, 300)):
+        if key in options and (type(options[key]) is not int or not low <= options[key] <= high):
+            raise Refused('invalid_screen_text_options', 422)
+    if 'key' in options and (not isinstance(options['key'], str) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', options['key'])):
+        raise Refused('invalid_screen_text_options', 422)
 
 
 def validate_commands(commands):
@@ -122,6 +145,8 @@ def validate_commands(commands):
                         validate_selector(condition[key])
             if name == 'extendedWaitUntil' and len(set(value) & {'visible', 'notVisible'}) != 1:
                 raise Refused('invalid_wait_condition', 422)
+        if name == 'readScreenText':
+            validate_screen_text(value)
         if name in {'repeat', 'retry', 'runFlow'}:
             validate_commands(value['commands'])
         if name == 'launchApp' and value.get('clearKeychain'):
@@ -148,6 +173,10 @@ def reference():
             'compatibility': 'Saved command lists and literal parameters remain usable. Unsupported commands fail validation before execution. Legacy retryTapIfNoChange is accepted but never repeats a tap. waitToSettleTimeoutMs is an explicit post-tap wait.',
             'receipts': 'steps contains path, command name, elapsed_ms and result. First failure has a durable screenshot and compact hierarchy. Poll running/unknown with the same request_id; never replay uncertain mutations.',
             'parameters': 'Literal ${UPPER_CASE} substitution, including saved subflows.',
+            'screen_text': 'readScreenText: {region: {x, y, w, h} | within: <selector>, min_confidence: 0-100 (60), limit: 1-300 (100), key: name (screen_text)} '
+                           'recognizes text in one screenshot on the USB host with Tesseract when the host config sets ocr_command. '
+                           'Use it when the hierarchy has no text, e.g. canvas-drawn list cards. It returns lines {text, bounds, confidence} in full-screen '
+                           'device pixels, top to bottom, also under receipt.data.<key>. Read-only; it never taps. ocr_unavailable or ocr_failed is a definite failure.',
             'limits': {'source_bytes': 32768, 'expanded_commands': 200, 'reference_depth': 8, 'executed_steps': 2000}}
 
 
@@ -255,6 +284,8 @@ class Uiautomator:
                         stderr=asyncio.subprocess.DEVNULL, env=env, start_new_session=True,
                         limit=4 * 1024 * 1024, pass_fds=(self.lock_fd,))
                     self.processes[device] = process
+                if getattr(self.config, 'ocr_command', None):
+                    options = {**options, 'ocr': {'command': self.config.ocr_command, 'languages': self.config.ocr_languages}}
                 process.stdin.write(json.dumps({'command': command, **options}).encode() + b'\n')
                 await process.stdin.drain()
                 response = await process.stdout.readline()
@@ -265,10 +296,12 @@ class Uiautomator:
                     error = Refused(result['error'], 409)
                     if 'details' in result:
                         error.details = result['details']
+                    if 'hint' in result:
+                        error.hint = result['hint']
                     raise error
                 return result
             except Refused as error:
-                if error.code not in {'element_not_found', 'screen_not_found', 'ambiguous_selector', 'invalid_element_bounds', 'unsupported_uiautomator_command', 'invalid_point'}:
+                if error.code not in DEFINITE | {'unsupported_uiautomator_command', 'invalid_point'}:
                     await self.close(device)
                 raise
             except BaseException:

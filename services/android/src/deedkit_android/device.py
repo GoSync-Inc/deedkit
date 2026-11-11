@@ -21,7 +21,7 @@ from xml.etree import ElementTree
 
 from .config import Refused
 from .flow_runner import FlowRunner
-from .uiautomator import Uiautomator, UiRunner
+from .uiautomator import DEFINITE, Uiautomator, UiRunner
 from .maestro import Maestro, screen_elements
 from .store import MAX_FILE
 
@@ -385,7 +385,7 @@ class Devices:
                                "next_action": "observe_then_resolve_checkpoint_and_submit_remaining_yaml"})
         except Refused as error:
             result = {"error": error.code, "next_action": "inspect_device_before_any_new_request"}
-            if error.code in {'element_not_found', 'screen_not_found', 'ambiguous_selector', 'invalid_element_bounds'}:
+            if error.code in DEFINITE:
                 state = 'failed'
                 result['next_action'] = 'inspect_failure_observation_and_correct_flow'
             if hasattr(error, 'command_path'):
@@ -393,6 +393,8 @@ class Devices:
                               failed_command_path=error.command_path, failed_command=error.command)
             if getattr(error, "details", None):
                 result["details"] = error.details
+            if getattr(error, "hint", None):
+                result["hint"] = error.hint
             if getattr(error, "diagnostic", None):
                 result["diagnostic"] = error.diagnostic
         except TimeoutError:
@@ -415,6 +417,8 @@ class Devices:
                 if self.ui:
                     result["data"] = {step["result"]["list"]: step["result"]["rows"] for step in runner.steps
                                       if "result" in step and "rows" in step["result"]}
+                    result["data"].update({step["result"]["key"]: step["result"]["lines"] for step in runner.steps
+                                           if "result" in step and "lines" in step["result"]})
                     result.update(engine='uiautomator2', steps=runner.steps,
                                   elapsed_ms=round((time.monotonic() - started) * 1000, 2))
                 self.store.finish(owner, request_id, state, result)

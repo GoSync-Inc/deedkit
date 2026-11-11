@@ -44,6 +44,13 @@ def test_lease_alias_conflict_is_rejected_and_lookup_defaults_are_discoverable()
     assert fields['optional_timeout_ms']['default'] == 1000
 
 
+# spec: ANYM-955
+def test_screen_text_and_full_hierarchy_are_discoverable_in_descriptions():
+    run, reference = CATALOG['android_run_flow']['description'], CATALOG['android_maestro']['description']
+    assert 'readScreenText' in run and 'data.<key>' in run and 'hierarchy {compressed: false' in run
+    assert 'reference.screen_text' in reference
+
+
 # spec: ANYM-951
 def test_existing_flows_remain_compatible_before_android_backend_upgrade():
     values = {'device_id': 'phone', 'session_id': 'lease',
