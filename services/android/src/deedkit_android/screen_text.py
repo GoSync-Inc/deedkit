@@ -5,12 +5,16 @@ from pathlib import Path
 import subprocess
 import tempfile
 import time
+from xml.etree import ElementTree
 
-from PIL import Image, ImageChops, ImageFilter, ImageOps
+from PIL import Image, ImageChops, ImageFilter, ImageOps, ImageStat
 
 from .config import Refused
+from .screen_structure import area, box as parse_box, contains, intersection
 
 PNG = b'\x89PNG\r\n\x1a\n'
+IMAGE_CLASSES = ('ImageView', 'TextureView')
+LARGE_IMAGE = 0.6  # an image over this share of the read region is a viewer or the target, not a photo to blank
 HINT = ('Text recognition needs ocr_command (absolute Tesseract path, also the fallback when Apple Vision is the '
         'engine) and optional ocr_languages, for example eng+ind, in the USB host configuration.')
 
@@ -110,6 +114,54 @@ def recognize(image, ocr, origin=(0, 0), min_confidence=None):
     return recognize_with(image, ocr, origin, min_confidence)[0]
 
 
+def dump_tree(device):
+    """The hierarchy as an element tree, or None: a read-only aid never fails the read."""
+    try:
+        return ElementTree.fromstring(device.jsonrpc_call('dumpWindowHierarchy', (True, 50)))
+    except Exception:  # noqa: BLE001 - secure screen, timeout or a broken dump; the OCR layout still stands
+        return None
+
+
+def is_image(node):
+    return (node.get('class') or '').endswith(IMAGE_CLASSES)
+
+
+def mask_plan(root, region):
+    """(image boxes to paint, text boxes to keep, large images skipped), in full-screen pixels inside the read region."""
+    read = (region['x'], region['y'], region['x'] + region['w'], region['y'] + region['h'])
+    nodes = []
+    for node in root.iter('node'):
+        found = parse_box(node.get('bounds'))
+        if found and area(found):
+            nodes.append((node, found))
+    images, skipped = [], 0
+    for node, found in nodes:
+        if is_image(node):
+            shown = intersection(found, read)
+            if area(shown) > LARGE_IMAGE * area(read):
+                skipped += 1
+            elif area(shown):
+                images.append(shown)
+    # Text the app draws over a photo (a badge, a price chip) is a node with its own text inside the photo's bounds.
+    keep = [found for node, found in nodes
+            if node.get('text') and node.get('password') != 'true' and not is_image(node)
+            and any(contains(shown, found) and area(found) * 2 <= area(shown) for shown in images)]
+    return images, keep, skipped
+
+
+def paint(image, origin, boxes, keep):
+    """Fill each image box with its own mean colour (so no edge appears), then restore the kept text boxes."""
+    if not boxes:
+        return
+    original = image.copy()
+    local = lambda found: (found[0] - origin[0], found[1] - origin[1], found[2] - origin[0], found[3] - origin[1])  # noqa: E731
+    for found in map(local, boxes):
+        colour = tuple(round(value) for value in ImageStat.Stat(image.crop(found)).mean)
+        image.paste(colour[0] if len(colour) == 1 else colour, found)
+    for found in map(local, keep):
+        image.paste(original.crop(found), found)
+
+
 def read_screen_text(device, options, ocr, locate):
     if not ocr:
         error = Refused('ocr_unavailable')
@@ -131,23 +183,27 @@ def read_screen_text(device, options, ocr, locate):
         if region['w'] < 1 or region['h'] < 1 or region['x'] + region['w'] > width or region['y'] + region['h'] > height:
             raise Refused('region_outside_screen')
         image = screen.crop((region['x'], region['y'], region['x'] + region['w'], region['y'] + region['h']))
+    mask = options.get('mask_images', True)
+    # One dump, right after the capture, serves the masking and the structure.
+    root = dump_tree(device) if mask or options.get('structure') else None
+    masked = None
+    if mask:
+        # Only this OCR copy is painted; the capture and anything android_observe returns stay as they were.
+        images, keep, skipped = mask_plan(root, region) if root is not None else ([], [], 0)
+        paint(image, (region['x'], region['y']), images, keep)
+        masked = {'regions': len(images), 'skipped_large': skipped, 'tree': 'ok' if root is not None else 'unavailable'}
     found, engine = recognize_with(image, ocr, (region['x'], region['y']), options.get('min_confidence'))
     limit = options.get('limit', 100)
     result = {'key': options.get('key', 'screen_text'), 'region': region,
               'lines': [{key: line[key] for key in ('text', 'bounds', 'confidence')} for line in found[:limit]],
               'truncated': len(found) > limit}
     if options.get('structure'):
-        from xml.etree import ElementTree
         from .screen_structure import MAX_ITEMS, build
-        try:
-            root = ElementTree.fromstring(device.jsonrpc_call('dumpWindowHierarchy', (True, 50)))
-        except Exception:  # noqa: BLE001 - read-only: the OCR layout still stands without the tree
-            root = None
         blocks, lists = build(found[:limit], root, (0, 0, width, height))
         result['structure'] = {
             'blocks': blocks, 'lists': lists,
             'tree': 'unavailable' if root is None else 'merged' if any(True for _ in root.iter('node')) else 'none',
             'truncated': len(found) > limit or any(len(item['items']) >= MAX_ITEMS for item in lists)}
     return {**result,
-            'ocr': {**engine, 'languages': ocr['languages'],
+            'ocr': {**engine, 'languages': ocr['languages'], 'masked': masked,
                     'elapsed_ms': round((time.monotonic() - started) * 1000, 2)}}

@@ -117,6 +117,46 @@ def test_read_screen_text_reports_preprocessing_and_reads_a_corpus_list(tmp_path
     assert 'Rp 1.250.000' in [line['text'] for line in result['lines']]
 
 
+# spec: ANYM-980
+def test_mask_images_keeps_text_printed_inside_a_photo_out_of_the_lines():
+    from deedkit_android.ui_worker import execute
+
+    image = Image.new('RGB', (1080, 700), 'white')
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((40, 60, 520, 520), fill='#7aa6c2')  # a product photo with text printed in it
+    draw.text((60, 260), 'FLASH SALE 50', fill='#10222e', font=ImageFont.load_default(size=56))
+    draw.text((580, 100), 'Sepatu Lari Pria', fill='black', font=ImageFont.load_default(size=44))
+    draw.text((580, 200), 'Rp 125.000', fill='black', font=ImageFont.load_default(size=44))
+    target = io.BytesIO()
+    image.save(target, format='PNG')
+    hierarchy = ('<hierarchy><node class="android.widget.FrameLayout" bounds="[0,0][1080,700]">'
+                 '<node class="android.widget.ImageView" bounds="[40,60][520,520]" />'
+                 '<node class="android.widget.TextView" text="Sepatu Lari Pria" bounds="[580,100][1000,160]" />'
+                 '<node class="android.widget.TextView" text="Rp 125.000" bounds="[580,200][900,260]" />'
+                 '</node></hierarchy>')
+
+    class Device:
+        def __init__(self):
+            self._dev = self
+
+        def shell2(self, args, timeout=None, encoding='utf-8'):
+            return SimpleNamespace(returncode=0, output=target.getvalue())
+
+        def jsonrpc_call(self, method, params, timeout=10):
+            return hierarchy
+
+    ocr = {'command': tesseract(), 'languages': 'eng'}
+    plain = execute(Device(), {'readScreenText': {'mask_images': False}}, ocr=ocr)
+    assert any('FLASH' in line['text'] or 'SALE' in line['text'] for line in plain['lines'])  # the photo's text is readable
+    masked = execute(Device(), {'readScreenText': {}}, ocr=ocr)
+    inside = [line['text'] for line in masked['lines']
+              if all(40 <= int(value) <= 520 for value in line['bounds'].replace('][', ',').strip('[]').split(',')[::2])]
+    assert inside == [] and 'FLASH' not in ' '.join(line['text'] for line in masked['lines'])
+    texts = [line['text'] for line in masked['lines']]
+    assert 'Sepatu Lari Pria' in texts and 'Rp 125.000' in texts
+    assert masked['ocr']['masked'] == {'regions': 1, 'skipped_large': 0, 'tree': 'ok'}
+
+
 # spec: ANYM-961
 def test_evaluation_prints_numbers_and_names_only(tmp_path):
     shutil.copy(CORPUS / 'settings_en_dark.png', tmp_path / 'private-1.png')
