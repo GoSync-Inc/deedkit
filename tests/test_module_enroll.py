@@ -287,6 +287,20 @@ def test_the_repository_manifest_of_recordings_is_valid_and_carries_no_live_acti
 
 
 # spec: ANYM-745
+def test_the_moved_enrollment_code_calls_the_production_names_a_test_patches(tmp_path, monkeypatch):
+    # W5-1b: enrollment lives in scripts/release_enroll.py; `production.run` patched is the run it calls.
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv[3])
+        return {"diff": "deploy/modules/recordings.json\0", "ls-tree": "deploy/modules/recordings.json\0",
+                "cat-file": RECORDINGS}[argv[3]]
+    monkeypatch.setattr(p, "run", run)
+    assert p.enrollment_pending(tmp_path, "a" * 40, "b" * 40, {"projects": []}) == ["recordings"]
+    assert calls == ["diff", "ls-tree", "cat-file"]
+    assert p.enrollment_pending.__globals__["__file__"] == str(ROOT / "scripts" / "release_enroll.py")
+
+
+# spec: ANYM-745
 def test_the_happy_plan_for_recordings_equals_the_golden_edits(tmp_path, monkeypatch):
     host = Enroller(tmp_path, monkeypatch)
     plan = host.plan()
