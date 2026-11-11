@@ -436,6 +436,48 @@ A messaging service from before this change refuses a call with `silent` (`unkno
 works as before. A silent row is refused before the provider by an older collector (`send_target_invalid`),
 so it is never sent with sound.
 
+### Mentioning group members (`mentions`, ANYM-928)
+
+`preview_message` and `send_message` (MCP and REST, chat_id recipients) take the optional `mentions`: up to 20
+`{sender, offset, length}`, no schema default; omitted or `[]` is the usual send. `sender` is an archive sender ID
+(a message's `sender`, a `search_people` `sender_id`). `offset` and `length` count UTF-16 code units of `text`,
+as formatting entities do (FORMATTING.md, Provider behavior), and mark the span shown as the mention, for
+example `@Анна`. The member is notified as when the owner mentions them in the app.
+
+- **Checks, before anything is queued.** Each span lies inside the text, on code point boundaries, without outer
+  whitespace (`mention_out_of_range`), and overlaps no other mention, link or code span
+  (`mention_overlap`); both refusals return `index` (the item) and `text_utf16_length`. In Markdown or HTML the
+  span must be plain source text that renders unchanged (inside bold is fine). Mentions are for groups: a private
+  chat, a channel, a phone or a username recipient is `mentions_not_group`. With `menu_choice` it is
+  `mentions_conflict`. The browser fallback (whatsapp-web.js) is `mentions_unsupported`.
+- **Membership.** The basis is the chat's current participants: a preview with mentions makes one
+  `list_participants` read of the chat itself (the key's own, when that operation is enabled for the account)
+  unless it holds one from the last 10 minutes; repeated previews within 10 minutes queue one read. Only when no
+  read is held (not enabled, rate limit, provider down, no answer within 12 s) does a sighting in that chat's
+  archive decide. The preview returns `membership_basis: participants|archive`. A person not found is
+  `mention_not_member`; a sender ID that names no person (a channel, a group, a malformed ID) is
+  `mention_unresolvable`; both carry `next_call: {tool: list_participants, arguments: {account, chat_id}}`.
+  The send checks the same rule against the newest read of the last day. On WhatsApp a participants read lists
+  phone or LID IDs as WhatsApp reports them; a member the archive knows by the other one is not matched.
+- **Preview.** `mentions_notified: [{sender, display_name, span_text}]` names everyone the mentions notify;
+  `mentions` shows the provider form. People notified by other means are shown too: on Telegram each plain
+  `@username` in the text as `notified_by_username`. On WhatsApp an `@<digits>` in the text without a matching
+  `mentions` item gives `warning: plain_at_is_not_a_mention`: **a WhatsApp member is notified only through
+  `mentions`**. The `preview_digest` binds the mentions, so adding, removing or moving one is `preview_mismatch`,
+  and a mentions send without a digest is `preview_required` (`caller_supplies` names `mentions`).
+- **Telegram.** Each mention becomes `InputMessageEntityMentionName` over the span. The collector resolves the
+  user from its session cache, else through one participants read of the chat; a user it still cannot resolve
+  fails the send `mention_unresolvable` before anything is sent, never as plain text.
+- **WhatsApp (native adapter).** Each span is replaced by `@<user part>` of the member's JID (the preview's
+  `provider_text` is this wire text) and the message carries `ContextInfo.MentionedJID`; a reply keeps its quote.
+  The span must stand apart from a word before it and a digit after it (`mention_overlap`), or the phone would
+  not render it.
+- **Retries.** The queued row keeps the mentions in its `render_policy` and render artifact: a retry with the same
+  `request_id` repeats them (else `idempotency_conflict`), the duplicate check treats different mentions as
+  different sends, and an `allow_duplicate` resend keeps its own mentions. `messages_send` does not take
+  `mentions`. A messaging service from before this change refuses a call with `mentions` (`unknown_field`); an
+  older collector or Go adapter refuses a mentions row before the provider (`send_target_invalid`).
+
 ### Menu choices: answering a WhatsApp bot menu (`menu_choice`, ANYM-837, schema 71)
 
 Many WhatsApp bots act only on the structured reply a phone sends when the user taps a menu option; a

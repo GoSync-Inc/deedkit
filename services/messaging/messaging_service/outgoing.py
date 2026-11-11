@@ -15,6 +15,7 @@ from .identifiers import ACCOUNT_RE, SEND_ID_RE, WA_CHAT_RE
 from .envelope import canonical, stable_id
 from .policy import audit, effective_permissions, lock_principal, targets
 from .store import APIError, serial
+from . import group_mentions
 from .silent_send import check as silent_check, render_policy, unsupported as silent_unsupported
 from .subscriptions import journal_send_failures
 
@@ -144,9 +145,11 @@ def target(c,p,account,chat_id,reply_to):
     return chat,reply_id
 
 
-def reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id,menu=None,silent=False):
+def reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id,menu=None,silent=False,
+             mentions=None,fresh_s=group_mentions.SEND_FRESH_S):
     """menu (ANYM-837): a resolved menu_choice; its menu, revision, type, option and label join the digest.
-    silent (ANYM-927): Telegram only; it joins the digest through the render policy (silent_send.py)."""
+    silent (ANYM-927): Telegram only; it joins the digest through the render policy (silent_send.py).
+    mentions (ANYM-928): group members to @-mention; the request and provider forms join the digest (group_mentions.py)."""
     from .formatting import render_message
     from .whatsapp_capabilities import account_provider
     silent_check(silent,chat['platform'])
@@ -155,7 +158,11 @@ def reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,c
         raise APIError('link_preview_unsupported',409)
     artifact=render_message(chat['platform'],text,format=format,
         link_preview=link_preview,allow_lossy=allow_lossy)
-    policy=render_policy(link_preview,allow_lossy,silent)
+    notice={}
+    if mentions:
+        artifact,notified,basis=group_mentions.apply(c,p,chat,text,format,link_preview,allow_lossy,artifact,mentions,fresh_s)
+        notice={'mentions_notified':notified,'membership_basis':basis}
+    policy=render_policy(link_preview,allow_lossy,silent,mentions)
     # This binds a scoped draft, never the owner's identity or approval.
     bound={'principal':p['id'],'scope_version':p['scope_version'],
         'account':account,'chat_id':chat_id,'provider_chat':chat['provider_chat'],
@@ -169,6 +176,7 @@ def reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,c
         'reply_to':reply_to,'reply_provider_id':reply_id,'render_policy':policy,
         'preview_digest':digest,'owner_approval_verified_by_server':False}
     if silent:draft['silent']=True
+    draft.update(notice,**group_mentions.notices(chat['platform'],artifact))
     if menu is not None:
         from . import menu_choice
         draft['menu_choice']=menu_choice.preview_block(menu,chat)
@@ -176,9 +184,10 @@ def reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,c
 
 
 def preview(c,p,account,chat_id,text,reply_to='',format='plain',link_preview=False,allow_lossy=False,menu_choice=None,
-            silent=False):
+            silent=False,mentions=None):
     """Render a scoped draft without provider calls, readiness or enqueueing."""
     format_options(format,link_preview,allow_lossy,silent=silent)
+    mentions=group_mentions.normalized(mentions);group_mentions.conflicts(mentions,menu_choice)
     if menu_choice is not None:
         # A menu is answered only on WhatsApp, which has no silent send (ANYM-927).
         if silent:raise silent_unsupported()
@@ -186,7 +195,8 @@ def preview(c,p,account,chat_id,text,reply_to='',format='plain',link_preview=Fal
         return reviewed(c,p,account,chat_id,menu['label'],menu['message_id'],'plain',False,False,chat,
             menu['provider_message_id'],menu)
     chat,reply_id=target(c,p,account,chat_id,reply_to)
-    return reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id,silent=silent)
+    return reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id,silent=silent,
+        mentions=mentions,fresh_s=group_mentions.PREVIEW_FRESH_S)
 
 
 def menu_arguments(text,reply_to,format,link_preview,allow_lossy,menu_choice):
@@ -240,10 +250,10 @@ def dispatch_payload(job,platform):
         else:
             policy=job.get('render_policy')
             if (not isinstance(artifact,dict) or not isinstance(policy,dict) or
-                set(artifact)!={'format','source_text','rendered_text','provider_text','entities',
+                set(artifact)-{'mentions'}!={'format','source_text','rendered_text','provider_text','entities',
                     'provider_payload','warnings','links','utf16_units','renderer_version'} or
-                set(policy)-{'silent'}!={'link_preview','allow_lossy'} or
-                any(type(v) is not bool for v in policy.values()) or policy.get('silent',True) is not True or
+                set(policy)-{'silent','mentions'}!={'link_preview','allow_lossy'} or
+                any(type(v) is not bool for k,v in policy.items() if k!='mentions') or policy.get('silent',True) is not True or
                 artifact.get('format') not in ('plain','markdown','html') or
                 artifact.get('format')!=job.get('source_format') or
                 not isinstance(artifact.get('source_text'),str) or
@@ -268,11 +278,12 @@ def dispatch_payload(job,platform):
             # visible text. Those semantic spans are not provider entities.
             validator=validate_entities if platform=='telegram' else validate_semantic_entities
             validator(artifact['rendered_text'],artifact['entities'])
-            if (artifact['format']!='plain' or policy['link_preview'] or policy['allow_lossy']) and (
+            if (artifact['format']!='plain' or policy['link_preview'] or policy['allow_lossy'] or 'mentions' in policy) and (
                 not isinstance(job.get('preview_digest'),str) or
                 not re.fullmatch(r'[a-f0-9]{64}',job['preview_digest'])):
                 raise ValueError('invalid_persisted_digest')
         payload=validate_provider_payload(platform,payload)
+        if artifact is not None:payload=group_mentions.dispatch_mentions(platform,artifact,job['render_policy'],payload)
         if isinstance(job.get('render_policy'),dict) and job['render_policy'].get('silent') is True:
             # ANYM-927: a silent row was previewed for a Telegram chat; no other platform sends it, loud or not.
             if platform!='telegram':raise ValueError('silent_unsupported')
@@ -566,14 +577,16 @@ def outbound_status(c,accounts):
 
 def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
             preview_digest='',link_preview=False,allow_lossy=False,phone_hash=None,child=False,
-            expected_last_message_id=None,guard=None,duplicate_guard=False,allow_duplicate=None,menu_choice=None,silent=False):
+            expected_last_message_id=None,guard=None,duplicate_guard=False,allow_duplicate=None,menu_choice=None,silent=False,
+            mentions=None):
     """menu_choice (ANYM-837): {message_id, option_id} of an archived WhatsApp menu, answered with its structured
     reply; it needs its own preview_digest and stores the archived label as the text.
     expected_last_message_id, guard (ANYM-736): the optional chat-head precondition, send_guard.py.
     duplicate_guard (ANYM-748): only the send_message tool passes True; allow_duplicate=True skips it for one call.
     phone_hash: a phone send (ANYM-532) whose digest the caller checked; it is the request hash.
     child: a messages_send step (ANYM-546) under its child key; only such a call may use the child prefix.
-    silent (ANYM-927): Telegram without a notification sound, with its own preview_digest (silent_send.py)."""
+    silent (ANYM-927): Telegram without a notification sound, with its own preview_digest (silent_send.py).
+    mentions (ANYM-928): group members to @-mention, with their own preview_digest (group_mentions.py)."""
     def refused(error,resolved=False):
         # ANYM-646: a caller's own send names the preview call; a phone step or a messages_send child keeps its body.
         # The chat is echoed only once it resolves for this key; a malformed digest is refused before that.
@@ -583,7 +596,8 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
             except Exception:return error
         from . import preview_refusal
         return preview_refusal.send(error,p,account,chat_id,reply_to=reply_to if isinstance(reply_to,str) else '',
-            format=format,link_preview=link_preview,allow_lossy=allow_lossy,silent=silent)
+            format=format,link_preview=link_preview,allow_lossy=allow_lossy,silent=silent,mentions=mentions)
+    mentions=group_mentions.normalized(mentions);group_mentions.conflicts(mentions,menu_choice)
     if menu_choice is not None:
         if phone_hash is not None or child:
             from .field_errors import refusal as field_refusal
@@ -621,7 +635,7 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
         # between this read and the insert is the guard's documented limit.
         try:send_guard.check(c,p,account,chat_id,chat['platform'],expected_last_message_id,guard)
         except APIError as failure:guard_refusal=failure
-    default_policy=format=='plain' and not link_preview and not allow_lossy and not silent
+    default_policy=format=='plain' and not link_preview and not allow_lossy and not silent and not mentions
     legacy_hash=hashlib.sha256(canonical([account,chat_id,text,reply_id])).hexdigest()
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('outgoing:'+p['id'],))
     existing=c.execute('SELECT * FROM outgoing_messages WHERE principal=%s AND request_id=%s',
@@ -641,19 +655,21 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
                 existing['account']==account and existing['chat']==chat_id and
                 existing['provider_chat']==chat['provider_chat'] and existing['reply_provider_id']==reply_id and
                 existing.get('source_text')==text and existing.get('source_format')==format and
-                existing.get('render_policy')==render_policy(link_preview,allow_lossy,silent) and
+                existing.get('render_policy')==render_policy(link_preview,allow_lossy,silent,mentions) and
                 (existing.get('preview_digest') or '')==preview_digest)
         if not matches:raise APIError('idempotency_conflict',409)
         return result(existing,c,p)
     if guard_refusal is not None:raise guard_refusal
     if duplicate_guard and allow_duplicate is not True:
-        refuse_unresolved_duplicate(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id,silent=silent)
+        refuse_unresolved_duplicate(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id,silent=silent,
+            mentions=mentions)
     if not default_policy and not preview_digest:raise refused(APIError('preview_required',409),True)
-    draft=reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id,silent=silent)
+    draft=reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id,silent=silent,
+        mentions=mentions)
     if phone_hash is None and preview_digest and preview_digest!=draft['preview_digest']:
         raise refused(APIError('preview_mismatch',409),True)
     artifact={name:draft[name] for name in ('format','source_text','rendered_text','provider_text','entities',
-        'provider_payload','warnings','links','utf16_units','renderer_version')}
+        'provider_payload','warnings','links','utf16_units','renderer_version',*(('mentions',) if mentions else ()))}
     request_hash=phone_hash or legacy_hash if default_policy else phone_hash or hashlib.sha256(canonical([
         account,chat_id,chat['provider_chat'],reply_id,artifact,draft['render_policy'],preview_digest])).hexdigest()
     admit(c,account,chat)
@@ -783,9 +799,9 @@ MENU_DUPLICATE_SQL=f"""SELECT request_id,status FROM outgoing_messages
 
 
 def unresolved_send(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id,option_id=None,
-                    silent=False):
+                    silent=False,mentions=None):
     """The newest unresolved earlier send of this principal with the same intent, or None."""
-    policy=Jsonb(render_policy(link_preview,allow_lossy,silent))
+    policy=Jsonb(render_policy(link_preview,allow_lossy,silent,mentions))
     if option_id is not None:
         return c.execute(MENU_DUPLICATE_SQL,(p['id'],account,chat_id,reply_id,option_id,request_id,
             CHILD_KEY_PREFIX)).fetchone()
@@ -794,7 +810,7 @@ def unresolved_send(c,p,account,chat_id,request_id,text,format,link_preview,allo
 
 
 def refuse_unresolved_duplicate(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id,
-                                option_id=None,silent=False):
+                                option_id=None,silent=False,mentions=None):
     """ANYM-748: refuse a send whose same content to the same chat is still queued, dispatching or unknown.
 
     Runs under the principal lock, so of two concurrent identical calls one queues and the other sees it. Its own
@@ -805,7 +821,7 @@ def refuse_unresolved_duplicate(c,p,account,chat_id,request_id,text,format,link_
             previous=c.execute("SELECT current_setting('statement_timeout') AS v").fetchone()['v']
             c.execute("SELECT set_config('statement_timeout',%s,true)",(str(DUPLICATE_TIMEOUT_MS),))
             earlier=unresolved_send(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id,option_id,
-                silent)
+                silent,mentions)
             c.execute("SELECT set_config('statement_timeout',%s,true)",(previous,))
     except Exception:
         raise APIError('chat_guard_unavailable',503) from None
@@ -849,7 +865,7 @@ def status(c,p,send_id=None,request_id=None):
 # Local refusals a finished row keeps by name; menu codes (ANYM-837) come from the native adapter or dispatch.
 SEND_REFUSALS=('send_expired','sending_disabled','send_target_invalid','send_access_changed','menu_choice_unsupported',
     'menu_unavailable','menu_changed','menu_option_ambiguous','menu_option_id_unrepresentable','menu_option_unsupported',
-    'menu_reply_shape_unverified')
+    'menu_reply_shape_unverified','mentions_unsupported','mention_unresolvable')
 
 
 class OutgoingWorker:

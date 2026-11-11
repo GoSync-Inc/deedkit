@@ -106,6 +106,12 @@ class ExcludedChat(TypedDict):
     __pydantic_config__ = ConfigDict(extra='forbid')
     account: StrictStr
     chat: StrictStr
+class Mention(TypedDict):
+    # ANYM-928: one @-mention of a group member; group_mentions.py checks the span, the chat and the member again.
+    __pydantic_config__ = ConfigDict(extra='forbid')
+    sender: StrictStr
+    offset: StrictInt
+    length: StrictInt
 # ANYM-830: the exclusion list's own conflict counter (0 before a definition's first list).
 # No schema default (as ANYM-826's page options), so a gateway never inserts them and an old backend sees none.
 ExclusionsRevision = Annotated[StrictInt | None, Field(ge=0,le=9007199254740991,

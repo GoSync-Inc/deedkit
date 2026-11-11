@@ -516,6 +516,8 @@ class NodeProvider:
         # ANYM-837: only the native adapter answers a menu; whatsapp-web.js would send the label as plain text.
         if 'menu_choice' in payload and self.cfg.get('provider','webjs')!='whatsmeow':
             raise SendRejected('menu_choice_unsupported')
+        # ANYM-928: only the native adapter sets MentionedJID; whatsapp-web.js would send @<number> as plain text.
+        if 'mentions' in payload and self.cfg.get('provider','webjs')!='whatsmeow':raise SendRejected('mentions_unsupported')
         if job.get('_preflight') is not None:await job['_preflight']()
         # Conservative: from here the adapter may already have the request.
         if report is not None:report('started')
@@ -523,7 +525,8 @@ class NodeProvider:
             'link_preview':payload['link_preview'],
             **({'send_id':job['id']} if SEND_ID_RE.fullmatch(job.get('id','')) else {}),
             'reply_provider_id':job.get('reply_provider_id'),'expires_at':job['expires_at'],
-            **({'menu_choice':payload['menu_choice']} if 'menu_choice' in payload else {})},sending=True)
+            **({'menu_choice':payload['menu_choice']} if 'menu_choice' in payload else {}),
+            **({'mentions':payload['mentions']} if 'mentions' in payload else {})},sending=True)
     async def execute_operation(self,job):
         if not self.send_lock.locked():raise RuntimeError('send_gate_required')
         report=job.get('_provider_phase')

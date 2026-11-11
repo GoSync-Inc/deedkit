@@ -78,7 +78,12 @@ Initial rich-link destinations allow HTTP(S) only, without fetching them during
 preview or rendering. Reject executable/local schemes and hidden control
 characters. Preserve URL destinations and make them visible in the approval
 preview. Provider-native mentions/custom emoji and other special actions require
-separate explicit support, rather than constructing them from arbitrary HTML.
+separate explicit support, rather than constructing them from arbitrary HTML. Mentions
+of group members have it: the `mentions` parameter (SENDING.md, ANYM-928), whose
+`{sender, offset, length}` spans count UTF-16 code units of the source text like
+these entities. A mention span must not overlap a link or code span; inside a style
+span it may. Telegram sends it as `InputMessageEntityMentionName` beside the
+formatting entities; WhatsApp replaces it with `@<number>` in the wire text.
 
 ## Provider behavior
 

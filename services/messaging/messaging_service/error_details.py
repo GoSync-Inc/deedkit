@@ -56,6 +56,9 @@ def payload(error,operation='',request_id=None):
     # ANYM-748: a refused duplicate names the caller's own earlier request_id and its status, never text or send_id.
     for name in ('earlier_request_id','earlier_status'):
         if hasattr(error,name):info[name]=getattr(error,name)
+    # ANYM-928: a refused mention names its item index and the text's UTF-16 length, never the text.
+    for name in ('index','text_utf16_length'):
+        if hasattr(error,name):info[name]=getattr(error,name)
     # ANYM-848: a refused wake target names the caller's own targets (IDs, labels, threads, states, versions), the
     # operator's disable reason and the limit; never another key's ID.
     for name in ('disabled_reason','wake_target','wake_targets'):
