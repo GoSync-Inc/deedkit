@@ -268,6 +268,8 @@ def create_app(config_path):
                       "next_offset": args["offset"] + len(content),
                       "eof": args["offset"] + len(content) == size,
                       "chunk_sha256": hashlib.sha256(content).hexdigest()}
+            if not result["eof"]:
+                result.update(next_action="read_next_chunk", max_length=4194304)
         return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
     return app

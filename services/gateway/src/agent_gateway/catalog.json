@@ -8987,7 +8987,7 @@
       "android:read"
     ],
     "required_manifest": true,
-    "description": "Read native-resolution PNG and UI elements in device-pixel coordinates under an acquired session. Image width/height identify the source coordinate space even if the client resizes its preview. The active persistent UI engine supplies the hierarchy when configured. Missing hierarchy does not prevent a screenshot. Re-observe after UI changes. Use crop={x,y,w,h} for small text. image_mode=file or both saves exact PNG bytes and returns image_file.file_id. Use android_download with that file_id and length up to 4194304 to obtain the original bytes.",
+    "description": "Read native-resolution PNG and UI elements in device-pixel coordinates under an acquired session. Image width/height identify the source coordinate space even if the client resizes its preview. The active persistent UI engine supplies the hierarchy when configured. Missing hierarchy does not prevent a screenshot. Re-observe after UI changes. Use crop={x,y,w,h} for small text. image_mode=file or both saves exact PNG bytes and returns image_file.file_id. Use android_download with that file_id and length up to 4194304 to obtain the original bytes. image_mode=inline or both returns two MCP content parts: JSON text first (with image_file for both), then the PNG image. image_mode=file returns one JSON part for clients that need a single object.",
     "inputSchema": {
       "$defs": {
         "Crop": {
@@ -9283,7 +9283,7 @@
       "android:read"
     ],
     "required_manifest": true,
-    "description": "Read a private file as base64 with byte offset and length up to 4194304 (4 MiB). Default length remains 32768 for compatibility. Return includes SHA256 for each chunk, next_offset and eof.",
+    "description": "Read a private file as base64 with byte offset and length up to 4194304 (4 MiB). Default length remains 32768 for compatibility. A partial chunk returns next_action=read_next_chunk and max_length; pass length=4194304 to read a screenshot in one call. Return includes SHA256 for each chunk, next_offset and eof.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
