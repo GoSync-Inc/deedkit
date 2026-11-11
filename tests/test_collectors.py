@@ -1456,6 +1456,92 @@ def test_message_reads_return_a_shared_whatsapp_location_and_never_its_live_trac
     assert store.search(other,'Синтетик')['items']==[]
 
 
+WA_EVENT='false_'+WA_GROUP+'_EVT1_444444@c.us'
+SYNTHETIC_EVENT={'name':'Шашлыки','description':'Берите пледы','start':'2099-06-01T10:00:00Z','end':'2099-06-01T12:00:00Z',
+    'location':{'title':'Парк','address':'ул. Синтетическая 1','latitude':55.75,'longitude':37.61},
+    'join_link':'https://call.whatsapp.com/video/synthetic','canceled':False,'is_call':False}
+
+
+def event_capture(block=None,*,mid=WA_EVENT,at=1700000000,responses=None,edited=None):
+    """The whatsmeow event envelope (events.go eventBlock, withEventResponses), synthetic only."""
+    block=deepcopy(SYNTHETIC_EVENT if block is None else block)
+    capture=wa_capture(mid,at,body=block['name'] if isinstance(block,dict) and isinstance(block.get('name'),str) else 'Шашлыки',kind='event',actor='444444@c.us')
+    capture['event'].update(isService=False,event=block)
+    if responses is not None:capture['event']['eventResponses']=responses
+    if edited is not None:capture['event']['editedTimestampMs']=edited;capture['change']='edit'
+    return capture
+
+
+# spec: ANYM-924
+def test_a_whatsapp_event_keeps_its_block_and_an_invalid_block_costs_only_the_block(caplog):
+    stored=validate_capture(event_capture(responses={'going':2,'not_going':0,'maybe':1}))['envelope']
+    assert stored['body']=='Шашлыки' and stored['metadata']['message_kind']=='event' and not stored['metadata']['is_service']
+    assert stored['metadata']['event']==SYNTHETIC_EVENT and stored['metadata']['event_responses']=={'going':2,'not_going':0,'maybe':1}
+    for bad in ({**SYNTHETIC_EVENT,'start':'tomorrow'},{**SYNTHETIC_EVENT,'end':'2099-06-01T09:00:00Z'},{**SYNTHETIC_EVENT,'name':'я'*257},
+            {**SYNTHETIC_EVENT,'description':'о'*2049},{**SYNTHETIC_EVENT,'location':{'title':'Парк','latitude':91}},
+            {**SYNTHETIC_EVENT,'canceled':'yes'},{**SYNTHETIC_EVENT,'extra':1},{**SYNTHETIC_EVENT,'join_link':'x\x00'},'Шашлыки'):
+        caplog.clear()
+        with caplog.at_level('WARNING'):
+            kept=validate_capture(event_capture(bad))['envelope']
+        assert 'event' not in kept['metadata'] and kept['metadata']['message_kind']=='event',bad
+        assert 'invalid_event' in caplog.text and 'Шашлыки' not in caplog.text and 'Синтетическая' not in caplog.text
+    # Counts the archive cannot accept are dropped too; the event stays.
+    kept=validate_capture(event_capture(responses={'going':-1,'not_going':0,'maybe':0}))['envelope']
+    assert 'event_responses' not in kept['metadata'] and kept['metadata']['event']==SYNTHETIC_EVENT
+    # Only an event carries the block, and a deleted event keeps none.
+    text=wa_capture('false_'+WA_GROUP+'_TXT_444444@c.us',1700000000,body='x',actor='444444@c.us')
+    text['event'].update(event=SYNTHETIC_EVENT)
+    assert 'event' not in validate_capture(text)['envelope']['metadata']
+    gone=event_capture(responses={'going':1,'not_going':0,'maybe':0});gone['change']='delete'
+    assert not {'event','event_responses'}&set(validate_capture(gone)['envelope']['metadata'])
+
+
+# spec: ANYM-924
+def test_message_reads_return_a_whatsapp_event_with_a_calendar_suggestion_and_no_calendar_write(wa_groups,monkeypatch):
+    import socket
+    import urllib.request
+    requests=[]
+    def refuse(*args,**kwargs):
+        requests.append(args)
+        raise OSError('no network in this test')
+    # Capture, reads, the cancellation and the subscription match make no request to any service, the calendar included.
+    monkeypatch.setattr(socket.socket,'connect',refuse);monkeypatch.setattr(socket,'create_connection',refuse)
+    monkeypatch.setattr(urllib.request,'urlopen',refuse)
+    from messaging_service.subscriptions import match_subscriptions
+    state,store,key=wa_groups
+    chat_id=stable_id('chat','wa-groups',WA_GROUP)
+    subscription=store.create_subscription(key,[chat_id])['subscription_id']
+    state.apply(event_capture(responses={'going':1,'not_going':0,'maybe':2}))
+    past={**SYNTHETIC_EVENT,'name':'Прошедшее','start':'2020-01-01T10:00:00Z','end':None,'location':None,'description':None}
+    state.apply(event_capture(past,mid='false_'+WA_GROUP+'_EVT2_444444@c.us',at=1700000010))
+    mid,pid=(stable_id('msg','wa-groups',WA_GROUP,'false_'+WA_GROUP+f'_EVT{n}_444444@c.us') for n in (1,2))
+    # The calendar service's schedule call takes title, start and duration (minutes); the rest is context to show.
+    suggestion={'title':'Шашлыки','start':'2099-06-01T10:00:00Z','duration':120,'end':'2099-06-01T12:00:00Z',
+        'location_text':'Парк, ул. Синтетическая 1','description':'Берите пледы','source_message':mid}
+    reads={'archive':store.get_messages(key,chat_id)['items'],'conversation':store.get_messages(key,chat_id,view='conversation')['items'],
+        'search':store.search(key,'Шашлыки',chat=chat_id)['items'],'context':[store.get_context(key,mid)['message']]}
+    for name,items in reads.items():
+        row=next(i for i in items if i['id']==mid)
+        assert row['event']==SYNTHETIC_EVENT and row['calendar_suggestion']==suggestion,name
+        assert row['event_responses']=={'going':1,'not_going':0,'maybe':2},name
+    assert next(i for i in reads['conversation'] if i['id']==mid)['kind']=='event'
+    # An event in the past keeps its block and gets no suggestion.
+    old=next(i for i in reads['archive'] if i['id']==pid)
+    assert old['event']==past and 'calendar_suggestion' not in old and 'event_responses' not in old
+    # An event wakes subscriptions like a message; its reference names the kind, never the place or text.
+    match_subscriptions(store)
+    references=store.get_subscription_events(key,subscription,limit=100)['items']
+    assert [r['metadata']['message_kind'] for r in references]==['event','event']
+    dump=json.dumps(references,default=str,ensure_ascii=False)
+    assert 'Синтетическая' not in dump and 'Берите' not in dump and 'event_responses' not in dump
+    # A cancellation (an edit of the event) updates it and withdraws the suggestion.
+    state.apply(event_capture({**SYNTHETIC_EVENT,'end':None,'canceled':True},edited=1700000100000,responses={'going':1,'not_going':1,'maybe':2}))
+    row=store.get_context(key,mid)['message']
+    assert row['event']=={**SYNTHETIC_EVENT,'end':None,'canceled':True} and 'calendar_suggestion' not in row
+    assert row['event_responses']=={'going':1,'not_going':1,'maybe':2}
+    assert requests==[]
+
+
 # spec: ANYM-921
 def test_poll_updates_wake_only_a_subscription_that_lists_them(wa_groups):
     from messaging_service.subscriptions import match_subscriptions
