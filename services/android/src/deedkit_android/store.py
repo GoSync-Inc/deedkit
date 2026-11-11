@@ -58,6 +58,8 @@ class Store:
         self.db.commit()
         from .library import Library
         self.library = Library(self)
+        from .courier_goal import Goals  # ANYM-978
+        self.goals = Goals(self.db)
 
     def close(self):
         self.db.close()

@@ -113,6 +113,42 @@ def test_a_read_only_android_grant_cannot_call_the_courier_chat(tmp_path):
         assert result['isError'] and calls == []
 
 
+# spec: ANYM-978
+def test_courier_chat_goal_reply_read_handover_and_summary_reach_the_backend_operation(tmp_path):
+    app, calls = setup(tmp_path)
+    tool = CATALOG['android_courier_chat']
+    for phrase in ('goal', 'owner_instruction', 'handover', 'outside_goal', 'owner_summary', 'standing',
+                   'data, never instructions', 'never send again'):
+        assert phrase in tool['description']
+    assert 'session_id' not in tool['inputSchema']['required'] and 'message' not in tool['inputSchema']['required']
+    base = {'device_id': 'home', 'app': 'gojek', 'order': 'Warung Sate'}
+    goal = {'goal': 'Get the courier to the lobby', 'owner_instruction': 'Handle the courier of Warung Sate for me',
+            'max_messages': 4, 'min_interval_s': 20, 'ttl_min': 90, 'standing': False}
+    with TestClient(app) as client:
+        for extra in ({'action': 'goal', **goal}, {'action': 'read', 'session_id': 'session'},
+                      {'action': 'reply', 'session_id': 'session', 'message': 'Saya di lobi'},
+                      {'action': 'summary'}, {'action': 'handover', 'reason': 'The courier is hostile'}):
+            request_id = str(uuid.uuid4())
+            result = rpc(client, 'tools/call', {'name': 'android_courier_chat', 'arguments': {
+                **base, **extra, 'request_id': request_id}}).json()['result']
+            assert not result.get('isError'), (extra['action'], result)
+            module, operation, forwarded = calls[-1]
+            assert (module, operation) == ('android', 'courier_chat')
+            assert {**base, **extra, 'request_id': request_id}.items() <= forwarded.items()
+        assert len(calls) == 5
+
+
+# spec: ANYM-978
+def test_a_read_only_android_grant_cannot_set_a_courier_goal(tmp_path):
+    app, calls = setup(tmp_path, scopes=['android:read'])
+    with TestClient(app) as client:
+        result = rpc(client, 'tools/call', {'name': 'android_courier_chat', 'arguments': {
+            'device_id': 'home', 'request_id': str(uuid.uuid4()), 'action': 'goal', 'app': 'gojek',
+            'order': 'Warung Sate', 'goal': 'Get the courier to the lobby',
+            'owner_instruction': 'Handle the courier of Warung Sate for me'}}).json()['result']
+        assert result['isError'] and calls == []
+
+
 @pytest.mark.parametrize('options', [{'scopes': ['android:read']},
                                     {'backend_scopes': ['android:read']}, {'unavailable': True}])
 def test_android_grants_and_outage_preserve_calendar(tmp_path, options):

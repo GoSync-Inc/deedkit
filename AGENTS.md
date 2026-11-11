@@ -29,6 +29,12 @@ docs/operations/parallel-development.md.
 - No send, call, ACK, pairing or provider-session start/stop without the owner's exact
   confirmation, except the incident recovery authority in section 2. Never retry an uncertain mutation or mint a new request ID. Never run two clients
   on one provider session. Tests and health checks never touch a live provider.
+- Override: the exact confirmation per message in one courier chat (owner 11-11: «Если ему говорю
+  какую-то цель, он там может серию сообщений делать сам. Я вообще с водителем не хочу общаться ... он может
+  полностью их проводить, пока они не доходят до меня, если только он не справляется»). Under the owner's goal for
+  an order, recorded by `android_courier_chat action=goal`, the agent messages that order's courier only, inside
+  the code's bounds, and hands the chat back when it cannot cope. Calls, `android_execute` and every other
+  send keep this section's confirmation. Enforcer: services/android/tests/test_courier_goal.py.
 - Never change applied migrations, provider IDs, existing test paths, names or parameters (Tiden
   IDs) or the seven `anymsg-ci::*` checks.
 - Deploys only via `scripts/production.py` from a green `main` SHA (docs/operations/production.md);

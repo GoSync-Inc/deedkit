@@ -9,6 +9,11 @@ Single steps only: hierarchy reads, a tap on the chat entry and on the message f
 UI engine (its guard applies to them), and one adb `input tap` on the send node. The send label is a guard stop phrase
 for scenarios, so that one tap is made here, after this module's own screen rule and only with a digest from a preview.
 Nothing else is ever tapped: a node is a target only when its own text or content-desc is one of the labels below.
+
+ANYM-978 adds `reply` and `read` beside them: with the owner's goal for the order (courier_goal.py) `reply` types and
+sends one message without a digest, inside the goal's bounds, and `read` looks at the chat for a new courier message.
+Both use these same steps, this screen rule and the same three nodes; a bound, a courier topic or a stop hands the
+chat over to the owner. `goal`, `handover` and `summary` touch the goal's state only and need no phone.
 """
 
 import asyncio
@@ -19,9 +24,12 @@ import json
 import secrets
 import time
 
+from . import courier_goal
 from .config import Refused
+from .courier_goal import Gate, Handover
 from .device import run_process
 from .guard import Rules, Stop, normalize, parse_bounds
+from .store import identifier
 
 APPS = {'gojek': 'com.gojek.app', 'grab': 'com.grabtaxi.passenger'}  # ids resolve on Google Play, 2026-11-11
 CHAT_ENTRY = frozenset({'chat', 'chat driver', 'chat dengan driver', 'chat with driver', 'message driver'})
@@ -90,15 +98,39 @@ def read_digest(principal, args):
 
 def check_request(principal, args):
     """Criteria 1 and 3: argument shape and the digest, before any device call."""
-    if not words(args['order']) or not words(args['message']):
+    action = args['action']
+    if not words(args['order']):
         raise Refused('invalid_arguments', 422)
-    if args['action'] == 'preview':
+    if action in courier_goal.STORE_ACTIONS:  # ANYM-978: the owner's goal, a handover, the summary
+        if action == 'goal' and (not words(args.get('goal')) or len(args.get('owner_instruction') or '') < 3):
+            raise Refused('invalid_arguments', 422)
+        if action == 'handover' and not words(args.get('reason')):
+            raise Refused('invalid_arguments', 422)
+        return
+    if not args.get('session_id'):
+        raise Refused('invalid_arguments', 422)
+    if action == 'read':
+        return
+    if not words(args.get('message')):
+        raise Refused('invalid_arguments', 422)
+    if action in {'preview', 'reply'}:
         if args.get('preview_digest') or args.get('owner_instruction'):
             raise Refused('invalid_arguments', 422)
         return
     read_digest(principal, args)
     if len(args.get('owner_instruction') or '') < 3:
         raise Refused('invalid_arguments', 422)
+
+
+async def handle(devices, owner, args):
+    """What the route does for `courier_chat`: the pre-device checks, then the goal's state or the job under the device lock."""
+    check_request(owner, args)
+    if args['action'] in courier_goal.STORE_ACTIONS:
+        return devices.store.goals.manage(owner, args)
+    request_id = identifier(args['request_id'])
+    job = CourierChat(devices, owner, args['device_id'], {**args, 'request_id': request_id})
+    return await devices.execute(owner, args['device_id'], args['session_id'], request_id, None,
+                                 args.get('timeout_s', 60), args.get('wait_s', 15), job=job)
 
 
 def box(node):
@@ -125,13 +157,14 @@ class CourierChat:
 
     def __init__(self, devices, owner, device, args):
         self.devices, self.owner, self.device, self.args = devices, owner, device, args
-        self.action, self.app, self.order, self.message = args['action'], args['app'], args['order'], args['message']
+        self.action, self.app, self.order, self.message = args['action'], args['app'], args['order'], args.get('message')
         self.package, self.digest = APPS[args['app']], args.get('preview_digest') or ''
         self.owner_instruction = args.get('owner_instruction') or ''
         guard = getattr(devices.config, 'guard', None)
         self.rules = Rules(guard.model_dump() if guard is not None else None)
         self.tapped = False
         self.before_sha = self.after_sha = None
+        self.goals, self.row = devices.store.goals, None  # ANYM-978: the order's rule, for reply and read
 
     @property
     def identity(self):
@@ -140,7 +173,7 @@ class CourierChat:
 
     def receipt(self, **values):
         found = {'action': self.action, 'device_id': self.device, 'app': self.app, 'order': self.order,
-                 'message': self.message, 'automatic_retry': False}
+                 'automatic_retry': False, **({'message': self.message} if self.message else {})}
         if self.owner_instruction:
             found['owner_instruction'] = self.owner_instruction
         found.update({key: value for key, value in (('screenshot_before_sha256', self.before_sha),
@@ -232,6 +265,11 @@ class CourierChat:
             await asyncio.sleep(POLL_S)
 
     async def run(self):
+        if self.action == 'reply':
+            self.row = self.goals.rule(self.owner, self.app, self.order, self.args)
+            self.goals.admit(self.row, self.args, self.message)
+        elif self.action == 'read':
+            self.row = self.goals.rule(self.owner, self.app, self.order, self.args)
         nodes = await self.read()
         if self.action == 'send':
             try:
@@ -243,9 +281,11 @@ class CourierChat:
         else:
             self.screen(nodes)
         self.before_sha = await self.shot()
-        return await (self.send(nodes) if self.action == 'send' else self.preview(nodes))
+        step = {'send': self.send, 'reply': self.reply, 'read': self.look}.get(self.action, self.preview)
+        return await step(nodes)
 
-    async def preview(self, nodes):
+    async def open_chat(self, nodes):
+        """The screen with the message field: tap the chat entry once when the field is not on screen."""
         field = self.field(nodes)
         if field is None:
             entries = self.targets(nodes, CHAT_ENTRY)
@@ -256,6 +296,10 @@ class CourierChat:
             if nodes is None:
                 raise Refused('message_field_not_found', 409)
             field = self.field(nodes)
+        return nodes, field
+
+    async def type_message(self, field):
+        """Replace the field's content with the message and read it back; the screen rule applies to the result."""
         await self.ui({'tapOn': {'point': '%d,%d' % centre(field)}})
         if words(self.typed(field)) != words(self.message):
             if self.typed(field):
@@ -266,6 +310,11 @@ class CourierChat:
         field = self.field(nodes)
         if field is None or words(self.typed(field)) != words(self.message):
             raise Refused('typed_text_mismatch', 409)
+        return nodes, field
+
+    async def preview(self, nodes):
+        nodes, field = await self.open_chat(nodes)
+        nodes, field = await self.type_message(field)
         chat = self.chat(nodes, field)
         chat_sha = hashlib.sha256('\n'.join(chat).encode()).hexdigest()
         expires = int(clock()) + DIGEST_TTL_S
@@ -287,26 +336,95 @@ class CourierChat:
         if field is None or words(self.typed(field)) != words(self.message) \
                 or hashlib.sha256('\n'.join(self.chat(nodes, field)).encode()).hexdigest() != chat_sha:
             raise Preview('preview_mismatch', self.args)
-        top, bottom = box(field)[1], box(field)[3]
-        sends = [node for node in self.targets(nodes, SEND) if box(node)[3] > top and box(node)[1] < bottom]
-        if len(sends) != 1:
-            raise Refused('send_button_not_found' if not sends else 'send_button_ambiguous', 409)
+        node = self.send_node(nodes, field)
         seen = self.mentions(nodes)
         self.consume()
         # The one mutation that can be uncertain: from here on a failure is `unknown`, never retried.
         self.tapped = True
-        x, y = centre(sends[0])
+        nodes = await self.tap_send(node, seen)
+        self.after_sha = await self.shot()
+        field = self.field(nodes)
+        return 'succeeded', self.receipt(sent=True, side_effects='sent', untrusted=UNTRUSTED,
+                                         chat=self.chat(nodes, field) if field else [],
+                                         next_action='read_replies_with_android_observe')
+
+    def send_node(self, nodes, field):
+        top, bottom = box(field)[1], box(field)[3]
+        sends = [node for node in self.targets(nodes, SEND) if box(node)[3] > top and box(node)[1] < bottom]
+        if len(sends) != 1:
+            raise Refused('send_button_not_found' if not sends else 'send_button_ambiguous', 409)
+        return sends[0]
+
+    async def tap_send(self, node, seen):
+        """The one adb tap, then the wait for the message to show as a new entry."""
+        x, y = centre(node)
         code, _, _ = await run_process([*self.devices.adb(self.device), 'shell', 'input', 'tap', str(x), str(y)], 10)
         if code:
             raise Refused('send_tap_failed', 409)
         nodes = await self.until(lambda found: self.mentions(found) > seen, SEND_WAIT_S, tolerant=True)
         if nodes is None:
             raise Refused('message_not_seen', 409)
+        return nodes
+
+    # ANYM-978: the owner's goal lets the agent reply and read without a yes per message.
+    def hits(self, rows):
+        """New courier rows that name a topic only the owner may handle."""
+        found = ((text, courier_goal.topic(text, inbound=True)) for text in self.goals.new_rows(self.row, rows))
+        return [(text, name) for text, name in found if name]
+
+    def courier_check(self, nodes, field):
+        rows = self.chat(nodes, field)
+        for text, name in self.hits(rows)[:1]:
+            reason = 'courier_raised_' + name
+            raise Handover(reason, self.goals.hand_over(self.row, reason, chat=rows, courier_row=text))
+
+    def order_seen(self, nodes):
+        wanted = words(self.order)
+        return any(node.get('package') == self.package and wanted in words(f"{node.get('text')} {node.get('content-desc')}")
+                   for node in nodes)
+
+    async def erase(self):
+        try:
+            await self.ui({'eraseText': {}})
+        except Exception:  # noqa: BLE001 - the handover stands even when the draft stays in the field
+            pass
+
+    async def reply(self, nodes):
+        nodes, field = await self.open_chat(nodes)
+        self.courier_check(nodes, field)
+        nodes, field = await self.type_message(field)
+        try:
+            self.courier_check(nodes, field)
+        except Handover:
+            await self.erase()
+            raise
+        node, seen, order_seen = self.send_node(nodes, field), self.mentions(nodes), self.order_seen(nodes)
+        self.goals.reserve(self.row, self.args['request_id'], self.message)  # counted before the tap
+        self.tapped = True
+        nodes = await self.tap_send(node, seen)
         self.after_sha = await self.shot()
+        self.goals.settle(self.row, self.args['request_id'], 'sent')
         field = self.field(nodes)
-        return 'succeeded', self.receipt(sent=True, side_effects='sent', untrusted=UNTRUSTED,
-                                         chat=self.chat(nodes, field) if field else [],
-                                         next_action='read_replies_with_android_observe')
+        return 'succeeded', self.receipt(
+            sent=True, side_effects='sent', autonomous=True, goal=self.row['goal'], authorized_by=self.row['instruction'],
+            message_number=self.row['sent'], max_messages=self.row['max_messages'], order_seen=order_seen,
+            owner_summary=self.goals.line(self.row), untrusted=UNTRUSTED, chat=self.chat(nodes, field) if field else [],
+            next_action='tell_the_owner_in_one_line_then_read_replies_with_courier_chat_read')
+
+    async def look(self, nodes):
+        nodes, field = await self.open_chat(nodes)
+        rows = self.chat(nodes, field)
+        new, hits = self.goals.new_rows(self.row, rows), self.hits(rows)
+        self.goals.mark_seen(self.row, rows)
+        found = {}
+        if hits and self.row['state'] == 'active':
+            reason = 'courier_raised_' + hits[0][1]
+            found['handover'] = self.goals.hand_over(self.row, reason, chat=rows, courier_row=hits[0][0])
+        return 'succeeded', self.receipt(
+            sent=False, side_effects='none', chat=rows, new_from_courier=new, untrusted=UNTRUSTED,
+            needs_owner=[{'row': text, 'topic': name} for text, name in hits], goal_state=self.row['state'],
+            order_seen=self.order_seen(nodes), owner_summary=self.goals.line(self.row),
+            next_action='tell_the_owner_now' if found else 'reply_within_the_goal_or_propose_with_preview', **found)
 
     def key(self):
         return 'digest:' + hashlib.sha256(self.digest.encode()).hexdigest()
@@ -326,7 +444,28 @@ class CourierChat:
         store.finish(self.owner, self.key(), 'succeeded', {'send_request_id': self.args.get('request_id')})
 
     async def failure(self, error, observe=True):
-        """The receipt for an error that ended `run`: a definite stop, a failure with no side effect, or unknown."""
+        """The receipt for an error that ended `run`; a reply or read also settles the order's rule (ANYM-978)."""
+        state, result = await self.outcome(error, observe)
+        if self.action not in {'reply', 'read'} or self.row is None:
+            return state, result
+        request_id, block = self.args['request_id'], None
+        if isinstance(error, Handover):
+            return 'stopped', {**result, 'stop_reason': 'handover', 'handover': error.block, 'next_action': 'tell_the_owner_now'}
+        if isinstance(error, Gate):
+            return state, result  # a refusal before the phone was touched
+        if state == 'stopped':  # the screen rule: payment, PIN, card, password or a protected package
+            block = self.goals.hand_over(self.row, 'guard_stop')
+        elif state == 'unknown':
+            self.goals.settle(self.row, request_id, 'unknown')
+            block = self.goals.hand_over(self.row, 'unknown_send_outcome')
+        else:
+            block = self.goals.failed_turn(self.row, request_id, result.get('error'), self.message)
+            if block:
+                state, result = 'stopped', {**result, 'stop_reason': 'handover', 'next_action': 'tell_the_owner_now'}
+        return state, {**result, **({'handover': block} if block else {})}
+
+    async def outcome(self, error, observe=True):
+        """A definite stop, a failure with no side effect, or unknown."""
         code = error.code if isinstance(error, Refused) else error
         guard = getattr(error, 'guard', None) if code == 'guard_stopped' else None
         if guard and not self.tapped:
@@ -347,7 +486,9 @@ class CourierChat:
         result = self.receipt(sent=False, error=code, side_effects='none',
                               next_action='inspect_failure_observation_and_correct_the_request')
         result.update(getattr(error, 'extra', {}))
-        if code == 'not_courier_app' or not getattr(error, 'observe', True):
+        if getattr(error, 'observe', True) is None:
+            pass  # a refusal before any device read: nothing to capture
+        elif code == 'not_courier_app' or not getattr(error, 'observe', True):
             result['observation'] = {'withheld': 'not_courier_app', 'expected_package': self.package}
         elif observe:
             result['observation'] = await self.safe_observation()
