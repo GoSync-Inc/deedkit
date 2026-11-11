@@ -17,6 +17,12 @@ HINT = ('Text recognition needs ocr_command (absolute Tesseract path) and option
 
 def lines(tsv, origin, min_confidence):
     """Group Tesseract word rows (level 5) into lines in full-screen pixels."""
+    return [{key: line[key] for key in ('text', 'bounds', 'confidence')}
+            for line in engine_lines(tsv, origin, min_confidence)]
+
+
+def engine_lines(tsv, origin, min_confidence):
+    """Lines with their words, as the engine laid them out, top to bottom."""
     groups = {}
     for row in tsv.splitlines()[1:]:
         cells = row.split('\t')
@@ -29,16 +35,20 @@ def lines(tsv, origin, min_confidence):
             continue
         if confidence >= 0:
             groups.setdefault(tuple(cells[1:5]), []).append(
-                (left, top, left + width, top + height, confidence, cells[11].strip()))
+                (left + origin[0], top + origin[1], left + width + origin[0], top + height + origin[1],
+                 confidence, cells[11].strip()))
     found = []
     for words in groups.values():
         confidence = round(sum(word[4] for word in words) / len(words), 1)
         if confidence < min_confidence:
             continue
-        left, top = min(word[0] for word in words) + origin[0], min(word[1] for word in words) + origin[1]
-        right, bottom = max(word[2] for word in words) + origin[0], max(word[3] for word in words) + origin[1]
+        left, top = min(word[0] for word in words), min(word[1] for word in words)
+        right, bottom = max(word[2] for word in words), max(word[3] for word in words)
         found.append(((top, left), {'text': ' '.join(word[5] for word in words),
-                                    'bounds': f'[{left},{top}][{right},{bottom}]', 'confidence': confidence}))
+                                    'bounds': f'[{left},{top}][{right},{bottom}]', 'confidence': confidence,
+                                    'box': (left, top, right, bottom),
+                                    'words': [{'text': word[5], 'bounds': f'[{word[0]},{word[1]}][{word[2]},{word[3]}]',
+                                               'confidence': round(word[4], 1)} for word in words]}))
     return [line for _, line in sorted(found, key=lambda item: item[0])]
 
 
@@ -74,9 +84,23 @@ def read_screen_text(device, options, ocr, locate):
             raise Refused('ocr_failed') from None
     if done.returncode:
         raise Refused('ocr_failed')
-    found = lines(done.stdout.decode('utf-8', 'replace'), (region['x'], region['y']), options.get('min_confidence', 60))
+    found = engine_lines(done.stdout.decode('utf-8', 'replace'), (region['x'], region['y']), options.get('min_confidence', 60))
     limit = options.get('limit', 100)
-    return {'key': options.get('key', 'screen_text'), 'region': region, 'lines': found[:limit],
-            'truncated': len(found) > limit,
+    result = {'key': options.get('key', 'screen_text'), 'region': region,
+              'lines': [{key: line[key] for key in ('text', 'bounds', 'confidence')} for line in found[:limit]],
+              'truncated': len(found) > limit}
+    if options.get('structure'):
+        from xml.etree import ElementTree
+        from .screen_structure import MAX_ITEMS, build
+        try:
+            root = ElementTree.fromstring(device.jsonrpc_call('dumpWindowHierarchy', (True, 50)))
+        except Exception:  # noqa: BLE001 - read-only: the OCR layout still stands without the tree
+            root = None
+        blocks, lists = build(found[:limit], root, (0, 0, width, height))
+        result['structure'] = {
+            'blocks': blocks, 'lists': lists,
+            'tree': 'unavailable' if root is None else 'merged' if any(True for _ in root.iter('node')) else 'none',
+            'truncated': len(found) > limit or any(len(item['items']) >= MAX_ITEMS for item in lists)}
+    return {**result,
             'ocr': {'engine': 'tesseract', 'languages': ocr['languages'],
                     'elapsed_ms': round((time.monotonic() - started) * 1000, 2)}}

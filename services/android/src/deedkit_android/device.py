@@ -402,8 +402,9 @@ class Devices:
                         result['observation'] = await self.failure_observation(owner, device)
                 result["data"] = {step["result"]["list"]: step["result"]["rows"] for step in runner.steps
                                   if "result" in step and "rows" in step["result"]}
-                result["data"].update({step["result"]["key"]: step["result"]["lines"] for step in runner.steps
-                                       if "result" in step and "lines" in step["result"]})
+                result["data"].update({step["result"]["key"]: {"lines": step["result"]["lines"], **step["result"]["structure"]}
+                                       if "structure" in step["result"] else step["result"]["lines"]
+                                       for step in runner.steps if "result" in step and "lines" in step["result"]})
                 result.update(engine='uiautomator2', steps=runner.steps,
                               elapsed_ms=round((time.monotonic() - started) * 1000, 2))
                 self.store.finish(owner, request_id, state, result)
