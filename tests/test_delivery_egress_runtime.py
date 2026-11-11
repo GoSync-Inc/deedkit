@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import uuid
 
 import pytest
@@ -51,12 +52,35 @@ def connect(host, port):
         return 'unreachable'
 print(json.dumps({target: connect(*target.rsplit(':', 1)) for target in sys.argv[1:]}))
 '''
+READY = 'import socket, sys\nsocket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=1).close()\n'
+LISTEN_ANY = 'import socket\ns = socket.create_server(("", 0))\nprint(s.getsockname()[1], flush=True)\nwhile True: s.accept()[0].close()\n'
 
 
 def docker(*args, check=True, timeout=120):
     result = subprocess.run(['docker', *args], text=True, capture_output=True, timeout=timeout)
     assert not check or result.returncode == 0, f"docker {' '.join(args)}\n{result.stdout}\n{result.stderr}"
     return result
+
+
+def wait_listening(container, port, tries=60):
+    """`docker run -d` returns before the container's Python has bound its port: wait until the listener answers from
+    inside its own container, so a refusal later is the network's and never the listener's slow start."""
+    for _ in range(tries):
+        if docker('exec', container, 'python', '-c', READY, str(port), check=False).returncode == 0:
+            return
+        time.sleep(0.5)
+    raise AssertionError(f'{container} never listened on {port}\n{docker("logs", container, check=False).stderr}')
+
+
+def listening_port(container, tries=60):
+    """The port a LISTEN_ANY container's kernel gave it. A port chosen by the test can be a source port of an outgoing
+    connection of the runner: the listener then dies with EADDRINUSE and every connection to it is refused."""
+    for _ in range(tries):
+        printed = docker('logs', container, check=False).stdout.strip()
+        if printed.isdigit():
+            return printed
+        time.sleep(0.5)
+    raise AssertionError(f'{container} chose no port\n{docker("logs", container, check=False).stderr}')
 
 
 # spec: ANYM-581
@@ -72,6 +96,7 @@ def test_an_internal_only_container_has_no_dns_no_other_bridge_and_no_internet_w
         docker('network', 'create', '--internal', internal)
         docker('network', 'create', bridge)
         docker('run', '-d', '--rm', '--name', listener, '--network', bridge, image, 'python', '-c', LISTEN)
+        wait_listening(listener, 8080)
         peer = docker('inspect', listener, '--format', '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}').stdout.strip()
         # The positive control: the listener answers on its own bridge, so silence below is the network, not it.
         control = docker('run', '--rm', '--network', bridge, image, 'python', '-c', PROBE, peer)
@@ -92,13 +117,15 @@ def test_an_isolated_internal_network_has_no_host_address_but_keeps_container_na
     assert re.search(r'@sha256:[0-9a-f]{64}$', image), 'the Python test image must be immutable'
     assert shutil.which('docker'), 'Docker is required when the network proof is enabled'
     tag = uuid.uuid4().hex[:12]
-    port = str(20000 + int(tag[:4], 16) % 20000)
     isolated, host_listener, peer = f'deedkit_t581_iso_{tag}', f'deedkit_t581_host_{tag}', f'deedkit_t581_peer_{tag}'
     try:
         docker('network', 'create', '--internal', '-o', 'com.docker.network.bridge.gateway_mode_ipv4=isolated', isolated)
-        docker('run', '-d', '--rm', '--name', host_listener, '--network', 'host', image, 'python', '-c', LISTEN, port)
+        docker('run', '-d', '--rm', '--name', host_listener, '--network', 'host', image, 'python', '-c', LISTEN_ANY)
         docker('run', '-d', '--rm', '--name', peer, '--network', isolated, '--network-alias', 'delivery-egress', image,
                'python', '-c', LISTEN, '8080')
+        port = listening_port(host_listener)
+        wait_listening(host_listener, port)
+        wait_listening(peer, 8080)
         ipam = json.loads(docker('network', 'inspect', isolated, '--format', '{{json .IPAM.Config}}').stdout)
         subnet = ipam[0]['Subnet'].split('/')[0]
         subnet_host = '.'.join(subnet.split('.')[:3] + [str(int(subnet.split('.')[3]) + 1)])

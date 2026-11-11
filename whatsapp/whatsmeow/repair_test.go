@@ -768,6 +768,12 @@ func TestRepairCaptureQueuedBehindARepairStatementIsReleasedOnCancel(t *testing.
 		journalUnknown(t, s, e, nil)
 	}
 	p := newRepairPass(s)
+	// A loaded runner: every clock read below is a second later. Under -race the first row alone could outlast the
+	// 200 ms slice: the setup tick ended before the four rows were counted, and the cancelled tick before it reached
+	// row 2. The slice that bounds a tick is not what this test checks: the capture's release on cancel is.
+	clock := time.Unix(1700000000, 0)
+	p.now = func() time.Time { clock = clock.Add(time.Second); return clock }
+	p.slice = time.Hour
 	p.tick(context.Background()) // loads and counts the four rows
 	if !p.done {
 		t.Fatal("setup pass did not finish")
@@ -776,6 +782,8 @@ func TestRepairCaptureQueuedBehindARepairStatementIsReleasedOnCancel(t *testing.
 		t.Fatal(err)
 	}
 	p = newRepairPass(s)
+	p.now = func() time.Time { clock = clock.Add(time.Second); return clock }
+	p.slice = time.Hour
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	type result struct {

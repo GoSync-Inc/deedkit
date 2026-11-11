@@ -149,13 +149,17 @@ def test_cursor_refuses_contract_breaks_and_detects_a_source_reset():
         read_page({'after': 2, 'journal_id': 'j1'}, page, limit=5, max_bytes=64000)
 
 
-@pytest.fixture()
-def modules(seeded):
-    store = seeded[0]
+def empty_module_journal(store):
+    """An empty module journal and no dispatcher heartbeat: events keyed calls:1 never meet an earlier test's calls:1."""
     with store.pool.connection() as c:
         c.execute('TRUNCATE module_events,module_source_health CASCADE')
         c.execute('UPDATE module_event_counter SET value=0 WHERE id=1')
         c.execute("DELETE FROM component_heartbeats WHERE component='dispatcher'")
+
+
+@pytest.fixture()
+def modules(seeded):
+    empty_module_journal(seeded[0])
     return seeded
 
 

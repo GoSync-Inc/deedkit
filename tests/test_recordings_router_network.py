@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import uuid
 from pathlib import Path
 
@@ -32,12 +33,35 @@ def connect(host, port):
         return 'unreachable'
 print(json.dumps({target: connect(*target.rsplit(':', 1)) for target in sys.argv[1:]}))
 '''
+READY = 'import socket, sys\nsocket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=1).close()\n'
+LISTEN_ANY = 'import socket\ns = socket.create_server(("", 0))\nprint(s.getsockname()[1], flush=True)\nwhile True: s.accept()[0].close()\n'
 
 
 def docker(*args, check=True, timeout=120):
     result = subprocess.run(['docker', *args], text=True, capture_output=True, timeout=timeout)
     assert not check or result.returncode == 0, f"docker {' '.join(args)}\n{result.stdout}\n{result.stderr}"
     return result
+
+
+def wait_listening(container, port, tries=60):
+    """`docker run -d` returns before the container's Python has bound its port: wait until the listener answers from
+    inside its own container, so a refusal later is the network's and never the listener's slow start."""
+    for _ in range(tries):
+        if docker('exec', container, 'python', '-c', READY, str(port), check=False).returncode == 0:
+            return
+        time.sleep(0.5)
+    raise AssertionError(f'{container} never listened on {port}\n{docker("logs", container, check=False).stderr}')
+
+
+def listening_port(container, tries=60):
+    """The port a LISTEN_ANY container's kernel gave it. A port chosen by the test can be a source port of an outgoing
+    connection of the runner: the listener then dies with EADDRINUSE and every connection to it is refused."""
+    for _ in range(tries):
+        printed = docker('logs', container, check=False).stdout.strip()
+        if printed.isdigit():
+            return printed
+        time.sleep(0.5)
+    raise AssertionError(f'{container} chose no port\n{docker("logs", container, check=False).stderr}')
 
 
 def runbook_options():
@@ -59,7 +83,6 @@ def test_the_runbook_network_is_internal_isolated_and_lets_only_the_two_containe
     options, _ = runbook_options()
     assert 'com.docker.network.bridge.gateway_mode_ipv4=isolated' in options
     tag = uuid.uuid4().hex[:12]
-    port = str(20000 + int(tag[:4], 16) % 20000)
     network, other = f'deedkit_t732_rr_{tag}', f'deedkit_t732_br_{tag}'
     feed, router, host_listener, elsewhere = (f'deedkit_t732_{role}_{tag}' for role in ('feed', 'router', 'host', 'else'))
     # The test's own bridge name (at most 15 characters), the runbook's other options exactly.
@@ -72,8 +95,12 @@ def test_the_runbook_network_is_internal_isolated_and_lets_only_the_two_containe
         docker('run', '-d', '--rm', '--name', feed, '--network', network, '--network-alias', 'recordings-api', image,
                'python', '-c', LISTEN, '13234')
         docker('run', '-d', '--rm', '--name', router, '--network', network, image, 'python', '-c', 'import time; time.sleep(120)')
-        docker('run', '-d', '--rm', '--name', host_listener, '--network', 'host', image, 'python', '-c', LISTEN, port)
+        docker('run', '-d', '--rm', '--name', host_listener, '--network', 'host', image, 'python', '-c', LISTEN_ANY)
         docker('run', '-d', '--rm', '--name', elsewhere, '--network', other, image, 'python', '-c', LISTEN, '8080')
+        wait_listening(feed, 13234)
+        port = listening_port(host_listener)
+        wait_listening(host_listener, port)
+        wait_listening(elsewhere, 8080)
         members = json.loads(docker('network', 'inspect', network, '--format', '{{json .Containers}}').stdout)
         assert sorted(item['Name'] for item in members.values()) == sorted([feed, router])
         subnet = json.loads(docker('network', 'inspect', network, '--format', '{{json .IPAM.Config}}').stdout)[0]['Subnet']

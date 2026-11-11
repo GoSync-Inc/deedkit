@@ -475,8 +475,9 @@ def resumed_case(store):
 
 
 def module_case(store):
-    from tests.test_module_events import beat,call_event,mixed,publish,subscriber
+    from tests.test_module_events import beat,call_event,empty_module_journal,mixed,publish,subscriber
     from tests.test_subscriptions import emit
+    empty_module_journal(store)  # calls:1 is taken when an earlier module test left its own calls:1 in the journal
     token=subscriber(store)
     sid=mixed(store,token)
     beat(store)
@@ -513,6 +514,19 @@ def test_compact_and_full_fetches_page_receipt_and_ack_the_same_range(seeded,cas
         assert [item['wake_reason'] for item in compact['items']]==[item['wake_reason'] for item in full['items']]
     finally:
         store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-826
+def test_the_module_case_starts_from_an_empty_journal_whatever_an_earlier_module_test_published(seeded):
+    from messaging_service.subscriptions import match_subscriptions
+    from tests.test_module_events import call_event,empty_module_journal,publish
+    store,_,_=seeded
+    empty_module_journal(store)
+    # Another module test ran first in the session and left its own calls:1 in the journal (test_module_links did).
+    publish(store,call_event(1,'call-from-an-earlier-test'))
+    token,sid=module_case(store)
+    match_subscriptions(store)
+    assert store.fetch_subscription_events(token,sid,limit=50)['module']['items']
 
 
 # spec: ANYM-826
