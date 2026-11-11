@@ -24,7 +24,7 @@
     "services/messaging/messaging_service/file_index.py": {"lines": 1020, "longest_function": 194},
     "services/messaging/messaging_service/outgoing.py": {"lines": 1034, "longest_function": 105},
     "services/messaging/messaging_service/store.py": {"lines": 1787, "longest_function": 81},
-    "services/messaging/messaging_service/subscriptions.py": {"lines": 1515, "longest_function": 122},
+    "services/messaging/messaging_service/subscriptions.py": {"lines": 1523, "longest_function": 113},
     "services/messaging/messaging_service/telegram_collector.py": {"lines": 1346, "longest_function": 74},
     "services/messaging/messaging_service/telegram_operations.py": {"lines": 1984, "longest_function": 201},
     "services/messaging/messaging_service/whatsapp_collector.py": {"lines": 950, "longest_function": 42},

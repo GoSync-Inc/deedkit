@@ -230,15 +230,12 @@ def test_closed_definition_becomes_a_tombstone_with_retention_gap_and_stops_coun
         'recoverable': False, 'floor': events[-1]}
     with pytest.raises(APIError, match='subscription_closed'):
         call(store, token, 'fetch_subscription_events', sid)
-    # A young tombstone still counts toward SUBSCRIPTION_MAX_DEFINITIONS; one older than 30 days does not.
+    # Retained tombstones occupy no active slot, including immediately after retirement.
     monkeypatch.setenv('SUBSCRIPTION_MAX_DEFINITIONS', '1')
-    with pytest.raises(APIError, match='subscription_limit'):
-        store.create_subscription(token, ['telegram-demo-chat'])
-    backdate(store, sid, 'tombstoned_at', '29 days 23 hours 59 minutes')
+    assert store.create_subscription(token, ['telegram-demo-chat'])['state'] == 'active'
     with pytest.raises(APIError, match='subscription_limit'):
         store.create_subscription(token, ['telegram-demo-chat'])
     backdate(store, sid, 'tombstoned_at', '30 days 1 minute')
-    assert store.create_subscription(token, ['telegram-demo-chat'])['state'] == 'active'
     assert store.get_subscription(token, sid)['data_deleted'] is True
     assert retire_subscriptions(store)['tombstoned'] == 0
 

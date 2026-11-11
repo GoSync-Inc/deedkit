@@ -64,8 +64,9 @@ def payload(error,operation='',request_id=None):
     for name in ('disabled_reason','wake_target','wake_targets'):
         if hasattr(error,name):info[name]=getattr(error,name)
     if code=='wake_target_limit' and hasattr(error,'max'):info['max']=error.max
-    # ANYM-795: a refused prepare's scope, count and cap; only this code, these names are common attributes.
-    if code=='upload_limit':
+    # ANYM-795: a refused prepare's scope, count and cap; only these codes, these names are common attributes.
+    # ANYM-183: a refused subscription create or resume names the key's active count and its cap.
+    if code in ('upload_limit','subscription_limit'):
         for name in ('limit','active','max'):
             if hasattr(error,name):info[name]=getattr(error,name)
     if retry:info['retry_after_seconds']=2
