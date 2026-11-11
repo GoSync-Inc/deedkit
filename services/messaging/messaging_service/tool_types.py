@@ -44,19 +44,23 @@ ReadyFilter = Annotated[Any, Field(json_schema_extra=LIST_OR_NULL, description=
     'three yet, e.g. voice notes still without a transcript. Counts the current revision only; each page is a snapshot. '
     'A match for an empty page: repeat without ready and read the per-row availability fields.')]
 SearchLanguage = Literal['auto','simple','russian','english','indonesian']
+# ANYM-923: the archive's message kinds (conversation.KINDS) and a call's outcome, for search filters.
+MessageKind = Literal['text','photo','video','voice','audio','document','sticker','location','contact','poll','system',
+    'group_change','call','unknown']
+CallOutcome = Literal['missed','rejected','answered','unknown']
 EventKind = Literal['message.created','message.edited','message.deleted','message.status','attachment.ready',
     'attachment.failed']
 SubscriptionEventKind = Literal['message.created','message.edited','message.deleted',
     'message.status','attachment.ready','file.text.ready','file.transcript.ready',
     'file.description.ready','file.processing.failed','send.failed','source.health','attachment.failed',
-    'poll.updated']
+    'poll.updated','call']
 EventOrigin = Literal['live','backfill','reconcile','fixture']
 SubscriptionOrigin = Literal['live','live_recovered','backfill','reconcile','fixture']
 MessageFormat = Literal['plain','markdown','html']
 SubscriptionReference = Annotated[StrictStr, Field(min_length=1,max_length=256,
     pattern=r'^[^\x00-\x20\x7f]+$')]
 SubscriptionReferences = Annotated[list[SubscriptionReference], Field(min_length=1,max_length=64)]
-SubscriptionKinds = Annotated[list[SubscriptionEventKind], Field(min_length=1,max_length=13)]
+SubscriptionKinds = Annotated[list[SubscriptionEventKind], Field(min_length=1,max_length=14)]
 SubscriptionOrigins = Annotated[list[SubscriptionOrigin], Field(min_length=1,max_length=5)]
 SubscriptionLimit = Annotated[StrictInt, Field(ge=1,le=100)]
 SubscriptionVersion = Annotated[StrictInt, Field(ge=1,le=9007199254740991)]

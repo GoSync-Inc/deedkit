@@ -11,8 +11,8 @@ from mcp.server.mcpserver import Context
 from mcp.types import ToolAnnotations
 from pydantic import Field, StrictBool, StrictInt, StrictStr
 
-from ..tool_types import (ConversationView, Detail, LiveWaitSeconds, MediaKindFilter, MessageDetail, QueryMode,
-    ReadyFilter, SearchLanguage, no_schema_default)
+from ..tool_types import (CallOutcome, ConversationView, Detail, LiveWaitSeconds, MediaKindFilter, MessageDetail,
+    MessageKind, QueryMode, ReadyFilter, SearchLanguage, no_schema_default)
 
 
 def register_archive_tools(mcp, call, async_call, read):
@@ -45,7 +45,8 @@ def register_archive_tools(mcp, call, async_call, read):
                     view: ConversationView='conversation',include_system: StrictBool=False,exclude_channels: StrictBool=False,
                chat_types: list[Literal['private','group','channel','unknown']] | None=None,include_channels: StrictBool=False,
                collapse_forwards: StrictBool=True,person: StrictStr='',body_format: Annotated[Literal['','html'] | None,Field(json_schema_extra=no_schema_default)]=None,include_media_text: StrictBool=True,
-               live: Literal['off','auto','on']='off', wait_s: LiveWaitSeconds | None=None, request_id: StrictStr='') -> dict[str, Any]:
+               live: Literal['off','auto','on']='off', wait_s: LiveWaitSeconds | None=None, request_id: StrictStr='',
+               message_kinds: list[MessageKind] | None=None, call_outcome: CallOutcome | None=None) -> dict[str, Any]:
         """Search archived text across chosen accounts/chats/sender IDs. Lists use OR within each
         dimension, AND between dimensions; [] matches nothing. Exact account-scoped sender IDs,
         not a merged person directory. query_mode: all, any (at least one word), phrase, web (quotes/OR/-word) or exact; see the query_mode parameter.
@@ -55,6 +56,9 @@ def register_archive_tools(mcp, call, async_call, read):
         Conversation view hides known system events unless include_system=true.
         order=relevance ranks hits, not dialogue turns. Preserve supplied order, inspect ambiguity.
         direction: incoming/outgoing or empty. detail=transcript returns only the numbered transcript.
+        message_kinds keeps rows of those kinds; call_outcome (missed/rejected/answered/unknown) keeps WhatsApp calls with
+        that outcome and alone implies message_kinds=['call']. Missed calls per person: sender, call_outcome=missed,
+        include_system=true (calls are service rows); both filters keep the call archive-only.
         Channels are excluded unless include_channels=true, chat_types lists channel, or chat/chats is set.
         chat_types: private/group/channel/unknown (null type = unknown), ANDed with exclude_channels.
         A query returns forwarded copies of one message once (the original if archived, else the
@@ -91,7 +95,10 @@ def register_archive_tools(mcp, call, async_call, read):
                     order=order,before=before,direction=direction,search_language=search_language,fuzzy=fuzzy,
                     compact=compact,body_chars=body_chars,include_coverage=include_coverage,view=view,include_system=include_system,exclude_channels=exclude_channels,
                     chat_types=chat_types,include_channels=include_channels,collapse_forwards=collapse_forwards,
-                    person=person,body_format=body_format,include_media_text=include_media_text,live=live,wait_s=wait_s,request_id=request_id)
+                    person=person,body_format=body_format,include_media_text=include_media_text,live=live,wait_s=wait_s,request_id=request_id,
+                    # Omitted when unset, so payloads and audit records of callers that omit them stay unchanged.
+                    **({'message_kinds':message_kinds} if message_kinds is not None else {}),
+                    **({'call_outcome':call_outcome} if call_outcome is not None else {}))
 
     @mcp.tool(structured_output=True, annotations=read)
     def search_files(ctx: Context, query: str='', account: str='', chat: str='', sender: str='',

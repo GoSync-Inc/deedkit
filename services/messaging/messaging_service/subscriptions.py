@@ -19,7 +19,7 @@ from .policy import effective_permissions, lock_principal, targets
 
 EVENT_KINDS = frozenset(('message.created', 'message.edited', 'message.deleted', 'poll.updated',
     'message.status', 'attachment.ready', 'file.text.ready', 'file.transcript.ready',
-    'file.description.ready', 'file.processing.failed', 'send.failed', 'source.health', 'attachment.failed'))
+    'file.description.ready', 'file.processing.failed', 'send.failed', 'source.health', 'attachment.failed', 'call'))
 # ANYM-867: a kind a selector receives without naming it, because it ends the same wait as a kind it names.
 IMPLIED_KINDS = {'attachment.failed': 'attachment.ready'}
 # ANYM-535: journal rows that name no archived message, matched by their own rule and never by default.
@@ -63,6 +63,13 @@ def quiet_group_change(snapshot):
     opt-in for the other changes belongs to the service-kinds card (ANYM-857). Rows of any other kind are untouched."""
     group = (snapshot.get('metadata') or {}).get('group_change')
     return isinstance(group, dict) and group.get('change') != 'joined_group'
+
+
+def call_outcome(snapshot):
+    """ANYM-923: a WhatsApp call row's outcome, else None. Such a row wakes only a selector whose kinds list `call`,
+    and only for a missed call; `message.created` alone never wakes on a call."""
+    call = (snapshot.get('metadata') or {}).get('call')
+    return call.get('outcome') if isinstance(call, dict) else None
 
 
 WAKE_RULES = frozenset(('incoming_message', 'owner_mention', 'reply_to_owner', 'reply_to_confirmed_send',
@@ -1005,7 +1012,11 @@ def _event_verdict(event, row, p, scope):
             _failure_audience(event, selected, row, p))
     else:
         matches = selected
-        if matches and event['kind'] not in selector['kinds'] and (
+        outcome = call_outcome(snapshot) if event['kind'] == 'message.created' else None
+        if matches and outcome is not None:
+            if 'call' not in selector['kinds'] or outcome != 'missed':
+                matches, metric = False, 'left_out_kind'
+        elif matches and event['kind'] not in selector['kinds'] and (
                 IMPLIED_KINDS.get(event['kind']) not in selector['kinds']):
             matches, metric = False, 'left_out_kind'
         if matches and quiet_group_change(snapshot):

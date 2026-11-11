@@ -249,6 +249,9 @@ func (p *Provider) downloadHistory(ctx context.Context, notif *waE2E.HistorySync
 	return p.Client.DownloadHistorySync(ctx, verified, true)
 }
 func (p *Provider) captureHistory(data *waHistorySync.HistorySync) error {
+	if err := p.captureCallLogRecords(data.GetCallLogRecords()); err != nil {
+		return err
+	}
 	for _, conv := range data.GetConversations() {
 		chat, err := types.ParseJID(conv.GetID())
 		if err != nil {
@@ -298,6 +301,13 @@ func (p *Provider) captureHistory(data *waHistorySync.HistorySync) error {
 					}
 					continue
 				}
+			}
+			// A synced call log names the same entry as its live call (ANYM-923).
+			if handled, err := p.captureCallLog(chat, historySender(wm), wm.GetKey().GetID(), wm.GetKey().GetFromMe(), int64(wm.GetMessageTimestamp()), wm.GetMessage().GetCallLogMesssage(), "history"); handled {
+				if err != nil {
+					return err
+				}
+				continue
 			}
 			var message *events.Message
 			if wm.GetMessage() == nil && wm.GetMessageStubType() != 0 {
