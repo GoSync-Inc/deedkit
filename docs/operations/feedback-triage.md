@@ -78,7 +78,9 @@ bug or feature stays `received` with the proposed card in its note; an answered 
 `declined` "answered, no change needed: <answer>"; `enable-only` stays `received` with no
 `spec_ref` and "waits for the owner: opt-in (<spec>)": `feedback_sync.py` never links or
 follows an item with that note, even when a card names it (reason `opt-in hold`). `fixed` and
-`verify_requested` are not set here: they follow the cards' delivery and deployment.
+`verify_requested` are not set here: `verify_requested` follows deployment. `spec_ref` is the story
+card that delivers the specific ask, never an umbrella or epic card; for a defect, the card on its
+fix PR. Hand triage writes its dispositions file and applies it in the same session (owner 11-11).
 
 Each run writes `reports/<time>.md` (items, classes, clusters, items that need the owner and the
 exact `set-feedback-status` commands for the operator container) and `dispositions/<time>.json`
@@ -100,29 +102,28 @@ python3 scripts/feedback_sync.py follow [--apply]   # by hand; `auto` runs it ev
 ```
 
 - `apply` applies the permitted transitions of a dispositions file and reports the rest.
-- `follow` moves each item with a `spec_ref`: card Done and its delivering commit (the one merged
-  pull request whose body has `Delivers: ANYM-n`) LIVE: `verify_requested` at the live plan A SHA;
-  Done and merged only: `fixed` at that commit; on main, not Done: `received` to `accepted`.
-- A card in `Review` whose delivering commit is on origin/main and LIVE moves its `accepted` items
-  to `verify_requested` at the live SHA with the note `Delivered by ANYM-n; live in deedkit@<sha12>;
+- `follow` moves an item only after the pull request naming it is LIVE (owner 11-11): every merged
+  pull request on origin/main whose own `Feedback: <id>[, <id>]` line names the item (outside fences
+  and comments) LIVE gives `verify_requested` at the live plan A SHA. There is no `fixed` step, and a
+  card's `Delivers: ANYM-n` pull request alone never moves an item. Until then a `received` item
+  whose card is on main becomes `accepted` (`not live yet`, or `no Feedback: pull request`).
+- When the item's card is in `Review`, the note is `Delivered by ANYM-n; live in deedkit@<sha12>;
   the card still waits for <its open check>. Please re-check.` The open check is the first
   `[open: live]`/`[open: measured]` line of the card outside fences and comments, or the word
   "review", at most 120 characters; that card line reaches the reporter, so it holds no private
-  data. Merged but not LIVE: `fixed`, as for Done. A `Review` card with no delivering commit stays
-  `card not delivered`. `Backlog` and `Active` cards are unchanged. A `verify_requested` item is
-  not rewritten when the card later moves from Review to Done (`already verify_requested`).
-- A reviewed file `config/feedback-delivery.json` maps a `Done` or `Review` card to its delivering
-  commit: `{"ANYM-171": {"commit": "<40 hex>", "pr": 342, "evidence": "<one line>", "added": "<date>"}}`,
+  data. A `verify_requested` item is never rewritten (`already verify_requested`).
+- For an old pull request with no `Feedback:` line, a reviewed file `config/feedback-delivery.json`
+  maps a `Done` or `Review` card to its delivering commit, which moves the card's items only once it
+  is LIVE: `{"ANYM-171": {"commit": "<40 hex>", "pr": 342, "evidence": "<one line>", "added": "<date>"}}`,
   beside one string `_header`, which is no entry. A `Review` card whose building pull request names
   it with `Spec:` only, because a criterion waits for a post-deploy receipt, is the usual case; it
   moves as the `Review` rule above says, its note naming the open check.
-  An entry is used only when the card is `Done` or in `Review`, no merged `Delivers: ANYM-n` pull
-  request exists, the commit is an ancestor of origin/main, no commit on origin/main says `This
+  An entry is used only when the card is `Done` or in `Review`, the commit is an ancestor of origin/main, no commit on origin/main says `This
   reverts commit <the entry's 40 hex>` (the line `git revert` writes, which the repository's squash
   message keeps) and `gh` shows that pull request merged with that squash commit and a body whose
   `Spec:` line names the card. The plan line shows `delivered by mapping (#<pr>)`. An entry that
   fails any condition (`Backlog` or `Active`: `the card is not Done or in Review`; a revert:
-  `reverted`), two entries for one card, or an entry whose card has a `Delivers:` pull request is
+  `reverted`) or two entries for one card is
   refused with a named reason (`mapping refused: <why>`) and writes nothing for that card, also no
   `received` to `accepted`; a file that is not JSON or not an object of `ANYM-n` entries stops the
   run (exit 1, no write). A delivery undone by other means (a manual edit, a fix-forward that removes
@@ -177,7 +178,7 @@ python3 scripts/feedback_sync.py status
   the first write; a failed, timed-out, non-JSON or truncated read ends the run with exit 1 and
   no write. A release receipt that exists and cannot be read (`http-current.json` over its 256 MiB
   bound, `current.json` over 64 KiB, malformed) is such a read, named in `last-run.json`, and so is
-  an ancestry answer git cannot give inside the 300 s budget: "cannot tell" never writes `fixed`. ssh runs with `BatchMode=yes`, git and `gh` with prompts off, stdin is never a
+  an ancestry answer git cannot give inside the 300 s budget: "cannot tell" never reads as not live. ssh runs with `BatchMode=yes`, git and `gh` with prompts off, stdin is never a
   terminal, every subprocess has a timeout.
 - `last-run.json` (mode 0600): time, exit code, export head, per reason the feedback and card
   IDs, items waiting for a card or for main with their age in hours, the files (complete, open,
