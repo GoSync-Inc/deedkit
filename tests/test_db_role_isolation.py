@@ -478,6 +478,67 @@ def test_a_bound_collector_can_neither_delete_nor_take_over_another_accounts_pol
         remove(s, bound)
 
 
+# spec: ANYM-919
+def test_a_bound_collector_reads_writes_and_deletes_only_its_own_accounts_birthday_rows(archive):  # noqa: F811
+    from datetime import date
+    from messaging_service import birthdays
+    ar, s, _, _ = archive
+    other_account(ar, s)
+    with s.pool.connection() as c:
+        birthdays.store(c, 'archive-other', '777', (1, 2, None))
+    bound = install(s, 'collector_role.sql', 'messaging_collector', account='archive-test')
+    shared = install(s, 'collector_role.sql', 'messaging_collector')
+    login, password = 'anym919_login_' + uuid4().hex[:10], uuid4().hex
+    with s.pool.connection() as c:
+        c.execute(sql.SQL('CREATE ROLE {} LOGIN INHERIT PASSWORD {}').format(sql.Identifier(login), sql.Literal(password)))
+        c.execute(sql.SQL('GRANT {} TO {}').format(sql.Identifier(shared), sql.Identifier(login)))
+        c.execute('INSERT INTO collector_account_roles(role_name,account) VALUES(%s,%s)', (login, 'archive-test'))
+
+    def no_effect(c, statement):
+        """Refused, or a statement that reaches no row of the other account."""
+        try:
+            assert c.execute(statement, ('777',)).rowcount == 0, statement
+        except FORBIDDEN:
+            pass
+        c.rollback()
+    try:
+        # Its own account: the pass's write, prune and reads, and list_birthdays' reads, fit the collector's grants.
+        with as_role(s, bound) as c:
+            birthdays.store(c, 'archive-test', '555', (3, 4, 1990))
+            assert [r['provider_user'] for r in c.execute('SELECT provider_user FROM contact_birthdays').fetchall()] == ['555']
+            assert birthdays.active_contacts(c, 'archive-test') == []
+            assert birthdays.due(c, 'archive-test', ['555']) == []
+            assert birthdays.upcoming(c, 'archive-test', date(2026, 11, 11), 14)['not_shared'] == 0
+            c.execute('SELECT chat_ids FROM principals LIMIT 1').fetchall()
+            assert birthdays.prune(c, 'archive-test', []) == 1
+        with pytest.raises((psycopg.errors.CheckViolation, FORBIDDEN)):
+            with as_role(s, bound) as c:
+                birthdays.store(c, 'archive-other', '556', None)
+        statements = ['DELETE FROM contact_birthdays WHERE provider_user=%s',
+                      "UPDATE contact_birthdays SET account='archive-test' WHERE provider_user=%s",
+                      'UPDATE contact_birthdays SET day=9 WHERE provider_user=%s']
+        for statement in statements:
+            with s.pool.connection() as c:
+                c.execute(sql.SQL('SET ROLE {}').format(sql.Identifier(bound)))
+                assert c.execute('SELECT count(*) AS n FROM contact_birthdays').fetchone()['n'] == 0
+                no_effect(c, statement)
+        # A bound login that switches to a shared, unbound collector role is still bound.
+        for statement in statements:
+            with psycopg.connect(login_conninfo(s, login, password)) as c:
+                c.execute(sql.SQL('SET ROLE {}').format(sql.Identifier(shared)))
+                no_effect(c, statement)
+        with s.pool.connection() as c:
+            assert c.execute("SELECT account,day FROM contact_birthdays WHERE provider_user='777'").fetchall() == [
+                {'account': 'archive-other', 'day': 1}]
+    finally:
+        with s.pool.connection() as c:
+            c.execute('DELETE FROM collector_account_roles WHERE role_name=%s', (login,))
+            c.execute("DELETE FROM contact_birthdays WHERE account='archive-other'")
+        drop_role(s, login)
+        remove(s, shared)
+        remove(s, bound)
+
+
 # spec: ANYM-867
 def test_a_bound_collector_publishes_attachment_failed_with_its_existing_grants(archive):  # noqa: F811
     from messaging_service import attachment_failures
