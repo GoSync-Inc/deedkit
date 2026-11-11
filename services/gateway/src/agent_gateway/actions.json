@@ -11,6 +11,9 @@
   "archive_chat": [
     "chat-manage"
   ],
+  "ban_member": [
+    "groups-moderate"
+  ],
   "block_contact": [
     "contacts-manage"
   ],
@@ -50,6 +53,9 @@
   ],
   "get_labels": [
     "contacts-read"
+  ],
+  "get_member_state": [
+    "groups-moderate"
   ],
   "get_message_info": [
     "read-live"
@@ -171,6 +177,9 @@
   ],
   "unarchive_chat": [
     "chat-manage"
+  ],
+  "unban_member": [
+    "groups-moderate"
   ],
   "unblock_contact": [
     "contacts-manage"

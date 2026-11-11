@@ -864,7 +864,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
             return await send(store,token,arguments)
         if method == 'preview_messenger_operation':
             # ANYM-549: accepted for parity with execute, ignored for idempotency.
-            arguments.pop('request_id',None)
+            arguments.pop('request_id',None)  # ANYM-935: a ban or unban preview adds one live read of the person's state
+            if arguments.get('operation') in ('ban_member','unban_member'):from .member_ban import preview_with_state;return await preview_with_state(store,token,arguments)
         if method == 'execute_messenger_operation':
             from .send_wait import validate_wait_s, wait_for_operation
             wait_s=validate_wait_s(arguments.pop('wait_s', 0))

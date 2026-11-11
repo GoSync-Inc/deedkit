@@ -81,7 +81,7 @@ AUDIT_CODES = frozenset({
     'unsupported_operation','invalid_operation_parameters','operation_disabled','operation_expired',
     'operation_access_changed','operation_result_unknown','operation_target_changed','operation_rejected',
     'button_not_captured','button_not_found','label_mismatch','button_kind_unsupported','message_changed','password_required','press_uncertain',
-    'not_admin','missing_admin_right','moderation_unsupported',
+    'not_admin','missing_admin_right','moderation_unsupported','ban_unsupported','unsupported_chat_type','target_protected',
     'reply_target_changed','invalid_subscription','subscription_limit','subscription_conflict','subscription_closed',
     'subscription_access_changed','invalid_subscription_state',
     'invalid_upload','invalid_upload_chunk','upload_limit','upload_capacity','upload_expired',

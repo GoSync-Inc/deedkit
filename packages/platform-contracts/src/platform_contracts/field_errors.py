@@ -10,6 +10,8 @@ REASONS = frozenset((
     "maximum", "min_items", "max_items", "unique", "format", "blank", "size", "expected_message_unknown",
     # ANYM-934: delete_member_messages targets.
     "message_not_found", "message_from_other_chat", "chat_not_collected", "own_message",
+    # ANYM-935: ban_member's person and messages.
+    "sender_not_found", "message_from_other_sender",
 ))
 MAX_ENTRIES = 20
 MAX_PATH = 128

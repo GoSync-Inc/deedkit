@@ -51,5 +51,5 @@
     ]
   },
   "operation_validation": ["unsupported_operation", "invalid_operation_parameters", "invalid_phone", "invalid_username",
-    "silent_unsupported", "moderation_unsupported"]
+    "silent_unsupported", "moderation_unsupported", "ban_unsupported"]
 }

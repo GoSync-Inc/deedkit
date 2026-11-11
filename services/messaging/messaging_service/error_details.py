@@ -35,7 +35,7 @@ def payload(error,operation='',request_id=None):
     for name in ('next_call','found_on_other_account','account','phone','operation_id'):
         if hasattr(error,name):info[name]=getattr(error,name)
     # ANYM-519: reviewed counters, states, steps and a header NAME, never a header value or secret.
-    for name in ('retry_after_s','next_step','state','header'):
+    for name in ('retry_after_s','next_step','state','header','reason'):  # ANYM-935: target_protected names its reason
         if hasattr(error,name):info[name]=getattr(error,name)
     # ANYM-934: a delete_member_messages target of another chat names that chat's archive ID and type (a chat the
     # key may read), so a channel's comment points the agent to its discussion group.
