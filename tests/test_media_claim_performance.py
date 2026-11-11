@@ -121,7 +121,7 @@ def index_tables(s):
 
 
 def outline(node, depth=0):
-    line=('  '*depth+node['Node Type']+' '+str(node.get('Relation Name') or node.get('Index Name') or '')
+    line=('  '*depth+node['Node Type']+' '+' '.join(filter(None,(node.get('Relation Name'),node.get('Index Name'))))
         +f" est={node.get('Plan Rows')} rows={node.get('Actual Rows')}x{node.get('Actual Loops')}"
         +f" {node.get('Index Cond') or ''} {node.get('Filter') or ''} {node.get('Hash Cond') or ''}"[:300])
     return '\n'.join([line]+[outline(child,depth+1) for child in node.get('Plans',[])])
@@ -164,9 +164,20 @@ def selection_is_indexed(plans):
     return query
 
 
+# The tables the measured claim plans read.
+MEASURED=('messages','media_jobs')
+
+
 @pytest.fixture()
-def backlog(archive, monkeypatch):
+def backlog(archive, monkeypatch, request):
     ar,s,_,_=archive
+    # The visibility map is held fixed as the statistics are: an autovacuum pass, if it came before a measurement,
+    # set the pages all-visible and the claim was planned through other indexes (merge-group run 43011411497).
+    # The seeded fixture's TRUNCATE left the map empty; with autovacuum off on these tables it stays empty.
+    def autovacuum(change):
+        with s.pool.connection() as c:
+            for table in MEASURED: c.execute(f'ALTER TABLE {table} {change}')
+    autovacuum('SET (autovacuum_enabled=false)'); request.addfinalizer(lambda:autovacuum('RESET (autovacuum_enabled)'))
     # A fixed sweep clock: only the first claim sweeps, however slow the runner is.
     monkeypatch.setattr(archive_module,'monotonic',lambda:1000.0)
     owner='perf-collector'; epoch=ar.acquire(ACCOUNT,owner)
@@ -332,6 +343,20 @@ def test_the_dormant_backlog_gets_the_same_statistics_on_every_analyze(backlog):
                 histogram_bounds::text FROM pg_stats WHERE tablename IN ('messages','media_jobs') ORDER BY 1,2''').fetchall()
     first=statistics()
     assert first and all(statistics()==first for _ in range(3))
+
+
+# spec: ANYM-302
+def test_no_vacuum_pass_changes_the_backlog_plans_between_the_analyze_and_the_claim(backlog):
+    """Regression (merge-group run 43011411497; 43008632780, 42964255628): an autovacuum pass that came before the
+    measurement made the backlog's pages all-visible, and the selection's window arm took an index-only skip scan of
+    message_chat_date instead of the message_scope_date range the plans here are measured on. The measured tables
+    keep autovacuum off, so their visibility map stays as the test made it: empty."""
+    _,s,_,_=backlog
+    grow_dormant(s,30_000)
+    with s.pool.connection() as c:
+        tables=c.execute('''SELECT relname,'autovacuum_enabled=false'=ANY(coalesce(reloptions,'{}')) AS off,relallvisible
+            FROM pg_class WHERE relname IN ('messages','media_jobs') ORDER BY 1''').fetchall()
+    assert [tuple(r.values()) for r in tables]==[('media_jobs',True,0),('messages',True,0)]
 
 
 def grow_recent_group(s, count, chat_type='group'):
