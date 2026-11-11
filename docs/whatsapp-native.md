@@ -73,8 +73,10 @@ the holder. Without the key the collector runs child mode unchanged; that is the
 The cutover stops and starts provider sessions: it runs only on the owner's exact confirmation through the
 orchestrator (AGENTS.md section 1), asked once for both accounts, never during a call, and after ANYM-896 (session
 marks, pair rule, night window) and ANYM-936's hand release (the holder logins) are live. The plan gets its own plan
-review before it runs. Each step is read back and has its undo; `S` is the serving release's SHA (`production.py
-status`), so no other change rides along.
+review before it runs. Each step is read back and has its undo. `S` is a green `main` SHA this host has not prepared
+yet: `prepare` refuses a SHA whose state directory exists, so the serving release (`production.py status`) cannot be
+prepared again. Each account's cutover and each undo takes its own new `S`. Its other changes ride along as in any
+release and are named when the candidate is reviewed.
 
 0. Preconditions, read-only: the installed host tool comes from a release that contains ANYM-937 part 2 (its
    `production.py` BUILDS names `whatsapp-holder`; an older tool refuses a `services` entry it does not know). Pause
@@ -92,11 +94,31 @@ Then per account, `whatsapp1` first and `whatsapp2` only after `whatsapp1` verif
    project's `files` and add `"whatsapp<n>-holder": {"target": "whatsapp-holder", "session": true, "collector":
    "whatsapp<n>"}` (ANYM-896's marks, production.md "Session holders") to `services`. Read back with `jq`.
 4. Read-only: no active call (production.md, the active-call check).
-5. `production.py prepare --sha S`: it builds and smoke-checks `deedkit-production-whatsapp-holder:S` from the
-   release checkout and resolves the candidate. Review it: only `whatsapp<n>` (new mounts) and `whatsapp<n>-holder`
-   (new) change. A refusal stops here: undo step 3.
-6. `production.py apply --sha S`. Order does not matter for safety: a holder started before the child-mode collector
-   stopped waits in-process for the session locks, and an attach-mode collector retries until the holder serves.
+5. First start, then prepare. `prepare` reads one container of every selected service, so a holder that never ran
+   refuses it ("exactly one running container"). First `sudo python3 /usr/local/lib/deedkit/production.py
+   create-holder --service whatsapp<n>-holder --sha S` (the installed tool must contain this command): under the
+   autodeploy pause only, for a session holder of the configuration that its Compose files define and that has no
+   container at all, it builds and smoke-checks `deedkit-production-whatsapp-holder:S` from the verified commit and
+   creates the holder's container with `up --no-start`. Nothing starts: no provider session begins before step 6. Read
+   back: `docker ps --all` shows the one container `Created` on that image. Its output names the undo, `docker compose
+   $F rm --stop whatsapp<n>-holder`. If the container runs before step 6 (a Docker restart), run that undo and create
+   it again. Then `production.py prepare --sha S`: it reuses that image and resolves the candidate. Review it: the
+   pair changes, `whatsapp<n>` (new mounts) and `whatsapp<n>-holder` (new, condition `created`, so step 6 recreates it
+   at once, ledger kind `recovery`, reason `created`), and so does whatever else `S` changes. A refusal of either
+   stops here: the undo above (if the container exists), then undo step 3.
+6. `production.py apply --sha S`. The pair goes as one: the collector stops first, the holder comes up and passes its
+   check, then the collector comes up and must attach. The running child-mode collector still mounts the session
+   directory the holder now owns. The session-opener check admits it only because this same apply stops it before the
+   holder starts; any other opener is refused (`foreign_session_opener`). On a failure:
+   - Before the collector was recreated (the holder fails its check, for example a wrong holder DSN file): the holder
+     stays stopped. The collector starts again on its own child-mode container, but only after that container's ID,
+     image and settings are checked against the prepare record. The pair is recorded as kept and the release as
+     `unhealthy`. `production.py rollback --sha S` then returns the rest of the release and leaves that pair as it is.
+     After that rollback, restore the account's two `.before-holder<n>` copies and run `docker compose $F rm --stop
+     whatsapp<n>-holder` ($F still naming the overlay). The collector keeps running its old container, so no
+     prepare/apply is needed.
+   - After the collector was recreated (no attach), or when the old container differs from the record: nothing more
+     is stopped or started. The apply ends `first_cutover_unrestored`, unresolved, and the undo below is done by hand.
 7. Verify: source status shows `operations.provider.name = whatsmeow` and `operations.holder` `state=attached`,
    `generation=1`; the holder logs `holder.claimed` and one `holder.provider_connected` with generation 1; one live
    event is captured (`last_ingest_at` moves). Receipt: times, those log lines and the generation (criterion 10).
@@ -106,7 +128,7 @@ Last: remove the autodeploy pause.
 Undo of one account (also after the cutover; the other account's holder and configuration stay): `docker compose $F
 stop whatsapp<n> whatsapp<n>-holder` ($F: the current file list); restore that account's two `.before-holder<n>`
 copies (for `whatsapp2` this keeps `whatsapp1`'s holder entries, taken after its cutover); `production.py prepare
---sha S` and `apply --sha S` recreate `whatsapp<n>` in child mode (one WhatsApp reconnect); then `docker compose
+--sha S` and `apply --sha S` with a new `S` recreate `whatsapp<n>` in child mode (one WhatsApp reconnect); then `docker compose
 $F rm --stop whatsapp<n>-holder` ($F as before the restore, so it still names the overlay). The session store is never copied or converted; it stays in
 `whatsapp<n>-session`.
 

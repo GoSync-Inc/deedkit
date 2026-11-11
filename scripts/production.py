@@ -523,7 +523,8 @@ def compose(project):
 def snapshot(project, *, stopped=False, labels=None, conditions=None, exited=()):
     """The project's Compose document and the identity of each selected service's container. Only rollback and a
     failed health wait (`stopped`) accept a container that exited or keeps restarting: that is when they run, and so
-    do the session services named in `exited` (ANYM-896: a stopped holder is recreated at once).
+    do the session services named in `exited` (ANYM-896: a stopped holder is recreated at once), which also may be a
+    container `create-holder` created and nothing started yet (whatsapp-native.md, Session holder cutover, step 5).
     `labels`, a dict, receives each service's input label (ANYM-895), None unless the container runs steadily;
     `conditions` why it does not: stopped, restarting, paused or unhealthy (None when it runs steadily)."""
     document = json.loads(run(compose(project) + ["config", "--format", "json"]))
@@ -539,7 +540,8 @@ def snapshot(project, *, stopped=False, labels=None, conditions=None, exited=())
         actual = json.loads(run(["docker", "inspect", ids[0]]))[0]
         condition = actual.get("State", {})
         if loose and not (condition.get("Running") and not condition.get("Paused")
-                          or condition.get("Status") in ("restarting", "exited")):
+                          or condition.get("Status") in ("restarting", "exited")
+                          or service in exited and condition.get("Status") == "created"):
             raise Refused("a selected container is neither running, restarting nor exited")
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", actual["Image"]):
             raise Refused("running container has no immutable image identity")
@@ -549,7 +551,8 @@ def snapshot(project, *, stopped=False, labels=None, conditions=None, exited=())
             labels[service] = ((actual.get("Config") or {}).get("Labels") or {}).get(INPUT_LABEL) if steady else None
         if conditions is not None:
             health = (condition.get("Health") or {}).get("Status", "healthy") if "Health" in condition else "healthy"
-            conditions[service] = ("stopped" if not condition.get("Running") else "restarting" if condition.get("Restarting")
+            conditions[service] = ("created" if condition.get("Status") == "created" else "stopped" if not condition.get("Running")
+                                   else "restarting" if condition.get("Restarting")
                                    else "paused" if condition.get("Paused") else "unhealthy" if health != "healthy" else None)
     return document, running
 
@@ -2052,6 +2055,16 @@ def check_session_openers(settings, documents, started):
             for source, _ in binds(unit):
                 if os.path.basename(source).endswith("-session"):
                     owners.setdefault(os.path.realpath(source), set()).add((project["name"], service))
+    # A holder's first cutover (docs/whatsapp-native.md): its collector's running child-mode container still mounts the
+    # session directory the holder now owns. When this apply starts both, holder_apply stops that collector before the
+    # holder starts, so it is admitted for the holder's directories only; any other opener is refused as before.
+    going = {(project["name"], service) for project, service, _ in started}
+    for project in settings["projects"]:
+        for holder, mark in (project.get("sessions") or {}).items():
+            if {(project["name"], holder), (project["name"], mark["collector"])} <= going:
+                for source, _ in binds(documents[project["name"]]["services"][holder]):
+                    if os.path.basename(source).endswith("-session"):
+                        owners.setdefault(os.path.realpath(source), set()).add((project["name"], mark["collector"]))
     exempt = [os.path.realpath(path) for path in settings.get("session_scan_exempt") or []
               if isinstance(path, str) and path.startswith("/")]
     containers = run(["docker", "ps", "--all", "--quiet", "--no-trunc"]).split()
@@ -2347,7 +2360,7 @@ def unhealthy(release, sha, receipt, evidence, touched, failure):
     restore = []
     try:
         for project, item in touched:
-            document, running = snapshot(project, stopped=True)
+            document, running = snapshot(project, stopped=True, exited=set(project.get("sessions") or ()))
             if digest(document) != item["before_digest"] or any(
                     running[service]["image"] != expected_image(receipt, item, service, target)
                     for service, target in project["services"].items()):
@@ -2775,7 +2788,7 @@ def rollback_plan(settings, release, data, failed):
             raise Refused("rollback data was written by an older production.py with order-dependent container settings; "
                           "use the manual procedure")
         # A crashed replacement exits or keeps restarting: that is when rollback is needed.
-        document, running = snapshot(project, stopped=True)
+        document, running = snapshot(project, stopped=True, exited=set(project.get("sessions") or ()))
         if digest(document) != item["after_digest"] or running != item["running"]:
             raise Refused("production changed since this release was applied")
         # ANYM-895: a service the release kept is never stopped or recreated by its rollback.
@@ -2824,13 +2837,17 @@ def rollback_restore(settings, release, sha, serving, plan):
             actual = json.loads(run(["docker", "inspect", ids[0]]))[0]
             if actual["Image"] != image or not actual["State"]["Running"]:
                 raise Refused("restored service does not run its previous image")
-    # ANYM-895: what the release kept was never touched; it must still run steadily on its own image.
+    # ANYM-895: what the release kept was never touched; it must still run steadily on its own image. A first cutover's
+    # holder that apply restored (holder_restore) stays stopped instead.
+    prepared = {item["name"]: item for item in read(release / "prepared.json")["projects"]}
     for project, before, previous in plan:
         command = ["docker", "compose", "--profile", "*", "--project-name", project["name"], "-f", str(before)]
+        fresh = holder_fresh(prepared.get(project["name"]) or {}, project.get("sessions") or {})
         for service in (service for service in project["services"] if service not in previous):
-            ids = run(command + ["ps", "-q", service]).split()
+            ids = run(command + ["ps", *(["--all"] if service in fresh else []), "-q", service]).split()
             actual = json.loads(run(["docker", "inspect", ids[0]]))[0] if len(ids) == 1 else {}
-            if actual.get("Image") != read(before)["services"][service]["image"] or not steady(actual):
+            if actual.get("Image") != read(before)["services"][service]["image"] or not (
+                    not (actual.get("State") or {}).get("Running") if service in fresh else steady(actual)):
                 raise Refused(f"{project['name']}/{service}, which the release kept, is not running steadily; inspect it")
 
 
@@ -3186,27 +3203,78 @@ def holder_apply(project, item, release, services, command, receipt, failed):
         fail(exc if isinstance(exc, Refused) else Refused(f"a session check failed: {type(exc).__name__}"))
 
 
+def holder_fresh(item, holders):
+    """The holders among `holders` a release starts for the first time: prepare found the container `create-holder`
+    created and nothing ever started (condition `created`), so there is no previous holder to go back to."""
+    return [holder for holder in holders if ((item.get("session") or {}).get(holder) or {}).get("precedence") == "created"]
+
+
+def holder_child(project, item, collector):
+    """Why a first cutover's collector cannot go back on its container from before the release, or None: that container
+    is gone (Compose replaced it with the attach-mode one), no longer has the recorded image and settings, or is not
+    the service's only container. Never started on a doubt."""
+    identity = item["running"][collector]
+    try:
+        actual = json.loads(run(["docker", "inspect", identity["container"]]))[0]
+    except Exception:
+        return "its container from before the release is gone (the attach-mode collector replaced it)"
+    if actual.get("Image") != identity["image"] or container_settings(actual) != identity["settings"]:
+        return "its container from before the release no longer has the recorded image and settings"
+    ids = run(["docker", "ps", "--all", "--filter", "label=com.docker.compose.oneoff=False",
+               "--filter", "label=com.docker.compose.project=" + project["name"],
+               "--filter", "label=com.docker.compose.service=" + collector, "--format", "{{.ID}}"]).split()
+    if [other for other in ids if not (other.startswith(identity["container"]) or identity["container"].startswith(other))]:
+        return "another container of the service exists beside its container from before the release"
+    return None
+
+
 def holder_restore(project, item, release, pairs, later, failure):
     """In apply, criterion 7: the pairs of a failed project back on their previous images (the release's before-file),
     holders first, then kept, so the release's rollback leaves them as they are. A failed restore leaves the attempt
-    unresolved."""
+    unresolved. A first cutover's pair (holder_fresh) has no previous holder: the holder stays stopped and its collector
+    starts again on its own child-mode container, checked first (holder_child). When that container cannot be used,
+    nothing more is stopped or started and the attempt ends `first_cutover_unrestored`, unresolved, for the hand undo."""
     before = ["docker", "compose", "--profile", "*", "--project-name", project["name"], "-f",
               str(release / (project["name"] + ".before.json"))]
     up = ["up", "-d", "--no-build", "--pull", "never", "--no-deps", "--force-recreate", "--wait", "--wait-timeout", "180"]
+    fresh = holder_fresh(item, pairs)
+    children = [project["sessions"][holder]["collector"] for holder in fresh]
+    code = "first_cutover_unrestored: " if fresh else ""
+    undo = "undo it by hand (docs/whatsapp-native.md, Session holder cutover, Undo of one account)"
+    try:
+        lost = [(collector, holder_child(project, item, collector)) for collector in children]
+    except Exception as exc:
+        lost = [(", ".join(children), f"it could not be read ({type(exc).__name__})")]
+    if lost := [f"{project['name']}/{collector}: {why}" for collector, why in lost if why]:
+        raise Refused(f"{code}{failure}; the first cutover cannot go back to child mode ({'; '.join(lost)}); nothing more "
+                      f"was stopped or started: {undo}")
     try:
         run(before + ["stop", *later, *pairs])
-        for members in (pairs, later):
-            run(before + up + members)
-            holder_steady(before, project, item["running"], {service: item["running"][service]["image"]
-                                                             for service in members})
+        for members in ([holder for holder in pairs if holder not in fresh], [service for service in later
+                                                                              if service not in children]):
+            if members:
+                run(before + up + members)
+                holder_steady(before, project, item["running"], {service: item["running"][service]["image"]
+                                                                 for service in members})
+        for collector in children:  # the holder stays stopped: no session runs without its collector
+            identity = item["running"][collector]
+            if why := holder_child(project, item, collector):
+                raise Refused(f"{project['name']}/{collector}: {why}")
+            run(["docker", "start", identity["container"]])
+            actual = json.loads(run(["docker", "inspect", identity["container"]]))[0]
+            if actual.get("Image") != identity["image"] or not steady(actual):
+                raise Refused(f"{project['name']}/{collector} is not running steadily on its container from before the release")
+            if settle := restart_loop(project, item, [(collector, identity["container"], actual)]):
+                raise Refused(settle)
         for service in (*pairs, *later):
             image = item["running"][service]["image"]
             labels = (json.loads(run(["docker", "image", "inspect", image]))[0].get("Config") or {}).get("Labels") or {}
             item.setdefault("kept", {})[service] = {"container": item["running"][service]["container"], "image": image,
                                                     "revision": labels.get(REVISION_LABEL)}
     except Exception as exc:
-        raise Refused(f"{failure}; restoring the previous {project['name']} pair failed too "
-                      f"({exc if isinstance(exc, Refused) else type(exc).__name__}); inspect it before any recovery") from exc
+        raise Refused(f"{code}{failure}; restoring the previous {project['name']} pair failed too "
+                      f"({exc if isinstance(exc, Refused) else type(exc).__name__}); inspect it before any recovery"
+                      + (f", then {undo}" if fresh else "")) from exc
 
 
 def holder_steady(command, project, running, images):
@@ -5497,14 +5565,14 @@ from release_enroll import (  # noqa: E402, F401  every name, re-exported: the p
     ENROLL_HEALTH_POLL, GATEWAY_SERVICE, CONNECT_CODE, run_input, file_sha256, replace_file, replace_like,
     enroll_calls, settle_halt, settle_finish, settle_retry, Enrollment, EnrollStop, public_http, enroll_apply,
     enroll_undo, enroll_command, enroll_required, ManifestInvalid, enrollment_halt, MANIFEST_FILE,
-    module_manifests, enrollment_pending, without_enrollments, enrollment_only)
+    module_manifests, enrollment_pending, without_enrollments, enrollment_only, create_holder)
 
 
 def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["verify", "prepare", "prepare-router", "apply", "rollback", "status",
                                            "images", "check-image", "deploy", "self-test", "tool-rollback",
-                                           "copy-database", "enroll"])
+                                           "copy-database", "enroll", "create-holder"])
     parser.add_argument("--sha")
     parser.add_argument("--target", choices=sorted(BUILDS))
     parser.add_argument("--config", help="default " + CONFIG + "; status: the autodeploy unit's (active_config)")
@@ -5514,6 +5582,7 @@ def argument_parser():
     parser.add_argument("--remove", action="store_true", help="images: remove the listed candidates")
     parser.add_argument("--database", help="copy-database: a name under the configuration's migration.databases")
     parser.add_argument("--module", help="enroll: the module of deploy/modules/<module>.json")
+    parser.add_argument("--service", help="create-holder: the new session holder, e.g. whatsapp1-holder")
     parser.add_argument("--plan", action="store_true", help="enroll: print the enrollment plan, change nothing")
     parser.add_argument("--apply", action="store_true", help="enroll: perform the plan named by --plan-digest")
     parser.add_argument("--plan-digest", help="enroll --apply: the plan_digest of the reviewed plan")
@@ -5589,6 +5658,7 @@ def locked_action(args):
                     result = {**result, "image_removal": retain_images(settings)}
             else:
                 result = (rollback(settings, args.sha, http, pre_claim=args.pre_claim_rollback) if args.action == "rollback" else
+                          create_holder(settings, args.service, args.sha) if args.action == "create-holder" else
                           {"prepare": prepare, "prepare-router": prepare_router}[args.action](settings, args.sha))
     return result
 

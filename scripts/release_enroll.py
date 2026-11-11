@@ -13,6 +13,8 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -1374,3 +1376,57 @@ def enrollment_only(mirror, head, settings, http, current, serving):
         return []
     return sorted(manifest["name"] for manifest in manifests)
 
+
+
+# The first start of a brand-new session holder (whatsapp-native.md, Session holder cutover, step 5): prepare reads the
+# container of every selected service, so a holder that never ran has none and each prepare refuses ("exactly one running
+# container"). `create-holder` creates that container from the verified main commit's holder image and starts nothing:
+# no provider session begins here. The holder's first process start is the pair step of the next apply, which recreates a
+# holder that is not running at once (ANYM-896, kind `recovery`, reason `stopped`), its collector stopped first.
+def create_holder(settings, service, sha):
+    """Create, never start, the one container of the session holder `service` on the image `prepare --sha sha` builds
+    (the same tag, reused there). Refused unless autodeploy is paused, the configuration marks `service` as a session
+    holder, its Compose files define it and it has no container at all. Returns the container, its image and the undo."""
+    if not p.PAUSE.exists():
+        raise p.Refused("create-holder runs only under the autodeploy pause (whatsapp-native.md, Session holder cutover)")
+    project = next((item for item in settings["projects"] if service in (item.get("sessions") or {})), None)
+    if project is None:
+        raise p.Refused(f"{service} is not a session holder in the production configuration: add its services entry first")
+    if service not in json.loads(p.run(p.compose(project) + ["config", "--format", "json"]))["services"]:
+        raise p.Refused(f"the Compose files of {project['name']} define no {service}: add its overlay to files first")
+    def containers():
+        return p.run(["docker", "ps", "--all", "--filter", "label=com.docker.compose.oneoff=False",
+                      "--filter", "label=com.docker.compose.project=" + project["name"],
+                      "--filter", "label=com.docker.compose.service=" + service, "--format", "{{.ID}}"]).split()
+    if containers():
+        raise p.Refused(f"{project['name']}/{service} already has a container; prepare reads it as it is")
+    state = Path(settings["state_directory"])
+    p.check_host_space(state)
+    docker_root = p.run(["docker", "info", "--format", "{{.DockerRootDir}}"]).strip()
+    if not docker_root or not Path(docker_root).is_dir():
+        raise p.Refused("create-holder requires the local production Docker engine")
+    p.check_image_space(docker_root, p.containerd_image_store(), state)
+    p.promotable(sha)
+    scratch = Path(tempfile.mkdtemp(prefix=".create-holder-", dir=state))
+    try:
+        source = scratch / "source"  # as prepare fetches it: the verified commit, public modes for the image build
+        p.run(["git", "init", "--quiet", str(source)])
+        p.run(["git", "-C", str(source), "remote", "add", "origin", "https://github.com/" + p.REPOSITORY + ".git"])
+        p.run(["git", "-C", str(source), "fetch", "--depth=1", "origin", sha])
+        if p.run(["git", "-C", str(source), "rev-parse", "FETCH_HEAD"]).strip() != sha:
+            raise p.Refused("fetched source is not the verified candidate commit")
+        p.run(["git", "-C", str(source), "checkout", "--quiet", "--detach", sha], umask=0o022)
+        image = p.build_image(source, sha, project["services"][service])
+        override = scratch / "image.json"
+        override.write_text(json.dumps({"services": {service: {"image": image}}}))
+        p.run(p.compose(project) + ["-f", str(override), "up", "--no-start", "--no-deps", "--no-build", "--pull", "never",
+                                    service])
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    undo = shlex.join(p.compose(project) + ["rm", "--stop", service])  # file and env-file paths only, never a value
+    ids = containers()
+    actual = json.loads(p.run(["docker", "inspect", ids[0]]))[0] if len(ids) == 1 else {}
+    if actual.get("Image") != image or (actual.get("State") or {}).get("Status") != "created":
+        raise p.Refused(f"{project['name']}/{service} is not one created container on {image}; inspect it, undo: {undo}")
+    return {"status": "created", "project": project["name"], "service": service, "container": ids[0], "image": image,
+            "sha": sha, "undo": undo}
