@@ -9,10 +9,10 @@ import re
 
 from .policy import scope_filter
 
-KINDS=frozenset(('text','photo','video','voice','audio','document','sticker','location','contact','poll','system','group_change','call','unknown'))
+KINDS=frozenset(('text','photo','video','voice','audio','document','sticker','location','contact','poll','system','group_change','call','event','unknown'))
 LABELS={'photo':'Фото','video':'Видео','voice':'Голосовое','audio':'Аудио','document':'Документ',
     'sticker':'Стикер','location':'Местоположение','contact':'Контакт','poll':'Опрос',
-    'system':'Служебное событие','group_change':'Изменение группы','call':'Звонок','unknown':'Сообщение неизвестного типа'}
+    'system':'Служебное событие','group_change':'Изменение группы','call':'Звонок','event':'Событие','unknown':'Сообщение неизвестного типа'}
 # Every character str.splitlines breaks on: extracted text must not start a second line (ANYM-664).
 _LINE_BREAKS=re.compile('[\\n\\r\\v\\f\\x1c-\\x1e\\x85\\u2028\\u2029]+')
 
@@ -41,7 +41,7 @@ def meaningful_sql(alias='m',metadata='md'):
     meta=metadata_sql(alias,metadata)
     return f'''NOT {alias}.deleted AND {visible_sql(alias,metadata)}
         AND (length(btrim({alias}.body))>0 OR {meta}->>'media_kind' IS NOT NULL
-          OR {meta}->>'message_kind' IN ('photo','video','voice','audio','document','sticker','location','contact','poll')
+          OR {meta}->>'message_kind' IN ('photo','video','voice','audio','document','sticker','location','contact','poll','event')
           OR EXISTS(SELECT 1 FROM media_jobs f WHERE f.message={alias}.id AND f.state<>'superseded')
           OR EXISTS(SELECT 1 FROM attachments f WHERE f.message={alias}.id AND f.active))'''
 

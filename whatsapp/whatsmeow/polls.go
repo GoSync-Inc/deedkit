@@ -88,13 +88,28 @@ func pollOptionIndices(v *waE2E.PollCreationMessage, selected [][]byte) (indices
 }
 
 // pollTarget finds the journaled poll a vote names: the chat it is kept under,
-// its capture ID and its creation message. The key's fromMe is the voter's
-// view (whatsmeow getOrigSenderFromKey): true means the voter created the poll.
-// The capture ID is matched exactly, creator included (a group ID carries the
-// sender), in the observed chat and creator form or their verified PN/LID alias.
+// its capture ID and its creation message (secretTarget).
 func (s *CaptureStore) pollTarget(e *events.Message, key *waCommon.MessageKey) (string, string, *waE2E.PollCreationMessage, error) {
+	chat, id, m, err := s.secretTarget(e, key, errPollVote)
+	if err != nil {
+		return "", "", nil, err
+	}
+	if poll := pollCreation(unwrap(m).Message); poll != nil {
+		return chat, id, poll, nil
+	}
+	return "", "", nil, errPollVote
+}
+
+// secretTarget finds the journaled message a modification sealed with its
+// secret names (a poll vote, an event response): the chat it is kept under, its
+// capture ID and the message. The key's fromMe is the modifier's view (whatsmeow
+// getOrigSenderFromKey): true means the modifier sent the message. The capture
+// ID is matched exactly, creator included (a group ID carries the sender), in
+// the observed chat and creator form or their verified PN/LID alias. Any miss is
+// fail; a journal read failure stays a failure.
+func (s *CaptureStore) secretTarget(e *events.Message, key *waCommon.MessageKey, fail error) (string, string, *events.Message, error) {
 	if key.GetID() == "" {
-		return "", "", nil, errPollVote
+		return "", "", nil, fail
 	}
 	creator := e.Info.Sender
 	if !key.GetFromMe() {
@@ -104,7 +119,7 @@ func (s *CaptureStore) pollTarget(e *events.Message, key *waCommon.MessageKey) (
 		}
 		j, err := types.ParseJID(raw)
 		if err != nil || j.IsEmpty() {
-			return "", "", nil, errPollVote
+			return "", "", nil, fail
 		}
 		creator = j
 	}
@@ -122,7 +137,7 @@ func (s *CaptureStore) pollTarget(e *events.Message, key *waCommon.MessageKey) (
 			}
 		}
 		for _, id := range candidates {
-			// A journal read failure stays a failure; only a missing poll is skipped.
+			// A journal read failure stays a failure; only a missing message is skipped.
 			var one int
 			err := s.db.QueryRow("SELECT 1 FROM capture WHERE chat=? AND message_id=? AND length(raw)>0 LIMIT 1", LegacyChatID(chat), id).Scan(&one)
 			if errors.Is(err, sql.ErrNoRows) {
@@ -133,15 +148,12 @@ func (s *CaptureStore) pollTarget(e *events.Message, key *waCommon.MessageKey) (
 			}
 			m, err := s.Get(LegacyChatID(chat), id)
 			if err != nil {
-				return "", "", nil, errPollVote
+				return "", "", nil, fail
 			}
-			if poll := pollCreation(unwrap(m).Message); poll != nil {
-				return LegacyChatID(chat), id, poll, nil
-			}
-			return "", "", nil, errPollVote
+			return LegacyChatID(chat), id, m, nil
 		}
 	}
-	return "", "", nil, errPollVote
+	return "", "", nil, fail
 }
 
 // pollIdentities is each JID and its verified PN/LID alias, without devices,
@@ -275,15 +287,9 @@ func (p *Provider) historyPollVote(poll *events.Message, creation *waE2E.PollCre
 	if creation == nil || u.GetVote() == nil || key.GetID() == "" {
 		return errPollVote
 	}
-	voter := p.Capture.Owner
-	if !key.GetFromMe() && poll.Info.IsGroup {
-		j, err := types.ParseJID(key.GetParticipant())
-		if err != nil || j.IsEmpty() {
-			return errPollVote
-		}
-		voter = j
-	} else if !key.GetFromMe() {
-		voter = poll.Info.Chat
+	voter, ok := p.Capture.historyActor(poll, key)
+	if !ok {
+		return errPollVote
 	}
 	vote := &events.Message{Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: poll.Info.Chat, Sender: voter, IsFromMe: key.GetFromMe(), IsGroup: poll.Info.IsGroup}, ID: key.GetID()}}
 	at := pollVoteTime(u.GetSenderTimestampMS(), time.UnixMilli(u.GetServerTimestampMS()))
@@ -434,4 +440,19 @@ func (e *operationEnv) votePoll(string) (any, error) {
 		return nil, err
 	}
 	return e.submitted(nil)
+}
+
+// historyActor is who sent a modification a history sync carries on a message
+// (a poll vote, an event response), by whatsmeow ParseWebMessage's sender rule
+// for the modification's key: the owner, the group participant or the chat.
+// False: a group modification names no readable participant.
+func (s *CaptureStore) historyActor(m *events.Message, key *waCommon.MessageKey) (types.JID, bool) {
+	if key.GetFromMe() {
+		return s.Owner, true
+	}
+	if !m.Info.IsGroup {
+		return m.Info.Chat, true
+	}
+	j, err := types.ParseJID(key.GetParticipant())
+	return j, err == nil && !j.IsEmpty()
 }

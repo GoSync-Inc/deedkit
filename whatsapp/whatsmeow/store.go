@@ -73,7 +73,7 @@ func OpenCapture(c Config) (*CaptureStore, error) {
 		return nil, e
 	}
 	db.SetMaxOpenConns(1)
-	for _, q := range []string{"PRAGMA journal_mode=DELETE", "PRAGMA synchronous=FULL", "PRAGMA max_page_count=131072", `CREATE TABLE IF NOT EXISTS capture(seq INTEGER PRIMARY KEY,digest TEXT NOT NULL UNIQUE,chat TEXT NOT NULL,message_id TEXT NOT NULL,source_ts INTEGER NOT NULL,raw BLOB NOT NULL,envelope BLOB NOT NULL,published INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL)`, `CREATE INDEX IF NOT EXISTS capture_chat_time ON capture(chat,source_ts,message_id)`, `CREATE TABLE IF NOT EXISTS chats(chat TEXT PRIMARY KEY,title TEXT NOT NULL,observed_at TEXT NOT NULL)`, `CREATE TABLE IF NOT EXISTS history_requests(id INTEGER PRIMARY KEY CHECK(id=1),last_ms INTEGER NOT NULL)`, `CREATE TABLE IF NOT EXISTS history_jobs(stanza TEXT PRIMARY KEY,wire BLOB NOT NULL,state TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,next_attempt_ms INTEGER NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT '')`} {
+	for _, q := range []string{"PRAGMA journal_mode=DELETE", "PRAGMA synchronous=FULL", "PRAGMA max_page_count=131072", `CREATE TABLE IF NOT EXISTS capture(seq INTEGER PRIMARY KEY,digest TEXT NOT NULL UNIQUE,chat TEXT NOT NULL,message_id TEXT NOT NULL,source_ts INTEGER NOT NULL,raw BLOB NOT NULL,envelope BLOB NOT NULL,published INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL)`, `CREATE INDEX IF NOT EXISTS capture_chat_time ON capture(chat,source_ts,message_id)`, `CREATE TABLE IF NOT EXISTS chats(chat TEXT PRIMARY KEY,title TEXT NOT NULL,observed_at TEXT NOT NULL)`, `CREATE TABLE IF NOT EXISTS history_requests(id INTEGER PRIMARY KEY CHECK(id=1),last_ms INTEGER NOT NULL)`, eventResponseTable, `CREATE TABLE IF NOT EXISTS history_jobs(stanza TEXT PRIMARY KEY,wire BLOB NOT NULL,state TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,next_attempt_ms INTEGER NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT '')`} {
 		if _, e = db.Exec(q); e != nil {
 			db.Close()
 			return nil, e
@@ -117,7 +117,7 @@ func (s *CaptureStore) Close() error { return s.db.Close() }
 // acknowledged and counted under its fixed code instead of stopping capture of
 // the whole account and being redelivered forever. Store, disk, spool and
 // identity failures are never in this set.
-var skippedCaptureCodes = map[string]bool{"invalid_provider_message": true, "unsupported_chat": true, "invalid_provider_media": true, "invalid_history_notification": true, "invalid_history_chat": true, "invalid_history_message": true, "skipped_group_change": true, "skipped_call_event": true, "poll_vote_undecryptable": true, "poll_vote_unknown_option": true}
+var skippedCaptureCodes = map[string]bool{"invalid_provider_message": true, "unsupported_chat": true, "invalid_provider_media": true, "invalid_history_notification": true, "invalid_history_chat": true, "invalid_history_message": true, "skipped_group_change": true, "skipped_call_event": true, "poll_vote_undecryptable": true, "poll_vote_unknown_option": true, "event_response_undecryptable": true, "event_edit_undecryptable": true}
 
 func skippableCapture(err error) bool { return err != nil && skippedCaptureCodes[err.Error()] }
 
@@ -389,6 +389,9 @@ func (s *CaptureStore) Put(e *events.Message, origin string) error {
 		e = &copy
 	}
 	envelope, err := captureEnvelope(s.Config.Account, e, s.Owner, origin, s.OwnerLID)
+	if err == nil {
+		err = s.withEventResponses(envelope) // ANYM-924: counts only (events.go)
+	}
 	if err != nil {
 		return err
 	}

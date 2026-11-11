@@ -481,8 +481,8 @@ class Archive:
             e={**e,'deleted':True,'body':'','media':[],
                'updated_at':max(tombstone,datetime.fromisoformat(e['updated_at'])).isoformat()}
             if 'formatting' in e:e['formatting']=unknown_formatting()
-            if {'contact','buttons','location'}&set(e.get('metadata',{})):
-                e['metadata']={k:v for k,v in e['metadata'].items() if k not in ('contact','buttons','location')}
+            if {'contact','buttons','location','event','event_responses'}&set(e.get('metadata',{})):
+                e['metadata']={k:v for k,v in e['metadata'].items() if k not in ('contact','buttons','location','event','event_responses')}
             o.e=e
         if (identity_observations and not e['deleted']
                 and c.execute('SELECT 1 FROM messages WHERE id=%s AND NOT deleted',(mid,)).fetchone()):

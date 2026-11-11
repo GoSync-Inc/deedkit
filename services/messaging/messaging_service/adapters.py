@@ -303,7 +303,7 @@ def whatsapp_message(account,event,*,origin='live',change='message',observed_at=
     service=event.get('isService') is True or native_type in ('notification','e2e_notification','call_log','gp2','protocol','ciphertext','revoked')
     kind='system' if service else {'chat':'text','image':'photo','video':'video','gif':'video','ptv':'video',
         'ptt':'voice','audio':'audio','document':'document','sticker':'sticker','location':'location',
-        'vcard':'contact','multi_vcard':'contact','poll_creation':'poll'}.get(native_type,'unknown')
+        'vcard':'contact','multi_vcard':'contact','poll_creation':'poll','event':'event'}.get(native_type,'unknown')
     # Business messages are text only when they carry visible text; header media is not fetched.
     # A choice from a bot menu is archived as its chosen option's text (whatsmeow menu.go).
     if native_type in ('template','interactive','buttons','list','product','group_invite','list_response',
@@ -340,6 +340,10 @@ def whatsapp_message(account,event,*,origin='live',change='message',observed_at=
         except ValueError:poll=None
     # A shared place (ANYM-922, whatsmeow capture.go); validate() drops a block it cannot accept, never the message.
     location=event.get('location') if kind=='location' and change!='delete' else None
+    # A WhatsApp event invitation and its response counts (ANYM-924, whatsmeow events.go); validate() drops a block it
+    # cannot accept, never the message.
+    invite=event.get('event') if kind=='event' and change!='delete' else None
+    responses=event.get('eventResponses') if invite is not None else None
     return validate({'account':account,'platform':'whatsapp','chat':event['chatId'],
         'chat_title':display_text(event.get('chatName'),512) or event['chatId'],'provider_id':event['messageId'],
         'sender':event.get('senderId') or '','body':body,
@@ -364,5 +368,7 @@ def whatsapp_message(account,event,*,origin='live',change='message',observed_at=
                     **({'call':call_times(call)} if call is not None else {}),
                     **({'poll':poll} if poll is not None else {}),
                     **({'location':location} if location is not None else {}),
+                    **({'event':invite} if invite is not None else {}),
+                    **({'event_responses':responses} if responses is not None else {}),
                     **({'sender_is_business_or_verified':True} if event.get('senderIsBusiness') is True else {}),
                     'media_kind':event.get('mediaKind')}})
