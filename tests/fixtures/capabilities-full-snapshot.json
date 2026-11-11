@@ -611,6 +611,9 @@
    }
   },
   "request_id_required": true,
+  "schedules": [
+   "telegram"
+  ],
   "server_approval_gate": false,
   "text_only": false,
   "wait_max_seconds": 25
@@ -914,7 +917,6 @@
   "drafts",
   "owner_approval",
   "project_memory",
-  "schedules",
   "oauth"
  ],
  "version": "<version>",

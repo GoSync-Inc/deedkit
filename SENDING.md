@@ -108,6 +108,10 @@ Refresh MCP discovery after upgrading; the messaging manifest contains 41 tools.
 | `expired` | The ten-minute pending window elapsed | Review and obtain approval for a new action |
 | `failed` | Locally rejected before invoking send | Inspect safe error code |
 | `unknown` | Timeout, interrupted dispatch or unverified receipt | Check history; never automatically send again |
+| `scheduled` | Telegram holds a `schedule_at` send in the owner's Scheduled messages (resting, not terminal; ANYM-464) | Nothing until the time; `get_send_status` or `list_scheduled` to check |
+| `scheduled_cancelled` | The scheduled message was deleted before its time (`cancel_reason`: `owner_app` or `agent`) | None; ask the owner before scheduling again |
+
+`cancelled` keeps its meaning above; a scheduled message deleted in the app is `scheduled_cancelled`.
 
 The 30-second provider timeout starts when the request leaves the collector.
 Waiting for the shared Telegram rate gate (history or media hit a flood wait)
@@ -435,6 +439,40 @@ one, so a retry may use either), and on WhatsApp `silent: true` is `silent_unsup
 A messaging service from before this change refuses a call with `silent` (`unknown_field`); a call without it
 works as before. A silent row is refused before the provider by an older collector (`send_target_invalid`),
 so it is never sent with sound.
+
+### Scheduling a Telegram send for later (`schedule_at`, ANYM-464, schema 87)
+
+`preview_message`, `send_message`, `messages_send` and `execute_messenger_operation` `send_file` (in
+`parameters`) take an optional `schedule_at` on a Telegram archive `chat_id`, a channel the owner administers
+included: an absolute time, RFC 3339 with an offset, 60 s to 365 days ahead (else `schedule_at_out_of_range`;
+on a digest-bound send also `next_action: send_now_or_preview_again`). Telegram holds the message in the
+owner's Scheduled messages and publishes it at that time, with no second confirmation; the owner can move,
+edit, send now or delete it in the app. There is no server-side timer.
+
+The preview returns `schedule_at_utc`, `schedule_at_local` in the owner's zone (`ANYMSG_OWNER_TIMEZONE`) and
+`owner_zone_source: owner`; with no zone set, `owner_zone_source: utc_fallback`, no local line, and
+`schedule_at_offset` echoes the caller's own offset. `render_policy.schedule_at` is the UTC time and the
+`preview_digest` binds it with the content, destination and options: any change needs a new preview. `silent`
+combines with it; `mentions` too. `messages_send` shows it as `schedule` and its `confirm_token` binds it.
+
+The send reads `queued`, `dispatching`, then `scheduled` with `scheduled_message_id` (Telegram's scheduled-list
+ID), `schedule_at` (Telegram's current time) and `edited_in_app`; a `wait_s` wait returns at `scheduled`. When
+Telegram publishes it the send becomes `sent` with the published `provider_message_id` and `message_id`; a
+deletion before the time makes it `scheduled_cancelled` (`cancel_reason: owner_app`). A move in the app updates
+`schedule_at`; an edit sets `edited_in_app: true` (the stored text stays the confirmed one; the published text is
+the archive message). A `send_file` operation follows the same states, ending `succeeded`. If the collector was
+offline at the time, an archived outgoing message in that chat with the exact text, sent from 60 s before the
+time on and not linked to another send, settles it `sent`; two minutes after the time the collector reads the
+chat's scheduled list once (`GetScheduledHistoryRequest`): still held keeps it `scheduled` with Telegram's
+time, otherwise it is `unknown` (`scheduled_outcome_unknown`). Nothing is ever resent; a submit timeout is
+`unknown` and is never retried or rescheduled.
+
+While an earlier send of the same account, chat, exact content and UTC time is `scheduled`, a new one is refused
+`duplicate_scheduled` (409) whatever its age, with `scheduled_message_id`, `next_call: list_scheduled` and, when
+it is your own, `earlier_request_id`; `allow_duplicate: true` overrides it. To reschedule, delete it in the app
+and send again with a new confirmation. WhatsApp has no scheduled send: `schedule_unsupported`, nothing queued;
+a phone or `username` recipient is refused as for `silent`. A messaging service from before schema 87 refuses
+`schedule_at` (`unknown_field`).
 
 ### Mentioning group members (`mentions`, ANYM-928)
 

@@ -133,6 +133,7 @@ without a mapping.
 | Module status | `state` |
 |---|---|
 | send: `queued` / `dispatching` / `sent` / `failed` / `expired` / `cancelled` / `unknown` | pending / running / succeeded / failed / expired / cancelled / unknown |
+| send or operation: `scheduled` / `scheduled_cancelled` (ANYM-464: Telegram holds it until its time) | pending / cancelled |
 | operation: `queued` / `dispatching` / `succeeded` / `failed` / `expired` / `cancelled` / `unknown` | pending / running / succeeded / failed / expired / cancelled / unknown |
 | calendar operation: `queued` / `running` / `verified` / `conflict` / `failed` | pending / running / succeeded / failed / failed |
 | calendar operation: `unknown` / `needs_attention` / `partial` | unknown (reconcile, do not create again) |

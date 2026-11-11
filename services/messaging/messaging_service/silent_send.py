@@ -12,10 +12,11 @@ DESCRIPTION = ('Telegram chat_id sends: true delivers without a notification sou
     'invalid_parameters; preview the archived chat_id instead. Omitted or false is the usual send with sound.')
 
 
-def render_policy(link_preview, allow_lossy, silent=False, mentions=None):
-    """The stored and digest-bound send policy; mentions (ANYM-928) is the request form, present only when given."""
+def render_policy(link_preview, allow_lossy, silent=False, mentions=None, schedule_at=None):
+    """The stored and digest-bound send policy; mentions (ANYM-928) is the request form, present only when given;
+    schedule_at (ANYM-464) the UTC time, present only when given."""
     return {'link_preview': link_preview, 'allow_lossy': allow_lossy, **({'silent': True} if silent else {}),
-            **({'mentions': mentions} if mentions else {})}
+            **({'mentions': mentions} if mentions else {}), **({'schedule_at': schedule_at} if schedule_at else {})}
 
 
 def unsupported():

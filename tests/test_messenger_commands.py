@@ -344,6 +344,25 @@ def test_mutations_never_retry_an_ambiguous_provider_result(operator,outcome,sta
     assert queue(s,key)['status']==status and len(calls)==1
 
 
+# spec: ANYM-464
+def test_a_scheduled_file_receipt_rests_in_scheduled_through_the_worker(operator):
+    from messaging_service.commands import CommandWorker,safe_result
+    s,_,key,state=operator
+    queued=queue(s,key);calls=[]
+    receipt={'outcome':'scheduled','basis':'provider_scheduled_message','provider_message_id':'12',
+             'provider_chat_id':'100','schedule_at':'2026-12-01T09:00:00+00:00'}
+    assert safe_result({**receipt,'token':'dropped'})==receipt
+    with pytest.raises(ValueError):safe_result({**receipt,'schedule_at':None})
+    async def provider(job):calls.append(job);return dict(receipt)
+    worker=CommandWorker(state,provider)
+    assert asyncio.run(worker.once()) and not asyncio.run(worker.once())
+    with s.pool.connection() as c:
+        row=c.execute('SELECT status,scheduled_message_id,schedule_at,result FROM messenger_commands WHERE id=%s',
+                      (queued['operation_id'],)).fetchone()
+    assert row['status']=='scheduled' and row['scheduled_message_id']=='12' and len(calls)==1
+    assert row['schedule_at'].isoformat()=='2026-12-01T09:00:00+00:00' and row['result']['schedule_at']==receipt['schedule_at']
+
+
 SPAM='Synthetic spam offer '*20
 MODERATOR=['read','read-live','groups-read','groups-moderate']
 

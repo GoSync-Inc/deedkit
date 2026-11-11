@@ -56,6 +56,8 @@ def payload(error,operation='',request_id=None):
     # ANYM-748: a refused duplicate names the caller's own earlier request_id and its status, never text or send_id.
     for name in ('earlier_request_id','earlier_status'):
         if hasattr(error,name):info[name]=getattr(error,name)
+    # ANYM-464: a refused duplicate scheduled send names Telegram's scheduled-list ID; an ID, never text.
+    if hasattr(error,'scheduled_message_id'):info['scheduled_message_id']=error.scheduled_message_id
     # ANYM-928: a refused mention names its item index and the text's UTF-16 length, never the text.
     for name in ('index','text_utf16_length'):
         if hasattr(error,name):info[name]=getattr(error,name)

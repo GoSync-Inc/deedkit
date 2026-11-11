@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import base64
 import threading
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from hypothesis import given, settings, strategies as st
@@ -13,6 +14,7 @@ from messaging_service.commands import CommandRejected, CommandWorker
 from messaging_service.envelope import stable_id
 from messaging_service.error_details import payload as error_payload
 from messaging_service.outgoing import OutgoingWorker
+from messaging_service.scheduled_send import normalized
 from messaging_service.send_intent import payload, send
 from messaging_service.store import APIError
 from platform_contracts.agent_conformance import run_matrix
@@ -553,6 +555,22 @@ def test_a_payload_sent_with_a_token_must_equal_the_preview(world):
     assert refused(world.call, confirm_token=token, to=CHAT, text='Synthetic other').code == 'idempotency_conflict'
     world.work()
     assert [t['body'] for t in world.texts] == ['Synthetic approved']
+
+
+# spec: ANYM-464
+def test_a_scheduled_messages_send_binds_its_time_to_the_confirm_token(world):
+    ahead = lambda days: (datetime.now(timezone(timedelta(hours=3))) + timedelta(days=days)).replace(microsecond=0).isoformat()
+    at, later = ahead(1), ahead(2)
+    result = world.call(to=CHAT, text='Synthetic scheduled', schedule_at=at, dry_run=True)
+    token = result['confirm_token']
+    assert result['state'] == 'previewed' and token and result['preview']['schedule']['schedule_at_utc'] == normalized(at)
+    assert refused(world.call, confirm_token=token, to=CHAT, text='Synthetic scheduled', schedule_at=later).code == 'idempotency_conflict'
+    world.work()
+    assert not world.texts and intents(world) == 0
+    assert world.call(confirm_token=token, to=CHAT, text='Synthetic scheduled', schedule_at=at, wait_s=0)['state'] in ('running', 'succeeded')
+    with world.s.pool.connection() as c:
+        policies = [r['render_policy'] for r in c.execute('SELECT render_policy FROM outgoing_messages').fetchall()]
+    assert [p['schedule_at'] for p in policies] == [normalized(at)]
 
 
 # spec: ANYM-546

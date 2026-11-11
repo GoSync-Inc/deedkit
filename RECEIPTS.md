@@ -91,6 +91,11 @@ from any participant (`audience: provider_aggregate`; the adapter does not recor
 which one), so `delivered` there never means every member got it. An agent that
 needs a push subscribes to `message.status` events instead of polling.
 
+A scheduled Telegram send (ANYM-464) has no receipt while Telegram holds it: its send status is `scheduled`,
+then `sent` or `scheduled_cancelled` (SENDING.md). Each of these transitions is a `message.status` event that
+names the `send_id` and `status` instead of a message, sent only to the key that made the send
+(SUBSCRIPTIONS.md); receipts start once it is published.
+
 ## Durable updates and coverage
 
 The account-scoped observation ledger accepts evidence before a message or chat

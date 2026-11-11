@@ -93,6 +93,8 @@ AUDIT_CODES = frozenset({
     'reserved_header','rotation_in_progress','endpoint_limit','endpoint_conflict','operator_disabled',
     'invalid_endpoint_state','endpoint_paused','endpoint_auto_paused','dynamic_sources_disabled','source_filters_disabled','source_exclusions_disabled',
     'duplicate_send_unresolved','chat_changed_since_seen','chat_guard_unavailable',
+    # ANYM-464: scheduled send refusals.
+    'schedule_at_out_of_range','schedule_unsupported','duplicate_scheduled',
     # ANYM-909: list_negotiations refusals.
     'not_ready','not_found_or_forbidden','selection_required',
 })

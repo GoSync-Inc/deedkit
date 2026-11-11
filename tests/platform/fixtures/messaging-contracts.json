@@ -156,6 +156,18 @@
             "title": "Reply To",
             "type": "string"
           },
+          "schedule_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Telegram chat_id sends: an absolute time, RFC 3339 with an offset (2026-11-12T09:00:00+03:00), 60 s to 365 days ahead. Telegram holds the message in the owner's Scheduled messages and publishes it then; the owner can move, edit or delete it in the app. preview_message shows schedule_at_utc, schedule_at_local in the owner's zone and owner_zone_source; its preview_digest binds the UTC time, so send with the same schedule_at. Status: scheduled (nothing to do until the time), then sent, or scheduled_cancelled when deleted before it. WhatsApp: schedule_unsupported, nothing queued. Omitted: send now.",
+            "title": "Schedule At"
+          },
           "silent": {
             "anyOf": [
               {
@@ -344,6 +356,18 @@
           "request_id": {
             "title": "Request Id",
             "type": "string"
+          },
+          "schedule_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Telegram chat_id sends: an absolute time, RFC 3339 with an offset (2026-11-12T09:00:00+03:00), 60 s to 365 days ahead. Telegram holds the message in the owner's Scheduled messages and publishes it then; the owner can move, edit or delete it in the app. preview_message shows schedule_at_utc, schedule_at_local in the owner's zone and owner_zone_source; its preview_digest binds the UTC time, so send with the same schedule_at. Status: scheduled (nothing to do until the time), then sent, or scheduled_cancelled when deleted before it. WhatsApp: schedule_unsupported, nothing queued. Omitted: send now.",
+            "title": "Schedule At"
           },
           "silent": {
             "anyOf": [
@@ -542,6 +566,18 @@
             ],
             "default": null,
             "title": "Resume"
+          },
+          "schedule_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "An archived Telegram chat only: every step (files, then text) is held by Telegram until this absolute time, RFC 3339 with an offset, 60 s to 365 days ahead; the preview shows it as schedule and the confirm_token binds it. Each step then reads scheduled. A phone or @username without a chat, or WhatsApp, is refused. Omitted: send now.",
+            "title": "Schedule At"
           },
           "text": {
             "anyOf": [

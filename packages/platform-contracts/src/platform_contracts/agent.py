@@ -35,10 +35,13 @@ STATUS_STATES = {
     "messaging.send": {
         "queued": "pending", "dispatching": "running", "sent": "succeeded", "failed": "failed",
         "expired": "expired", "cancelled": "cancelled", "unknown": "unknown",
+        # ANYM-464: Telegram holds it until its time (not final); deleted before it.
+        "scheduled": "pending", "scheduled_cancelled": "cancelled",
     },
     "messaging.operation": {
         "queued": "pending", "dispatching": "running", "succeeded": "succeeded", "failed": "failed",
         "expired": "expired", "cancelled": "cancelled", "unknown": "unknown",
+        "scheduled": "pending", "scheduled_cancelled": "cancelled",
     },
     # partial and needs_attention ask for reconciliation ("do not create again"), so they are never `failed`.
     "calendar.operation": {
