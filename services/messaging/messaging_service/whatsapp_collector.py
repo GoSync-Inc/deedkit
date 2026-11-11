@@ -25,6 +25,8 @@ from .telegram_collector import TelegramCollector,ProviderUnavailable,private_js
 from .error_codes import CODES
 from .operational import CONNECTION_ERRORS,MEDIA_ERRORS,collector_stop
 from .media_policy import MEDIA_POLICY_FIELDS,configure_media_policy
+# ANYM-809/963: the native journal's repair status file (re-exported for callers and tests).
+from .native_repair import NATIVE_REPAIR_STATES as NATIVE_REPAIR_STATES,validate_native_repair_status
 
 # How the adapter's error replies map to exceptions (error_codes.json, parity with the Go and JS adapters).
 PROVIDER_REPLY=CODES['provider_reply']
@@ -238,7 +240,7 @@ class WhatsAppState(CollectorState):
             row=self._operations(c);value=row['operations']
             if value.get('provider',{}).get('name')!='whatsmeow':return
             value['provider_repair']={**status,'checked_at':row['observed'].isoformat(),
-                'scope':'native_capture_journal','publishes':False}
+                'scope':'native_capture_journal','publishes':'republish' in status}
             self._save_operations(c,value)
 
     def progress(self,chat,kind):
@@ -606,23 +608,6 @@ def validate_native_history_status(value):
         or value['coverage']!='partial'):
         raise ValueError('invalid_native_history_status')
     return {**value,'observed_at':utc(value['observed_at'])}
-
-
-NATIVE_REPAIR_STATES=('would_add_content','label_only','same','no_raw','placeholder','sender_key_only','parse_error')
-
-
-def validate_native_repair_status(value):
-    from .envelope import utc
-    def count(x):return type(x) is int and 0<=x<2**53
-    if (not isinstance(value,dict) or set(value)!={'version','done','rows_scanned','counts','last_error','observed_at'}
-        or not count(value['version']) or not 1<=value['version']<=10**6 or type(value['done']) is not bool
-        or not count(value['rows_scanned']) or value['last_error'] not in ('','repair_read','repair_storage')
-        or not isinstance(value['counts'],dict) or set(value['counts'])!=set(NATIVE_REPAIR_STATES)
-        or not all(count(x) for x in value['counts'].values())):
-        raise ValueError('invalid_native_repair_status')
-    try:observed=utc(value['observed_at'])
-    except (ValueError,TypeError,OverflowError):raise ValueError('invalid_native_repair_status') from None
-    return {**value,'counts':{k:value['counts'][k] for k in NATIVE_REPAIR_STATES},'observed_at':observed}
 
 
 class WhatsmeowProvider(NodeProvider):

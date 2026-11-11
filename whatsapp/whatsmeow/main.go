@@ -67,6 +67,8 @@ func main() {
 	flag.StringVar(&fixture, "normalize-fixture", "", "offline synthetic fixture; no provider/session access")
 	var menuFixture string
 	flag.StringVar(&menuFixture, "menu-answer-fixture", "", "offline synthetic menu choice through sendText with fake dependencies; no provider/session access")
+	var republish string
+	flag.StringVar(&republish, "republish-fixture", "", "offline synthetic journal: the ANYM-963 republish pass on a throwaway capture store; no provider/session access")
 	var mediaKeys bool
 	flag.BoolVar(&mediaKeys, "media-keys", false, "read-only capture journal lookup for the operator media inventory; no provider/session access")
 	var menuShapes bool
@@ -86,6 +88,8 @@ func main() {
 		err = normalizeFixture(fixture)
 	} else if menuFixture != "" {
 		err = menuAnswerFixture(menuFixture, os.Stdout)
+	} else if republish != "" {
+		err = republishFixture(republish)
 	} else if mediaKeys {
 		err = serveMediaKeys(path, os.Stdin, os.Stdout)
 	} else if menuShapes {

@@ -60,6 +60,7 @@ type repairPass struct {
 	counts    map[string]int64
 	lastError string
 	reported  string
+	next      *republishPass // ANYM-963: runs once this count is done; nil: the count only
 }
 
 func newRepairPass(s *CaptureStore) *repairPass {
@@ -266,6 +267,9 @@ func (p *repairPass) tick(ctx context.Context) {
 	if code != "" {
 		p.lastError = code
 	}
+	if p.done && p.next != nil {
+		p.next.tick(ctx)
+	}
 	p.writeStatus()
 }
 
@@ -396,7 +400,11 @@ func (p *repairPass) status() map[string]any {
 	for _, k := range repairStates {
 		counts[k] = p.counts[k]
 	}
-	return map[string]any{"version": p.version, "done": p.done, "rows_scanned": p.scanned, "counts": counts, "last_error": p.lastError}
+	out := map[string]any{"version": p.version, "done": p.done, "rows_scanned": p.scanned, "counts": counts, "last_error": p.lastError}
+	if again := p.next.status(); again != nil {
+		out["republish"] = again // ANYM-963: absent until the republish pass starts
+	}
+	return out
 }
 
 // writeStatus updates .repair-status only when it changed; a failed write is
@@ -422,6 +430,7 @@ func (p *repairPass) writeStatus() {
 func (p *Provider) repairWorker(ctx context.Context, interval time.Duration) {
 	pass := newRepairPass(p.Capture)
 	pass.active = func() bool { return p.ready.Load() && ctx.Err() == nil }
+	pass.next = newRepublishPass(pass) // shares the count's bounds and stop
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
