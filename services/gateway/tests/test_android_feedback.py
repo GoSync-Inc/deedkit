@@ -71,6 +71,12 @@ def test_descriptions_name_one_ui_engine():
     assert 'or legacy maestro' not in CATALOG['android_capabilities']['description']
 
 
+# spec: ANYM-960
+def test_screen_structure_is_described():
+    run = CATALOG['android_run_flow']['description']
+    assert 'structure: true' in run and 'blocks > lines (row) > words' in run and 'smallest tree node' in run
+
+
 # spec: ANYM-951
 def test_existing_flows_remain_compatible_before_android_backend_upgrade():
     values = {'device_id': 'phone', 'session_id': 'lease',

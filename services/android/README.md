@@ -194,6 +194,16 @@ the step fails with `ocr_unavailable` or `ocr_failed` as a definite failure.
 Older service versions reject these keys, so roll back the config with the
 executable.
 
+`structure: true` adds a layout built from the OCR engine's own words and their
+geometry, never from a model: `blocks`, each with `lines` (with a `row` index for
+lines that share a row) and `words`, all with bounds and confidence. A clickable
+or identified tree container (for example a textless order card) groups the
+text inside it; elsewhere a vertical gap above 1.5 line heights starts a new
+block. Each block names the smallest tree node that contains it, and `source:
+tree` marks text the tree already exposes. Consecutive blocks of the same shape
+form `lists` of item block indexes. `tree` says whether the hierarchy was merged.
+The receipt then keeps `{lines, blocks, lists, tree, truncated}` under the key.
+
 A screen signature can match while content still loads. Add the spinner to the
 screen's `forbid` list so screen waits continue until it is gone. `waitSettled`
 (`stable_ms` 100-5000, default 500, and `timeout`) waits until the map's

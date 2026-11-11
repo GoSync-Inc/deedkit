@@ -36,7 +36,7 @@ UI_FIELDS = {
     'setOrientation': {'orientation', 'label'},
     'runFlow': {'commands', 'when', 'label', 'name', 'version'}, 'repeat': {'commands', 'times', 'while', 'label'},
     'retry': {'commands', 'maxRetries', 'label'}, 'checkpoint': set(),
-    'readScreenText': {'region', 'within', 'min_confidence', 'limit', 'key', 'label'},
+    'readScreenText': {'region', 'within', 'min_confidence', 'limit', 'key', 'structure', 'label'},
     'sleep': set(),
 }
 UNSUPPORTED_HINT = 'Use android_execute for this operation. The reference lists supported UI commands.'
@@ -70,6 +70,8 @@ def validate_screen_text(value):
             raise Refused('invalid_screen_text_region', 422)
     if 'within' in options:
         validate_selector(options['within'])
+    if 'structure' in options and type(options['structure']) is not bool:
+        raise Refused('invalid_screen_text_options', 422)
     for key, low, high in (('min_confidence', 0, 100), ('limit', 1, 300)):
         if key in options and (type(options[key]) is not int or not low <= options[key] <= high):
             raise Refused('invalid_screen_text_options', 422)
@@ -182,7 +184,11 @@ def reference():
             'screen_text': 'readScreenText: {region: {x, y, w, h} | within: <selector>, min_confidence: 0-100 (60), limit: 1-300 (100), key: name (screen_text)} '
                            'recognizes text in one screenshot on the USB host with Tesseract when the host config sets ocr_command. '
                            'Use it when the hierarchy has no text, e.g. canvas-drawn list cards. It returns lines {text, bounds, confidence} in full-screen '
-                           'device pixels, top to bottom, also under receipt.data.<key>. Read-only; it never taps. ocr_unavailable or ocr_failed is a definite failure.',
+                           'device pixels, top to bottom, also under receipt.data.<key>. Read-only; it never taps. ocr_unavailable or ocr_failed is a definite failure. '
+                           'structure: true adds structure {blocks: [{bounds, confidence, node?, lines: [{text, bounds, confidence, row, source: ocr|tree, node?, words: [{text, bounds, confidence}]}]}], '
+                           'lists: [{bounds, items: [block indexes]}], tree: merged|none|unavailable, truncated}, built from the OCR layout and geometry only. '
+                           'A clickable or identified tree container groups the text inside it; node is the smallest tree node containing a block; source tree marks text the tree already has. '
+                           'Repeated blocks of the same shape form lists, e.g. order cards. receipt.data.<key> then holds {lines, blocks, lists, tree, truncated}.',
             'limits': {'source_bytes': 32768, 'expanded_commands': 200, 'reference_depth': 8, 'executed_steps': 2000}}
 
 
