@@ -617,9 +617,10 @@ async def write_file(op):
                 round_message=mode == 'video_note', supports_streaming=mode == 'video'))
         media = types.InputMediaUploadedDocument(uploaded, mime, attributes, force_file=mode == 'document')
     random_id = secrets.randbits(63)
-    response = await invoke(functions.messages.SendMediaRequest(peer, media, parameters.get('caption', ''),
-        silent=parameters.get('silent') is True or None, random_id=random_id, clear_draft=False, entities=[]),
-        mutation=True)  # ANYM-927: silent is a validated true or absent; None keeps the usual notification.
+    from .scheduled_send import file_send  # ANYM-464: Telegram holds the file until a validated UTC time.
+    response = await file_send(op, parameters.get('schedule_at'), lambda schedule: functions.messages.SendMediaRequest(
+        peer, media, parameters.get('caption', ''), silent=parameters.get('silent') is True or None,
+        random_id=random_id, clear_draft=False, entities=[], schedule_date=schedule))  # ANYM-927: silent true or absent.
     return accepted_updates(response, chat, random_id)
 
 
@@ -1497,6 +1498,12 @@ async def _execute(client, job, *, verified_self=None, governor=None):
         updates = getattr(value, 'updates', [])
         mapped = {u.id for u in updates if isinstance(u, types.UpdateMessageID) and u.random_id == random_id}
         for update in updates[:100]:
+            if isinstance(update, types.UpdateNewScheduledMessage):  # ANYM-464: held by Telegram until its time.
+                from .scheduled_send import scheduled_receipt
+                held = scheduled_receipt(update.message, mapped, chat)
+                if held is not None:
+                    return held
+                continue
             if not isinstance(update, (types.UpdateNewMessage, types.UpdateNewChannelMessage)):
                 continue
             candidate = update.message

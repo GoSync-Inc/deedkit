@@ -811,15 +811,21 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
             -- ANYM-529, ANYM-658, ANYM-922, ANYM-924: contact cards, inline keyboards, shared places and event invitations are content the journal keeps, references do not.
             'metadata',(e.snapshot->'metadata')-'contact'-'buttons'-'location'-'event'-'event_responses','reply_evidence',e.snapshot->'reply_evidence',
             -- ANYM-535: IDs and codes only; the sending key stays in the journal.
-            'send_id',CASE WHEN e.kind='send.failed' THEN e.snapshot->'send_id' END,
+            'send_id',CASE WHEN e.kind IN ('send.failed','message.status') THEN e.snapshot->'send_id' END,
             'error_code',CASE WHEN e.kind='send.failed' THEN e.snapshot->'error_code' END,
-            'status',CASE WHEN e.kind IN ('send.failed','source.health') THEN e.snapshot->'status' END,
+            'status',CASE WHEN e.kind IN ('send.failed','source.health','message.status') THEN e.snapshot->'status' END,
+            -- ANYM-464: a scheduled send's status: IDs, the time and the cancel reason, never text.
+            'operation_id',CASE WHEN e.kind='message.status' THEN e.snapshot->'operation_id' END,
+            'schedule_at',CASE WHEN e.kind='message.status' THEN e.snapshot->'schedule_at' END,
+            'scheduled_message_id',CASE WHEN e.kind='message.status' THEN e.snapshot->'scheduled_message_id' END,
+            'cancel_reason',CASE WHEN e.kind='message.status' THEN e.snapshot->'cancel_reason' END,
             'date',CASE WHEN e.kind='contact.birthday' THEN e.snapshot->'date' END)) AS snapshot
         FROM subscription_matches sm JOIN events e ON e.id=sm.event
         WHERE sm.subscription=%s AND sm.event>%s AND ''' + where + ''' ORDER BY sm.event LIMIT %s''',
         (row['id'], after, *args, limit + 1)).fetchall()
     fields = ('message', 'account', 'chat', 'sender', 'provider_id', 'revision', 'sent_at',
-        'direction', 'deleted', 'processing', 'metadata', 'reply_evidence', 'send_id', 'error_code', 'status', 'date')
+        'direction', 'deleted', 'processing', 'metadata', 'reply_evidence', 'send_id', 'error_code', 'status',
+        'operation_id', 'schedule_at', 'scheduled_message_id', 'cancel_reason', 'date')
     # ANYM-734: delivered_at is when the earliest delivered events hint covering the event finished. Retention deletes
     # finished hints as a prefix up to hints_deleted_through: for an event at or below it the first covering hint may be
     # gone, so the time is unknown (null), never the next hint's. One read per page, no per-row query.
@@ -976,7 +982,8 @@ def _batch_events(c, row, batch_size):
                 jsonb_strip_nulls(jsonb_build_object('chat',e.snapshot->'chat',
                     'sender',e.snapshot->'sender','direction',e.snapshot->'direction',
                     'metadata',e.snapshot->'metadata','reply_evidence',e.snapshot->'reply_evidence',
-                    'principal',e.snapshot->'principal','key_id',e.snapshot->'key_id')) AS snapshot
+                    'principal',e.snapshot->'principal','key_id',e.snapshot->'key_id',
+                    'send_id',e.snapshot->'send_id','operation_id',e.snapshot->'operation_id')) AS snapshot
                 FROM events e LEFT JOIN accounts a ON a.id=e.account WHERE e.id>%s AND e.id<=%s ORDER BY e.id LIMIT %s''',
         (row['matched_through'], head, batch_size)).fetchall()
     for event in events:
@@ -1015,7 +1022,7 @@ def _event_verdict(event, row, p, scope):
     snapshot = event['snapshot']
     source = (event['account'], snapshot.get('chat'))
     selected = source in lookup if visible is None else source in visible
-    failure = event['kind'] in FAILURE_KINDS
+    failure = event['kind'] in FAILURE_KINDS or own_send_status(event)
     metric, missing = None, 0
     if failure:
         # Direction and senders describe messages; these kinds have their own audience.
@@ -1162,13 +1169,20 @@ def _match_modules(c, row, batch_size, maximum, stats):
         print(json.dumps({'error': 'subscription_module_match_failed', 'class': type(error).__name__}), flush=True)
 
 
+def own_send_status(event):
+    """ANYM-464: a scheduled send's message.status (it names its send or operation, no archived message yet):
+    like send.failed, only the key that made the send receives it."""
+    snapshot = event.get('snapshot') or {}
+    return event['kind'] == 'message.status' and ('send_id' in snapshot or 'operation_id' in snapshot)
+
+
 def _failure_audience(event, selected_chat, row, p):
     """send.failed: only the key that made the send, in a selected chat. source.health: a key that
     sees the whole account; a chat-restricted key reads no collector health (sync_status). contact.birthday: a
     selected chat outside a dynamic definition's exclusions."""
     if event['kind'] == 'contact.birthday':
         return selected_chat
-    if event['kind'] == 'send.failed':
+    if event['kind'] == 'send.failed' or own_send_status(event):
         snapshot = event['snapshot']
         return (selected_chat and snapshot.get('principal') == row['principal'] and
             snapshot.get('key_id') == str(row['key_id']))

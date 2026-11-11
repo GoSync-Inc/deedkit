@@ -215,7 +215,9 @@ def capabilities(self, token, detail='full', sections=None):
                     'idempotency':'one_hint_per_subscription_version_window'}},
             'events':{'fetch':'fetch_subscription_events','ack':'ack_subscription_events','wait':'wait_for_subscription_events','wait_max_seconds':25,'page_detail':['full','compact'],'page_detail_default':'full','page_include':['subscription','delivery','metadata','reply_evidence'],'positions':['acked_through','fetched_through','open_receipts','oldest_open_receipt_expires_at','expired_unacked'],'test':'test_subscription','delivery':'operator_registered_signed_hints','host_turn_verified':False},
             'feedback':{'implemented':True,'write_permission':'feedback-write','ownership':'exact_credential','external_delivery':False},
+            # ANYM-464: Telegram holds a scheduled send (send_message, messages_send, send_file schedule_at).
             'sending':{'implemented':True,'wait_max_seconds':25,'approval_mode':'acting_agent_obtains_exact_owner_confirmation',
+                'schedules':['telegram'],
                 'server_approval_gate':False,'text_only':False,'legacy_send_message_text_only':True,
                 'request_id_required':True,
                 'formatting':{'formats':['plain','markdown','html'],
@@ -260,7 +262,7 @@ def capabilities(self, token, detail='full', sections=None):
                 # ANYM-549: execute takes wait_s up to this bound; preview takes and ignores request_id.
                 'execute_wait_s_max':25,'preview_accepts_request_id':True},
             'unavailable': ['guaranteed_full_history', 'drafts',
-                            'owner_approval', 'project_memory', 'schedules', 'oauth'],
+                            'owner_approval', 'project_memory', 'oauth'],
             'limits': {'page_size': 100, 'query_chars': 200,
                        'download_grant_seconds': 120, 'delivery_seconds': 900,
                        'review_sources':20, 'context_reviews':5,'send_text_utf16_units':4000,

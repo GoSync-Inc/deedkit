@@ -88,9 +88,13 @@ def safe_result(value):
                 result[key]=walk(entry,depth+1)
             return result
         raise ValueError('invalid_operation_result')
-    if not isinstance(value,dict) or value.get('outcome') not in ('confirmed','submitted','unknown'):
+    if not isinstance(value,dict) or value.get('outcome') not in ('confirmed','submitted','unknown','scheduled'):
         raise ValueError('invalid_operation_result')
-    result={key:walk(value[key]) for key in ('outcome','data','provider_message_id') if key in value}
+    # ANYM-464 r1 B2: a file Telegram holds keeps its scheduled-list ID, chat and time (scheduled_send.scheduled_receipt).
+    scheduled=('basis','provider_chat_id','schedule_at') if value['outcome']=='scheduled' else ()
+    if scheduled and not all(isinstance(value.get(key),str) for key in ('provider_message_id',*scheduled)):
+        raise ValueError('invalid_operation_result')
+    result={key:walk(value[key]) for key in ('outcome','data','provider_message_id',*scheduled) if key in value}
     if len(canonical(result))>60000:raise ValueError('invalid_operation_result')
     return result
 
@@ -384,6 +388,7 @@ def preview(store,c,p,account,operation,chat_id='',message_id='',expected_revisi
         pressed=payload['parameters']
         shown['earlier_presses']=button_press.earlier_presses(c,account,message_id,pressed['row'],pressed['column'])
     if operation in ('delete_member_messages','ban_member','unban_member'):from .member_ban import shown as moderation;shown['moderation']=moderation(c,p,account,_chat(c,p,account,chat_id),operation,payload)
+    from .scheduled_send import operation_preview;shown.update(operation_preview(operation,parameters))  # ANYM-464
     return serial({**payload,**shown,'permission':spec['permission'],'mutation':spec['mutation'],
         'required_permissions':payload['authorization_binding']['required_permissions'],
         'preview_digest':_digest(p,payload),'owner_approval_verified_by_server':False,
@@ -479,10 +484,16 @@ def _public(row,c=None,p=None):
         'finished_at':row['finished_at'],'error_code':row['error_code'],'result':answer,
         'request_id':row['request_id'],'preview_digest':row['preview_digest'],
         'owner_approval_verified_by_server':False,'automatic_retry':False,
-        **({'verify':verify} if (verify:=_verify(row,c)) else {}),
-        'next_action':refusal['next_action'] if refusal else
+        **({'verify':verify} if (verify:=_verify(row,c)) else {}),**(scheduled:=_scheduled(row)),
+        'next_action':refusal['next_action'] if refusal else scheduled.get('next_action') or (
             'get_messenger_operation' if row['status'] in ('queued','dispatching') else
-            'verify_provider_state_before_any_new_action' if row['status']=='unknown' else 'none'})
+            'verify_provider_state_before_any_new_action' if row['status']=='unknown' else 'none')})
+
+
+def _scheduled(row):
+    """ANYM-464: a scheduled send_file's time, scheduled-list ID and next action; empty for any other operation."""
+    from .scheduled_send import operation_fields
+    return operation_fields(row)
 
 
 def _input(account,operation,chat_id,message_id,expected_revision,parameters,preview_digest):
@@ -535,6 +546,7 @@ def enqueue(store,c,p,account,operation,chat_id='',message_id='',expected_revisi
     if spec['mutation'] and not preview_digest:raise refused(APIError('preview_required',409),True)
     if preview_digest and preview_digest!=expected:raise refused(APIError('preview_mismatch',409),True)
     payload['request_input']=request_input
+    from .scheduled_send import operation_preview;operation_preview(operation,parameters,bool(preview_digest))  # ANYM-464
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('commands-account:'+account,))
     if operation=='join_chat':_join_guard(c,account,payload['parameters']['link'])
     if operation==PRESS:
@@ -858,7 +870,8 @@ class CommandWorker:
                 'rate_limited','provider_timeout','invalid_phone','identity_changed','sending_disabled','invite_invalid','invite_expired','chat_full',
                 'join_not_allowed','already_member','invalid_cursor','invalid_anchor','username_not_found',
                 'recipient_not_user','message_changed','password_required','press_uncertain',
-                'button_kind_unsupported','not_admin','missing_admin_right','poll_secret_unavailable','target_protected','unsupported_chat_type') else 'operation_rejected'
+                'button_kind_unsupported','not_admin','missing_admin_right','poll_secret_unavailable','target_protected','unsupported_chat_type',
+                'schedule_at_out_of_range') else 'operation_rejected'
             # Nothing was sent, so a lookup that ran out of time is a retryable read.
             result={'data':{'code':code,'retry':True}} if code=='provider_timeout' else {'data':{'code':code,**exc.data}} if code in ('not_admin','missing_admin_right','target_protected') and isinstance(exc.data,dict) else None
             # ANYM-676: a press refused before it left (the live message differs from the preview) returns the live
@@ -891,7 +904,11 @@ class CommandWorker:
                 # ANYM-477: the phone sends the messages later; the agent searches the archive again after a minute.
                 answer['data'].update(delivery='via_phone',search_again_after_s=60)
             confirmed=answer['outcome']=='confirmed'
-            await settle(job,'succeeded' if confirmed else
+            if answer['outcome']=='scheduled':  # ANYM-464: Telegram holds the file until its time.
+                from .scheduled_send import finish_scheduled
+                await finish_durably(finish_scheduled,self.state,'operation',job,answer.get('provider_message_id'),
+                    answer.get('schedule_at'),answer)
+            else:await settle(job,'succeeded' if confirmed else
                 'unknown' if job['mutation'] else 'failed',answer,None if confirmed else 'operation_result_unknown')
             if job['operation'] in ('delete_member_messages','ban_member'):from .member_messages import record_deletions;await record_deletions(self.state,job,answer)
         # A cancellation that came while optional work followed a provider change resumes once the receipt is settled.

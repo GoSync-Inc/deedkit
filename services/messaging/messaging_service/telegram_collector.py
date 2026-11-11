@@ -408,6 +408,11 @@ class TelethonProvider(PollProvider,BirthdayProvider):
             # ANYM-868: a basic group's boundary shares the private one's update type; each handler takes its own peers.
             self.client.add_event_handler(group_receipts,events.Raw([types.UpdateReadHistoryOutbox,types.UpdateReadChannelOutbox]))
 
+    def subscribe_scheduled(self,handler):
+        """ANYM-464: the owner's scheduled-list changes (moved, edited, deleted, published) for scheduled sends."""
+        from telethon import events,types
+        self.client.add_event_handler(handler,events.Raw([types.UpdateNewScheduledMessage,types.UpdateDeleteScheduledMessages]))
+
     def service_messages(self,capture):
         from telethon import types
         async def service_message(update):
@@ -442,6 +447,7 @@ class TelethonProvider(PollProvider,BirthdayProvider):
 
     async def send_text(self,job):
         from .outgoing import SendRejected,dispatch_payload
+        from . import scheduled_send
         from telethon import types
         from telethon.errors import FloodError
         report=job.get('_provider_phase')
@@ -452,6 +458,7 @@ class TelethonProvider(PollProvider,BirthdayProvider):
             'reply_to':int(job['reply_provider_id']) if job.get('reply_provider_id') else None,
             'clear_draft':False}
         if payload.get('silent') is True:options['silent']=True  # ANYM-927: a previewed silent row, no sound.
+        if payload.get('schedule_at') is not None:options['schedule']=payload['schedule_at']  # ANYM-464: Telegram holds it.
         if job.get('render_artifact') is not None:
             constructors={'bold':types.MessageEntityBold,'italic':types.MessageEntityItalic,
                 'strikethrough':types.MessageEntityStrike,'underline':types.MessageEntityUnderline,
@@ -472,6 +479,9 @@ class TelethonProvider(PollProvider,BirthdayProvider):
         async def send():
             if datetime.now(timezone.utc).timestamp()>=job['expires_at']:
                 raise SendRejected('send_expired')
+            # ANYM-464 r1 B1: after every governor, cooldown and mention wait; a time too near would send now.
+            if 'schedule' in options and not scheduled_send.still_ahead(options['schedule']):
+                raise SendRejected('schedule_at_out_of_range')
             if report is not None:report('started')
             try:message=await self.client.send_message(int(job['provider_chat']),payload['text'],**options)
             except FloodError:
@@ -480,6 +490,8 @@ class TelethonProvider(PollProvider,BirthdayProvider):
                 raise
             if not message or str(message.chat_id)!=job['provider_chat']:
                 raise RuntimeError('send_receipt_mismatch')
+            if 'schedule' in options:  # A scheduled-list ID and Telegram's time; not a chat message yet.
+                return {'provider_message_id':str(message.id),'message':message,'scheduled':True,'schedule_at':message.date}
             return {'provider_message_id':str(message.id),'message':message}
         if payload.get('mentions'):  # ANYM-928: users resolved through the governor first; before() checks access after.
             from .group_mentions import with_mentions;await with_mentions(self,job['provider_chat'],payload,options)
@@ -1107,6 +1119,9 @@ class TelegramCollector(LiveReadsCollector,CaptureCollector,MediaCollector,PollC
             else:self.provider.subscribe(self.capture,self.deleted)
             polls=hasattr(self.provider,'subscribe_polls') and hasattr(self.provider,'poll_votes')  # ANYM-920
             if polls:self.provider.subscribe_polls(self.poll_update)
+            from . import scheduled_send  # ANYM-464: only records what Telegram reports; never sends.
+            scheduled=hasattr(self.provider,'subscribe_scheduled')
+            if scheduled:self.provider.subscribe_scheduled(scheduled_send.handler(self.state))
             # Renew ownership and honor shutdown during a slow network connect.
             tasks=[asyncio.create_task(self.heartbeat()),asyncio.create_task(self.stopping.wait())]
             if self.session_claim is not None:
@@ -1121,7 +1136,8 @@ class TelegramCollector(LiveReadsCollector,CaptureCollector,MediaCollector,PollC
             tasks.remove(connecting)
             tasks.extend(asyncio.create_task(coro) for coro in
                 [self.drain_loop(),self.reconcile_loop(),self.media_loop(),self.outgoing_loop(),
-                 self.provider.wait_disconnected(),self.failed.wait(),*([self.poll_voters_loop()] if polls else []),*([self.birthdays_loop()] if hasattr(self.provider,'full_user_birthday') else [])])
+                 self.provider.wait_disconnected(),self.failed.wait(),*([self.poll_voters_loop()] if polls else []),*([self.birthdays_loop()] if hasattr(self.provider,'full_user_birthday') else []),
+                 *([scheduled_send.loop(self.state,self.provider)] if scheduled else [])])
             done,_=await asyncio.wait(tasks,return_when=asyncio.FIRST_COMPLETED)
             for task in done: task.result()
             if self.failed.is_set():
@@ -1240,6 +1256,7 @@ class TelegramCollector(LiveReadsCollector,CaptureCollector,MediaCollector,PollC
 
     async def send_outgoing(self,job):
         receipt=await self.provider.send_text(job)
+        if receipt.get('scheduled') is True:return receipt  # ANYM-464: published later, captured as a new message.
         # Send receipt is independent of archive commit. A capture failure must
         # never cause another send; reconciliation can recover the observation.
         try:

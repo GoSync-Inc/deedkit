@@ -49,7 +49,7 @@ def open_grants(arguments):
 def _module(target):
     from . import phone_send, username_send
     return (username_send, target['username'][1:]) if 'username' in target else (phone_send, target['phone'][1:])
-FIELDS = frozenset(('to', 'account', 'reply_to', 'text', 'files', 'format', *CONTROL))
+FIELDS = frozenset(('to', 'account', 'reply_to', 'text', 'files', 'format', 'schedule_at', *CONTROL))
 FILE_FIELDS = frozenset(('upload_id', 'attachment_id', 'mode'))
 INLINE_FIELDS = frozenset(('name', 'mime', 'base64', 'mode'))
 # Inline files of one call, decoded; a larger file goes through UPLOAD_TOOL and chunks.
@@ -66,7 +66,7 @@ REUSE_LEFT_S = 1800
 CAPTION_LIMIT = 1024
 COMPARED = ('target', 'reply_to', 'text', 'files', 'scope')
 PENDING = frozenset(('queued', 'dispatching'))
-DEFINITE = frozenset(('failed', 'expired', 'cancelled'))
+DEFINITE = frozenset(('failed', 'expired', 'cancelled', 'scheduled_cancelled'))
 
 
 def _error(code, status=409, **fields):
@@ -185,10 +185,15 @@ def payload(arguments):
                          inline_file=_facts(files[index]))
     if len({canonical(item) for item in clean}) != len(clean): raise _invalid('files', 'unique')
     if not value['text'].strip() and not clean: raise _invalid('text', 'required')
+    if arguments.get('schedule_at') is not None:
+        # ANYM-464: Telegram holds every step until this time; the format here, the range at each preview and send.
+        from .scheduled_send import parse
+        parse(arguments['schedule_at'])
+        value['schedule_at'] = arguments['schedule_at']
     return {**value, 'files': clean}
 
 
-def _file(store, c, p, account, chat_id, item, caption):
+def _file(store, c, p, account, chat_id, item, caption, schedule_at=None):
     """One file's identity under the low-level checks; the send_file preview raises the same refusals as
     execute_messenger_operation (permissions, opt-in, owner, destination, hidden source)."""
     from .commands import preview
@@ -207,7 +212,8 @@ def _file(store, c, p, account, chat_id, item, caption):
         name, size, digest, mime = row['filename'], row['bytes'], row['digest'], row['mime']
     mode = item.get('mode', 'document')
     source = 'upload_id' if 'upload_id' in item else 'attachment_id'
-    parameters = {source: item[source], 'sha256': digest, 'mode': mode, 'caption': caption}
+    parameters = {source: item[source], 'sha256': digest, 'mode': mode, 'caption': caption,
+                  **({'schedule_at': schedule_at} if schedule_at is not None else {})}
     checked = preview(store, c, p, account, 'send_file', chat_id, parameters=parameters)
     return {'source': source, 'id': item[source], 'name': name, 'bytes': size, 'sha256': digest, 'mime': mime,
             'mode': mode, 'caption': caption, 'digest': checked['preview_digest']}
@@ -235,8 +241,12 @@ def resolve(store, c, p, value, phone_text=None, open_chat=OPEN_ALL, files=True)
     scope = {'scope_version': p['scope_version'], 'key_permission_version': p['key_permission_version']}
     text = value['text'] if value['text'].strip() else ''
     if text and value['format'] == 'plain': valid_text(text)
+    schedule_at = value.get('schedule_at')
     if to.get('opens_chat'):
         kind = 'username' if 'username' in to else 'phone'
+        if schedule_at is not None:  # ANYM-464: a scheduled send goes to an archived Telegram chat only.
+            from .scheduled_send import chat_id_only
+            chat_id_only({'schedule_at': schedule_at}, to.get('phone'), to.get('username'))
         if not open_chat[kind]: raise APIError('forbidden', 403)
         if value['files']:
             raise _invalid('files', 'max_items', 'a phone without a chat takes text only: send it, then the files')
@@ -248,24 +258,32 @@ def resolve(store, c, p, value, phone_text=None, open_chat=OPEN_ALL, files=True)
                 'caption': None, 'scope': scope}
     chat, reply_id = target(c, p, account, to['chat_id'], value['reply_to'])
     recipient.update(chat_id=to['chat_id'], provider_chat=chat['provider_chat'])
+    schedule = None
+    if schedule_at is not None:
+        from . import scheduled_send
+        scheduled_send.check(schedule_at, chat['platform'])
+        scheduled_send.in_range(schedule_at)
+        schedule = scheduled_send.preview_block(schedule_at)
     # A plain caption that fits rides on the first file; anything else (rich text, a reply) is its own last step.
     caption = bool(text and value['files'] and value['format'] == 'plain' and not value['reply_to']
                    and len(text) <= CAPTION_LIMIT)
-    files = [_file(store, c, p, account, to['chat_id'], item, text if caption and not index else '')
+    files = [_file(store, c, p, account, to['chat_id'], item, text if caption and not index else '', schedule_at)
              for index, item in enumerate(value['files'])]
     draft = None if not text or caption else _text(reviewed(c, p, account, to['chat_id'], text, value['reply_to'],
-                                                             value['format'], False, False, chat, reply_id))
+                                                             value['format'], False, False, chat, reply_id,
+                                                             schedule_at=schedule_at))
     return {'target': recipient, 'reply_to': {'message_id': value['reply_to'], 'provider_id': reply_id}
             if value['reply_to'] else None, 'text': draft, 'files': files,
             'caption': None if not text or not value['files'] else 'with_first_file' if caption else 'separate_text',
-            'scope': scope}
+            'scope': scope, **({'schedule': schedule} if schedule else {})}
 
 
 def _comparable(resolution):
     """The previewed facts a token binds: per-scope digests are recomputed at execution, never compared."""
     strip = lambda item: {k: v for k, v in item.items() if k != 'digest'} if isinstance(item, dict) else item
     return {'target': resolution['target'], 'reply_to': resolution['reply_to'], 'text': strip(resolution['text']),
-            'files': [strip(item) for item in resolution['files']], 'scope': resolution['scope']}
+            'files': [strip(item) for item in resolution['files']], 'scope': resolution['scope'],
+            **({'schedule': resolution['schedule']} if resolution.get('schedule') else {})}
 
 
 def _steps(resolution):
@@ -286,6 +304,7 @@ def _visible(resolution):
         'text': text and {k: v for k, v in text.items() if k != 'digest'},
         'files': [{k: item[k] for k in ('name', 'bytes', 'sha256', 'mime', 'mode', 'caption')} for item in resolution['files']],
         'caption': resolution['caption'], 'steps': [step['name'] for step in _steps(resolution)],
+        **({'schedule': resolution['schedule']} if resolution.get('schedule') else {}),
         'owner_confirmation': 'required_before_send', 'owner_approval_verified_by_server': False})
 
 
@@ -439,13 +458,16 @@ def _enqueue(store, c, p, row, step):
     from .outgoing import enqueue as send
     resolution, value = row['plan']['resolution'], row['plan']['value']
     target, key = resolution['target'], _key(p, row, step)
+    schedule_at = value.get('schedule_at')  # ANYM-464: each step is held by Telegram until this time.
     if step['kind'] == 'text':
-        rich = value['format'] != 'plain'
+        bound = value['format'] != 'plain' or schedule_at is not None
         return {'send_id': send(c, p, target['account'], target['chat_id'], value['text'], key, value['reply_to'],
-                                value['format'], resolution['text']['digest'] if rich else '', child=True)['send_id']}
+                                value['format'], resolution['text']['digest'] if bound else '', child=True,
+                                schedule_at=schedule_at)['send_id']}
     if step['kind'] == 'file':
         item = resolution['files'][int(step['name'][4:]) - 1]
-        parameters = {item['source']: item['id'], 'sha256': item['sha256'], 'mode': item['mode'], 'caption': item['caption']}
+        parameters = {item['source']: item['id'], 'sha256': item['sha256'], 'mode': item['mode'], 'caption': item['caption'],
+                      **({'schedule_at': schedule_at} if schedule_at is not None else {})}
         from .commands import preview
         digest = preview(store, c, p, target['account'], 'send_file', target['chat_id'], parameters=parameters)['preview_digest']
         return {'operation_id': operation(store, c, p, target['account'], 'send_file', target['chat_id'],
@@ -486,6 +508,7 @@ def _observe(store, c, p, row, step):
             return _observe(store, c, p, row, step)
     if status in PENDING: return 'pending', None
     if status in ('sent', 'succeeded'): return 'succeeded', done
+    if status == 'scheduled': return 'succeeded', {**done, 'status': 'scheduled'}  # ANYM-464: Telegram holds it.
     if status in DEFINITE: return 'failed', receipt.get('error_code') or status
     return 'unknown', None
 

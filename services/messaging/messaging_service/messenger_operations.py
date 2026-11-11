@@ -359,7 +359,8 @@ def _fields(platform, name, spec):
     if platform == 'telegram' and name == 'list_contacts':
         return {**spec['fields'], 'query': _field('string', maximum=64, nonempty=True)}
     if platform == 'telegram' and name == 'send_file':
-        return {**spec['fields'], 'silent': _field('boolean')}  # ANYM-927: true sends without a notification sound.
+        # ANYM-927: true sends without a notification sound. ANYM-464: Telegram holds the file until schedule_at.
+        return {**spec['fields'], 'silent': _field('boolean'), 'schedule_at': _field('schedule_time')}
     if name == 'update_profile':
         names = ('name', 'status') if platform == 'whatsapp' else ('first_name', 'last_name', 'bio')
         return {n: _field('string', maximum=64 if n in ('name', 'first_name', 'last_name') else 139,
@@ -505,6 +506,8 @@ def parameter_format(platform, kind):
             'to_time exclusive',
         'ban_until': ('RFC 3339 date and time with a UTC offset, such as 2026-10-22T08:00:00Z, 1 minute to 366 days '
             'ahead; exactly one of until or forever: true'),
+        'schedule_time': 'RFC 3339 date and time with an offset, such as 2026-11-12T09:00:00+03:00, 60 s to 365 days '
+            'ahead; Telegram holds the file in the owner\'s Scheduled messages until then',
         'search_cursor': 'next_cursor of an earlier search_messages_live with the same account, chat_id and parameters',
         'label_ids': 'up to 20 unique label IDs of 1-64 letters, digits, _ or -, from get_labels'}.get(kind)
 
@@ -603,6 +606,12 @@ def _problem(platform, descriptor, value, field):
     if kind == 'search_filter':
         if not isinstance(value, str): return fail('type', 'string')
         return None if value in LIVE_FILTERS else fail('enum', allowed=list(LIVE_FILTERS))
+    if kind == 'schedule_time':  # ANYM-464: the format here; the range only for a new operation (commands.enqueue).
+        from .scheduled_send import parse
+        if not isinstance(value, str): return fail('type', 'string')
+        try: parse(value)
+        except Exception: return fail('format', parameter_format(platform, kind))
+        return None
     if kind in ('timestamp', 'ban_until'):
         if not isinstance(value, str): return fail('type', 'string')
         return None if timestamp(value) else fail('format', parameter_format(platform, kind))
@@ -613,6 +622,11 @@ def _problem(platform, descriptor, value, field):
         if not isinstance(value, str): return fail('type', 'string')
         return None if re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', value) else fail('format', parameter_format(platform, 'label_ids'))
     return fail('type')
+
+
+def _schedule_time(value):
+    from .scheduled_send import normalized
+    return normalized(value)
 
 
 def timestamp(value):
@@ -667,6 +681,10 @@ def validate_operation(platform, operation, parameters, *, provider=None):
     if not isinstance(parameters, dict): raise ParameterError(field_error('parameters', 'type', 'object'))
     from .silent_send import operation_parameters
     fields, parameters = _fields(platform, operation, spec), operation_parameters(operation, parameters)
+    if operation == 'send_file' and 'schedule_at' not in fields and 'schedule_at' in parameters:
+        # ANYM-464: WhatsApp has no scheduled send; named, never an unknown field. Nothing is queued.
+        raise ParameterError(field_error('schedule_at', 'enum', 'omitted: WhatsApp has no scheduled send', [None]),
+                             code='schedule_unsupported')
     if operation == 'send_file' and 'silent' not in fields and 'silent' in parameters:
         # ANYM-927: WhatsApp has no send without a notification sound; named, never an unknown field.
         raise ParameterError(field_error('silent', 'enum', 'false: WhatsApp has no silent send', [False]),
@@ -690,7 +708,8 @@ def validate_operation(platform, operation, parameters, *, provider=None):
             else: output[name] = (value.strip() if (operation, name) == ('list_contacts', 'query') else phone_digits(value)[0] if descriptor['type'] == 'phone_number' else
                 chat_link_key(platform, value) if descriptor['type'] == 'chat_link' else
                 telegram_username(value) if descriptor['type'] == 'telegram_username' else
-                timestamp(value) if descriptor['type'] in ('timestamp', 'ban_until') else value)
+                timestamp(value) if descriptor['type'] in ('timestamp', 'ban_until') else
+                _schedule_time(value) if descriptor['type'] == 'schedule_time' else value)
         # Only a bounded identifier name is returned; the submitted value never is.
         allowed = 'only ' + ', '.join(fields) if fields else 'no parameters'
         for name in parameters:

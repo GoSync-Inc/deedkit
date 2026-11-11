@@ -77,3 +77,7 @@ GRANT SELECT,INSERT,UPDATE ON telegram_polls TO messaging_collector;
 -- Schema 86 (ANYM-919): the birthday pass writes an active contact's birthday or hidden and deletes the row of a user
 -- who is no longer active; list_birthdays reads it. Its own account's rows only (the table's row-level security).
 GRANT SELECT,INSERT,UPDATE,DELETE ON contact_birthdays TO messaging_collector;
+-- Schema 87 (ANYM-464): a scheduled send or send_file rests in 'scheduled'; the collector records Telegram's
+-- scheduled-list ID and time, a move or app edit, a cancellation reason and its one overdue check. Nothing else.
+GRANT UPDATE(schedule_at,scheduled_message_id,cancel_reason,edited_in_app,schedule_checked_at)
+    ON outgoing_messages,messenger_commands TO messaging_collector;

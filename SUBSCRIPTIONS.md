@@ -1306,6 +1306,12 @@ messages only, so a subscription with wake rules never matches them. `direction`
 | `send.failed` | A send reaches `failed` or `unknown` (uncertain; also a send interrupted by a collector restart) | `send_id`, `account`, `chat`, `status`, `error_code` | `send_id`, `status`, `account_id`, `chat_id` |
 | `source.health` | An account's health changes to or from `disconnected`, `auth_required` or `stale` | `account`, `status` | `status`, `account_id` |
 
+A scheduled send (ANYM-464, SENDING.md) also journals `message.status` at `scheduled`, `sent`,
+`scheduled_cancelled` (and `unknown` after a failed overdue check), with no archived message: fetched fields
+`send_id` (or `operation_id` for `send_file`), `account`, `chat`, `status`, `schedule_at`,
+`scheduled_message_id`, `cancel_reason`. Like `send.failed`, it matches only the key that made the send, and
+holds no text.
+
 `send.failed` matches only subscriptions of the key that made the send, in one of their chats;
 another key of the same principal sees nothing. No text leaves: neither the body nor the
 provider's error text, only the fixed `error_code`. The collector writes the row in the same
