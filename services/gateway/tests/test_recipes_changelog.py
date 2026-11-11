@@ -234,7 +234,7 @@ def test_an_empty_call_answers_as_before_plus_recipe_ids_and_revision(gateway):
     assert result["changelog_revision"] == CHANGELOG[-1]["revision"]
     assert "recipes" not in result and "whats_new" not in result
     rows = {row["id"]: row for row in result["modules_available"]}
-    assert set(rows["messaging"]) == {"id", "purpose", "tool_count", "selected", "path", "recipe_ids"}
+    assert set(rows["messaging"]) == {"id", "purpose", "tool_count", "selected", "path", "recipe_ids", "health"}
     assert {"read_a_chat", "send_safely"} <= set(rows["messaging"]["recipe_ids"])
     # Key b has the same profile but no send grant: no send recipe, the read recipe stays.
     others = {row["id"]: row for row in other["modules_available"]}

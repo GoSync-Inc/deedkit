@@ -210,7 +210,8 @@ def create_app(config_path, agent_url=None):
             except Refused:
                 secrets = {"secrets": [], "secrets_error": "unavailable"}
             result = {**secrets, "service": "deedkit-android", "permissions": principal.permissions,
-                      "devices": await devices.status(principal.devices), "adb_commands": sorted(COMMANDS),
+                      "devices": [{**row, "session": store.session_state(owner, row["device_id"])}
+                                  for row in await devices.status(principal.devices)], "adb_commands": sorted(COMMANDS),
                       "tool_manifest": {"version": 1, "names": list(SCHEMAS)},
                       "input_schemas": {name: schema.model_json_schema() for name, schema in SCHEMAS.items()},
                       "ui": {"engine": "uiautomator2", "configured": bool(devices.ui),

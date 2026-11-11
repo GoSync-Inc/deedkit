@@ -13,7 +13,7 @@ from .adapters import agents
 
 from .catalog import arguments, CATALOG, InvalidArguments, routed
 from .diagnostics import (FAILURE_FIELDS, discovery, gateway_build, manifest_lacks, manifest_summary, module_conditions,
-                          operation_missing_detail, stale_arguments_hint, unavailable, unknown_tool_denial)
+                          module_health, operation_missing_detail, stale_arguments_hint, unavailable, unknown_tool_denial)
 from .field_errors import root_refusal
 from .http_clients import WAIT_POOL, WAIT_RETRY_AFTER_S
 from .policy import Denied, key_from_file
@@ -384,6 +384,7 @@ class Dispatch:
         return current, principal, visible, {
             "states": states, "scopes": scopes, "actions": actions,
             "unavailable_modules": unavailable_modules, "backend_builds": builds,
+            "module_health": module_health([m for m in modules if states.get(m) == "ready"], unavailable_modules, capabilities),
             "discovery": discovery(visible, actions, current["revision"]),
             "backend_tool_manifests": manifests, "selected": selected,
         }
@@ -423,7 +424,7 @@ class Dispatch:
             "selected_modules": chosen,
             "modules_available": [
                 {"id": m, "purpose": MODULE_PURPOSES[m], "tool_count": counts[m], "selected": m in chosen,
-                 "path": MODULE_PATH + m}
+                 "path": MODULE_PATH + m, **states["module_health"].get(m, {})}
                 for m in sorted(counts)
             ],
             "connection_guidance": {
