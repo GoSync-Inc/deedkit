@@ -647,6 +647,13 @@ class Hanging(Telegram):
         await asyncio.Event().wait()
 
 
+class Loaded(Telegram):
+    """A lookup on a loaded runner: its work before the request takes half a second, within the 30 s timeout."""
+    async def __call__(self, request):
+        await asyncio.sleep(0.5)
+        return await super().__call__(request)
+
+
 # spec: ANYM-643
 def test_a_hanging_lookup_is_cut_at_the_operation_timeout_and_frees_the_lane(telegram, monkeypatch):
     from messaging_service import commands
@@ -659,7 +666,7 @@ def test_a_hanging_lookup_is_cut_at_the_operation_timeout_and_frees_the_lane(tel
     collector(state, Hanging(), governor)
     assert rows(s, 'SELECT status FROM messenger_commands')[0]['status'] == 'failed'
     assert not governor.lock.locked()
-    client = Telegram()
+    client = Loaded()
     s.username_preview_lookup(key, **draft())
     collector(state, client, governor)
     assert len(client.calls) == 1
