@@ -207,7 +207,7 @@ class RouterProof:
         scripts = self.directory / "source" / "scripts"
         scripts.mkdir(parents=True)
         source = Path(release.__file__).parent
-        for name in ["seamless_release.py", "production.py"]:
+        for name in release.p.TOOL_FILES.values():  # production.py loads release_enroll.py beside it (W5-1b)
             shutil.copyfile(source / name, scripts / name)
         (self.directory / "backend.py").write_text(BACKEND)
         (self.directory / "client.py").write_text(CLIENT)

@@ -4819,13 +4819,14 @@ def test_production_md_states_the_manifest_invalid_pause_and_the_earlier_network
     assert "is refused as `network_unsafe` before the pause, the receipt or any file is written" in docs
 
 
-HALT_CALLS = 43  # every halt(...) of production.py; a new call raises this number and adds its code to p.HALTS
+HALT_CALLS = 43  # every halt(...) of the tool files; a new call raises this number and adds its code to p.HALTS
 
 
 def halt_call_problems(source, table):
-    """The number of `halt(...)` calls in `source` and, by line or by code, what breaks the parity with `table`."""
+    """The number of `halt(...)` calls in `source` (one text, or the texts of every tool file) and, by line or by
+    code, what breaks the parity with `table`."""
     calls, used, problems = 0, set(), []
-    for node in ast.walk(ast.parse(source)):
+    for node in (node for text in ([source] if isinstance(source, str) else source) for node in ast.walk(ast.parse(text))):
         if not isinstance(node, ast.Call):
             continue
         if (node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", None)) != "halt":
@@ -4843,7 +4844,11 @@ def halt_call_problems(source, table):
 
 # spec: ANYM-766
 def test_every_halt_call_has_a_literal_code_of_the_table_and_the_table_no_unused_code():
-    calls, problems = halt_call_problems((ROOT / "scripts/production.py").read_text(), p.HALTS)
+    # Every tool file (TOOL_FILES): a halt moved out of production.py still counts (W5-1b).
+    # reads: scripts/production.py
+    # reads: scripts/seamless_release.py
+    # reads: scripts/release_enroll.py
+    calls, problems = halt_call_problems([(ROOT / path).read_text() for path in p.TOOL_FILES], p.HALTS)
     assert problems == [] and calls == HALT_CALLS
 
 
@@ -7579,7 +7584,10 @@ def test_a_snapshot_service_entry_that_is_not_a_mapping_removes_nothing(tmp_path
 # and the real self-test run as a separate process with the CI Python against synthetic configurations.
 # reads: scripts/production.py
 # reads: scripts/seamless_release.py
-TOOL = {path: (ROOT / path).read_bytes() for path in ("scripts/production.py", "scripts/seamless_release.py")}
+# reads: scripts/production.py
+# reads: scripts/seamless_release.py
+# reads: scripts/release_enroll.py
+TOOL = {path: (ROOT / path).read_bytes() for path in p.TOOL_FILES}  # this checkout's tool files
 SYNTHETIC_VALUES = ("https://example.invalid/deedkit", "legacy-api:8080", "legacy-gateway:13240", "synthetic-router",
                     "synthetic-frontend", "synthetic-policy-secret")
 
@@ -7609,7 +7617,7 @@ def candidate_tool(verifier, *, pin=None, inject=b"", seamless=b""):
         pin or hashlib.sha256(verifier.read_bytes()).hexdigest()).encode(), source)
     marker = b'\nif __name__ == "__main__":\n    main()\n'
     assert source.endswith(marker)
-    return {"scripts/production.py": source[:-len(marker)] + inject + marker,
+    return {**TOOL, "scripts/production.py": source[:-len(marker)] + inject + marker,
             "scripts/seamless_release.py": TOOL["scripts/seamless_release.py"] + seamless}
 
 
@@ -7695,6 +7703,8 @@ class ToolHost(Deployer):
         script = (self.tool / "current" / "production.py").resolve()
         spec = importlib.util.spec_from_file_location(f"installed_tool_{script.parent.name}", script)
         module = importlib.util.module_from_spec(spec)
+        # Its tool_module() registers the release's release_enroll.py; this checkout's entry returns at teardown.
+        self.monkeypatch.setitem(sys.modules, "release_enroll", sys.modules["release_enroll"])
         spec.loader.exec_module(module)
         for name, value in vars(p).items():
             if isinstance(value, type) and issubclass(value, BaseException) and value.__module__ == p.__name__:
@@ -7737,7 +7747,7 @@ def test_a_tool_only_range_installs_the_candidates_pair_and_the_next_run_deploys
     assert p.read(host.state / "deploy.json") == outcome and "started_at" not in outcome
     assert host.steps == [] and host.paused() is None and host.current_tool() == f"releases/{NEWEST}"
     release = host.tool / "releases" / NEWEST
-    assert {name: (release / name).read_bytes() for name in ("production.py", "seamless_release.py")} == {
+    assert {name: (release / name).read_bytes() for name in p.TOOL_FILES.values()} == {
         Path(path).name: content for path, content in host.files.items()}
     assert p.read(release / "tool.json")["blobs"] == {path: git_blob(content) for path, content in host.files.items()}
     assert stat.S_IMODE(release.stat().st_mode) == 0o755 and stat.S_IMODE((release / "tool.json").stat().st_mode) == 0o644
@@ -7751,11 +7761,12 @@ def test_a_tool_only_range_installs_the_candidates_pair_and_the_next_run_deploys
 
 
 def three_file_tool(verifier, manifest=None, extra=b'"""A synthetic third tool module."""\nVALUE = 1\n'):
-    """A candidate whose production.py lists a third module, scripts/tool_extra.py, in its TOOL_FILES."""
+    """A candidate whose production.py lists one more module, scripts/tool_extra.py, in its TOOL_FILES."""
     files = candidate_tool(verifier)
     manifest = manifest or (b'TOOL_FILES = {"scripts/production.py": "production.py", "scripts/seamless_release.py": '
-                            b'"seamless_release.py", "scripts/tool_extra.py": "tool_extra.py"}')
-    source, count = re.subn(rb"(?m)^TOOL_FILES = \{.*\}$", manifest.replace(b"\\", b"\\\\"), files["scripts/production.py"])
+                            b'"seamless_release.py", "scripts/release_enroll.py": "release_enroll.py", '
+                            b'"scripts/tool_extra.py": "tool_extra.py"}')
+    source, count = re.subn(rb"(?ms)^TOOL_FILES = \{.*?\}$", manifest.replace(b"\\", b"\\\\"), files["scripts/production.py"])
     assert count == 1
     return {**files, "scripts/production.py": source, "scripts/tool_extra.py": extra}
 
@@ -7768,8 +7779,8 @@ def test_a_candidate_listing_a_third_tool_file_installs_it_deploys_with_it_and_r
     outcome = host.deploy()
     assert outcome["status"] == "tool-updated" and host.current_tool() == f"releases/{NEWEST}"
     release = host.tool / "releases" / NEWEST
-    assert sorted(path.name for path in release.iterdir()) == ["production.py", "seamless_release.py", "tool.json",
-                                                               "tool_extra.py"]
+    assert sorted(path.name for path in release.iterdir()) == ["production.py", "release_enroll.py",
+                                                               "seamless_release.py", "tool.json", "tool_extra.py"]
     assert p.read(release / "tool.json")["blobs"] == {path: git_blob(content) for path, content in host.files.items()}
     # The release's own list decides its layout, whatever the running tool lists: still an exact set.
     assert p.installed_tool()["sha"] == NEWEST
@@ -7824,7 +7835,7 @@ def test_a_candidate_that_drops_a_tool_file_the_running_tool_lists_installs_its_
     outcome = host.deploy()
     assert outcome["status"] == "tool-updated" and host.current_tool() == f"releases/{dropped}"
     assert sorted(path.name for path in (host.tool / "releases" / dropped).iterdir()) == [
-        "production.py", "seamless_release.py", "tool.json"]
+        "production.py", "release_enroll.py", "seamless_release.py", "tool.json"]
     assert p.installed_tool()["sha"] == dropped and host.paused() is None
 
 
@@ -7843,6 +7854,27 @@ def test_a_tool_files_value_that_is_no_file_name_is_refused_and_retention_skips_
     install_release(host.tool, odd, {path: content for path, content in files.items() if "extra" not in path})
     install_release(host.tool, "5" * 40, TOOL, "2026-10-19T00:00:00Z")
     assert p.retain_tools([BASE]) == ["5" * 40] and (host.tool / "releases" / odd).is_dir()
+
+
+# spec: ANYM-443
+def test_a_production_py_loaded_by_its_path_runs_with_the_release_enroll_py_beside_it(tmp_path, monkeypatch):
+    for path, content in TOOL.items():
+        (tmp_path / Path(path).name).write_bytes(content)
+    monkeypatch.setitem(sys.modules, "release_enroll", sys.modules["release_enroll"])
+    def load():
+        # Unregistered, as some readers load it (deedkit admin and calendar_rotate.py register it, others do not).
+        spec = importlib.util.spec_from_file_location("production_by_path", tmp_path / "production.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    module, enroll = load(), sys.modules["release_enroll"]
+    assert Path(enroll.__file__) == tmp_path / "release_enroll.py" and module.enrollment_pending is enroll.enrollment_pending
+    assert enroll.p.Refused is module.Refused and issubclass(module.EnrollRefused, module.Refused)
+    module.run = lambda argv, **kwargs: b"patched"  # the loaded module's name, read when the call runs
+    assert module.repo_file(tmp_path, "a" * 40, "deploy/modules/x.json") == b"patched"
+    (tmp_path / "release_enroll.py").unlink()
+    with pytest.raises(ImportError, match="release_enroll.py is missing"):
+        load()
 
 
 # spec: ANYM-443

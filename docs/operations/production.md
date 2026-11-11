@@ -99,8 +99,8 @@ read it back, and only then delete the ruleset, so `main` is never unprotected.
 Keep administration behind the existing Tailscale/OpenSSH route. CI needs no SSH
 key, tailnet enrollment, provider token or production database access.
 
-Install reviewed copies of `scripts/production.py` and
-`scripts/seamless_release.py` from one `main` commit in the self-updating
+Install reviewed copies of the tool's files (`TOOL_FILES`: `scripts/production.py`,
+`scripts/seamless_release.py` and `scripts/release_enroll.py`) from one `main` commit in the self-updating
 layout ("Deploy tool updates" below): `/usr/local/lib/deedkit/production.py`
 and `seamless_release.py` are symlinks into `current/`, `current` points at
 `releases/<sha>/`, everything owned by root and writable only by root.
@@ -3239,7 +3239,8 @@ Otherwise it:
    retried, and no older commit follows it;
 3. pauses with a reason when the range changes the SQL inventory (any `*.sql`,
    `services/*/migrations/**`) or a deploy tool (`scripts/production.py`,
-   `scripts/seamless_release.py`, `tools/attest-verify/**`,
+   `scripts/seamless_release.py`, any other file the running tool's `TOOL_FILES` lists such as
+   `scripts/release_enroll.py`, `tools/attest-verify/**`,
    `services/release-router/**`, `deploy/deedkit-autodeploy.service` and
    `.timer`) that is not installed yet (the running tool file, or the unit in
    `/etc/systemd/system/`, equals the candidate's; a host without the unit
@@ -3259,8 +3260,8 @@ Otherwise it:
    any failure there names the file `manual`. The
    class changes nothing else: the run pauses and you migrate by hand at once ("Migration releases" item 4), unless the range qualifies
    for an unattended migration ("Unattended migrations"): then the run migrates in phases instead;
-   When the only such change is the `production.py`/`seamless_release.py`
-   pair, the self-updating layout installs it instead ("Deploy tool updates");
+   When the only such change is the tool's own files (`TOOL_FILES`), the
+   self-updating layout installs them instead ("Deploy tool updates");
    when the host backup runner is not the candidate's, `deploy` installs it with
    the candidate's backup image pin after `prepare` and before any migration or
    apply ("Backup runner"), so a merge that changes `backup_runner.py` no longer
@@ -3381,9 +3382,12 @@ read with `ast` and never run, `production.py` and `seamless_release.py` among
 them. Every check below reads that list from the release it checks (the
 candidate's blob for an update, the older release's file for a rollback), so a
 release may add a module; the two compatibility links stay the only links.
-Python takes `sys.path[0]` from the resolved script, so all modules always
-come from one release directory, and every documented command and the unit
-keep working. `tool.json` is `{"sha", "blobs": {"scripts/production.py": <git
+Python takes `sys.path[0]` from the resolved script, and `production.py` loads
+its other listed modules (`release_enroll.py`) by path from its own resolved
+directory, so all modules always come from one release directory, also for a
+reader that loads `production.py` by its path (deedkit admin,
+`calendar_rotate.py`, the inference worker), and every documented command and
+the unit keep working. `tool.json` is `{"sha", "blobs": {"scripts/production.py": <git
 blob id>, "scripts/seamless_release.py": <id>, ...one per listed file},
 "installed_at"}`. A host
 without `current` never updates its tool and keeps the pause of step 3. With
@@ -3462,12 +3466,13 @@ with the timer paused (`<mirror>` is `<plan A state>/deploy-source.git`):
 ```sh
 sha=<40-character main sha>; root=/usr/local/lib/deedkit; release=$root/releases/$sha
 sudo install -d -o root -g root -m 0755 $root/releases $release
-for f in production.py seamless_release.py; do
+for f in production.py seamless_release.py release_enroll.py; do  # the commit's TOOL_FILES
   sudo git -C <mirror> cat-file blob $sha:scripts/$f | sudo tee $release/$f >/dev/null
 done
-printf '{"sha": "%s", "blobs": {"scripts/production.py": "%s", "scripts/seamless_release.py": "%s"}, "installed_at": "%s"}\n' \
+printf '{"sha": "%s", "blobs": {"scripts/production.py": "%s", "scripts/seamless_release.py": "%s", "scripts/release_enroll.py": "%s"}, "installed_at": "%s"}\n' \
   $sha $(sudo git -C <mirror> rev-parse $sha:scripts/production.py) \
-  $(sudo git -C <mirror> rev-parse $sha:scripts/seamless_release.py) $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  $(sudo git -C <mirror> rev-parse $sha:scripts/seamless_release.py) \
+  $(sudo git -C <mirror> rev-parse $sha:scripts/release_enroll.py) $(date -u +%Y-%m-%dT%H:%M:%SZ) \
   | sudo tee $release/tool.json >/dev/null
 sudo chmod 0644 $release/*
 sudo python3 -B -E -s $release/production.py self-test     # {"self_test": "ok", "sha": "<sha>"}
