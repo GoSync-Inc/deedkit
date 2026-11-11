@@ -16,6 +16,7 @@ from . import courier_chat
 from .app_maps import compile_scenario, load, validate_map
 from .config import Configuration, Refused, Strict
 from .device import COMMANDS, Devices
+from .field_errors import entries as field_errors
 from .guard import Rules
 from .store import Store, identifier
 from .uiautomator import reference as ui_reference
@@ -168,9 +169,13 @@ def create_app(config_path, agent_url=None):
 
     @app.exception_handler(Refused)
     async def refused(request, error):
+        # ANYM-984: no `invalid_arguments` goes out bare; one raised without a list names the request itself.
+        fields = getattr(error, "field_errors", None) or (
+            [{"field": "$", "reason": "format"}] if error.code == "invalid_arguments" else None)
         return JSONResponse({"error": error.code, **({'hint': error.hint} if hasattr(error, 'hint') else {}),
-                             **getattr(error, 'extra', {})}, status_code=error.status,
-                            headers={"Cache-Control": "no-store"})
+                             **getattr(error, 'extra', {}),
+                             **({"field_errors": fields, "next_action": "check_parameters"} if fields else {})},
+                            status_code=error.status, headers={"Cache-Control": "no-store"})
 
     @app.post("/v1/{operation}")
     async def call(operation: str, request: Request):
@@ -191,8 +196,10 @@ def create_app(config_path, agent_url=None):
         try:
             raw = json.loads(body)
             args = OPERATIONS[operation].model_validate(raw).model_dump()
-        except (ValidationError, ValueError):
-            raise Refused("invalid_arguments", 422) from None
+        except ValidationError as invalid:
+            raise Refused("invalid_arguments", 422, field_errors(invalid, OPERATIONS[operation])) from None
+        except ValueError:
+            raise Refused("invalid_arguments", 422, [{"field": "$", "reason": "format"}]) from None
         device = args.get("device_id")
         if device is not None and device not in principal.devices:
             raise Refused("not_found", 404)
@@ -228,7 +235,7 @@ def create_app(config_path, agent_url=None):
                                            args["image_mode"], args["crop"])
         elif operation == "execute":
             if any(len(arg) > 16384 or "\x00" in arg for arg in args["argv"]):
-                raise Refused("invalid_arguments", 422)
+                raise Refused("invalid_arguments", 422, [{"field": "argv", "reason": "size"}])
             result = await devices.execute(owner, device, args["session_id"], identifier(args["request_id"]),
                                            args["argv"], args["timeout_s"], args["wait_s"])
         elif operation == "courier_chat":

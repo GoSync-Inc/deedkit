@@ -74,12 +74,17 @@ Arguments that fail a tool's input schema are rejected with 422 `invalid_argumen
 `required`, `unknown_field`, `type`, `enum`, `min_length`, `max_length`, `pattern`, `minimum`,
 `maximum`, `min_items`, `max_items`, `unique`, `format`, `blank`, `size`, `expected_message_unknown`. `expected` and `allowed` come
 from the schema, never from the submitted value, and an unknown key is named only when it is a short
-identifier. Other rejections (non-finite numbers, a non-object body) keep the bare
-`{"error": "invalid_arguments"}`.
+identifier. No `invalid_arguments` answer is bare (ANYM-984): a non-finite number names its top-level field
+(`{"field": "wait_s", "reason": "type", "expected": "number"}`), a body that is not an object or not JSON
+names `$` (`type` with `expected: "object"`, or `format`), and the Android service answers the same shape for a
+body its models reject (`field_errors` and `next_action`, reasons and hints from its models, never a value),
+which the gateway returns unchanged. `retry_after_seconds` is never on `invalid_arguments`: it appears only
+where a retry can help (`backend_unavailable`, recordings), because the same bad call is not retried.
 
-When a rejection has a top-level `required` or `unknown_field` entry, the body adds
+Every schema rejection of a tool with properties adds
 `tool_fields: {required: [{name, type, values?}], optional: [name]}`: the tool's top-level properties from
-the packaged catalog schema (at most 64 names; `values` only for enums of at most 8 values), so a caller with an
+the packaged catalog schema (at most 64 names; `values` only for enums of at most 8 values), so a wrong type or
+a value outside an enum is as fixable in one step as a missing field, and a caller with an
 old tool list can retry at once. An `unknown_field` entry also adds `tool_list_stale: "likely"` and an
 `owner_hint` line to relay once (reconnect the DeedKit MCP client); a missing required field alone does not.
 When every unknown field is the singular or plural of a field the tool has, the body names it instead

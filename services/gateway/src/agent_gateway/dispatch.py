@@ -14,6 +14,7 @@ from .adapters import agents
 from .catalog import arguments, CATALOG, InvalidArguments, routed
 from .diagnostics import (FAILURE_FIELDS, discovery, gateway_build, manifest_lacks, manifest_summary, module_conditions,
                           operation_missing_detail, stale_arguments_hint, unavailable, unknown_tool_denial)
+from .field_errors import root_refusal
 from .http_clients import WAIT_POOL, WAIT_RETRY_AFTER_S
 from .policy import Denied, key_from_file
 from . import recipes
@@ -640,7 +641,9 @@ class Dispatch:
                     denied.detail["next"] = {"tool": name, "arguments": {**values, "request_id": PLACEHOLDER_REQUEST_ID}}
             raise denied from None
         except ValueError:
-            raise Denied("invalid_arguments", 422) from None
+            denied = Denied("invalid_arguments", 422)
+            denied.detail = root_refusal()
+            raise denied from None
         return snapshot, agent, tool, selected, args
 
     async def gateway_capabilities(self, key, route, args=None):

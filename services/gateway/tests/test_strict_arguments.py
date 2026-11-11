@@ -187,10 +187,67 @@ def test_every_catalog_tool_yields_bounded_field_errors_from_the_closed_vocabula
                 pytest.fail(f"{name}: bare ValueError {error}")
 
 
+# spec: ANYM-984
+def test_every_catalog_tool_refusal_carries_the_whole_envelope_and_the_tool_fields_within_8_kib():
+    from agent_gateway.diagnostics import stale_arguments_hint
+
+    largest = refusals = 0
+    for name, tool in CATALOG.items():
+        for values in ({"zz_unknown": 1}, {key: CANARY for key in tool["inputSchema"].get("properties", {})}):
+            try:
+                arguments(tool, values)
+            except InvalidArguments as refusal:
+                found = refusal.field_errors
+                refusals += 1
+            else:
+                continue  # a schema that accepts this body (open or all-string) has no refusal to check
+            body = stale_arguments_hint(tool, {"error": "invalid_arguments", "field_errors": found,
+                                               "next_action": "check_parameters"})
+            assert body["error"] == "invalid_arguments" and body["next_action"] == "check_parameters", name
+            assert body["field_errors"], name
+            if tool["inputSchema"].get("properties"):
+                fields = body["tool_fields"]
+                required = tool["inputSchema"].get("required", [])
+                assert [f["name"] for f in fields["required"]] == [r for r in required if r in tool["inputSchema"]["properties"]][:64], name
+                assert all("type" in f for f in fields["required"]), name
+            assert CANARY not in json.dumps(body), name
+            largest = max(largest, len(json.dumps(body, ensure_ascii=False).encode()))
+    assert refusals >= len(CATALOG) and largest < 8 * 1024, (refusals, largest)
+
+
+# spec: ANYM-984
+def test_a_wrong_type_or_a_value_outside_an_enum_names_the_tool_fields_without_a_stale_claim(tmp_path):
+    rest, mcp = post_both(calls_app(tmp_path, []), "calls_dial_call", {"brief_id": "brief-1", "destination_source": "nobody"})
+    body = rest.json()
+    assert rest.status_code == 422 and mcp["isError"] and mcp["structuredContent"] == body
+    assert body["field_errors"] == [{"field": "destination_source", "reason": "enum", "allowed": ["owner_named", "agent_found"]}]
+    assert body["tool_fields"]["required"] == [{"name": "brief_id", "type": "string"},
+                                              {"name": "destination_source", "type": "string", "values": ["owner_named", "agent_found"]}]
+    assert "tool_list_stale" not in body and "owner_hint" not in body and "use_instead" not in body
+
+
+# spec: ANYM-984
+def test_a_non_finite_number_a_non_object_and_a_malformed_body_are_refused_with_a_field_list(tmp_path):
+    headers = {**HEADERS, "Content-Type": "application/json"}
+    app = calls_app(tmp_path, [])
+    with TestClient(app) as client:
+        nan = client.post("/v1/calls_dial_call", content='{"brief_id": "b", "wait_s": NaN}', headers=headers)
+        array = client.post("/v1/calls_dial_call", content="[1, 2]", headers=headers)
+        broken = client.post("/v1/calls_dial_call", content="{not json", headers=headers)
+    assert nan.status_code == array.status_code == broken.status_code == 422
+    assert nan.json()["field_errors"] == [{"field": "wait_s", "reason": "type", "expected": "number"}]
+    assert array.json()["field_errors"] == [{"field": "$", "reason": "type", "expected": "object"}]
+    assert broken.json() == {"error": "invalid_arguments", "next_action": "check_parameters",
+                             "field_errors": [{"field": "$", "reason": "format"}]}
+    for body in (nan.json(), array.json()):
+        assert body["error"] == "invalid_arguments" and body["next_action"] == "check_parameters" and "tool_fields" in body
+
+
 def test_non_schema_rejections_and_valid_calls_keep_their_existing_shape():
-    with pytest.raises(ValueError) as caught:
+    with pytest.raises(InvalidArguments) as caught:
         arguments(CATALOG["messages_send_message"], {**SEND, "wait_s": float("nan")})
-    assert not isinstance(caught.value, InvalidArguments) and str(caught.value) == "invalid_arguments"
+    # ANYM-984: a non-finite number is named by its top-level field instead of answering bare.
+    assert caught.value.field_errors == [{"field": "wait_s", "reason": "type", "expected": "number"}]
     assert arguments(CATALOG["calls_dial_call"], {**DIAL, "destination_source": "owner_named"})["destination_source"] == "owner_named"
 
 

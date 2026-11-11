@@ -8,6 +8,8 @@ import math
 from jsonschema import Draft202012Validator
 from jsonschema.validators import extend
 
+from platform_contracts.field_errors import SEGMENT
+
 from .field_errors import field_errors
 
 
@@ -25,15 +27,18 @@ StrictValidator = extend(
 def finite_numbers(value):
     # Check untyped operation parameters too: schema bounds do not reject NaN,
     # and HTTPX would otherwise fail serialization after capability admission.
-    pending = [value]
-    while pending:
-        item = pending.pop()
-        if type(item) is float and not math.isfinite(item):
-            raise ValueError("invalid_arguments")
-        if isinstance(item, dict):
-            pending.extend(item.values())
-        elif isinstance(item, list):
-            pending.extend(item)
+    # The refusal names the top-level field that holds the number (`$` when it is no plain field name).
+    for key, member in value.items() if isinstance(value, dict) else [("$", value)]:
+        pending = [member]
+        while pending:
+            item = pending.pop()
+            if type(item) is float and not math.isfinite(item):
+                field = key if isinstance(key, str) and SEGMENT.fullmatch(key) else "$"
+                raise InvalidArguments([{"field": field, "reason": "type", "expected": "number"}])
+            if isinstance(item, dict):
+                pending.extend(item.values())
+            elif isinstance(item, list):
+                pending.extend(item)
 
 
 class InvalidArguments(ValueError):
@@ -64,7 +69,7 @@ def feedback_operation_errors(value, known_tools):
 
 def arguments(tool, value, known_tools):
     if not isinstance(value, dict):
-        raise ValueError("invalid_arguments")
+        raise InvalidArguments([{"field": "$", "reason": "type", "expected": "object"}])
     if tool.get('name') == 'android_session' and 'lease_s' in value:
         if 'seconds' in value:
             raise InvalidArguments([{'field': 'lease_s', 'reason': 'unknown_field',
@@ -85,9 +90,9 @@ def arguments(tool, value, known_tools):
         try:
             raw = base64.b64decode(value["data_base64"], validate=True)
         except (ValueError, binascii.Error):
-            raise ValueError("invalid_arguments") from None
+            raise InvalidArguments([{"field": "data_base64", "reason": "format"}]) from None
         if not 0 < len(raw) <= 262144:
-            raise ValueError("invalid_arguments")
+            raise InvalidArguments([{"field": "data_base64", "reason": "size"}])
     result = deepcopy(value)
     # REST and MCP backend defaults differ for conversation tools. Preserve the
     # reviewed MCP defaults when routing either gateway transport over REST.

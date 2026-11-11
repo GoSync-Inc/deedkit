@@ -143,6 +143,15 @@ def _rank(schema, field):
     return key
 
 
+def root_refusal(reason="format", expected=None):
+    """The `invalid_arguments` body of a request that is no usable arguments object at all (ANYM-984).
+
+    One entry names the object itself (`$`); no submitted value is echoed.
+    """
+    entry = {"field": ROOT, "reason": reason, **({"expected": expected} if expected else {})}
+    return {"error": "invalid_arguments", "field_errors": [entry], "next_action": "check_parameters"}
+
+
 def field_errors(schema, errors):
     """Collapse jsonschema errors into at most MAX_ENTRIES entries, one per field, in schema order."""
     found = {}

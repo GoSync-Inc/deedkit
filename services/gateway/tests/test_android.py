@@ -20,7 +20,7 @@ PNG = b'\x89PNG\r\n\x1a\nsynthetic'
 
 
 def setup(tmp_path, scopes=SCOPES, backend_scopes=SCOPES, unavailable=False, interrupted=False,
-          image=None):
+          image=None, refusal=None):
     value = config()
     value['deployment'] = {'modules': ['calendar', 'android'], 'backends': {
         'calendar': {'url': 'http://calendar'}, 'android': {'url': 'http://android'}}}
@@ -50,6 +50,8 @@ def setup(tmp_path, scopes=SCOPES, backend_scopes=SCOPES, unavailable=False, int
                 'version': 1, 'names': [CATALOG[name]['operation'] for name in TOOLS]}})
         args = json.loads(request.content)
         calls.append((module, operation, args))
+        if module == 'android' and refusal is not None:
+            return httpx.Response(422, json=refusal)
         if module == 'android' and operation in {'execute', 'courier_chat'} and interrupted:
             raise httpx.ReadTimeout('reply lost', request=request)
         if operation == 'observe':
@@ -147,6 +149,21 @@ def test_a_read_only_android_grant_cannot_set_a_courier_goal(tmp_path):
             'order': 'Warung Sate', 'goal': 'Get the courier to the lobby',
             'owner_instruction': 'Handle the courier of Warung Sate for me'}}).json()['result']
         assert result['isError'] and calls == []
+
+
+# spec: ANYM-984
+def test_an_android_refusal_with_a_field_list_reaches_the_agent_unchanged(tmp_path):
+    refusal = {'error': 'invalid_arguments', 'next_action': 'check_parameters',
+               'field_errors': [{'field': 'seconds', 'reason': 'minimum', 'expected': 'at least 30'}]}
+    app, calls = setup(tmp_path, refusal=refusal)
+    headers = {'Authorization': 'Bearer gateway-a'}
+    values = {'device_id': 'home', 'action': 'acquire', 'seconds': 31}
+    with TestClient(app) as client:
+        rest = client.post('/v1/android_session', json=values, headers=headers)
+        mcp = rpc(client, 'tools/call', {'name': 'android_session', 'arguments': values}).json()['result']
+    assert rest.status_code == 422 and rest.json() == refusal
+    assert mcp['isError'] and mcp['structuredContent'] == refusal
+    assert [operation for _, operation, _ in calls] == ['session', 'session']
 
 
 @pytest.mark.parametrize('options', [{'scopes': ['android:read']},

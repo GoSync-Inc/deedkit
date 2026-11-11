@@ -254,6 +254,18 @@ def test_a_send_needs_a_valid_unexpired_digest_before_any_device_call(tmp_path, 
         assert len(calls) == 2
 
 
+# spec: ANYM-984
+def test_every_courier_chat_argument_refusal_names_its_field(tmp_path):
+    with TestClient(create_app(service_config(tmp_path))) as client:
+        base = {'device_id': 'home', 'session_id': str(uuid.uuid4()), 'request_id': str(uuid.uuid4()), 'action': 'preview',
+                'app': 'gojek', 'order': ORDER, 'message': MESSAGE}
+        for change, field in (({'message': '  '}, 'message'), ({'order': '!!'}, 'order'), ({'preview_digest': 'x'}, 'preview_digest'),
+                              ({'owner_instruction': 'Yes please'}, 'owner_instruction'), ({'app': 'whatsapp'}, 'app')):
+            answer = client.post('/v1/courier_chat', json={**base, **change}, headers={'Authorization': 'Bearer one'}).json()
+            assert answer['error'] == 'invalid_arguments' and answer['next_action'] == 'check_parameters', change
+            assert [entry['field'] for entry in answer['field_errors']] == [field], (change, answer)
+
+
 # spec: ANYM-975
 def test_a_preview_takes_no_digest_and_arguments_are_checked(tmp_path):
     with TestClient(create_app(service_config(tmp_path))) as client:

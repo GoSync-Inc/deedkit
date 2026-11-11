@@ -324,7 +324,7 @@ def tool_fields(tool):
 
 
 def stale_arguments_hint(tool, detail):
-    """An `invalid_arguments` body plus the tool's current fields when it names a missing or unknown top-level field.
+    """An `invalid_arguments` body plus the tool's current fields (ANYM-984: on every schema refusal).
 
     An unknown field also says the tool list is likely stale, unless every unknown field is the singular or plural
     of a field the tool has (`account` for `accounts`): then `use_instead` names that field and the list is current.
@@ -336,9 +336,13 @@ def stale_arguments_hint(tool, detail):
         unknown = [e["field"] for e in entries if e["reason"] == "unknown_field"
                    and (e["field"] == "$" or "/" not in e["field"] and e["field"] not in properties)]
         missing = any(e["reason"] == "required" and "/" not in e["field"] for e in entries)
-        if not (unknown or missing):
+        if not properties:
             return detail
+        # Every schema refusal names the tool's fields (ANYM-984), so a wrong type or value outside an enum is as
+        # fixable in one step as a missing field; only an unknown or missing field also says the list may be stale.
         hinted = {**detail, "tool_fields": tool_fields(tool)}
+        if not (unknown or missing):
+            return hinted
         renamed = {name: other for name in unknown for other in (name + "s", name[:-1] if name.endswith("s") else "")
                    if other and other in properties}
         if renamed and len(renamed) == len(unknown):

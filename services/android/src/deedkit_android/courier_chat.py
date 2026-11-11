@@ -96,30 +96,38 @@ def read_digest(principal, args):
     return chat_sha
 
 
+def refusal(field, reason, expected=None):
+    """An `invalid_arguments` refusal that names the field (ANYM-984)."""
+    return Refused('invalid_arguments', 422, [{'field': field, 'reason': reason, **({'expected': expected} if expected else {})}])
+
+
 def check_request(principal, args):
     """Criteria 1 and 3: argument shape and the digest, before any device call."""
     action = args['action']
     if not words(args['order']):
-        raise Refused('invalid_arguments', 422)
+        raise refusal('order', 'min_length', 'some words')
     if action in courier_goal.STORE_ACTIONS:  # ANYM-978: the owner's goal, a handover, the summary
-        if action == 'goal' and (not words(args.get('goal')) or len(args.get('owner_instruction') or '') < 3):
-            raise Refused('invalid_arguments', 422)
+        if action == 'goal' and not words(args.get('goal')):
+            raise refusal('goal', 'min_length', 'some words')
+        if action == 'goal' and len(args.get('owner_instruction') or '') < 3:
+            raise refusal('owner_instruction', 'min_length', 'at least 3 characters')
         if action == 'handover' and not words(args.get('reason')):
-            raise Refused('invalid_arguments', 422)
+            raise refusal('reason', 'min_length', 'some words')
         return
     if not args.get('session_id'):
-        raise Refused('invalid_arguments', 422)
+        raise refusal('session_id', 'required')
     if action == 'read':
         return
     if not words(args.get('message')):
-        raise Refused('invalid_arguments', 422)
+        raise refusal('message', 'min_length', 'some words')
     if action in {'preview', 'reply'}:
-        if args.get('preview_digest') or args.get('owner_instruction'):
-            raise Refused('invalid_arguments', 422)
+        for field in ('preview_digest', 'owner_instruction'):
+            if args.get(field):
+                raise refusal(field, 'format', 'only with action send')
         return
     read_digest(principal, args)
     if len(args.get('owner_instruction') or '') < 3:
-        raise Refused('invalid_arguments', 422)
+        raise refusal('owner_instruction', 'min_length', 'at least 3 characters')
 
 
 async def handle(devices, owner, args):
