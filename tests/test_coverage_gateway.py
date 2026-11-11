@@ -607,7 +607,7 @@ def test_catalog_covers_explicit_families_and_provider_differences():
         'groups-read': ['list_participants', 'list_topics', 'list_join_requests', 'check_chat_link'],
         'profile-read': ['get_profile'], 'contacts-read': ['list_contacts', 'get_contact', 'list_blocked', 'get_labels', 'list_birthdays'],
         'send': ['send_file', 'forward_message', 'send_poll', 'send_contact', 'send_location', 'open_chat_by_phone',
-                 'open_chat_by_username'],
+                 'open_chat_by_username', 'list_scheduled', 'cancel_scheduled'],  # ANYM-929
         'message-edit': ['edit_message'], 'message-delete': ['delete_message'],
         'message-react': ['send_reaction', 'vote_poll'], 'message-pin': ['pin_message', 'unpin_message'],
         'read-state': ['mark_read', 'mark_unread'],
@@ -634,7 +634,7 @@ def test_catalog_covers_explicit_families_and_provider_differences():
     for name in ['get_profile', 'list_contacts', 'get_contact', 'list_blocked', 'add_contact',
                  'delete_contact', 'block_contact', 'unblock_contact', 'update_profile', 'create_group']:
         assert telegram[name]['full_account'] and whatsapp[name]['full_account']
-    for name in ['list_topics', 'vote_poll', 'search_messages_live']:
+    for name in ['list_topics', 'vote_poll', 'search_messages_live', 'list_scheduled', 'cancel_scheduled']:
         assert telegram[name]['supported'] and not whatsapp[name]['supported']
     for name in ['get_pinned_messages', 'pin_chat', 'unpin_chat', 'star_message', 'unstar_message',
                  'get_labels', 'set_chat_labels']:

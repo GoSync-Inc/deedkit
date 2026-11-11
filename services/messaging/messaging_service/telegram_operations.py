@@ -24,6 +24,7 @@ from telethon import errors, functions, types, utils
 from .envelope import canonical, stable_id
 from .formatting import MAX_SOURCE_UNITS
 from .name_variants import contact_matcher
+from .scheduled_manage import HANDLERS as SCHEDULED_HANDLERS
 from .messenger_operations import (HISTORY, INSPECT_BUTTONS, LIVE_SEARCH, live_cursor_binding, platform_parameters,
                                    validate_operation)
 from .telegram_stories import STORY_HANDLERS  # ANYM-932: the story operations, beside this module
@@ -1187,7 +1188,8 @@ GROUP_HANDLERS = {
     **dict.fromkeys(('delete_member_messages', 'ban_member', 'unban_member', 'get_member_state'), write_member_messages),
 }
 
-HANDLERS = {**READ_HANDLERS, **ACCOUNT_HANDLERS, **MESSAGE_HANDLERS, **GROUP_HANDLERS, **STORY_HANDLERS}
+HANDLERS = {**READ_HANDLERS, **ACCOUNT_HANDLERS, **MESSAGE_HANDLERS, **GROUP_HANDLERS, **STORY_HANDLERS,
+            **SCHEDULED_HANDLERS}  # ANYM-929
 
 
 def check_slow_mode(parameters, job, prepared):

@@ -468,11 +468,33 @@ time, otherwise it is `unknown` (`scheduled_outcome_unknown`). Nothing is ever r
 `unknown` and is never retried or rescheduled.
 
 While an earlier send of the same account, chat, exact content and UTC time is `scheduled`, a new one is refused
-`duplicate_scheduled` (409) whatever its age, with `scheduled_message_id`, `next_call: list_scheduled` and, when
-it is your own, `earlier_request_id`; `allow_duplicate: true` overrides it. To reschedule, delete it in the app
-and send again with a new confirmation. WhatsApp has no scheduled send: `schedule_unsupported`, nothing queued;
+`duplicate_scheduled` (409) whatever its age, with `scheduled_message_id`, a `next_call` that runs
+`list_scheduled` on that chat and, when it is your own, `earlier_request_id`; `allow_duplicate: true` overrides
+it. To reschedule, cancel it (below) or delete it in the app, and send again with a new confirmation. WhatsApp has no scheduled send: `schedule_unsupported`, nothing queued;
 a phone or `username` recipient is refused as for `silent`. A messaging service from before schema 87 refuses
 `schedule_at` (`unknown_field`).
+
+#### Listing and cancelling scheduled sends (ANYM-929)
+
+Two Telegram messenger operations (`execute_messenger_operation`, permission `send` plus `read`, opted in per
+account) answer "what is scheduled?" and "cancel the 8 o'clock greeting":
+
+- `list_scheduled` without `chat_id` lists DeedKit's own `scheduled` sends and `send_file` operations in the chats
+  the key may read, from the archive with no provider request (`source: archive`). With `chat_id` it reads that
+  chat's Scheduled messages once (`GetScheduledHistoryRequest`, through the governor; `source: provider`), so it
+  also shows the ones the owner made in the app. Each item has `scheduled_message_id`, `schedule_at`, `text` (first
+  200 characters) and `made_by_deedkit`; DeedKit's own add `send_id` or `operation_id`, `chat_id`, `status` and
+  `edited_in_app`. At most 100 items; a flood wait is `rate_limited` with `retry_after`.
+- `cancel_scheduled` takes `chat_id` and `parameters.scheduled_message_id` and is a mutation: preview it, show the
+  owner `scheduled` (its text and time), and execute with the same `preview_digest`, which binds that send
+  (`scheduled_send`). A scheduled message the owner made in the app is `not_scheduled_here` (409; the owner cancels
+  it in the app); one already published is `already_sent` (409, its `next_step` names the message). At execution
+  the collector reads the message once (`GetScheduledMessagesRequest`) and deletes it once
+  (`DeleteScheduledMessagesRequest`). The receipt's `data.state` is `scheduled_cancelled` (`cancel_reason: agent`,
+  or `owner_app` when the owner had already deleted it: no delete is sent and it is not an error) or
+  `already_sent` with `provider_message_id` when Telegram had published it; the send's own status follows
+  (`scheduled_cancelled` with its `cancel_reason`, or `sent`). A delete without Telegram's confirmation, or a
+  timeout, is `unknown` and is never retried: read `list_scheduled` on the chat before asking the owner again.
 
 ### Mentioning group members (`mentions`, ANYM-928)
 

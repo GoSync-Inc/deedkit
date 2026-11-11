@@ -394,7 +394,7 @@ def test_a_second_identical_scheduled_send_is_duplicate_scheduled_whatever_its_a
                        request_id='synthetic-request-0002', schedule_at=at, preview_digest=digest)
     assert first['status'] == 'queued' and refused.value.status == 409
     assert refused.value.earlier_request_id == 'synthetic-request-0001'
-    assert refused.value.scheduled_message_id == '7' and refused.value.next_call['tool'] == 'list_scheduled'
+    assert refused.value.scheduled_message_id == '7' and refused.value.next_call['arguments']['operation'] == 'list_scheduled'
     again = s.send_message(key, account='send-fixture', chat_id=CHAT, text='Exact synthetic text',
                            request_id='synthetic-request-0002', schedule_at=at, preview_digest=digest,
                            allow_duplicate=True)
