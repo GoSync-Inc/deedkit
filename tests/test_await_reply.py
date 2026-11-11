@@ -107,6 +107,13 @@ def test_migration_092_only_adds_columns_and_the_gateway_grants_name_only_them(s
                 c.execute('UPDATE outgoing_messages SET ' + bad)
 
 
+# spec: ANYM-986
+def test_migration_092_classifies_non_critical_so_it_needs_no_backup_gate():
+    from messaging_service.migration_rollout import risk_class
+    # A DO block made it critical (autodeploy halted migration_by_hand, 11-11): the constraint is inline now.
+    assert risk_class((SOURCE / 'migrations' / '092_send_await_reply.sql').read_text()) == ('non-critical', None, None)
+
+
 def asked_row(store, token, status='sent', within=3600, chat='telegram-demo-chat'):
     send = 'send_' + uuid4().hex[:12]
     with store.authorized(token) as (_, p):

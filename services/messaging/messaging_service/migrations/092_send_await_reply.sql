@@ -4,7 +4,8 @@
 -- subscription after the message is `sent` (`await_state` pending, created or refused, with the subscription ID or
 -- a fixed reason code). The API-side job in await_reply.py reads the row as its queue.
 -- Risk tier: non-critical (docs/operations/production.md "Migration risk tiers": four nullable ADD COLUMNs with CHECKs
--- on the new columns only, and one partial index that matches no row yet; no row is read, rewritten or deleted). It
+-- on the new columns only, and one partial index that matches no row yet; no row is read, rewritten or deleted;
+-- migration_rollout.risk_class says non-critical, with no DO block). It
 -- is DROP-free and grants only on the columns it adds: INSERT(await_reply,await_state) and
 -- UPDATE(await_state,await_subscription_id,await_reason) to messaging_gateway, in gateway_role.sql (ANYM-590 L1).
 -- A schema-91 runtime never names the columns and is refused by database_newer_than_runtime.
@@ -24,16 +25,11 @@ ALTER TABLE outgoing_messages
     ADD COLUMN IF NOT EXISTS await_reason text
         CONSTRAINT outgoing_await_reason_values CHECK (await_reason IS NULL OR (await_state='refused' AND await_reason IN
             ('no_delivery_endpoint','ambiguous_delivery_endpoint','subscription_limit','permission_changed',
-             'key_inactive','send_not_sent','subscription_refused')));
--- The intent and its state exist together; a created subscription names itself, a refusal names its reason.
--- Repeatable: a replay of this file (the migration tests) finds the constraint and adds nothing.
-DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='outgoing_await_state_pair'
-            AND conrelid='public.outgoing_messages'::regclass) THEN
-        ALTER TABLE public.outgoing_messages ADD CONSTRAINT outgoing_await_state_pair CHECK (
+             'key_inactive','send_not_sent','subscription_refused')))
+        -- The intent and its state exist together; a created subscription names itself, a refusal names its reason.
+        -- Inline on the last new column, so a replay (ADD COLUMN IF NOT EXISTS) adds nothing and no DO block is needed.
+        CONSTRAINT outgoing_await_state_pair CHECK (
             (await_reply IS NULL)=(await_state IS NULL) AND
             (await_state IS DISTINCT FROM 'created' OR await_subscription_id IS NOT NULL) AND
             (await_state IS DISTINCT FROM 'refused' OR await_reason IS NOT NULL));
-    END IF;
-END $$;
 CREATE INDEX IF NOT EXISTS outgoing_await_pending ON outgoing_messages(created_at) WHERE await_state='pending';
