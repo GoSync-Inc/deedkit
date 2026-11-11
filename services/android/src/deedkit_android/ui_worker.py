@@ -20,6 +20,9 @@ from uiautomator2.exceptions import HTTPError as HTTPError, UiObjectNotFoundErro
 from .config import Refused
 from .uiautomator import SELECTORS, stop_script
 
+# Accessibility classes of editable fields (EditText subclasses report EditText).
+TEXT_FIELDS = ('EditText', 'AutoCompleteTextView')
+
 
 class Device(u2.Device):
     """Own the patched server; a lost response never repeats a mutation."""
@@ -176,11 +179,19 @@ def execute(device, command, element_timeout_ms=5000, optional_timeout_ms=1000, 
     elif name in {'inputText', 'eraseText'}:
         # Direct accessibility setText handles Unicode without installing an IME
         # or falling back to a second send after an ambiguous transport failure.
-        target = device(focused=True)
-        text = target.get_text(timeout=0) or ''
+        # A keyboard key can report focus too, and the uiautomator2 server clicks its
+        # setText target first: only a focused text field is a target, else nothing acts.
         root = ElementTree.fromstring(device.jsonrpc_call('dumpWindowHierarchy', (True, 50)))
-        focused = next((node for node in root.iter('node') if node.get('focused') == 'true'), None)
-        if focused is not None and focused.get('hint') == text:
+        focused = next((node for node in root.iter('node') if node.get('focused') == 'true'
+                        and (node.get('class') or '').endswith(TEXT_FIELDS)), None)
+        if focused is None:
+            raise Refused('focused_field_not_found')
+        selector = {'focused': True, 'className': focused.get('class')}
+        if focused.get('package'):
+            selector['packageName'] = focused.get('package')
+        target = device(**selector)
+        text = target.get_text(timeout=0) or ''
+        if focused.get('hint') == text:
             text = ''
         if name == 'inputText':
             text += value['text'] if isinstance(value, dict) else str(value)
