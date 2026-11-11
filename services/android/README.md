@@ -539,6 +539,28 @@ Upgrading a host to an engine-enabled config must update the executable and
 configuration together. Rollback must restore both originals because older
 service versions reject the new optional keys.
 
+## Android versions
+
+The service was last measured on Android 16. Android 16 omits `mCurrentFocus` from
+`dumpsys window windows`, so the foreground check reads `dumpsys window` (PR #864):
+0.095 s per call, against 5.2 s for the upstream fallback that dumps every activity's
+view tree. No Android 16 specific failure is known. Support is not promised for a
+version or build the service was not measured on.
+
+After a major OTA run these read-only checks, in order:
+
+1. `adb devices` shows the phone as `device`, not `unauthorized` or `offline`.
+2. `android_capabilities` lists the phone as granted and connected.
+3. `android_observe` returns the screenshot and the hierarchy.
+4. One saved read-only scenario runs to its end.
+
+An OTA can reset USB debugging or revoke its authorization, and ADB can be unavailable
+for some minutes after the first boot (one report: ADB came back by itself about 16
+minutes after the reboot, with no new pairing). System apps can change their hierarchy
+when they update, so re-check app maps and selectors. When authorization is lost, the
+owner re-enables USB debugging and re-approves the key on the phone; the service and
+agents never do that.
+
 ## Verification
 
 The service tests use a synthetic ADB executable and no phone or user accounts.
