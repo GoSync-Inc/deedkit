@@ -1,4 +1,4 @@
-"""Feedback follows its card: apply triage dispositions, follow the card to fixed or re-check (ANYM-473)."""
+"""Feedback follows its card: apply triage dispositions, ask for a re-check once its pull request is live (ANYM-473)."""
 from datetime import datetime, timedelta, timezone
 import fcntl
 import json
@@ -337,11 +337,12 @@ def test_follow_moves_each_status_after_its_card(tmp_path):
     root, shas = repo(tmp_path, ['one', 'two', 'three'])
     one, two, three = shas['one'], shas['two'], shas['three']
     gh, asked = pull_requests({
-        'ANYM-10': [(1, 'Spec: ANYM-10\nDelivers: ANYM-10', one), (9, 'Spec: ANYM-10, ANYM-100', OLD)],
-        'ANYM-11': [(2, 'Spec: ANYM-9\n  Delivers: ANYM-9, ANYM-11', two)],  # indented and second: sync B's grammar
-        'ANYM-13': [(3, 'Delivers: ANYM-13', one), (4, 'Delivers: ANYM-13', three)],  # two deliveries: ambiguous
-        'ANYM-14': [(5, 'fix(x): mentions ANYM-14 only in the title', three)],
-        'ANYM-15': [(6, 'Delivers: ANYM-15', MERGED)],  # not on origin/main
+        A: [(1, f'Spec: ANYM-10\nDelivers: ANYM-10\nFeedback: {A}, {J}', one), (9, f'mentions {A}', OLD)],
+        J: [(1, f'Spec: ANYM-10\nDelivers: ANYM-10\nFeedback: {A}, {J}', one)],
+        B: [(2, f'Spec: ANYM-9\nFeedback: {C}, {B}', two)],  # second ID of the line
+        F: [(3, f'Feedback: {F}', one), (4, f'Feedback: {F}', three)],  # two pull requests: both must be live
+        IDS[10]: [(5, f'fix(x): mentions {IDS[10]} only in the title', three)],
+        IDS[11]: [(6, f'Feedback: {IDS[11]}', MERGED)],  # not on origin/main
     })
     prod = Prod({A: disp('accepted', 'ANYM-10', note='triage'), B: disp('accepted', 'ANYM-11'),
                  C: disp('received', 'ANYM-12', note='Reporter text kept by triage'), D: disp('accepted', 'ANYM-12'), E: disp('accepted', 'ANYM-20'),
@@ -351,11 +352,10 @@ def test_follow_moves_each_status_after_its_card(tmp_path):
     prod.rows[IDS[10]] = dict(disp('accepted', 'ANYM-14'), at=START)
     prod.rows[IDS[11]] = dict(disp('accepted', 'ANYM-15'), at=START)
     assert follow(tmp_path, prod, root, gh, lambda commit: LIVE if commit == one else None) == 0
-    assert sorted(asked) == ['ANYM-10', 'ANYM-11', 'ANYM-13', 'ANYM-14', 'ANYM-15']  # Done cards with movable items
+    assert sorted(asked) == sorted([A, B, C, D, F, J, IDS[10], IDS[11]])  # movable items whose card is on main
     assert shown(prod, A) == disp('verify_requested', 'ANYM-10', fixed='deedkit@' + LIVE,
                                   note=f'Delivered by ANYM-10; live in deedkit@{LIVE[:12]}. Please re-check.')
-    assert shown(prod, B) == disp('fixed', 'ANYM-11', fixed='deedkit@' + two,
-                                  note=f'Delivered by ANYM-11 in deedkit@{two[:12]}; not live yet.')
+    assert prod.rows[B]['status'] == 'accepted'  # merged, not live: no `fixed` step (owner 11-11)
     assert shown(prod, C) == disp('accepted', 'ANYM-12', note='Accepted as ANYM-12; it follows that card.')
     assert prod.rows[J]['status'] == 'verify_requested'
     for unchanged, status in ((D, 'accepted'), (E, 'accepted'), (F, 'accepted'), (G, 'verified'), (H, 'declined'),
@@ -366,9 +366,38 @@ def test_follow_moves_each_status_after_its_card(tmp_path):
         assert 'triage' not in argv  # follow writes its own note, never kept feedback-derived text
     prod.writes.clear()
     assert follow(tmp_path, prod, root, gh, lambda commit: LIVE) == 0
-    assert [flags(argv)['--status'] for argv in prod.writes] == ['verify_requested']  # B is live now
+    assert [flags(argv)['--status'] for argv in prod.writes] == ['verify_requested'] * 2  # B and F are live now
     prod.writes.clear()
     assert follow(tmp_path, prod, root, gh, lambda commit: LIVE) == 0 and prod.writes == []
+
+
+# spec: ANYM-473
+def test_follow_moves_an_item_only_after_the_pull_request_naming_it_in_a_feedback_line_is_live(tmp_path, capsys):
+    """Owner 11-11: a card's `Delivers:` pull request alone moves nothing and there is no `fixed` step; an item moves to
+    verify_requested only when the merged pull requests whose `Feedback:` line names it are LIVE."""
+    root, shas = repo(tmp_path, ['one', 'two'])
+    one, two = shas['one'], shas['two']
+    gh, asked = pull_requests({
+        'ANYM-10': [(1, 'Spec: ANYM-10\nDelivers: ANYM-10', one)],
+        A: [(2, f'Spec: ANYM-10\nFeedback: {A}', two)],
+        B: [(3, f'Delivers: ANYM-10\n```\nFeedback: {B}\n```', one)],  # an example in a fence names nothing
+        C: [(4, f'Feedback: {C}', MERGED)],  # not on origin/main
+    })
+    prod = Prod({A: disp('accepted', 'ANYM-10'), B: disp('accepted', 'ANYM-10'), C: disp('accepted', 'ANYM-10'),
+                 D: disp('received', 'ANYM-10')})
+    assert follow(tmp_path, prod, root, gh, lambda commit: None) == 0  # merged, nothing live: no `fixed`
+    assert [prod.rows[i]['status'] for i in (A, B, C)] == ['accepted'] * 3
+    assert shown(prod, D) == disp('accepted', 'ANYM-10', note='Accepted as ANYM-10; it follows that card.')
+    out = capsys.readouterr().out
+    assert f'{A} accepted -> no change (not live yet)' in out
+    assert f'{B} accepted -> no change (no Feedback: pull request)' in out
+    assert {A, B, C, D} <= set(asked)
+    assert follow(tmp_path, prod, root, gh, lambda commit: LIVE if commit == two else None) == 0
+    assert shown(prod, A) == disp('verify_requested', 'ANYM-10', fixed='deedkit@' + LIVE,
+                                  note=f'Delivered by ANYM-10; live in deedkit@{LIVE[:12]}. Please re-check.')
+    prod.writes.clear()
+    assert follow(tmp_path, prod, root, gh, lambda commit: LIVE) == 0  # the Delivers: pull request is live too
+    assert prod.writes == [] and [prod.rows[i]['status'] for i in (B, C, D)] == ['accepted'] * 3
 
 
 REVIEW_LINE = '2. Read-back on production. [open: live]'
@@ -381,12 +410,12 @@ def in_review(content=REVIEW_LINE):
 # spec: ANYM-764
 def test_a_review_card_with_a_live_commit_asks_for_a_re_check_and_names_its_open_check(tmp_path, capsys):
     root, shas = repo(tmp_path, ['one'])
-    gh, _ = pull_requests({'ANYM-10': [(1, 'Delivers: ANYM-10', shas['one'])]})
+    gh, _ = pull_requests({i: [(1, f'Delivers: ANYM-10\nFeedback: {A}, {B}', shas['one'])] for i in (A, B)})
     prod = Prod({A: disp('accepted', 'ANYM-10'), B: disp('fixed', 'ANYM-10', fixed='deedkit@' + OLD)})
     assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, in_review('Text\n' + REVIEW_LINE + '\n[open: measured] later')) == 0
     note = f'Delivered by ANYM-10; live in deedkit@{LIVE[:12]}; the card still waits for {REVIEW_LINE}. Please re-check.'
     assert shown(prod, A) == shown(prod, B) == disp('verify_requested', 'ANYM-10', fixed='deedkit@' + LIVE, note=note)
-    assert '(card delivered, still in Review)' in capsys.readouterr().out
+    assert '(live, still in Review)' in capsys.readouterr().out
     # A second deploy keeps the first live SHA, also when the card then moves to Done.
     prod.writes.clear()
     for main in (in_review(), main_of(spec(10, 'Done'))):
@@ -399,18 +428,18 @@ def test_a_review_card_with_a_live_commit_asks_for_a_re_check_and_names_its_open
 def test_a_review_card_merged_but_not_live_is_fixed_and_without_a_commit_stays_not_delivered(tmp_path, capsys):
     root, shas = repo(tmp_path, ['one'])
     one = shas['one']
-    gh, asked = pull_requests({'ANYM-10': [(1, 'Delivers: ANYM-10', one)], 'ANYM-11': [(2, 'Spec: ANYM-11', one)]})
+    gh, asked = pull_requests({A: [(1, f'Delivers: ANYM-10\nFeedback: {A}', one)], B: [(2, f'Spec: ANYM-11 {B}', one)]})
     prod = Prod({A: disp('accepted', 'ANYM-10'), B: disp('accepted', 'ANYM-11'), C: disp('received', 'ANYM-11'),
                  D: disp('accepted', 'ANYM-12'), E: disp('accepted', 'ANYM-13')})
     main = main_of(spec(10, 'Review'), spec(11, 'Review'), spec(12, 'Active'), spec(13, 'Backlog'))
     assert follow(tmp_path, prod, root, gh, lambda commit: None, main) == 0
-    assert shown(prod, A) == disp('fixed', 'ANYM-10', fixed='deedkit@' + one,
-                                  note=f'Delivered by ANYM-10 in deedkit@{one[:12]}; not live yet.')
+    assert prod.rows[A]['status'] == 'accepted'  # merged, not live: no `fixed` step (owner 11-11)
     assert shown(prod, C) == disp('accepted', 'ANYM-11', note='Accepted as ANYM-11; it follows that card.')
     out = capsys.readouterr().out
-    assert f'{B} accepted -> no change (card not delivered)' in out
-    assert f'{D} accepted -> no change (card not delivered)' in out and f'{E} accepted -> no change (card not delivered)' in out
-    assert sorted(asked) == ['ANYM-10', 'ANYM-11']  # Active and Backlog cards are not asked about
+    assert f'{A} accepted -> no change (not live yet)' in out and f'{B} accepted -> no change (no Feedback: pull request)' in out
+    assert f'{D} accepted -> no change (no Feedback: pull request)' in out
+    assert f'{E} accepted -> no change (no Feedback: pull request)' in out
+    assert sorted(asked) == sorted([A, B, C, D, E])  # every movable item whose card is on main
 
 
 # spec: ANYM-764
@@ -472,12 +501,30 @@ def test_a_done_card_follows_its_reviewed_mapping_entry(tmp_path, capsys):
     prod = Prod({A: disp('accepted', 'ANYM-10'), B: disp('verified', 'ANYM-10'), C: disp('declined', 'ANYM-10'),
                  D: disp('duplicate', 'ANYM-10')})
     assert follow(tmp_path, prod, root, gh, lambda commit: None, DONE) == 0
-    assert shown(prod, A) == disp('fixed', 'ANYM-10', fixed='deedkit@' + shas['one'],
-                                  note=f'Delivered by ANYM-10 in deedkit@{shas["one"][:12]}; not live yet.')
-    assert f'{A} accepted -> fixed ANYM-10 deedkit@{shas["one"]} (delivered by mapping (#7))' in capsys.readouterr().out
+    assert prod.rows[A]['status'] == 'accepted'  # merged, not live: no `fixed` step (owner 11-11)
+    assert f'{A} accepted -> no change (not live yet)' in capsys.readouterr().out
     assert [prod.rows[i]['status'] for i in (B, C, D)] == ['verified', 'declined', 'duplicate']
     assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, DONE) == 0
     assert shown(prod, A)['status'] == 'verify_requested' and shown(prod, A)['fixed_in'] == 'deedkit@' + LIVE
+    assert f'{A} accepted -> verify_requested ANYM-10 deedkit@{LIVE} (delivered by mapping (#7))' in capsys.readouterr().out
+
+
+# spec: ANYM-764
+def test_a_mapping_entry_moves_an_item_only_when_its_commit_is_live(tmp_path, capsys):
+    """Owner 11-11: a reviewed entry stays a source for an old pull request with no `Feedback:` line, but it moves
+    the item only when its commit is LIVE; merged and not live is no `fixed` step."""
+    root, shas = repo(tmp_path, ['one'])
+    write_mapping(root, {'ANYM-10': entry(shas['one'])})
+    gh, _ = github([(7, 'Spec: ANYM-9, ANYM-10', shas['one'])])
+    prod = Prod({A: disp('accepted', 'ANYM-10'), B: disp('received', 'ANYM-10')})
+    assert follow(tmp_path, prod, root, gh, lambda commit: None, DONE) == 0
+    assert [prod.rows[i]['status'] for i in (A, B)] == ['accepted', 'accepted']
+    assert f'{A} accepted -> no change (not live yet)' in capsys.readouterr().out
+    assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, DONE) == 0
+    assert shown(prod, A) == shown(prod, B) == disp(
+        'verify_requested', 'ANYM-10', fixed='deedkit@' + LIVE,
+        note=f'Delivered by ANYM-10; live in deedkit@{LIVE[:12]}. Please re-check.')
+    assert '(delivered by mapping (#7))' in capsys.readouterr().out
 
 
 # spec: ANYM-764
@@ -528,6 +575,9 @@ def test_a_mapping_entry_that_fails_a_condition_is_refused_by_name_and_writes_no
     gh, _ = github(merged, others)
     prod = Prod({A: disp('accepted', 'ANYM-10', note='kept')})
     assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, main) == 0
+    if case == 'has-delivers':  # owner 11-11: a Delivers: pull request neither delivers nor refuses an entry
+        assert prod.rows[A]['status'] == 'verify_requested' and '(delivered by mapping (#7))' in capsys.readouterr().out
+        return
     assert prod.writes == [] and shown(prod, A) == disp('accepted', 'ANYM-10', note='kept')
     assert f'{A} accepted -> no change (mapping refused: {why})' in capsys.readouterr().out
 
@@ -536,12 +586,12 @@ def test_a_mapping_entry_that_fails_a_condition_is_refused_by_name_and_writes_no
 def test_a_bad_entry_holds_only_its_own_card(tmp_path, capsys):
     root, shas = repo(tmp_path, ['one'])
     write_mapping(root, {'ANYM-10': dict(entry(shas['one']), pr=0), 'ANYM-12': entry(shas['one'])})
-    gh, _ = pull_requests({'ANYM-11': [(1, 'Delivers: ANYM-11', shas['one'])]})
+    gh, _ = pull_requests({B: [(1, f'Delivers: ANYM-11\nFeedback: {B}', shas['one'])]})
     prod = Prod({A: disp('accepted', 'ANYM-10'), B: disp('accepted', 'ANYM-11'), C: disp('received', 'ANYM-13'),
                  D: disp('accepted', 'ANYM-12')})
     main = main_of(spec(10, 'Done'), spec(11, 'Done'), spec(12, 'Active'), spec(13, 'Active'))
-    assert follow(tmp_path, prod, root, gh, lambda commit: None, main) == 0
-    assert prod.rows[B]['status'] == 'fixed' and prod.rows[C]['status'] == 'accepted'
+    assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, main) == 0
+    assert prod.rows[B]['status'] == 'verify_requested' and prod.rows[C]['status'] == 'accepted'
     out = capsys.readouterr().out
     assert f'{A} accepted -> no change (mapping refused: pr is not a number)' in out
     assert f'{D} accepted -> no change (mapping refused: the card is not Done or in Review)' in out
@@ -584,9 +634,8 @@ def test_a_review_card_with_a_mapping_entry_merged_but_not_live_is_fixed(tmp_pat
     gh, _ = github([(7, 'Spec: ANYM-10', shas['one'])])
     prod = Prod({A: disp('accepted', 'ANYM-10')})
     assert follow(tmp_path, prod, root, gh, lambda commit: None, in_review()) == 0
-    assert shown(prod, A) == disp('fixed', 'ANYM-10', fixed='deedkit@' + shas['one'],
-                                  note=f'Delivered by ANYM-10 in deedkit@{shas["one"][:12]}; not live yet.')
-    assert '(delivered by mapping (#7))' in capsys.readouterr().out
+    assert prod.writes == [] and prod.rows[A]['status'] == 'accepted'  # no `fixed` step (owner 11-11)
+    assert f'{A} accepted -> no change (not live yet)' in capsys.readouterr().out
 
 
 # spec: ANYM-798
@@ -597,7 +646,7 @@ def test_a_mapping_entry_of_a_card_neither_done_nor_in_review_is_refused(tmp_pat
     gh, calls = github([(7, 'Spec: ANYM-10', shas['one'])])
     prod = Prod({A: disp('accepted', 'ANYM-10', note='kept')})
     assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, main_of(spec(10, status))) == 0
-    assert prod.writes == [] and calls == []
+    assert prod.writes == [] and calls == [('merged', A)]  # only the item's own Feedback: search
     assert f'{A} accepted -> no change (mapping refused: the card is not Done or in Review)' in capsys.readouterr().out
 
 
@@ -653,15 +702,15 @@ def test_a_revert_off_origin_main_or_of_another_commit_does_not_refuse(tmp_path)
     gh, _ = github([(7, 'Spec: ANYM-10', delivery)])
     git(root, 'update-ref', 'refs/remotes/origin/main', delivery)  # the revert is only local
     prod = Prod({A: disp('accepted', 'ANYM-10')})
-    assert follow(tmp_path, prod, root, gh, lambda commit: None, DONE) == 0
-    assert prod.rows[A]['status'] == 'fixed'
+    assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, DONE) == 0
+    assert prod.rows[A]['status'] == 'verify_requested'
     other = git(root, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit-tree', '-m',
                 f'other\n\nThis reverts commit {OLD}.\nThis reverts commit {delivery[:12]}.', '-p', delivery,
                 git(root, 'rev-parse', delivery + '^{tree}'))
     git(root, 'update-ref', 'refs/remotes/origin/main', other)
     prod = Prod({B: disp('accepted', 'ANYM-10')})
-    assert follow(tmp_path, prod, root, gh, lambda commit: None, DONE) == 0
-    assert prod.rows[B]['status'] == 'fixed'
+    assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, DONE) == 0
+    assert prod.rows[B]['status'] == 'verify_requested'
 
 
 # spec: ANYM-798
@@ -709,11 +758,11 @@ def test_two_spec_pull_requests_move_nothing_until_a_reviewed_entry_names_one(tm
     gh, calls = github([(7, 'Spec: ANYM-10', shas['one']), (8, 'Spec: ANYM-10', shas['two'])])
     prod = Prod({A: disp('accepted', 'ANYM-10')})
     assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, DONE) == 0
-    assert prod.writes == [] and f'{A} accepted -> no change (no delivering commit on origin/main)' in capsys.readouterr().out
-    assert calls == [('merged', 'ANYM-10')]  # no entry: the tool asks nothing further and never derives one
+    assert prod.writes == [] and f'{A} accepted -> no change (no Feedback: pull request)' in capsys.readouterr().out
+    assert calls == [('merged', A)]  # no entry: the tool asks nothing further and never derives one
     write_mapping(root, {'ANYM-10': entry(shas['two'], 8)})
-    assert follow(tmp_path, prod, root, gh, lambda commit: None, DONE) == 0
-    assert prod.rows[A]['fixed_in'] == 'deedkit@' + shas['two']
+    assert follow(tmp_path, prod, root, gh, lambda commit: LIVE if commit == shas['two'] else None, DONE) == 0
+    assert prod.rows[A]['fixed_in'] == 'deedkit@' + LIVE
 
 
 # spec: ANYM-764
@@ -725,8 +774,8 @@ def test_a_failed_or_truncated_spec_listing_ends_the_run_with_no_write(tmp_path,
     prod = Prod({A: disp('accepted', 'ANYM-10')})
     assert follow(tmp_path, prod, root, github(merged, fail=fail)[0], lambda commit: None, DONE) == 1
     assert prod.writes == []
-    assert follow(tmp_path, prod, root, github(merged)[0], lambda commit: None, DONE) == 0
-    assert prod.rows[A]['status'] == 'fixed'
+    assert follow(tmp_path, prod, root, github(merged)[0], lambda commit: LIVE, DONE) == 0
+    assert prod.rows[A]['status'] == 'verify_requested'
 
 
 # spec: ANYM-764
@@ -745,7 +794,7 @@ def test_the_opt_in_hold_is_kept_on_a_delivered_or_mapped_card(tmp_path):
 def test_the_hourly_plan_prints_the_new_reasons_without_writing(tmp_path, capsys):
     root, shas = repo(tmp_path, ['one'])
     write_mapping(root, {'ANYM-11': entry(shas['one'])})
-    gh, _ = github([(1, 'Delivers: ANYM-10', shas['one']), (7, 'Spec: ANYM-11', shas['one'])])
+    gh, _ = github([(1, f'Delivers: ANYM-10\nFeedback: {A}', shas['one']), (7, 'Spec: ANYM-11', shas['one'])])
     prod = Prod({A: disp('accepted', 'ANYM-10'), B: disp('accepted', 'ANYM-11')})
     main = main_of(dict(spec(10, 'Review'), content=REVIEW_LINE), spec(11, 'Done'))
 
@@ -754,7 +803,7 @@ def test_the_hourly_plan_prints_the_new_reasons_without_writing(tmp_path, capsys
     assert sync.main(['auto', '--state', str(state_dir(tmp_path)), '--triage-state', str(triage_dir(tmp_path))], ssh=prod.ssh,
                      read=read, live=lambda commit: LIVE, gh=gh, run=prod.run, root=root, fetch=False) == 0
     out = capsys.readouterr().out
-    assert prod.writes == [] and '(card delivered, still in Review)' in out and '(delivered by mapping (#7))' in out
+    assert prod.writes == [] and '(live, still in Review)' in out and '(delivered by mapping (#7))' in out
 
 
 # spec: ANYM-764
@@ -797,7 +846,7 @@ def test_a_failed_or_malformed_read_stops_follow_before_any_write(tmp_path, bad)
              'next_page': None, 'dispositions': [{'id': A, 'status': 'accepted', 'spec_ref': 'ANYM-10',
                                                   'duplicate_of': None, 'fixed_in': None, 'status_note': None,
                                                   'status_changed_at': (START + timedelta(days=1)).isoformat()}]})
-    gh, _ = pull_requests({'ANYM-10': [(1, 'Delivers: ANYM-10', shas['one'])] * (sync.PR_LIMIT if bad == 'gh' else 1)})
+    gh, _ = pull_requests({A: [(1, f'Feedback: {A}', shas['one'])] * (sync.PR_LIMIT if bad == 'gh' else 1)})
     assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, main) == 1
     assert prod.writes == []
 
@@ -838,7 +887,7 @@ def test_a_commit_git_does_not_know_refuses(tmp_path):
 # spec: ANYM-473
 def test_an_exhausted_budget_stops_the_run_before_an_accepted_item_is_written_fixed(tmp_path, monkeypatch):
     root, shas = repo(tmp_path, ['delivered', 'plan'])
-    gh, _ = pull_requests({'ANYM-10': [(1, 'Delivers: ANYM-10', shas['delivered'])]})
+    gh, _ = pull_requests({A: [(1, f'Feedback: {A}', shas['delivered'])]})
     prod = Prod({A: disp('accepted', 'ANYM-10')})
     answer = {'plan_a': {'sha': shas['plan'], 'status': 'applied'}, 'http': {'sha': shas['plan'], 'status': 'serving'},
               'deploy': None, 'pause': {'present': False, 'reason': None}, 'unresolved': [], 'served': []}
@@ -1324,13 +1373,13 @@ def test_a_malformed_pending_record_or_tiden_reply_still_replaces_the_report(tmp
 # spec: ANYM-536
 def test_a_superseded_queue_row_stays_superseded_when_follow_moves_the_item(tmp_path):
     root, shas = repo(tmp_path, ['one'])
-    gh, _ = pull_requests({'ANYM-10': [(1, 'Delivers: ANYM-10', shas['one'])]})
+    gh, _ = pull_requests({A: [(1, f'Feedback: {A}', shas['one'])]})
     prod = Prod({A: disp('accepted', 'ANYM-10')})  # a hand decision at 09:00
     path = publish(tmp_path, 'one.json', {A: disp('declined')}, START - timedelta(hours=1))
     assert sync.main(['auto', '--apply', '--state', str(state_dir(tmp_path)), '--triage-state', str(triage_dir(tmp_path))],
-                     ssh=prod.ssh, read=lambda *argv: MAIN, live=lambda commit: None, gh=gh, run=prod.run, root=root,
+                     ssh=prod.ssh, read=lambda *argv: MAIN, live=lambda commit: LIVE, gh=gh, run=prod.run, root=root,
                      fetch=False) == 0
-    assert prod.rows[A]['status'] == 'fixed' and flags(prod.writes[0])['--status'] == 'fixed'
+    assert prod.rows[A]['status'] == 'verify_requested' and flags(prod.writes[0])['--status'] == 'verify_requested'
     assert synced(tmp_path, 'applied.json')['files'][path.name]['rows'][A]['outcome'] == 'superseded'
 
 

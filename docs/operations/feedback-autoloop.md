@@ -132,6 +132,12 @@ pass the gate first:
 A cluster with an outcome never gets another card worker. A lost, interrupted, cancelled or stopped
 one gets its one relaunch.
 
+Feedback status rule (owner 11-11, «просто сделайте все что надо и отметьте сделанное»): triage
+sets `spec_ref` to the story card that delivers the specific ask, never an umbrella or epic card; for
+a defect it is the card on its fix PR. `follow` moves an item only after the PR naming it in a
+`Feedback:` line is LIVE (docs/operations/feedback-triage.md, Sync). Hand triage writes its
+dispositions file and applies it in the same session.
+
 Status notes go through a dispositions file that the ANYM-536 `auto` applies. The sync's
 never-down rule keeps an item that is further along. Each note goes to an item once. No note goes
 to a dropped item, and none follows a declined or large outcome:
