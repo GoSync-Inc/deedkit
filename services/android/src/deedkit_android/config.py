@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import stat
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -40,9 +40,27 @@ class GuardRules(Strict):
         default_factory=list, max_length=500)
 
 
+class EngineConfig(Strict):
+    """One driving CLI of the local agent (ANYM-971). The login stays in a 0600 file or a private directory of the host:
+    Claude reads `token_file`, Codex its `auth.json` in `codex_home`. `version` pins the binary's version."""
+    binary: str
+    version: str = Field(min_length=1, max_length=64)
+    model: str | None = Field(default=None, min_length=1, max_length=128)
+    token_file: str | None = None
+    codex_home: str | None = None
+
+
+class AgentConfig(Strict):
+    # Off until set: while false no run starts and no engine login file is read (ANYM-971 criterion 10).
+    enabled: bool = False
+
+
 class Config(Strict):
     adb: str
     state_dir: str
+    engines: dict[Literal["claude", "codex"], EngineConfig] = Field(default_factory=dict)
+    default_engine: Literal["claude", "codex"] | None = None
+    agent: AgentConfig = Field(default_factory=AgentConfig)
     # Removed engine (owner 11-11): a config that still names it fails at start.
     maestro: str | None = None
     java_home: str | None = None
@@ -85,6 +103,14 @@ class Configuration:
             os.close(fd)
         if config.maestro is not None or config.java_home is not None:
             raise ValueError("maestro_engine_removed")
+        for name, engine in config.engines.items():
+            paths = (engine.binary, engine.token_file, engine.codex_home)
+            if any(value is not None and not Path(value).is_absolute() for value in paths):
+                raise ValueError("absolute_runtime_paths_required")
+            if (name == "claude" and engine.codex_home) or (name == "codex" and engine.token_file):
+                raise ValueError("invalid_engine_login")
+        if config.default_engine is not None and config.default_engine not in config.engines:
+            raise ValueError("default_engine_not_configured")
         ids = [p.id for p in config.principals]
         keys = [p.key_sha256 for p in config.principals]
         if len(set(config.devices.values())) != len(config.devices) or any(

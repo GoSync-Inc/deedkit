@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import AliasChoices, Field, ValidationError
 from typing import Literal
 
+from .agent_run import AgentCall, Agents, install_routes
 from . import courier_chat
 from .app_maps import compile_scenario, load, validate_map
 from .config import Configuration, Refused, Strict
@@ -134,26 +135,36 @@ SCHEMAS = {
     "run_flow": RunFlow, "flows": Flows, "session": Session, "upload": Upload, "download": Download, "delete_file": FileRef,
     "courier_chat": CourierChat,
 }
+# The local agent's operation joins SCHEMAS (and the gateway catalog, which test_device_service pins to it) with the
+# android_agent tool (ANYM-972); until then it is served here and described in android_capabilities.agent.
+OPERATIONS = {**SCHEMAS, "agent": AgentCall}
+# Where runs reach this service; the command line sets it from --host and --port.
+AGENT_URL = None
 READS = {"capabilities", "observe", "get_operation", "download", "maestro"}
 
 
-def create_app(config_path):
+def create_app(config_path, agent_url=None):
+    agent_url = agent_url or AGENT_URL
     configuration = Configuration(config_path)
 
     @asynccontextmanager
     async def lifespan(app):
         store = Store(configuration.initial.state_dir)
         devices = Devices(configuration.initial, store)
-        app.state.devices, app.state.store = devices, store
+        # The local agent (ANYM-971): runs reach this service on agent_url with their own per-run bearer.
+        agents = Agents(devices, store, configuration, agent_url)
+        app.state.devices, app.state.store, app.state.agents = devices, store, agents
         try:
             yield
         finally:
             try:
+                await agents.close()
                 await devices.close()
             finally:
                 store.close()
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    install_routes(app)
 
     @app.exception_handler(Refused)
     async def refused(request, error):
@@ -167,7 +178,7 @@ def create_app(config_path):
         # The stored secret names, read once and only when a flow holds a reference (ANYM-969).
         known = functools.cache(devices.secrets.packages)
         principal = configuration.authenticate(request.headers.get("authorization", ""))
-        if operation not in SCHEMAS:
+        if operation not in OPERATIONS:
             raise Refused("not_found", 404)
         permission = "android:read" if operation in READS else "android:control"
         if permission not in principal.permissions:
@@ -178,7 +189,8 @@ def create_app(config_path):
             if len(body) > 65536:
                 raise Refused("request_too_large", 413)
         try:
-            args = SCHEMAS[operation].model_validate(json.loads(body)).model_dump()
+            raw = json.loads(body)
+            args = OPERATIONS[operation].model_validate(raw).model_dump()
         except (ValidationError, ValueError):
             raise Refused("invalid_arguments", 422) from None
         device = args.get("device_id")
@@ -203,6 +215,10 @@ def create_app(config_path):
                       "session_policy": {"renew_on_activity": True, "release_explicitly": True,
                                          "maximum_idle_seconds": 900},
                       "limits": {"command_seconds": 600, "file_bytes": 268435456, "chunk_bytes": 32768, "download_chunk_bytes": 4194304}}
+            try:
+                result["agent"] = await request.app.state.agents.describe()
+            except Refused:
+                result["agent"] = {"enabled": False, "reason": "unavailable"}
         elif operation == "session":
             if devices.locks[device].locked() and args["action"] != "renew":
                 raise Refused("device_busy")
@@ -262,6 +278,8 @@ def create_app(config_path):
             else:
                 options = {key: value for key, value in args.items() if key != 'yaml'}
                 result = store.library.manage(owner, source=args['yaml'], **options)
+        elif operation == "agent":
+            result = await request.app.state.agents.handle(owner, AgentCall.model_validate(raw))
         elif operation == "get_operation":
             result = await devices.receipt(owner, identifier(args["request_id"]), args["wait_s"])
         elif operation == "upload":

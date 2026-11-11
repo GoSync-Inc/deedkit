@@ -274,6 +274,44 @@ a row fail before the tap, a send is uncertain (`unknown`, as for `send`), or th
 polls with `read`: nothing pushes a courier's message to it yet. `order_seen` records whether the order text is on
 screen; it is not a gate, because the app's chat title is unverified until the first live conversation.
 
+## Local agent
+
+`operation agent` (`POST /v1/agent`, scope `android:control`) hands a whole phone goal to a model-driven engine that runs
+on this host and drives the phone through the service's own guarded verbs, at local speed (ANYM-971). It is **off**
+until the host config sets `agent.enabled: true`: while off, `start` answers `409 agent_disabled`, no engine process
+is started and no engine login file is read. Enabling sends screen text and up to three screenshots per run to the
+engine's provider (Anthropic for Claude Code, OpenAI for Codex), which is the owner's data-policy answer to give.
+
+```json
+{"engines": {"claude": {"binary": "/opt/.../claude", "version": "2.1.322", "model": "sonnet",
+                        "token_file": "/.../claude.token"},
+             "codex":  {"binary": "/opt/.../codex", "version": "0.166.0", "codex_home": "/.../codex-home"}},
+ "default_engine": "claude", "agent": {"enabled": false}}
+```
+
+- **Actions.** `start` {device_id, session_id (the caller's lease), request_id, goal, owner_instruction, apps (1-5; a
+  write-denied or protected package is refused with `app_not_allowed`), params, secrets (names from `deedkit-android
+  secret`, bound to a package in `apps`), outputs, max_minutes (1-15, 5), max_actions (10-300, 120), engine},
+  `get` {request_id, after, wait_s 0-25} (the new events after a cursor; a long-poll is the streaming path) and `stop`.
+  The same request_id with the same fields returns the run; other fields give `409 request_id_conflict`. A run holds the
+  device lock for its whole life (`409 device_busy` for another start).
+- **Engines.** Claude Code or Codex, per host (`default_engine`) and per run (`engine`). The engine is started as its own
+  process group in a private directory as HOME, with only PATH, HOME and its login in the environment (Claude:
+  `CLAUDE_CODE_OAUTH_TOKEN` from the 0600 `token_file`; Codex: `CODEX_HOME`, a private 0700 directory holding
+  `auth.json`). Its only tools are the `phone` stdio server (`deedkit-android phone-mcp`): screen, tap, type, key, swipe,
+  wait, read_text, read_list, open_app, run_flow and finish. An engine is offered only when configured, logged in, at
+  its pinned version and with a passed probe of that version: `deedkit-android engine probe claude|codex --config FILE`
+  runs it once against a fake phone and records the result. `android_capabilities.agent` lists both engines with
+  `available` and a `reason` (`not_configured`, `login_missing`, `version_mismatch`, `probe_failed`, `codex_probe_failed`).
+- **Stops.** The guard stops a run before pay, order, confirm, send or a PIN screen (`stopped_by_guard`, with its record
+  and the stop screen). Other ends: `succeeded` (the engine called `finish`), `timed_out` (SIGTERM to the process group,
+  SIGKILL after 5 s), `action_cap`, `failed` (the engine exited without `finish`; `exit_code`), `stopped` and `lost` (the
+  service restarted: the group is killed by its private marker).
+- **Result.** `summary`, `data` and `missing_outputs`, `final_screen_text` (at most 8 KB), `screenshots` (at most 3
+  file IDs for `android_download`), `action_log` (secrets as references), `timings`, `engine`, `model`, `tokens` and
+  `preamble_version` (`agent_preamble.md`). Runs, events and logs are deleted 14 days after the run ends.
+- **Not yet.** The `android_agent` gateway tool and the production enable are ANYM-972.
+
 ## Execution and recovery
 
 1. Read capabilities and acquire a session for the chosen device.
@@ -564,7 +602,7 @@ receipt; never mint another UUID as a recovery attempt.
 Saved flows, operation receipts and checkpoint remainders persist in private
 SQLite state. The worker stops its token-identified device server when the
 service's pipe closes, and a later service stops a leftover server by its private
-marker before the next operation. No model API is called by this runtime. Device interactions
+marker before the next operation. No model API is called by this runtime unless the local agent is enabled. Device interactions
 can cause the apps themselves to contact their services.
 
 ## Observation and image coordinates
@@ -659,7 +697,7 @@ Cleanup verifies the PID identity and leaves a private marker if the device is
 unreachable, so later operations must complete cleanup first. It never kills a
 generic `app_process` or adopts another server. Rollback to an older service must
 finish this cleanup while the new service still understands those markers.
-No model API or analytics service receives device content from the runtime.
+No model API or analytics service receives device content from the runtime, except the engine of an enabled local agent run (see Local agent).
 
 
 ### Application maps and scenario versions
