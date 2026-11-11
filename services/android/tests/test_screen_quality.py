@@ -157,6 +157,43 @@ def test_mask_images_keeps_text_printed_inside_a_photo_out_of_the_lines():
     assert masked['ocr']['masked'] == {'regions': 1, 'skipped_large': 0, 'tree': 'ok'}
 
 
+# spec: ANYM-981
+def test_per_card_returns_one_record_per_card_with_no_line_from_a_neighbour():
+    from deedkit_android.ui_worker import execute
+
+    cards = [('Sepatu Lari Pria', 'Rp 125.000'), ('Tas Kulit Wanita', 'Rp 340.000'), ('Topi Baseball Biru', 'Rp 59.000')]
+    image = Image.new('RGB', (1080, 900), 'white')
+    draw = ImageDraw.Draw(image)
+    nodes = ''
+    for number, (title, price) in enumerate(cards):
+        top = 20 + number * 290
+        draw.rectangle((20, top, 1060, top + 270), outline='#9aa0a6', width=3)
+        draw.text((60, top + 40), title, fill='black', font=ImageFont.load_default(size=44))
+        draw.text((60, top + 150), price, fill='black', font=ImageFont.load_default(size=44))
+        nodes += f'<node class="android.view.ViewGroup" clickable="true" bounds="[20,{top}][1060,{top + 270}]" />'  # no text in the tree
+    hierarchy = ('<hierarchy><node class="android.widget.FrameLayout" bounds="[0,0][1080,900]">'
+                 '<node class="androidx.recyclerview.widget.RecyclerView" scrollable="true" bounds="[0,0][1080,900]">'
+                 + nodes + '</node></node></hierarchy>')
+    target = io.BytesIO()
+    image.save(target, format='PNG')
+
+    class Device:
+        def __init__(self):
+            self._dev = self
+
+        def shell2(self, args, timeout=None, encoding='utf-8'):
+            return SimpleNamespace(returncode=0, output=target.getvalue())
+
+        def jsonrpc_call(self, method, params, timeout=10):
+            return hierarchy
+
+    result = execute(Device(), {'readScreenText': {'per_card': True}}, ocr={'command': tesseract(), 'languages': 'eng'})
+    assert [card['source'] for card in result['cards']] == ['ocr'] * 3
+    for card, own in zip(result['cards'], cards):
+        assert [line['text'] for line in card['lines']] == list(own), card
+    assert result['ocr']['cards'] == {'tree': 'ok', 'from_tree': 0, 'from_ocr': 3} and result['cards_truncated'] is False
+
+
 # spec: ANYM-961
 def test_evaluation_prints_numbers_and_names_only(tmp_path):
     shutil.copy(CORPUS / 'settings_en_dark.png', tmp_path / 'private-1.png')
