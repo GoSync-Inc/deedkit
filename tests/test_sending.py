@@ -3,6 +3,7 @@ import asyncio
 from datetime import datetime, timezone
 
 import pytest
+from psycopg.types.json import Jsonb
 from starlette.testclient import TestClient
 
 from messaging_service.app import create_app
@@ -142,6 +143,318 @@ def test_silent_on_whatsapp_is_the_field_error_silent_unsupported_and_queues_not
             'expected': 'false: WhatsApp has no silent send', 'allowed': [False]}]
     assert queued_count(s) == 0
     assert s.preview_message(key, account='wa-silent', chat_id=chat, text='Synthetic', silent=False)['account'] == 'wa-silent'
+
+
+GROUP = stable_id('chat', 'send-fixture', '-500')
+
+
+def tg_group(archive):
+    """A Telegram group where Анна (42) wrote today and Борис (99) wrote a year ago."""
+    for provider_id, sender, name, at in (('1', '42', 'Анна', '2026-11-10T12:00:00+00:00'),
+                                          ('2', '99', 'Борис', '2025-11-10T12:00:00+00:00')):
+        archive.ingest(event(account='send-fixture', chat='-500', chat_title='Synthetic family', provider_id=provider_id,
+            sender=sender, body='Synthetic hello', sent_at=at, updated_at=at, metadata={'chat_type': 'group'},
+            sender_profile={'display_name': name}))
+    return GROUP
+
+
+def members_read(s, key, account, chat, ids, *, minutes_ago=0, complete=True, request_id='synthetic-members-0001'):
+    """A finished list_participants read of the chat by this key (synthetic: the row a collector would leave)."""
+    s.set_messenger_operations(account, ['list_participants'])
+    queued = s.execute_messenger_operation(key, account, 'list_participants', chat, parameters={'limit': 100},
+                                           request_id=request_id)
+    data = {'participants': [{'id': i, 'first_name': 'Member'} for i in ids], 'next_offset': None if complete else 100}
+    with s.pool.connection() as c:
+        c.execute('''UPDATE messenger_commands SET status='succeeded',result=%s,finished_at=clock_timestamp(),
+            created_at=clock_timestamp()-make_interval(mins=>%s) WHERE id=%s''',
+            (Jsonb({'outcome': 'confirmed', 'data': data}), minutes_ago, queued['operation_id']))
+
+
+def group_key(s):
+    return s.issue_key('mention-agent', ['send-fixture'], permissions=['read', 'send', 'groups-read'])
+
+
+def mention_preview(s, key, text, mentions, chat=GROUP, account='send-fixture', **changes):
+    return s.preview_message(key, account=account, chat_id=chat, text=text, mentions=mentions, **changes)
+
+
+def mention_send(s, key, text, mentions, digest, request_id='mention-request-0001', chat=GROUP, account='send-fixture',
+                 **changes):
+    return s.send_message(key, account=account, chat_id=chat, text=text, request_id=request_id, mentions=mentions,
+                          preview_digest=digest, **changes)
+
+
+# spec: ANYM-928
+def test_a_telegram_mention_preview_names_who_is_notified_and_its_digest_binds_the_mentions(sender):
+    s, archive, _, _, _ = sender
+    tg_group(archive)
+    key = group_key(s)
+    text, anna = 'Привет, @Анна! Спроси @school_bot', [{'sender': '42', 'offset': 8, 'length': 5}]
+    draft = mention_preview(s, key, text, anna)
+    assert draft['mentions_notified'] == [{'sender': '42', 'display_name': 'Анна', 'span_text': '@Анна'}]
+    assert draft['membership_basis'] == 'archive' and draft['notified_by_username'] == ['school_bot']
+    assert draft['mentions'] == [{'offset': 8, 'length': 5, 'user_id': '42'}]
+    assert draft['provider_payload'] == {'text': text, 'entities': [], 'link_preview': False}
+    plain = mention_preview(s, key, text, None)
+    assert 'mentions' not in plain and 'mentions_notified' not in plain and mention_preview(s, key, text, []) == plain
+    moved = mention_preview(s, key, text, [{'sender': '42', 'offset': 9, 'length': 4}])
+    added = mention_preview(s, key, text, [*anna, {'sender': '99', 'offset': 0, 'length': 6}])
+    assert len({draft['preview_digest'], plain['preview_digest'], moved['preview_digest'], added['preview_digest']}) == 4
+    with pytest.raises(APIError, match='preview_required'):
+        mention_send(s, key, text, anna, '')
+    for digest in (plain['preview_digest'], moved['preview_digest'], added['preview_digest']):
+        with pytest.raises(APIError, match='preview_mismatch'):
+            mention_send(s, key, text, anna, digest)
+    with pytest.raises(APIError, match='preview_mismatch'):
+        mention_send(s, key, text, None, draft['preview_digest'])
+    assert queued_count(s) == 0
+    receipt = mention_send(s, key, text, anna, draft['preview_digest'])
+    assert receipt['status'] == 'queued'
+    assert mention_send(s, key, text, anna, draft['preview_digest'])['send_id'] == receipt['send_id']
+    with pytest.raises(APIError, match='idempotency_conflict'):
+        mention_send(s, key, text, None, draft['preview_digest'])
+    with s.pool.connection() as c:
+        row = c.execute('SELECT render_policy,render_artifact FROM outgoing_messages').fetchone()
+    assert row['render_policy'] == {'link_preview': False, 'allow_lossy': False, 'mentions': anna}
+    assert row['render_artifact']['mentions'] == draft['mentions']
+
+
+# spec: ANYM-928
+def test_mention_spans_are_checked_against_the_text_and_refusals_queue_nothing(sender):
+    s, archive, _, _, _ = sender
+    tg_group(archive)
+    key = group_key(s)
+    cases = [('Hi @Анна', [{'sender': '42', 'offset': 3, 'length': 6}], 'mention_out_of_range', 0),
+             ('😀 @Анна', [{'sender': '42', 'offset': 1, 'length': 2}], 'mention_out_of_range', 0),
+             ('Hi @Анна', [{'sender': '42', 'offset': 3, 'length': 5}, {'sender': '99', 'offset': 4, 'length': 2}],
+              'mention_overlap', 1),
+             ('Hi @Анна ', [{'sender': '42', 'offset': 3, 'length': 6}], 'mention_out_of_range', 0)]
+    for text, mentions, code, index in cases:
+        with pytest.raises(APIError, match=code) as refused:
+            mention_preview(s, key, text, mentions)
+        assert refused.value.index == index and refused.value.text_utf16_length == len(text.encode('utf-16-le')) // 2
+        with pytest.raises(APIError, match=code):
+            mention_send(s, key, text, mentions, 'a' * 64)
+    link = mention_preview(s, key, '[@Анна](https://example.org) и **@Анна**', None, format='markdown')
+    assert link['rendered_text'] == '@Анна и @Анна'
+    with pytest.raises(APIError, match='mention_overlap'):
+        mention_preview(s, key, '[@Анна](https://example.org) и **@Анна**', [{'sender': '42', 'offset': 1, 'length': 5}],
+                        format='markdown')
+    bold = mention_preview(s, key, '[@Анна](https://example.org) и **@Анна**', [{'sender': '42', 'offset': 33, 'length': 5}],
+                           format='markdown')
+    assert bold['mentions'] == [{'offset': 8, 'length': 5, 'user_id': '42'}]
+    assert bold['mentions_notified'][0]['span_text'] == '@Анна'
+    for bad in ('x', [{'sender': '42', 'offset': 0}], [{'sender': '42', 'offset': -1, 'length': 1}],
+                [{'sender': '42', 'offset': 0, 'length': 1}] * 21):
+        with pytest.raises(APIError, match='invalid_parameters'):
+            mention_preview(s, key, 'Hi @Анна', bad)
+    with pytest.raises(APIError, match='mentions_not_group'):
+        mention_preview(s, key, 'Hi @Анна', [{'sender': '42', 'offset': 3, 'length': 5}],
+                        chat=stable_id('chat', 'send-fixture', '100'))
+    assert queued_count(s) == 0
+    with TestClient(create_app(s, ['testserver'])) as client:
+        body = client.post('/v1/preview_message', headers={'Authorization': 'Bearer ' + key},
+            json={'account': 'send-fixture', 'chat_id': GROUP, 'text': 'Hi @Анна',
+                  'mentions': [{'sender': '42', 'offset': 3, 'length': 9}]}).json()
+        private = client.post('/v1/preview_message', headers={'Authorization': 'Bearer ' + key},
+            json={'account': 'send-fixture', 'username': '@synthetic_person', 'text': 'Hi @Анна',
+                  'mentions': [{'sender': '42', 'offset': 3, 'length': 5}]}).json()
+    assert body['error'] == 'mention_out_of_range' and body['index'] == 0 and body['text_utf16_length'] == 8
+    assert body['field_errors'][0]['field'] == 'mentions/0' and 'Анна' not in str(body)
+    assert private['error'] == 'mentions_not_group'
+
+
+# spec: ANYM-928
+def test_membership_is_the_participants_read_and_only_without_one_the_archive(sender):
+    s, archive, _, _, _ = sender
+    tg_group(archive)
+    key = group_key(s)
+    newcomer, gone = [{'sender': '77', 'offset': 3, 'length': 5}], [{'sender': '99', 'offset': 3, 'length': 5}]
+    # No read held: the archive decides. The newcomer never wrote; the member of a year ago did.
+    with pytest.raises(APIError, match='mention_not_member') as refused:
+        mention_preview(s, key, 'Hi @Вова', newcomer)
+    assert refused.value.next_call == {'tool': 'list_participants',
+                                       'arguments': {'account': 'send-fixture', 'chat_id': GROUP}}
+    assert mention_preview(s, key, 'Hi @Боря', gone)['membership_basis'] == 'archive'
+    # A read of a minute ago: the member added a minute ago passes, the one who left fails.
+    members_read(s, key, 'send-fixture', GROUP, ['42', '77'], minutes_ago=1)
+    draft = mention_preview(s, key, 'Hi @Вова', newcomer)
+    assert draft['membership_basis'] == 'participants'
+    assert draft['mentions_notified'] == [{'sender': '77', 'display_name': 'Member', 'span_text': '@Вова'}]
+    with pytest.raises(APIError, match='mention_not_member'):
+        mention_preview(s, key, 'Hi @Боря', gone)
+    assert mention_send(s, key, 'Hi @Вова', newcomer, draft['preview_digest'])['status'] == 'queued'
+    for sender_id in ('-1001234', 'channel', '0'):
+        with pytest.raises(APIError, match='mention_unresolvable') as refused:
+            mention_preview(s, key, 'Hi @Вова', [{'sender': sender_id, 'offset': 3, 'length': 5}])
+        assert refused.value.next_call['tool'] == 'list_participants'
+    assert queued_count(s) == 1
+
+
+# spec: ANYM-928
+def test_a_preview_with_mentions_queues_one_participants_read_per_chat_and_ten_minutes(sender, monkeypatch):
+    from messaging_service import group_mentions
+    s, archive, _, _, _ = sender
+    tg_group(archive)
+    key = group_key(s)
+    s.set_messenger_operations('send-fixture', ['list_participants'])
+    monkeypatch.setattr(group_mentions, 'READ_WAIT_S', 0.2)
+    monkeypatch.setattr(group_mentions, '_now', lambda: 1800000000.0)  # one 10-minute bucket for the whole test
+    args = {'account': 'send-fixture', 'chat_id': GROUP, 'text': 'Hi @Анна',
+            'mentions': [{'sender': '42', 'offset': 3, 'length': 5}]}
+    with TestClient(create_app(s, ['testserver'])) as client:
+        headers = {'Authorization': 'Bearer ' + key}
+        first = client.post('/v1/preview_message', headers=headers, json=args).json()
+        second = client.post('/v1/preview_message', headers=headers, json=args).json()
+        client.post('/v1/preview_message', headers=headers, json={**args, 'mentions': None})
+    # Nobody answered the read in time: the archive decided, and the second preview queued no second read.
+    assert first['membership_basis'] == second['membership_basis'] == 'archive'
+    with s.pool.connection() as c:
+        reads = c.execute("SELECT request_id,payload FROM messenger_commands WHERE operation='list_participants'").fetchall()
+    assert len(reads) == 1 and reads[0]['request_id'].startswith('mention-members:')
+    assert reads[0]['payload']['parameters']['limit'] == 100
+
+
+def mention_job(platform, artifact, policy):
+    return {'provider_chat': '-500' if platform == 'telegram' else 'family@g.us', 'body': artifact['provider_text'],
+            'source_text': artifact['source_text'], 'source_format': artifact['format'],
+            'render_artifact': {k: v for k, v in artifact.items() if k in (
+                'format', 'source_text', 'rendered_text', 'provider_text', 'entities', 'provider_payload', 'warnings',
+                'links', 'utf16_units', 'renderer_version', 'mentions')},
+            'render_policy': policy, 'preview_digest': 'f' * 64,
+            'expires_at': datetime.now(timezone.utc).timestamp() + 300}
+
+
+# spec: ANYM-928
+def test_a_telegram_mention_reaches_telethon_as_input_message_entity_mention_name(sender):
+    from types import SimpleNamespace
+    from telethon import types
+    from messaging_service.outgoing import SendRejected
+    from messaging_service.telegram_collector import TelethonProvider
+    s, archive, _, _, _ = sender
+    tg_group(archive)
+    key = group_key(s)
+    members_read(s, key, 'send-fixture', GROUP, ['42', '77'])
+    mentions = [{'sender': '77', 'offset': 10, 'length': 5}, {'sender': '42', 'offset': 0, 'length': 5}]
+    draft = mention_preview(s, key, '@Анна и **@Вова**', mentions, format='markdown')
+    job = mention_job('telegram', draft, draft['render_policy'])
+    calls, cached = [], {42: 4242}
+
+    class Client:
+        async def get_input_entity(self, peer):
+            if peer.user_id not in cached: raise ValueError('not cached')
+            return types.InputPeerUser(peer.user_id, cached[peer.user_id])
+        async def get_participants(self, chat, limit):
+            calls.append(('participants', chat, limit)); cached[77] = 7777
+        async def send_message(self, chat, text, **options):
+            calls.append(('send', chat, text, options)); return SimpleNamespace(id=42, chat_id=-500)
+
+    provider = TelethonProvider.__new__(TelethonProvider)
+    provider.client = Client()
+    asyncio.run(provider.send_text(job))
+    assert calls[0] == ('participants', -500, 200)
+    _, chat, text, options = calls[1]
+    assert (chat, text) == (-500, '@Анна и @Вова')
+    entities = options['formatting_entities']
+    assert [type(e).__name__ for e in entities] == ['InputMessageEntityMentionName', 'MessageEntityBold',
+                                                     'InputMessageEntityMentionName']
+    assert [(e.offset, e.length) for e in entities] == [(0, 5), (8, 5), (8, 5)]
+    assert (entities[0].user_id.user_id, entities[0].user_id.access_hash) == (42, 4242)
+    assert (entities[2].user_id.user_id, entities[2].user_id.access_hash) == (77, 7777)
+    # A user the participants read does not cache either is refused before the send, never sent as plain text.
+    calls.clear(); cached.clear()
+    with pytest.raises(SendRejected, match='mention_unresolvable'):
+        asyncio.run(provider.send_text(job))
+    assert [call[0] for call in calls] == ['participants']
+    # A stored mention that is not the previewed one is refused before any provider call.
+    for policy in ({**draft['render_policy'], 'mentions': mentions[:1]}, {'link_preview': False, 'allow_lossy': False}):
+        with pytest.raises(SendRejected, match='send_target_invalid'):
+            asyncio.run(provider.send_text(mention_job('telegram', draft, policy)))
+    assert [call[0] for call in calls] == ['participants']
+
+
+def wa_group(s, archive, provider='whatsmeow'):
+    archive.register('wa-group', 'whatsapp', 'Synthetic WhatsApp', discover=True)
+    archive.ingest(event(account='wa-group', platform='whatsapp', chat='family@g.us', provider_id='1',
+        sender='15559876543@c.us', body='Synthetic hello', sender_profile={'display_name': 'Анна'}))
+    archive.set_sending('wa-group', True)
+    epoch = archive.acquire('wa-group', 'synthetic-wa-worker')
+    state = CollectorState(archive, 'wa-group', ('synthetic-wa-worker', epoch))
+    state.phase('connection', 'connected', 'provider_ready')
+    with s.pool.connection() as c:
+        c.execute('''UPDATE collector_health SET operations=operations||%s WHERE account='wa-group' ''',
+                  (Jsonb({'provider': {'name': provider, 'contract_version': 1}}),))
+    return s.issue_key('wa-mention-agent', ['wa-group'], permissions=['read', 'send']), stable_id('chat', 'wa-group', 'family@g.us')
+
+
+# spec: ANYM-928
+def test_a_whatsapp_mention_becomes_at_number_with_mentioned_jid_and_plain_at_digits_warn(sender):
+    from messaging_service.outgoing import dispatch_payload
+    s, archive, _, _, _ = sender
+    key, chat = wa_group(s, archive)
+    common = {'account': 'wa-group', 'chat': chat}
+    draft = mention_preview(s, key, 'Привет, Анна!', [{'sender': '15559876543@c.us', 'offset': 8, 'length': 4}], **common)
+    assert draft['provider_text'] == 'Привет, @15559876543!' and draft['rendered_text'] == 'Привет, Анна!'
+    assert draft['mentions'] == [{'offset': 8, 'length': 12, 'jid': '15559876543@c.us'}]
+    assert draft['mentions_notified'] == [{'sender': '15559876543@c.us', 'display_name': 'Анна', 'span_text': 'Анна'}]
+    assert 'warning' not in draft
+    assert mention_preview(s, key, 'Позвони @15550001111', None, **common)['warning'] == 'plain_at_is_not_a_mention'
+    with pytest.raises(APIError, match='mention_overlap'):
+        mention_preview(s, key, 'mailАнна', [{'sender': '15559876543@c.us', 'offset': 4, 'length': 4}], **common)
+    receipt = mention_send(s, key, 'Привет, Анна!', [{'sender': '15559876543@c.us', 'offset': 8, 'length': 4}],
+                           draft['preview_digest'], **common)
+    with s.pool.connection() as c:
+        row = c.execute('SELECT * FROM outgoing_messages WHERE id=%s', (receipt['send_id'],)).fetchone()
+    assert row['body'] == 'Привет, @15559876543!'
+    payload = dispatch_payload(row, 'whatsapp')
+    assert payload['text'] == 'Привет, @15559876543!' and payload['mentions'] == ['15559876543@c.us']
+
+
+# spec: ANYM-928
+def test_the_whatsapp_browser_fallback_refuses_mentions_unsupported(sender):
+    s, archive, _, _, _ = sender
+    key, chat = wa_group(s, archive, provider='webjs')
+    with pytest.raises(APIError, match='mentions_unsupported'):
+        mention_preview(s, key, 'Привет, Анна!', [{'sender': '15559876543@c.us', 'offset': 8, 'length': 4}],
+                        account='wa-group', chat=chat)
+    assert queued_count(s) == 0
+
+
+# spec: ANYM-928
+def test_mentions_with_a_menu_choice_conflict_and_an_allow_duplicate_resend_keeps_its_mentions(sender):
+    s, archive, _, _, _ = sender
+    tg_group(archive)
+    key = group_key(s)
+    anna = [{'sender': '42', 'offset': 3, 'length': 5}]
+    menu = {'message_id': stable_id('msg', 'send-fixture', '-500', '1'), 'option_id': '1'}
+    with pytest.raises(APIError, match='mentions_conflict'):
+        mention_preview(s, key, 'Hi @Анна', anna, menu_choice=menu)
+    with pytest.raises(APIError, match='mentions_conflict'):
+        mention_send(s, key, 'Hi @Анна', anna, 'a' * 64, menu_choice=menu)
+    draft = mention_preview(s, key, 'Hi @Анна', anna)
+    mention_send(s, key, 'Hi @Анна', anna, draft['preview_digest'], duplicate_guard=True)
+    with pytest.raises(APIError, match='duplicate_send_unresolved'):
+        mention_send(s, key, 'Hi @Анна', anna, draft['preview_digest'], 'mention-request-0002', duplicate_guard=True)
+    again = mention_send(s, key, 'Hi @Анна', anna, draft['preview_digest'], 'mention-request-0002', duplicate_guard=True,
+                         allow_duplicate=True)
+    with s.pool.connection() as c:
+        row = c.execute('SELECT render_policy,render_artifact FROM outgoing_messages WHERE id=%s',
+                        (again['send_id'],)).fetchone()
+    assert row['render_policy']['mentions'] == anna and row['render_artifact']['mentions'] == draft['mentions']
+    assert queued_count(s) == 2
+
+
+# spec: ANYM-928
+def test_mcp_send_message_and_preview_take_mentions_with_no_schema_default(sender):
+    s, _, key, _, _ = sender
+    headers = {'Authorization': 'Bearer ' + key}
+    with TestClient(create_app(s, ['testserver'])) as client:
+        tools = client.post('/mcp', headers={**headers, 'Accept': 'application/json, text/event-stream'},
+            json={'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list', 'params': {}}).json()['result']['tools']
+    for name in ('preview_message', 'send_message'):
+        schema = next(t for t in tools if t['name'] == name)['inputSchema']
+        assert 'default' not in schema['properties']['mentions'] and 'mention_not_member' in schema['properties']['mentions']['description']
+        assert set(schema['$defs']['Mention']['properties']) == {'sender', 'offset', 'length'}
 
 
 def test_worker_sends_once_and_rechecks_revocation(sender):
