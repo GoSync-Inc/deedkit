@@ -9,8 +9,8 @@ Grok → DeedKit MCP gateway → private HTTP → USB host → ADB → Android a
 ```
 
 The client agent chooses each action. A persistent uiautomator2 worker on the USB
-host executes selector-based actions and reusable workflows. Existing installations
-may retain the legacy Maestro engine.
+host executes selector-based actions and reusable workflows. It is the only UI
+engine: the Maestro engine was removed on 2026-11-11.
 
 ## Tools
 
@@ -21,7 +21,7 @@ may retain the legacy Maestro engine.
 | `android_observe` | PNG screenshot plus Android UI hierarchy |
 | `android_execute` | Run device-targeted ADB arguments and retain a result receipt |
 | `android_maestro` | Read the supported dialect or validate a flow without execution |
-| `android_run_flow` | Run inline or saved Maestro YAML with a durable receipt |
+| `android_run_flow` | Run inline or saved flow YAML with a durable receipt |
 | `android_flows` | List, save, read and delete reusable owner-scoped flows |
 | `android_get_operation` | Read or wait for the receipt using the original request UUID |
 | `android_upload` | Upload an APK or another file in bounded chunks |
@@ -212,11 +212,15 @@ and list candidates: an id or class repeated under one parent, with its count,
 field ids present in at least half of the items and `has_text`. A candidate
 without text points to the full-hierarchy option and `readScreenText`.
 
-Older installations can still install a pinned Maestro CLI release with its supported Java runtime. Set optional
-absolute `maestro` and `java_home` paths in the private service configuration and
-restart the service. The service starts one local stdio MCP process lazily and
-retains its device connection. The gateway continues using the same Android
-backend credential and the client continues using its existing gateway key.
+The Maestro engine was removed. A private config that still sets `maestro` or
+`java_home` stops the service at start with `maestro_engine_removed`; delete both
+keys when upgrading, and restore the previous wheel and config together on
+rollback. Without `uiautomator2_jar` the service keeps raw ADB and observation,
+and `android_run_flow` returns `ui_engine_not_configured`. Saved command lists run
+unchanged on uiautomator2. A Maestro-only command (for example `travel`,
+`setLocation` or `setAirplaneMode`) fails validation before any device action
+with `unsupported_uiautomator_command` and a hint to use `android_execute`. The
+tool keeps its compatibility name `android_maestro`.
 
 `android_run_flow` takes `device_id`, `session_id`, `request_id` and exactly one of
 `yaml` or a saved `name`. `parameters` supplies literal `${NAME}` substitutions.
@@ -229,12 +233,12 @@ Missing-element probes use `element_timeout_ms=5000`, or
 `optional_timeout_ms=1000` for optional selectors and `when`/`while` conditions.
 Both accept 100–60000 ms. A selector's `timeout` or a condition's `timeout`
 overrides the run default. Native `extendedWaitUntil` keeps its explicit timeout.
-The local runner uses Maestro's native visibility assertions, then sends the
-action only after a successful probe; nested flow, repeat and explicit retry
-blocks retain this behavior. Probe limits exclude cold driver startup and an
-action after the probe (whose element may disappear in the meantime). The total
-`timeout_s` still bounds execution. Completed lookup misses retain the warm
-Maestro connection; transport errors close it.
+The worker waits for the selector with the bounded timeout, then acts only after
+a match; nested flow, repeat and explicit retry blocks retain this behavior.
+Probe limits exclude cold driver startup and an action after the probe (whose
+element may disappear in the meantime). The total `timeout_s` still bounds
+execution. Completed lookup misses keep the warm worker; transport errors fence
+and restart it.
 
 ```yaml
 - tapOn: {text: Optional popup, optional: true, timeout: 300}
@@ -300,21 +304,17 @@ with the same request UUID. If dispatch may have happened, read the original
 receipt; never mint another UUID as a recovery attempt.
 
 Saved flows, operation receipts and checkpoint remainders persist in private
-SQLite state. Substituted commands temporarily occupy a private Java temporary
-directory during execution. The service removes its process-owned directory on
-shutdown or timeout. A small parent-process monitor holds the state lock while
-Maestro runs, stops its process group when the service disappears, and removes
-its temporary directory. A later service removes crash leftovers only after
-obtaining that exclusive lock. No model API is called by this runtime. Device interactions
+SQLite state. The worker stops its token-identified device server when the
+service's pipe closes, and a later service stops a leftover server by its private
+marker before the next operation. No model API is called by this runtime. Device interactions
 can cause the apps themselves to contact their services.
 
 ## Observation and image coordinates
 
 Screenshot capture and hierarchy inspection run concurrently with bounded waits.
-With uiautomator2 or Maestro configured, the hierarchy uses the active persistent accessibility driver.
-Nodes keep the existing ADB-style attribute names. Maestro's compact hierarchy
-omits password flags, so editable-node text is conservatively omitted. Without
-Maestro, the existing ADB hierarchy path remains available.
+With uiautomator2 configured, the hierarchy uses the persistent accessibility driver.
+Nodes keep the existing ADB-style attribute names and password text is omitted.
+Without it, the existing ADB hierarchy path remains available.
 
 PNGs retain their source pixels. `device_size` gives the full frame dimensions,
 `image.width` and `image.height` give delivered image dimensions, and `image_origin`
@@ -353,9 +353,8 @@ reference. `action=validate` accepts inline `yaml` or a saved `name`, optional
 `version`, and literal `parameters`. It validates the supported dialect and expands
 saved references without taking control of the device.
 
-On the legacy Maestro engine, relative selectors include `below`, `above`, `leftOf`, `rightOf`, `childOf`,
-`containsChild` and `containsDescendants`. Clipboard, orientation, location,
-permissions, application state and display-mode commands are listed in the reference.
+Relative selectors, clipboard, location and display-mode commands are not part
+of the uiautomator2 dialect; use `android_execute` for such device operations.
 Saved flows compose through `runFlow` with a `name` and optional `version`.
 They share the outer call's parameters. References resolve within the authenticated
 principal's store before admission to device execution. Expansion shares the

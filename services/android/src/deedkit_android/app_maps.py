@@ -10,7 +10,7 @@ from yaml.tokens import AliasToken, AnchorToken
 
 from .config import Refused
 from .flows import VARIABLE, compile_flow
-from .uiautomator import UI_FIELDS, validate_commands, validate_selector
+from .uiautomator import UI_FIELDS, UNSUPPORTED_HINT, validate_commands, validate_selector
 
 MAP_ACTIONS = {
     'openApp': {'cold', 'expect_screen', 'timeout', 'settle_ms'},
@@ -80,7 +80,7 @@ def load(source):
         return literal(yaml.safe_load(source))
     except (yaml.YAMLError, RecursionError):
         error = Refused('invalid_flow_yaml', 422)
-        error.hint = 'Use one YAML document. Use a command list such as - back, or a scenario with map and steps. Omit the Maestro appId/--- header.'
+        error.hint = 'Use one YAML document. Use a command list such as - back, or a scenario with map and steps. Omit any appId/--- header.'
         raise error from None
 
 
@@ -368,6 +368,11 @@ def compile_scenario(library, owner, source, parameters, *, stage='published', r
                     validate_action(name, parsed, app_map)
                     output.append({name: {**parsed, 'app_map': app_map, 'map_ref': map_ref}})
                 else:
+                    if isinstance(item, dict) and name not in all_fields:
+                        # Includes former Maestro-only commands: the engine was removed (owner 11-11).
+                        error = Refused('unsupported_uiautomator_command', 422)
+                        error.hint = UNSUPPORTED_HINT
+                        raise error
                     parsed = compile_flow(yaml.safe_dump([item]), values, fields=all_fields)
                     validate_commands(parsed)
                     output.extend(parsed)

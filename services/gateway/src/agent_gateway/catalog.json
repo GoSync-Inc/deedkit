@@ -9019,7 +9019,7 @@
       "android:read"
     ],
     "required_manifest": true,
-    "description": "Start here for Android. Read devices[].device_id and state, session_policy, adb_commands and ui.engine (or legacy maestro). Pick a connected device, acquire android_session, then use android_observe and android_execute or android_run_flow. For saved scenarios discover android_flows, and for the active engine’s supported YAML dialect use android_maestro (compatibility tool name, also serves uiautomator2). Example: {}",
+    "description": "Start here for Android. Read devices[].device_id and state, session_policy, adb_commands and ui.engine (uiautomator2; the Maestro engine was removed). Pick a connected device, acquire android_session, then use android_observe and android_execute or android_run_flow. For saved scenarios discover android_flows, and for the active engine’s supported YAML dialect use android_maestro (compatibility tool name, also serves uiautomator2). Example: {}",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},
@@ -9755,7 +9755,7 @@
     "scopes": [
       "android:read"
     ],
-    "description": "Read the active Android workflow engine reference with action=reference. The compatibility name android_maestro also serves uiautomator2. It lists supported commands, selector fields and examples. Then use action=validate with exactly one of yaml or saved name, plus parameters when needed. Validation returns compiled commands without executing them. Saved subflows are owner-scoped. Execute validated YAML or a saved name with android_run_flow under an acquired android_session. Example: {\"action\":\"reference\"} YAML is a command list without appId/--- headers. A checkpoint is a scalar: - checkpoint: verify. Reference includes saved-subflow and targeted permission-dialog examples. reference.screen_text documents readScreenText (local OCR). The reference.library section documents app maps, generic actions, typed parameters and the complete draft/test/publish/repair path. Structured scenarios use map and steps; stage=draft validates candidate dependencies. A normal published scenario can run directly by name without repeating validation or discovery.",
+    "description": "Read the active Android workflow engine reference with action=reference. The compatibility name android_maestro serves uiautomator2, the only engine; Maestro-only commands return unsupported_uiautomator_command. It lists supported commands, selector fields and examples. Then use action=validate with exactly one of yaml or saved name, plus parameters when needed. Validation returns compiled commands without executing them. Saved subflows are owner-scoped. Execute validated YAML or a saved name with android_run_flow under an acquired android_session. Example: {\"action\":\"reference\"} YAML is a command list without appId/--- headers. A checkpoint is a scalar: - checkpoint: verify. Reference includes saved-subflow and targeted permission-dialog examples. reference.screen_text documents readScreenText (local OCR). The reference.library section documents app maps, generic actions, typed parameters and the complete draft/test/publish/repair path. Structured scenarios use map and steps; stage=draft validates candidate dependencies. A normal published scenario can run directly by name without repeating validation or discovery.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

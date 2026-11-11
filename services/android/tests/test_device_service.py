@@ -291,11 +291,26 @@ def test_partial_download_names_the_next_chunk_and_the_larger_limit(service):
     assert whole['eof'] and 'next_action' not in whole and 'max_length' not in whole
 
 
+# spec: ANYM-958
+def test_one_ui_engine_is_reported_and_flows_without_it_never_reach_the_device(service):
+    capabilities = post(service, 'capabilities', key='reader').json()
+    assert capabilities['ui']['engine'] == 'uiautomator2' and capabilities['ui']['configured'] is False
+    assert capabilities['maestro']['removed'] is True
+    refused = post(service, 'maestro', {'action': 'validate', 'yaml': '- setLocation: {latitude: 1, longitude: 2}'})
+    assert refused.status_code == 422 and refused.json()['error'] == 'unsupported_uiautomator_command'
+    assert 'android_execute' in refused.json()['hint']
+    run = post(service, 'run_flow', {'device_id': 'home', 'session_id': session(service),
+                                     'request_id': str(uuid.uuid4()), 'yaml': '- back'})
+    assert run.status_code == 503 and run.json()['error'] == 'ui_engine_not_configured'
+    assert not (service[1] / 'executions').exists()
+
+
 # spec: ANYM-952
 def test_maestro_authoring_requires_no_device_action_and_resolves_only_owned_flows(service):
     reference = post(service, 'maestro', {'action': 'reference'}, key='reader')
     assert reference.status_code == 200
-    assert 'pasteText' in reference.json()['commands']
+    # The Maestro dialect reference was removed (owner 11-11); the uiautomator2 reference remains.
+    assert reference.json()['engine'] == 'uiautomator2' and 'pasteText' not in reference.json()['commands']
     source = '- inputText: ${QUERY}'
     saved = post(service, 'flows', {'action': 'put', 'name': 'search', 'yaml': source}).json()
     outer = '- runFlow: {name: search}'

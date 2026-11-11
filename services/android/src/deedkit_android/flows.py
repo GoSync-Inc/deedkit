@@ -1,4 +1,4 @@
-"""Bounded, device-only Maestro YAML. Host scripts and file references stay private."""
+"""Bounded, device-only flow YAML (Maestro-style syntax, uiautomator2 engine). Host scripts and file references stay private."""
 
 import re
 
@@ -155,21 +155,3 @@ def compile_flow(source, parameters, *, resolve=None, fields=None, _stack=(), _b
         return output
 
     return sequence(value(commands), _depth)
-
-
-def reference():
-    """The accepted dialect, derived from the compiler's own allowlists."""
-    return {"dialect_version": 2, "commands": {name: sorted(FIELDS.get(name, set()))
-                                               for name in sorted(FIELDS.keys() | BARE)},
-            "bare_commands": sorted(BARE), "selector_fields": sorted(SELECTOR),
-            "parameters": "Literal ${UPPER_CASE} substitution. The same parameters reach saved subflows.",
-            "saved_subflow": {"runFlow": {"name": "saved-name", "version": "optional SHA256"}},
-            "format": "YAML command list only; omit appId and ---. Checkpoints are top-level scalars: - checkpoint: verify",
-            "lookup_timeouts": {"element_timeout_ms": 5000, "optional_timeout_ms": 1000,
-                                "override": "run_flow arguments, selector.timeout, or when/while.timeout (100..60000 ms)",
-                                "note": "Native visibility probes precede actions. These bound lookup waits, not driver startup or a tap after the probe."},
-            "limits": {"source_bytes": 32768, "expanded_commands": 200, "reference_depth": 8},
-            "examples": {"relative_selector": "- tapOn: {text: Buy, below: {id: product_title}}",
-                         "search": "- tapOn: Search\n- inputText: ${QUERY}\n- pressKey: Enter",
-                         "dismiss_known_permission": "- runFlow:\n    when: {visible: {id: 'com.android.permissioncontroller:id/permission_deny_button'}, timeout: 300}\n    commands:\n      - tapOn: {id: 'com.android.permissioncontroller:id/permission_deny_button', timeout: 300}"},
-            "unsupported": ["host files", "JavaScript", "cloud runs", "viewer"]}

@@ -39,6 +39,7 @@ UI_FIELDS = {
     'readScreenText': {'region', 'within', 'min_confidence', 'limit', 'key', 'label'},
     'sleep': set(),
 }
+UNSUPPORTED_HINT = 'Use android_execute for this operation. The reference lists supported UI commands.'
 # Definite read/lookup failures: nothing acted, so the persistent worker stays.
 DEFINITE = {'element_not_found', 'screen_not_found', 'ambiguous_selector', 'invalid_element_bounds',
             'ocr_unavailable', 'ocr_failed', 'screenshot_unavailable', 'region_outside_screen',
@@ -81,7 +82,7 @@ def validate_commands(commands):
         name, value = next(iter(command.items())) if isinstance(command, dict) else (command, None)
         if name not in SUPPORTED:
             error = Refused('unsupported_uiautomator_command', 422)
-            error.hint = 'Use android_execute for this operation. The reference lists supported UI commands.'
+            error.hint = UNSUPPORTED_HINT
             raise error
         if isinstance(value, dict) and set(value) - UI_FIELDS.get(name, set()):
             raise Refused('unsupported_uiautomator_option', 422)
@@ -196,7 +197,7 @@ def stop_script(pid, token):
 
 class UiRunner(FlowRunner):
     def __init__(self, call, element_timeout_ms, optional_timeout_ms):
-        super().__init__(call, None, element_timeout_ms, optional_timeout_ms)
+        super().__init__(call, element_timeout_ms, optional_timeout_ms)
         self.steps = []
 
     async def probe(self, selector, timeout, visible=True):

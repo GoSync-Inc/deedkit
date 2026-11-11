@@ -20,9 +20,7 @@ import uuid
 from xml.etree import ElementTree
 
 from .config import Refused
-from .flow_runner import FlowRunner
 from .uiautomator import DEFINITE, Uiautomator, UiRunner
-from .maestro import Maestro, screen_elements
 from .store import MAX_FILE
 
 OUTPUT_LIMIT = 4 * 1024 * 1024
@@ -89,7 +87,6 @@ class Devices:
         self.config, self.store = config, store
         self.locks = {name: asyncio.Lock() for name in config.devices}
         self.tasks = {}
-        self.maestro = Maestro(config, store.lock_fd)
         self.ui = Uiautomator(config, store.lock_fd) if getattr(config, "uiautomator2_jar", None) else None
 
     async def close(self):
@@ -97,7 +94,6 @@ class Devices:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        await self.maestro.close()
         if self.ui:
             await self.ui.close()
 
@@ -199,13 +195,6 @@ class Devices:
                 return {'hierarchy_source': 'uiautomator2', 'elements': elements}
             except (TimeoutError, OSError, Refused, ValueError, KeyError):
                 return {'hierarchy_source': 'uiautomator2', 'hierarchy_error': 'unavailable'}
-        if self.config.maestro:
-            try:
-                hierarchy = await self.maestro.call("inspect_screen", {"device_id": self.config.devices[device]}, 8)
-                return {"hierarchy_source": "maestro", "elements": screen_elements(hierarchy)}
-            except (TimeoutError, OSError, Refused, ValueError, KeyError, TypeError):
-                return {"hierarchy_source": "maestro", "hierarchy_error": "unavailable",
-                        "next_action": "use_screenshot_or_retry_hierarchy"}
         path = "/data/local/tmp/deedkit-" + uuid.uuid4().hex + ".xml"
         script = f"uiautomator dump {path} >/dev/null && cat {path}; result=$?; rm -f {path}; exit $result"
         try:
@@ -291,8 +280,8 @@ class Devices:
             temporary = tempfile.TemporaryDirectory(dir=self.store.directory)
             if flow is None:
                 command, output = self.prepare(owner, device, argv, Path(temporary.name))
-            elif not self.config.maestro and not self.ui:
-                raise Refused("maestro_not_configured", 503)
+            elif not self.ui:
+                raise Refused("ui_engine_not_configured", 503)
             self.store.admit(owner, request_id, payload, identity=identity, metadata=metadata)
         except BaseException:
             if temporary is not None:
@@ -357,18 +346,15 @@ class Devices:
         return result
 
     def remaining(self, commands):
-        if self.ui:
-            from .app_maps import continuation
-            return continuation(commands)
-        return commands
+        from .app_maps import continuation
+        return continuation(commands)
 
     async def perform_flow(self, owner, device, request_id, commands, timeout, temporary, lock,
                            element_timeout_ms=5000, optional_timeout_ms=1000):
         state, result = "unknown", {}
         started = time.monotonic()
-        runner = (UiRunner(lambda command, **options: self.ui.call(device, command, **options),
-                           element_timeout_ms, optional_timeout_ms) if self.ui else
-                  FlowRunner(self.maestro.call, self.config.devices[device], element_timeout_ms, optional_timeout_ms))
+        runner = UiRunner(lambda command, **options: self.ui.call(device, command, **options),
+                          element_timeout_ms, optional_timeout_ms)
         cancelled = False
         try:
             checkpoint = next((i for i, command in enumerate(commands)
@@ -403,7 +389,7 @@ class Devices:
             cancelled = True
             result = {"error": "service_stopped", "next_action": "inspect_device_before_any_new_request"}
         except (OSError, ValueError):
-            result = {"error": "maestro_unavailable", "next_action": "inspect_device_before_any_new_request"}
+            result = {"error": "ui_engine_unavailable", "next_action": "inspect_device_before_any_new_request"}
         finally:
             try:
                 if state not in {'succeeded', 'paused'}:
@@ -414,13 +400,12 @@ class Devices:
                                       failed_command_path=runner.current_path, failed_command=runner.current_command)
                     if not cancelled:
                         result['observation'] = await self.failure_observation(owner, device)
-                if self.ui:
-                    result["data"] = {step["result"]["list"]: step["result"]["rows"] for step in runner.steps
-                                      if "result" in step and "rows" in step["result"]}
-                    result["data"].update({step["result"]["key"]: step["result"]["lines"] for step in runner.steps
-                                           if "result" in step and "lines" in step["result"]})
-                    result.update(engine='uiautomator2', steps=runner.steps,
-                                  elapsed_ms=round((time.monotonic() - started) * 1000, 2))
+                result["data"] = {step["result"]["list"]: step["result"]["rows"] for step in runner.steps
+                                  if "result" in step and "rows" in step["result"]}
+                result["data"].update({step["result"]["key"]: step["result"]["lines"] for step in runner.steps
+                                       if "result" in step and "lines" in step["result"]})
+                result.update(engine='uiautomator2', steps=runner.steps,
+                              elapsed_ms=round((time.monotonic() - started) * 1000, 2))
                 self.store.finish(owner, request_id, state, result)
             finally:
                 temporary.cleanup()

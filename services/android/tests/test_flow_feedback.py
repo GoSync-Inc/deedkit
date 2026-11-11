@@ -5,7 +5,6 @@ from types import SimpleNamespace
 import uuid
 
 import pytest
-import yaml
 
 from deedkit_android.config import Refused
 from deedkit_android.flows import compile_flow
@@ -14,48 +13,53 @@ from deedkit_android.store import Store
 
 # spec: ANYM-951
 def test_required_and_optional_lookups_use_native_bounded_probes():
-    from deedkit_android.flow_runner import FlowRunner
+    # The Maestro engine was removed (owner 11-11); uiautomator2 bounds the same lookups natively.
+    from deedkit_android.ui_worker import execute
 
-    async def scenario():
-        calls = []
-        async def call(name, args, timeout):
-            commands = list(yaml.safe_load_all(args['yaml']))[1]
-            calls.extend(commands)
-            if 'extendedWaitUntil' in commands[0]:
-                raise RefusedWithDiagnostic('Failed to run flow: Assertion is false: missing is visible')
-            return {'success': True}
-        runner = FlowRunner(call, 'serial', 5000, 700)
-        await runner.run(compile_flow('- tapOn: {text: missing, optional: true}\n- back', {}))
-        assert calls[0] == {'extendedWaitUntil': {'visible': {'text': 'missing'}, 'timeout': 700}}
-        assert calls[1:] == ['back']  # Missing optional target is never tapped.
-        with pytest.raises(Refused, match='element_not_found') as failure:
-            await runner.run(compile_flow('- tapOn: {text: missing, timeout: 2200}', {}))
-        assert calls[-1]['extendedWaitUntil']['timeout'] == 2200
-        assert failure.value.command_path == [0]
-    asyncio.run(scenario())
+    device = LookupDevice()
+    assert execute(device, {'tapOn': {'text': 'missing', 'optional': True}}, 5000, 700) == {
+        'skipped': True, 'reason': 'element_not_found'}
+    assert device.waits == [('waitForExists', 700)] and device.clicks == []  # Never tapped.
+    with pytest.raises(Refused, match='element_not_found'):
+        execute(device, {'tapOn': {'text': 'missing', 'timeout': 2200}}, 5000, 700)
+    assert device.waits[-1] == ('waitForExists', 2200) and device.clicks == []
 
 
-class RefusedWithDiagnostic(Refused):
-    def __init__(self, diagnostic):
-        super().__init__('maestro_action_failed')
-        self.diagnostic = diagnostic
+class LookupDevice:
+    """A synthetic uiautomator2 device whose selector waits never match."""
+
+    def __init__(self):
+        self.waits, self.clicks = [], []
+
+    def __call__(self, **selector):
+        return SimpleNamespace(selector=selector)
+
+    def jsonrpc_call(self, method, params, timeout=10):
+        self.waits.append((method, params[1]))
+        return False
+
+    def click(self, x, y):
+        self.clicks.append((x, y))
+
+
+def ui_devices(tmp_path, store):
+    from deedkit_android.device import Devices
+    return Devices(SimpleNamespace(devices={'phone': 'SERIAL'}, adb='/synthetic', uiautomator2_jar='/synthetic',
+                                   state_dir=str(tmp_path / 'state')), store)
 
 
 # spec: ANYM-952
 def test_condition_timeout_nested_steps_and_driver_failure_are_not_silently_skipped():
-    from deedkit_android.flow_runner import FlowRunner
+    from deedkit_android.uiautomator import UiRunner
 
     async def scenario():
         calls = []
-        async def call(name, args, timeout):
-            command = list(yaml.safe_load_all(args['yaml']))[1][0]
+        async def call(command, **options):
             calls.append(command)
-            if 'extendedWaitUntil' in command:
-                raise RefusedWithDiagnostic('Failed to run flow: device transport disconnected')
-            return {'success': True}
-        runner = FlowRunner(call, 'serial', 5000, 700)
+            raise Refused('uiautomator_transport_error')
+        runner = UiRunner(call, 5000, 700)
         flow = compile_flow('- runFlow: {when: {visible: Popup, timeout: 250}, commands: [back]}', {})
-        with pytest.raises(Refused, match='maestro_action_failed'):
+        with pytest.raises(Refused, match='uiautomator_transport_error'):
             await runner.run(flow)
         assert calls == [{'extendedWaitUntil': {'visible': 'Popup', 'timeout': 250}}]
     asyncio.run(scenario())
@@ -63,20 +67,19 @@ def test_condition_timeout_nested_steps_and_driver_failure_are_not_silently_skip
 
 # spec: ANYM-951
 def test_failed_flow_persists_one_snapshot_and_replay_does_not_capture_again(tmp_path, monkeypatch):
-    from deedkit_android.device import Devices
 
     async def scenario():
         store = Store(tmp_path / 'state')
-        devices = Devices(SimpleNamespace(devices={'phone': 'SERIAL'}, maestro='/synthetic', adb='/synthetic'), store)
+        devices = ui_devices(tmp_path, store)
         captures = []
-        async def call(*args):
-            raise RefusedWithDiagnostic('Failed to run flow: Assertion is false: missing is visible')
+        async def call(*args, **options):
+            raise Refused('element_not_found')
         async def image(owner, device, mode, crop):
             captures.append(mode)
             return {'image_file': {**store.save(owner, b'fake PNG'), 'mime_type': 'image/png'}}
         async def hierarchy(device):
-            return {'elements': [{'text': 'Home'}], 'hierarchy_source': 'maestro'}
-        monkeypatch.setattr(devices.maestro, 'call', call)
+            return {'elements': [{'text': 'Home'}], 'hierarchy_source': 'uiautomator2'}
+        monkeypatch.setattr(devices.ui, 'call', call)
         monkeypatch.setattr(devices, 'capture_image', image)
         monkeypatch.setattr(devices, 'capture_hierarchy', hierarchy)
         token = store.reserve('owner', 'phone', 'acquire')['session_id']
@@ -108,16 +111,15 @@ def test_failed_flow_persists_one_snapshot_and_replay_does_not_capture_again(tmp
 
 # spec: ANYM-951
 def test_capture_failure_keeps_original_error_and_releases_device(tmp_path, monkeypatch):
-    from deedkit_android.device import Devices
 
     async def scenario():
         store = Store(tmp_path / 'state')
-        devices = Devices(SimpleNamespace(devices={'phone': 'SERIAL'}, maestro='/synthetic', adb='/synthetic'), store)
-        async def call(*args):
-            raise RefusedWithDiagnostic('Failed to run flow: Assertion is false: absent is visible')
+        devices = ui_devices(tmp_path, store)
+        async def call(*args, **options):
+            raise Refused('element_not_found')
         async def unavailable(*args):
             raise Refused('file_quota_exceeded')
-        monkeypatch.setattr(devices.maestro, 'call', call)
+        monkeypatch.setattr(devices.ui, 'call', call)
         monkeypatch.setattr(devices, 'capture_image', unavailable)
         monkeypatch.setattr(devices, 'capture_hierarchy', unavailable)
         token = store.reserve('owner', 'phone', 'acquire')['session_id']
@@ -153,41 +155,41 @@ def test_session_legacy_lease_alias_is_normalized_without_ambiguous_precedence()
 
 
 # spec: ANYM-951
-def test_completed_lookup_failure_keeps_maestro_transport_warm(monkeypatch):
-    from deedkit_android.maestro import Maestro
+def test_completed_lookup_failure_keeps_maestro_transport_warm(tmp_path):
+    # The Maestro transport is gone; the uiautomator2 worker stays warm after a definite miss.
+    from deedkit_android.uiautomator import Uiautomator
+
+    ui = Uiautomator(SimpleNamespace(devices={'phone': 'SERIAL'}, uiautomator2_jar='/synthetic',
+                                     adb='/synthetic/adb', state_dir=str(tmp_path)), 0)
+
+    class Process:
+        returncode = None
+        stdin = SimpleNamespace(write=lambda data: None, drain=lambda: asyncio.sleep(0))
+        stdout = SimpleNamespace(readline=lambda: asyncio.sleep(0, b'{"error": "element_not_found"}\n'))
+    process = ui.processes['phone'] = Process()
 
     async def scenario():
-        client = Maestro(SimpleNamespace())
-        closed = []
-        async def start():
-            pass
-        async def exchange(*args):
-            return {'isError': True, 'content': [{'type': 'text', 'text': 'Failed to run flow: Assertion is false: missing'}]}
-        async def close():
-            closed.append(True)
-        monkeypatch.setattr(client, 'start', start)
-        monkeypatch.setattr(client, 'exchange', exchange)
-        monkeypatch.setattr(client, 'close', close)
         for _ in range(2):
-            with pytest.raises(Refused):
-                await client.call('run', {}, 1)
-        assert closed == []
+            with pytest.raises(Refused, match='element_not_found'):
+                await ui.call('phone', {'tapOn': 'missing'})
     asyncio.run(scenario())
+    assert ui.processes['phone'] is process
 
 
 # spec: ANYM-952
 def test_nested_repeats_conditions_and_explicit_retries_keep_command_paths():
-    from deedkit_android.flow_runner import FlowRunner
+    from deedkit_android.uiautomator import UiRunner
 
     async def scenario():
         seen = []
-        async def call(name, args, timeout):
-            command = list(yaml.safe_load_all(args['yaml']))[1][0]
+        async def call(command, **options):
             seen.append(command)
-            if 'extendedWaitUntil' in command:
-                raise RefusedWithDiagnostic('Failed to run flow: Assertion is false: absent')
+            if isinstance(command, dict) and 'extendedWaitUntil' in command:
+                return {'matched': False}
+            if isinstance(command, dict) and 'tapOn' in command:
+                raise Refused('element_not_found')
             return {'success': True}
-        runner = FlowRunner(call, 'serial', 5000, 1000)
+        runner = UiRunner(call, 5000, 1000)
         await runner.run(compile_flow('- repeat: {times: 2, commands: [back]}\n'
             '- runFlow: {when: {visible: absent, timeout: 100}, commands: [hideKeyboard]}', {}))
         assert seen[:2] == ['back', 'back'] and len(seen) == 3
@@ -200,20 +202,19 @@ def test_nested_repeats_conditions_and_explicit_retries_keep_command_paths():
 
 # spec: ANYM-951
 def test_total_timeout_retains_uncertainty_and_custom_wait_changes_conflict(tmp_path, monkeypatch):
-    from deedkit_android.device import Devices
 
     async def scenario():
         store = Store(tmp_path / 'state')
-        devices = Devices(SimpleNamespace(devices={'phone': 'SERIAL'}, maestro='/synthetic', adb='/synthetic'), store)
+        devices = ui_devices(tmp_path, store)
         calls = []
-        async def call(*args):
+        async def call(*args, **options):
             calls.append(True)
             await asyncio.sleep(30)
         async def image(*args):
             return {'screenshot_error': 'unavailable'}
         async def hierarchy(*args):
             return {'elements': []}
-        monkeypatch.setattr(devices.maestro, 'call', call)
+        monkeypatch.setattr(devices.ui, 'call', call)
         monkeypatch.setattr(devices, 'capture_image', image)
         monkeypatch.setattr(devices, 'capture_hierarchy', hierarchy)
         token = store.reserve('owner', 'phone', 'acquire')['session_id']
