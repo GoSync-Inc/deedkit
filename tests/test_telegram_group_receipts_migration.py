@@ -27,8 +27,22 @@ VERSION = int(MIGRATION.name[:3])
 # Migration numbers may skip one another lane holds; PREVIOUS is the newest file before this one.
 FILES = sorted(int(p.name[:3]) for p in SOURCE.glob('migrations/[0-9][0-9][0-9]_*.sql'))
 PREVIOUS = max(v for v in FILES if v < VERSION)
-# A release goes to the newest file (migrate_expand's target), which a later migration may have moved past this one.
-LATEST = max(FILES)
+# A release goes to the newest file (migrate_expand's target), which a later migration may have moved past this one;
+# a critical file (production.md "Migration risk tiers") is released by hand, so an unattended range ends before it.
+LATEST = test_migrate_expand.unattended_head(VERSION)
+IMAGE = SOURCE  # the release's package: a copy at LATEST while a later critical file exists (the `image` fixture)
+
+
+@pytest.fixture(scope='module', autouse=True)
+def image(tmp_path_factory):
+    """The package a release to LATEST ships: no migration after LATEST and no role block of a later schema."""
+    global IMAGE
+    if LATEST == FILES[-1]:
+        yield SOURCE; return
+    root = test_migrate_expand.image_at(tmp_path_factory.mktemp('image'), LATEST)
+    IMAGE = root
+    yield root
+    IMAGE = SOURCE
 
 
 def batch(base):
@@ -76,7 +90,7 @@ def runtime_index(database):
 def appended_roles(base):
     """Each role file's blocks for schemas after `base` (`-- Schema N` headers): what a release from `base` appends."""
     found = {}
-    for path in sorted(SOURCE.glob('*_role.sql')):
+    for path in sorted(IMAGE.glob('*_role.sql')):
         text = path.read_text()
         later = [m.start() for m in re.finditer(r'^-- Schema (\d+)', text, re.M) if int(m.group(1)) > base]
         if later: found[path.name] = text[later[0]:]
@@ -84,7 +98,7 @@ def appended_roles(base):
 
 
 def release_plan(base):
-    return plan_for(SOURCE, base, LATEST, appended_roles(base))
+    return plan_for(IMAGE, base, LATEST, appended_roles(base))
 
 
 def gateway_role(dsn):
@@ -181,7 +195,7 @@ def test_the_widened_check_takes_group_aggregates_only_and_rewrites_no_row(at_sc
     assert constraints(dsn) == {'message_receipts_check': True}
     with psycopg.connect(dsn) as c:
         before = c.execute('SELECT md5(string_agg(m::text,\'\' ORDER BY id)) FROM message_receipts m').fetchone()[0]
-    assert store_module.migrate_expand(dsn, release_plan(PREVIOUS)) == {'schema_version': LATEST}
+    assert store_module.migrate_expand(dsn, release_plan(PREVIOUS), root=IMAGE) == {'schema_version': LATEST}
     assert constraints(dsn) == {'message_receipts_source_check': False} and version(dsn) == (LATEST, batch(PREVIOUS))
     with psycopg.connect(dsn) as c:
         assert c.execute('SELECT md5(string_agg(m::text,\'\' ORDER BY id)) FROM message_receipts m').fetchone()[0] == before
@@ -200,8 +214,9 @@ def test_a_rerun_over_a_rewound_ledger_is_idempotent(db):
     with psycopg.connect(dsn) as c:
         c.execute('DELETE FROM archive_migrations WHERE version>=%s', (VERSION,))
         c.execute("UPDATE probe_metadata SET value=%s WHERE name='schema_version'", (str(PREVIOUS),))
-    store.migrate()
-    assert constraints(dsn) == {'message_receipts_source_check': False} and version(dsn) == (LATEST, batch(PREVIOUS))
+    store.migrate()  # the runtime's migrate() applies every file, a critical one too
+    assert constraints(dsn) == {'message_receipts_source_check': False} and version(dsn) == (
+        FILES[-1], sum(PREVIOUS < v for v in FILES))
     store.migrate()
     assert constraints(dsn) == {'message_receipts_source_check': False}
 
@@ -255,7 +270,7 @@ def test_the_swap_on_100k_receipts_commits_or_aborts_inside_the_runner_bounds(at
 
     def migrate():
         started = time.monotonic()
-        try: result['out'] = store_module.migrate_expand(dsn, plan, before_commit=later_statement)
+        try: result['out'] = store_module.migrate_expand(dsn, plan, root=IMAGE, before_commit=later_statement)
         except ExpandError as exc: result['out'] = exc.code
         result['span'] = (started, time.monotonic())
 
@@ -287,7 +302,7 @@ def test_the_swap_on_100k_receipts_commits_or_aborts_inside_the_runner_bounds(at
     else:
         # Nothing applied, from any file or grant of the batch; the next deploy retries the same batch.
         assert batch_state(dsn, base) == before
-        assert store_module.migrate_expand(dsn, plan) == {'schema_version': LATEST}
+        assert store_module.migrate_expand(dsn, plan, root=IMAGE) == {'schema_version': LATEST}
         assert batch_state(dsn, base) == applied
 
 

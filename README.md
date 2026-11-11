@@ -39,7 +39,7 @@ use SHA-256 deduplication; references to every source message stay separate.
 [Conversation view and compatibility](CONVERSATION.md) explain message kinds,
 ordering uncertainty and the last known dialogue turn.
 
-Development version: **0.9.19 — experimental**, PostgreSQL schema 88.
+Development version: **0.9.19 — experimental**, PostgreSQL schema 89.
 
 The expanded live-operation catalog covers messages, registered attachments,
 reactions, groups, contacts and profile fields. Access requires explicit per-key

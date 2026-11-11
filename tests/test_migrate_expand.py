@@ -59,6 +59,30 @@ def db(template, tmp_path):
             owner.execute(sql.SQL('DROP DATABASE {} WITH (FORCE)').format(sql.Identifier(name)))
 
 
+def unattended_head(after):
+    """The newest migration a migrate_expand release from `after` can reach: the last file before the first critical
+    file above `after` (production.md "Migration risk tiers": a critical file is a hand release)."""
+    from messaging_service import migration_rollout
+    files = sorted(int(p.name[:3]) for p in SOURCE.glob('migrations/[0-9][0-9][0-9]_*.sql'))
+    hand = [v for v in files if v > after and migration_rollout.risk_class(
+        next(SOURCE.glob('migrations/%03d_*.sql' % v)).read_text())[0] == 'critical']
+    return max(v for v in files if not hand or v < hand[0])
+
+
+def image_at(directory, latest):
+    """A copy of the messaging package as a release to `latest` ships it: no later migration and no role block of a
+    later schema (`-- Schema N` headers)."""
+    import re
+    root = Path(directory) / ('image-%d' % latest) / 'messaging_service'
+    shutil.copytree(SOURCE, root, ignore=shutil.ignore_patterns('__pycache__'))
+    for path in root.glob('migrations/[0-9][0-9][0-9]_*.sql'):
+        if int(path.name[:3]) > latest: path.unlink()
+    for path in root.glob('*_role.sql'):
+        blocks = re.split(r'(?m)^(?=-- Schema \d+)', path.read_text())
+        path.write_text(''.join(b for b in blocks if not (m := re.match(r'-- Schema (\d+)', b)) or int(m.group(1)) <= latest))
+    return root
+
+
 def plan_for(root, base, target, appended=None):
     """The plan deploy would write: every role file's prefix before `appended[name]`."""
     roles = {}

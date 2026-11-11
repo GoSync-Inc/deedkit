@@ -88,7 +88,7 @@ def main():
             if last_health is None or time.monotonic() - last_health >= HEALTH_INTERVAL_S:
                 journal_source_health(store)
                 last_health = time.monotonic()
-            # ANYM-919: tomorrow's birthdays from 09:00 owner time, once per contact and year; skipped before schema 87.
+            # ANYM-919: tomorrow's birthdays from 09:00 owner time, once per contact and year; skipped before schema 89.
             if last_birthdays is None or time.monotonic() - last_birthdays >= BIRTHDAY_INTERVAL_S:
                 journal_birthday_hints(store)
                 last_birthdays = time.monotonic()

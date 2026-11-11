@@ -69,3 +69,7 @@ GRANT SELECT(id,platform) ON accounts TO messaging_subscriptions;
 -- Schema 70 (ANYM-824): the matcher adds per-day counts (numbers, platform names, UTC days); retention deletes old and
 -- retired rows. Only this table.
 GRANT SELECT,INSERT,UPDATE,DELETE ON subscription_activity TO messaging_subscriptions;
+-- Schema 89 (ANYM-919): contact.birthday rows only through the definer function, which derives tomorrow's date and
+-- the 09:00 gate in the given zone from the database clock (chat and date only); no direct journal, counter or
+-- birthday-table access, and no grant on contact_birthdays_due.
+GRANT EXECUTE ON FUNCTION public.journal_contact_birthdays(text) TO messaging_subscriptions;

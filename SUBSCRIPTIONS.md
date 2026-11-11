@@ -1888,9 +1888,17 @@ fetched item has `chat` and `date` and no message, name or year. Only a subscrip
 exclude); default subscriptions and `get_updates` never return it, and `wake_rules` and sender filters do not apply.
 The list covers the owner's active Telegram contacts only, and DeedKit adds nothing to any calendar.
 
-Rollout: schema 86 adds the birthday table and the reads; the matcher calls schema 87's journal function
-`journal_contact_birthdays(date)` once a minute and skips the call while that function is absent or not granted, so
-until 87 no `contact.birthday` row is written.
+From 09:00 owner time, the matcher calls the definer function `journal_contact_birthdays(zone)` (schema 89) once a
+minute with the owner's IANA zone (`ANYMSG_OWNER_TIMEZONE`; unset is UTC). The function derives the date itself from
+the database clock: before 09:00 in that zone it journals nothing, and from 09:00 it journals tomorrow's local date. It
+accepts only a named zone of the server's time zone database, never a raw offset. It journals only rows of known
+birthdays of contacts in `contact_birthdays` (which the collector keeps to the active ones), each with a private chat
+of that account. A pushed hint's reference carries `chat_id` and `date`.
+
+Rollout: schema 86 adds the birthday table and the reads. Migration 89 is a hand release: its function bumps the feed
+counter, so the computed tier is critical. Then reapply `subscription_role.sql` (EXECUTE on
+`journal_contact_birthdays(text)`). Before both, the matcher skips the call and no `contact.birthday` row is written.
+Undo: stop selecting the kind; revoking the EXECUTE grant stops new rows, and the written rows stay in the journal.
 
 ## Remaining extensions and verification boundaries
 

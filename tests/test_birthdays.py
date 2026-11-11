@@ -373,14 +373,37 @@ def test_the_hint_is_due_from_nine_owner_time_for_tomorrow():
 
 
 # spec: ANYM-919
+@pytest.mark.parametrize('day, expected', [
+    ('2026-02-28', ['1001', '1002']),  # a common year: the 29 February birthday falls on the 28th
+    ('2026-03-01', ['1003']),
+    ('2028-02-28', ['1001']),          # a leap year: the 28th is only the 28th
+    ('2028-02-29', ['1002']),
+    ('2026-11-12', ['1004']),          # an ordinary day of a common year
+])
+def test_the_due_birthdays_of_a_date_handle_29_february_in_common_and_leap_years(bd, day, expected):
+    _, store = bd
+    with store.pool.connection() as c:
+        for user, birthday in (('1001', (28, 2, None)), ('1002', (29, 2, 1992)), ('1003', (1, 3, None)),
+                               ('1004', (12, 11, 1985)), ('1005', None)):
+            c.execute("""INSERT INTO chats(id,account,provider_chat,title,chat_type)
+                VALUES(%s,%s,%s,'Synthetic','private')""", (ACCOUNT + '-' + user, ACCOUNT, user))
+            birthdays.store(c, ACCOUNT, user, birthday)
+        rows = c.execute('SELECT provider_user FROM public.contact_birthdays_due(%s::date)', (day,)).fetchall()
+    assert [r['provider_user'] for r in rows] == expected
+
+
+# spec: ANYM-919
 def test_the_matcher_skips_the_birthday_hint_until_schema_87_and_never_raises(bd):
     _, store = bd
     with store.pool.connection() as c:
         head = c.execute('SELECT value FROM feed_counter WHERE id=1').fetchone()['value']
     noon = datetime(2026, 11, 11, 4, 0, tzinfo=timezone.utc)
     env = {'ANYMSG_OWNER_TIMEZONE': 'Asia/Makassar'}
-    # Schema 86 has no journal function: the call is skipped, nothing is journaled, no error is logged.
-    assert birthdays.journal_birthday_hints(store, now=noon, environ=env) is None
+    # Before schema 89 there is no journal function (schema 89 has one: here its name is missing): the call is skipped, nothing is
+    # journaled, no error is logged.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(birthdays, 'HINT_FUNCTION', 'public.journal_contact_birthdays_absent(text)')
+        assert birthdays.journal_birthday_hints(store, now=noon, environ=env) is None
     assert birthdays.journal_birthday_hints(store, now=noon - timedelta(hours=4), environ=env) == 0  # 08:00 local
     broken = NS(pool=NS(connection=lambda: (_ for _ in ()).throw(OSError('down'))))
     assert birthdays.journal_birthday_hints(broken, now=noon, environ=env) is None

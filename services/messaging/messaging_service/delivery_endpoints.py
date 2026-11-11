@@ -1213,6 +1213,8 @@ def hint_body(c, hint, row, p):
         if item['kind'] in ('send.failed', 'source.health'):
             # ANYM-535: the status code only; the error code is read through the subscription fetch.
             reference['status'] = evidence.get('status')
+        if item['kind'] == 'contact.birthday':
+            reference['date'] = evidence.get('date')  # ANYM-919: the chat and the birthday's date only
         if 'reply_to_confirmed_send' in reasons:
             reference['reply_to_send_id'] = (row['selector'].get('reply_anchor') or {}).get('send_id')
         references.append(reference)

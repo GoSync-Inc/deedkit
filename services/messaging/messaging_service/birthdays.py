@@ -7,7 +7,7 @@ days, not deleted; the self chat, the Telegram service chat and a chat whose inc
 Telegram marked as sent by a bot are excluded. The collector's birthday pass (telegram_birthdays.py) keeps
 `contact_birthdays` to exactly those users: it reads a missing or week-old birthday, stores `known` or `hidden`,
 and deletes the row of a user who is no longer active. `list_birthdays` reads the upcoming known ones. The matcher
-journals the `contact.birthday` hint once schema 87's definer function exists; until then it skips.
+journals the `contact.birthday` hint once schema 89's definer function exists; until then it skips.
 A birthday is data a contact chose; logs carry counts only.
 """
 from datetime import date, datetime, timedelta, timezone
@@ -137,7 +137,7 @@ def upcoming(c, account, today, days_ahead=DAYS_AHEAD, *, chat_scope=None, allow
 
 # Under the pool's 5 s statement_timeout, as the source.health journal (subscriptions.journal_source_health).
 HINT_TRANSACTION_TIMEOUT = '2s'
-HINT_FUNCTION = 'public.journal_contact_birthdays(date)'
+HINT_FUNCTION = 'public.journal_contact_birthdays(text)'
 
 
 def hint_date(now, zone):
@@ -148,14 +148,15 @@ def hint_date(now, zone):
 
 
 def journal_birthday_hints(store, *, now=None, environ=None):
-    """The matcher's call of schema 87's definer function for tomorrow's birthdays; None while that function is
-    absent or not granted (schema 86 ships the table first), and never raises."""
+    """The matcher's call of schema 89's definer function with the owner's zone; the function derives tomorrow's date
+    and the 09:00 gate from the database clock. None while that function is absent or not granted (schema 86 ships the
+    table first), and never raises."""
     import os
     from .time_references import owner_zone
-    zone, _ = owner_zone(os.environ if environ is None else environ)
-    target = hint_date(now or datetime.now(timezone.utc), zone)
-    if target is None:
-        return 0
+    zone, name = owner_zone(os.environ if environ is None else environ)
+    if hint_date(now or datetime.now(timezone.utc), zone) is None:
+        return 0  # before 09:00 owner time: no database call
+    name = 'UTC' if name == 'UTC_fallback' else name
     try:
         with store.pool.connection() as c:
             c.execute("SELECT set_config('transaction_timeout',%s,true)", (HINT_TRANSACTION_TIMEOUT,))
@@ -163,7 +164,7 @@ def journal_birthday_hints(store, *, now=None, environ=None):
             if not c.execute('''SELECT coalesce(has_function_privilege(to_regprocedure(%s),'EXECUTE'),false)
                     AS ready''', (HINT_FUNCTION,)).fetchone()['ready']:
                 return None
-            return c.execute('SELECT public.journal_contact_birthdays(%s) AS n', (target,)).fetchone()['n']
+            return c.execute('SELECT public.journal_contact_birthdays(%s) AS n', (name,)).fetchone()['n']
     except Exception as error:
         from .telemetry import capture
         capture(error, 'birthday_hint_failed')

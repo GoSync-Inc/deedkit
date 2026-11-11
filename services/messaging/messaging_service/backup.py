@@ -97,7 +97,7 @@ V83_TABLES={'poll_results':'message,option_index','poll_voters':'message,voter,o
 V84_TABLES={'telegram_polls':'message'}
 # ANYM-919: an active Telegram contact's birthday (day, month, optional year) or hidden, and its check time.
 V86_TABLES={'contact_birthdays':'account,provider_user'}
-SCHEMAS=range(2,89)
+SCHEMAS=range(2,90)
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
 V17_TABLES={'message_conflicts':'receipt_digest'}
