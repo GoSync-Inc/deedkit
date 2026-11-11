@@ -1,0 +1,102 @@
+{
+ "languages": "eng+ind",
+ "size": [
+  1080,
+  760
+ ],
+ "lines": [
+  {
+   "text": "Pesan",
+   "bounds": [
+    40,
+    68,
+    168,
+    100
+   ]
+  },
+  {
+   "text": "Budi Santoso",
+   "bounds": [
+    72,
+    218,
+    252,
+    240
+   ]
+  },
+  {
+   "text": "10.42",
+   "bounds": [
+    932,
+    218,
+    1008,
+    240
+   ]
+  },
+  {
+   "text": "Sampai jumpa besok pagi",
+   "bounds": [
+    72,
+    264,
+    421,
+    292
+   ]
+  },
+  {
+   "text": "Toko Elektronik",
+   "bounds": [
+    72,
+    398,
+    280,
+    420
+   ]
+  },
+  {
+   "text": "09.15",
+   "bounds": [
+    932,
+    398,
+    1008,
+    420
+   ]
+  },
+  {
+   "text": "Pesanan Anda sudah dikirim",
+   "bounds": [
+    72,
+    444,
+    458,
+    466
+   ]
+  },
+  {
+   "text": "Ibu Sari",
+   "bounds": [
+    72,
+    578,
+    176,
+    600
+   ]
+  },
+  {
+   "text": "Kemarin",
+   "bounds": [
+    895,
+    578,
+    1008,
+    600
+   ]
+  },
+  {
+   "text": "Terima kasih banyak ya",
+   "bounds": [
+    72,
+    624,
+    391,
+    652
+   ]
+  }
+ ],
+ "lists": [
+  3
+ ]
+}

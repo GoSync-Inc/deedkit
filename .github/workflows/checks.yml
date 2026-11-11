@@ -602,7 +602,18 @@ jobs:
         id: android
         if: ${{ !cancelled() && steps.source.outcome == 'success' }}
         working-directory: services/android
+        env:
+          DEEDKIT_OCR_REQUIRED: '1'
         run: |
+          # Tesseract with the corpus languages for tests/test_screen_quality.py (ANYM-961); bounded and
+          # retried on archive.ubuntu.com like the native extraction tools step.
+          apt_opts=(-o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::Retries=3)
+          for attempt in 1 2 3; do
+            [ "$attempt" = 3 ] && exit 1
+            if [ "$attempt" = 2 ] && [ -f /etc/apt/apt-mirrors.txt ]; then echo 'http://archive.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null; fi
+            if sudo timeout --kill-after=10s 90 apt-get "${apt_opts[@]}" update && sudo timeout --kill-after=10s 150 apt-get "${apt_opts[@]}" install -y tesseract-ocr tesseract-ocr-eng tesseract-ocr-ind tesseract-ocr-rus; then break; fi
+            echo "::warning::Tesseract install attempt $attempt failed"
+          done
           uv sync --locked --group dev
           uv run ruff check src tests
           uv run pytest -q -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/android.xml"

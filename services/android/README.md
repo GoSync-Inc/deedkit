@@ -204,6 +204,17 @@ tree` marks text the tree already exposes. Consecutive blocks of the same shape
 form `lists` of item block indexes. `tree` says whether the hierarchy was merged.
 The receipt then keeps `{lines, blocks, lists, tree, truncated}` under the key.
 
+Before Tesseract, the screenshot is normalized on the host (`ocr.preprocess:
+local_contrast`): each pixel's distance from its local background, so light text
+on coloured buttons and dark themes becomes dark on white at the same size and
+coordinates. Quality is measured on the committed synthetic corpus
+(`tests/fixtures/screens`, rendered by `tools/make_screen_corpus.py`):
+`tests/test_screen_quality.py` holds character error rate at most 2% and exact
+list item counts. For real screens, `tools/evaluate_ocr.py SET_DIR --command
+<tesseract>` prints the same numbers, never text, for a labelled set kept only in
+the host's private state directory; `--tsv-command` runs another local engine
+that prints Tesseract TSV for a bake-off.
+
 A screen signature can match while content still loads. Add the spinner to the
 screen's `forbid` list so screen waits continue until it is gone. `waitSettled`
 (`stable_ms` 100-5000, default 500, and `timeout`) waits until the map's

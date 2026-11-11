@@ -1,0 +1,129 @@
+{
+ "languages": "eng+ind",
+ "size": [
+  1080,
+  928
+ ],
+ "lines": [
+  {
+   "text": "Daftar Transaksi",
+   "bounds": [
+    40,
+    68,
+    382,
+    100
+   ]
+  },
+  {
+   "text": "Pesanan Selesai",
+   "bounds": [
+    72,
+    218,
+    313,
+    241
+   ]
+  },
+  {
+   "text": "Rp 125.000",
+   "bounds": [
+    841,
+    218,
+    1008,
+    247
+   ]
+  },
+  {
+   "text": "Rabu, 11 Nov 2026",
+   "bounds": [
+    72,
+    268,
+    350,
+    296
+   ]
+  },
+  {
+   "text": "Kopi Susu Gula Aren 2x",
+   "bounds": [
+    72,
+    318,
+    415,
+    347
+   ]
+  },
+  {
+   "text": "Dikirim",
+   "bounds": [
+    72,
+    454,
+    170,
+    477
+   ]
+  },
+  {
+   "text": "Rp 89.500",
+   "bounds": [
+    859,
+    454,
+    1008,
+    483
+   ]
+  },
+  {
+   "text": "Senin, 9 Nov 2026",
+   "bounds": [
+    72,
+    504,
+    337,
+    532
+   ]
+  },
+  {
+   "text": "Kabel Data USB-C 1 m",
+   "bounds": [
+    72,
+    554,
+    402,
+    577
+   ]
+  },
+  {
+   "text": "Menunggu Pembayaran",
+   "bounds": [
+    72,
+    690,
+    417,
+    719
+   ]
+  },
+  {
+   "text": "Rp 1.250.000",
+   "bounds": [
+    814,
+    690,
+    1008,
+    719
+   ]
+  },
+  {
+   "text": "Minggu, 8 Nov 2026",
+   "bounds": [
+    72,
+    740,
+    361,
+    769
+   ]
+  },
+  {
+   "text": "Sepatu Lari Ukuran 42",
+   "bounds": [
+    72,
+    790,
+    395,
+    819
+   ]
+  }
+ ],
+ "lists": [
+  3
+ ]
+}
