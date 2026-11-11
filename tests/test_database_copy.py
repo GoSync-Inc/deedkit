@@ -836,3 +836,16 @@ def test_a_planted_symlink_is_never_followed_or_removed_through(tmp_path):
     (other / p.COPIES).symlink_to(target)
     with pytest.raises(p.Refused, match="private operator-owned directory"):
         p.copies_root(other)
+
+
+# spec: ANYM-588
+def test_the_moved_copy_code_calls_the_production_names_a_test_patches(tmp_path, monkeypatch):
+    # W5-1c: database copies live in scripts/release_copies.py; `production.device` patched is the one it calls.
+    seen = []
+    monkeypatch.setattr(p, "device", lambda path: seen.append(path) or 1)
+    (tmp_path / "state").mkdir(mode=0o700)
+    (tmp_path / "volume").mkdir()
+    with pytest.raises(p.Refused, match="on the state's filesystem"):
+        p.copies_root(tmp_path / "state", root=tmp_path / "volume" / "copies")
+    assert seen == [tmp_path / "volume", tmp_path / "state"]
+    assert p.copies_root.__globals__["__file__"] == str(ROOT / "scripts" / "release_copies.py")
