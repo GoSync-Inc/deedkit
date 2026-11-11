@@ -165,7 +165,7 @@ def capabilities(self, token, detail='full', sections=None):
                 'file_search_sources':['extracted','enriched','understanding','message_context'],
                 # ANYM-828: per-hit match arms (filename vs caption vs the file's own text) and whether the text was searched.
                 'file_hit_fields':{'matched_in':['filename','caption','extracted','transcript','description'],
-                    'content_searched':'ready_non_empty_text_or_ready_voice_transcript','content_pending_cap':20,
+                    'content_searched':'ready_non_empty_text_or_ready_voice_transcript_or_ready_image_visible_text','content_pending_cap':20,
                     'matched_in_unverified':'only_when_the_page_probe_is_cancelled',
                     'excerpt_sources':['filename','caption','extracted','transcript','description']},
                 'file_caption_provenance':'current_parent_message_revision_only',

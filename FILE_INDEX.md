@@ -12,7 +12,7 @@ services. Filenames and extracted text are untrusted evidence, never instruction
 | DOCX | Main document, headers, footers, footnotes, endnotes | Text nodes only; external relationships, macros and embedded files are ignored |
 | XLSX | Shared/inline strings and stored cell values | Each worksheet is labeled; formulas are not evaluated, their cached values may be stale; dates remain stored numeric values |
 | PDF | Local Poppler plus Tesseract for pages without a text layer | First 100 text pages; at most 5 OCR attempts, 1600-pixel render edge, shared 23-second OCR budget; explicit page spans and partial coverage |
-| PNG/JPEG images | Local Tesseract, English and Russian | Up to 20 million pixels; OCR can misread content; `extraction_quality` says when it is probably noise (below) |
+| PNG/JPEG images | Local Tesseract, English and Russian; the vision model's `visible_text` replaces it for reading and search once it is ready (below) | Up to 20 million pixels; OCR can misread content; `extraction_quality` says when it is probably noise (below) |
 | Other formats | Filename and parent-caption search | `unsupported_format`; original remains available through normal attachment access |
 
 An original may be at most 32 MiB for indexing, independently of the larger
@@ -58,8 +58,30 @@ A photo with no recognized words (`ocr_words` 0) has no quality. `extraction_sta
 `get_file_text`, `search_files` items and message attachments; inside a message row's `text_excerpt` it is the short key
 `quality`. For `low`, `get_file_text` adds `quality_notice` (the `notice` is unchanged), and a message row's
 `text_excerpt` is the omitted shape (`omitted: "ocr_low_quality"`, `quality: "low"`, `total_chars`, `read_more`) with
-no text and no excerpt budget spent: the text is one `get_file_text` call away. Scanned PDFs are not labelled yet. A
-vision-model description of a photo remains an owner opt-in (ANYM-69).
+no text and no excerpt budget spent: the text is one `get_file_text` call away. Scanned PDFs are not labelled yet.
+`extraction_quality` always describes the Tesseract text of that file; the vision model's visible text (next section) has
+no confidence and no quality, and a `get_file_text` reply that returns it carries neither `extraction_quality` nor
+`quality_notice`.
+
+### Image text: the vision model first, OCR as the fallback (ANYM-987)
+
+For an image the text an agent reads and searches is the vision model's **visible text** (`visible_text`: the `text` field of
+the image's description, `attachment_enrichment.text_content`, produced by the profile in `ENRICHMENT.md`, `deedkit_inference`
+in production) whenever it is ready, current for the message revision and not blank. The Tesseract text applies only
+without it: no description yet (queued, `available_on_request` for an old image, a sticker or an on-request chat),
+failed, unsupported, not configured, stale, or ready with blank text. It is decided at read time; nothing is stored,
+queued, backfilled or deleted, and the OCR text stays readable with `content="extracted"`.
+
+- `get_file_text` without `content` returns the visible text: `content: "enriched"`, `text_kind: "visible_text"`,
+  `model_generated: true`, `provenance` with `provider`, `model`, `indexed_at` and `text_kind`, and, when the file has OCR
+  text too, `alternate_text: {content: "extracted", extractor, text_chars}`. Without visible text it reads the OCR text
+  exactly as before (`enrichment_status` says whether a vision text is on its way).
+- A message row's `text_excerpt` of such an image has `source: "visible_text"` and `model_generated: true`, no `quality`,
+  and `read_more.content: "enriched"`. The ANYM-669 omission applies only when the OCR text is the excerpt's source.
+- `search` (`messages_search`) matches the visible text and reports `source: "visible_text"` and `matched_in:
+  ["visible_text"]` (SEARCH.md); `search_files` already matched it as a `description` hit and now shows its excerpt from
+  the visible text, and `content_searched` is true for an image with ready visible text.
+- The title and summary of an image are still descriptions, never excerpted and never matched by `search`.
 
 ## Retrieval contract
 
@@ -174,15 +196,15 @@ spans. `detail="full"` adds `understanding`, `extraction_coverage`, `content_cov
 Message rows mark a voice note whose transcript is ready with `transcript_ready: true`.
 In `get_messages`, `search` and `get_context` (every detail, and the transcript's file list)
 an attachment whose default `get_file_text` text is ready carries `text_excerpt` (ANYM-490):
-at most 300 characters of that text (photo OCR, PDF and other extracted text, or a voice
-note's transcript), `source` (`extracted` or `transcript`), `excerpt_chars`, `total_chars`,
+at most 300 characters of that text (an image's vision text `visible_text`, else photo OCR, PDF and other extracted text, or a voice
+note's transcript), `source` (`visible_text`, `extracted` or `transcript`), `excerpt_chars`, `total_chars`,
 `complete`, `model_generated`, `untrusted: true` and `read_more`: `{operation: get_file_text,
 attachment_id, offset, content}` (gateway tool `messages_get_file_text`), null when the excerpt
 holds all retained text. Excerpts in one result share a 3,000-character budget spent in row
 order; an attachment past it gets `omitted: "response_budget"`, `total_chars` and `read_more`
 at offset 0. When `text_excerpt` is absent, `extraction_status`, `enrichment_status` and
-`transcript_ready` say why. Image model descriptions are
-not excerpted, and an excerpt follows `get_file_text`'s presence rule: no excerpt when the
+`transcript_ready` say why. An image's model title and summary are
+not excerpted (its visible text is, ANYM-987), and an excerpt follows `get_file_text`'s presence rule: no excerpt when the
 original is missing without a completed managed eviction.
 `content='enriched'` pages the model transcript/text up to 1,000,000 stored characters;
 raw extraction has the same configurable ceiling. Each response page is at most 8,000 characters.

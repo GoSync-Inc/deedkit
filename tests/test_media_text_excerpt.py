@@ -65,7 +65,8 @@ def test_voice_note_excerpt_is_its_model_transcript(seeded):
 def test_no_excerpt_without_ready_text_or_for_image_descriptions(seeded):
     s, _, b = seeded
     voice(s, 'voice-pending', state='unconfigured')
-    voice(s, 'photo-described', filename='photo.jpg', mime='image/jpeg', transcript='Model description of a photo')
+    # ANYM-987: an image's title and summary are never excerpted; its visible text is (tests/test_image_visible_text.py).
+    voice(s, 'photo-described', filename='photo.jpg', mime='image/jpeg', transcript='')
     add_file(s, 'clip', 'demo-tg-1', b'abc', 'clip.mp4', 'video/mp4')
     add_file(s, 'queued-note', 'demo-tg-1', b'Not yet extracted text', 'queued.txt')
     shown = read(s, b)

@@ -5,19 +5,22 @@ from contextvars import ContextVar
 
 from .attachment_metadata import attachment_fields, count_media_error, media_fields, media_unavailable
 from .file_extract import ocr_quality
-from .media_policy import DESCRIPTION_WAITS, ELIGIBILITY_JOIN, ENRICHMENT_REASON, RECOGNITION_REASON, RECOGNITION_WITHHELD
+from .media_policy import (DESCRIPTION_WAITS, ELIGIBILITY_JOIN, ENRICHMENT_REASON, RECOGNITION_REASON, RECOGNITION_WITHHELD,
+    VISIBLE_TEXT_READY)
 
 # Set by Store.access; without it no excerpt is shown (the presence rule cannot run).
 FILES_ROOT:ContextVar=ContextVar('files_root',default=None)
 EXCERPT_CHARS=300
 EXCERPT_BUDGET=3000
-# get_file_text's default choice: ready extracted text, else a voice note's ready transcript (ANYM-453).
+# get_file_text's default choice: an image's ready vision text (ANYM-987), else ready extracted text, else a voice
+# note's ready transcript (ANYM-453).
+_VISIBLE=VISIBLE_TEXT_READY
 _EXTRACTED="f.state='ready' AND coalesce(f.text_content,'')<>''"
 _TRANSCRIPT="(a.mime LIKE 'audio/%%' OR a.mime='application/ogg') AND e.state='ready' AND coalesce(e.text_content,'')<>''"
-_TEXT='(CASE WHEN '+_EXTRACTED+' THEN f.text_content WHEN '+_TRANSCRIPT+' THEN e.text_content END)'
-EXCERPT_COLUMNS=(',CASE WHEN '+_EXTRACTED+" THEN 'extracted' WHEN "+_TRANSCRIPT+" THEN 'transcript' END AS excerpt_source,"
+_TEXT='(CASE WHEN '+_VISIBLE+' THEN e.text_content WHEN '+_EXTRACTED+' THEN f.text_content WHEN '+_TRANSCRIPT+' THEN e.text_content END)'
+EXCERPT_COLUMNS=(',CASE WHEN '+_VISIBLE+" THEN 'visible_text' WHEN "+_EXTRACTED+" THEN 'extracted' WHEN "+_TRANSCRIPT+" THEN 'transcript' END AS excerpt_source,"
     'left('+_TEXT+',%s) AS excerpt_head,length('+_TEXT+') AS excerpt_total,'
-    'CASE WHEN '+_EXTRACTED+' THEN f.truncated WHEN '+_TRANSCRIPT+' THEN e.truncated END AS excerpt_source_truncated,')
+    'CASE WHEN '+_VISIBLE+' THEN e.truncated WHEN '+_EXTRACTED+' THEN f.truncated WHEN '+_TRANSCRIPT+' THEN e.truncated END AS excerpt_source_truncated,')
 # ANYM-664: is_managed_evicted's rule inside this read, so a pending label adds no query per file.
 RESIDENCY_COLUMN=("CASE WHEN EXISTS(SELECT FROM attachment_residency r JOIN attachment_eviction_journal ej ON ej.id=r.eviction_id"
     " WHERE r.digest=a.digest AND r.bytes=a.bytes AND r.state='evicted' AND ej.state='completed'"
@@ -141,7 +144,7 @@ def text_excerpt(c,file,budget):
         # Prefer a word boundary near the end so the excerpt does not stop mid-word.
         match=re.search(r'\s\S*$',head[EXCERPT_CHARS-40:])
         if match:head=head[:EXCERPT_CHARS-40+match.start()].rstrip() or head
-    common={'source':source,'model_generated':source=='transcript','untrusted':True}
+    common={'source':source,'model_generated':source in ('transcript','visible_text'),'untrusted':True}
     # ANYM-669: the OCR confidence class of photo text, in the short key; low text is one get_file_text call away,
     # never in a message row and never against the budget. An unmeasured row reads as ok here.
     quality=ocr_quality(file.get('extractor'),file.get('ocr_metadata')) if source=='extracted' else None

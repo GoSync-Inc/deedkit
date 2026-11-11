@@ -69,7 +69,9 @@ def assert_searchable_current(s, key, other, attachment, revision):
         assert [x['attachment_id'] for x in found]==[attachment]
         assert found[0]['revision']==revision
         assert s.search_files(other,needle)['items']==[]
-    assert s.get_file_text(key,attachment)['text']==OCR_TEXT[:4000]
+    # ANYM-987: an image's ready vision text is the default read; its OCR text is one explicit call away.
+    assert s.get_file_text(key,attachment)['text']==MODEL_TEXT[:4000]
+    assert s.get_file_text(key,attachment,content='extracted')['text']==OCR_TEXT[:4000]
     assert s.get_file_text(key,attachment,content='enriched')['text']==MODEL_TEXT[:4000]
     with pytest.raises(APIError,match='not_found'):
         s.get_file_text(other,attachment)
@@ -159,7 +161,7 @@ def test_format_only_revision_rebuilds_incomplete_or_stale_passages(derivatives,
     with s.pool.connection() as c:
         restored=c.execute('SELECT * FROM '+table+' WHERE attachment=%s ORDER BY chunk_index',(attachment,)).fetchall()
     assert restored==[{**old,'source_revision':2} for old in saved]
-    assert s.get_file_text(key,attachment)['text']==OCR_TEXT[:4000]
+    assert s.get_file_text(key,attachment,content='extracted')['text']==OCR_TEXT[:4000]
 
 
 @pytest.mark.parametrize('state',['failed','unsupported'])
@@ -282,7 +284,7 @@ def test_derivative_rebind_uses_existing_trigger_privileges_without_collector_ac
             c.execute('SET LOCAL ROLE '+role)
             c.execute('UPDATE messages SET revision=revision+1 WHERE id=%s',(mid,))
         assert all(x['state']=='ready' and x['source_revision']==2 for x in rows(s,attachment))
-        assert s.get_file_text(key,attachment)['text']==OCR_TEXT[:4000]
+        assert s.get_file_text(key,attachment,content='extracted')['text']==OCR_TEXT[:4000]
     finally:
         with s.pool.connection() as c:
             c.execute('DROP OWNED BY '+role)
