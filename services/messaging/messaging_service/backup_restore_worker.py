@@ -282,7 +282,10 @@ def run(config, source=None):
     except Exception as error:
         # verify_bundle's refusal of a well-formed bundle newer than this helper runs after age authenticated the
         # stream (incident 11-11: a helper behind production's schema): a schema failure, not a decryption one.
-        code=('restore_schema_failed' if profile=='messaging' and str(error)=='unsupported_backup_schema' else
+        # Recordings checks its archive schema inside decryption too (backup_crypto; Astra r1 on the incident follow-up),
+        # the same code restore_recordings gives it.
+        code=('restore_schema_failed' if (profile,str(error)) in (('messaging','unsupported_backup_schema'),
+                                                                   ('recordings','recordings_schema_unsupported')) else
               'restore_bundle_failed' if profile=='calendar' and str(error) in CALENDAR_BUNDLE_ERRORS else
               'restore_mismatch' if profile=='calls' and str(error) in CALLS_BUNDLE_ERRORS else 'restore_decryption_failed')
         raise RestoreStageError(code) from None

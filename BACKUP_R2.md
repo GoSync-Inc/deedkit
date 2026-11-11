@@ -860,7 +860,16 @@ as root, an hour after the previous run ends. Each run:
    the pair (incident 11-11: the journal and the follow waited on each other).
    Its `last-failure.json` names the candidate (`backup_id`) and the helper
    (`helper_revision`); until the pins move, a run for that candidate fails
-   with the same code before any download;
+   with the same code before any download. A verifier from before this rule
+   keeps that journal, so the follow can still stop behind one until it has
+   installed a release with the rule. If `follow-status.json` reads
+   `verification_pending` while `last-failure.json` reads
+   `restore_schema_failed` and `active.json` reads phase `restoring`, then
+   with no verifier or follow running (`systemctl is-active` of both
+   services) rename `active.json` to `active.json.held-<date>` and start
+   `deedkit-backup-r2-follow.service` once. That is the incident 11-11 step:
+   the journal holds no proof, and the next verification journals anew on
+   the new pins. Undo, before the next verifier run: rename it back;
 2. reads main's head with `git ls-remote` (no API quota) and fetches its
    history treeless into `follow-main.git` in the verifier directory; it moves
    only to a descendant of the pinned revision, never to an older commit

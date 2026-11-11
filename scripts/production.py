@@ -4410,6 +4410,7 @@ from release_migrations import (  # noqa: E402, F401  every name, re-exported: t
     backup_health_lines, inference_worker_line, negotiation_worker_line, leaf_identity, leaf_read, leaf_write,
     stage_leaf, settle_pin, follow_producer, RUNNER_CONFIGS, RUNNER_UNITS, RUNNER_PYTHON, install_backup_runner,
     BACKUP_HEALTH_PROGRAM, BACKUP_HEALTH_CONFIG, BACKUP_HEALTH_SOURCE, install_backup_health, backup_health_files,
+    BACKUP_HEALTH_PROBE_S, restore_leaves,
     migration_gate, calendar_gate, migration_receipt, migration_image, NO_CHANGE, step_name, container_name,
     evidence_file, expand_answer, migration_outcome, outcome_text, Progress, resumed_migration, unsettled_outcomes,
     unsettled_migrations, migrate_rehearse, migrate_gate, migrate_expand)

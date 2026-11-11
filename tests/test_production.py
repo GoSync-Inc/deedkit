@@ -596,7 +596,7 @@ def test_apply_installs_the_releases_backup_checker_naming_the_release(tmp_path,
 
 
 # spec: ANYM-807
-@pytest.mark.parametrize("case", ["refusing-checker", "no-release-sha", "absent"])
+@pytest.mark.parametrize("case", ["refusing-checker", "no-release-sha", "absent", "fifo", "second-rename"])
 def test_a_backup_checker_that_cannot_be_installed_leaves_both_files_and_the_release_stands(tmp_path, monkeypatch,
                                                                                              case):
     settings, calls, _ = fixture(tmp_path, monkeypatch)
@@ -607,16 +607,54 @@ def test_a_backup_checker_that_cannot_be_installed_leaves_both_files_and_the_rel
         config.write_text(json.dumps({"side": "producer"}))
     if case == "absent":
         config.unlink()
-    files = {path: path.read_bytes() for path in (program, config) if path.exists()}
+    if case == "fifo":
+        # Astra r1: a FIFO in place of the config is refused at once, never a read that waits for a writer.
+        config.unlink()
+        os.mkfifo(config, 0o600)
+    files = {path: path.read_bytes() for path in (program, config) if path.exists() and path.is_file()}
+    listed = sorted(path.name for path in (*program.parent.iterdir(), *config.parent.iterdir()))
+    if case == "second-rename":
+        # Astra r1: the config's rename fails after the program's: the previous program goes back.
+        original, seen = os.replace, []
+        def replace(source, target, **kw):
+            seen.append(target)
+            if target == config.name:
+                raise OSError("synthetic")
+            return original(source, target, **kw)
+        monkeypatch.setattr(os, "replace", replace)
     assert p.apply(settings, SHA)["status"] == "applied"
+    if case == "fifo":
+        assert stat.S_ISFIFO(config.lstat().st_mode)
     assert {path: path.read_bytes() for path in files} == files
-    assert sorted(path.name for path in (*program.parent.iterdir(), *config.parent.iterdir())) == sorted(
-        path.name for path in files)
+    # The second-rename case keeps its two `.before-<sha>` copies: past the probe they are the undo.
+    kept = [f"{path.name}.before-{SHA}" for path in (program, config)] if case == "second-rename" else []
+    assert sorted(path.name for path in (*program.parent.iterdir(), *config.parent.iterdir())) == sorted(listed + kept)
     receipt = Path(settings["state_directory"]) / SHA / "backup-health.json"
     if case == "absent":
         assert not receipt.exists()
     else:
         assert json.loads(receipt.read_text())["status"] == "refused"
+    if case == "second-rename":
+        assert "the previous files are back" in json.loads(receipt.read_text())["reason"]
+
+
+# spec: ANYM-807
+def test_a_closed_stderr_after_the_backup_checker_install_never_fails_the_applied_release(tmp_path, monkeypatch):
+    # Astra r1: the install's line on a closed pipe after current.json names the release would read as plan A in an
+    # unknown state.
+    settings, calls, _ = fixture(tmp_path, monkeypatch)
+    p.prepare(settings, SHA)
+    host_checker(tmp_path, monkeypatch)
+    class Closed:
+        def write(self, text):
+            raise BrokenPipeError(32, "synthetic")
+        def flush(self):
+            raise BrokenPipeError(32, "synthetic")
+    monkeypatch.setattr(sys, "stderr", Closed())
+    # Called as apply calls it, after current.json names the release.
+    assert p.install_backup_health(SHA, Path(settings["state_directory"]) / SHA)["status"] == "installed"
+    receipt = json.loads((Path(settings["state_directory"]) / SHA / "backup-health.json").read_text())
+    assert receipt["status"] == "installed"
 
 
 # spec: ANYM-488
