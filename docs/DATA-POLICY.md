@@ -53,6 +53,11 @@ volume) (owner 11-03, see Data egress).
   someone shares are stored and deleted under the message-text rules (retention above, deletion below);
   a live location is stored only as the fact that it was shared, never as a track of positions (owner
   2026-11-09, DECISIONS.md: "location coordinates YES", "live location NO-ish").
+- WhatsApp event invitations (ANYM-924): an event's name, description, times, place, join link and
+  cancelled flag are stored and deleted under the message-text rules (retention above, deletion below);
+  responses are archived only as counts (going, not going, maybe); the adapter's local journal keeps the
+  newest response per member to count them, never exported. Nothing is written to a calendar (owner
+  2026-11-09, DECISIONS.md: "WA event invitations «пусть будет»"; ANYM-891, no calendar writes by DeedKit).
 - Scheduling negotiations (ANYM-907): each chat's negotiation records states, times, zones, offsets
   and references (message, chat and account IDs) derived from its messages by fixed rules, with no
   copied text and no model. Visibility is that of messages (`read`, ANYM-909). Deletion: a message

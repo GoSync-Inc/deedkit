@@ -187,6 +187,8 @@ def checked_location(data):
 def validate(data):
     if not isinstance(data, dict): raise ValueError('invalid_envelope')
     data=checked_location(data)
+    from .event_invites import checked_event
+    data=checked_event(data)
     if len(canonical(data))>MAX_ENVELOPE: raise ValueError('envelope_too_large')
     allowed={'account','platform','chat','chat_title','provider_id','sender','body','sent_at',
              'updated_at','deleted','direction','origin','media','sender_profile','metadata','formatting'}
@@ -216,7 +218,7 @@ def validate(data):
         metadata=data['metadata']
         if not isinstance(metadata,dict) or set(metadata)-{'reply_to_provider_id','forwarded','media_kind','mentions_owner','reply_to_owner','sender_is_bot','chat_type','sender_identity_basis','is_service','is_self_chat','sender_is_contact','sender_is_business_or_verified',
                 'message_kind','provider_message_type','timestamp_resolution','media_duration_seconds','forward_origin','contact',
-                'web_preview_id','buttons','group_change','call','poll','poll_results','location'}:
+                'web_preview_id','buttons','group_change','call','poll','poll_results','location','event','event_responses'}:
             raise ValueError('invalid_metadata')
         result['metadata']={}
         for key,value in metadata.items():
@@ -261,6 +263,9 @@ def validate(data):
                 # A place someone shared (ANYM-922). A block the archive cannot accept never costs the message:
                 # it was dropped by checked_location() before the envelope was measured.
                 if value is None:continue
+            elif key in ('event','event_responses'):
+                # A WhatsApp event invitation and its counts (ANYM-924), checked by checked_event() before measuring.
+                if value is None:continue
             elif key=='web_preview_id':
                 # Telegram's link preview page ID in its unsigned 64-bit decimal form (ANYM-611).
                 if value is not None and (type(value) is not str or not re.fullmatch(r'[0-9]{1,20}',value)):
@@ -276,7 +281,7 @@ def validate(data):
                     raise ValueError('invalid_metadata')
                 if key=='sender_identity_basis' and value!='authenticated_self':
                     raise ValueError('invalid_metadata')
-                if key=='message_kind' and value not in ('text','photo','video','voice','audio','document','sticker','location','contact','poll','system','group_change','call','unknown'):
+                if key=='message_kind' and value not in ('text','photo','video','voice','audio','document','sticker','location','contact','poll','system','group_change','call','event','unknown'):
                     raise ValueError('invalid_metadata')
                 if key=='timestamp_resolution' and value not in ('second','unknown'):
                     raise ValueError('invalid_metadata')
@@ -312,8 +317,9 @@ def validate(data):
         result.get('metadata',{}).pop('contact',None)
         # Nor a keyboard: its labels and links are message content (ANYM-658).
         result.get('metadata',{}).pop('buttons',None)
-        # Nor a shared place (ANYM-922).
+        # Nor a shared place (ANYM-922), nor an event invitation or its counts (ANYM-924).
         result.get('metadata',{}).pop('location',None)
+        result.get('metadata',{}).pop('event',None);result.get('metadata',{}).pop('event_responses',None)
     return result
 
 

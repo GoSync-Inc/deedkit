@@ -593,6 +593,9 @@ func (p *Provider) handleMessage(e *events.Message) error {
 	if unwrapped.Message.GetPollUpdateMessage() != nil {
 		return p.capturePollVote(unwrapped, "live")
 	}
+	if handled, err := p.captureEventSecret(unwrapped, "live"); handled { // ANYM-924, events.go
+		return err
+	}
 	if handled, err := p.captureCallLog(unwrapped.Info.Chat, unwrapped.Info.Sender, unwrapped.Info.ID, unwrapped.Info.IsFromMe, unwrapped.Info.Timestamp.Unix(), unwrapped.Message.GetCallLogMesssage(), "live"); handled {
 		return err
 	}

@@ -322,10 +322,15 @@ func (p *Provider) captureHistory(data *waHistorySync.HistorySync) error {
 				}
 			}
 			// A vote is journaled as a poll_vote entry; a poll's synced votes follow it (ANYM-921).
+			// An event's synced responses are counted before it is journaled, so it is journaled once (ANYM-924).
 			if message.Message.GetPollUpdateMessage() != nil {
 				err = p.capturePollVote(unwrap(message), "history")
-			} else if err = p.Capture.putOrSkip(message, "history"); err == nil {
-				err = p.captureHistoryPollVotes(message, wm.GetPollUpdates())
+			} else if handled, e := p.captureEventSecret(unwrap(message), "history"); handled {
+				err = e
+			} else if err = p.recordHistoryEventResponses(message, wm.GetEventResponses()); err == nil {
+				if err = p.Capture.putOrSkip(message, "history"); err == nil {
+					err = p.captureHistoryPollVotes(message, wm.GetPollUpdates())
+				}
 			}
 			if err != nil {
 				return err

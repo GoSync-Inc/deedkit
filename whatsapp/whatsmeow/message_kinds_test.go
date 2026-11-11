@@ -27,6 +27,8 @@ import (
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"go.mau.fi/whatsmeow/util/gcmutil"
+	"go.mau.fi/whatsmeow/util/hkdfutil"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
@@ -1166,6 +1168,279 @@ func TestNativePollVoteMatchesItsCreatorWhenAnotherMemberUsedTheSameMessageID(t 
 	last := entries[len(entries)-1]
 	if last["kind"] != "poll_vote" || last["poll_provider_id"] != "false_120363000000000009@g.us_POLL1_444444@c.us" || fmt.Sprint(last["option_indices"]) != "[0]" {
 		t.Fatalf("vote matched another member's message: %#v %v", last, skipCounts(t, p.Capture))
+	}
+}
+
+// eventSecret is the synthetic message secret of the test events.
+var eventSecret = bytes.Repeat([]byte{9}, 32)
+
+// eventFixture is a synthetic group event by 444444 that carries its message secret.
+func eventFixture(id string, v *waE2E.EventMessage) *events.Message {
+	m := &waE2E.Message{EventMessage: v, MessageContextInfo: &waE2E.MessageContextInfo{MessageSecret: eventSecret}}
+	e := groupFixture(id, m)
+	e.Info.Chat, e.Info.Sender = groupJID, member("444444")
+	return e
+}
+
+// eventKey names a test event the way a member's modification of it does: the group and its creator 444444.
+func eventKey(id string) *waCommon.MessageKey {
+	return &waCommon.MessageKey{RemoteJID: proto.String(groupJID.String()), FromMe: proto.Bool(false), ID: proto.String(id), Participant: proto.String("444444@s.whatsapp.net")}
+}
+
+// sealSecret encrypts a modification of a message as WhatsApp does (whatsmeow msgsecret.go generateMsgSecretKey):
+// HKDF-SHA256 of the original secret over ID, original sender, modifying sender and use case; AES-GCM; a response
+// carries the ID and modifying sender as additional data, an event edit none.
+func sealSecret(t *testing.T, useCase, origID string, origSender, modSender types.JID, plaintext proto.Message, aad bool) ([]byte, []byte) {
+	t.Helper()
+	data, err := proto.Marshal(plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := hkdfutil.SHA256(eventSecret, nil, []byte(origID+origSender.ToNonAD().String()+modSender.ToNonAD().String()+useCase), 32)
+	var additional []byte
+	if aad {
+		additional = []byte(origID + "\x00" + modSender.ToNonAD().String())
+	}
+	iv := bytes.Repeat([]byte{3}, 12)
+	payload, err := gcmutil.Encrypt(key, iv, data, additional)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload, iv
+}
+
+// eventProvider journals a synthetic group event EVT1 by 444444 whose secret the store holds.
+func eventProvider(t *testing.T, v *waE2E.EventMessage) (*Provider, *events.Message) {
+	t.Helper()
+	p := skipProvider(t)
+	owner := p.Capture.Owner
+	secrets := pollSecrets{}
+	p.Client = nativeClient(&store.Device{ID: &owner, MsgSecrets: secrets})
+	event := eventFixture("EVT1", v)
+	if err := p.handleMessage(event); err != nil {
+		t.Fatal(err)
+	}
+	_ = secrets.PutMessageSecret(context.Background(), groupJID, member("444444"), "EVT1", eventSecret)
+	return p, event
+}
+
+func eventResponse(t *testing.T, target, id, responder string, response waE2E.EventResponseMessage_EventResponseType, ms int64) *events.Message {
+	t.Helper()
+	payload, iv := sealSecret(t, "Event Response", target, member("444444"), member(responder), &waE2E.EventResponseMessage{Response: response.Enum(), TimestampMS: proto.Int64(ms)}, true)
+	e := groupFixture(id, &waE2E.Message{EncEventResponseMessage: &waE2E.EncEventResponseMessage{EventCreationMessageKey: eventKey(target), EncPayload: payload, EncIV: iv}})
+	e.Info.Chat, e.Info.Sender, e.Info.Timestamp = groupJID, member(responder), time.UnixMilli(ms)
+	return e
+}
+
+// eventEntries returns the journaled envelopes of message EVT1 in journal order.
+func eventEntries(t *testing.T, s *CaptureStore) []map[string]any {
+	t.Helper()
+	out := []map[string]any{}
+	for _, entry := range journalKinds(t, s) {
+		if v, ok := entry["event"].(map[string]any); ok && v["messageId"] == "false_120363000000000009@g.us_EVT1_444444@c.us" {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+func syntheticEvent() *waE2E.EventMessage {
+	return &waE2E.EventMessage{Name: proto.String("Шашлыки"), Description: proto.String("Берите пледы"), StartTime: proto.Int64(1767261600), EndTime: proto.Int64(1767268800),
+		Location: &waE2E.LocationMessage{Name: proto.String("Парк"), Address: proto.String("ул. Синтетическая 1"), DegreesLatitude: proto.Float64(55.75), DegreesLongitude: proto.Float64(37.61)},
+		JoinLink: proto.String("https://call.whatsapp.com/video/synthetic"), IsScheduleCall: proto.Bool(true), ExtraGuestsAllowed: proto.Bool(true)}
+}
+
+// spec: ANYM-924
+func TestNativeEventInvitationKeepsItsNameTimesPlaceAndLinkAsBoundedData(t *testing.T) {
+	owner := types.NewJID("123456", types.DefaultUserServer)
+	v, err := NormalizeMessage(eventFixture("EVT1", syntheticEvent()), owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireFields(t, v, map[string]any{"messageType": "event", "body": "Шашлыки", "isService": false})
+	if data, _ := json.Marshal(v["event"]); string(data) != `{"canceled":false,"description":"Берите пледы","end":"2026-01-01T12:00:00Z","is_call":true,`+
+		`"join_link":"https://call.whatsapp.com/video/synthetic","location":{"address":"ул. Синтетическая 1","latitude":55.75,"longitude":37.61,"title":"Парк"},`+
+		`"name":"Шашлыки","start":"2026-01-01T10:00:00Z"}` {
+		t.Fatal(string(data))
+	}
+	// Sender-written texts are bounded; no end, place, description or link stated is null, never guessed.
+	long := &waE2E.EventMessage{Name: proto.String(strings.Repeat("и", 300)), Description: proto.String(strings.Repeat("о", 3000)), StartTime: proto.Int64(1767261600),
+		Location: &waE2E.LocationMessage{Address: proto.String(strings.Repeat("я", 300)), DegreesLatitude: proto.Float64(math.NaN())}}
+	v, err = NormalizeMessage(eventFixture("EVT2", long), owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := v["event"].(map[string]any)
+	place := block["location"].(map[string]any)
+	if utf8.RuneCountInString(block["name"].(string)) != 256 || utf8.RuneCountInString(block["description"].(string)) != 2048 || utf8.RuneCountInString(place["address"].(string)) != 256 ||
+		place["title"] != nil || place["latitude"] != nil || place["longitude"] != nil || block["end"] != nil || block["join_link"] != nil || block["is_call"] != false {
+		t.Fatalf("bounds: %#v", block)
+	}
+	v, _ = NormalizeMessage(eventFixture("EVT3", &waE2E.EventMessage{Name: proto.String("Встреча")}), owner)
+	if data, _ := json.Marshal(v["event"]); string(data) != `{"canceled":false,"description":null,"end":null,"is_call":false,"join_link":null,"location":null,"name":"Встреча","start":null}` {
+		t.Fatal(string(data))
+	}
+	if v, _ := NormalizeMessage(fixtureMessage("TEXT", 1700000000), owner); v["event"] != nil {
+		t.Fatal("event block on a text message")
+	}
+}
+
+// spec: ANYM-924
+func TestNativeEventEditAndCancellationAreNewRevisionsOfTheSameEvent(t *testing.T) {
+	p, _ := eventProvider(t, syntheticEvent())
+	// whatsmeow's edit wrapper (MESSAGE_EDIT) moves the event.
+	moved := syntheticEvent()
+	moved.StartTime, moved.EndTime = proto.Int64(1767348000), nil
+	edit := groupFixture("EDIT1", &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{Type: waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(), Key: eventKey("EVT1"),
+		EditedMessage: &waE2E.Message{EventMessage: moved}, TimestampMS: proto.Int64(1700000100000)}})
+	edit.Info.Chat, edit.Info.Sender, edit.Info.Timestamp = groupJID, member("444444"), time.Unix(1700000100, 0)
+	if err := p.handleMessage(edit); err != nil {
+		t.Fatal(err)
+	}
+	// WhatsApp's own event edit is a secret message (EVENT_EDIT); a cancellation is such an edit.
+	canceled := proto.Clone(moved).(*waE2E.EventMessage)
+	canceled.IsCanceled = proto.Bool(true)
+	payload, iv := sealSecret(t, "Event Edit", "EVT1", member("444444"), member("444444"), &waE2E.Message{EventMessage: canceled}, false)
+	cancel := groupFixture("EDIT2", &waE2E.Message{SecretEncryptedMessage: &waE2E.SecretEncryptedMessage{TargetMessageKey: eventKey("EVT1"), EncPayload: payload, EncIV: iv,
+		SecretEncType: waE2E.SecretEncryptedMessage_EVENT_EDIT.Enum()}})
+	cancel.Info.Chat, cancel.Info.Sender, cancel.Info.Timestamp = groupJID, member("444444"), time.Unix(1700000200, 0)
+	if err := p.handleMessage(cancel); err != nil {
+		t.Fatal(err)
+	}
+	entries := eventEntries(t, p.Capture)
+	if len(entries) != 3 {
+		t.Fatalf("want the event and two revisions, got %d", len(entries))
+	}
+	for i, want := range []struct {
+		change, start string
+		end           any
+		canceled      bool
+	}{{"message", "2026-01-01T10:00:00Z", "2026-01-01T12:00:00Z", false}, {"edit", "2026-01-02T10:00:00Z", nil, false}, {"edit", "2026-01-02T10:00:00Z", nil, true}} {
+		v := entries[i]["event"].(map[string]any)
+		block := v["event"].(map[string]any)
+		if entries[i]["change"] != want.change || v["messageType"] != "event" || v["body"] != "Шашлыки" || v["timestamp"] != float64(1700000000) ||
+			block["start"] != want.start || block["end"] != want.end || block["canceled"] != want.canceled {
+			t.Fatalf("revision %d: %v %#v", i, entries[i]["change"], v)
+		}
+	}
+	if entries[2]["event"].(map[string]any)["editedTimestampMs"] != float64(1700000200000) {
+		t.Fatalf("cancellation edit time: %#v", entries[2]["event"].(map[string]any)["editedTimestampMs"])
+	}
+	// An edit that cannot be decrypted is counted, never a message, and capture goes on.
+	broken := groupFixture("EDIT3", &waE2E.Message{SecretEncryptedMessage: &waE2E.SecretEncryptedMessage{TargetMessageKey: eventKey("EVT1"), EncPayload: []byte("synthetic"),
+		EncIV: bytes.Repeat([]byte{1}, 12), SecretEncType: waE2E.SecretEncryptedMessage_EVENT_EDIT.Enum()}})
+	broken.Info.Chat, broken.Info.Sender = groupJID, member("444444")
+	before := len(journalKinds(t, p.Capture))
+	if err := p.handleMessage(broken); err != nil {
+		t.Fatal(err)
+	}
+	if counts := skipCounts(t, p.Capture); counts["event_edit_undecryptable"] != 1 || len(counts) != 1 || len(journalKinds(t, p.Capture)) != before {
+		t.Fatal(counts)
+	}
+	if err := p.handleMessage(fixtureMessage("after", 1700000601)); err != nil || len(journalKinds(t, p.Capture)) != before+1 {
+		t.Fatal("message after an undecryptable edit not captured", err)
+	}
+}
+
+// spec: ANYM-924
+func TestNativeEventResponsesAreCountedOnlyAndAnUndecryptableOneNeverStopsCapture(t *testing.T) {
+	p, _ := eventProvider(t, syntheticEvent())
+	for _, r := range []*events.Message{
+		eventResponse(t, "EVT1", "RSVP1", "555555", waE2E.EventResponseMessage_GOING, 1700000100000),
+		eventResponse(t, "EVT1", "RSVP2", "666666", waE2E.EventResponseMessage_MAYBE, 1700000110000),
+		eventResponse(t, "EVT1", "RSVP3", "555555", waE2E.EventResponseMessage_NOT_GOING, 1700000120000), // a changed answer replaces the first
+		eventResponse(t, "EVT1", "RSVP4", "555555", waE2E.EventResponseMessage_GOING, 1700000105000),     // an older one never does
+	} {
+		if err := p.handleMessage(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries := eventEntries(t, p.Capture)
+	last := entries[len(entries)-1]["event"].(map[string]any)
+	if data, _ := json.Marshal(last["eventResponses"]); string(data) != `{"going":0,"maybe":1,"not_going":1}` || last["event"] == nil {
+		t.Fatalf("counts: %s", data)
+	}
+	if data, _ := json.Marshal(entries[0]["event"].(map[string]any)["eventResponses"]); string(data) != "null" {
+		t.Fatalf("an event nobody answered has no counts: %s", data)
+	}
+	// A response is never a chat message, and who answered never leaves the adapter.
+	all, _ := json.Marshal(journalKinds(t, p.Capture))
+	if bytes.Contains(all, []byte("555555")) || bytes.Contains(all, []byte("666666")) || bytes.Contains(all, []byte("RSVP")) {
+		t.Fatalf("a responder or response in the journal: %s", all)
+	}
+	// An edit keeps the counts.
+	edit := groupFixture("EDIT1", &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{Type: waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(), Key: eventKey("EVT1"),
+		EditedMessage: &waE2E.Message{EventMessage: &waE2E.EventMessage{Name: proto.String("Шашлыки у реки"), StartTime: proto.Int64(1767261600)}}, TimestampMS: proto.Int64(1700000300000)}})
+	edit.Info.Chat, edit.Info.Sender = groupJID, member("444444")
+	if err := p.handleMessage(edit); err != nil {
+		t.Fatal(err)
+	}
+	entries = eventEntries(t, p.Capture)
+	if v := entries[len(entries)-1]["event"].(map[string]any); v["body"] != "Шашлыки у реки" || fmt.Sprint(v["eventResponses"]) != "map[going:0 maybe:1 not_going:1]" {
+		t.Fatalf("edit lost the counts: %#v", v)
+	}
+	// Undecryptable: a forged payload, an event never journaled, a lost secret. Each is counted and left out.
+	forged := eventResponse(t, "EVT1", "RSVP5", "777777", waE2E.EventResponseMessage_GOING, 1700000400000)
+	forged.Message.EncEventResponseMessage.EncPayload = []byte("synthetic")
+	unknown := eventResponse(t, "EVT9", "RSVP6", "777777", waE2E.EventResponseMessage_GOING, 1700000400000)
+	lost := eventResponse(t, "EVT1", "RSVP7", "888888", waE2E.EventResponseMessage_GOING, 1700000400000)
+	journaled := len(journalKinds(t, p.Capture))
+	for i, r := range []*events.Message{forged, unknown, lost} {
+		if i == 2 {
+			clear(p.Client.Store.MsgSecrets.(pollSecrets))
+		}
+		if err := p.handleMessage(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if counts := skipCounts(t, p.Capture); counts["event_response_undecryptable"] != 3 || len(counts) != 1 || len(journalKinds(t, p.Capture)) != journaled || !p.ready.Load() {
+		t.Fatal(counts)
+	}
+	if err := p.handleMessage(fixtureMessage("after", 1700000601)); err != nil || len(journalKinds(t, p.Capture)) != journaled+1 {
+		t.Fatal("message after an undecryptable response not captured", err)
+	}
+}
+
+// spec: ANYM-924
+func TestNativeEventSecretOpensWhatWhatsmeowSeals(t *testing.T) {
+	// The response decryption follows whatsmeow's own derivation: it opens a poll vote whatsmeow sealed.
+	p, voter, poll, _ := pollProvider(t)
+	vote := pollVote(t, voter, poll, "VOTE1", 1700000100250, pollOptionHash("Да"))
+	update := vote.Message.GetPollUpdateMessage()
+	plain, err := openMsgSecret(p.Client, vote, update.GetPollCreationMessageKey(), "Poll Vote", update.GetVote().GetEncIV(), update.GetVote().GetEncPayload())
+	var got waE2E.PollVoteMessage
+	if err != nil || proto.Unmarshal(plain, &got) != nil || !bytes.Equal(got.GetSelectedOptions()[0], pollOptionHash("Да")) {
+		t.Fatal("whatsmeow's sealed vote did not open", err)
+	}
+}
+
+// spec: ANYM-924
+func TestNativeHistoryEventKeepsItsSyncedResponseCountsWithoutDuplicates(t *testing.T) {
+	p, event := eventProvider(t, syntheticEvent())
+	response := func(id, participant string, r waE2E.EventResponseMessage_EventResponseType, ms int64) *waWeb.EventResponse {
+		return &waWeb.EventResponse{EventResponseMessageKey: &waCommon.MessageKey{RemoteJID: proto.String(groupJID.String()), ID: proto.String(id), Participant: proto.String(participant)},
+			TimestampMS: proto.Int64(ms), EventResponseMessage: &waE2E.EventResponseMessage{Response: r.Enum(), TimestampMS: proto.Int64(ms)}}
+	}
+	data := &waHistorySync.HistorySync{Conversations: []*waHistorySync.Conversation{{ID: proto.String(groupJID.String()), Messages: []*waHistorySync.HistorySyncMsg{
+		{Message: &waWeb.WebMessageInfo{Key: &waCommon.MessageKey{RemoteJID: proto.String(groupJID.String()), ID: proto.String("EVT1")}, Participant: proto.String("444444@s.whatsapp.net"),
+			MessageTimestamp: proto.Uint64(uint64(event.Info.Timestamp.Unix())), Message: proto.Clone(event.Message).(*waE2E.Message),
+			EventResponses: []*waWeb.EventResponse{
+				response("RSVP1", "555555@s.whatsapp.net", waE2E.EventResponseMessage_GOING, 1700000100000),
+				response("RSVP2", "666666@s.whatsapp.net", waE2E.EventResponseMessage_GOING, 1700000110000),
+				{EventResponseMessageKey: &waCommon.MessageKey{ID: proto.String("RSVP3")}}, // no response: counted
+			}}},
+	}}}}
+	for range 2 {
+		if err := p.captureHistory(data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries := eventEntries(t, p.Capture)
+	if len(entries) != 2 || fmt.Sprint(entries[1]["event"].(map[string]any)["eventResponses"]) != "map[going:2 maybe:0 not_going:0]" || entries[1]["origin"] != "backfill" {
+		t.Fatalf("history event: %d entries %#v", len(entries), entries[len(entries)-1])
+	}
+	if counts := skipCounts(t, p.Capture); counts["event_response_undecryptable"] != 2 {
+		t.Fatal(counts)
 	}
 }
 

@@ -251,6 +251,10 @@ def shape_messages(rows, *, compact=False, body_chars=None):
             if not isinstance(location,dict):row.pop('location')
             elif location.get('live') is not True:
                 row['location']={k:location.get(k) for k in ('latitude','longitude','accuracy_m','title','address')}|{'live':False}
+        if 'event' in row:
+            # ANYM-924: an event invitation, its counts and the calendar offer an agent may put to the owner.
+            from .event_invites import shape_event
+            shape_event(row)
         if compact:
             if body is not None:row.setdefault('snippet',body[:320])
             row.pop('body',None)

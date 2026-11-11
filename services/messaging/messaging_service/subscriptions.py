@@ -806,8 +806,8 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
             'sender',e.snapshot->'sender','provider_id',e.snapshot->'provider_id',
             'sent_at',e.snapshot->'sent_at','direction',e.snapshot->'direction',
             'deleted',e.snapshot->'deleted','processing',e.snapshot->'processing',
-            -- ANYM-529, ANYM-658, ANYM-922: contact cards, inline keyboards and shared places are content the journal keeps, references do not.
-            'metadata',(e.snapshot->'metadata')-'contact'-'buttons'-'location','reply_evidence',e.snapshot->'reply_evidence',
+            -- ANYM-529, ANYM-658, ANYM-922, ANYM-924: contact cards, inline keyboards, shared places and event invitations are content the journal keeps, references do not.
+            'metadata',(e.snapshot->'metadata')-'contact'-'buttons'-'location'-'event'-'event_responses','reply_evidence',e.snapshot->'reply_evidence',
             -- ANYM-535: IDs and codes only; the sending key stays in the journal.
             'send_id',CASE WHEN e.kind='send.failed' THEN e.snapshot->'send_id' END,
             'error_code',CASE WHEN e.kind='send.failed' THEN e.snapshot->'error_code' END,
