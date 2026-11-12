@@ -761,7 +761,10 @@ class Agents:
         run = None
         try:
             if self.devices.ui is not None:
-                await self.devices.ui.ensure_fenced_process_stopped(call.device_id)
+                if bare:
+                    await self.devices.ui.close(call.device_id)
+                else:
+                    await self.devices.ui.ensure_fenced_process_stopped(call.device_id)
             run_dir = Path(tempfile.mkdtemp(prefix='run-', dir=self.root))
             run_dir.chmod(0o700)
             secrets_run = SecretRun(self.devices.secrets)

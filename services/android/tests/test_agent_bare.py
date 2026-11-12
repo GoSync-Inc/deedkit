@@ -192,3 +192,21 @@ sys.stdout.buffer.write(b'\\x89PNG\\r\\n\\x1a\\n' + b'0'*16)
         assert base64.b64decode(downloaded['data_base64']).startswith(b'\x89PNG')
         service.post('download', {'file_id': file_id}, key='two', code=404)
 
+
+# spec: ANYM-993
+def test_bare_closes_the_target_warm_ui_worker_while_holding_its_phone_lock(tmp_path):
+    config, _ = bare_host(tmp_path)
+    with Service(config) as service:
+        devices = service.app.state.devices
+        closed = []
+
+        async def close(device=None):
+            if device is not None:
+                assert devices.locks[device].locked()
+                closed.append(device)
+
+        devices.ui.close = close
+        run = service.finished(service.start(service.lease())['request_id'])
+        assert run['state'] == 'succeeded'
+        assert closed == ['home']
+
