@@ -307,23 +307,31 @@ measurement. `max_actions` is a command-count cancellation limit; a command alre
 by Codex may be in flight when cancellation arrives. Requests and logs retain the existing
 14-day policy. Phone content and task data go to OpenAI under the existing provider policy.
 
-Learning runs through an explicit structured-result contract in the same session. The service
-publishes validated per-app navigation into `CODEX_HOME/skills/<app-name-and-hash>/SKILL.md`
-and loads it for the next run, even when the model writes no skill file. A small
-`android-learning` skill explains the contract. Only static resource IDs, action enums and
-defined navigation pitfalls are persisted; goals, summaries, screen text, task parameters,
-contacts, addresses and secrets never enter this knowledge format. No reusable observation
-means an empty lesson list. The local result-schema.json is an instruction to the ordinary
-session; the service does not send an API output schema. One JSON codefence is accepted.
-Invalid learning returns learning_error and publishes nothing, while preserving genuine
-native summary/data. A nonzero native exit or absent final message remains a failed run.
+The prompt contains the phone location, owner-agent role and caller goal/context. There is
+no bootstrap learning instruction, result schema or required final JSON. The native final
+message is returned unchanged as `summary`; bare-mode `data` is empty and any legacy
+`outputs` remain listed in `missing_outputs`. A nonzero native exit or absent final message
+remains a failed run. JSON-looking natural output is not interpreted as a result contract.
+
+Codex can author ordinary app `SKILL.md` files and supporting resources itself. Its existing
+dedicated `CODEX_HOME/skills` directory is available through the run's standard `.agents/skills`
+location and is writable with native `--add-dir`; auth/config outside it remain outside the
+write grant. Native skill discovery/reuse handles the files; the service injects no skill body,
+resource-ID grammar, enum list or generic-content filter. `skills_updated` lists changed paths
+relative to that directory, not a claim that a useful lesson was learned. No file written means
+no learned-skill claim. Native file writes persist as ordinary workspace writes, including when
+a later task fails or is stopped. Skills are for generic app navigation/verified shortcuts;
+private patient/order facts belong in task context. Existing retention and egress policy stays.
+See [native Codex skills](https://developers.openai.com/codex/skills/).
+
+On an upgrade from the structured-learning release, move its service-generated `android-learning`
+bootstrap skill aside before ordinary runs so native discovery cannot pick up stale instructions.
+Preserve other app skills and the original files for undo; do not change auth or global settings.
 Bounded sanitized engine_errors and exit_code report native startup errors; raw stderr and
 phone dumps are never logged. timings.commands_started counts submissions independently
 of completed commands, including when cancellation interrupts one. token_usage_observed
 distinguishes reported usage from zero-filled counters when no usage report was received;
 those counters are not evidence of zero billing.
-The sandbox does not make the skills directory writable to the model; the service publishes
-it atomically after success.
 
 Rollback: with zero active runs, set `agent.guarded: true` and reload/restart the service
 through the documented mini release route. The previous phone-tool path below then applies.

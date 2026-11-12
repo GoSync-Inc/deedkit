@@ -1,12 +1,13 @@
 """Ordinary Codex on serial-specific adb, retaining the service's lifecycle and native sandbox."""
 
 import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path
 import time
 
-from . import agent_diagnostics, agent_learning, engines
+from . import agent_diagnostics, engines
 from .agent_run import AgentRun, MINUTE_S, MAX_NOTES
 from .config import Refused
 
@@ -32,12 +33,12 @@ class BareRun(AgentRun):
         super().__init__(*args)
         self.command_starts, self.model_ms = {}, 0.0
         self.skills_updated, self.learning_error = [], None
+        self.skills = Path(self.config.codex_home) / 'skills'
+        self.skills_before = {}
         self.stderr, self.stderr_reader, self.commands_started = bytearray(), None, 0
 
     def prompt(self):
         host = self.agents.read_config()
-        skills = agent_learning.setup(self.config.codex_home, self.dir, self.request.outputs)
-        learned = agent_learning.load(self.config.codex_home, self.request.apps)
         prompt = (f'Android phone on this host: {host.adb} -s {host.devices[self.device]}.\n'
                   "You are the owner's agent that does orders and tasks on this phone.\n"
                   f'Goal: {self.request.goal}\n')
@@ -45,19 +46,33 @@ class BareRun(AgentRun):
             prompt += 'Parameters: ' + json.dumps(self.params) + '\n'
         if self.request.apps:
             prompt += 'Apps: ' + ', '.join(self.request.apps) + '\n'
-        prompt += '$android-learning\n' + (skills / 'android-learning' / 'SKILL.md').read_text()
-        prompt += '\nPrior app navigation: ' + json.dumps(learned)
-        prompt += '\nRequested data keys: ' + json.dumps(self.request.outputs)
         return prompt
+
+    def skill_files(self):
+        """Change metadata only. Codex authors and discovers ordinary skills itself."""
+        result = {}
+        for path in self.skills.rglob('*'):
+            try:
+                if path.is_file() and not path.is_symlink():
+                    with path.open('rb') as stream:
+                        result[str(path.relative_to(self.skills))] = hashlib.file_digest(stream, 'sha256').hexdigest()
+            except OSError:
+                continue
+        return result
 
     async def spawn(self):
         prompt = self.prompt()
         host = self.agents.read_config()
+        self.skills.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (self.dir / '.agents').mkdir(mode=0o700)
+        (self.dir / '.agents' / 'skills').symlink_to(self.skills, target_is_directory=True)
+        self.skills_before = self.skill_files()
         command = [self.config.binary, 'exec', '--json', '--ephemeral', '--skip-git-repo-check',
                    '--sandbox', 'workspace-write', '-C', str(self.dir), '-m', self.config.model,
+                   '--add-dir', str(self.skills),
                    '-c', 'model_reasoning_effort=' + json.dumps(self.config.reasoning_effort),
                    '-c', 'sandbox_workspace_write.network_access=true', '-c', 'approval_policy=never',
-                   '-o', str(self.dir / 'final.json'), '-']
+                   '-o', str(self.dir / 'final.txt'), '-']
         env = engines.environment('codex', self.config, self.dir)
         env['PATH'] = str(Path(host.adb).parent) + os.pathsep + env['PATH']
         env['ANDROID_SERIAL'] = host.devices[self.device]
@@ -100,16 +115,20 @@ class BareRun(AgentRun):
                 await reader  # consume all command completions and token usage before finalizing
                 await self.stderr_reader
                 if self.state == 'running':
+                    error = None
                     try:
-                        path = self.dir / 'final.json'
+                        path = self.dir / 'final.txt'
                         if path.stat().st_size > 65536:
                             raise ValueError('result_too_large')
-                        outcome, self.learning_error = agent_learning.decode_result(path.read_text())
+                        text = path.read_text()
+                        if not text.strip():
+                            raise ValueError('no_final_message')
                         if self.process.returncode == 0:
-                            self.finished = outcome
+                            self.finished = {'summary': text, 'data': {}}
                     except (OSError, ValueError):
-                        self.learning_error = 'invalid_or_missing_result'
-                    await self.end('succeeded' if self.finished else 'failed', exit_code=self.process.returncode)
+                        error = 'invalid_or_missing_result'
+                    await self.end('succeeded' if self.finished else 'failed', exit_code=self.process.returncode,
+                                   **({'error': error} if error else {}))
         except TimeoutError:
             await self.end('timed_out')
         except (OSError, ValueError):
@@ -158,11 +177,9 @@ class BareRun(AgentRun):
                 await asyncio.wait_for(self.stderr_reader, 1)
             except (TimeoutError, asyncio.CancelledError):
                 pass
-        if state == 'succeeded' and not self.learning_error:
-            try:
-                self.skills_updated = agent_learning.publish(self.config.codex_home, finished.get('lessons', []))
-            except (OSError, ValueError):
-                self.learning_error = 'skill_publish_failed'
+        if state == 'succeeded':
+            self.skills_updated = sorted(name for name, digest in self.skill_files().items()
+                                         if self.skills_before.get(name) != digest)
         screenshot = None
         try:
             async with asyncio.timeout(10):
