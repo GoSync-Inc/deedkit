@@ -281,3 +281,12 @@ def test_startup_failure_returns_sanitized_native_error_without_success(tmp_path
         assert any(item['source'] == 'stderr' for item in run['engine_errors'])
         assert canary not in json.dumps(run) and 'private phone' not in json.dumps(run)
 
+
+# spec: ANYM-993
+def test_native_diagnostics_redact_authorization_and_cookie_headers():
+    from deedkit_android.agent_diagnostics import message
+    canary = 'short_private_credential_123'
+    for header in ('Authorization: Bearer ', 'Authorization: Basic ', '"Authorization": "Bearer ',
+                   'Cookie: session=', 'Set-Cookie: session='):
+        assert canary not in message('Error: ' + header + canary)
+
