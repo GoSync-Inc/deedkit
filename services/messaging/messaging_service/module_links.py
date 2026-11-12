@@ -264,6 +264,22 @@ def api_sources(c, p, module_sources):
     return call_sources(c, p, module_sources)
 
 
+def insert_source(c, subscription_id, source, scope_ref, types):
+    """One source row of a subscription, written by INSERT alone: the API role has no UPDATE on the table, and `ON CONFLICT ...
+    DO UPDATE` needs it even when nothing conflicts (the live create of a maintainer subscription got HTTP 503 from it, 11-12).
+    A row the subscription already holds with the same types is left as it is; with other types it is a refusal, never a silent
+    keep of the old ones (no caller does this: sources are attached once, to a new subscription)."""
+    types = sorted(set(types))
+    written = c.execute("""INSERT INTO subscription_module_sources(subscription,source,scope_ref,types) VALUES(%s,%s,%s,%s)
+        ON CONFLICT(subscription,source,scope_ref) DO NOTHING RETURNING 1 AS written""",
+        (subscription_id, source, scope_ref, types)).fetchone()
+    if written is None:
+        held = c.execute('SELECT types FROM subscription_module_sources WHERE subscription=%s AND source=%s AND scope_ref=%s',
+            (subscription_id, source, scope_ref)).fetchone()
+        if held is None or sorted(held['types']) != types:
+            raise ValueError('module_source_types_conflict')
+
+
 def admit(c, subscription_id, source, scope_ref, types):
     """Give the subscription a module source under its principal's live link and record the link's generation.
 
@@ -297,9 +313,7 @@ def _admit_calendar(c, subscription_id, scope_ref, types):
         raise not_linked('calendar')
     if scope_ref != CALENDAR_ALL and not access_holds(c, link['module_principal'], scope_ref):
         raise not_linked('calendar')
-    c.execute('''INSERT INTO subscription_module_sources(subscription,source,scope_ref,types) VALUES(%s,%s,%s,%s)
-        ON CONFLICT(subscription,source,scope_ref) DO UPDATE SET types=excluded.types''',
-        (subscription_id, MODULES['calendar'], scope_ref, list(types)))
+    insert_source(c, subscription_id, MODULES['calendar'], scope_ref, list(types))
     c.execute('''INSERT INTO subscription_module_links(subscription,source,scope_ref,generation) VALUES(%s,%s,%s,%s)
         ON CONFLICT DO NOTHING''', (subscription_id, MODULES['calendar'], scope_ref, link['generation']))
     return link['generation']

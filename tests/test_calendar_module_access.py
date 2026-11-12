@@ -19,6 +19,7 @@ from messaging_service.module_events import ModuleContractError, validate_event
 from messaging_service.store import APIError
 from messaging_service.subscriptions import match_subscriptions
 from test_module_events import beat, bound, empty_module_journal, module_hints, publish
+from test_feedback_maintainer_subscription import api_role_store
 from test_module_links import key
 
 PRINCIPAL = 'cal-principal'
@@ -129,6 +130,15 @@ def test_calendar_sources_need_the_link_and_the_linked_principals_access_now(mod
             (['calendar:all'], [])):
         with pytest.raises(APIError, match='invalid_filter'):
             calendar_sub(store, token, *scopes, types=types)
+
+
+# spec: ANYM-577
+def test_a_calendar_source_is_created_by_the_api_role_that_holds_no_update_of_the_module_sources(modules):
+    store, seq = modules[0], Seq()
+    token = reader(store)
+    put(store, access(seq()))  # the principal's access to cal-1
+    with api_role_store(store) as gateway:
+        assert calendar_sub(gateway, token, 'calendar:all', 'calendar:cal-1')  # the INSERT of each source: no UPDATE needed
 
 
 # spec: ANYM-566
