@@ -168,7 +168,7 @@ STALE = timedelta(hours=2)
 CAPS = {'items_per_principal': 20, 'reader_runs': 24, 'card_launches': 5, 'build_launches': 3, 'card_in_flight': 2,
         'build_in_flight': 2, 'worker_hours': 12}
 CONFIG = {'live': False, 'principals': [], 'tz': 'UTC', 'caps': CAPS, 'orchestrator_thread': None,
-          'worker_machine': None}
+          'worker_machine': None, 'record_projection': False}
 LIMITS = {'card': 2 * 3600, 'build': 4 * 3600}  # each worker's wall-clock reservation, in seconds
 LIVE = ('reserved', 'unknown', 'started')  # intents that hold an in-flight slot
 CONTROL = re.compile(r'AUTOLOOP (STOP|DROP ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}))')
@@ -556,6 +556,72 @@ def committed_briefs(state, triage_state):
             and brief.get('release') == RELEASE}
 
 
+# --- the projection (ANYM-988) -----------------------------------------------------------------------------------
+# With `"record_projection": true` in config.json (default false) each read run's decisions and released briefs go to
+# DeedKit's `record-feedback-projection`, so a maintainer key on another host reads them (`export_feedback_metadata`)
+# without the operator container. Only closed words, card IDs and a brief that passed `released`; never feedback text.
+PROJECTION = 'projection.json'  # the items not yet recorded: {feedback ID: item}; a failed call leaves them for the next tick
+PROJECTION_BATCH = 100
+PROJECTION_KEEP = timedelta(days=7)  # an item older than this is dropped: it never blocks the others
+REASON_CODES = {text: code for code, text in REASONS.items()}
+SPEC_REF = re.compile(r'ANYM-[1-9][0-9]{0,5}')
+READER_PIN = f'claude-code@{CLI_VERSION}/release-{RELEASE}'
+# The operator container of triage.EXPORT with its own name and a stdin: the command reads its file from /dev/stdin.
+RECORD = [('deedkit-feedback-projection' if word == 'deedkit-feedback-export' else word) for word in triage.EXPORT]
+RECORD.insert(RECORD.index('--rm') + 1, '-i')
+
+
+def projection_items(state, now):
+    """{ID: item} of the last read run's decisions, in the shape of `record-feedback-projection`'s file."""
+    briefs, at, items = triage.load(state / 'briefs.json', {}), triage.stamp(now), {}
+    for d in triage.load(state / 'decisions.json', []):
+        code = REASON_CODES.get(d.get('reason'))
+        if code is None or d.get('classification') not in CLASSES or not isinstance(d.get('id'), str):
+            continue
+        item = {'feedback_id': d['id'], 'classification': d['classification'], 'reason_code': code, 'released_at': at,
+                'reader_pin': READER_PIN}
+        if isinstance(d.get('primary'), str) and SPEC_REF.fullmatch(d['primary']):
+            item['primary_spec'] = d['primary']
+        if isinstance(d.get('new_card'), str) and NEW_CARD.fullmatch(d['new_card']):
+            item['new_card'] = d['new_card']
+        brief = briefs.get(d['id']) or {}
+        text = brief.get('card_brief')
+        # A brief of an older release, of another card, too long or with a control character is recorded as none: the
+        # server refuses a whole file for one bad value, which would hold every other item back.
+        if brief.get('release') == RELEASE and brief.get('new_card') == item.get('new_card') and isinstance(text, str) \
+                and text.strip() and len(text) <= BRIEF_LIMIT and not re.search(r'[\x00-\x1f\x7f]', text):
+            item['released_brief'] = text
+        items[d['id']] = item
+    return items
+
+
+def record_projection(state, host, ssh, now, fresh):
+    """One call per tick: the pending items (this run's, with `fresh`) in one operator-container call of at most
+    PROJECTION_BATCH, on stdin. A refusal or a failed call raises with the run's own fixed message and keeps the items,
+    which the next tick sends again (the command is idempotent: an item replaces the stored one only when newer)."""
+    ssh = ssh or triage.remote
+    pending = triage.load(state / PROJECTION, {})
+    keep = triage.stamp(now - PROJECTION_KEEP)
+    pending = {i: item for i, item in pending.items() if item.get('released_at', '') >= keep}
+    if fresh:
+        pending.update(projection_items(state, now))
+    triage.save(state / PROJECTION, pending)
+    if not pending:
+        return None
+    batch = [pending[i] for i in sorted(pending)[:PROJECTION_BATCH]]
+    image = ssh(host, ['docker', 'inspect', '--format', '{{.Image}}', triage.API_CONTAINER]).strip()
+    if not triage.IMAGE.fullmatch(image):
+        raise Refused('the API container image is not a digest')
+    reply = triage.parse(ssh(host, RECORD + [image, 'python', '-m', 'messaging_service', 'record-feedback-projection',
+                                             '--file', '/dev/stdin'], stdin=json.dumps({'projections': batch})), 'record')
+    if not isinstance(reply, dict) or any(type(reply.get(k)) is not int for k in ('recorded', 'unchanged')):
+        raise Refused('record: unexpected reply')
+    for item in batch:
+        pending.pop(item['feedback_id'], None)
+    triage.save(state / PROJECTION, pending)
+    return f"recorded {reply['recorded']}, unchanged {reply['unchanged']}"
+
+
 # --- the tick (ANYM-569) -----------------------------------------------------------------------------------------
 def enter(stack, manager, what):
     """Take one lock, non-blocking: a held lock ends the tick as busy before anything is read or written."""
@@ -579,6 +645,7 @@ def config(state):
     caps = raw.get('caps', {}) if isinstance(raw, dict) else None
     principals = raw.get('principals', []) if isinstance(raw, dict) else None
     if not isinstance(raw, dict) or set(raw) - set(CONFIG) or not isinstance(raw.get('live', False), bool) \
+            or not isinstance(raw.get('record_projection', False), bool) \
             or not isinstance(principals, list) or not all(isinstance(p, str) and p for p in principals) \
             or not isinstance(caps, dict) or set(caps) - set(CAPS) \
             or any(type(v) is not int or v < 0 for v in caps.values()) \
@@ -592,7 +659,8 @@ def config(state):
     except (ValueError, TypeError, ZoneInfoNotFoundError):
         raise Refused('config.json: unknown tz') from None
     return {'live': raw.get('live', False), 'principals': set(principals), 'zone': zone, 'caps': dict(CAPS, **caps),
-            'orchestrator_thread': raw.get('orchestrator_thread'), 'worker_machine': raw.get('worker_machine')}
+            'orchestrator_thread': raw.get('orchestrator_thread'), 'worker_machine': raw.get('worker_machine'),
+            'record_projection': raw.get('record_projection', False)}
 
 
 def counters(ledger, cfg, now):
@@ -2242,6 +2310,12 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
             count, _ = read(state, triage_state, runner, chosen, now)
             refused = sorted(i for i, e in refusals(state).items() if e['count'] > before.get(i, {}).get('count', 0))
             reader = 'ran'
+        projected = None
+        if cfg['record_projection']:  # ANYM-988: off by default; a failed call never fails the tick or the reader's record
+            try:
+                projected = record_projection(state, host, ssh, now, count > 0)
+            except (Refused, triage.Refused) as error:
+                projected = f'projection: {error}'
         try:  # the build stage (ANYM-572): a failed read there leaves the card stage and the reader as they are
             built, failed = builds(state, triage_state, cfg, snap, now, bb, gh, probe or receipt_watch.probe,
                                    host)
@@ -2258,6 +2332,8 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
                 'over_cap': over,
                 'today': today, 'clusters': provenance(triage.load(triage_state / 'ledger.json', {}), cfg['principals']),
                 'intents': {name: i['status'] for name, i in intents(state).items()}}
+        if cfg['record_projection']:
+            plan['projection'] = projected
         triage.save(state / 'plan.json', plan)
         if not withheld and not failed:  # a withhold or build step not done is no good tick: `status` reports it
             heartbeat(state, now, 'live' if cfg['live'] else 'plan')

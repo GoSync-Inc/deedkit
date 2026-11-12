@@ -152,3 +152,6 @@ GRANT SELECT ON telegram_polls TO messaging_gateway;
 -- write: only the owner CLI writes links.
 GRANT SELECT ON module_links,subscription_module_links TO messaging_gateway;
 GRANT INSERT ON subscription_module_sources,subscription_module_links TO messaging_gateway;
+-- Schema 94 (ANYM-988): export_feedback_metadata shows the feedback loop's released summary beside each item's metadata
+-- (a maintainer key only, checked by the operation's permission); read only. The operator's owner connection writes it.
+GRANT SELECT ON feedback_projections TO messaging_gateway;

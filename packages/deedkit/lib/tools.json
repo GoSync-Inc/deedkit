@@ -59,6 +59,7 @@
   {"name": "messages_delete_wake_target", "read_only": false},
   {"name": "messages_dismiss_reply", "read_only": false},
   {"name": "messages_execute_messenger_operation", "read_only": false},
+  {"name": "messages_export_feedback_metadata", "read_only": true},
   {"name": "messages_fetch_subscription_events", "read_only": true},
   {"name": "messages_get_attachment", "read_only": true},
   {"name": "messages_get_context", "read_only": true},

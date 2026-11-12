@@ -59,7 +59,8 @@ def main():
     parser.add_argument('command',choices=['serve','init','migrate','issue-key','revoke-key',
         'replay','snapshot','verify-restore','quarantine-restore','register-account',
         'set-access','list-keys','audit-tail','set-sending','set-key-permissions',
-        'set-messenger-operations','extend-key','set-feedback-status','export-feedback','release-retention-hold',
+        'set-messenger-operations','extend-key','set-feedback-status','export-feedback','record-feedback-projection',
+        'release-retention-hold',
         'set-subscription-retention','link-person','unlink-person','delete-person','list-people','set-person-channel','key-info',
         'principal-info','delivery-endpoints-list','disable-delivery-endpoint','enable-delivery-endpoint',
         'reload-delivery-policy','set-delivery-features','migrate-expand','set-module-cursor','abandon-module-gap',
@@ -95,6 +96,7 @@ def main():
         help='issue-key: refuse principal_exists instead of rewriting an existing principal (ANYM-496)')
     parser.add_argument('--days',type=int,help='issue-key: 1-365 (default 7); extend-key: required, 1-365')
     parser.add_argument('--input',type=Path)
+    parser.add_argument('--file',type=Path,help='record-feedback-projection: a JSON file, or /dev/stdin, with {"projections": [...]} (ANYM-988)')
     parser.add_argument('--spool',type=Path)
     parser.add_argument('--snapshot-dir',type=Path)
     parser.add_argument('--dump-command',help='Operator-only JSON argv; never a shell string')
@@ -275,6 +277,12 @@ def main():
             print(json.dumps(store.set_feedback_status(args.feedback_ids,args.status,fixed_in=args.fixed_in,
                 spec_ref=args.spec,duplicate_of=args.duplicate_of,note=args.note,
                 **{name:value for name,value in (('unchanged_since',args.unchanged_since),('not_after',args.not_after)) if value})))
+        elif args.command=='record-feedback-projection':
+            # ANYM-988: the controller records the reader's decisions and released briefs; counts only on stdout.
+            if not args.file: parser.error('record-feedback-projection requires --file')
+            try: document=json.loads(args.file.read_bytes()[:1<<20])
+            except (OSError,ValueError): raise ValueError('invalid_projection_file') from None
+            print(json.dumps(store.record_feedback_projection(document)))
         elif args.command=='export-feedback':
             print(json.dumps(store.export_feedback(since=args.since,changed_since=args.changed_since,page=args.page,
                 overlap=args.overlap,limit=args.limit)))

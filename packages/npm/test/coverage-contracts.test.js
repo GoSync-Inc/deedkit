@@ -48,10 +48,11 @@ const actions={
   listDeliveryAttempts:{endpoint_id:'11111111-1111-4111-8111-111111111111',limit:4},
   submitFeedback:{request_id:'synthetic-feedback',category:'quality',description:'Synthetic issue'},
   listFeedback:{limit:4},
+  exportFeedbackMetadata:{cursor:'synthetic-cursor',limit:4},
   listNegotiations:{states:['open','upcoming'],person:'11111111-1111-4111-8111-111111111111',limit:4},
 };
 const defaults=new Set(['capabilities','listChats','search','searchPeople','searchFiles',
-  'getSyncStatus','getUpdates','listSubscriptions','listFeedback','listDeliveryEndpoints','listNegotiations']);
+  'getSyncStatus','getUpdates','listSubscriptions','listFeedback','exportFeedbackMetadata','listDeliveryEndpoints','listNegotiations']);
 const camel=operation=>operation.replace(/_([a-z])/g,(_,letter)=>letter.toUpperCase());
 
 test('every public convenience helper delegates the exact operation and retains server JSON',async()=>{

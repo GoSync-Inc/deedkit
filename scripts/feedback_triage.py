@@ -155,8 +155,8 @@ def locked(state):
 
 # --- pull --------------------------------------------------------------------------------------------------------
 
-def remote(host, argv):
-    return run(['ssh', '-o', 'BatchMode=yes', host, shlex.join(argv)], SSH_TIMEOUT)
+def remote(host, argv, stdin=None):
+    return run(['ssh', '-o', 'BatchMode=yes', host, shlex.join(argv)], SSH_TIMEOUT, stdin)
 
 
 def export_pages(host, since, ssh=None):

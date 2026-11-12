@@ -1064,14 +1064,14 @@ def test_migration_70_runs_twice_and_keeps_the_counts_and_every_grant(seeded):
     emit(store)
     match_subscriptions(store)
     with store.pool.connection() as c:
-        c.execute('DELETE FROM archive_migrations WHERE version IN (70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93)')
+        c.execute('DELETE FROM archive_migrations WHERE version IN (70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94)')
         c.execute("UPDATE probe_metadata SET value='69' WHERE name='schema_version'")
         grants = c.execute("SELECT oid,relacl::text FROM pg_class WHERE relnamespace='public'::regnamespace ORDER BY oid").fetchall()
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '93'
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '93'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '94'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '94'
         assert c.execute('SELECT count(*) AS n FROM archive_migrations WHERE version=70').fetchone()['n'] == 1
         assert c.execute("SELECT oid,relacl::text FROM pg_class WHERE relnamespace='public'::regnamespace ORDER BY oid").fetchall() == grants
     assert activity(store, token, sid) == {'telegram': {'scanned': 1, 'matched': 1}}

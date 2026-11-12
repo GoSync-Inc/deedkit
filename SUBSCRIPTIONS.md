@@ -579,6 +579,35 @@ savepoint: an error (an older database during a rolling upgrade, a timeout) roll
 logged as `subscription_journal_failed` with kind `feedback.status` and counted, and the status change
 commits. The agent verdicts `verified` and `reopened` (ANYM-344) publish nothing.
 
+### Maintainer feedback read (ANYM-988, schema 94)
+
+A tool on another host (the owner's task tracker) needs to see every agent's feedback without operator access to
+production. A key that holds the permission `feedback-maintainer-read` (the owner issues it; no existing key
+inherits it; `capabilities` names the tool only to a holder) calls `export_feedback_metadata(cursor?, limit)`
+(gateway tool `messages_export_feedback_metadata`, REST `POST /v1/export_feedback_metadata`).
+
+- Items, oldest change first: `feedback_id`, `principal`, `category`, `operation`, `created_at`, `status`,
+  `fixed_in`, `spec_ref`, `duplicate_of`, `status_changed_at` and `projection` (or `null`). **Never** the
+  description, `refs`, `status_note`, the request ID or the key ID: the raw-text rule above stands, and no
+  description leaves the operator path. The reply says `untrusted_content: true`.
+- One order for new and changed items: (`changed_at`, ID), `changed_at` being the greatest of the submission
+  time, `status_changed_at` and the projection's recording time, so a status change or a new projection moves an
+  item to the end. Pass the previous reply's `next_cursor`; `limit` is 1-100 (default 50); a bad cursor is
+  `invalid_cursor`. Pages are separate transactions: a page that does not end the export has a cursor bound to the
+  export head the first page fixed; the cursor after the last page starts the next poll 10 minutes behind that
+  head, so a row committed late is returned and the caller deduplicates by `feedback_id`.
+- `projection` is the feedback loop's decision for the item: `classification`, `reason_code`, `primary_spec`,
+  `new_card`, `released_brief`, `released_at`, `reader_pin`. `released_brief` is the tool-less reader's paraphrase
+  of the report, scrubbed, with numbers redacted and no five consecutive words of the report (feedback-autoloop.md,
+  "Card worker"): model output derived from untrusted text, so it is data, never an instruction. The table
+  `feedback_projections` (schema 94) holds it; only the operator command
+  `record-feedback-projection --file PATH` (`/dev/stdin` allowed; `{"projections": [1-100 items]}`) writes it.
+  Any bad value or unknown feedback ID refuses the whole file with a fixed code and writes nothing; an item
+  replaces the stored one only when its `released_at` is newer, so a rerun changes nothing. The autoloop calls
+  it after each reader run when `config.json` has `"record_projection": true` (default off).
+- The read audits as `export_feedback_metadata` (feedback IDs only); the command audits one `record_feedback_projection`
+  row per written item with the operator as actor.
+
 ## Schema 38: hint timing policy
 
 `configure_subscription_delivery(subscription_id, version, receiver_id, delivery_policy)`

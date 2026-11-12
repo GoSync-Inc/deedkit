@@ -59,6 +59,7 @@ export type ToolName =
   | 'messages_delete_wake_target'
   | 'messages_dismiss_reply'
   | 'messages_execute_messenger_operation'
+  | 'messages_export_feedback_metadata'
   | 'messages_fetch_subscription_events'
   | 'messages_get_attachment'
   | 'messages_get_context'

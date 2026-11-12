@@ -463,6 +463,6 @@ def test_migration_074_refuses_an_unusable_index_of_its_name_and_builds_it_once_
         store.migrate()
         store.migrate()
         with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '93'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '94'
             assert c.execute("SELECT pg_get_indexdef('public.events_created_at'::regclass) AS d").fetchone()['d'] == (
                 'CREATE INDEX events_created_at ON public.events USING btree (created_at)')

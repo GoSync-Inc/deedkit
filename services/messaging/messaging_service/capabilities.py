@@ -108,6 +108,7 @@ def capabilities(self, token, detail='full', sections=None):
             features['read'].extend(['list_subscriptions','get_subscription','get_subscription_events','fetch_subscription_events','wait_for_subscription_events','list_feedback'])
             features['subscription-ack']=['ack_subscription_events']
             features['feedback-write']=['submit_feedback']
+            features['feedback-maintainer-read']=['export_feedback_metadata']  # ANYM-988: named only to a key that holds it
             features['subscription-write']=['create_subscription','update_subscription','configure_subscription_delivery','test_subscription']
             from .delivery_endpoints import TOOLS as delivery_tools
             features['delivery-write']=list(delivery_tools)

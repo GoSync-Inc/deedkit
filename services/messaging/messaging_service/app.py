@@ -45,6 +45,7 @@ from .tool_types import (  # noqa: F401  (the moved names stay importable from h
     WakeTargetSubscriptions, WakeTargetLabel, WakeTargetBudget, WakeConfirmationCode, no_schema_default)
 from .app_tools.archive import register_archive_tools
 from .app_tools.conversations import register_conversation_tools
+from .app_tools.feedback import register_feedback_maintainer_tools
 from .app_tools.subscriptions import register_delivery_tools, register_subscription_tools
 from .app_tools.updates import register_update_tools
 # The only calls whose body may pass 16 KiB (ANYM-547: inline files of messages_send); REST path or MCP tool name.
@@ -469,6 +470,7 @@ def register_tools(mcp, call, async_call):
     register_subscription_tools(mcp, call, async_call, read, upload_write)
     register_delivery_tools(mcp, call, async_call, read, upload_write)
     register_feedback_tools(mcp, call, read, upload_write)
+    register_feedback_maintainer_tools(mcp, call, read)
 
 
 def register_send_tools(mcp, call, async_call, read):
@@ -948,7 +950,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
                     'fetch_subscription_events','ack_subscription_events','wait_for_subscription_events','configure_subscription_delivery','test_subscription','submit_feedback','list_feedback',
                     'register_delivery_endpoint','list_delivery_endpoints','update_delivery_endpoint','delete_delivery_endpoint','test_delivery_endpoint',
                     'list_delivery_attempts','register_wake_target','list_wake_targets','update_wake_target',
-                    'delete_wake_target','confirm_wake_target','list_negotiations'}
+                    'delete_wake_target','confirm_wake_target','list_negotiations','export_feedback_metadata'}
         method=request.path_params['operation']
         if method not in operations: raise APIError('not_found',404)
         try:
