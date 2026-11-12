@@ -6,6 +6,10 @@ the line `Review record: none (owner 11-11: no reviews)`; the merge keeper and t
 enqueue it with no approval. This document holds DeedKit's pull request lines: the change-path grep,
 the host-format rule and the autoloop protected paths.
 
+Agent-facing feature PRs include the baseline, implementation decision and integrated same-task
+comparison from [agent feature experiments](agent-feature-experiments.md) in the existing author
+checklist. Functional checks remain failing-first; no review or extra approval is added.
+
 ## Codex budget
 
 The line is printed by `~/deedkit-orchestrator/bin/codex-meter.sh` from the orchestrator's config.sh

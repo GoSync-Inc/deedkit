@@ -12,7 +12,8 @@ in public issues. Use synthetic reproducers. Do not test against other people's 
 Messages, extracted file text and model output are untrusted source data. They must
 not authorize sends, tool execution or changes to access scopes. Text sending is
 opt-in for both the account and agent credential. The acting agent must obtain
-exact owner confirmation; this release has no server approval gate. See SENDING.md.
+exact owner confirmation, subject to AGENTS.md section 1's scoped goal overrides;
+this release has no server approval gate. See SENDING.md.
 Provider authentication is done only in an owner's terminal.
 
 Backup delivery is distinct from successful restoration. Verify a copy in an isolated
@@ -103,4 +104,4 @@ the hook also looks there, and `python3` in `/usr/bin` (mini) or on `PATH` (lapt
 Ubuntu, which has `timeout`. Cloud sessions were not checked. The production host runs no agent session: an SSH command
 is checked on the machine that starts it, and Codex does not read `.claude/` hooks.
 
-Android app secrets (ANYM-969): a value a phone run types as `${secret:NAME}` lives only in `<state_dir>/secrets.json` (0600, atomic replace) on the phone host and is set from standard input by `deedkit-android secret set`; no HTTP route or tool sets, reads or lists one, the worker types it only into a focused editable field of the app it is bound to, names holding PIN, CVV, CVC, CARD, OTP or PASSCODE are refused, and every read of a run after the typing (receipt, failure observation) shows the reference instead, with no screenshot. Details: services/android/README.md, "Secrets".
+Android app secrets (ANYM-969, guarded executor): a value a phone run types as `${secret:NAME}` lives only in `<state_dir>/secrets.json` (0600, atomic replace) on the phone host and is set from standard input by `deedkit-android secret set`; no HTTP route or tool sets, reads or lists one, the worker types it only into a focused editable field of the app it is bound to, names holding PIN, CVV, CVC, CARD, OTP or PASSCODE are refused, and every read of a run after the typing (receipt, failure observation) shows the reference instead, with no screenshot. The replacement ordinary Codex path (ANYM-993) does not resolve this secret store; its scoped authority and native sandbox are described in [agent feature experiments](docs/operations/agent-feature-experiments.md). Details: services/android/README.md, "Secrets".

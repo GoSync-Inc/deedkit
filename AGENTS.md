@@ -1,15 +1,12 @@
 # DeedKit agent rules
 
-Process: harness egerev/agent-harness @ 0.83.0, ~/agent-harness; this file adds project rules.
-Claude Code loads harness process.md through the SessionStart hook (`.claude/hooks/harness.sh`:
-merged `origin/main`, else the pinned copy). Codex and cloud agents read the pinned copy
-docs/harness/process.md first. If no harness text is in context, stop and report BLOCKED. Each
-section below adds to the harness section with the same number.
+Process: egerev/agent-harness @ 0.83.0, ~/agent-harness; project additions below.
+Claude Code loads process.md through `.claude/hooks/harness.sh`; Codex/cloud read pinned
+docs/harness/process.md first. Without harness text, report BLOCKED. Sections extend the harness.
 
-DeedKit is the product; the repo keeps its AnyMsg identities (`anymsg`, `messaging_service`,
-`ANYM-*`, package, API and database names).
+DeedKit keeps AnyMsg identities (`anymsg`, `messaging_service`, `ANYM-*`, package/API/database names).
 
-Installing for yourself on your own server? Read docs/personal-install.md.
+Personal installation: docs/personal-install.md.
 
 Harness values: ruleset `deploy/main-ruleset.json`; required checks `CI gate` and
 `checks / verify`; CI check IDs: the seven `anymsg-ci::*` checks; deploy command
@@ -27,8 +24,12 @@ docs/operations/parallel-development.md.
 ## 1. Always
 
 - No send, call, ACK, pairing or provider-session start/stop without the owner's exact
-  confirmation, except the incident recovery authority in section 2. Never retry an uncertain mutation or mint a new request ID. Never run two clients
+  confirmation, except scoped overrides below and section 2 recovery. Never retry an uncertain mutation or mint a new request ID. Never run two clients
   on one provider session. Tests and health checks never touch a live provider.
+- Override: Android goal execution (owner 11-12: «Просто голый кодекс», «взять прям минимум
+  инструкций»): phone information, agent role and caller goal; native Codex sandbox, no custom
+  per-tap guard or injected order/payment stop. Section 2's five decisions and unrelated
+  messenger/provider live-action confirmations stay. Authority, incident and enforcer: docs/operations/agent-feature-experiments.md.
 - Override: the exact confirmation per message in one courier chat (owner 11-11: «Если ему говорю
   какую-то цель, он там может серию сообщений делать сам. Я вообще с водителем не хочу общаться ... он может
   полностью их проводить, пока они не доходят до меня, если только он не справляется»). Under the owner's goal for
@@ -46,17 +47,16 @@ docs/operations/parallel-development.md.
 ## 2. What the owner keeps
 
 Authority: owner decision D25 (harness, 2026-10-27, «1) да 2)да 3)да»): the owner keeps only the
-five harness items; production changes, rollbacks, restores, destructive SQL, keys and access are
-agents' under the harness section 2 gates. Item 2 asks only what docs/DATA-POLICY.md does not
-cover; item 3 is the Budget line above. The live actions act on the owner's messenger accounts
-under the owner's name (item 4) and the owner's devices and provider auth (item 5): they keep
-section 1's exact confirmation. In a task (a ready card) the agent applies its migration under
+five harness items; production, rollback, restore, destructive SQL, keys/access follow harness section 2.
+Item 2 asks only what docs/DATA-POLICY.md does not cover; item 3 is Budget above. Live actions use the
+owner's accounts/name (item 4) and devices/auth (item 5): section 1's scoped overrides apply.
+In a ready card the agent applies its migration under
 production.md "Migration releases"; enabling a feature never includes send, call, pairing,
 session or allowlist changes, and none of it runs during an active call.
 
-Releases and migrations follow harness process.md section 2 (owner 11-04: «давай все делать не ждать ничего»).
-production.md "Migration risk tiers" lists what deletes or rewrites user data (critical);
-"Migration releases" item 4 is the hand route.
+Releases/migrations: harness section 2 (owner 11-04: «давай все делать не ждать ничего»).
+production.md "Migration risk tiers" defines critical data rewrites/deletions; "Migration releases"
+item 4 gives the hand route.
 
 Override: harness process.md sections 1–5, incident recovery only
 (owner 10-30, Telegram sends: «это быстрый hotfix», «И только после этого уже продолжаем работу
@@ -82,12 +82,15 @@ live action from it wait for the owner, and so does that document's boundary.
 
 ## 3. Change paths
 
-The signal grep is in docs/operations/review-protocol.md. AUTO+review is gone (section 5): a path is
-AUTO or OWNER.
+Signal grep: docs/operations/review-protocol.md. Paths: AUTO or OWNER; no AUTO+review (section 5).
 
 ## 4. Product context and Tiden
 
-Product IDs and DeedKit's queue rules: docs/operations/tiden-product-workflow.md; CI: TIDEN-CI.md.
+Agent-facing features start with an ordinary-agent end-to-end experiment: basic context and task,
+then compare completion, usability, time and turns against the final integrated caller path.
+Wrapper constraints need a demonstrated reason and measured cost. Follow
+docs/operations/agent-feature-experiments.md; failing-first functional checks remain.
+Product/queue: docs/operations/tiden-product-workflow.md; CI: TIDEN-CI.md.
 
 ## 5. Reviews
 
