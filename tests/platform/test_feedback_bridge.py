@@ -124,9 +124,11 @@ class FakeGateway:
         return {'subscriptions': [dict(s) for s in self.subs]}
 
     def messages_set_feedback_triage(self, feedback_id, status, request_id, expected_status, expected_changed_at,
-                                     duplicate_of=None):
+                                     duplicate_of=None, spec_ref=None):
         if request_id in self.writes:
             return self.writes[request_id]
+        if status == 'accepted' and spec_ref is None:  # the server's rule (ANYM-992): accepted names its card
+            raise fb.Refused('invalid_feedback', 400)
         if self.write_mode == 'uncertain_not_applied':
             self.write_mode = None
             raise fb.Uncertain('gateway_unreachable')
@@ -134,7 +136,8 @@ class FakeGateway:
         if item['status'] != expected_status or item['status_changed_at'] != expected_changed_at:
             raise fb.Refused('version_conflict', 409)
         self.seq += 1
-        item.update(status=status, status_changed_at=iso(NOW + self.seq), _seq=self.seq, duplicate_of=duplicate_of)
+        item.update(status=status, status_changed_at=iso(NOW + self.seq), _seq=self.seq, duplicate_of=duplicate_of,
+            spec_ref=spec_ref)
         result = self.writes[request_id] = {'feedback_id': feedback_id, 'status': status,
             'status_changed_at': item['status_changed_at']}
         if self.write_mode == 'uncertain_applied':
@@ -545,12 +548,12 @@ def test_reverse_writes_a_task_side_acceptance_once_with_a_deterministic_request
     gw.submit(row(1))
     bridge.cycle()
     key = task_of(tasks, 1)['key']
-    tasks.human(key, status='todo')
+    tasks.human(key, status='todo', labels=['feedback', 'spec:ANYM-990'])
     version = tasks.tasks[key]['updatedAt']
     assert bridge.reverse()['written'] == 1
     write = gw.calls('messages_set_feedback_triage')[0]
     assert write == {'feedback_id': fid(1), 'status': 'accepted', 'expected_status': 'received', 'expected_changed_at': None,
-        'request_id': fb.request_id(fid(1), 'T001', version)}
+        'request_id': fb.request_id(fid(1), 'T001', version), 'spec_ref': 'ANYM-990'}
     assert re.fullmatch(r'[0-9a-f]{32}', write['request_id'])
     assert bridge.reverse()['written'] == 0 and len(gw.calls('messages_set_feedback_triage')) == 1
     bridge.cycle()  # the forward pass sees `accepted` and the task already compatible: no rewrite
@@ -576,6 +579,54 @@ def test_reverse_declines_a_canceled_task_and_marks_a_duplicate_only_with_its_li
     for _ in range(3):
         bridge.reverse()
     assert [ref for ref, body in tasks.comments if 'Duplicate-Of' in body] == [three]
+    assert all('spec_ref' not in write for write in writes.values())  # declined and duplicate carry no card
+
+
+# spec: ANYM-992
+def test_an_acceptance_names_its_card_from_the_task_label_else_from_the_projection_and_with_neither_writes_nothing(tmp_path):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1, projection=projection()))  # primary card ANYM-12
+    gw.submit(row(2, projection=projection()))
+    gw.submit(row(3))
+    gw.submit(row(4, projection=projection()))
+    bridge.cycle()
+    keys = {n: task_of(tasks, n)['key'] for n in (1, 2, 3, 4)}
+    assert bridge.ledger.link(fid(1))['primary_spec'] == 'ANYM-12' and bridge.ledger.link(fid(3))['primary_spec'] is None
+    tasks.human(keys[1], status='todo')  # no label: the projection's card
+    tasks.human(keys[2], status='todo', labels=['feedback', 'spec:ANYM-77'])  # the label wins
+    tasks.human(keys[3], status='todo')  # neither
+    tasks.human(keys[4], status='in_progress', labels=['feedback', 'spec:ANYM-1', 'spec:ANYM-2'])  # two labels: not a choice
+    assert bridge.reverse()['written'] == 3
+    writes = {w['feedback_id']: w for w in gw.calls('messages_set_feedback_triage')}
+    assert {fid(n): writes[fid(n)]['spec_ref'] for n in (1, 2, 4)} == {fid(1): 'ANYM-12', fid(2): 'ANYM-77', fid(4): 'ANYM-12'}
+    assert fid(3) not in writes
+    said = [body for ref, body in tasks.comments if ref == keys[3]]
+    assert len(said) == 1 and 'card is needed' in said[0] and 'spec:ANYM-<n>' in said[0]
+    for _ in range(3):
+        assert bridge.reverse()['written'] == 0
+    assert len([1 for ref, body in tasks.comments if ref == keys[3]]) == 1 and fid(3) not in [
+        w['feedback_id'] for w in gw.calls('messages_set_feedback_triage')]
+    tasks.human(keys[3], labels=['feedback', 'spec:ANYM-88'])  # the human names the card: the next pass writes it
+    assert bridge.reverse()['written'] == 1
+    assert gw.calls('messages_set_feedback_triage')[-1]['spec_ref'] == 'ANYM-88'
+    assert len([1 for ref, body in tasks.comments if ref == keys[3]]) == 1
+
+
+# spec: ANYM-992
+def test_a_ledger_of_an_earlier_version_gains_the_primary_card_column_and_keeps_its_rows(tmp_path):
+    import sqlite3
+    state = tmp_path / 'state'
+    state.mkdir()
+    old = sqlite3.connect(state / 'ledger.sqlite3')
+    old.execute('CREATE TABLE links(fid TEXT PRIMARY KEY, task_id TEXT, task_key TEXT, skipped INTEGER NOT NULL DEFAULT 0, '
+        'fb_status TEXT, fb_changed_at TEXT, fp TEXT, title TEXT, desc_sha TEXT, bridge_version TEXT, seen_version TEXT)')
+    old.execute("INSERT INTO links(fid,task_id,task_key,fb_status) VALUES('f-1','T1','DK-1','received')")
+    old.commit()
+    old.close()
+    ledger = fb.Ledger(state)
+    assert ledger.link('f-1')['task_key'] == 'DK-1' and ledger.link('f-1')['primary_spec'] is None
+    ledger.update_link('f-1', primary_spec='ANYM-5')
+    assert fb.Ledger(state).link('f-1')['primary_spec'] == 'ANYM-5'
 
 
 # spec: ANYM-990
@@ -613,7 +664,7 @@ def test_an_uncertain_status_write_that_applied_is_read_back_and_not_replayed(tm
     bridge, gw, tasks = make(tmp_path)
     gw.submit(row(1))
     bridge.cycle()
-    tasks.human(task_of(tasks, 1)['key'], status='todo')
+    tasks.human(task_of(tasks, 1)['key'], status='todo', labels=['feedback', 'spec:ANYM-990'])
     gw.write_mode = 'uncertain_applied'
     assert bridge.reverse()['written'] == 1
     assert len(gw.calls('messages_set_feedback_triage')) == 1 and bridge.ledger.link(fid(1))['fb_status'] == 'accepted'
@@ -625,7 +676,7 @@ def test_an_uncertain_status_write_that_did_not_apply_is_replayed_with_the_same_
     bridge, gw, tasks = make(tmp_path)
     gw.submit(row(1))
     bridge.cycle()
-    tasks.human(task_of(tasks, 1)['key'], status='todo')
+    tasks.human(task_of(tasks, 1)['key'], status='todo', labels=['feedback', 'spec:ANYM-990'])
     gw.write_mode = 'uncertain_not_applied'
     assert bridge.reverse()['written'] == 1
     sent = gw.calls('messages_set_feedback_triage')
@@ -641,7 +692,7 @@ def test_a_conflict_is_not_replayed_the_server_status_wins_and_a_comment_says_so
     gw.server_change(1, 'fixed')
     gw.rows[0]['fixed_in'] = 'a' * 40
     key = task_of(tasks, 1)['key']
-    tasks.human(key, status='todo')  # the human acts on a status the server has already left
+    tasks.human(key, status='todo', labels=['feedback', 'spec:ANYM-990'])  # the human acts on a status the server has already left
     assert bridge.reverse()['written'] == 0
     assert len(gw.calls('messages_set_feedback_triage')) == 1
     assert tasks.tasks[key]['status'] == 'in_review'
@@ -656,7 +707,7 @@ def test_an_incomplete_task_listing_changes_nothing_and_a_missing_write_tool_lea
     bridge, gw, tasks = make(tmp_path)
     gw.submit(row(1))
     bridge.cycle()
-    tasks.human(task_of(tasks, 1)['key'], status='todo')
+    tasks.human(task_of(tasks, 1)['key'], status='todo', labels=['feedback', 'spec:ANYM-990'])
     tasks.fail_list = fb.Incomplete('tasks_listing_incomplete')
     with pytest.raises(fb.Incomplete):
         bridge.reverse()

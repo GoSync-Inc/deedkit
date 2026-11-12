@@ -20,7 +20,7 @@ const METHODS = Object.freeze([
   'list_messenger_operations','preview_messenger_operation','execute_messenger_operation','get_messenger_operation',
   'create_subscription','list_subscriptions','get_subscription','update_subscription','get_subscription_events',
   'fetch_subscription_events','ack_subscription_events','wait_for_subscription_events',
-  'configure_subscription_delivery','test_subscription','submit_feedback','list_feedback','export_feedback_metadata',
+  'configure_subscription_delivery','test_subscription','submit_feedback','list_feedback','export_feedback_metadata','set_feedback_triage',
   'register_delivery_endpoint','list_delivery_endpoints','update_delivery_endpoint','delete_delivery_endpoint','test_delivery_endpoint',
   'list_delivery_attempts',
   'prepare_file_upload','upload_file_chunk','get_file_upload',
@@ -171,7 +171,11 @@ const FEEDBACK_FIELDS = Object.freeze({
   submit_feedback: [['request_id','category','description'],['request_id','category','description','operation','refs']],
   list_feedback: [[],['limit','status']],
   export_feedback_metadata: [[],['cursor','limit']],
+  set_feedback_triage: [['feedback_id','status','expected_status','expected_changed_at','request_id'],
+    ['feedback_id','status','expected_status','expected_changed_at','request_id','spec_ref','duplicate_of','note']],
 });
+const TRIAGE_STATUSES = Object.freeze(['accepted','declined','duplicate']);
+const FEEDBACK_UUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const SUBSCRIPTION_KINDS = new Set(['message.created','message.edited','message.deleted',
   'message.status','attachment.ready','file.text.ready','file.transcript.ready',
   'file.description.ready','file.processing.failed','send.failed','source.health','attachment.failed','poll.updated','contact.birthday']);
@@ -362,7 +366,15 @@ function feedbackArguments(method,args) {
     let valid;
     if (key==='request_id') valid=requestId(value);
     else if (key==='limit') valid=Number.isSafeInteger(value) && value>=1 && value<=100;
-    else if (key==='status') valid=typeof value==='string' && FEEDBACK_STATUSES.includes(value);
+    else if (key==='status') valid=typeof value==='string' &&
+      (method==='set_feedback_triage' ? TRIAGE_STATUSES : FEEDBACK_STATUSES).includes(value);
+    else if (key==='expected_status') valid=typeof value==='string' && FEEDBACK_STATUSES.includes(value);
+    else if (key==='expected_changed_at') valid=value===null || typeof value==='string' && value.length>=20 && value.length<=64;
+    else if (key==='feedback_id') valid=typeof value==='string' && FEEDBACK_UUID.test(value);
+    else if (key==='duplicate_of') valid=value===null || typeof value==='string' && FEEDBACK_UUID.test(value);
+    else if (key==='spec_ref') valid=value===null || typeof value==='string' && /^ANYM-[1-9][0-9]{0,5}$/.test(value);
+    else if (key==='note') valid=value===null || typeof value==='string' && [...value].length>=1 && [...value].length<=280 &&
+      value.trim().length>0 && !/[\x00-\x1f\x7f]/.test(value);
     else if (key==='cursor') valid=typeof value==='string' && value.length>=1 && value.length<=512;
     else if (key==='category') valid=typeof value==='string' && ['bug','feature','quality','other'].includes(value);
     else if (key==='description') valid=typeof value==='string' && [...value].length>=1 &&
@@ -658,5 +670,8 @@ export class AnyMsgClient {
   }
   exportFeedbackMetadata(args={},options) {
     return this.call('export_feedback_metadata',feedbackArguments('export_feedback_metadata',args),options);
+  }
+  setFeedbackTriage(args,options) {
+    return this.call('set_feedback_triage',feedbackArguments('set_feedback_triage',args),options);
   }
 }

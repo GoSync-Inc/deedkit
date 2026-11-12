@@ -18,7 +18,8 @@ subscription (`wait_for_subscription_events`, 25 seconds), and a bb script autom
 The key holds the gateway tools `messages_export_feedback_metadata`, `messages_create_subscription`,
 `messages_list_subscriptions`, `messages_wait_for_subscription_events`, `messages_fetch_subscription_events` and
 `messages_ack_subscription_events`; the reverse path adds `messages_set_feedback_triage` (permission
-`feedback-maintainer-write`) when that card ships. Until the tool exists or is granted the reverse write stays idle:
+`feedback-maintainer-write`, ANYM-992). The key holds `feedback-maintainer-read`, `feedback-maintainer-write`,
+`subscription-write` and `subscription-ack`, and no `read`. Until the tool is granted the reverse write stays idle:
 the bridge prints `reverse_unavailable_<code>` to stderr and exits 0.
 
 ## Mapping
@@ -32,7 +33,10 @@ the bridge prints `reverse_unavailable_<code>` to stderr and exits 0.
 | declined, duplicate | canceled |
 | reopened | backlog |
 
-Task side to DeedKit: todo, in_progress or in_review on a received or reopened item writes `accepted`; canceled on a
+Task side to DeedKit: todo, in_progress or in_review on a received or reopened item writes `accepted` with the card that
+plans it, `spec_ref`: the task's label `spec:ANYM-<n>` (exactly one), else the primary card of the item's projection
+(`primary_spec`); with neither, nothing is written and the bridge leaves one task comment that a card is needed (add the
+label and move the task again); canceled on a
 received, accepted or reopened item writes `declined`, or `duplicate` when the task carries the label `duplicate` and a
 line `Duplicate-Of: <feedback id>`; backlog changes nothing; done is never written (a comment says that done in BB is not
 fixed or deployed, which only release evidence sets).

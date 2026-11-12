@@ -72,10 +72,11 @@ def test_an_agents_grants_make_these_tools_visible_with_or_without_read(grants, 
     assert shown == expected | ({"messages_search"} if "read" in grants else set())
 
 
-def gateway(tmp_path, grants, permissions):
+def gateway(tmp_path, grants, permissions, answers=None):
     value = config()
     value["deployment"] = {"modules": ["messaging"], "backends": {"messaging": {"url": "http://messaging.test"}}}
-    value["profiles"] = {"agent": {"tools": ["platform_capabilities", *sorted(CALLS), "messages_search"], "actions": {}}}
+    value["profiles"] = {"agent": {"tools": ["platform_capabilities", *sorted(CALLS), "messages_search",
+                                            "messages_set_feedback_triage"], "actions": {}}}
     key = tmp_path / "a-messaging.key"
     key.write_text("backend-messaging-a")
     key.chmod(0o600)
@@ -93,8 +94,10 @@ def gateway(tmp_path, grants, permissions):
         operation = request.url.path.removeprefix("/v1/")
         if operation == "capabilities":
             return httpx.Response(200, json={"permissions": permissions, "tool_manifest": {"names": sorted(
-                name.removeprefix("messages_") for name in CALLS)}})
+                [name.removeprefix("messages_") for name in CALLS] + ["set_feedback_triage"])}})
         reached.append(operation)
+        if answers and operation in answers:
+            return httpx.Response(answers[operation][0], json=answers[operation][1])
         return httpx.Response(200, json={"items": [], "synthetic": True})
     app = create_app(path, "http://testserver", transports={"messaging": httpx.MockTransport(respond)})
     return app, reached
@@ -125,3 +128,30 @@ def test_a_key_that_lost_the_permission_at_the_backend_is_refused_though_the_gra
         assert client.post("/v1/messages_create_subscription", json=CALLS["messages_create_subscription"],
                            headers=HEADERS).status_code == 200  # the backend decides the rest
     assert "fetch_subscription_events" not in reached and "wait_for_subscription_events" not in reached
+
+
+TRIAGE = {"feedback_id": SUBSCRIPTION, "status": "accepted", "expected_status": "received", "expected_changed_at": None,
+          "request_id": "gateway-triage-1", "spec_ref": "ANYM-992"}
+
+
+# spec: ANYM-992
+def test_the_gateway_admits_the_triage_write_by_its_own_scope_and_relays_a_lost_race_and_a_replay(tmp_path):
+    assert CATALOG["messages_set_feedback_triage"]["scopes"] == ["feedback-maintainer-write"]
+    assert not CATALOG["messages_set_feedback_triage"].get("alt_scopes")
+    assert CATALOG["messages_set_feedback_triage"]["annotations"]["readOnlyHint"] is False
+    answers = {"set_feedback_triage": (409, {"error": "version_conflict"})}
+    app, reached = gateway(tmp_path, ["feedback-maintainer-write"], ["feedback-maintainer-write"], answers)
+    with TestClient(app) as client:
+        assert "messages_set_feedback_triage" in client.post("/v1/platform_capabilities", json={}, headers=HEADERS).json()["tools"]
+        lost = client.post("/v1/messages_set_feedback_triage", json=TRIAGE, headers=HEADERS)
+        assert lost.status_code == 409 and lost.json()["error"] == "version_conflict"
+        for bad in ({**TRIAGE, "status": "fixed"}, {**TRIAGE, "extra": 1}, {**TRIAGE, "spec_ref": "card"}):
+            assert client.post("/v1/messages_set_feedback_triage", json=bad, headers=HEADERS).status_code in (400, 422)
+    assert reached == ["set_feedback_triage"]
+    # without the grant the tool is neither listed nor reached; the read permission alone never stands for it
+    app, reached = gateway(tmp_path, [PERMISSION, "subscription-write"], [PERMISSION, "subscription-write"])
+    with TestClient(app) as client:
+        assert "messages_set_feedback_triage" not in client.post("/v1/platform_capabilities", json={},
+                                                                headers=HEADERS).json()["tools"]
+        assert client.post("/v1/messages_set_feedback_triage", json=TRIAGE, headers=HEADERS).status_code in (403, 404)
+    assert "set_feedback_triage" not in reached

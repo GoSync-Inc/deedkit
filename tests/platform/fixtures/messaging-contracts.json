@@ -5511,6 +5511,125 @@
         "title": "export_feedback_metadataDictOutput",
         "type": "object"
       }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "For a maintainer key (`feedback-maintainer-write`) only: move one feedback item to accepted (spec_ref ANYM-n required: the card), declined or duplicate (duplicate_of the same key's other item, or spec_ref). Nothing else: fixed, verify_requested, verified and reopened come from release evidence and the reporting agent. Compare-and-set: pass the item's status and status_changed_at as export_feedback_metadata showed them (status_changed_at null if it never changed); another value is version_conflict (409) and nothing is written, and so is an item that is already fixed, verify_requested or verified. Idempotent by request_id: the same id and payload returns the same answer (replayed), another payload is idempotency_conflict. note (at most 280 characters) is shown to the reporting agent: URLs and file paths are stripped from it. Publishes the usual status event to the reporting key. Returns feedback_id, status, status_changed_at, spec_ref, duplicate_of, replayed.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "duplicate_of": {
+            "anyOf": [
+              {
+                "maxLength": 36,
+                "minLength": 36,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Duplicate Of"
+          },
+          "expected_changed_at": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 20,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Changed At"
+          },
+          "expected_status": {
+            "enum": [
+              "received",
+              "accepted",
+              "declined",
+              "duplicate",
+              "fixed",
+              "verify_requested",
+              "verified",
+              "reopened"
+            ],
+            "title": "Expected Status",
+            "type": "string"
+          },
+          "feedback_id": {
+            "maxLength": 36,
+            "minLength": 36,
+            "title": "Feedback Id",
+            "type": "string"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "maxLength": 280,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Note"
+          },
+          "request_id": {
+            "maxLength": 128,
+            "minLength": 8,
+            "pattern": "^[A-Za-z0-9_.:-]+$",
+            "title": "Request Id",
+            "type": "string"
+          },
+          "spec_ref": {
+            "anyOf": [
+              {
+                "pattern": "^ANYM-[1-9][0-9]{0,5}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Spec Ref"
+          },
+          "status": {
+            "enum": [
+              "accepted",
+              "declined",
+              "duplicate"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "feedback_id",
+          "status",
+          "expected_status",
+          "expected_changed_at",
+          "request_id"
+        ],
+        "title": "set_feedback_triageArguments",
+        "type": "object"
+      },
+      "name": "set_feedback_triage",
+      "outputSchema": {
+        "additionalProperties": true,
+        "title": "set_feedback_triageDictOutput",
+        "type": "object"
+      }
     }
   ],
   "transport": {

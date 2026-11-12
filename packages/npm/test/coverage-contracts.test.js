@@ -49,6 +49,7 @@ const actions={
   submitFeedback:{request_id:'synthetic-feedback',category:'quality',description:'Synthetic issue'},
   listFeedback:{limit:4},
   exportFeedbackMetadata:{cursor:'synthetic-cursor',limit:4},
+  setFeedbackTriage:{feedback_id:'11111111-1111-4111-8111-111111111111',status:'accepted',expected_status:'received',expected_changed_at:null,request_id:'synthetic-triage-1',spec_ref:'ANYM-1'},
   listNegotiations:{states:['open','upcoming'],person:'11111111-1111-4111-8111-111111111111',limit:4},
 };
 const defaults=new Set(['capabilities','listChats','search','searchPeople','searchFiles',

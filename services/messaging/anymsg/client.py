@@ -169,7 +169,11 @@ _FEEDBACK_FIELDS = {
     'list_feedback': (set(), {'limit','status'}),
     # ANYM-988: a maintainer key's read of every agent's feedback metadata.
     'export_feedback_metadata': (set(), {'cursor','limit'}),
+    # ANYM-992: a maintainer key's guarded status write (accepted, declined, duplicate).
+    'set_feedback_triage': ({'feedback_id','status','expected_status','expected_changed_at','request_id'},
+        {'feedback_id','status','expected_status','expected_changed_at','request_id','spec_ref','duplicate_of','note'}),
 }
+_TRIAGE_STATUSES = ('accepted','declined','duplicate')
 _SUBSCRIPTION_KINDS = frozenset({'message.created','message.edited','message.deleted','message.status',
     'attachment.ready','file.text.ready','file.transcript.ready','file.description.ready','file.processing.failed',
     'send.failed','source.health','attachment.failed','poll.updated','contact.birthday'})
@@ -321,7 +325,17 @@ def _feedback_parameters(operation, parameters):
     for name,value in parameters.items():
         if name=='request_id':valid=_request_id(value)
         elif name=='limit':valid=type(value) is int and 1<=value<=100
-        elif name=='status':valid=isinstance(value,str) and value in _FEEDBACK_STATUSES
+        elif name=='status':valid=isinstance(value,str) and value in (
+            _TRIAGE_STATUSES if operation=='set_feedback_triage' else _FEEDBACK_STATUSES)
+        elif name=='expected_status':valid=isinstance(value,str) and value in _FEEDBACK_STATUSES
+        elif name=='expected_changed_at':valid=value is None or isinstance(value,str) and 20<=len(value)<=64
+        elif name in ('feedback_id','duplicate_of'):
+            valid=(name=='duplicate_of' and value is None) or isinstance(value,str) and bool(re.fullmatch(
+                r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}',value))
+        elif name=='spec_ref':valid=value is None or isinstance(value,str) and bool(re.fullmatch(r'ANYM-[1-9][0-9]{0,5}',value))
+        elif name=='note':
+            valid=value is None or isinstance(value,str) and 1<=len(value)<=280 and bool(value.strip()) and not any(
+                ord(ch)<32 or ord(ch)==127 for ch in value)
         elif name=='cursor':valid=isinstance(value,str) and 1<=len(value)<=512
         elif name=='category':valid=isinstance(value,str) and value in ('bug','feature','quality','other')
         elif name=='description':
@@ -816,6 +830,16 @@ class Client:
         """A maintainer key (feedback-maintainer-read): every agent's feedback metadata and the loop's released summary,
         oldest change first; never the description, references or notes. Pass the previous reply's next_cursor."""
         return self.call('export_feedback_metadata',{'limit':limit,**({} if cursor is None else {'cursor':cursor})})
+
+    def set_feedback_triage(self, *, feedback_id, status, expected_status, expected_changed_at, request_id,
+                            spec_ref=None, duplicate_of=None, note=None):
+        """A maintainer key (feedback-maintainer-write): move one item to accepted (spec_ref ANYM-n required), declined or
+        duplicate (duplicate_of, or spec_ref). Compare-and-set on the status and status_changed_at that
+        export_feedback_metadata showed (null if it never changed): a lost race is version_conflict, nothing written.
+        Idempotent by request_id. URLs and file paths are stripped from note."""
+        optional = (('spec_ref',spec_ref),('duplicate_of',duplicate_of),('note',note))
+        return self.call('set_feedback_triage',dict(feedback_id=feedback_id,status=status,expected_status=expected_status,
+            expected_changed_at=expected_changed_at,request_id=request_id,**{name:value for name,value in optional if value is not None}))
 
     def list_feedback(self, *, limit=50, status=None):
         """Read only this credential's private feedback and its status, without former source references."""

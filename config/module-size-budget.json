@@ -26,7 +26,7 @@
     "services/messaging/messaging_service/delivery_endpoints.py": {"lines": 1408, "longest_function": 83},
     "services/messaging/messaging_service/file_index.py": {"lines": 1040, "longest_function": 198},
     "services/messaging/messaging_service/outgoing.py": {"lines": 1067, "longest_function": 119},
-    "services/messaging/messaging_service/store.py": {"lines": 1818, "longest_function": 82},
+    "services/messaging/messaging_service/store.py": {"lines": 1822, "longest_function": 82},
     "services/messaging/messaging_service/subscriptions.py": {"lines": 1576, "longest_function": 134},
     "services/messaging/messaging_service/telegram_collector.py": {"lines": 1367, "longest_function": 78},
     "services/messaging/messaging_service/telegram_operations.py": {"lines": 1994, "longest_function": 207},
