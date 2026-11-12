@@ -274,7 +274,57 @@ a row fail before the tap, a send is uncertain (`unknown`, as for `send`), or th
 polls with `read`: nothing pushes a courier's message to it yet. `order_seen` records whether the order text is on
 screen; it is not a gate, because the app's chat title is unverified until the first live conversation.
 
-## Local agent
+## Local agent (bare Codex, ANYM-993)
+
+The default `android_agent start` path runs ordinary `codex exec` against the configured phone
+with serial-specific adb. Its task prompt gives the phone location, the owner-agent role and
+the caller goal. It follows that goal, including any order/payment boundary the caller states.
+Native Codex `workspace-write` sandbox and safeguards remain, with network enabled for adb;
+there is no custom per-action guard, phone MCP or guarded preamble in this path. The existing
+`agent.enabled` switch stays required.
+
+```json
+{"agent": {"enabled": true, "guarded": false},
+ "engines": {"codex": {"binary": "/absolute/path/codex", "version": "YOUR_PINNED_VERSION",
+                       "codex_home": "/private/engine/codex-home",
+                       "model": "gpt-6.1-terra", "reasoning_effort": "medium"}}}
+```
+
+`start` accepts `model` and `effort` (`minimal`, `low`, `medium`, `high`) per call; defaults
+are Terra medium, then host config, then call overrides. `apps` is optional.
+`owner_instruction` remains in the private request record; it is not injected into the prompt.
+Bare mode rejects `engine=claude`, `secrets`, `save_as` and `param_names`; it never resolves
+the app secret store. Login and pinned CLI version are checked without the guarded phone probe.
+The process receives only PATH (adb first), a private HOME, CODEX_HOME, ANDROID_SERIAL,
+and TMPDIR/LANG when configured.
+
+The run holds the phone lock until finalization. `get` long-polls by cursor and original
+request ID; `stop`, timeout and restart cancel its process group. Results include summary,
+data, missing outputs, command timings, tokens, effective model/effort, mode, and the final
+screenshot as an owner-scoped downloadable file. If capture fails, `final_screenshot` says
+`unavailable`. `model_ms` is elapsed engine time less observed command time, not a model-server
+measurement. `max_actions` is a command-count cancellation limit; a command already submitted
+by Codex may be in flight when cancellation arrives. Requests and logs retain the existing
+14-day policy. Phone content and task data go to OpenAI under the existing provider policy.
+
+Learning runs through an explicit structured-result contract in the same session. The service
+publishes validated per-app navigation into `CODEX_HOME/skills/android-<package>/SKILL.md`
+and loads it for the next run, even when the model writes no skill file. A small
+`android-learning` skill explains the contract. Only static resource IDs, action enums and
+defined navigation pitfalls are persisted; goals, summaries, screen text, task parameters,
+contacts, addresses and secrets never enter this knowledge format. No reusable observation
+means an empty lesson list; invalid output fails visibly, without publishing fabricated knowledge.
+The sandbox does not make the skills directory writable to the model; the service publishes
+it atomically after success.
+
+Rollback: with zero active runs, set `agent.guarded: true` and reload/restart the service
+through the documented mini release route. The previous phone-tool path below then applies.
+No existing learned app skill is deleted.
+
+### Guarded compatibility path
+
+The following instructions apply only when `agent.guarded: true`.
+
 
 `operation agent` (`POST /v1/agent`, scope `android:control`) hands a whole phone goal to a model-driven engine that runs
 on this host and drives the phone through the service's own guarded verbs, at local speed (ANYM-971). It is **off**
@@ -327,7 +377,7 @@ engine's provider (Anthropic for Claude Code, OpenAI for Codex), which is the ow
 - **Result.** `summary`, `data` and `missing_outputs`, `final_screen_text` (at most 8 KB), `screenshots` (at most 3
   file IDs for `android_download`), `action_log` (secrets as references), `timings`, `engine`, `model`, `tokens` and
   `preamble_version` (`agent_preamble.md`). Runs, events and logs are deleted 14 days after the run ends.
-- **Not yet.** The `android_agent` gateway tool and the production enable are ANYM-972.
+- The gateway tool carries start/get/stop; check actual host capabilities for availability.
 
 ## Execution and recovery
 

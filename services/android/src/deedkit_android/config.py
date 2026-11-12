@@ -46,6 +46,7 @@ class EngineConfig(Strict):
     binary: str
     version: str = Field(min_length=1, max_length=64)
     model: str | None = Field(default=None, min_length=1, max_length=128)
+    reasoning_effort: Literal['minimal', 'low', 'medium', 'high'] = 'medium'
     token_file: str | None = None
     codex_home: str | None = None
 
@@ -53,6 +54,7 @@ class EngineConfig(Strict):
 class AgentConfig(Strict):
     # Off until set: while false no run starts and no engine login file is read (ANYM-971 criterion 10).
     enabled: bool = False
+    guarded: bool = False
 
 
 class Config(Strict):
