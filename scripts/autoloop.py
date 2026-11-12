@@ -12,17 +12,19 @@ reader (ANYM-570).
     autoloop.py install-cli [--from PATH]
 
 `tick` takes the triage lock, the feedback-sync lock and its own, non-blocking in that order, and ends as busy with
-no write if one is held. With `PAUSE` it only fences: it closes the terminals of the loop's own workspaces (names
-from `intents/`), cancels the ready merges of `proposal/autoloop-` branches, disarms and dequeues `autoloop-` PRs and
-reads back; the stop is effective only after a clean read-back. Otherwise it reads Tiden and the feedback export
+no write if one is held. With `PAUSE` it only fences: it closes the terminals and stops the turns of the loop's own
+worker threads (intents from `intents/`, threads by their recorded IDs), cancels the ready merges of
+`proposal/autoloop-` branches, disarms and dequeues `autoloop-` PRs and reads back; the stop is effective only after
+a clean read-back (a thread still `stopping` then fails it; the next fenced tick sees it idle). Otherwise it reads Tiden and the feedback export
 whole (a failed or truncated read ends it with no write), then pulls, matches, settles `unknown` intents from the
-workspace list by name, applies owner-principal `AUTOLOOP STOP` and `AUTOLOOP DROP <id>` and, with `live: true` in
+thread list by title, applies owner-principal `AUTOLOOP STOP` and `AUTOLOOP DROP <id>` and, with `live: true` in
 `config.json`, runs the reader on the items within the daily caps (a decision the checks refuse leaves only its item
 in the inbox; after two such refusals the item waits for the orchestrator, `refused.json`); with `live: false` (the default) it writes
 `plan.json` and starts nothing. Provenance comes from `config.json` principals only. Launches (ANYM-571, ANYM-572)
 go through `admit` and `launch`: the intent, its slot and its full wall-clock limit are written before the start.
-Live, each new owner-agent cluster with a committed card brief gets one card worker (ANYM-571): a Superset workspace
-with the worker preset whose prompt names `briefs/autoloop-card.md`, the intent, the opaque cluster key, the feedback
+Live, each new owner-agent cluster with a committed card brief gets one card worker (ANYM-571): a bb thread (a child of
+`orchestrator_thread` in `config.json`, Claude Code, claude-sonnet-5-5) whose prompt names `briefs/common.md`,
+`briefs/bb-overlay.md`, `briefs/autoloop-card.md`, the intent, the opaque cluster key, the feedback
 IDs and the projection path, never feedback text; a card brief that copies feedback words is never released. The
 worker binds the card it creates (`bind`, so `hold ANYM-n` stops it) and ends with `finish`, after `decline` (a Fable
 reject, by reason code) or `large` (an epic, a card over 8 SP or a branch it does not own alone) when no Ready card
@@ -95,6 +97,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -159,12 +162,13 @@ No other field."""
 PROMPT = 'Decide every item of the JSON on stdin. Reply with the JSON object only.'
 SYNC_STATE = Path.home() / '.deedkit' / 'feedback-sync'  # feedback_sync.STATE: the lock of its ANYM-536 `auto`
 REPO = 'GoSync-Inc/deedkit'
-PROJECT = 'deedkit'  # the Superset project of the loop's workspaces
+PROJECT = 'proj_nfixav7q2f'  # the bb project of the loop's worker threads
 CALL_TIMEOUT = 120
 STALE = timedelta(hours=2)
 CAPS = {'items_per_principal': 20, 'reader_runs': 24, 'card_launches': 5, 'build_launches': 3, 'card_in_flight': 2,
         'build_in_flight': 2, 'worker_hours': 12}
-CONFIG = {'live': False, 'principals': [], 'tz': 'UTC', 'caps': CAPS}
+CONFIG = {'live': False, 'principals': [], 'tz': 'UTC', 'caps': CAPS, 'orchestrator_thread': None,
+          'worker_machine': None}
 LIMITS = {'card': 2 * 3600, 'build': 4 * 3600}  # each worker's wall-clock reservation, in seconds
 LIVE = ('reserved', 'unknown', 'started')  # intents that hold an in-flight slot
 CONTROL = re.compile(r'AUTOLOOP (STOP|DROP ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}))')
@@ -178,14 +182,22 @@ PR = ('number id state headRefName headRefOid baseRefName isDraft body mergedAt 
       'commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: 100) { nodes { '
       '... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } }')
 DEQUEUE = 'mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }'
-# The card worker (ANYM-571): a local workspace of the deedkit project with the worker preset (worker settings, empty
-# MCP config); its brief template stays in the harness, outside Git.
+# The card worker (ANYM-571): a bb thread of the deedkit project, a child of the orchestrator thread named in
+# config.json, running the Claude Code provider; its brief template stays in the harness, outside Git. A build worker
+# (ANYM-574) is a thread too: a one-line host for the terminal that runs the container runner's launcher.
 BRIEFS = Path.home() / 'deedkit-orchestrator' / 'briefs'
 CARD_BRIEF = BRIEFS / 'autoloop-card.md'
-PROJECT_ID = '705cd9cb-2688-4db6-8e65-abc4d978339c'
-PRESET = 'd2e1c0de-5eed-4b2c-9a10-2026101900aa'
-EFFORT = 'high'
-WORKSPACE_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{7,63}')
+BB_OVERLAY = BRIEFS / 'bb-overlay.md'  # what a bb worker follows after common.md (it wins on conflict)
+PROVIDER, WORKER_MODEL, HOST_MODEL, EFFORT = 'claude-code', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'high'
+NOTIFY = 'stuck'  # bb --parent-notifications of a worker: the orchestrator hears of a failure or a question, not of each end
+NO_ORCHESTRATOR = 'no orchestrator_thread in config.json'
+THREAD_ID = re.compile(r'thr_[a-z0-9]{6,40}')
+MACHINE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')  # a bb machine ID or name
+RUNNING = ('pending', 'starting', 'active', 'stopping')  # bb thread statuses of a turn that has not ended
+TERMINAL_ALPHABET = '23456789abcdefghijkmnpqrstuvwxyz'  # bb: `term_` plus ten of these
+TERMINAL_TRIES, TERMINAL_WAIT = 6, 5  # a new thread's environment may not be ready for its terminal at once
+HOST = ("This thread only hosts the terminal of one autoloop build ({name}). A script starts that terminal in this "
+        "thread's environment. Run no command, change no file, call no tool: answer `ready` and stop.")
 RETRY = ('lost', 'interrupted', 'cancelled', 'stopped')  # card intents after which a cluster gets its one relaunch
 # Status notes the agent can act on (plan §3 step 9), besides WITHDRAWN and the reader's opt-in hold.
 LARGE = 'queued: large card, built by the orchestrator'
@@ -556,7 +568,10 @@ def enter(stack, manager, what):
 
 
 def config(state):
-    """The owner-written config.json (0600): `live`, `principals`, `tz` and `caps`; a missing file is all defaults."""
+    """The owner-written config.json (0600): `live`, `principals`, `tz`, `caps`, `orchestrator_thread` (the bb
+    thread that parents every worker; a launch needs it) and `worker_machine` (the bb machine ID or name the workers
+    run on, `--machine`; none: the parent's machine). Nothing here assumes the host the controller runs on. A
+    missing file is all defaults."""
     path = state / 'config.json'
     if path.exists() and path.stat().st_mode & 0o077:
         raise Refused('config.json must be 0600')
@@ -566,13 +581,18 @@ def config(state):
     if not isinstance(raw, dict) or set(raw) - set(CONFIG) or not isinstance(raw.get('live', False), bool) \
             or not isinstance(principals, list) or not all(isinstance(p, str) and p for p in principals) \
             or not isinstance(caps, dict) or set(caps) - set(CAPS) \
-            or any(type(v) is not int or v < 0 for v in caps.values()):
+            or any(type(v) is not int or v < 0 for v in caps.values()) \
+            or not (raw.get('orchestrator_thread') is None or (isinstance(raw['orchestrator_thread'], str)
+                                                       and THREAD_ID.fullmatch(raw['orchestrator_thread']))) \
+            or not (raw.get('worker_machine') is None or (isinstance(raw['worker_machine'], str)
+                                                          and MACHINE.fullmatch(raw['worker_machine']))):
         raise Refused('config.json: an unknown key or a bad value')
     try:
         zone = ZoneInfo(raw.get('tz', CONFIG['tz']))
     except (ValueError, TypeError, ZoneInfoNotFoundError):
         raise Refused('config.json: unknown tz') from None
-    return {'live': raw.get('live', False), 'principals': set(principals), 'zone': zone, 'caps': dict(CAPS, **caps)}
+    return {'live': raw.get('live', False), 'principals': set(principals), 'zone': zone, 'caps': dict(CAPS, **caps),
+            'orchestrator_thread': raw.get('orchestrator_thread'), 'worker_machine': raw.get('worker_machine')}
 
 
 def counters(ledger, cfg, now):
@@ -659,7 +679,7 @@ def refund(state, intent, seconds):
 def launch(state, name, start, now):
     """Start a reserved intent once, under the tick lock. The intent is read back from intents/ (never a caller's
     copy) and the gate is checked again: PAUSE, a held card or a dropped item cancel it and return its reservation.
-    It is `unknown` before the call, so a crash or a lost response is settled by `reconcile` from the workspace
+    It is `unknown` before the call, so a crash or a lost response is settled by `reconcile` from the thread
     list, never by a second start."""
     intent = stored(state, name)
     if not intent or intent['status'] != 'reserved':
@@ -677,27 +697,32 @@ def launch(state, name, start, now):
     return intent, None
 
 
-def ours(intent, workspace):
-    """A workspace is an intent's only by its recorded ID. An `unknown` intent (start called, no reply) claims a
-    same-named workspace of the deedkit project created after its launch stamp; a reserved intent has none."""
-    if workspace.get('projectName') != PROJECT or workspace.get('name') != intent['name'] \
-            or not isinstance(workspace.get('id'), str):
+def archived(row):
+    return bool(row.get('archivedAt') or row.get('deletedAt'))
+
+
+def ours(intent, row):
+    """A thread row is an intent's only by its recorded ID. An `unknown` intent (start called, no reply) claims a
+    thread of the deedkit project with its name as the title, created after its launch stamp; a reserved intent has
+    none. (bb counts `createdAt` in milliseconds.)"""
+    if row.get('projectId') != PROJECT or not isinstance(row.get('id'), str):
         return False
     if intent.get('workspace'):
-        return workspace['id'] == intent['workspace']
-    if intent['status'] != 'unknown' or not intent.get('started_at'):
+        return row['id'] == intent['workspace']
+    if row.get('title') != intent['name'] or intent['status'] != 'unknown' or not intent.get('started_at'):
         return False
     try:
-        return utc(workspace.get('createdAt')) >= triage.when(intent['started_at']) - timedelta(minutes=1)
-    except (ValueError, TypeError):
+        created = datetime.fromtimestamp(row['createdAt'] / 1000, timezone.utc)
+        return created >= triage.when(intent['started_at']) - timedelta(minutes=1)
+    except (KeyError, ValueError, TypeError, OverflowError, OSError):
         return False
 
 
 def reconcile(state, listing, now):
-    """An `unknown` intent is started or lost by its workspace name; a started one whose workspace is gone without
-    `finish` is interrupted. Lost and interrupted runs keep their whole reservation; a found one keeps the time
+    """An `unknown` intent is started or lost by its thread's title; a started one whose thread is gone or archived
+    without `finish` is interrupted. Lost and interrupted runs keep their whole reservation; a found one keeps the time
     `launch` stamped before its call, never the time it was found."""
-    listing = [w for w in listing if isinstance(w, dict) and not w.get('archivedAt')]
+    listing = [w for w in listing if isinstance(w, dict) and not archived(w)]
     changed = []
     for name, intent in intents(state).items():
         found = next((w for w in listing if ours(intent, w)), None)
@@ -873,28 +898,59 @@ def withdraw(state, triage_state, drops, decisions, now):
         triage.save(triage.fresh_name(triage_state / 'dispositions', name, '.json'), rows)
 
 
-def superset_cli(argv):
-    return triage.parse(triage.run(['superset', *argv, '--json'], CALL_TIMEOUT), 'superset ' + argv[0])
+def bb_cli(argv, stdin=None):
+    """One bb command's JSON reply (None for an empty one); `stdin` feeds `--prompt-file -`."""
+    text = triage.run(['bb', *argv, '--json'], CALL_TIMEOUT, stdin)
+    return triage.parse(text, 'bb ' + ' '.join(argv[:2])) if text.strip() else None
 
 
 def gh_cli(argv):
     return triage.run(['gh', *argv], CALL_TIMEOUT)
 
 
-def loop_workspaces(known, superset):
-    """{name: workspace id} of the given intents' workspaces in the deedkit project; one whose ID is not the one
-    `launch` or `reconcile` recorded is not the loop's."""
-    listing = superset(['workspaces', 'list', '--local', '--search', 'autoloop-'])
-    if not isinstance(listing, list) or any(not isinstance(w, dict) for w in listing):
-        raise Refused('superset workspaces list: unexpected reply')
-    return {w['name']: w['id'] for w in listing if w.get('name') in known and ours(known[w['name']], w)}
+def thread_rows(bb, argv):
+    rows = bb(['thread', 'list', *argv])
+    if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
+        raise Refused('bb thread list: unexpected reply')
+    return rows
 
 
-def live_terminals(superset, workspace):
-    reply = superset(['terminals', 'list', '--local', '--workspace', workspace])
+def loop_listing(bb, known):
+    """The thread rows of the given intents: each recorded thread by its ID (an archived one is listed, with its
+    `archivedAt`), and, while an intent has no recorded thread, the project's live threads for its title. By ID
+    because a bare listing may stop at a window of the newest threads."""
+    ids = sorted({i['workspace'] for i in known.values() if i.get('workspace')})
+    rows = {}
+    for first in range(0, len(ids), 50):
+        argv = ['--include-archived']
+        for thread in ids[first:first + 50]:
+            argv += ['--thread', thread]
+        rows.update({r.get('id'): r for r in thread_rows(bb, argv)})
+    if any(not i.get('workspace') and i['status'] == 'unknown' for i in known.values()):
+        rows.update({r.get('id'): r for r in thread_rows(bb, ['--project', PROJECT])})
+    return list(rows.values())
+
+
+def loop_threads(known, listing):
+    """{intent name: thread row} of the given intents' live threads; one whose ID is not the one `launch` or
+    `reconcile` recorded is not the loop's."""
+    out = {}
+    for name, intent in known.items():
+        row = next((r for r in listing if not archived(r) and ours(intent, r)), None)
+        if row:
+            out[name] = row
+    return out
+
+
+def live_work(bb, row):
+    """What still runs in one worker thread: (`terminal`, ID) for each of its terminals that has not exited and
+    (`thread`, ID) while a turn of it has not ended."""
+    reply = bb(['terminal', 'list', '--thread', row['id']])
     if not isinstance(reply, dict) or not isinstance(reply.get('sessions'), list):
-        raise Refused('superset terminals list: unexpected reply')
-    return [s['terminalId'] for s in reply['sessions'] if isinstance(s, dict) and not s.get('exited')]
+        raise Refused('bb terminal list: unexpected reply')
+    work = [('terminal', s['id']) for s in reply['sessions'] if isinstance(s, dict) and isinstance(s.get('id'), str)
+            and s.get('status') != 'exited']
+    return work + [('thread', row['id'])] if row.get('status') in RUNNING else work
 
 
 def proposal(name, intent):
@@ -945,19 +1001,20 @@ def pulls(known, gh):
     return prs
 
 
-def running(known, superset, gh, terminals=True):
-    """What the given intents have: workspaces, live terminals, ready-merge runs and PRs; no intent reads nothing."""
+def running(known, bb, gh, threads=True):
+    """What the given intents have: live work (terminals and turns of their threads), ready-merge runs and PRs; no
+    intent reads nothing."""
     if not known:
-        return {}, {}, [], []
-    loop = loop_workspaces(known, superset) if terminals else {}
-    return loop, {name: live_terminals(superset, ws) for name, ws in loop.items()}, ready_runs(known, gh), \
-        pulls(known, gh)
+        return {}, [], []
+    live = {name: live_work(bb, row) for name, row in loop_threads(known, loop_listing(bb, known)).items()} \
+        if threads else {}
+    return live, ready_runs(known, gh), pulls(known, gh)
 
 
-def stop_work(known, superset, gh, close=(), terminals=True):
-    """Close the given intents' terminals, cancel their active ready merges, disarm and dequeue their open PRs and
-    close the open PRs of the intents in `close`, then read back. Mutations touch only resources read for these
-    intents, by ID. A failed first read raises; a failed read-back keeps the first read."""
+def stop_work(known, bb, gh, close=(), threads=True):
+    """Close the given intents' terminals, stop the turns of their threads, cancel their active ready merges, disarm
+    and dequeue their open PRs and close the open PRs of the intents in `close`, then read back. Mutations touch only
+    resources read for these intents, by ID. A failed first read raises; a failed read-back keeps the first read."""
     failed = []
 
     def attempt(what, call, argv):
@@ -966,11 +1023,13 @@ def stop_work(known, superset, gh, close=(), terminals=True):
         except (Refused, triage.Refused) as error:
             failed.append(f'{what}: {error}')
 
-    loop, live, runs, prs = running(known, superset, gh, terminals)
-    for name, ids in live.items():
-        for terminal in ids:
-            attempt(f'close {name}', superset,
-                    ['terminals', 'close', '--local', '--workspace', loop[name], '--terminal', terminal])
+    live, runs, prs = running(known, bb, gh, threads)
+    for name, handles in live.items():
+        for kind, handle in handles:
+            if kind == 'terminal':
+                attempt(f'close {name}', bb, ['terminal', 'close', handle])
+            else:
+                attempt(f'stop {name}', bb, ['thread', 'stop', handle])
     for run in runs:
         if run.get('status') in ACTIVE:
             attempt(f"cancel run {run['databaseId']}", gh, ['run', 'cancel', str(run['databaseId']), '-R', REPO])
@@ -984,11 +1043,12 @@ def stop_work(known, superset, gh, close=(), terminals=True):
         if pr['headRefName'] in close:
             attempt(f"close #{pr['number']}", gh, ['pr', 'close', str(pr['number']), '-R', REPO])
     try:
-        _, live, runs, prs = running(known, superset, gh, terminals)
+        live, runs, prs = running(known, bb, gh, threads)
         read_back = 'clean'
     except (Refused, triage.Refused) as error:
         read_back = f'failed: {error}'
-    alive = [f'terminal {name}' for name, ids in live.items() if ids] + \
+    alive = [f'{kind} {name}' for kind in ('terminal', 'thread') for name, handles in live.items()
+             if any(k == kind for k, _ in handles)] + \
         [f"run {r['databaseId']}" for r in runs if r.get('status') in ACTIVE] + \
         [f"PR #{p['number']}" for p in prs if p.get('state') == 'OPEN'
          and (p.get('autoMergeRequest') or p.get('mergeQueueEntry') or p['headRefName'] in close)]
@@ -999,13 +1059,13 @@ def utc(text):
     return triage.when(str(text).replace('Z', '+00:00'))
 
 
-def fence(state, now, superset, gh):
-    """PAUSE: close the loop's terminals, cancel its ready merges, disarm and dequeue its PRs, then read back.
+def fence(state, now, bb, gh):
+    """PAUSE: close the loop's terminals and stop its worker turns, cancel its ready merges, disarm and dequeue its PRs, then read back.
     The stop is effective only after a clean read-back; writes that landed after the PAUSE time are listed."""
     paused_at = datetime.fromtimestamp((state / 'PAUSE').stat().st_mtime, timezone.utc)
     known = intents(state)
     try:
-        work = stop_work(known, superset, gh)
+        work = stop_work(known, bb, gh)
     except (Refused, triage.Refused) as error:
         result = {'effective': False, 'read_back': f'failed: {error}', 'alive': [], 'failed': [], 'after_stop': []}
     else:
@@ -1033,9 +1093,9 @@ def fence(state, now, superset, gh):
     return result
 
 
-def fenced(state, now, superset, gh, triage_state=None):
+def fenced(state, now, bb, gh, triage_state=None):
     consumed(state)  # a STOP that wrote PAUSE never pauses again after the owner resumes
-    result = fence(state, now, superset, gh)
+    result = fence(state, now, bb, gh)
     if triage_state is not None and result.get('stopped'):  # the items of the workers the stop closed
         notify(state, triage_state, {i: ('received', PAUSED) for i in result['stopped']}, now)
     heartbeat(state, now, 'paused')
@@ -1045,7 +1105,7 @@ def fenced(state, now, superset, gh, triage_state=None):
                f"failed {len(result['failed'])}); see {state / 'fence.json'}")
 
 
-def withhold(state, superset, gh):
+def withhold(state, bb, gh):
     """Every tick: the intents of a held card or a dropped item lose auto-merge, their merge queue entry and active
     ready merges; the open PR of an intent built on a dropped item is closed. Nothing merged is reverted.
     Returns what failed or is still alive ([] when done); the next tick tries again."""
@@ -1055,8 +1115,8 @@ def withhold(state, superset, gh):
     if not affected:
         return []
     try:
-        work = stop_work(affected, superset, gh, close={name for name, i in affected.items()
-                                                         if set(i['feedback']) & set(held['items'])}, terminals=False)
+        work = stop_work(affected, bb, gh, close={name for name, i in affected.items()
+                                                   if set(i['feedback']) & set(held['items'])}, threads=False)
     except (Refused, triage.Refused) as error:
         return [f'read failed: {error}']
     return work['alive'] + work['failed'] + ([] if work['read_back'] == 'clean' else [work['read_back']])
@@ -1118,34 +1178,46 @@ def card_projection(state, triage_state, intent):
     return path
 
 
-def create(superset, intent, prompt=None, command=None):
-    """One worker's workspace (branch = intent name): the worker preset with its prompt, or a shell command (the
-    container runner's launcher); a reply without a workspace ID leaves the intent `unknown` for `reconcile`."""
-    start = ['--command', command] if command else ['--agent', PRESET, '--model', MODEL, '--effort', EFFORT,
-                                                    '--prompt', prompt]
-    reply = superset(['workspaces', 'create', '--local', '--project', PROJECT_ID, '--name', intent['name'],
-                      '--branch', intent['name'], '--skip-branch-prefix', '--base-branch', 'main', *start])
-    found = reply.get('workspace', reply) if isinstance(reply, dict) else None
-    workspace = found.get('id') if isinstance(found, dict) else None
-    if not isinstance(workspace, str) or not WORKSPACE_ID.fullmatch(workspace):
-        raise Refused('superset workspaces create: no workspace ID in the reply')
-    return workspace
+def terminal_id(name):
+    """The terminal a build intent runs in: bb's `term_` plus ten letters of a hash of the intent name, so a second
+    create for the same intent fails on bb's side instead of running the launcher twice."""
+    digest = hashlib.sha256(name.encode()).digest()
+    return 'term_' + ''.join(TERMINAL_ALPHABET[b % len(TERMINAL_ALPHABET)] for b in digest[:10])
 
 
-def card_start(superset, projection_path):
+def spawn(bb, cfg, intent, prompt, model, effort=None):
+    """One worker's thread (title = intent name, a child of the orchestrator thread, a fresh worktree of main): the
+    prompt goes in on stdin; `worker_machine` of the config pins the machine. A reply without a thread ID leaves
+    the intent `unknown` for `reconcile`."""
+    argv = ['thread', 'spawn', '--project', PROJECT, '--parent-thread', cfg['orchestrator_thread'],
+            '--new-environment', 'worktree', '--base-branch', 'main', '--title', intent['name'],
+            '--provider', PROVIDER, '--model', model, '--parent-notifications', NOTIFY, '--prompt-file', '-']
+    reply = bb(argv + (['--reasoning-level', effort] if effort else [])
+               + (['--machine', cfg['worker_machine']] if cfg.get('worker_machine') else []), prompt)
+    thread = reply.get('id') if isinstance(reply, dict) else None
+    if not isinstance(thread, str) or not THREAD_ID.fullmatch(thread):
+        raise Refused('bb thread spawn: no thread ID in the reply')
+    return thread
+
+
+def card_start(bb, cfg, projection_path):
     """The start of one card worker; its prompt holds the intent, the cluster key, the feedback IDs and the
     projection path only."""
-    return lambda intent: create(superset, intent, (
-        f"Read and follow {BRIEFS / 'common.md'} and {CARD_BRIEF}. Intent: {intent['name']}. "
-        f"Cluster: {intent['card']}. Feedback: {', '.join(intent['feedback'])}. Projection: {projection_path}."))
+    return lambda intent: spawn(bb, cfg, intent, (
+        f"Read and follow {BRIEFS / 'common.md'}, then {BB_OVERLAY} (it wins on conflict), then {CARD_BRIEF}. "
+        f"Your orchestrator is bb thread {cfg['orchestrator_thread']}. Intent: {intent['name']}. "
+        f"Cluster: {intent['card']}. Feedback: {', '.join(intent['feedback'])}. Projection: {projection_path}."),
+        WORKER_MODEL, EFFORT)
 
 
-def launch_cards(state, triage_state, cfg, now, superset):
+def launch_cards(state, triage_state, cfg, now, bb):
     """One card worker per new owner-agent cluster within the caps: {cluster: intent name or why it waits}. A relaunch
     keeps the first intent's proposal branch and bound card. A cluster over a daily cap or stopped by PAUSE gets its
     status note."""
     if not CARD_BRIEF.is_file():
         return {'*': 'no card brief template'}
+    if not cfg.get('orchestrator_thread'):
+        return {'*': NO_ORCHESTRATOR}
     out, notes = {}, {}
     over = OVER_CAP.format((now.astimezone(cfg['zone']).date() + timedelta(days=1)).isoformat())
     for cluster, ids in card_clusters(state, triage_state, cfg['principals']).items():
@@ -1157,10 +1229,10 @@ def launch_cards(state, triage_state, cfg, now, superset):
             intent.update(cluster=cluster, branch='proposal/autoloop-card-' + key.removeprefix('new:'), ref=ref)
             put(state, intent)
             try:
-                started, why = launch(state, intent['name'], card_start(superset, card_projection(state, triage_state,
-                                                                                                  intent)), now)
+                started, why = launch(state, intent['name'], card_start(bb, cfg, card_projection(state, triage_state,
+                                                                                                 intent)), now)
             except (Refused, triage.Refused):
-                started, why = None, 'start unknown'  # settled from the workspace list by `reconcile`, never retried
+                started, why = None, 'start unknown'  # settled from the thread list by `reconcile`, never retried
             intent = started
         out[cluster] = intent['name'] if intent else why
         if why in ('daily launches', 'worker hours'):
@@ -1336,13 +1408,10 @@ def compare_base(gh, head):
     return reply['files'], base if SHA40.fullmatch(str(base)) else None
 
 
-def branch_files(superset, gh):
-    """{branch: changed paths} of the pushed branches of live (unarchived) deedkit workspaces; unpushed local work is
-    invisible here (a conflict at rebase parks that PR instead)."""
-    listing = superset(['workspaces', 'list', '--local'])
-    if not isinstance(listing, list) or any(not isinstance(w, dict) for w in listing):
-        raise Refused('superset workspaces list: unexpected reply')
-    names = {w.get('branch') for w in listing if w.get('projectName') == PROJECT and not w.get('archivedAt')} \
+def branch_files(bb, gh):
+    """{branch: changed paths} of the pushed branches of live (unarchived) threads of the deedkit project, each by the
+    branch of its environment; unpushed local work is invisible here (a conflict at rebase parks that PR instead)."""
+    names = {r.get('environmentBranchName') for r in thread_rows(bb, ['--project', PROJECT]) if not archived(r)} \
         - {None, 'main'}
     pages = triage.parse(gh(['api', '--paginate', '--slurp', f'repos/{REPO}/branches?per_page=100']), 'gh api branches')
     try:
@@ -1378,18 +1447,45 @@ def build_cards(state, triage_state, principals):
                         and (b['status'] not in RETRY or b.get('outcome') or b.get('pr')) for b in known)}
 
 
-def build_start(superset):
-    """The start of one build worker: the workspace's terminal runs the container runner's launcher (ANYM-574) from
-    this checkout with the intent and the card ID only; the launcher writes the worker's prompt."""
-    return lambda intent: create(superset, intent, command=' '.join(shlex.quote(str(part)) for part in (
-        sys.executable, LAUNCHER, 'build', intent['name'], intent['card'])))
+def build_start(bb, cfg):
+    """The start of one build worker (ANYM-574): a thread that only hosts a terminal, which runs the container
+    runner's launcher from this checkout with the intent and the card ID only; the launcher writes the worker's
+    prompt. The terminal's ID comes from the intent name, so trying again cannot run the launcher twice: a try that
+    fails is settled by reading the thread's terminals. A thread whose terminal never came up is archived."""
+    def start(intent):
+        thread = spawn(bb, cfg, intent, HOST.format(name=intent['name']), HOST_MODEL)
+        terminal = terminal_id(intent['name'])
+        argv = ['terminal', 'create', '--thread', thread, '--id', terminal, '--title', intent['name'], '--command',
+                ' '.join(shlex.quote(str(part)) for part in (sys.executable, LAUNCHER, 'build', intent['name'],
+                                                             intent['card']))]
+        for attempt in range(TERMINAL_TRIES):
+            try:
+                bb(argv)
+                return thread
+            except (Refused, triage.Refused):
+                try:
+                    reply = bb(['terminal', 'list', '--thread', thread])
+                    if any(isinstance(t, dict) and t.get('id') == terminal for t in (reply or {}).get('sessions', [])):
+                        return thread
+                except (Refused, triage.Refused, AttributeError):
+                    pass
+            if attempt + 1 < TERMINAL_TRIES:
+                time.sleep(TERMINAL_WAIT)
+        try:
+            bb(['thread', 'archive', thread])
+        except (Refused, triage.Refused):
+            pass
+        raise Refused('bb terminal create: the build terminal did not start')
+    return start
 
 
-def launch_builds(state, triage_state, cfg, snap, now, superset, gh):
+def launch_builds(state, triage_state, cfg, snap, now, bb, gh):
     """One build worker per Ready card inside the envelope whose lane and expected paths no other live build intent,
-    open PR (any author) or pushed branch of a live workspace touches: {card: intent name or why it waits}."""
+    open PR (any author) or pushed branch of a live thread touches: {card: intent name or why it waits}."""
     if not BUILD_BRIEF.is_file():
         return {'*': 'no build brief template'}
+    if not cfg.get('orchestrator_thread'):
+        return {'*': NO_ORCHESTRATOR}
     out, prs, branches = {}, None, None
     for ref, ids in build_cards(state, triage_state, cfg['principals']).items():
         why = outside(snap, ref)
@@ -1405,7 +1501,7 @@ def launch_builds(state, triage_state, cfg, snap, now, superset, gh):
             taken = next((f'open PR #{n}' for n, files in prs.items()
                           if any(overlaps(a, b) for a in files for b in mine[1])), None)
         if taken is None:
-            branches = branch_files(superset, gh) if branches is None else branches
+            branches = branch_files(bb, gh) if branches is None else branches
             taken = next((f'branch {b}' for b, files in branches.items()
                           if any(overlaps(a, p) for a in files for p in mine[1])), None)
         if taken:
@@ -1416,9 +1512,9 @@ def launch_builds(state, triage_state, cfg, snap, now, superset, gh):
             intent.update(lane=mine[0], paths=mine[1])
             put(state, intent)
             try:
-                intent, why = launch(state, intent['name'], build_start(superset), now)
+                intent, why = launch(state, intent['name'], build_start(bb, cfg), now)
             except (Refused, triage.Refused):
-                intent, why = None, 'start unknown'  # settled from the workspace list by `reconcile`, never retried
+                intent, why = None, 'start unknown'  # settled from the thread list by `reconcile`, never retried
         out[ref] = intent['name'] if intent else why
     return out
 
@@ -1854,7 +1950,7 @@ def deployed(state, host, probe):
     return 'autodeploy paused' if paused else f'live {count}'
 
 
-def builds(state, triage_state, cfg, snap, now, superset, gh, probe, host):
+def builds(state, triage_state, cfg, snap, now, bb, gh, probe, host):
     """The build stage of a tick: audit first (an unapproved merge pauses before anything is armed), then the
     controller, then new launches (live only), then the deploy read. Returns the plan's `builds` entry and what
     failed."""
@@ -1871,7 +1967,7 @@ def builds(state, triage_state, cfg, snap, now, superset, gh, probe, host):
     if paused:
         return {'audit': paused}, []
     done, failed = controller(state, cfg, snap, now, gh, prs)
-    launched = launch_builds(state, triage_state, cfg, snap, now, superset, gh) if cfg['live'] else {}
+    launched = launch_builds(state, triage_state, cfg, snap, now, bb, gh) if cfg['live'] else {}
     return {'prs': done, 'launched': launched, 'deploy': deployed(state, host, probe)}, failed
 
 
@@ -2093,31 +2189,28 @@ def heartbeat(state, now, outcome):
     triage.save(state / 'last-tick.json', {'at': triage.stamp(now), 'outcome': outcome})
 
 
-def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=None, runner=run_reader, superset=None,
+def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=None, runner=run_reader, bb=None,
          gh=None, host=triage.HOST, probe=None):
     """One hourly run: (exit code, one line of IDs, counts and statuses; never feedback text)."""
     now = now or datetime.now(timezone.utc)
-    superset, gh = superset or superset_cli, gh or gh_cli
+    bb, gh = bb or bb_cli, gh or gh_cli
     with ExitStack() as stack:
         enter(stack, triage.locked(triage_state), 'a triage run')
         enter(stack, triage.locked(sync_state or SYNC_STATE), 'a feedback sync run')
         enter(stack, own_lock(state), 'another tick')
         cfg = config(state)
         if (state / 'PAUSE').exists():
-            return fenced(state, now, superset, gh, triage_state)
+            return fenced(state, now, bb, gh, triage_state)
         # The export first and checked whole: an owner STOP in it writes PAUSE (the one write before the other
-        # reads) and needs neither Tiden nor Superset. Its item is recorded by the first tick after the resume.
+        # reads) and needs neither Tiden nor bb. Its item is recorded by the first tick after the resume.
         items, head = triage.export_pages(host, triage.since(triage_state), ssh)
         stop, _, _ = control(*incoming(triage_state, items), cfg, consumed(state))
         if stop:
             triage.private_write(state / 'PAUSE', f"stop by feedback {' '.join(stop)} at {triage.stamp(now)}\n")
-            return fenced(state, now, superset, gh, triage_state)
+            return fenced(state, now, bb, gh, triage_state)
         # Reads: each finishes before the first write; a failed, truncated or timed-out one ends the tick here.
         known = intents(state)
-        listing = superset(['workspaces', 'list', '--local', '--search', 'autoloop-']) \
-            if any(i['status'] in ('unknown', 'started') for i in known.values()) else None
-        if listing is not None and not isinstance(listing, list):
-            raise Refused('superset workspaces list: unexpected reply')
+        listing = loop_listing(bb, known) if any(i['status'] in ('unknown', 'started') for i in known.values()) else None
         snap = triage.collect(read_tiden)
         # Writes.
         fresh, _ = triage.merge(triage_state, items, head)
@@ -2130,7 +2223,7 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
         withdraw(state, triage_state, drops, decisions, now)
         if decisions:
             triage.record(triage_state, decisions, now)
-        withheld = withhold(state, superset, gh)
+        withheld = withhold(state, bb, gh)
         ledger = triage.load(state / 'ledger.json', {})
         today = counters(ledger, cfg, now)
         inbox = triage.load(triage_state / 'inbox.json', {})
@@ -2150,11 +2243,11 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
             refused = sorted(i for i, e in refusals(state).items() if e['count'] > before.get(i, {}).get('count', 0))
             reader = 'ran'
         try:  # the build stage (ANYM-572): a failed read there leaves the card stage and the reader as they are
-            built, failed = builds(state, triage_state, cfg, snap, now, superset, gh, probe or receipt_watch.probe,
+            built, failed = builds(state, triage_state, cfg, snap, now, bb, gh, probe or receipt_watch.probe,
                                    host)
         except (Refused, triage.Refused) as error:
             built, failed = {}, [f'build stage: {error}']
-        cards = launch_cards(state, triage_state, cfg, now, superset) if cfg['live'] else {}
+        cards = launch_cards(state, triage_state, cfg, now, bb) if cfg['live'] else {}
         if cfg['live'] and over:
             next_day = (now.astimezone(cfg['zone']).date() + timedelta(days=1)).isoformat()
             notify(state, triage_state, {i: ('received', OVER_CAP.format(next_day)) for i in over}, now)
@@ -2235,7 +2328,7 @@ def main(argv_=None):
             # Before `git pull` in the automation: an existing PAUSE is fenced by the installed revision even when
             # the update fails. No PAUSE: nothing is read or written.
             with own_lock(args.state):
-                code, line = fenced(args.state, now, superset_cli, gh_cli, args.triage_state) \
+                code, line = fenced(args.state, now, bb_cli, gh_cli, args.triage_state) \
                     if (args.state / 'PAUSE').exists() \
                     else (0, 'not paused')
             print(line, file=sys.stdout if code == 0 else sys.stderr)

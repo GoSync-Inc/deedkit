@@ -184,47 +184,41 @@ python3 scripts/feedback_sync.py status
   IDs, items waiting for a card or for main with their age in hours, the files (complete, open,
   legacy, refused), the pending call, `last_ok`; never note text. `status` prints it.
 
-### LaunchAgent `ai.deedkit.feedback-follow` (orchestrator machine)
+### bb automation `deedkit-feedback-follow` (controller host)
 
-Prerequisites: a clean checkout of `main` used only by this job, an SSH key for `deedkit-prod`
-that needs no prompt, stored `gh` and Tiden tokens, coreutils `timeout` on the job's `PATH`, and a
-logged-in macOS session. A run missed in sleep runs once on wake (launchd `StartInterval`). Each
-run first pulls: a `git fetch` cut at 120 s (exit 124), then a local `git merge --ff-only`, which is
-never cut, so the job runs current `main` without a hand step. A pull that fails writes `git pull
-failed (exit <n>)` to `launchd.err.log` and the run still syncs the code the checkout has. A checkout
-with a tracked change, an untracked file that Git does not ignore or a stale `index.lock` (an
-interrupted update, a hand edit) is not one revision: the run writes `the checkout is not clean`
-there, exits 1 and syncs nothing until it is cleaned by hand. Install outside Git, in
-`~/Library/LaunchAgents/ai.deedkit.feedback-follow.plist`, with your absolute paths:
+Owner 11-12: the hourly sync is a bb script automation; the macOS LaunchAgent `ai.deedkit.feedback-follow` is
+retired with the cutover. The jobs run on one controller host, the one where the export's ssh alias works (the
+production ssh is not on every machine: egor-ryzen has none, DevOps boundary 11-12); bb runs a script
+automation on its own server host, so that is the machine whose bb server holds the automation.
+Prerequisites on that host: a clean checkout of `main` used only by the loop's two jobs (`<checkout>`:
+`git clone https://github.com/GoSync-Inc/deedkit.git` once, never edited), the ssh alias for `deedkit-prod` that
+needs no prompt, stored `gh` and Tiden logins, and `uv`, `timeout` and `git` on the job's `PATH`. Each run first pulls: a `git fetch` cut at 120 s, then a local `git merge --ff-only`, so the job runs
+current `main` without a hand step. A pull that fails prints `git pull failed` and the run still syncs the code
+the checkout has. A checkout with a tracked change, an untracked file that Git does not ignore or a stale
+`index.lock` is not one revision: the run prints `the checkout is not clean`, fails and syncs nothing until it is
+cleaned by hand. The run is silent when `auto --apply` exits 0 (bb records a skipped tick; `last-run.json` and
+`audit.jsonl` hold what it did); any failure prints its last lines and fails the run, which bb retries after 30 s
+and 60 s. Save this outside Git as `~/.deedkit/automations/feedback-follow.sh`:
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>ai.deedkit.feedback-follow</string>
-  <key>ProgramArguments</key><array>
-    <string>/bin/sh</string><string>-c</string>
-    <string>{ timeout 120 git fetch -q origin main &amp;&amp; git merge --ff-only origin/main; } || echo "git pull failed (exit $?) at $(date -u +%FT%TZ); this run syncs the current code" &gt;&amp;2; { changes=$(git status --porcelain) &amp;&amp; test -z "$changes" &amp;&amp; test ! -e "$(git rev-parse --git-path index.lock)"; } || { echo "the checkout is not clean at $(date -u +%FT%TZ); no sync" &gt;&amp;2; exit 1; }; exec /Users/OWNER/.local/bin/uv run --no-project --python 3.13 python scripts/feedback_sync.py auto --apply</string>
-  </array>
-  <key>WorkingDirectory</key><string>/Users/OWNER/CHECKOUT</string>
-  <key>EnvironmentVariables</key><dict>
-    <key>PATH</key><string>/Users/OWNER/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
-    <key>GIT_TERMINAL_PROMPT</key><string>0</string>
-  </dict>
-  <key>StartInterval</key><integer>3600</integer>
-  <key>StandardOutPath</key><string>/Users/OWNER/.deedkit/feedback-sync/launchd.log</string>
-  <key>StandardErrorPath</key><string>/Users/OWNER/.deedkit/feedback-sync/launchd.err.log</string>
-</dict></plist>
+```bash
+#!/usr/bin/env bash
+{ timeout 120 git fetch -q origin main && git merge --ff-only origin/main >/dev/null; } || echo "git pull failed (exit $?) at $(date -u +%FT%TZ); this run syncs the current code" >&2
+{ changes=$(git status --porcelain) && test -z "$changes" && test ! -e "$(git rev-parse --git-path index.lock)"; } || { echo "the checkout is not clean at $(date -u +%FT%TZ); no sync" >&2; exit 1; }
+out=$(uv run --no-project --python 3.13 python scripts/feedback_sync.py auto --apply 2>&1) || { code=$?; printf '%s\n' "$out" | tail -5; exit "$code"; }
 ```
 
 ```sh
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.deedkit.feedback-follow.plist
-launchctl kickstart gui/$(id -u)/ai.deedkit.feedback-follow    # first run now; then `status`
-launchctl bootout gui/$(id -u)/ai.deedkit.feedback-follow      # undo; then delete the plist
+bb automation create --project proj_nfixav7q2f --name deedkit-feedback-follow --cron '5 * * * *' --timezone UTC \
+  --script-file ~/.deedkit/automations/feedback-follow.sh --interpreter bash --timeout 15m \
+  --working-directory <checkout> \
+  --env-json '{"PATH":"<HOME>/.local/bin:/usr/local/bin:/usr/bin:/bin","GIT_TERMINAL_PROMPT":"0"}'
+bb automation list --project proj_nfixav7q2f                      # the automation ID
+bb automation pause <id> --project proj_nfixav7q2f                 # undo (resume, or delete --yes)
 ```
 
-Stopping it ends future runs only; writes already made stay. A hand `apply` or `follow` stays
-possible (same lock).
+Pausing it ends future runs only; writes already made stay. A hand `apply` or `follow` stays possible (same
+lock). Do not create it while the Mac's LaunchAgent still runs: two syncs on one export would write twice (the
+lock is per machine).
 
 ## Tool-less reader (ANYM-570)
 
@@ -281,23 +275,30 @@ and `config.json` must be 0600:
 
 ```json
 {"live": false, "principals": ["<agent principal from list-keys>"], "tz": "Europe/Moscow",
+ "orchestrator_thread": "<bb thread ID that parents the workers>", "worker_machine": "<bb machine of the workers>",
+
  "caps": {"items_per_principal": 20, "reader_runs": 24, "card_launches": 5, "build_launches": 3,
           "card_in_flight": 2, "build_in_flight": 2, "worker_hours": 12}}
 ```
 
-Every key is optional (the values above are the defaults, with `tz` `UTC` and no principals).
+Every key is optional (the values above are the defaults, with `tz` `UTC` and no principals). A live
+launch needs `orchestrator_thread` (a `thr_…` ID from `bb thread list`; the orchestrator's thread, which
+parents every worker); without it the plan says `no orchestrator_thread in config.json` and nothing starts.
+`worker_machine` (a bb machine ID or name, optional) is where the workers run (`--machine`); without it they run on the
+orchestrator thread's machine. Set it to the machine that holds the controller's checkout, the briefs and the logins
+(a build worker's terminal runs `launch.py` from that checkout). Nothing assumes which host that is.
 One tick:
 
 1. `PAUSE` present: fence only (below), no read, triage or launch.
 2. The feedback export, read whole and checked (every item has a feedback ID) before any write. An
    owner-principal `AUTOLOOP STOP` in it writes `PAUSE` at once and fences: it needs neither Tiden
-   nor Superset. `PAUSE` names every new STOP of the export; a paused tick and `autoloop.py resume`
+   nor bb. `PAUSE` names every new STOP of the export; a paused tick and `autoloop.py resume`
    journal them in `stops.json`, so after the resume they are recorded as declined `autoloop
    control` and never pause again. A `PAUSE` removed by hand before any paused tick ran, after a
    crash, pauses once more (the safe side); `resume` journals before it removes.
-3. Reads, all before the first write: the workspace list (only when an intent is open), Tiden main
-   and open branches. A failed, truncated or timed-out read ends the tick with no write (exit 1).
-4. Writes: pulls into the inbox, the snapshot, matches; settles `unknown` intents by workspace name.
+3. Reads, all before the first write: the worker threads (`bb thread list`, only when an intent is open),
+   Tiden main and open branches. A failed, truncated or timed-out read ends the tick with no write (exit 1).
+4. Writes: pulls into the inbox, the snapshot, matches; settles `unknown` intents by thread title.
 5. Control, from principals in `config.json` only and as the whole item text: `AUTOLOOP DROP
    <feedback-id>` (an item of the same principal) holds the item and its card and declines it
    "withdrawn by the reporter" (an inbox item with the batch, a triaged one through an
@@ -326,14 +327,16 @@ in `tz`.
   `new:demo`) is refused. `launch <intent>` reads the intent back from `intents/` under the lock,
   checks the gate again (`PAUSE`, a held card or a dropped item cancel it, `cancelled` saved
   before its reservation returns) and writes `unknown` with the start time before its call; an `unknown` intent
-  becomes `started` (keeping that time) or `lost` by a workspace of its name in the deedkit
-  project of `superset workspaces list` created after that time, never by a second start. A started intent whose workspace is gone
+  becomes `started` (keeping that time) or `lost` by a thread titled with its name in the deedkit
+  project (`bb thread list --project`) created after that time, never by a second start. A started intent whose thread
+  (read by its recorded ID, archived ones included) is gone or archived
   without `autoloop.py finish <intent>` is `interrupted`. Lost and interrupted runs keep their
   reservation; `finish` returns the unused part to the day it started, once (the day's `refunds`
   journal). One relaunch per card (`-r1`), as a new reservation.
 - Fence (`PAUSE`): acts only on what belongs to an intent in `intents/`, never on a name prefix:
-  closes the terminals of its workspace (deedkit project, the recorded workspace ID; an `unknown`
-  intent's as in reconcile; a reserved intent has none), cancels
+  closes the terminals of its thread (`bb terminal close`) and stops a turn of it that has not ended
+  (`bb thread stop`; the deedkit project, the recorded thread ID; an `unknown` intent's as in reconcile;
+  a reserved intent has none), cancels
   queued or running ready merges (`tiden-sync.yml` dispatch) of its `proposal/<intent>` branch,
   disables auto-merge on and dequeues the open PRs whose head is its branch in this repository
   (not a fork's), then reads all three back. With no intent it reads and touches nothing. The run
@@ -341,7 +344,8 @@ in `tz`.
   listing is a failed read. `fence.json` says
   whether the stop is effective (clean read-back, nothing alive, no failed call) and lists what
   landed after the `PAUSE` time (merged PRs with their revert, successful ready merges) and holds
-  those cards. Intents with no live terminal become `stopped`. The tick exits 1 while the stop is
+  those cards. Intents with no live terminal or turn become `stopped` (a thread still `stopping` at the
+  read-back keeps the stop not effective until the next paused tick). The tick exits 1 while the stop is
   not effective. Resume: `autoloop.py resume` (journals the STOPs, then removes `PAUSE`; removing the file works too), by the owner or the orchestrator on the owner's words.
 - `autoloop.py gate <intent>` (workers, before every Tiden write, push, ready dispatch and merge
   arm) exits 1 on `PAUSE`, a held card, a dropped item or an intent that is not running.
@@ -349,20 +353,55 @@ in `tz`.
 - `autoloop.py status` exits 1 when the last good tick is older than 2 hours, the stop is not
   effective, a hold or drop is not withheld, or `PAUSE` starts with `audit`.
 
-### Superset automation `deedkit-autoloop` (owner Mac)
+### bb automation `deedkit-autoloop` (controller host)
 
-Prerequisites: `superset`, `gh` and `tiden` logged in on the Mac, the owner's SSH alias
-`deedkit-prod`, the pinned reader CLI (above), `config.json` written by the owner. Create it once on
-the local deedkit workspace on `main`:
+Owner 11-12: the hourly job is a bb script automation, not the Superset automation of the owner's Mac. It runs on
+the same controller host as `deedkit-feedback-follow` (above; the port assumes no host). Prerequisites on it: `bb`,
+`gh`, `tiden`, `uv` and `docker` installed and logged in, the ssh alias for `deedkit-prod` (the host and alias stay
+config), the pinned reader CLI (above), `config.json` written by the owner with the orchestrator's
+`orchestrator_thread` (and `worker_machine`), and the clean checkout of `main` of `deedkit-feedback-follow` above
+(`<checkout>`, shared by both jobs). Save this outside Git as
+`~/.deedkit/automations/autoloop-tick.sh`:
 
-```sh
-superset automations create --name deedkit-autoloop --rrule 'FREQ=HOURLY;BYMINUTE=20' --local \
-  --workspace <local deedkit workspace on main> --agent claude \
-  --prompt 'Run exactly: uv run python scripts/autoloop.py fence; git pull --ff-only && uv run python scripts/autoloop.py tick. Reply with both exit codes and the last output line only. Run nothing else.'
+```bash
+#!/usr/bin/env bash
+set -u
+al() { uv run --no-project --python 3.13 python scripts/autoloop.py "$@" 2>&1; }
+failed=0
+note() { printf '%s\n' "$*"; failed=1; }
+msg=$(al fence) || note "fence: $msg"
+if { timeout 120 git fetch -q origin main && git merge --ff-only -q origin/main; } 2>/dev/null \
+   && [ -z "$(git status --porcelain)" ] && [ ! -e "$(git rev-parse --git-path index.lock)" ]; then
+  msg=$(al tick) || note "tick: $msg"
+else
+  note "the checkout is not a clean, current main; no tick"
+fi
+msg=$(al status) || note "status: $msg"
+exit $failed
 ```
 
-`autoloop.py fence` runs first from the installed revision: with `PAUSE` it fences (as the tick
-does), without it reads and writes nothing; a failed `git pull` then skips only the tick, never
-the fence. The orchestrator's wake check runs `uv run python scripts/autoloop.py status`. Undo:
-`superset automations pause deedkit-autoloop` (or `delete`); `touch ~/.deedkit/autoloop/PAUSE`
-stops the loop itself.
+```sh
+bb automation create --project proj_nfixav7q2f --name deedkit-autoloop --cron '20 * * * *' --timezone UTC \
+  --script-file ~/.deedkit/automations/autoloop-tick.sh --interpreter bash --timeout 15m \
+  --working-directory <checkout> \
+  --env-json '{"PATH":"<HOME>/.local/bin:/usr/local/bin:/usr/bin:/bin","GIT_TERMINAL_PROMPT":"0"}'
+bb automation list --project proj_nfixav7q2f                      # the automation ID
+```
+
+`autoloop.py fence` runs first from the installed revision: with `PAUSE` it fences (as the tick does), without it
+reads and writes nothing; a failed pull then skips only the tick, never the fence. The run is silent when the
+fence, the tick and `status` all exit 0 (bb records a skipped tick; `plan.json` and the day's report hold what the
+tick did); otherwise it prints each failing step's output and fails, and bb retries after 30 s and 60 s (a tick is
+safe to repeat: it holds its locks and writes before it starts a worker, never after). The run has at most 15 minutes
+(bb's cap; the reader's own bound is 10 minutes). The orchestrator's wake check runs `uv run python scripts/autoloop.py status`.
+
+Undo: `bb automation pause <id> --project proj_nfixav7q2f` (resume, or `delete <id> --yes`);
+`touch ~/.deedkit/autoloop/PAUSE` stops the loop itself and the next run fences it.
+
+Cutover from the Mac (no two controllers on one state): `touch PAUSE` on the Mac, wait for its fence to read back
+clean (`autoloop.py status`), remove the Mac's Superset automation and the LaunchAgent `ai.deedkit.feedback-follow`
+(`launchctl bootout gui/$(id -u)/ai.deedkit.feedback-follow`), then create the two automations on the new controller host. The
+state directories (`~/.deedkit/autoloop`, `~/.deedkit/feedback-triage`, `~/.deedkit/feedback-sync`; 0700, files
+0600) are per machine: copy them over only if the ledger, holds and daily counters should carry on. An intent
+whose recorded worker is a Superset workspace ID reads as `interrupted` at the first tick (a card worker's
+relaunch is its one retry).

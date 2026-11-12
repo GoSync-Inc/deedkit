@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The autoloop runner's launcher (ANYM-574, docs/operations/feedback-autoloop.md, Container runner).
 
-    launch.py build INTENT CARD   # the build worker's Superset terminal runs this (scripts/autoloop.py build_start)
+    launch.py build INTENT CARD   # the build worker's bb terminal runs this (scripts/autoloop.py build_start)
     launch.py check               # the isolation check and one model call: the subscription login works in a container
 
 It runs on the owner's Mac. It builds the pinned image (tagged by the hash of this directory), keeps an internal

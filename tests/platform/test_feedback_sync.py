@@ -3,7 +3,6 @@ from datetime import datetime, timedelta, timezone
 import fcntl
 import json
 from pathlib import Path
-import plistlib
 import re
 import shutil
 import subprocess
@@ -1404,12 +1403,14 @@ def test_an_unreadable_release_receipt_stops_the_hourly_run_with_its_name_before
 
 
 def launch_agent(tmp_path, checkout=None, **exits):
-    """Runs the ProgramArguments of the plist the document tells the operator to install, with a stub uv that records
-    what ran, and with a stub git (exit codes by subcommand) unless a real `checkout` is given."""
+    """Runs the script of the bb automation the document tells the operator to create (it replaced the macOS
+    LaunchAgent's command, with the same steps), with a stub uv that records what ran, and with a stub git (exit
+    codes by subcommand) unless a real `checkout` is given. The first result holds the job's environment variables."""
     text = (Path(sync.__file__).parents[1] / 'docs/operations/feedback-triage.md').read_text()
-    block = re.search(r'```xml\n(.*?)```', text, re.S)
-    assert block
-    agent = plistlib.loads(block[1].encode())
+    block = re.search(r'```bash\n(#!/usr/bin/env bash\n.*?)```', text, re.S)
+    variables = re.search(r"--name deedkit-feedback-follow .*?--env-json '([^']*)'", text, re.S)
+    assert block and variables
+    agent = {'EnvironmentVariables': json.loads(variables[1])}
     bin_, log = tmp_path / 'bin', tmp_path / 'ran.log'
     bin_.mkdir(exist_ok=True)
     log.write_text('')
@@ -1420,12 +1421,14 @@ def launch_agent(tmp_path, checkout=None, **exits):
     for name, body in stubs.items():
         (bin_ / name).write_text(f'#!/bin/sh\n{body}\n')
         (bin_ / name).chmod(0o755)
-    argv = [word.replace('/Users/OWNER/.local/bin/uv', str(bin_ / 'uv')) for word in agent['ProgramArguments']]
+    script = tmp_path / 'feedback-follow.sh'
+    script.write_text(block[1])
     real_git = shutil.which('git')
     assert real_git
     path = f'{bin_}:{Path(real_git).parent}:/usr/bin:/bin'
     env = {**agent['EnvironmentVariables'], 'PATH': path}
-    done = subprocess.run(argv, cwd=checkout or tmp_path, env=env, capture_output=True, text=True, timeout=60)
+    done = subprocess.run(['bash', str(script)], cwd=checkout or tmp_path, env=env, capture_output=True, text=True,
+                          timeout=60)
     return agent, done, log.read_text().splitlines()
 
 
@@ -1438,7 +1441,7 @@ CLEAN = ['git status --porcelain', 'git rev-parse --git-path index.lock']
 def test_the_launch_agent_pulls_the_checkout_before_the_sync_and_never_waits_on_a_prompt(tmp_path):
     agent, done, ran = launch_agent(tmp_path)
     assert ran == [*PULL, *CLEAN, SYNC_RUN]
-    assert done.returncode == 7 and done.stderr == ''  # the sync's own exit code is launchd's
+    assert done.returncode == 7 and done.stderr == ''  # the sync's own exit code is the automation's
     assert agent['EnvironmentVariables']['GIT_TERMINAL_PROMPT'] == '0'
 
 
