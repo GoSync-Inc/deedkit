@@ -9,11 +9,10 @@ import time
 import pytest
 
 from agent_harness import Service, recorded, write_config
-from deedkit_android.agent_learning import skill_name
 
 
 def bare_host(tmp_path, *, delay=0, result=True, exit_code=0, commands=1, reject_schema=False,
-              fenced=False, invalid_learning=False, startup_error=None):
+              fenced=False, invalid_learning=False, startup_error=None, natural=True, native_skill=True):
     record = tmp_path / 'record.json'
     binary = tmp_path / 'codex'
     binary.write_text(f'''#!{sys.executable}
@@ -21,7 +20,9 @@ import json, os, pathlib, sys, time
 if sys.argv[1:] == ['--version']:
     print('9.9.9'); raise SystemExit
 prompt = sys.stdin.read()
-json.dump(dict(argv=sys.argv, env=dict(os.environ), stdin=prompt, pid=os.getpid()), open({str(record)!r}, 'w'))
+skills = pathlib.Path.cwd() / '.agents' / 'skills'
+known = {{str(p.relative_to(skills)): p.read_text() for p in skills.glob('*/SKILL.md')}}
+json.dump(dict(argv=sys.argv, env=dict(os.environ), stdin=prompt, pid=os.getpid(), known_skills=known), open({str(record)!r}, 'w'))
 if ({reject_schema!r} and '--output-schema' in sys.argv) or {startup_error!r}:
     print(json.dumps(dict(type='turn.failed', error=dict(message='stream disconnected before completion'))), flush=True)
     print({startup_error!r} or 'Error: unsupported output schema', file=sys.stderr, flush=True)
@@ -38,6 +39,12 @@ if {result!r}:
     body = json.dumps(data)
     if {fenced!r}:
         body = chr(96)*3 + 'json' + chr(10) + body + chr(10) + chr(96)*3
+    if {natural!r}:
+        body = 'Read-only task complete in ordinary prose.'
+    if {native_skill!r}:
+        skill = skills / 'example-food' / 'SKILL.md'
+        skill.parent.mkdir(parents=True, exist_ok=True)
+        skill.write_text('---\\nname: example-food\\ndescription: Navigate the example food app.\\n---\\nRead the product title after content appears. Verified route: example://products.\\n')
     pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text(body)
 print(json.dumps(dict(type='turn.completed', usage=dict(input_tokens=100, cached_input_tokens=20, output_tokens=10))), flush=True)
 raise SystemExit({exit_code})
@@ -51,6 +58,30 @@ raise SystemExit({exit_code})
 
 
 # spec: ANYM-993
+def test_ordinary_goal_natural_final_and_native_skill_authoring_reuse(tmp_path):
+    config, record = bare_host(tmp_path, natural=True, native_skill=True)
+    with Service(config) as service:
+        session = service.lease()
+        first = service.finished(service.start(session)['request_id'])
+        seen = recorded(record)
+        assert '$android-learning' not in seen['stdin']
+        assert 'result-schema' not in seen['stdin'] and 'lessons' not in seen['stdin']
+        assert '--output-schema' not in seen['argv']
+        root = Path(seen['env']['CODEX_HOME']) / 'skills'
+        assert seen['argv'][seen['argv'].index('--add-dir') + 1] == str(root)
+        assert first['state'] == 'succeeded' and first['summary'] == 'Read-only task complete in ordinary prose.'
+        assert first['data'] == {} and first['learning_error'] is None
+        assert first['skills_updated'] == ['example-food/SKILL.md']
+        skill = root / 'example-food' / 'SKILL.md'
+        assert 'Verified route: example://products.' in skill.read_text()
+        assert not (root / 'android-learning').exists()
+        second = service.finished(service.start(session)['request_id'])
+        assert second['state'] == 'succeeded'
+        assert recorded(record)['known_skills']['example-food/SKILL.md'] == skill.read_text()
+        assert 'Verified route' not in recorded(record)['stdin']  # native discovery, no injected skill grammar/body
+
+
+# spec: ANYM-993
 def test_bare_default_launch_result_and_mandatory_skill_reuse(tmp_path):
     config, record = bare_host(tmp_path)
     with Service(config) as service:
@@ -58,11 +89,11 @@ def test_bare_default_launch_result_and_mandatory_skill_reuse(tmp_path):
         run = service.finished(service.start(session, outputs=['total'])['request_id'])
         assert run['state'] == 'succeeded', run
         result = run
-        assert result['data'] == {'total': '141400'}
+        assert result['data'] == {} and result['summary'] == 'Read-only task complete in ordinary prose.'
         assert result['model'] == 'gpt-6.1-terra' and result['effort'] == 'medium'
         assert result['tokens']['input'] == 100 and result['timings']['commands'] == 1
         assert result['token_usage_observed'] is True
-        assert result['skills_updated'] == ['example.food']
+        assert result['skills_updated'] == ['example-food/SKILL.md']
         assert result['final_screenshot']['file_id']
         seen = recorded(record)
         argv, prompt = seen['argv'], seen['stdin']
@@ -73,13 +104,13 @@ def test_bare_default_launch_result_and_mandatory_skill_reuse(tmp_path):
         assert 'SERIAL' in prompt and 'Order check for me' not in prompt
         assert service.phone.commands == []  # no guard, hierarchy, or phone MCP
         home = Path(seen['env']['CODEX_HOME'])
-        skill = home / 'skills' / skill_name('example.food') / 'SKILL.md'
-        assert 'example.food:id/cart' in skill.read_text()
+        skill = home / 'skills' / 'example-food' / 'SKILL.md'
+        assert 'Verified route: example://products.' in skill.read_text()
         assert '141400' not in skill.read_text() and 'Cart total' not in skill.read_text()
         second = service.finished(service.start(session, model='gpt-6.1-sol', effort='high')['request_id'])
         assert second['model'] == 'gpt-6.1-sol'
         assert second['effort'] == 'high'
-        assert 'example.food:id/cart' in recorded(record)['stdin']
+        assert recorded(record)['known_skills']['example-food/SKILL.md'] == skill.read_text()
 
 
 # spec: ANYM-993
@@ -103,7 +134,7 @@ def test_stop_holds_device_and_releases_process_without_publishing_skill(tmp_pat
         stopped = service.post('agent', {'action': 'stop', 'request_id': request_id})
         assert stopped['state'] == 'stopped'
         assert stopped['skills_updated'] == []
-        assert not (tmp_path / 'codex-home' / 'skills' / skill_name('example.food')).exists()
+        assert not (tmp_path / 'codex-home' / 'skills' / 'example-food').exists()
 
 
 # spec: ANYM-993
@@ -118,18 +149,16 @@ def test_missing_result_or_unsuccessful_exit_never_succeeds(tmp_path, result, ex
 
 # spec: ANYM-993
 def test_knowledge_does_not_accept_private_text_or_dynamic_identifiers(tmp_path):
-    from deedkit_android.agent_learning import publish
-    home = tmp_path / 'home'
-    good = {'package': 'example.food', 'steps': [{'action': 'tap', 'resource_id': 'example.food:id/cart'}],
-            'pitfalls': ['refresh_hierarchy']}
-    assert publish(home, [good]) == ['example.food']
-    skill = home / 'skills' / skill_name('example.food') / 'SKILL.md'
-    before = skill.read_bytes()
-    for change in ({'notes': 'Private address'}, {'steps': [{'action': 'tap', 'resource_id': 'example.food:id/user_123'}]},
-                   {'pitfalls': ['PIN 1234']}):
-        with pytest.raises(ValueError):
-            publish(home, [{**good, **change}])
-        assert skill.read_bytes() == before
+    # Keep the existing test identity: ordinary navigation prose/templates stay out of receipts;
+    # no service-authored grammar strips them or turns task values into knowledge.
+    config, record = bare_host(tmp_path)
+    with Service(config) as service:
+        run = service.finished(service.start(service.lease())['request_id'])
+        home = Path(recorded(record)['env']['CODEX_HOME'])
+        content = (home / 'skills' / 'example-food' / 'SKILL.md').read_text()
+        assert 'Verified route: example://products.' in content
+        assert '141400' not in content and 'Cart total' not in content
+        assert content not in json.dumps(run)
 
 
 # spec: ANYM-993
@@ -227,14 +256,15 @@ def test_bare_closes_the_target_warm_ui_worker_while_holding_its_phone_lock(tmp_
 # spec: ANYM-993
 def test_app_skills_have_native_codex_names_and_keep_package_identity(tmp_path):
     import yaml
-    from deedkit_android.agent_learning import load, publish
-    lesson = dict(package='example.food', steps=[dict(action='tap', resource_id='example.food:id/cart')], pitfalls=[])
-    publish(tmp_path, [lesson])
-    path, = (tmp_path / 'skills').glob('*/SKILL.md')
-    metadata = yaml.safe_load(path.read_text().split('---')[1])
-    assert re.fullmatch(r'[a-z0-9-]{1,63}', metadata['name'])
-    assert path.parent.name == metadata['name']
-    assert load(tmp_path, ['example.food']) == [lesson]
+    config, record = bare_host(tmp_path)
+    with Service(config) as service:
+        service.finished(service.start(service.lease())['request_id'])
+        root = Path(recorded(record)['env']['CODEX_HOME']) / 'skills'
+        path, = root.glob('*/SKILL.md')
+        metadata = yaml.safe_load(path.read_text().split('---')[1])
+        assert re.fullmatch(r'[a-z0-9-]{1,63}', metadata['name'])
+        assert path.parent.name == metadata['name']
+        assert metadata['description'] == 'Navigate the example food app.'
 
 
 # spec: ANYM-993
@@ -245,27 +275,29 @@ def test_native_startup_uses_plain_output_and_an_explicit_local_result_contract(
         assert run['state'] == 'succeeded', run
         seen = recorded(record)
         assert '--output-schema' not in seen['argv']
-        assert 'result-schema.json' in seen['stdin']
+        assert 'result-schema.json' not in seen['stdin']
+        assert '$android-learning' not in seen['stdin']
 
 
 # spec: ANYM-993
 def test_one_json_codefence_preserves_native_result_and_learned_skill(tmp_path):
-    config, _ = bare_host(tmp_path, fenced=True)
+    config, _ = bare_host(tmp_path, fenced=True, natural=False)
     with Service(config) as service:
         run = service.finished(service.start(service.lease())['request_id'])
         assert run['state'] == 'succeeded', run
-        assert run['data'] == {'total': '141400'}
-        assert run['skills_updated'] == ['example.food']
+        assert run['data'] == {} and run['summary'].startswith('```json\n')
+        assert '"total": "141400"' in run['summary']
+        assert run['skills_updated'] == ['example-food/SKILL.md']
 
 
 # spec: ANYM-993
 def test_invalid_learning_does_not_erase_a_completed_native_outcome(tmp_path):
-    config, _ = bare_host(tmp_path, invalid_learning=True)
+    config, _ = bare_host(tmp_path, invalid_learning=True, natural=False)
     with Service(config) as service:
         run = service.finished(service.start(service.lease())['request_id'])
         assert run['state'] == 'succeeded', run
-        assert run['summary'] == 'Cart total read' and run['data'] == {'total': '141400'}
-        assert run['learning_error'] == 'invalid_learning_result' and run['skills_updated'] == []
+        assert '"summary": "Cart total read"' in run['summary'] and run['data'] == {}
+        assert run['learning_error'] is None and run['skills_updated'] == ['example-food/SKILL.md']
 
 
 # spec: ANYM-993
