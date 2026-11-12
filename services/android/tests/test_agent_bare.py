@@ -12,7 +12,8 @@ from agent_harness import Service, recorded, write_config
 from deedkit_android.agent_learning import skill_name
 
 
-def bare_host(tmp_path, *, delay=0, result=True, exit_code=0, commands=1):
+def bare_host(tmp_path, *, delay=0, result=True, exit_code=0, commands=1, reject_schema=False,
+              fenced=False, invalid_learning=False, startup_error=None):
     record = tmp_path / 'record.json'
     binary = tmp_path / 'codex'
     binary.write_text(f'''#!{sys.executable}
@@ -21,6 +22,10 @@ if sys.argv[1:] == ['--version']:
     print('9.9.9'); raise SystemExit
 prompt = sys.stdin.read()
 json.dump(dict(argv=sys.argv, env=dict(os.environ), stdin=prompt, pid=os.getpid()), open({str(record)!r}, 'w'))
+if ({reject_schema!r} and '--output-schema' in sys.argv) or {startup_error!r}:
+    print(json.dumps(dict(type='turn.failed', error=dict(message='stream disconnected before completion'))), flush=True)
+    print({startup_error!r} or 'Error: unsupported output schema', file=sys.stderr, flush=True)
+    raise SystemExit(1)
 print(json.dumps(dict(type='item.started', item=dict(id='a', type='command_execution', command='adb -s SERIAL shell input keyevent HOME'))), flush=True)
 for i in range({commands}-1):
     print(json.dumps(dict(type='item.started', item=dict(id=str(i), type='command_execution', command='adb -s SERIAL get-state'))), flush=True)
@@ -28,7 +33,12 @@ time.sleep({delay})
 print(json.dumps(dict(type='item.completed', item=dict(id='a', type='command_execution', command='adb -s SERIAL shell input keyevent HOME', exit_code=0))), flush=True)
 if {result!r}:
     data = dict(summary='Cart total read', data=dict(total='141400'), lessons=[dict(package='example.food', steps=[dict(action='tap', resource_id='example.food:id/cart')], pitfalls=['refresh_hierarchy'])])
-    pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text(json.dumps(data))
+    if {invalid_learning!r}:
+        data['lessons'][0]['notes'] = 'private task detail'
+    body = json.dumps(data)
+    if {fenced!r}:
+        body = chr(96)*3 + 'json' + chr(10) + body + chr(10) + chr(96)*3
+    pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text(body)
 print(json.dumps(dict(type='turn.completed', usage=dict(input_tokens=100, cached_input_tokens=20, output_tokens=10))), flush=True)
 raise SystemExit({exit_code})
 ''')
@@ -51,6 +61,7 @@ def test_bare_default_launch_result_and_mandatory_skill_reuse(tmp_path):
         assert result['data'] == {'total': '141400'}
         assert result['model'] == 'gpt-6.1-terra' and result['effort'] == 'medium'
         assert result['tokens']['input'] == 100 and result['timings']['commands'] == 1
+        assert result['token_usage_observed'] is True
         assert result['skills_updated'] == ['example.food']
         assert result['final_screenshot']['file_id']
         seen = recorded(record)
@@ -224,4 +235,49 @@ def test_app_skills_have_native_codex_names_and_keep_package_identity(tmp_path):
     assert re.fullmatch(r'[a-z0-9-]{1,63}', metadata['name'])
     assert path.parent.name == metadata['name']
     assert load(tmp_path, ['example.food']) == [lesson]
+
+
+# spec: ANYM-993
+def test_native_startup_uses_plain_output_and_an_explicit_local_result_contract(tmp_path):
+    config, record = bare_host(tmp_path, reject_schema=True)
+    with Service(config) as service:
+        run = service.finished(service.start(service.lease())['request_id'])
+        assert run['state'] == 'succeeded', run
+        seen = recorded(record)
+        assert '--output-schema' not in seen['argv']
+        assert 'result-schema.json' in seen['stdin']
+
+
+# spec: ANYM-993
+def test_one_json_codefence_preserves_native_result_and_learned_skill(tmp_path):
+    config, _ = bare_host(tmp_path, fenced=True)
+    with Service(config) as service:
+        run = service.finished(service.start(service.lease())['request_id'])
+        assert run['state'] == 'succeeded', run
+        assert run['data'] == {'total': '141400'}
+        assert run['skills_updated'] == ['example.food']
+
+
+# spec: ANYM-993
+def test_invalid_learning_does_not_erase_a_completed_native_outcome(tmp_path):
+    config, _ = bare_host(tmp_path, invalid_learning=True)
+    with Service(config) as service:
+        run = service.finished(service.start(service.lease())['request_id'])
+        assert run['state'] == 'succeeded', run
+        assert run['summary'] == 'Cart total read' and run['data'] == {'total': '141400'}
+        assert run['learning_error'] == 'invalid_learning_result' and run['skills_updated'] == []
+
+
+# spec: ANYM-993
+def test_startup_failure_returns_sanitized_native_error_without_success(tmp_path):
+    canary = 'PRIVATE_OAUTH_CANARY_abcdefghijklmnopqrstuvwxyz'
+    config, _ = bare_host(tmp_path, startup_error='Error: auth token=' + canary + '\n<hierarchy>private phone</hierarchy>')
+    with Service(config) as service:
+        run = service.finished(service.start(service.lease())['request_id'])
+        assert run['state'] == 'failed' and run['exit_code'] == 1
+        assert run['timings']['commands'] == 0 and run['tokens']['input'] == 0
+        assert run['timings']['commands_started'] == 0 and run['token_usage_observed'] is False
+        assert any('stream disconnected' in item['message'] for item in run['engine_errors'])
+        assert any(item['source'] == 'stderr' for item in run['engine_errors'])
+        assert canary not in json.dumps(run) and 'private phone' not in json.dumps(run)
 

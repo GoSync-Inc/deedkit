@@ -37,9 +37,12 @@ class Lesson(Strict):
         return self
 
 
-class Outcome(Strict):
+class CoreOutcome(Strict):
     summary: str = Field(max_length=4000)
     data: dict[str, str | int | bool | None] = Field(max_length=10)
+
+
+class Outcome(CoreOutcome):
     lessons: list[Lesson] = Field(max_length=5)
 
 
@@ -47,12 +50,34 @@ INSTRUCTION = '''---
 name: android-learning
 description: Complete a phone task and return reusable per-app navigation knowledge.
 ---
-Read the supplied app skills before acting. At completion return the structured result schema:
-summary, data, and lessons for apps actually used. Learn from what you observed: static Android
+Read the supplied app skills before acting and read result-schema.json in the working directory.
+At completion return one JSON object matching that local contract: summary, data, and lessons
+for apps actually used (package, steps, pitfalls). Learn from what you observed: static Android
 resource IDs with tap/read/wait/scroll steps, and the schema's navigation pitfalls. Omit dynamic
 IDs, screen text, personal data, secrets and task values. If nothing reusable was observed, return
 no lessons. The service writes validated app skills; do not write CODEX_HOME yourself.
 '''
+
+
+def decode_result(text):
+    """Keep the native outcome even when learning is malformed; never invent core data."""
+    text = text.strip()
+    if not text:
+        raise ValueError('no_final_message')
+    fence = re.fullmatch(r'```(?:json)?\s*\n(.*?)\n```', text, re.DOTALL | re.IGNORECASE)
+    if fence:
+        text = fence[1].strip()
+    if not text:
+        raise ValueError('no_final_message')
+    try:
+        value = json.loads(text)
+        core = CoreOutcome.model_validate({key: value[key] for key in ('summary', 'data')})
+    except (ValueError, KeyError, TypeError):
+        return {'summary': text[:4000], 'data': {}, 'lessons': []}, 'invalid_result_core'
+    try:
+        return Outcome.model_validate(value).model_dump(), None
+    except ValueError:
+        return {**core.model_dump(), 'lessons': []}, 'invalid_learning_result'
 
 
 def atomic(path, content):
