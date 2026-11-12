@@ -1,0 +1,21 @@
+# systemd --user unit of the feedback <-> BB Tasks bridge (ANYM-990). It listens on nothing: it long-polls the
+# gateway and writes tasks through the local `bb tasks` CLI. Credentials come from the 0600 env file the program
+# reads itself (~/.config/deedkit/feedback-bridge.env). Install steps: docs/operations/feedback-bridge.md.
+[Unit]
+Description=DeedKit feedback bridge (long-poll, feedback and BB Tasks both ways)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# `bb` is a node script: the node directory must be on PATH (check: systemctl --user show-environment).
+Environment=PATH=%h/.local/bin:%h/.local/opt/node-v26.13.1-linux-x64/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/.local/lib/deedkit-feedback-bridge/feedback_bridge.py watch
+Restart=always
+RestartSec=5
+TimeoutStopSec=40
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target
