@@ -206,7 +206,7 @@ def write_config(tmp_path, claude=None, codex=None, enabled=True, default=None, 
                  'permissions': ['android:read']},
                 {'id': 'two', 'key_sha256': hashlib.sha256(b'two').hexdigest(), 'devices': ['home'],
                  'permissions': ['android:read', 'android:control']}],
-            'engines': engine_config, 'agent': {'enabled': enabled}}
+            'engines': engine_config, 'agent': {'enabled': enabled, 'guarded': True}}
     if default:
         body['default_engine'] = default
     if guard:

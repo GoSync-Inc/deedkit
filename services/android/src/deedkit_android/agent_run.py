@@ -1,7 +1,4 @@
-"""The local-agent run: one model-driven engine on the phone host whose only hands are the service's own guarded verbs
-(ANYM-971). A run holds its device's lock for its whole life, is driven by Claude Code or Codex through the `phone`
-stdio tool server, and ends in one of eight states. The guard, the secret resolution and the limits are enforced here and
-in the worker, never by the preamble alone."""
+"""Shared local-agent lifecycle, guarded compatibility executor and admission to bare Codex."""
 
 import asyncio
 import hashlib
@@ -47,7 +44,7 @@ STATES = ('running', 'succeeded', 'stopped_by_guard', 'timed_out', 'action_cap',
 NAME = r'^[A-Z][A-Z0-9_]{0,63}$'
 POINT = re.compile(r'\s*\d+(?:\.\d+)?%?\s*,\s*\d+(?:\.\d+)?%?\s*')
 START_ONLY = ('device_id', 'session_id', 'goal', 'owner_instruction', 'apps', 'params', 'secrets', 'outputs',
-              'max_minutes', 'max_actions', 'engine', 'save_as', 'param_names')
+              'max_minutes', 'max_actions', 'engine', 'model', 'effort', 'save_as', 'param_names')
 
 
 def preamble():
@@ -79,6 +76,8 @@ class AgentCall(Strict):
     max_minutes: int = Field(default=5, ge=1, le=15)
     max_actions: int = Field(default=120, ge=10, le=300)
     engine: Literal['claude', 'codex'] | None = None
+    model: str | None = Field(default=None, pattern=r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
+    effort: Literal['minimal', 'low', 'medium', 'high'] | None = None
     save_as: str | None = Field(default=None, pattern=r'^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$')
     param_names: list[str] = Field(default_factory=list, max_length=20)
     after: int = Field(default=0, ge=0)
@@ -88,7 +87,7 @@ class AgentCall(Strict):
     def fields_of_the_action(self):
         given = self.model_fields_set
         if self.action == 'start':
-            missing = {'device_id', 'session_id', 'goal', 'owner_instruction', 'apps'} - given
+            missing = {'device_id', 'session_id', 'goal', 'owner_instruction'} - given
             if missing or self.after or self.wait_s:
                 raise ValueError('start_fields')
         elif given & set(START_ONLY) or (self.action == 'stop' and given & {'after', 'wait_s'}):
@@ -183,7 +182,7 @@ class AgentRun:
         self.bearer, self.secrets = os.urandom(32).hex(), secrets_run
         self.preamble_version, self.system_prompt = preamble_text
         self.state, self.process, self.stream = 'running', None, engines.Stream(engine)
-        self.apps, self.params = set(request.apps), {name: str(value) for name, value in request.params.items()}
+        self.apps, self.params = set(request.apps or []), {name: str(value) for name, value in request.params.items()}
         self.actions, self.screenshots, self.images, self.notes = [], [], 0, 0
         self.finished, self.finish_tries, self.guard, self.op, self.error = None, 0, None, None, {}
         self.saver, self.resolved, self.read_value, self.pending = Saver(self) if request.save_as else None, None, None, None
@@ -677,18 +676,23 @@ class Agents:
         """The agent section of android_capabilities: the switch, each engine and why one is not offered."""
         config = self.read_config()
         if config.agent.enabled:
-            found = {name: await asyncio.to_thread(engines.status, self.store.directory, name, config.engines.get(name))
+            found = {name: await asyncio.to_thread(engines.status, self.store.directory, name, config.engines.get(name), config.agent.guarded)
                      for name in ('claude', 'codex')}
         else:  # Off: no login file is read and no engine is run.
             found = {name: {'engine': name, 'provider': engines.PROVIDERS[name], 'available': False,
                             'reason': 'agent_disabled'} for name in ('claude', 'codex')}
-        default = config.default_engine or 'claude'
+        if not config.agent.guarded:
+            found['claude'] = {**found['claude'], 'available': False, 'reason': 'bare_mode_codex_only'}
+        default = (config.default_engine or 'claude') if config.agent.guarded else 'codex'
         try:
-            version = preamble()[0]
+            version = preamble()[0] if config.agent.guarded else None
         except Refused:
             version = None
         return {'enabled': config.agent.enabled, **({} if config.agent.enabled else {'reason': 'agent_disabled'}),
-                'default_engine': default, 'engines': found, 'tools': list(MODELS), 'preamble_version': version, 'input_schema': AgentCall.model_json_schema(),
+                'mode': 'guarded' if config.agent.guarded else 'bare',
+                'default_model': config.engines.get('codex').model or 'gpt-6.1-terra' if config.engines.get('codex') else 'gpt-6.1-terra',
+                'default_effort': config.engines['codex'].reasoning_effort if 'codex' in config.engines else 'medium',
+                'default_engine': default, 'engines': found, 'tools': list(MODELS) if config.agent.guarded else ['codex'], 'preamble_version': version, 'input_schema': AgentCall.model_json_schema(),
                 'limits': {'max_minutes': 15, 'max_actions': 300, 'max_images': 3, 'wait_s': 25, 'apps': 5}}
 
     async def handle(self, owner, args):
@@ -718,14 +722,19 @@ class Agents:
         config = self.read_config()
         if not config.agent.enabled:
             raise Refused('agent_disabled')
-        name = call.engine or config.default_engine or 'claude'
-        offered = await asyncio.to_thread(engines.status, self.store.directory, name, config.engines.get(name))
+        bare = not config.agent.guarded
+        from .agent_bare import BareRun, admission
+        selected = admission(call, config) if bare else None
+        name = 'codex' if bare else call.engine or config.default_engine or 'claude'
+        if not bare and not call.apps:
+            raise Refused('apps_required', 422)
+        offered = await asyncio.to_thread(engines.status, self.store.directory, name, config.engines.get(name), not bare)
         if not offered['available']:
             error = Refused('engine_unavailable')
             error.hint = offered['reason']
             raise error
         rules = Rules(config.guard.model_dump())
-        if any(package in rules.write_denied or package in rules.protected for package in call.apps):
+        if not bare and any(package in rules.write_denied or package in rules.protected for package in call.apps):
             raise Refused('app_not_allowed', 422)
         declared = {}
         if call.secrets:
@@ -739,25 +748,32 @@ class Agents:
                 if found[secret]['package'] not in call.apps:
                     raise Refused('secret_not_in_apps', 422)
             declared = {secret: found[secret] for secret in call.secrets}
-        if self.devices.ui is None:
+        if not bare and self.devices.ui is None:
             raise Refused('ui_engine_not_configured', 503)
-        if self.url is None:
+        if not bare and self.url is None:
             raise Refused('agent_unavailable', 503)
-        texts = preamble()
+        texts = (None, '') if bare else preamble()
         self.store.touch(owner, call.device_id, call.session_id)  # The caller's own, live lease.
-        await self.devices.ui.ensure_fenced_process_stopped(call.device_id)
         lock = self.devices.locks[call.device_id]
         if lock.locked():
             raise Refused('device_busy')
         await lock.acquire()
         run = None
         try:
+            if self.devices.ui is not None:
+                if bare:
+                    await self.devices.ui.close(call.device_id)
+                else:
+                    await self.devices.ui.ensure_fenced_process_stopped(call.device_id)
             run_dir = Path(tempfile.mkdtemp(prefix='run-', dir=self.root))
             run_dir.chmod(0o700)
             secrets_run = SecretRun(self.devices.secrets)
             secrets_run.bound, secrets_run.packages = declared, sorted({entry['package'] for entry in declared.values()})
-            model = config.engines[name].model or engines.DEFAULT_MODEL[name] or 'default'
-            run = AgentRun(self, owner, call, name, config.engines[name], run_dir, secrets_run, texts)
+            selected = selected or config.engines[name].model_copy(update={
+                'model': call.model or config.engines[name].model,
+                'reasoning_effort': call.effort or config.engines[name].reasoning_effort})
+            model = selected.model or engines.DEFAULT_MODEL[name] or 'default'
+            run = (BareRun if bare else AgentRun)(self, owner, call, name, selected, run_dir, secrets_run, texts)
             request = {**{key: value for key, value in call.model_dump(exclude={'session_id', 'after', 'wait_s'}).items()},
                        'engine': name}
             self.db.insert(owner, call.request_id, identity, call.device_id, name, model, request)
@@ -767,7 +783,8 @@ class Agents:
             lock.release()
             raise
         self.runs[(owner, call.request_id)] = run
-        self.by_bearer[run.bearer] = run
+        if not bare:
+            self.by_bearer[run.bearer] = run
         await run.event('state', state='running')
         task = asyncio.create_task(run.supervise())
         self.tasks.add(task)

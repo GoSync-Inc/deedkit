@@ -1,0 +1,227 @@
+"""Bare Codex lifecycle and actual learned skills; synthetic executables, no phone or provider."""
+
+import json
+from pathlib import Path
+import re
+import sys
+import time
+
+import pytest
+
+from agent_harness import Service, recorded, write_config
+from deedkit_android.agent_learning import skill_name
+
+
+def bare_host(tmp_path, *, delay=0, result=True, exit_code=0, commands=1):
+    record = tmp_path / 'record.json'
+    binary = tmp_path / 'codex'
+    binary.write_text(f'''#!{sys.executable}
+import json, os, pathlib, sys, time
+if sys.argv[1:] == ['--version']:
+    print('9.9.9'); raise SystemExit
+prompt = sys.stdin.read()
+json.dump(dict(argv=sys.argv, env=dict(os.environ), stdin=prompt, pid=os.getpid()), open({str(record)!r}, 'w'))
+print(json.dumps(dict(type='item.started', item=dict(id='a', type='command_execution', command='adb -s SERIAL shell input keyevent HOME'))), flush=True)
+for i in range({commands}-1):
+    print(json.dumps(dict(type='item.started', item=dict(id=str(i), type='command_execution', command='adb -s SERIAL get-state'))), flush=True)
+time.sleep({delay})
+print(json.dumps(dict(type='item.completed', item=dict(id='a', type='command_execution', command='adb -s SERIAL shell input keyevent HOME', exit_code=0))), flush=True)
+if {result!r}:
+    data = dict(summary='Cart total read', data=dict(total='141400'), lessons=[dict(package='example.food', steps=[dict(action='tap', resource_id='example.food:id/cart')], pitfalls=['refresh_hierarchy'])])
+    pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text(json.dumps(data))
+print(json.dumps(dict(type='turn.completed', usage=dict(input_tokens=100, cached_input_tokens=20, output_tokens=10))), flush=True)
+raise SystemExit({exit_code})
+''')
+    binary.chmod(0o755)
+    config = write_config(tmp_path, codex=binary, default='codex')
+    body = json.loads(config.read_text())
+    body['agent']['guarded'] = False
+    config.write_text(json.dumps(body))
+    return config, record
+
+
+# spec: ANYM-993
+def test_bare_default_launch_result_and_mandatory_skill_reuse(tmp_path):
+    config, record = bare_host(tmp_path)
+    with Service(config) as service:
+        session = service.lease()
+        run = service.finished(service.start(session, outputs=['total'])['request_id'])
+        assert run['state'] == 'succeeded', run
+        result = run
+        assert result['data'] == {'total': '141400'}
+        assert result['model'] == 'gpt-6.1-terra' and result['effort'] == 'medium'
+        assert result['tokens']['input'] == 100 and result['timings']['commands'] == 1
+        assert result['skills_updated'] == ['example.food']
+        assert result['final_screenshot']['file_id']
+        seen = recorded(record)
+        argv, prompt = seen['argv'], seen['stdin']
+        assert argv[argv.index('--sandbox') + 1] == 'workspace-write'
+        assert 'sandbox_workspace_write.network_access=true' in argv
+        assert 'approval_policy=never' in argv
+        assert not any('mcp_servers' in item or 'dangerously' in item or 'ignore-rules' in item for item in argv)
+        assert 'SERIAL' in prompt and 'Order check for me' not in prompt
+        assert service.phone.commands == []  # no guard, hierarchy, or phone MCP
+        home = Path(seen['env']['CODEX_HOME'])
+        skill = home / 'skills' / skill_name('example.food') / 'SKILL.md'
+        assert 'example.food:id/cart' in skill.read_text()
+        assert '141400' not in skill.read_text() and 'Cart total' not in skill.read_text()
+        second = service.finished(service.start(session, model='gpt-6.1-sol', effort='high')['request_id'])
+        assert second['model'] == 'gpt-6.1-sol'
+        assert second['effort'] == 'high'
+        assert 'example.food:id/cart' in recorded(record)['stdin']
+
+
+# spec: ANYM-993
+@pytest.mark.parametrize('fields', [{'engine': 'claude'}, {'secrets': ['PASSWORD']}, {'save_as': 'food'},
+                                  {'model': '../invalid'}, {'effort': 'invalid'}])
+def test_bare_rejects_unsupported_inputs_before_engine_start(tmp_path, fields):
+    config, record = bare_host(tmp_path)
+    with Service(config) as service:
+        service.start(service.lease(), code=422, **fields)
+        assert not record.exists()
+
+
+# spec: ANYM-993
+def test_stop_holds_device_and_releases_process_without_publishing_skill(tmp_path):
+    config, record = bare_host(tmp_path, delay=60)
+    with Service(config) as service:
+        session = service.lease()
+        request_id = service.start(session)['request_id']
+        recorded(record)
+        service.start(session, code=409)
+        stopped = service.post('agent', {'action': 'stop', 'request_id': request_id})
+        assert stopped['state'] == 'stopped'
+        assert stopped['skills_updated'] == []
+        assert not (tmp_path / 'codex-home' / 'skills' / skill_name('example.food')).exists()
+
+
+# spec: ANYM-993
+@pytest.mark.parametrize('result,exit_code', [(False, 0), (True, 2)])
+def test_missing_result_or_unsuccessful_exit_never_succeeds(tmp_path, result, exit_code):
+    config, _ = bare_host(tmp_path, result=result, exit_code=exit_code)
+    with Service(config) as service:
+        run = service.finished(service.start(service.lease())['request_id'])
+        assert run['state'] == 'failed'
+        assert run['skills_updated'] == []
+
+
+# spec: ANYM-993
+def test_knowledge_does_not_accept_private_text_or_dynamic_identifiers(tmp_path):
+    from deedkit_android.agent_learning import publish
+    home = tmp_path / 'home'
+    good = {'package': 'example.food', 'steps': [{'action': 'tap', 'resource_id': 'example.food:id/cart'}],
+            'pitfalls': ['refresh_hierarchy']}
+    assert publish(home, [good]) == ['example.food']
+    skill = home / 'skills' / skill_name('example.food') / 'SKILL.md'
+    before = skill.read_bytes()
+    for change in ({'notes': 'Private address'}, {'steps': [{'action': 'tap', 'resource_id': 'example.food:id/user_123'}]},
+                   {'pitfalls': ['PIN 1234']}):
+        with pytest.raises(ValueError):
+            publish(home, [{**good, **change}])
+        assert skill.read_bytes() == before
+
+
+# spec: ANYM-993
+def test_timeout_and_command_cap_cancel_without_publishing(tmp_path, monkeypatch):
+    from deedkit_android import agent_bare
+    monkeypatch.setattr(agent_bare, 'MINUTE_S', 0.15)
+    config, _ = bare_host(tmp_path, delay=60)
+    with Service(config) as service:
+        run = service.finished(service.start(service.lease(), max_minutes=1)['request_id'])
+        assert run['state'] == 'timed_out' and run['skills_updated'] == []
+    monkeypatch.setattr(agent_bare, 'MINUTE_S', 60)
+    second = tmp_path / 'cap'
+    second.mkdir()
+    config, _ = bare_host(second, delay=60, commands=11)
+    with Service(config) as service:
+        run = service.finished(service.start(service.lease(), max_actions=10)['request_id'])
+        assert run['state'] == 'action_cap' and run['skills_updated'] == []
+
+
+# spec: ANYM-993
+def test_optional_apps_start_identity_and_owner_scope_are_preserved(tmp_path):
+    config, _ = bare_host(tmp_path)
+    with Service(config) as service:
+        session = service.lease()
+        args = dict(action='start', device_id='home', session_id=session,
+                    request_id='5f634f65-e8fa-4894-9098-1f0f9ab1fa53', goal='Read cart', owner_instruction='Read my cart')
+        first = service.post('agent', args)
+        service.post('agent', {**args, 'effort': 'high'}, code=409)
+        service.post('agent', {'action': 'get', 'request_id': args['request_id']}, key='two', code=404)
+        final = service.finished(first['request_id'])
+        assert final['state'] == 'succeeded'
+        assert service.post('agent', args)['request_id'] == first['request_id']
+
+
+# spec: ANYM-993
+def test_stop_really_terminates_the_owned_engine_pid(tmp_path):
+    from agent_harness import alive
+    config, record = bare_host(tmp_path, delay=60)
+    with Service(config) as service:
+        request_id = service.start(service.lease())['request_id']
+        pid = recorded(record)['pid']
+        assert alive(pid)
+        service.post('agent', {'action': 'stop', 'request_id': request_id})
+        deadline = time.monotonic() + 2
+        while alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not alive(pid)
+
+
+# spec: ANYM-993
+def test_final_screenshot_uses_serial_specific_adb_and_owner_scoped_download(tmp_path):
+    import base64
+    from deedkit_android.device import Devices
+    config, _ = bare_host(tmp_path)
+    adb = tmp_path / 'adb'
+    log = tmp_path / 'adb.json'
+    adb.write_text(f'''#!{sys.executable}
+import json, sys
+json.dump(sys.argv[1:], open({str(log)!r}, 'w'))
+sys.stdout.buffer.write(b'\\x89PNG\\r\\n\\x1a\\n' + b'0'*16)
+''')
+    adb.chmod(0o755)
+    body = json.loads(config.read_text())
+    body['adb'] = str(adb)
+    config.write_text(json.dumps(body))
+    with Service(config) as service:
+        devices = service.app.state.devices
+        devices.capture_image = Devices.capture_image.__get__(devices)
+        run = service.finished(service.start(service.lease())['request_id'])
+        assert json.loads(log.read_text()) == ['-s', 'SERIAL', 'exec-out', 'screencap', '-p']
+        file_id = run['final_screenshot']['file_id']
+        downloaded = service.post('download', {'file_id': file_id})
+        assert base64.b64decode(downloaded['data_base64']).startswith(b'\x89PNG')
+        service.post('download', {'file_id': file_id}, key='two', code=404)
+
+
+# spec: ANYM-993
+def test_bare_closes_the_target_warm_ui_worker_while_holding_its_phone_lock(tmp_path):
+    config, _ = bare_host(tmp_path)
+    with Service(config) as service:
+        devices = service.app.state.devices
+        closed = []
+
+        async def close(device=None):
+            if device is not None:
+                assert devices.locks[device].locked()
+                closed.append(device)
+
+        devices.ui.close = close
+        run = service.finished(service.start(service.lease())['request_id'])
+        assert run['state'] == 'succeeded'
+        assert closed == ['home']
+
+
+# spec: ANYM-993
+def test_app_skills_have_native_codex_names_and_keep_package_identity(tmp_path):
+    import yaml
+    from deedkit_android.agent_learning import load, publish
+    lesson = dict(package='example.food', steps=[dict(action='tap', resource_id='example.food:id/cart')], pitfalls=[])
+    publish(tmp_path, [lesson])
+    path, = (tmp_path / 'skills').glob('*/SKILL.md')
+    metadata = yaml.safe_load(path.read_text().split('---')[1])
+    assert re.fullmatch(r'[a-z0-9-]{1,63}', metadata['name'])
+    assert path.parent.name == metadata['name']
+    assert load(tmp_path, ['example.food']) == [lesson]
+

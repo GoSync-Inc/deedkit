@@ -218,7 +218,7 @@ def write_probe(state_dir, name, record):
     path.chmod(0o600)
 
 
-def status(state_dir, name, config):
+def status(state_dir, name, config, require_probe=True):
     """What `android_capabilities` shows for one engine: offered only when configured, logged in, at the pinned version and
     with a passed probe of that version. `reason` says why not (Codex: codex_probe_failed)."""
     shown = {'engine': name, 'provider': PROVIDERS[name], 'available': False}
@@ -229,6 +229,8 @@ def status(state_dir, name, config):
         return {**shown, 'reason': 'login_missing'}
     if installed_version(config.binary) != config.version:
         return {**shown, 'reason': 'version_mismatch'}
+    if not require_probe:
+        return {**shown, 'available': True}
     record = read_probe(state_dir, name)
     if not record or record.get('passed') is not True or record.get('version') != config.version:
         return {**shown, 'reason': 'codex_probe_failed' if name == 'codex' else 'probe_failed'}
