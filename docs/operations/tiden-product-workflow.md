@@ -7,6 +7,11 @@ is harness `tiden.md`; how a change records itself is harness `process.md` and
 [AGENTS.md](../../AGENTS.md) section 4; CI details in [TIDEN-CI.md](../../TIDEN-CI.md). This
 document holds DeedKit's values.
 
+Agent-facing features use [ordinary-agent experiments](agent-feature-experiments.md) before
+implementation and compare the same task through the integrated caller path afterward. Keep
+baseline, implementation decision and final comparison in the existing PR evidence; functional
+checks remain failing-first. CI success alone does not establish task usability.
+
 During a confirmed production incident, [incident recovery](incident-recovery.md)
 takes precedence: recover first and complete deferred intake/links afterward,
 before other tasks. Tiden availability or card ceremony must not hold a minimal
@@ -58,8 +63,8 @@ GitHub.
 ## Ready merge
 
 The flow is harness `tiden.md` (Card intake step 4, Ready merge; owner D6, 2026-10-26: a card that
-passed its reviews goes to main and into work with no separate approval). A draft stays on its
-proposal branch until clean reviews make it ready; the writer then fills `Ready:` (legacy
+meets the ready contract goes to main and into work with no separate approval). No reviews
+apply (AGENTS.md section 5); the writer fills `Ready:` on the proposal branch (legacy
 `Accepted:` counts as ready, but the job needs a `Ready:` line citing it) and, before any pull
 request names the card, dispatches DeedKit's ready-merge job:
 
@@ -72,7 +77,7 @@ The orchestrator dispatches it for a package. The job, its checks and recovery a
 land on main as `Backlog`, and step 5 queues them. A pull request on a ready card names its
 stories on main and no proposal branch. A later criterion edit goes on a `review/<name>`
 branch: the pull request's own while coding (sync B merges it with the squash); before work
-starts, one reviewed like the card, with a new `Ready:` line, merged by the same job. A card the
+starts, one meeting the same ready contract, with a new `Ready:` line, merged by the same job. A card the
 building pull request writes itself (one story under a parent on main) skips the job: that pull
 request names its branch.
 
