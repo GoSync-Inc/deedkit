@@ -35,9 +35,10 @@ def submit(store, token, n):
 
 
 def journal(store):
+    """The status events (ANYM-962); the submission events of ANYM-989 are read by `submissions`."""
     with store.pool.connection() as c:
         return c.execute('SELECT seq,event_key,source,type,subject,scope_ref,data,urgency,expires_at FROM module_events '
-            'ORDER BY seq').fetchall()
+            "WHERE NOT (type='feedback.received' AND NOT data ? 'previous_status') ORDER BY seq").fetchall()
 
 
 def key_id(store, token):
@@ -90,6 +91,53 @@ def _feedback_cases():
         'call_type_under_feedback': {**event, 'type': 'call.interrupted',
             'data': {'call_id': 'call-1', 'end_reason': 'service_restart'}, 'subject': 'call-1'},
         'id_above_2_53': {**event, 'id': 'feedback:9007199254740992'},
+        **_submission_cases(),
+    }
+
+
+def submission_event(**changes):
+    """ANYM-989: a feedback.received event of a submission: no previous status, a category."""
+    data = {'feedback_id': FEEDBACK_ID, 'status': 'received', 'category': 'bug'}
+    event = feedback_event('received')
+    return {**event, 'data': {**data, **changes.pop('data', {})}, **changes}
+
+
+def projection_event(**data):
+    event = feedback_event('received')
+    return {**event, 'type': 'feedback.projection_recorded',
+        'data': {'feedback_id': FEEDBACK_ID, 'classification': 'reported-bug', **data}}
+
+
+def _submission_cases():
+    """ANYM-989: the two new shapes and what stays refused beside them."""
+    operator = feedback_event('received')  # the operator's change back to received: previous status, no category
+    return {
+        'valid_submission': submission_event(),
+        **{'valid_submission_' + category: submission_event(data={'category': category})
+            for category in ('bug', 'feature', 'quality', 'other')},
+        'valid_operator_change_back_to_received': operator,
+        'valid_projection_recorded': projection_event(),
+        **{'valid_projection_' + name: projection_event(classification=name) for name in
+            ('reported-bug', 'feature', 'question', 'not-actionable', 'already-live', 'enable-only')},
+        **{'submission_with_' + key: submission_event(data={key: value}) for key, value in
+            (('description', 'private words'), ('note', 'private words'), ('refs', 'x'), ('principal', 'agent-a'),
+             ('previous_status', 'accepted'), ('spec_ref', 'ANYM-962'), ('fixed_in', MERGED))},
+        'submission_without_category': {**submission_event(), 'data': {'feedback_id': FEEDBACK_ID, 'status': 'received'}},
+        'submission_with_a_new_category': submission_event(data={'category': 'idea'}),
+        'operator_received_with_a_category': {**operator, 'data': {**operator['data'], 'category': 'bug'}},
+        'operator_received_unchanged': feedback_event('received', previous_status='received'),
+        'submission_of_another_type': {**submission_event(), 'type': 'feedback.accepted'},
+        'submission_batched': submission_event(urgency='batch'),
+        'submission_expiring': submission_event(expires_at='2099-01-01T00:00:00Z'),
+        'accepted_without_previous': {**feedback_event('accepted'), 'data': {'feedback_id': FEEDBACK_ID, 'status': 'accepted',
+            'category': 'bug'}},
+        'projection_with_a_status': projection_event(status='received'),
+        'projection_with_a_brief': projection_event(released_brief='private words'),
+        'projection_with_a_new_classification': projection_event(classification='bogus'),
+        'projection_without_classification': {**projection_event(), 'data': {'feedback_id': FEEDBACK_ID}},
+        'projection_batched': {**projection_event(), 'urgency': 'batch'},
+        'projection_expiring': {**projection_event(), 'expires_at': '2099-01-01T00:00:00Z'},
+        'projection_under_calls': {**projection_event(), 'id': 'calls:1', 'source': 'deedkit:calls'},
     }
 
 
@@ -99,8 +147,8 @@ def test_feedback_event_contract_is_one_in_the_python_check_and_the_definer_func
     with store.pool.connection() as c:
         for name, event in _feedback_cases().items():
             assert both(c, event) == (name.startswith('valid_'),) * 2, name
-    assert {'feedback.' + status for status in feedback_events.STATUSES} == {kind for kind in KINDS
-        if kind.startswith('feedback.')}
+    assert {'feedback.' + status for status in feedback_events.STATUSES} | {'feedback.projection_recorded'} == {
+        kind for kind in KINDS if kind.startswith('feedback.')}
 
 
 # jsonb holds no NUL character, so no stored event can carry one.
@@ -194,6 +242,7 @@ def test_migration_091_only_widens_the_lists_and_replays_without_touching_acls(m
         acl, constraints = c.execute(query).fetchone(), c.execute(shape).fetchall()
         c.execute(text)  # a repeated run (the module tests re-run migrations) changes nothing...
         c.execute((SOURCE / 'migrations' / '093_module_access_changed.sql').read_text())  # ...once the later one follows
+        c.execute((SOURCE / 'migrations' / '095_feedback_submission_events.sql').read_text())  # (ANYM-989) and its successor
         assert c.execute(query).fetchone() == acl and c.execute(shape).fetchall() == constraints
 
 

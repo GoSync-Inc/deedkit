@@ -2352,6 +2352,9 @@
     "operation": "list_subscriptions",
     "scopes": [
       "read"
+    ],
+    "alt_scopes": [
+      "feedback-maintainer-read"
     ]
   },
   {
@@ -2388,6 +2391,9 @@
     "operation": "get_subscription",
     "scopes": [
       "read"
+    ],
+    "alt_scopes": [
+      "feedback-maintainer-read"
     ]
   },
   {
@@ -2476,6 +2482,9 @@
     "operation": "get_subscription_events",
     "scopes": [
       "read"
+    ],
+    "alt_scopes": [
+      "feedback-maintainer-read"
     ]
   },
   {
@@ -5035,6 +5044,9 @@
               "$ref": "#/$defs/SubscriptionFeedbackStatuses"
             },
             {
+              "$ref": "#/$defs/SubscriptionFeedbackMaintainer"
+            },
+            {
               "type": "null"
             }
           ],
@@ -5251,6 +5263,29 @@
           "title": "SubscriptionEndpoint",
           "type": "object"
         },
+        "SubscriptionFeedbackMaintainer": {
+          "additionalProperties": false,
+          "properties": {
+            "maintainer": {
+              "const": true,
+              "description": "Wakes a key that holds feedback-maintainer-read (forbidden otherwise) on every agent's new feedback, recorded summary and status change. Alone it needs no read: its fetch, wait and ACK work without it. Statuses beside it add your own report statuses.",
+              "title": "Maintainer",
+              "type": "boolean"
+            },
+            "statuses": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Statuses",
+              "type": "array"
+            }
+          },
+          "required": [
+            "maintainer"
+          ],
+          "title": "SubscriptionFeedbackMaintainer",
+          "type": "object"
+        },
         "SubscriptionFeedbackStatuses": {
           "additionalProperties": false,
           "properties": {
@@ -5295,6 +5330,13 @@
               "title": "Chat Types",
               "type": "array"
             },
+            "exclude_chats": {
+              "items": {
+                "$ref": "#/$defs/ExcludedChat"
+              },
+              "title": "Exclude Chats",
+              "type": "array"
+            },
             "include_bots": {
               "title": "Include Bots",
               "type": "boolean"
@@ -5302,13 +5344,6 @@
             "include_channels": {
               "title": "Include Channels",
               "type": "boolean"
-            },
-            "exclude_chats": {
-              "items": {
-                "$ref": "#/$defs/ExcludedChat"
-              },
-              "title": "Exclude Chats",
-              "type": "array"
             }
           },
           "required": [
@@ -7436,6 +7471,9 @@
     "scopes": [
       "read"
     ],
+    "alt_scopes": [
+      "feedback-maintainer-read"
+    ],
     "required_manifest": true,
     "description": "Fetch an issued event page. Does not advance ACK or mark provider read. With explicit subscription-ack, a non-empty page gets a short-lived receipt (5 minutes). Safe to retry; a retry may evict the oldest receipt beyond 128, which then fails closed when ACKed. detail=compact (pollers) drops repeated blocks; same items, cursors and receipt. positions: acked, fetched and open/expired receipts; after invalid_receipt, fetch again (events may repeat) and compare positions.",
     "inputSchema": {
@@ -7519,6 +7557,10 @@
       "read",
       "subscription-ack"
     ],
+    "alt_scopes": [
+      "feedback-maintainer-read",
+      "subscription-ack"
+    ],
     "required_manifest": true,
     "description": "ACK an issued page using its receipt and ack_version. Exact retries are idempotent; never ACKs provider messages.",
     "inputSchema": {
@@ -7570,6 +7612,9 @@
     "operation": "wait_for_subscription_events",
     "scopes": [
       "read"
+    ],
+    "alt_scopes": [
+      "feedback-maintainer-read"
     ],
     "required_manifest": true,
     "description": "Wait at most 25 seconds for an authorized event page. No ACK, provider polling or guarantee that a host runs a turn. With explicit subscription-ack, a non-empty page gets a short-lived receipt (5 minutes). Safe to retry; a retry may evict the oldest receipt beyond 128, which then fails closed when ACKed. detail=compact (pollers) drops repeated blocks; same items, cursors and receipt.",

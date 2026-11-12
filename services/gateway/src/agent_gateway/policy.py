@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .catalog import CATALOG, ACTIONS, routed
+from .catalog import CATALOG, ACTIONS, routed, scopes_met
 
 
 # The deployable modules. ANYM-820: a build that knows `agents` must serve before a policy names it, and on a
@@ -225,7 +225,7 @@ class Policy:
             for name in profile["tools"]
             if CATALOG[name]["module"] in modules
             and (CATALOG[name]["module"] == "gateway" or CATALOG[name]["module"] in agent["credentials"])
-            and set(CATALOG[name]["scopes"]) <= set(agent["grants"].get(CATALOG[name]["module"], []))
+            and scopes_met(CATALOG[name], agent["grants"].get(CATALOG[name]["module"], []))
             and (not CATALOG[name].get("action_group") or bool(routed(CATALOG[name], Policy.actions(snapshot, agent))))
             and (
                 not CATALOG[name].get("required_action")

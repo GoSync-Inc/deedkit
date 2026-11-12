@@ -49,6 +49,14 @@ def arguments(tool, value):
     return validate_arguments(tool, value, CATALOG)
 
 
+def scopes_met(tool, granted):
+    """Whether `granted` (a backend key's permissions, or an agent's grants for the tool's module) admits the tool: all of
+    its `scopes`, or all of its `alt_scopes` alone when it has them (ANYM-989: a maintainer key without `read` runs
+    the subscription calls of its own maintainer-only subscription; the backend refuses it any other)."""
+    granted = set(granted)
+    return set(tool["scopes"]) <= granted or bool(tool.get("alt_scopes")) and set(tool["alt_scopes"]) <= granted
+
+
 def routed(tool, actions):
     """The actions a tool may carry: a risk-class tool (ANYM-549) only those it routes."""
     routes = tool.get("routes_actions")

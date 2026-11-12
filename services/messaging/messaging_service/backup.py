@@ -101,7 +101,7 @@ V86_TABLES={'contact_birthdays':'account,provider_user'}
 V90_TABLES={'module_links':'principal,module','subscription_module_links':'subscription,source,scope_ref'}
 # ANYM-988: the feedback loop's decision and released brief per feedback item (closed words, a scrubbed paraphrase; no text).
 V94_TABLES={'feedback_projections':'feedback_id'}
-SCHEMAS=range(2,95)
+SCHEMAS=range(2,96)
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
 V17_TABLES={'message_conflicts':'receipt_digest'}

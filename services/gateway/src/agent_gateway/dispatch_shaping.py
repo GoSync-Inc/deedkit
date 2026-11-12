@@ -9,7 +9,7 @@ from .catalog import routed
 from .diagnostics import manifest_summary
 from .policy import Denied
 from .sections import capabilities_view, negotiation_calls, subscription_blocks
-from .catalog import ACTIONS, CATALOG
+from .catalog import ACTIONS, CATALOG, scopes_met
 
 CALENDAR_CONSTRAINTS = {
     "event_write",
@@ -385,7 +385,7 @@ def shape_result(gateway, result, *, tool, module, snapshot, agent, caps, curren
             n
             for n in gateway.policy.visible(snapshot, agent)
             if CATALOG[n]["module"] == module
-            and set(CATALOG[n]["scopes"]) <= set(caps["permissions"])
+            and scopes_met(CATALOG[n], caps["permissions"])
             and gateway.implemented(CATALOG[n], snapshot, agent, caps)
             and (
                 not CATALOG[n].get("action_group")

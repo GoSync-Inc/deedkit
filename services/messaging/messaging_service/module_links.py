@@ -82,17 +82,32 @@ def _calendar_live(subscription, source, scope, seq):
         " AND ml.state='active' AND ml.generation=sl.generation AND " + entitled + ')')
 
 
+def _maintainer_holds(subscription):
+    """SQL: a subscription that has the maintainer source (the selector's `feedback_maintainer`, ANYM-989) is read only while
+    its key is neither revoked nor expired, its principal is enabled and both hold `feedback-maintainer-read`. A NULL key
+    ceiling inherits no new permission (policy.effective_permissions), so it never holds it."""
+    return ("EXISTS(SELECT FROM subscriptions fs WHERE fs.id=" + subscription +
+        " AND (NOT fs.selector ? 'feedback_maintainer' OR EXISTS(SELECT FROM api_keys fk JOIN principals fp "
+        "ON fp.id=fk.principal WHERE fk.id=fs.key_id AND fp.id=fs.principal AND NOT fk.revoked "
+        "AND fk.expires_at>clock_timestamp() AND fp.enabled "
+        "AND fk.permissions @> ARRAY['feedback-maintainer-read']::text[] "
+        "AND fp.permissions @> ARRAY['feedback-maintainer-read']::text[])))")
+
+
 def live(subscription, source, scope, *, linked=True, seq=None):
     """SQL: the module source (source, scope) of a subscription may match, be read and be announced.
 
     The arguments are column expressions of the caller's query (code constants, never request values). `seq` is the
     event's module seq column when the caller judges one event (a calendar source is entitled per event, ANYM-577).
-    Recordings and feedback sources are left as they are.
+    Recordings are left as they are; a feedback source too, unless its subscription has the maintainer source (ANYM-989).
     """
     linked_sources = "('deedkit:calls','deedkit:calendar')"
     if not linked:
         return '(' + source + ' NOT IN ' + linked_sources + ')'
-    return ('(' + source + ' NOT IN ' + linked_sources + " OR " + source + "='deedkit:calls' AND EXISTS(SELECT FROM "
+    # ANYM-989: an own-key feedback subscription stays live as before; one with the maintainer source is live only while
+    # its key holds the permission, so a revocation hides even the references matched before it.
+    return ('(' + source + ' NOT IN ' + linked_sources + ' AND (' + source + "<>'deedkit:feedback' OR " +
+        _maintainer_holds(subscription) + ') OR ' + source + "='deedkit:calls' AND EXISTS(SELECT FROM "
         'subscription_module_links sl JOIN subscriptions su ON su.id=sl.subscription '
         "JOIN module_links ml ON ml.principal=su.principal AND ml.module='calls' "
         'WHERE sl.subscription=' + subscription + ' AND sl.source=' + source + ' AND sl.scope_ref=' + scope +

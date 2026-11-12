@@ -17,6 +17,7 @@ import json
 import re
 
 from .feedback import SPEC_REF, UUID, _timestamp
+from .feedback_events import publish_projection_recorded
 from .policy import audit, targets
 
 # The reader's closed sets (scripts/autoloop.py CLASSES, REASONS, NEW_CARD, BRIEF_LIMIT); migration 094 holds the same
@@ -117,7 +118,7 @@ def record_projections(c, document):
             ON CONFLICT(feedback_id) DO UPDATE SET classification=excluded.classification,reason_code=excluded.reason_code,
             primary_spec=excluded.primary_spec,new_card=excluded.new_card,released_brief=excluded.released_brief,
             released_at=excluded.released_at,reader_pin=excluded.reader_pin,recorded_at=excluded.recorded_at
-            WHERE feedback_projections.released_at<excluded.released_at RETURNING feedback_id''',
+            WHERE feedback_projections.released_at<excluded.released_at RETURNING feedback_id,recorded_at''',
             (row['id'], item['classification'], item['reason_code'], item.get('primary_spec'), item.get('new_card'),
              item.get('released_brief'), released[str(row['id'])], item['reader_pin'])).fetchone()
         if written:
@@ -125,6 +126,9 @@ def record_projections(c, document):
             # One content-free operator audit row per written item: the fixed operation code and the feedback ID only.
             audit(c, {'id': row['principal'], 'key_id': row['key_id'], '_audit_targets': [str(row['id'])]},
                 'record_feedback_projection', 'ok')
+            # ANYM-989: a written item (never an unchanged one) wakes a maintainer subscription, in this transaction and
+            # in a savepoint of its own: an error is counted and the write commits.
+            publish_projection_recorded(c, row['id'], item['classification'], written['recorded_at'])
     return {'recorded': recorded, 'unchanged': len(rows) - recorded}
 
 
