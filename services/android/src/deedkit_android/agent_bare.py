@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import time
 
-from . import agent_learning, engines
+from . import agent_diagnostics, agent_learning, engines
 from .agent_run import AgentRun, MINUTE_S, MAX_NOTES
 from .config import Refused
 
@@ -32,6 +32,7 @@ class BareRun(AgentRun):
         super().__init__(*args)
         self.command_starts, self.model_ms = {}, 0.0
         self.skills_updated, self.learning_error = [], None
+        self.stderr, self.stderr_reader, self.commands_started = bytearray(), None, 0
 
     def prompt(self):
         host = self.agents.read_config()
@@ -56,7 +57,7 @@ class BareRun(AgentRun):
                    '--sandbox', 'workspace-write', '-C', str(self.dir), '-m', self.config.model,
                    '-c', 'model_reasoning_effort=' + json.dumps(self.config.reasoning_effort),
                    '-c', 'sandbox_workspace_write.network_access=true', '-c', 'approval_policy=never',
-                   '--output-schema', str(self.dir / 'result-schema.json'), '-o', str(self.dir / 'final.json'), '-']
+                   '-o', str(self.dir / 'final.json'), '-']
         env = engines.environment('codex', self.config, self.dir)
         env['PATH'] = str(Path(host.adb).parent) + os.pathsep + env['PATH']
         env['ANDROID_SERIAL'] = host.devices[self.device]
@@ -65,9 +66,10 @@ class BareRun(AgentRun):
                 env[name] = os.environ[name]
         process = await asyncio.create_subprocess_exec(
             *command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL, env=env, cwd=self.dir, start_new_session=True,
+            stderr=asyncio.subprocess.PIPE, env=env, cwd=self.dir, start_new_session=True,
             limit=4 * 1024 * 1024)
         self.process = process
+        self.stderr_reader = asyncio.create_task(self.read_stderr())
         if self.state != 'running':
             await engines.kill_group(process)
             raise OSError('run_already_stopped')
@@ -82,6 +84,11 @@ class BareRun(AgentRun):
             pass
         return process
 
+    async def read_stderr(self):
+        while chunk := await self.process.stderr.read(4096):
+            self.stderr.extend(chunk)
+            del self.stderr[:-16384]  # memory only; no raw diagnostic log or phone dump
+
     async def supervise(self):
         heartbeat, reader = asyncio.create_task(self.keep_lease()), None
         try:
@@ -91,14 +98,15 @@ class BareRun(AgentRun):
                 reader = asyncio.create_task(self.read_stream())
                 await self.process.wait()
                 await reader  # consume all command completions and token usage before finalizing
+                await self.stderr_reader
                 if self.state == 'running':
                     try:
                         path = self.dir / 'final.json'
                         if path.stat().st_size > 65536:
                             raise ValueError('result_too_large')
-                        outcome = agent_learning.Outcome.model_validate_json(path.read_text())
-                        if self.process.returncode == 0 and not self.stream.errors:
-                            self.finished = outcome.model_dump()
+                        outcome, self.learning_error = agent_learning.decode_result(path.read_text())
+                        if self.process.returncode == 0:
+                            self.finished = outcome
                     except (OSError, ValueError):
                         self.learning_error = 'invalid_or_missing_result'
                     await self.end('succeeded' if self.finished else 'failed', exit_code=self.process.returncode)
@@ -110,7 +118,10 @@ class BareRun(AgentRun):
             heartbeat.cancel()
             if reader and not reader.done():
                 reader.cancel()
-            await asyncio.gather(heartbeat, *([reader] if reader else []), return_exceptions=True)
+            if self.stderr_reader and not self.stderr_reader.done():
+                self.stderr_reader.cancel()
+            await asyncio.gather(heartbeat, *([reader] if reader else []),
+                                 *([self.stderr_reader] if self.stderr_reader else []), return_exceptions=True)
 
     async def read_stream(self):
         async for line in self.process.stdout:
@@ -120,6 +131,7 @@ class BareRun(AgentRun):
                 if item.get('type') == 'command_execution':
                     key = item.get('id', '')
                     if event.get('type') == 'item.started':
+                        self.commands_started += 1
                         self.command_starts[key] = time.monotonic()
                         if len(self.actions) + len(self.command_starts) > self.request.max_actions:
                             await self.end('action_cap')
@@ -141,7 +153,12 @@ class BareRun(AgentRun):
 
     async def final(self, state, extra):
         finished = self.finished or {}
-        if state == 'succeeded':
+        if self.stderr_reader and not self.stderr_reader.done():
+            try:
+                await asyncio.wait_for(self.stderr_reader, 1)
+            except (TimeoutError, asyncio.CancelledError):
+                pass
+        if state == 'succeeded' and not self.learning_error:
             try:
                 self.skills_updated = agent_learning.publish(self.config.codex_home, finished.get('lessons', []))
             except (OSError, ValueError):
@@ -155,12 +172,19 @@ class BareRun(AgentRun):
             pass
         data = {key: value for key, value in finished.get('data', {}).items() if value is not None}
         total = round((time.monotonic() - self.started) * 1000, 2)
+        usages = [self.stream.final] if self.stream.final else list(self.stream.messages.values())
+        observed = any(type(usage.get(key)) is int for usage in usages if isinstance(usage, dict)
+                       for keys in engines.TOKEN_KEYS.values() for key in keys)
         return {'summary': finished.get('summary', ''), 'data': data,
                 'missing_outputs': [key for key in self.request.outputs if key not in data],
                 'screenshots': [screenshot] if screenshot else [], 'final_screenshot': screenshot or 'unavailable',
                 'action_log': self.actions, 'finished': self.finished is not None,
                 'timings': {'engine_ms': self.engine_ms, 'total_ms': total, 'device_ms': self.device_ms,
-                            'commands': len(self.actions), 'model_ms': max(0, self.engine_ms - self.device_ms)},
-                'tokens': self.stream.tokens(), 'engine': 'codex', 'model': self.config.model,
+                            'commands': len(self.actions), 'commands_started': self.commands_started,
+                            'model_ms': max(0, self.engine_ms - self.device_ms)},
+                'tokens': self.stream.tokens(), 'token_usage_observed': observed,
+                'engine': 'codex', 'model': self.config.model,
                 'effort': self.config.reasoning_effort, 'mode': 'bare', 'prompt_version': 1,
-                'skills_updated': self.skills_updated, 'learning_error': self.learning_error, **extra}
+                'skills_updated': self.skills_updated, 'learning_error': self.learning_error,
+                'engine_errors': agent_diagnostics.receipt(self.stream.errors, bytes(self.stderr),
+                    [self.request.goal, self.request.owner_instruction, *self.params.values()]), **extra}

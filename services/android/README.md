@@ -313,7 +313,15 @@ and loads it for the next run, even when the model writes no skill file. A small
 `android-learning` skill explains the contract. Only static resource IDs, action enums and
 defined navigation pitfalls are persisted; goals, summaries, screen text, task parameters,
 contacts, addresses and secrets never enter this knowledge format. No reusable observation
-means an empty lesson list; invalid output fails visibly, without publishing fabricated knowledge.
+means an empty lesson list. The local result-schema.json is an instruction to the ordinary
+session; the service does not send an API output schema. One JSON codefence is accepted.
+Invalid learning returns learning_error and publishes nothing, while preserving genuine
+native summary/data. A nonzero native exit or absent final message remains a failed run.
+Bounded sanitized engine_errors and exit_code report native startup errors; raw stderr and
+phone dumps are never logged. timings.commands_started counts submissions independently
+of completed commands, including when cancellation interrupts one. token_usage_observed
+distinguishes reported usage from zero-filled counters when no usage report was received;
+those counters are not evidence of zero billing.
 The sandbox does not make the skills directory writable to the model; the service publishes
 it atomically after success.
 
