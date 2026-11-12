@@ -48,7 +48,7 @@ docs/operations/parallel-development.md.
 
 Authority: owner decision D25 (harness, 2026-10-27, «1) да 2)да 3)да»): the owner keeps only the
 five harness items; production, rollback, restore, destructive SQL, keys/access follow harness section 2.
-Item 2 asks only what docs/DATA-POLICY.md excludes; item 3 is Budget above. Live actions use the
+Item 2 asks only what docs/DATA-POLICY.md does not cover; item 3 is Budget above. Live actions use the
 owner's accounts/name (item 4) and devices/auth (item 5): section 1's scoped overrides apply.
 In a ready card the agent applies its migration under
 production.md "Migration releases"; enabling a feature never includes send, call, pairing,
