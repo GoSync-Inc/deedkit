@@ -167,7 +167,8 @@ CALL_TIMEOUT = 120
 STALE = timedelta(hours=2)
 CAPS = {'items_per_principal': 20, 'reader_runs': 24, 'card_launches': 5, 'build_launches': 3, 'card_in_flight': 2,
         'build_in_flight': 2, 'worker_hours': 12}
-CONFIG = {'live': False, 'principals': [], 'tz': 'UTC', 'caps': CAPS, 'orchestrator_thread': None}
+CONFIG = {'live': False, 'principals': [], 'tz': 'UTC', 'caps': CAPS, 'orchestrator_thread': None,
+          'worker_machine': None}
 LIMITS = {'card': 2 * 3600, 'build': 4 * 3600}  # each worker's wall-clock reservation, in seconds
 LIVE = ('reserved', 'unknown', 'started')  # intents that hold an in-flight slot
 CONTROL = re.compile(r'AUTOLOOP (STOP|DROP ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}))')
@@ -191,6 +192,7 @@ PROVIDER, WORKER_MODEL, HOST_MODEL, EFFORT = 'claude-code', 'claude-sonnet-5-5',
 NOTIFY = 'stuck'  # bb --parent-notifications of a worker: the orchestrator hears of a failure or a question, not of each end
 NO_ORCHESTRATOR = 'no orchestrator_thread in config.json'
 THREAD_ID = re.compile(r'thr_[a-z0-9]{6,40}')
+MACHINE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')  # a bb machine ID or name
 RUNNING = ('pending', 'starting', 'active', 'stopping')  # bb thread statuses of a turn that has not ended
 TERMINAL_ALPHABET = '23456789abcdefghijkmnpqrstuvwxyz'  # bb: `term_` plus ten of these
 TERMINAL_TRIES, TERMINAL_WAIT = 6, 5  # a new thread's environment may not be ready for its terminal at once
@@ -566,8 +568,10 @@ def enter(stack, manager, what):
 
 
 def config(state):
-    """The owner-written config.json (0600): `live`, `principals`, `tz`, `caps` and `orchestrator_thread` (the bb
-    thread that parents every worker; a launch needs it); a missing file is all defaults."""
+    """The owner-written config.json (0600): `live`, `principals`, `tz`, `caps`, `orchestrator_thread` (the bb
+    thread that parents every worker; a launch needs it) and `worker_machine` (the bb machine ID or name the workers
+    run on, `--machine`; none: the parent's machine). Nothing here assumes the host the controller runs on. A
+    missing file is all defaults."""
     path = state / 'config.json'
     if path.exists() and path.stat().st_mode & 0o077:
         raise Refused('config.json must be 0600')
@@ -579,14 +583,16 @@ def config(state):
             or not isinstance(caps, dict) or set(caps) - set(CAPS) \
             or any(type(v) is not int or v < 0 for v in caps.values()) \
             or not (raw.get('orchestrator_thread') is None or (isinstance(raw['orchestrator_thread'], str)
-                                                       and THREAD_ID.fullmatch(raw['orchestrator_thread']))):
+                                                       and THREAD_ID.fullmatch(raw['orchestrator_thread']))) \
+            or not (raw.get('worker_machine') is None or (isinstance(raw['worker_machine'], str)
+                                                          and MACHINE.fullmatch(raw['worker_machine']))):
         raise Refused('config.json: an unknown key or a bad value')
     try:
         zone = ZoneInfo(raw.get('tz', CONFIG['tz']))
     except (ValueError, TypeError, ZoneInfoNotFoundError):
         raise Refused('config.json: unknown tz') from None
     return {'live': raw.get('live', False), 'principals': set(principals), 'zone': zone, 'caps': dict(CAPS, **caps),
-            'orchestrator_thread': raw.get('orchestrator_thread')}
+            'orchestrator_thread': raw.get('orchestrator_thread'), 'worker_machine': raw.get('worker_machine')}
 
 
 def counters(ledger, cfg, now):
@@ -1181,11 +1187,13 @@ def terminal_id(name):
 
 def spawn(bb, cfg, intent, prompt, model, effort=None):
     """One worker's thread (title = intent name, a child of the orchestrator thread, a fresh worktree of main): the
-    prompt goes in on stdin. A reply without a thread ID leaves the intent `unknown` for `reconcile`."""
+    prompt goes in on stdin; `worker_machine` of the config pins the machine. A reply without a thread ID leaves
+    the intent `unknown` for `reconcile`."""
     argv = ['thread', 'spawn', '--project', PROJECT, '--parent-thread', cfg['orchestrator_thread'],
             '--new-environment', 'worktree', '--base-branch', 'main', '--title', intent['name'],
             '--provider', PROVIDER, '--model', model, '--parent-notifications', NOTIFY, '--prompt-file', '-']
-    reply = bb(argv + (['--reasoning-level', effort] if effort else []), prompt)
+    reply = bb(argv + (['--reasoning-level', effort] if effort else [])
+               + (['--machine', cfg['worker_machine']] if cfg.get('worker_machine') else []), prompt)
     thread = reply.get('id') if isinstance(reply, dict) else None
     if not isinstance(thread, str) or not THREAD_ID.fullmatch(thread):
         raise Refused('bb thread spawn: no thread ID in the reply')

@@ -184,13 +184,15 @@ python3 scripts/feedback_sync.py status
   IDs, items waiting for a card or for main with their age in hours, the files (complete, open,
   legacy, refused), the pending call, `last_ok`; never note text. `status` prints it.
 
-### bb automation `deedkit-feedback-follow` (egor-ryzen)
+### bb automation `deedkit-feedback-follow` (controller host)
 
 Owner 11-12: the hourly sync is a bb script automation; the macOS LaunchAgent `ai.deedkit.feedback-follow` is
-retired with the cutover. Prerequisites: a clean checkout of `main` used only by the loop's two jobs
-(`/home/egor/deedkit-autoloop`: `git clone https://github.com/GoSync-Inc/deedkit.git` once, never edited), an SSH key
-for `deedkit-prod` that needs no prompt, stored `gh` and Tiden logins, and `uv`, `timeout` and `git` on the job's
-`PATH`. Each run first pulls: a `git fetch` cut at 120 s, then a local `git merge --ff-only`, so the job runs
+retired with the cutover. The jobs run on one controller host, the one where the export's ssh alias works (the
+production ssh is not on every machine: egor-ryzen has none, DevOps boundary 11-12); bb runs a script
+automation on its own server host, so that is the machine whose bb server holds the automation.
+Prerequisites on that host: a clean checkout of `main` used only by the loop's two jobs (`<checkout>`:
+`git clone https://github.com/GoSync-Inc/deedkit.git` once, never edited), the ssh alias for `deedkit-prod` that
+needs no prompt, stored `gh` and Tiden logins, and `uv`, `timeout` and `git` on the job's `PATH`. Each run first pulls: a `git fetch` cut at 120 s, then a local `git merge --ff-only`, so the job runs
 current `main` without a hand step. A pull that fails prints `git pull failed` and the run still syncs the code
 the checkout has. A checkout with a tracked change, an untracked file that Git does not ignore or a stale
 `index.lock` is not one revision: the run prints `the checkout is not clean`, fails and syncs nothing until it is
@@ -208,8 +210,8 @@ out=$(uv run --no-project --python 3.13 python scripts/feedback_sync.py auto --a
 ```sh
 bb automation create --project proj_nfixav7q2f --name deedkit-feedback-follow --cron '5 * * * *' --timezone UTC \
   --script-file ~/.deedkit/automations/feedback-follow.sh --interpreter bash --timeout 15m \
-  --working-directory /home/egor/deedkit-autoloop \
-  --env-json '{"PATH":"/home/egor/.local/bin:/usr/local/bin:/usr/bin:/bin","GIT_TERMINAL_PROMPT":"0"}'
+  --working-directory <checkout> \
+  --env-json '{"PATH":"<HOME>/.local/bin:/usr/local/bin:/usr/bin:/bin","GIT_TERMINAL_PROMPT":"0"}'
 bb automation list --project proj_nfixav7q2f                      # the automation ID
 bb automation pause <id> --project proj_nfixav7q2f                 # undo (resume, or delete --yes)
 ```
@@ -273,7 +275,8 @@ and `config.json` must be 0600:
 
 ```json
 {"live": false, "principals": ["<agent principal from list-keys>"], "tz": "Europe/Moscow",
- "orchestrator_thread": "<bb thread ID that parents the workers>",
+ "orchestrator_thread": "<bb thread ID that parents the workers>", "worker_machine": "<bb machine of the workers>",
+
  "caps": {"items_per_principal": 20, "reader_runs": 24, "card_launches": 5, "build_launches": 3,
           "card_in_flight": 2, "build_in_flight": 2, "worker_hours": 12}}
 ```
@@ -281,6 +284,9 @@ and `config.json` must be 0600:
 Every key is optional (the values above are the defaults, with `tz` `UTC` and no principals). A live
 launch needs `orchestrator_thread` (a `thr_…` ID from `bb thread list`; the orchestrator's thread, which
 parents every worker); without it the plan says `no orchestrator_thread in config.json` and nothing starts.
+`worker_machine` (a bb machine ID or name, optional) is where the workers run (`--machine`); without it they run on the
+orchestrator thread's machine. Set it to the machine that holds the controller's checkout, the briefs and the logins
+(a build worker's terminal runs `launch.py` from that checkout). Nothing assumes which host that is.
 One tick:
 
 1. `PAUSE` present: fence only (below), no read, triage or launch.
@@ -347,12 +353,14 @@ in `tz`.
 - `autoloop.py status` exits 1 when the last good tick is older than 2 hours, the stop is not
   effective, a hold or drop is not withheld, or `PAUSE` starts with `audit`.
 
-### bb automation `deedkit-autoloop` (egor-ryzen)
+### bb automation `deedkit-autoloop` (controller host)
 
-Owner 11-12: the hourly job is a bb script automation, not the Superset automation of the owner's Mac. Prerequisites:
-`bb`, `gh`, `tiden`, `uv` and `docker` logged in or installed on egor-ryzen, the SSH alias `deedkit-prod`, the pinned reader
-CLI (above), `config.json` written by the owner with the orchestrator's `orchestrator_thread`, and the clean checkout
-of `main` of `deedkit-feedback-follow` above (`/home/egor/deedkit-autoloop`, shared by both jobs). Save this outside Git as
+Owner 11-12: the hourly job is a bb script automation, not the Superset automation of the owner's Mac. It runs on
+the same controller host as `deedkit-feedback-follow` (above; the port assumes no host). Prerequisites on it: `bb`,
+`gh`, `tiden`, `uv` and `docker` installed and logged in, the ssh alias for `deedkit-prod` (the host and alias stay
+config), the pinned reader CLI (above), `config.json` written by the owner with the orchestrator's
+`orchestrator_thread` (and `worker_machine`), and the clean checkout of `main` of `deedkit-feedback-follow` above
+(`<checkout>`, shared by both jobs). Save this outside Git as
 `~/.deedkit/automations/autoloop-tick.sh`:
 
 ```bash
@@ -375,8 +383,8 @@ exit $failed
 ```sh
 bb automation create --project proj_nfixav7q2f --name deedkit-autoloop --cron '20 * * * *' --timezone UTC \
   --script-file ~/.deedkit/automations/autoloop-tick.sh --interpreter bash --timeout 15m \
-  --working-directory /home/egor/deedkit-autoloop \
-  --env-json '{"PATH":"/home/egor/.local/bin:/usr/local/bin:/usr/bin:/bin","GIT_TERMINAL_PROMPT":"0"}'
+  --working-directory <checkout> \
+  --env-json '{"PATH":"<HOME>/.local/bin:/usr/local/bin:/usr/bin:/bin","GIT_TERMINAL_PROMPT":"0"}'
 bb automation list --project proj_nfixav7q2f                      # the automation ID
 ```
 
@@ -392,7 +400,7 @@ Undo: `bb automation pause <id> --project proj_nfixav7q2f` (resume, or `delete <
 
 Cutover from the Mac (no two controllers on one state): `touch PAUSE` on the Mac, wait for its fence to read back
 clean (`autoloop.py status`), remove the Mac's Superset automation and the LaunchAgent `ai.deedkit.feedback-follow`
-(`launchctl bootout gui/$(id -u)/ai.deedkit.feedback-follow`), then create the two automations on egor-ryzen. The
+(`launchctl bootout gui/$(id -u)/ai.deedkit.feedback-follow`), then create the two automations on the new controller host. The
 state directories (`~/.deedkit/autoloop`, `~/.deedkit/feedback-triage`, `~/.deedkit/feedback-sync`; 0700, files
 0600) are per machine: copy them over only if the ledger, holds and daily counters should carry on. An intent
 whose recorded worker is a Superset workspace ID reads as `interrupted` at the first tick (a card worker's

@@ -962,6 +962,33 @@ def test_config_reads_the_orchestrator_thread_and_it_defaults_to_none(loop):
 
 
 # spec: ANYM-568
+@pytest.mark.parametrize('value', ['', 5, 'a b', '-x', ['mini'], 'm' * 65])
+def test_config_refuses_a_worker_machine_that_is_not_a_bb_machine_id_or_name(loop, value):
+    t, a, s = loop
+    configure(a, worker_machine=value)
+    with pytest.raises(autoloop.Refused, match='config.json'):
+        autoloop.config(a)
+
+
+# spec: ANYM-568
+def test_a_worker_runs_on_the_configured_machine_and_on_its_parents_when_none_is_set(loop):
+    t, a, s = loop
+    configure(a, worker_machine='mac-mini')
+    assert autoloop.config(a)['worker_machine'] == 'mac-mini'
+    configure(a)
+    assert autoloop.config(a)['worker_machine'] is None
+    spawns = []
+
+    def bb(argv, stdin=None):
+        spawns.append(argv)
+        return {'id': 'thr_000009'}
+    for machine in ('mac-mini', None):
+        autoloop.spawn(bb, dict(cfg(), worker_machine=machine), {'name': 'autoloop-card-xyz'}, 'prompt', 'm')
+    with_machine, without = spawns
+    assert with_machine[with_machine.index('--machine') + 1] == 'mac-mini' and '--machine' not in without
+
+
+# spec: ANYM-568
 @settings(max_examples=60, deadline=None)
 @given(st.from_regex(autoloop.WORKSPACE, fullmatch=True))
 def test_a_build_terminal_id_is_a_fixed_function_of_the_intent_name_in_bbs_alphabet(name):

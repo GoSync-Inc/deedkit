@@ -9,7 +9,10 @@ Runtime (owner 11-12, on moving DeedKit to bb on egor-ryzen: «цикл наве
 организовать другим способом ... поискать способ закрыть этот же джобс то би дан только функционалами которые
 есть бб»; «можешь запускать, настраивать все»): the loop's workers and its schedule use the `bb` CLI, no longer
 Superset or launchd. The boundary, envelope, caps and undo below are unchanged; only what starts and lists a
-worker, and what runs the hourly job, moved (a worker is a bb thread, the job a bb script automation).
+worker, and what runs the hourly job, moved (a worker is a bb thread, the job a bb script automation). The port
+assumes no host: the controller runs where the export's ssh alias works (DevOps boundary 11-12: egor-ryzen has no
+ssh to `deedkit-prod`; production administration stays on the owner's admin Mac), the ssh alias and host stay
+config (`feedback_triage.HOST`), and `worker_machine` in `config.json` pins the machine the workers run on.
 
 The driver is `scripts/autoloop.py` (ANYM-569 tick, ANYM-570 reader, ANYM-571 card launcher,
 ANYM-572 build launcher and controller merge, ANYM-573 status and report); feedback statuses move
@@ -111,8 +114,8 @@ With `live: true`, the tick gives each new owner-agent cluster that has a releas
 card worker within the caps. The worker is a bb thread titled `autoloop-card-c<hash>` (project
 `proj_nfixav7q2f`, Claude Code, claude-sonnet-5-5, effort high, a fresh worktree of `main`), a child of
 the orchestrator thread named by `orchestrator_thread` in `config.json`, started with
-`bb thread spawn --parent-thread <orchestrator> --new-environment worktree --base-branch main --title
-<intent> --parent-notifications stuck --prompt-file -` (the prompt on stdin). `stuck` wakes the
+`bb thread spawn --parent-thread <orchestrator> [--machine <worker_machine>] --new-environment worktree
+--base-branch main --title <intent> --parent-notifications stuck --prompt-file -` (the prompt on stdin). `stuck` wakes the
 orchestrator for a failure or a question, not for each finished worker (the day's report lists the
 rest). The worker's permission mode follows its parent's. Names, titles and prompts use an opaque key
 (a hash of the cluster), so no word of the reader's slug reaches them. The prompt names
