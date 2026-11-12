@@ -385,4 +385,6 @@ export declare class AnyMsgClient {
   submitFeedback(args: PrivateFeedback, options?: {signal?:AbortSignal}): Promise<Record<string,unknown>>;
   /** Only the current credential's records, without former source references. */
   listFeedback(args?: {limit?:number}, options?: {signal?:AbortSignal}): Promise<Record<string,unknown>>;
+  /** A maintainer key (feedback-maintainer-read): every agent's feedback metadata and the loop's released summary, oldest change first; never the description, references or notes. Pass the previous reply's next_cursor. */
+  exportFeedbackMetadata(args?: {cursor?:string; limit?:number}, options?: {signal?:AbortSignal}): Promise<Record<string,unknown>>;
 }

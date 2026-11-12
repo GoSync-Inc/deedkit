@@ -20,7 +20,7 @@ const METHODS = Object.freeze([
   'list_messenger_operations','preview_messenger_operation','execute_messenger_operation','get_messenger_operation',
   'create_subscription','list_subscriptions','get_subscription','update_subscription','get_subscription_events',
   'fetch_subscription_events','ack_subscription_events','wait_for_subscription_events',
-  'configure_subscription_delivery','test_subscription','submit_feedback','list_feedback',
+  'configure_subscription_delivery','test_subscription','submit_feedback','list_feedback','export_feedback_metadata',
   'register_delivery_endpoint','list_delivery_endpoints','update_delivery_endpoint','delete_delivery_endpoint','test_delivery_endpoint',
   'list_delivery_attempts',
   'prepare_file_upload','upload_file_chunk','get_file_upload',
@@ -170,6 +170,7 @@ const FEEDBACK_STATUSES = Object.freeze(['received','accepted','declined','dupli
 const FEEDBACK_FIELDS = Object.freeze({
   submit_feedback: [['request_id','category','description'],['request_id','category','description','operation','refs']],
   list_feedback: [[],['limit','status']],
+  export_feedback_metadata: [[],['cursor','limit']],
 });
 const SUBSCRIPTION_KINDS = new Set(['message.created','message.edited','message.deleted',
   'message.status','attachment.ready','file.text.ready','file.transcript.ready',
@@ -362,6 +363,7 @@ function feedbackArguments(method,args) {
     if (key==='request_id') valid=requestId(value);
     else if (key==='limit') valid=Number.isSafeInteger(value) && value>=1 && value<=100;
     else if (key==='status') valid=typeof value==='string' && FEEDBACK_STATUSES.includes(value);
+    else if (key==='cursor') valid=typeof value==='string' && value.length>=1 && value.length<=512;
     else if (key==='category') valid=typeof value==='string' && ['bug','feature','quality','other'].includes(value);
     else if (key==='description') valid=typeof value==='string' && [...value].length>=1 &&
       [...value].length<=4000 && value.trim().length>0 && !/[\x00-\x08\x0b-\x1f\x7f]/.test(value);
@@ -653,5 +655,8 @@ export class AnyMsgClient {
   }
   listFeedback(args={},options) {
     return this.call('list_feedback',feedbackArguments('list_feedback',args),options);
+  }
+  exportFeedbackMetadata(args={},options) {
+    return this.call('export_feedback_metadata',feedbackArguments('export_feedback_metadata',args),options);
   }
 }

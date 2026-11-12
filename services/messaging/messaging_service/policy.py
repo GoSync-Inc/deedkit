@@ -18,8 +18,12 @@ BOT_PERMISSIONS = frozenset(('bot-press', 'webview-open'))
 MODERATION_PERMISSIONS = frozenset(('groups-moderate',))
 # ANYM-932: posting and deleting a story or status publishes under the owner's name; no existing key ceiling inherits it.
 STORY_PERMISSIONS = frozenset(('stories-post',))
+# ANYM-988: every principal's feedback metadata and the feedback loop's released summary (export_feedback_metadata); no
+# existing key ceiling inherits it, and an agent's own reports stay readable through `read` alone (list_feedback).
+MAINTAINER_PERMISSIONS = frozenset(('feedback-maintainer-read',))
 PERMISSIONS = (LEGACY_PERMISSIONS | MESSENGER_PERMISSIONS | SUBSCRIPTION_PERMISSIONS | UPLOAD_PERMISSIONS |
-               DELIVERY_PERMISSIONS | BOT_PERMISSIONS | MODERATION_PERMISSIONS | STORY_PERMISSIONS)
+               DELIVERY_PERMISSIONS | BOT_PERMISSIONS | MODERATION_PERMISSIONS | STORY_PERMISSIONS |
+               MAINTAINER_PERMISSIONS)
 
 
 def effective_permissions(principal_permissions, key_permissions):
@@ -56,12 +60,15 @@ OPERATION_PERMISSIONS = {
     'delete_wake_target':'delivery-write','confirm_wake_target':'delivery-write',
     # ANYM-909: every negotiation being arranged (ANYM-907 rows), read only.
     'list_negotiations':'read',
+    # ANYM-988: every principal's feedback metadata with the loop's released summary, for a maintainer key only.
+    'export_feedback_metadata':'feedback-maintainer-read',
 }
 # resolve_target is audited as resolve_reference (ANYM-545) and messages_send as its preview_message and
 # send_message steps (ANYM-546): the audit_log CHECK lists operations by migration.
 AUDIT_OPERATIONS = frozenset(OPERATION_PERMISSIONS) - {'resolve_target', 'messages_send'} | {
     'issue_key', 'revoke_key', 'set_access', 'http_boundary', 'send_dispatch', 'set_sending',
     'set_key_permissions', 'set_operations', 'messenger_dispatch', 'extend_key', 'set_feedback_status',
+    'record_feedback_projection',  # ANYM-988: the operator command, one content-free row per written item
 }
 AUDIT_CODES = frozenset({
     # ANYM-848: wake target refusals.
@@ -173,7 +180,7 @@ def audit(c, p, operation, outcome, code=None):
     values = (p.get('id'), p.get('key_id'), operation, outcome, safe_code,
               p.get('_audit_targets', []) if outcome == 'ok' else [])
     if operation in ('issue_key','revoke_key','extend_key','set_access','set_sending','set_key_permissions','set_operations',
-            'set_feedback_status'):
+            'set_feedback_status','record_feedback_projection'):
         c.execute('''INSERT INTO audit_log(principal,key_id,operation,outcome,error_code,resource_ids,actor)
             VALUES(%s,%s,%s,%s,%s,%s,'operator')''', values)
     elif operation in ('send_dispatch','messenger_dispatch'):

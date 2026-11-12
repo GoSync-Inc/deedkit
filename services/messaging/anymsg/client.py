@@ -167,6 +167,8 @@ _FEEDBACK_STATUSES = ('received','accepted','declined','duplicate','fixed','veri
 _FEEDBACK_FIELDS = {
     'submit_feedback': ({'request_id','category','description'}, {'request_id','category','description','operation','refs'}),
     'list_feedback': (set(), {'limit','status'}),
+    # ANYM-988: a maintainer key's read of every agent's feedback metadata.
+    'export_feedback_metadata': (set(), {'cursor','limit'}),
 }
 _SUBSCRIPTION_KINDS = frozenset({'message.created','message.edited','message.deleted','message.status',
     'attachment.ready','file.text.ready','file.transcript.ready','file.description.ready','file.processing.failed',
@@ -320,6 +322,7 @@ def _feedback_parameters(operation, parameters):
         if name=='request_id':valid=_request_id(value)
         elif name=='limit':valid=type(value) is int and 1<=value<=100
         elif name=='status':valid=isinstance(value,str) and value in _FEEDBACK_STATUSES
+        elif name=='cursor':valid=isinstance(value,str) and 1<=len(value)<=512
         elif name=='category':valid=isinstance(value,str) and value in ('bug','feature','quality','other')
         elif name=='description':
             valid=isinstance(value,str) and 1<=len(value)<=4000 and bool(value.strip()) and not any(
@@ -808,6 +811,11 @@ class Client:
         """Record bounded private feedback locally. Never forwards or publishes it."""
         return self.call('submit_feedback',dict(request_id=request_id,category=category,
             description=description,operation=operation,refs=refs))
+
+    def export_feedback_metadata(self, *, cursor=None, limit=50):
+        """A maintainer key (feedback-maintainer-read): every agent's feedback metadata and the loop's released summary,
+        oldest change first; never the description, references or notes. Pass the previous reply's next_cursor."""
+        return self.call('export_feedback_metadata',{'limit':limit,**({} if cursor is None else {'cursor':cursor})})
 
     def list_feedback(self, *, limit=50, status=None):
         """Read only this credential's private feedback and its status, without former source references."""

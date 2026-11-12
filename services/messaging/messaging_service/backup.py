@@ -99,7 +99,9 @@ V84_TABLES={'telegram_polls':'message'}
 V86_TABLES={'contact_birthdays':'account,provider_user'}
 # ANYM-564: the links and each call source's admitted generation, consistent with the sources in one snapshot.
 V90_TABLES={'module_links':'principal,module','subscription_module_links':'subscription,source,scope_ref'}
-SCHEMAS=range(2,94)
+# ANYM-988: the feedback loop's decision and released brief per feedback item (closed words, a scrubbed paraphrase; no text).
+V94_TABLES={'feedback_projections':'feedback_id'}
+SCHEMAS=range(2,95)
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
 V17_TABLES={'message_conflicts':'receipt_digest'}
@@ -123,7 +125,7 @@ def database_manifest(c):
                        **(V35_TABLES if version>=35 else {}),
                        **(V37_TABLES if version>=37 else {}),
                        **(V38_TABLES if version>=38 else {}),**(V41_TABLES if version>=41 else {}),**(V42_TABLES if version>=42 else {}),**(V43_TABLES if version>=43 else {}),
-                       **(V44_TABLES if version>=44 else {}),**(V45_TABLES if version>=45 else {}),**(V48_TABLES if version>=48 else {}),**(V49_TABLES if version>=49 else {}),**(V50_TABLES if version>=50 else {}),**(V51_TABLES if version>=51 else {}),**(V53_TABLES if version>=53 else {}),**(V56_TABLES if version>=56 else {}),**(V57_TABLES if version>=57 else {}),**(V58_TABLES if version>=58 else {}),**(V61_TABLES if version>=61 else {}),**(V69_TABLES if version>=69 else {}),**(V70_TABLES if version>=70 else {}),**(V73_TABLES if version>=73 else {}),**(V76_TABLES if version>=76 else {}),**(V77_TABLES if version>=77 else {}),**(V78_TABLES if version>=78 else {}),**(V82_TABLES if version>=82 else {}),**(V83_TABLES if version>=83 else {}),**(V84_TABLES if version>=84 else {}),**(V86_TABLES if version>=86 else {}),**(V90_TABLES if version>=90 else {})}.items():
+                       **(V44_TABLES if version>=44 else {}),**(V45_TABLES if version>=45 else {}),**(V48_TABLES if version>=48 else {}),**(V49_TABLES if version>=49 else {}),**(V50_TABLES if version>=50 else {}),**(V51_TABLES if version>=51 else {}),**(V53_TABLES if version>=53 else {}),**(V56_TABLES if version>=56 else {}),**(V57_TABLES if version>=57 else {}),**(V58_TABLES if version>=58 else {}),**(V61_TABLES if version>=61 else {}),**(V69_TABLES if version>=69 else {}),**(V70_TABLES if version>=70 else {}),**(V73_TABLES if version>=73 else {}),**(V76_TABLES if version>=76 else {}),**(V77_TABLES if version>=77 else {}),**(V78_TABLES if version>=78 else {}),**(V82_TABLES if version>=82 else {}),**(V83_TABLES if version>=83 else {}),**(V84_TABLES if version>=84 else {}),**(V86_TABLES if version>=86 else {}),**(V90_TABLES if version>=90 else {}),**(V94_TABLES if version>=94 else {})}.items():
         query=sql.SQL('SELECT row_to_json(t) AS record FROM {} t ORDER BY {}').format(
             sql.Identifier(name),sql.SQL(',').join(sql.Identifier(part) for part in order.split(',')))
         sha=hashlib.sha256(); count=0
