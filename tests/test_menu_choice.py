@@ -427,7 +427,12 @@ def test_migration_071_and_its_grant_qualify_for_the_unattended_release():
         cwd=ROOT, capture_output=True, text=True)
     old = base.stdout if base.returncode == 0 else (source / 'gateway_role.sql').read_text().rsplit('-- Schema 71', 1)[0]
     current = (source / 'gateway_role.sql').read_text()
-    assert current.startswith(old) and role_class(old, current, new_tables(text, {})) == 'additive'
+    assert current.startswith(old)
+    # Schema 71's own block, judged against the file before it: a later block (a function grant, ANYM-989) has its own
+    # classification and never changes this one's.
+    head, _, rest = current.partition('-- Schema 71')
+    block = '-- Schema 71' + rest.split('\n-- Schema ', 1)[0] + '\n'
+    assert role_class(head, head + block, new_tables(text, {})) == 'additive'
 
 
 # spec: ANYM-837

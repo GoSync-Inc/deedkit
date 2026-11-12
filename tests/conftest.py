@@ -44,6 +44,10 @@ def seeded(database):
         c.execute('TRUNCATE attachment_backup_fences,attachment_residency,attachment_eviction_journal CASCADE')
         c.execute('TRUNCATE accounts,principals,api_key_operations,feed_counter,audit_log CASCADE')
         c.execute('TRUNCATE message_purges,chat_tombstones,ingest_receipt_links')
+        # ANYM-989: every submission journals an event, so module events of an earlier test would otherwise stay behind for a
+        # test that replays older migrations (their CHECK lists do not name the newer types).
+        c.execute('TRUNCATE module_events,module_source_health CASCADE')
+        c.execute('UPDATE module_event_counter SET value=0 WHERE id=1')
         c.execute('INSERT INTO feed_counter(id) VALUES(1)')
     database.seed()
     one=database.issue_key('agent-a',['telegram-demo','whatsapp-demo-1'])
