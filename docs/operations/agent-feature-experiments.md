@@ -52,7 +52,7 @@ remain. This does not authorize unrelated account actions, provider auth or chan
 2's five reserved decisions. A caller's arbitrary goal is not owner authority for unrelated
 messenger sends/calls, ACK, pairing or provider-session actions; their exact confirmations remain.
 The old guarded executor remains a rollback path. Functional enforcement belongs to
-`services/android/tests/test_agent.py` and the integrated same-task comparison, delivered by the
+`services/android/tests/test_agent_bare.py` and the integrated same-task comparison, delivered by the
 Android replacement worker under ANYM-993. No reviews remain under owner 11-11.
 
 ## Reported experiment
