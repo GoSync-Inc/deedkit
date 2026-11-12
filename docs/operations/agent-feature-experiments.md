@@ -51,6 +51,8 @@ phone information, agent role, caller goal and reusable per-app skills. Native C
 remain. This does not authorize unrelated account actions, provider auth or changes to section
 2's five reserved decisions. A caller's arbitrary goal is not owner authority for unrelated
 messenger sends/calls, ACK, pairing or provider-session actions; their exact confirmations remain.
+Calls and `android_execute` retain AGENTS.md section 1's exact confirmation; the existing
+courier-goal exception remains scoped to that order's messages.
 The old guarded executor remains a rollback path. Functional enforcement belongs to
 `services/android/tests/test_agent_bare.py` and the integrated same-task comparison, delivered by the
 Android replacement worker under ANYM-993. No reviews remain under owner 11-11.

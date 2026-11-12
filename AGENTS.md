@@ -34,7 +34,7 @@ docs/operations/parallel-development.md.
   какую-то цель, он там может серию сообщений делать сам. Я вообще с водителем не хочу общаться ... он может
   полностью их проводить, пока они не доходят до меня, если только он не справляется»). Under the owner's goal for
   an order, recorded by `android_courier_chat action=goal`, the agent messages that order's courier only, inside
-  the code's bounds, and hands the chat back when it cannot cope. Outside the Android goal override, calls, `android_execute` and every other
+  the code's bounds, and hands the chat back when it cannot cope. Calls, `android_execute` and every other
   send keep this section's confirmation. Enforcer: services/android/tests/test_courier_goal.py.
 - Never change applied migrations, provider IDs, existing test paths, names or parameters (Tiden
   IDs) or the seven `anymsg-ci::*` checks.
