@@ -20,7 +20,8 @@ The key holds the gateway tools `messages_export_feedback_metadata`, `messages_c
 `messages_ack_subscription_events`; the reverse path adds `messages_set_feedback_triage` (permission
 `feedback-maintainer-write`, ANYM-992). The key holds `feedback-maintainer-read`, `feedback-maintainer-write`,
 `subscription-write` and `subscription-ack`, and no `read`. Until the tool is granted the reverse write stays idle:
-the bridge prints `reverse_unavailable_<code>` to stderr and exits 0.
+the bridge prints `reverse_unavailable_<code>` to stderr and exits 0 (`not_found_or_forbidden` is the gateway's one answer for a
+tool the key cannot call).
 
 ## Mapping
 
@@ -90,7 +91,9 @@ Every error is one line `feedback-bridge: <code>` on stderr (`journalctl --user 
 automation's run output); no key, path or response body is printed. `gateway_unreachable`, `gateway_http_5xx`,
 `tasks_timeout`, `tasks_failed`: transient, the loop backs off from 1 s to 60 s and the next cycle repeats the work (no
 create is ever repeated blind: a pending create is reconciled by a complete tracker listing first, and a failed or
-truncated listing creates nothing). `forbidden`: the key lacks a tool or a permission. `item_malformed`: one metadata
+truncated listing, one whose `has_more` is not false, creates nothing). A `gateway_http_5xx` line adds the gateway's own
+fixed diagnosis in parentheses, for example `gateway_http_503 (backend_status=500)`: the backend's status, its fixed error code
+or the transport reason, never a body. `forbidden`: the key lacks a tool or a permission. `item_malformed`: one metadata
 row was skipped. `lock_busy`: another cycle held the lock for 5 minutes.
 
 ## Undo

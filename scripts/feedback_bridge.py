@@ -46,9 +46,12 @@ ID_LINE = re.compile(r'Feedback-ID: (%s)' % UUID)
 DUP_LINE = re.compile(r'^Duplicate-Of: (%s)[ \t]*$' % UUID, re.MULTILINE)
 WORD = re.compile(r'[A-Za-z0-9_.:@/ -]{1,64}')
 STAMP = re.compile(r'[0-9TZ:.+-]{10,40}')
-SPEC = re.compile(r'ANYM-[1-9][0-9]*')
+SPEC = re.compile(r'ANYM-[1-9][0-9]{0,5}')  # feedback.SPEC_REF
 SLUG = re.compile(r'[a-z0-9][a-z0-9-]{2,60}')
-SHA = re.compile(r'[0-9a-f]{40}')
+# feedback.FIXED_IN, at most 80 characters: the release a fix shipped in, as the server stores it
+RELEASE = re.compile(r'(?=.{1,80}\Z)(?:deedkit@[0-9a-f]{40}|anymsg@(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)'
+    r'(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?'
+    r'(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)')
 CODE = re.compile(r'[a-z][a-z0-9_]{0,63}')
 FORWARD = {'received': 'backlog', 'accepted': 'todo', 'fixed': 'in_review', 'verify_requested': 'in_review',
     'verified': 'done', 'declined': 'canceled', 'duplicate': 'canceled', 'reopened': 'backlog'}
@@ -58,12 +61,17 @@ COMPATIBLE = {'received': {'backlog'}, 'accepted': {'todo', 'in_progress', 'in_r
 OPEN = ('received', 'accepted', 'reopened', 'fixed', 'verify_requested')
 STATUSES = 'backlog,todo,in_progress,in_review,done,canceled'
 CLOSED = ('subscription_closed', 'subscription_access_changed', 'not_found')
-UNAVAILABLE = ('forbidden', 'unauthorized', 'unsupported_operation', 'not_found', 'unknown_tool')
+# The tool is closed to this key, tool-wide: the gateway's one body for a tool the key cannot call (`not_found_or_forbidden`,
+# 403), a module not selected or missing from the build, the backend's `forbidden`, a revoked key. `not_found` is not one:
+# set_feedback_triage answers it (404) for one item that is gone.
+UNAVAILABLE = ('forbidden', 'unauthorized', 'not_found_or_forbidden', 'module_not_selected', 'operation_not_in_module_build')
+# The gateway refused before any backend call and says nothing about the change: the next pass asks again.
+RETRY = ('policy_changed',)
 MAX_EXPORT_PAGES, MAX_LIST_PAGES, DEAD = 50, 20, ('closed', 'expired', 'access_changed', 'revoked')
 BACKOFF_MIN, BACKOFF_MAX, MIN_PASS, REVERSE_EVERY, LOCK_WAIT = 1, 60, 1, 120, 300
 NEED_CARD = ('A DeedKit card is needed before this item can be marked accepted: add the label `spec:ANYM-<n>` of the card that '
     'plans it (or ask the maintainers to give the item a primary card) and move this task again.')
-SPEC_LABEL = re.compile(r'spec:(ANYM-[1-9][0-9]*)')
+SPEC_LABEL = re.compile(r'spec:(%s)' % SPEC.pattern)
 DONE_NOTE = ('Done in BB is not fixed or deployed in DeedKit: `fixed` and `verify_requested` come only from release '
     'evidence, so this task\'s status was not written back (DeedKit status: %s).')
 
@@ -71,9 +79,9 @@ DONE_NOTE = ('Done in BB is not fixed or deployed in DeedKit: `fixed` and `verif
 class BridgeError(Exception):
     """A failure with a fixed code; never carries a value, a path or a response body."""
 
-    def __init__(self, code, status=None):
+    def __init__(self, code, status=None, note=''):
         super().__init__(code)
-        self.code, self.status = code, status
+        self.code, self.status, self.note = code, status, note
 
 
 class ConfigError(BridgeError):
@@ -96,8 +104,12 @@ class Busy(Exception):
     pass
 
 
-def log(code):
-    print('feedback-bridge: %s' % code, file=sys.stderr, flush=True)
+def log(code, note=''):
+    print('feedback-bridge: %s%s' % (code, ' (%s)' % note if note else ''), file=sys.stderr, flush=True)
+
+
+def report(error):
+    log(getattr(error, 'code', 'lock_busy'), getattr(error, 'note', ''))
 
 
 @dataclass
@@ -158,6 +170,24 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _why(body):
+    """The gateway's fixed diagnosis of a 5xx (agent_gateway.diagnostics.failure_details, http_clients): the backend's status
+    and its fixed error code, or the transport reason. Nothing else of the body is read, so no value can reach a log."""
+    try:
+        value = json.loads(body)
+    except ValueError:
+        return ''
+    if not isinstance(value, dict):
+        return ''
+    found = []
+    if type(value.get('backend_status')) is int and 100 <= value['backend_status'] <= 599:
+        found.append('backend_status=%d' % value['backend_status'])
+    for name in ('backend_error', 'reason'):
+        if isinstance(value.get(name), str) and CODE.fullmatch(value[name]):
+            found.append('%s=%s' % (name, value[name]))
+    return ' '.join(found)
+
+
 class Gateway:
     """Bounded REST calls (POST /v1/<tool>) with the maintainer key; no redirects, no retries, no body in any error."""
 
@@ -176,7 +206,7 @@ class Gateway:
             if 300 <= status < 400:
                 raise Refused('redirect_rejected', status) from None
             if status >= 500:
-                raise Uncertain('gateway_http_%d' % status, status) from None
+                raise Uncertain('gateway_http_%d' % status, status, _why(body)) from None
             try:
                 code = json.loads(body).get('error')
             except (ValueError, AttributeError):
@@ -443,7 +473,7 @@ def normalize(raw):
         'primary_spec': pick(given.get('primary_spec'), SPEC), 'new_card': pick(given.get('new_card'), SLUG), 'brief': brief}
     return {'feedback_id': raw['feedback_id'], 'principal': word(raw.get('principal')), 'category': word(raw.get('category')),
         'operation': word(raw.get('operation')), 'created_at': created, 'created_ts': created_ts, 'status': raw['status'],
-        'status_changed_at': stamp(raw.get('status_changed_at')), 'fixed_in': pick(raw.get('fixed_in'), SHA),
+        'status_changed_at': stamp(raw.get('status_changed_at')), 'fixed_in': pick(raw.get('fixed_in'), RELEASE),
         'spec_ref': pick(raw.get('spec_ref'), SPEC), 'duplicate_of': pick(raw.get('duplicate_of'), re.compile(UUID)),
         'projection': shown}
 
@@ -525,8 +555,10 @@ class Bridge:
         if known:
             return known
         if self.ledger.meta('subscription_pending'):
-            subs = self.gateway.call('messages_list_subscriptions', {'limit': 100}).get('subscriptions')
-            if not isinstance(subs, list) or len(subs) >= 100:
+            # list_subscriptions answers `{items, has_more}` (newest first, no cursor): complete only when has_more is false.
+            listing = self.gateway.call('messages_list_subscriptions', {'limit': 100})
+            subs = listing.get('items')
+            if not isinstance(subs, list) or listing.get('has_more') is not False:
                 raise Incomplete('subscriptions_listing_incomplete')
             live = sorted(s['subscription_id'] for s in subs if isinstance(s, dict) and s.get('label') == LABEL
                 and s.get('state') not in DEAD and isinstance(s.get('subscription_id'), str))
@@ -733,6 +765,8 @@ class Bridge:
             self.ledger.drop_pending_write(rid)
             if error.code in UNAVAILABLE:
                 return error.code
+            if error.code in RETRY:
+                return None  # the version stays unseen: the next pass writes it again with the same request ID
             if error.code == 'version_conflict':
                 self.conflict(link, task, wanted_status)
             self.ledger.update_link(fid, seen_version=version)
@@ -766,7 +800,7 @@ class Bridge:
         try:
             return self.reverse()
         except BridgeError as error:
-            log(error.code)
+            report(error)
 
     def watch(self, stop, sleep=time.sleep, monotonic=time.monotonic):
         delay, first, last = BACKOFF_MIN, True, None
@@ -790,7 +824,7 @@ class Bridge:
                         self.safe_reverse()
                         last = monotonic()
             except (BridgeError, Busy) as error:
-                log(getattr(error, 'code', 'lock_busy'))
+                report(error)
                 sleep(min(delay, BACKOFF_MAX) * (1 + 0.25 * self.rand()))
                 delay = min(delay * 2, BACKOFF_MAX)
                 continue
@@ -835,7 +869,7 @@ def main(argv=None, environ=None, gateway=None, tasks=None, now=time.time, sleep
     except Busy:
         return 75
     except BridgeError as error:
-        log(error.code)
+        report(error)
         return 1
     if result.get('unavailable'):
         log('reverse_unavailable_%s' % result['unavailable'])
