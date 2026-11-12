@@ -1,6 +1,7 @@
 """Owner export of agent feedback through the operator container (ANYM-265)."""
 import json
 from pathlib import Path
+import re
 import sys
 import time
 
@@ -239,13 +240,18 @@ def test_changed_since_finds_a_status_change_on_an_old_item(seeded):
 
 # spec: ANYM-265
 def test_no_agent_key_reaches_the_export():
+    # The operator export stays out of every agent surface. The one read that shows other keys' metadata is ANYM-988's
+    # `export_feedback_metadata`: owner-requested, behind `feedback-maintainer-read`, never the description (its own tests).
     assert 'export_feedback' not in OPERATION_PERMISSIONS and 'export_feedback' not in AUDIT_OPERATIONS
     for path in (SOURCE / 'app.py', *sorted((SOURCE / 'app_tools').glob('*.py'))):
-        assert 'export_feedback' not in path.read_text(), path.name
+        assert not re.search(r'export_feedback(?!_metadata)', path.read_text()), path.name
     catalog = json.loads((ROOT / 'services/gateway/src/agent_gateway/catalog.json').read_text())
     contracts = json.loads((ROOT / 'tests/platform/fixtures/messaging-contracts.json').read_text())
-    assert not any('export' in tool['name'] and 'feedback' in tool['name'] for tool in catalog)
-    assert not any('export' in tool['name'] and 'feedback' in tool['name'] for tool in contracts['tools'])
+    exposed = [tool for tool in catalog if 'export' in tool['name'] and 'feedback' in tool['name']]
+    assert [(tool['name'], tool['scopes']) for tool in exposed] == [
+        ('messages_export_feedback_metadata', ['feedback-maintainer-read'])]
+    assert [tool['name'] for tool in contracts['tools'] if 'export' in tool['name'] and 'feedback' in tool['name']] == [
+        'export_feedback_metadata']
 
 
 class RecordingStore:
