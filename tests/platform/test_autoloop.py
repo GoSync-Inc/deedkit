@@ -1590,8 +1590,9 @@ def test_a_build_thread_whose_terminal_never_came_up_is_archived_and_the_start_i
 
 # spec: ANYM-568
 def test_the_driver_and_the_launcher_call_bb_never_superset():
-    for path in ('scripts/autoloop.py', 'deploy/autoloop-runner/launch.py'):
-        assert 'superset' not in (ROOT / path).read_text().lower(), path
+    # Literal paths: a read through a variable would count as a read of every document (scripts/docs_only.py).
+    assert 'superset' not in (ROOT / 'scripts/autoloop.py').read_text().lower()
+    assert 'superset' not in (ROOT / 'deploy/autoloop-runner/launch.py').read_text().lower()
 
 
 # spec: ANYM-568
