@@ -241,6 +241,92 @@ def test_a_bridge_key_without_read_creates_waits_fetches_acks_and_manages_its_ow
     assert (paused['state'], resumed['state'], closed['state']) == ('paused', 'active', 'closed')
 
 
+@contextmanager
+def api_role_store(store):
+    """A copy of the store whose every connection is the API role (gateway_role.sql), as the live API process runs: the other
+    tests of this module run as the owner, which holds every privilege."""
+    api = install(store, 'gateway_role.sql', 'messaging_gateway')
+
+    class RestrictedPool:
+        @contextmanager
+        def connection(self):
+            with store.pool.connection() as c:
+                c.execute(sql.SQL('SET LOCAL ROLE {}').format(sql.Identifier(api)))
+                yield c
+    gateway = copy(store)
+    gateway.pool = RestrictedPool()
+    try:
+        yield gateway
+    finally:
+        remove(store, api)
+
+
+def source_rows(store):
+    with store.pool.connection() as c:
+        return c.execute('SELECT subscription,source,scope_ref,types FROM subscription_module_sources '
+            'ORDER BY subscription,source,scope_ref').fetchall()
+
+
+# spec: ANYM-989
+def test_a_bridge_key_runs_its_whole_cycle_as_the_api_role_that_holds_no_update_of_the_module_sources(modules):
+    # The live create got HTTP 503 (11-12): the API role holds INSERT, not UPDATE, on subscription_module_sources, and
+    # `ON CONFLICT ... DO UPDATE` needs UPDATE even when no row conflicts, so every feedback source failed under the real role.
+    store = modules[0]
+    with api_role_store(store) as gateway:
+        bridge = key(store, 'bridge', [*BRIDGE, 'feedback-maintainer-write'])
+        created = gateway.create_subscription(bridge, feedback=MAINTAINER, label='bridge')
+        sid = created['subscription_id']
+        own = identity(store)
+        assert gateway.create_subscription(own, feedback=True)['subscription_id']  # the own-key source: the same insert
+        shared = gateway.create_subscription(identity(store, 'with-chats'), ['telegram-demo-chat'],
+            feedback={'statuses': ['fixed']})
+        assert shared['subscription_id']
+        fid = submit(gateway, own, 1)
+        match_subscriptions(store)
+        page = asyncio.run(wait_for_subscription_events(gateway, bridge, sid, timeout=2, limit=10))
+        assert [item['data']['feedback_id'] for item in page['module']['items']] == [fid]
+        fetched = gateway.fetch_subscription_events(bridge, sid)
+        acked = gateway.ack_subscription_events(bridge, sid, fetched['receipt'], fetched['ack_version'])
+        assert acked['module_acked_through'] == fetched['module']['next_after']
+        assert [item['feedback_id'] for item in gateway.export_feedback_metadata(bridge)['items']] == [fid]
+        moved = gateway.set_feedback_triage(bridge, fid, 'accepted', 'received', None, 'bridge-request-0001', spec_ref='ANYM-989')
+        assert moved['status'] == 'accepted'
+        assert [item['subscription_id'] for item in gateway.list_subscriptions(bridge)['items']] == [sid]
+
+
+# spec: ANYM-989
+def test_a_source_named_twice_keeps_its_last_types_and_one_the_subscription_holds_is_never_silently_kept(modules):
+    store = modules[0]
+    sid = store.create_subscription(key(store, 'holder', FULL), ['telegram-demo-chat'])['subscription_id']
+    with store.pool.connection() as c:
+        module_events.attach_sources(c, sid, [(feedback_events.SOURCE, 'feedback:all', ['feedback.fixed']),
+            (feedback_events.SOURCE, 'feedback:all', ['feedback.declined', 'feedback.accepted'])])  # the later entry wins
+    assert [(row['scope_ref'], row['types']) for row in source_rows(store)] == [('feedback:all', ['feedback.accepted', 'feedback.declined'])]
+    with store.pool.connection() as c:  # the same types again: a no-op
+        module_events.attach_sources(c, sid, [(feedback_events.SOURCE, 'feedback:all', ['feedback.declined', 'feedback.accepted'])])
+    before = source_rows(store)
+    with pytest.raises(ValueError, match='module_source_types_conflict'), store.pool.connection() as c:
+        module_events.attach_sources(c, sid, [(feedback_events.SOURCE, 'feedback:all', ['feedback.fixed'])])
+    assert source_rows(store) == before  # other types: a refusal, never the old ones kept without a word
+
+
+# spec: ANYM-989
+def test_no_path_after_create_changes_a_subscriptions_module_sources(modules):
+    # The inventory behind `DO NOTHING`: create_subscription is the only caller that attaches sources, always to the new row
+    # (feedback_events.attach through it); pause, resume, close and delivery changes never touch the source rows.
+    store = modules[0]
+    callers = {path.name for path in SOURCE.glob('*.py') if re.search(r'\battach_sources\(', path.read_text())}
+    assert callers == {'module_events.py', 'subscriptions.py', 'feedback_events.py'}, callers
+    token = key(store, 'bridge', BRIDGE)
+    created = store.create_subscription(token, feedback=MAINTAINER, label='bridge')
+    rows = source_rows(store)
+    assert [row['types'] for row in rows] == [sorted(feedback_events.MAINTAINER_TYPES)]
+    paused = store.update_subscription(token, created['subscription_id'], created['version'], action='pause')
+    resumed = store.update_subscription(token, created['subscription_id'], paused['version'], action='resume')
+    store.update_subscription(token, created['subscription_id'], resumed['version'], action='close')
+    assert source_rows(store) == rows
+
+
 # spec: ANYM-989
 def test_a_bridge_key_without_read_is_refused_everything_else(modules):
     store = modules[0]

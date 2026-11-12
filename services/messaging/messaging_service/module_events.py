@@ -293,15 +293,19 @@ def attach_sources(c, subscription_id, sources):
         acked_through,hinted_through) VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING''',
         (subscription_id, head, head, head, head))
     from . import module_links
+    # The API role holds INSERT and no UPDATE on subscription_module_sources (gateway_role.sql), and `DO UPDATE` needs UPDATE
+    # even when no row conflicts. A source named twice keeps its last types, decided here; a source the subscription already
+    # holds with other types is refused (module_links.insert_source). Only create_subscription attaches sources, to a new row.
+    last = {}
     for source, scope_ref, types in sources:
+        last[(source, scope_ref)] = sorted(set(types))
+    for (source, scope_ref), types in last.items():
         if source in (module_links.MODULES['calls'], module_links.MODULES['calendar']):
             if not module_links.ready(c):
                 raise module_links.not_linked('calendar' if source == module_links.MODULES['calendar'] else 'calls')
-            module_links.admit(c, subscription_id, source, scope_ref, sorted(set(types)))
+            module_links.admit(c, subscription_id, source, scope_ref, types)
             continue
-        c.execute('''INSERT INTO subscription_module_sources(subscription,source,scope_ref,types)
-            VALUES(%s,%s,%s,%s) ON CONFLICT(subscription,source,scope_ref) DO UPDATE SET types=excluded.types''',
-            (subscription_id, source, scope_ref, sorted(set(types))))
+        module_links.insert_source(c, subscription_id, source, scope_ref, types)
 
 
 def stream(c, subscription_id, *, lock=False):
