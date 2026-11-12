@@ -680,8 +680,9 @@ def test_the_installed_scripts_run_as_a_process_against_a_fake_bb_executable(tmp
     install, fake, work = tmp_path / 'lib', tmp_path / 'bin', tmp_path / 'work'
     for folder in (install, fake, work):
         folder.mkdir()
-    for name in ('feedback_bridge.py', 'feedback_dispatch.py'):  # the install layout: both files in one directory
-        (install / name).write_text((REPO / 'scripts' / name).read_text())
+    # the install layout: both files in one directory
+    (install / 'feedback_bridge.py').write_text((REPO / 'scripts/feedback_bridge.py').read_text())
+    (install / 'feedback_dispatch.py').write_text((REPO / 'scripts/feedback_dispatch.py').read_text())
     (fake / 'bb').write_text(FAKE_BB)
     (fake / 'bb').chmod(0o755)
     task = {'id': 'T1', 'key': 'DK-1', 'number': 1, 'title': 't', 'status': 'todo', 'description': fb.render(raw_row(1))[1]}
@@ -732,5 +733,5 @@ def test_the_dispatcher_install_material_enables_nothing_and_holds_no_secret():
     for needle in ('feedback_dispatch.py check', 'bb automation create', 'feedback-dispatch.json', 'PAUSE', '"dispatch": true',
             'gate', 'Undo', 'feedback-task.md'):
         assert needle in section, needle
-    is_blocked = doc_commands.load_is_blocked(REPO / doc_commands.MATCHER)
+    is_blocked = doc_commands.load_is_blocked(REPO / '.claude/hooks/block_secret_env_reads.py')
     assert not [block for block in doc_commands.fenced_shell_blocks(section) if is_blocked(block)]
