@@ -1,0 +1,9 @@
+{
+  "dispatch": false,
+  "orchestrator_thread": "thr_orchestrator_id",
+  "principals": ["agent-name"],
+  "tracker": "DK",
+  "hold": [],
+  "max_live": 2,
+  "daily_starts": 6
+}
