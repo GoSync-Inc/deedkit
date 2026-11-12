@@ -21,6 +21,7 @@ from pydantic import Field, ValidationError, model_validator
 import yaml
 
 from . import engines
+from .agent_save import MAX_REPAIRS, SaveError, Saver, resolve_point, settle
 from .agent_screen import cap_bytes, compact, render_lines
 from .agent_tools import MODELS, target
 from .app_maps import compile_scenario
@@ -46,7 +47,7 @@ STATES = ('running', 'succeeded', 'stopped_by_guard', 'timed_out', 'action_cap',
 NAME = r'^[A-Z][A-Z0-9_]{0,63}$'
 POINT = re.compile(r'\s*\d+(?:\.\d+)?%?\s*,\s*\d+(?:\.\d+)?%?\s*')
 START_ONLY = ('device_id', 'session_id', 'goal', 'owner_instruction', 'apps', 'params', 'secrets', 'outputs',
-              'max_minutes', 'max_actions', 'engine')
+              'max_minutes', 'max_actions', 'engine', 'save_as', 'param_names')
 
 
 def preamble():
@@ -78,6 +79,8 @@ class AgentCall(Strict):
     max_minutes: int = Field(default=5, ge=1, le=15)
     max_actions: int = Field(default=120, ge=10, le=300)
     engine: Literal['claude', 'codex'] | None = None
+    save_as: str | None = Field(default=None, pattern=r'^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$')
+    param_names: list[str] = Field(default_factory=list, max_length=20)
     after: int = Field(default=0, ge=0)
     wait_s: int = Field(default=0, ge=0, le=25)
 
@@ -90,6 +93,9 @@ class AgentCall(Strict):
                 raise ValueError('start_fields')
         elif given & set(START_ONLY) or (self.action == 'stop' and given & {'after', 'wait_s'}):
             raise ValueError('action_fields')
+        if (self.param_names and self.save_as is None) or not set(self.param_names) <= set(self.params) or len(
+                set(self.param_names)) != len(self.param_names):
+            raise ValueError('param_names')
         if any(not re.fullmatch(NAME, name) for name in (*self.secrets, *self.params)) or any(
                 not DATA_KEY.fullmatch(name) for name in self.outputs) or len(set(self.secrets)) != len(
                 self.secrets) or len(set(self.outputs)) != len(self.outputs):
@@ -180,6 +186,7 @@ class AgentRun:
         self.apps, self.params = set(request.apps), {name: str(value) for name, value in request.params.items()}
         self.actions, self.screenshots, self.images, self.notes = [], [], 0, 0
         self.finished, self.finish_tries, self.guard, self.op, self.error = None, 0, None, None, {}
+        self.saver, self.resolved, self.read_value, self.pending = Saver(self) if request.save_as else None, None, None, None
         self.busy, self.cond, self.seq = asyncio.Lock(), asyncio.Condition(), 0
         self.concluded, self.tasks = asyncio.Event(), []
         self.started, self.started_at, self.engine_started, self.engine_ms, self.device_ms = time.monotonic(), time.time(), None, 0.0, 0.0
@@ -223,7 +230,7 @@ class AgentRun:
 
     async def perform(self, name, args):
         if name == 'finish':
-            return self.take_finish(args)
+            return await self.take_finish(args)
         if len(self.actions) >= self.request.max_actions:
             self.tasks.append(asyncio.create_task(self.end('action_cap')))
             return {'text': 'error: action limit reached, the run ends', 'is_error': True}
@@ -231,9 +238,12 @@ class AgentRun:
                  'verdict': 'allowed'}
         started = time.monotonic()
         stopped = None
+        self.resolved = self.read_value = None
         try:
             async with asyncio.timeout(TOOL_TIMEOUT_S):
                 reply = await getattr(self, 'do_' + name)(args)
+            if self.saver is not None:  # What a scenario saved from this run needs of the action (ANYM-973).
+                entry.update({key: value for key, value in (('resolved', self.resolved), ('read', self.read_value)) if value})
         except Refused as error:
             if error.code == 'guard_stopped' and getattr(error, 'guard', None):
                 stopped = error
@@ -261,7 +271,7 @@ class AgentRun:
             self.tasks.append(asyncio.create_task(self.end('stopped_by_guard')))
         return reply
 
-    def take_finish(self, args):
+    async def take_finish(self, args):
         missing = [name for name in self.request.outputs if name not in args.data]
         self.finish_tries += 1
         if missing and self.finish_tries < 2:
@@ -270,9 +280,49 @@ class AgentRun:
         data = {name: args.data[name] for name in self.request.outputs if name in args.data}
         if len(json.dumps(data, default=str)) > 16384:
             raise Refused('invalid_arguments', 422)
-        self.finished = {'summary': args.summary, 'data': data}
+        if self.saver is None:
+            return self.conclude(args.summary, data)
+        if self.pending is not None:  # a repair is under way: the draft is repaired with flow_edit and flow_test
+            return {'text': 'error: the scenario draft is not published yet; use flow_edit and flow_test', 'is_error': True}
+        self.pending = {'summary': args.summary, 'data': data}
+        try:
+            self.saver.draft_from_log(data)  # the service's SQLite connection is this thread's
+        except SaveError as error:  # The run's own result stays succeeded; only the saving fails.
+            self.saver.error = error.code + (f' (step {error.step})' if error.step else '')
+            return self.conclude(**self.pending)
+        except Refused as error:
+            self.saver.error = error.code
+            return self.conclude(**self.pending)
+        return await self.test_draft()
+
+    def conclude(self, summary, data):
+        self.finished = {'summary': summary, 'data': data}
         self.tasks.append(asyncio.create_task(self.after_finish()))
         return {'text': 'ok, the run is finished'}
+
+    async def test_draft(self):
+        """Test the draft in this run's session. A pass publishes and finishes; a guard stop ends the run and never
+        publishes; a failure goes back to the engine for at most MAX_REPAIRS repairs."""
+        saver = self.saver
+        outcome, detail = await settle(saver, await saver.test())
+        if outcome is True:
+            return self.conclude(**self.pending)
+        if outcome is False:
+            self.guard = {'rule': detail.get('rule'), 'matched': detail.get('matched'), 'when': detail.get('when'),
+                          'package': None, 'sensitive': True, 'action': len(self.actions) + 1, 'tool': 'flow_test',
+                          'step_path': detail.get('step_path')}
+            self.tasks.append(asyncio.create_task(self.end('stopped_by_guard')))
+            return {'text': 'STOPPED by the guard (' + str(detail.get('rule')) + '): the run ends here. Do nothing more.',
+                    'is_error': True}
+        if (saver.error != 'test_failed') or saver.repairs >= MAX_REPAIRS or saver.tests > MAX_REPAIRS:
+            return self.conclude(**self.pending)
+        return {'text': 'the draft test failed: ' + detail + f' Repair it with flow_edit (repairs left: '
+                f'{MAX_REPAIRS - saver.repairs}), then flow_test.'}
+
+    def repairing(self):
+        if self.saver is None or self.pending is None or self.finished is not None:
+            raise Refused('no_scenario_to_repair', 422)
+        return self.saver
 
     async def after_finish(self):
         """The engine ends on its own after `finish`; one that lingers is stopped, then the run concludes."""
@@ -322,8 +372,27 @@ class AgentRun:
 
     async def do_tap(self, args):
         selector = {'point': args.point} if args.point else args.selector.fields()
+        if args.point and self.saver is not None:  # What the point hit, for a scenario saved from this run (ANYM-973).
+            await self.call('__guard__')
+            self.resolved = resolve_point((await self.call('__hierarchy__'))['xml'], args.point)
         await self.guarded({'tapOn': selector})
         return {'text': 'tapped'}
+
+    async def do_flow_get(self, args):
+        saver = self.repairing()
+        return {'text': json.dumps(saver.library.read(self.owner, 'flow', saver.name, None, 'draft'))}
+
+    async def do_flow_edit(self, args):
+        saver = self.repairing()
+        if saver.repairs >= MAX_REPAIRS:
+            raise Refused('repair_limit', 422)
+        saver.write_draft(args.yaml)
+        saver.repairs += 1
+        return {'text': f'draft saved; run flow_test (repairs used: {saver.repairs} of {MAX_REPAIRS})'}
+
+    async def do_flow_test(self, args):
+        self.repairing()
+        return await self.test_draft()
 
     async def do_type(self, args):
         text = args.text
@@ -359,6 +428,7 @@ class AgentRun:
     async def do_read_text(self, args):
         if args.selector is not None:
             result = await self.call(self.command({'copyTextFrom': args.selector.fields()}))
+            self.read_value = self.secrets.mask(str(result.get('text', '')))[:500]
             return {'text': self.secrets.mask(str(result.get('text', '')))}
         options = {'limit': args.limit, **({'region': args.region.model_dump()} if args.region else {})}
         return {'text': render_lines(await self.call(self.command({'readScreenText': options})))}
@@ -533,6 +603,8 @@ class AgentRun:
                   'timings': {'engine_ms': self.engine_ms, 'device_ms': round(self.device_ms, 2), 'total_ms': total},
                   'engine': self.engine, 'model': self.stream.model or self.config.model or engines.DEFAULT_MODEL[self.engine] or 'default',
                   'tokens': self.stream.tokens(), 'preamble_version': self.preamble_version, **extra}
+        if self.saver is not None:
+            result['scenario'] = self.saver.view()
         if withheld:
             result['final_screen_withheld'] = withheld
         if self.guard:
@@ -579,6 +651,10 @@ class Agents:
                 '${secret:%s} (app %s)' % (name, package) for name, package in run.declared().items()))
         if request.outputs:
             lines.append('Outputs to fill in finish.data, by exact name: ' + ', '.join(request.outputs))
+        if request.save_as:
+            lines.append('This run is saved as the scenario ' + request.save_as + ': act in clean, repeatable steps and read each '
+                         'declared output with read_text and a selector. After finish the service tests the saved draft; if '
+                         'the test fails, repair it with flow_get, flow_edit and flow_test (at most 3 repairs), under the guard.')
         lines += [f'Limits: at most {request.max_actions} tool calls and {request.max_minutes} minutes.', '</task>']
         return '\n'.join(lines)
 
