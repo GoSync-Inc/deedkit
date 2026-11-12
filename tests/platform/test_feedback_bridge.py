@@ -18,6 +18,10 @@ NOW = datetime(2026, 11, 12, 12, 0, tzinfo=timezone.utc).timestamp()
 KEY = 'canary-key-' + 'x' * 16
 SUB = 'deedkit-feedback-bridge'
 REPO = Path(__file__).resolve().parents[2]
+RECEIPT = 'r' * 43  # secrets.token_urlsafe(32), as subscription_consumption.fetch_subscription_events issues it
+STATUSES = ('received', 'accepted', 'declined', 'duplicate', 'fixed', 'verify_requested', 'verified', 'reopened')  # feedback.STATUSES
+REQUEST_ID = re.compile(r'[a-zA-Z0-9_.:-]{8,128}')  # feedback_triage.REQUEST_ID
+SERVER_SPEC = re.compile(r'ANYM-[1-9][0-9]{0,5}')  # feedback.SPEC_REF
 
 
 def fid(n):
@@ -72,13 +76,33 @@ class FakeGateway:
         self.log.append((tool, args))
         if tool in self.fail:
             raise self.fail[tool]
+        if not 1 <= args.get('limit', 50) <= 100:  # store.bounded
+            raise fb.Refused('invalid_limit', 400)
         return getattr(self, tool)(**args)
 
+    @staticmethod
+    def event_data(kind, ident):
+        """The data of one feedback module event: feedback_events._event, publish_received, publish_projection_recorded."""
+        if kind == 'feedback.projection_recorded':
+            return {'feedback_id': ident, 'classification': 'reported-bug'}
+        if kind == 'feedback.received':
+            return {'feedback_id': ident, 'status': 'received', 'category': 'bug'}
+        return {'feedback_id': ident, 'status': kind.split('.')[1], 'previous_status': 'received'}
+
     def page_of(self):
-        items = [{'module_event_id': n, 'id': 'feedback:%d' % n, 'type': kind, 'subject': ident,
-            'data': {'feedback_id': ident, 'status': kind.split('.')[1]}} for n, (kind, ident) in enumerate(self.events, 1)]
-        return {'module': {'items': items, 'has_more': False}, 'receipt': 'r' * 32 if items else None,
-            'ack_version': 7 if items else None}
+        """A compact page of a maintainer-only definition: subscription_consumption.fetch_subscription_events through
+        project_page (module_events.page holds the items)."""
+        items = [{'module_event_id': n, 'specversion': '1.0', 'id': 'feedback:%d' % n, 'source': 'deedkit:feedback',
+            'type': kind, 'subject': ident, 'time': iso(NOW), 'data': self.event_data(kind, ident), 'urgency': 'now',
+            'expires_at': None, 'expired': False} for n, (kind, ident) in enumerate(self.events, 1)]
+        return {'subscription': {'subscription_id': 'sub-0', 'state': 'active', 'version': 1, 'label': SUB, 'matched_through': 1,
+            'matcher_caught_up': True, 'acked_through': 1, 'blocked_reason': None, 'gap': None, 'scope_masked': False},
+            'items': [], 'has_more': False, 'next_after': 1, 'consumption': 'explicit_subscription_ack', 'scope_masked': False,
+            'module': {'items': items, 'has_more': False, 'next_after': len(items), 'gap': None, 'acked_through': 0},
+            'positions': {'acked_through': 1, 'fetched_through': 1, 'open_receipts': 1 if items else 0,
+                'oldest_open_receipt_expires_at': iso(NOW + 300) if items else None, 'expired_unacked': 0},
+            'ack_version': 7, 'receipt': RECEIPT if items else None, 'acked_through': 1,
+            'receipt_expires_at': iso(NOW + 300) if items else None, 'ack_available': True}
 
     def messages_fetch_subscription_events(self, subscription_id, limit=50, detail=None):
         return self.page_of()
@@ -87,17 +111,19 @@ class FakeGateway:
         if self.on_wait is not None:
             hook, self.on_wait = self.on_wait, None
             hook()
-        return self.page_of()
+        page = self.page_of()
+        return page | {'wait_status': 'events_available' if page['module']['items'] else 'timeout'}
 
     def messages_ack_subscription_events(self, subscription_id, receipt, version):
-        assert receipt == 'r' * 32 and version == 7
+        assert receipt == RECEIPT and version == 7
         if self.on_ack is not None:
             self.on_ack()
         self.order.append('ack')
         self.events, self.acked = [], self.acked + 1
         if self.crash_after_ack:
             raise Crash
-        return {'acked': True}
+        return {'subscription_id': subscription_id, 'acked_through': 1, 'ack_version': 8, 'provider_read_state_changed': False,
+            'module_acked_through': 1}
 
     def messages_export_feedback_metadata(self, cursor=None, limit=50):
         after = int(cursor or 0)
@@ -106,40 +132,50 @@ class FakeGateway:
         more = len(rows) > len(page)
         head = max([r['_seq'] for r in self.rows] or [0])
         return {'items': [{k: v for k, v in r.items() if k != '_seq'} for r in page], 'has_more': more,
-            'next_cursor': str(page[-1]['_seq'] if more else max(0, head - 1)), 'untrusted_content': True}
+            'next_cursor': str(page[-1]['_seq'] if more else max(0, head - 1)), 'untrusted_content': True,
+            'export_head': iso(NOW)}
 
     def messages_create_subscription(self, feedback, label):
         assert feedback == {'maintainer': True}
         if self.create_mode == 'uncertain_not_created':
             self.create_mode = None
             raise fb.Uncertain('gateway_unreachable')
-        sub = {'subscription_id': 'sub-%d' % (len(self.subs) + 1), 'label': label, 'state': 'active'}
-        self.subs.append(sub)
+        sub = {'subscription_id': 'sub-%d' % (len(self.subs) + 1), 'label': label, 'state': 'active', 'version': 1,
+            'feedback_maintainer': 'only'}
+        self.subs.insert(0, sub)  # the listing is newest first
         if self.create_mode == 'uncertain_created':
             self.create_mode = None
             raise fb.Uncertain('gateway_unreachable')
         return dict(sub)
 
     def messages_list_subscriptions(self, limit=50):
-        return {'subscriptions': [dict(s) for s in self.subs]}
+        """subscriptions.list_subscriptions: `{items, has_more}`, at most `limit` definitions, has_more past them."""
+        return {'items': [dict(s) for s in self.subs[:limit]], 'has_more': len(self.subs) > limit}
 
     def messages_set_feedback_triage(self, feedback_id, status, request_id, expected_status, expected_changed_at,
-                                     duplicate_of=None, spec_ref=None):
-        if request_id in self.writes:
-            return self.writes[request_id]
-        if status == 'accepted' and spec_ref is None:  # the server's rule (ANYM-992): accepted names its card
+                                     duplicate_of=None, spec_ref=None, note=None):
+        bad = (status not in ('accepted', 'declined', 'duplicate') or expected_status not in STATUSES
+            or not REQUEST_ID.fullmatch(request_id) or (spec_ref is not None and not SERVER_SPEC.fullmatch(spec_ref))
+            or (status == 'accepted' and spec_ref is None) or (status == 'duplicate' and duplicate_of is None and spec_ref is None)
+            or (status != 'duplicate' and duplicate_of is not None))  # feedback_triage._errors
+        if bad:
             raise fb.Refused('invalid_feedback', 400)
+        if request_id in self.writes:
+            return self.writes[request_id] | {'replayed': True}
         if self.write_mode == 'uncertain_not_applied':
             self.write_mode = None
             raise fb.Uncertain('gateway_unreachable')
-        item = next(r for r in self.rows if r['feedback_id'] == feedback_id)
+        item = next((r for r in self.rows if r['feedback_id'] == feedback_id), None)
+        if item is None:
+            raise fb.Refused('not_found', 404)
         if item['status'] != expected_status or item['status_changed_at'] != expected_changed_at:
             raise fb.Refused('version_conflict', 409)
         self.seq += 1
         item.update(status=status, status_changed_at=iso(NOW + self.seq), _seq=self.seq, duplicate_of=duplicate_of,
             spec_ref=spec_ref)
         result = self.writes[request_id] = {'feedback_id': feedback_id, 'status': status,
-            'status_changed_at': item['status_changed_at']}
+            'status_changed_at': item['status_changed_at'], 'spec_ref': spec_ref, 'duplicate_of': duplicate_of,
+            'replayed': False}
         if self.write_mode == 'uncertain_applied':
             self.write_mode = None
             raise fb.Uncertain('gateway_unreachable')
@@ -284,7 +320,7 @@ def test_a_first_run_skips_history_and_closed_items(tmp_path):
     gw.submit(row(2, 'accepted', age=40 * day))
     gw.submit(row(3, 'accepted', age=2 * day))
     gw.submit(row(4, 'declined', age=60))
-    gw.submit(row(5, 'fixed', age=5 * day, fixed_in='a' * 40))
+    gw.submit(row(5, 'fixed', age=5 * day, fixed_in='deedkit@' + 'a' * 40))
     bridge.cycle()
     assert sorted(t['title'] for t in tasks.tasks.values()) == ['bug feedback: messages_search (metadata only)'] * 2
     assert {n: bridge.ledger.link(fid(n))['skipped'] for n in (1, 2, 3, 4, 5)} == {1: 1, 2: 1, 3: 0, 4: 1, 5: 0}
@@ -318,7 +354,7 @@ def test_every_status_maps_to_its_task_status(tmp_path, status, expected):
     gw.submit(row(1))
     bridge.cycle()
     gw.server_change(1, status)
-    gw.rows[0]['fixed_in'] = 'a' * 40 if status in ('fixed', 'verify_requested') else None
+    gw.rows[0]['fixed_in'] = 'deedkit@' + 'a' * 40 if status in ('fixed', 'verify_requested') else None
     gw.rows[0]['duplicate_of'] = fid(9) if status == 'duplicate' else None
     bridge.cycle()
     assert task_of(tasks, 1)['status'] == expected
@@ -364,6 +400,21 @@ def test_a_malformed_row_is_skipped_beside_a_good_one_and_never_blocks_it(tmp_pa
     bridge.cycle()
     assert [fb.first_line_id(t['description']) for t in tasks.tasks.values()] == [fid(3)]
     assert capsys.readouterr().err.count('item_malformed') == 2
+
+
+# spec: ANYM-990
+@pytest.mark.parametrize('value, shown', [('deedkit@' + 'a' * 40, True), ('anymsg@1.2.3', True), ('anymsg@1.2.3-rc.1+build.5', True),
+    ('a' * 40, False), ('deedkit@abc', False), ('anymsg@1.2', False), ('deedkit@' + 'a' * 40 + '\nInjected: line', False)])
+def test_the_fixed_in_line_shows_the_release_forms_the_server_stores_and_nothing_else(value, shown):
+    title, text = fb.render(row(1, 'fixed', fixed_in=value))  # feedback.FIXED_IN
+    assert ('Fixed in: ' + value + '\n' in text) == shown and 'Injected' not in text
+
+
+# spec: ANYM-990
+def test_a_card_number_longer_than_the_servers_pattern_names_no_card():
+    assert fb.task_spec(['feedback', 'spec:ANYM-123456']) == 'ANYM-123456' and fb.task_spec(['spec:ANYM-1234567']) is None  # feedback.SPEC_REF
+    item = fb.normalize(row(1, projection=projection() | {'primary_spec': 'ANYM-1234567'}))
+    assert item['projection']['primary_spec'] is None and fb.normalize(row(1, spec_ref='ANYM-1234567'))['spec_ref'] is None
 
 
 # spec: ANYM-990
@@ -649,7 +700,7 @@ def test_done_in_bb_is_never_written_back_and_a_comment_says_why_once(tmp_path):
     bridge, gw, tasks = make(tmp_path)
     gw.submit(row(1))
     gw.server_change(1, 'fixed')
-    gw.rows[0]['fixed_in'] = 'a' * 40
+    gw.rows[0]['fixed_in'] = 'deedkit@' + 'a' * 40
     bridge.cycle()
     key = task_of(tasks, 1)['key']
     tasks.human(key, status='done')
@@ -690,7 +741,7 @@ def test_a_conflict_is_not_replayed_the_server_status_wins_and_a_comment_says_so
     gw.submit(row(1))
     bridge.cycle()
     gw.server_change(1, 'fixed')
-    gw.rows[0]['fixed_in'] = 'a' * 40
+    gw.rows[0]['fixed_in'] = 'deedkit@' + 'a' * 40
     key = task_of(tasks, 1)['key']
     tasks.human(key, status='todo', labels=['feedback', 'spec:ANYM-990'])  # the human acts on a status the server has already left
     assert bridge.reverse()['written'] == 0
@@ -717,6 +768,49 @@ def test_an_incomplete_task_listing_changes_nothing_and_a_missing_write_tool_lea
     assert bridge.reverse() == {'written': 0, 'unavailable': 'forbidden'}
     gw.fail = {}
     assert bridge.reverse()['written'] == 1  # the same version is still waiting
+
+
+# spec: ANYM-990
+def test_the_gateways_refusal_of_a_tool_the_key_cannot_call_leaves_reverse_idle_and_the_change_waiting(tmp_path):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1))
+    bridge.cycle()
+    tasks.human(task_of(tasks, 1)['key'], status='todo', labels=['feedback', 'spec:ANYM-990'])
+    gw.fail['messages_set_feedback_triage'] = fb.Refused('not_found_or_forbidden', 403)  # the gateway's one body for an uncallable tool
+    assert bridge.reverse() == {'written': 0, 'unavailable': 'not_found_or_forbidden'}
+    gw.fail = {}
+    assert bridge.reverse()['written'] == 1
+
+
+# spec: ANYM-990
+def test_an_item_the_server_no_longer_has_is_skipped_and_the_next_task_is_still_written(tmp_path):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1))
+    gw.submit(row(2))
+    bridge.cycle()
+    for n in (1, 2):
+        tasks.human(task_of(tasks, n)['key'], status='todo', labels=['feedback', 'spec:ANYM-990'])
+    gw.rows = [r for r in gw.rows if r['feedback_id'] != fid(1)]  # feedback_triage: not_found (404) names this item only
+    assert bridge.reverse() == {'written': 1}
+    assert [w['feedback_id'] for w in gw.calls('messages_set_feedback_triage')] == [fid(1), fid(2)]
+    assert bridge.reverse() == {'written': 0} and len(gw.calls('messages_set_feedback_triage')) == 2  # not asked again
+
+
+# spec: ANYM-990
+def test_a_policy_change_between_the_gateway_and_its_tool_keeps_the_task_change_waiting(tmp_path):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1))
+    gw.submit(row(2))
+    bridge.cycle()
+    for n in (1, 2):
+        tasks.human(task_of(tasks, n)['key'], status='todo', labels=['feedback', 'spec:ANYM-990'])
+    gw.fail['messages_set_feedback_triage'] = fb.Refused('policy_changed', 409)  # dispatch: raised before any backend call
+    assert bridge.reverse() == {'written': 0}
+    assert len(gw.calls('messages_set_feedback_triage')) == 2  # the pass went on to the second task
+    gw.fail = {}
+    assert bridge.reverse()['written'] == 2
+    sent = gw.calls('messages_set_feedback_triage')
+    assert [w['request_id'] for w in sent[:2]] == [w['request_id'] for w in sent[2:]]  # the same deterministic request IDs
 
 
 # spec: ANYM-990
@@ -774,9 +868,43 @@ def test_a_failed_or_full_subscription_listing_means_no_create(tmp_path, listing
     if listing == 'failed':
         gw.fail['messages_list_subscriptions'] = fb.Uncertain('gateway_unreachable')
     else:
-        gw.subs = [{'subscription_id': 'other-%d' % n, 'label': 'x', 'state': 'active'} for n in range(100)]
+        gw.subs = [{'subscription_id': 'other-%d' % n, 'label': 'x', 'state': 'active'} for n in range(101)]
     bridge.watch(stopper(3), sleep=lambda s: None)
     assert len(gw.calls('messages_create_subscription')) == creates and bridge.ledger.meta('subscription_id') is None
+
+
+# spec: ANYM-990
+def test_a_listing_that_says_has_more_is_incomplete_whatever_its_length(tmp_path):
+    bridge, gw, tasks = make(tmp_path, subscription_id=None)
+    gw.create_mode = 'uncertain_not_created'
+    bridge.watch(stopper(1), sleep=lambda s: None)
+    creates = len(gw.calls('messages_create_subscription'))
+    gw.messages_list_subscriptions = lambda limit=50: {'items': [], 'has_more': True}  # list_subscriptions: more than `limit`
+    bridge.watch(stopper(3), sleep=lambda s: None)
+    assert len(gw.calls('messages_create_subscription')) == creates and bridge.ledger.meta('subscription_id') is None
+
+
+# spec: ANYM-990
+def test_a_listing_of_exactly_one_hundred_without_has_more_is_complete_and_a_pending_create_is_made_once(tmp_path):
+    bridge, gw, tasks = make(tmp_path, subscription_id=None)
+    gw.create_mode = 'uncertain_not_created'
+    bridge.watch(stopper(1), sleep=lambda s: None)
+    gw.subs = [{'subscription_id': 'other-%d' % n, 'label': 'x', 'state': 'active'} for n in range(100)]
+    assert gw.messages_list_subscriptions(limit=100)['has_more'] is False
+    bridge.watch(stopper(3), sleep=lambda s: None)
+    assert len(gw.calls('messages_create_subscription')) == 2 and bridge.ledger.meta('subscription_id') == 'sub-101'
+
+
+# spec: ANYM-990
+def test_a_pending_create_adopts_the_live_definition_of_its_label_from_the_items_listing(tmp_path):
+    bridge, gw, tasks = make(tmp_path, subscription_id=None)
+    gw.subs = [{'subscription_id': 'sub-9', 'label': SUB, 'state': 'closed', 'version': 3},
+        {'subscription_id': 'sub-8', 'label': 'other', 'state': 'active', 'version': 1},
+        {'subscription_id': 'sub-6', 'state': 'access_changed', 'version': 2, 'recreate_required': True, 'scope_masked': True},
+        {'subscription_id': 'sub-7', 'label': SUB, 'state': 'active', 'version': 1}]  # the masked and closed ones name no live one
+    bridge.ledger.set_meta('subscription_pending', '1')
+    assert bridge.ensure_subscription() == 'sub-7' and not gw.calls('messages_create_subscription')
+    assert bridge.ledger.meta('subscription_pending') is None
 
 
 # spec: ANYM-990
@@ -835,12 +963,12 @@ def test_reverse_runs_at_least_every_120_seconds_while_the_loop_is_idle(tmp_path
 def test_a_closed_subscription_is_cleared_and_recreated_once(tmp_path):
     bridge, gw, tasks = make(tmp_path, subscription_id=None)
     bridge.watch(stopper(1), sleep=lambda s: None)
-    gw.fail['messages_wait_for_subscription_events'] = fb.Refused('subscription_closed', 410)
+    gw.fail['messages_wait_for_subscription_events'] = fb.Refused('subscription_closed', 409)
     bridge.watch(stopper(1), sleep=lambda s: None)
     gw.fail = {}
     gw.subs[0]['state'] = 'closed'
     bridge.watch(stopper(2), sleep=lambda s: None)
-    assert [s['subscription_id'] for s in gw.subs] == ['sub-1', 'sub-2'] and bridge.ledger.meta('subscription_id') == 'sub-2'
+    assert [s['subscription_id'] for s in gw.subs] == ['sub-2', 'sub-1'] and bridge.ledger.meta('subscription_id') == 'sub-2'
 
 
 # spec: ANYM-990
@@ -965,6 +1093,34 @@ def test_the_gateway_client_posts_json_with_the_bearer_key_and_classifies_every_
             assert KEY not in str(caught.value) and 'CANARY' not in str(caught.value)
     with pytest.raises(fb.Uncertain):
         fb.Gateway('http://127.0.0.1:1', KEY).call('t', {})  # connection refused
+
+
+# spec: ANYM-990
+def test_the_gateways_own_refusals_are_read_as_the_codes_it_sends_and_a_backend_failure_names_its_status(capsys):
+    # agent_gateway.dispatch.unknown_tool_denial (HTTP 403) and diagnostics.failure_details / http_clients (HTTP 503), as the REST route answers
+    denied = {'error': 'not_found_or_forbidden', 'next_action': 'refresh_tool_list_once', 'hint': 'If the tool is still absent after a refresh.'}
+    crashed = {'error': 'backend_unavailable', 'backend_status': 500, 'request_id': 'a' * 32}
+    waited = {'error': 'backend_unavailable', 'backend_status': 503, 'backend_error': 'subscription_wait_timeout'}
+    lost = {'error': 'backend_unavailable', 'reason': 'gateway_timeout'}
+    hostile = {'error': 'backend_unavailable', 'backend_status': 'CANARY\n', 'backend_error': 'CANARY-code', 'reason': KEY}
+    replies = [(403, json.dumps(denied).encode(), {})] + [(503, json.dumps(x).encode(), {}) for x in (crashed, waited, lost, hostile)]
+    with Server(replies) as server:
+        gateway = fb.Gateway(server.url, KEY)
+        with pytest.raises(fb.Refused) as caught:
+            gateway.call('messages_set_feedback_triage', {})
+        assert (caught.value.code, caught.value.status) == ('not_found_or_forbidden', 403)
+        said = []
+        for _ in range(4):
+            with pytest.raises(fb.Uncertain) as caught:
+                gateway.call('messages_create_subscription', {})
+            assert (caught.value.code, caught.value.status) == ('gateway_http_503', 503)
+            said.append(caught.value.note)
+            fb.report(caught.value)
+    assert said == ['backend_status=500', 'backend_status=503 backend_error=subscription_wait_timeout', 'reason=gateway_timeout', '']
+    lines = capsys.readouterr().err.splitlines()
+    assert lines == ['feedback-bridge: gateway_http_503 (backend_status=500)',
+        'feedback-bridge: gateway_http_503 (backend_status=503 backend_error=subscription_wait_timeout)',
+        'feedback-bridge: gateway_http_503 (reason=gateway_timeout)', 'feedback-bridge: gateway_http_503']
 
 
 def runner_for(script):
