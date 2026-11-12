@@ -28,8 +28,8 @@ docs/operations/parallel-development.md.
   on one provider session. Tests and health checks never touch a live provider.
 - Override: Android goal execution (owner 11-12: «Просто голый кодекс», «взять прям минимум
   инструкций»): phone information, agent role and caller goal; native Codex sandbox, no custom
-  per-tap guard or injected order/payment stop. Section 2's five decisions and live actions outside
-  that goal stay. Authority, incident and enforcer: docs/operations/agent-feature-experiments.md.
+  per-tap guard or injected order/payment stop. Section 2's five decisions and unrelated
+  messenger/provider live-action confirmations stay. Authority, incident and enforcer: docs/operations/agent-feature-experiments.md.
 - Override: the exact confirmation per message in one courier chat (owner 11-11: «Если ему говорю
   какую-то цель, он там может серию сообщений делать сам. Я вообще с водителем не хочу общаться ... он может
   полностью их проводить, пока они не доходят до меня, если только он не справляется»). Under the owner's goal for

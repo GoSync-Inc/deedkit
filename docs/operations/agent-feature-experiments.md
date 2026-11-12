@@ -49,7 +49,8 @@ goal executor. Replace the Android task wrapper's custom per-action guard, manda
 cycle and unconditional final-order/payment stop with an ordinary Codex workspace-write session:
 phone information, agent role, caller goal and reusable per-app skills. Native Codex safeguards
 remain. This does not authorize unrelated account actions, provider auth or changes to section
-2's five reserved decisions; listed live actions outside the Android goal retain exact confirmation.
+2's five reserved decisions. A caller's arbitrary goal is not owner authority for unrelated
+messenger sends/calls, ACK, pairing or provider-session actions; their exact confirmations remain.
 The old guarded executor remains a rollback path. Functional enforcement belongs to
 `services/android/tests/test_agent.py` and the integrated same-task comparison, delivered by the
 Android replacement worker under ANYM-993. No reviews remain under owner 11-11.
