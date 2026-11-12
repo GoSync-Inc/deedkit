@@ -2,12 +2,14 @@
 
 import json
 from pathlib import Path
+import re
 import sys
 import time
 
 import pytest
 
 from agent_harness import Service, recorded, write_config
+from deedkit_android.agent_learning import skill_name
 
 
 def bare_host(tmp_path, *, delay=0, result=True, exit_code=0, commands=1):
@@ -60,7 +62,7 @@ def test_bare_default_launch_result_and_mandatory_skill_reuse(tmp_path):
         assert 'SERIAL' in prompt and 'Order check for me' not in prompt
         assert service.phone.commands == []  # no guard, hierarchy, or phone MCP
         home = Path(seen['env']['CODEX_HOME'])
-        skill = home / 'skills' / 'android-example.food' / 'SKILL.md'
+        skill = home / 'skills' / skill_name('example.food') / 'SKILL.md'
         assert 'example.food:id/cart' in skill.read_text()
         assert '141400' not in skill.read_text() and 'Cart total' not in skill.read_text()
         second = service.finished(service.start(session, model='gpt-6.1-sol', effort='high')['request_id'])
@@ -90,7 +92,7 @@ def test_stop_holds_device_and_releases_process_without_publishing_skill(tmp_pat
         stopped = service.post('agent', {'action': 'stop', 'request_id': request_id})
         assert stopped['state'] == 'stopped'
         assert stopped['skills_updated'] == []
-        assert not (tmp_path / 'codex-home' / 'skills' / 'android-example.food').exists()
+        assert not (tmp_path / 'codex-home' / 'skills' / skill_name('example.food')).exists()
 
 
 # spec: ANYM-993
@@ -110,7 +112,7 @@ def test_knowledge_does_not_accept_private_text_or_dynamic_identifiers(tmp_path)
     good = {'package': 'example.food', 'steps': [{'action': 'tap', 'resource_id': 'example.food:id/cart'}],
             'pitfalls': ['refresh_hierarchy']}
     assert publish(home, [good]) == ['example.food']
-    skill = home / 'skills' / 'android-example.food' / 'SKILL.md'
+    skill = home / 'skills' / skill_name('example.food') / 'SKILL.md'
     before = skill.read_bytes()
     for change in ({'notes': 'Private address'}, {'steps': [{'action': 'tap', 'resource_id': 'example.food:id/user_123'}]},
                    {'pitfalls': ['PIN 1234']}):
@@ -209,4 +211,17 @@ def test_bare_closes_the_target_warm_ui_worker_while_holding_its_phone_lock(tmp_
         run = service.finished(service.start(service.lease())['request_id'])
         assert run['state'] == 'succeeded'
         assert closed == ['home']
+
+
+# spec: ANYM-993
+def test_app_skills_have_native_codex_names_and_keep_package_identity(tmp_path):
+    import yaml
+    from deedkit_android.agent_learning import load, publish
+    lesson = dict(package='example.food', steps=[dict(action='tap', resource_id='example.food:id/cart')], pitfalls=[])
+    publish(tmp_path, [lesson])
+    path, = (tmp_path / 'skills').glob('*/SKILL.md')
+    metadata = yaml.safe_load(path.read_text().split('---')[1])
+    assert re.fullmatch(r'[a-z0-9-]{1,63}', metadata['name'])
+    assert path.parent.name == metadata['name']
+    assert load(tmp_path, ['example.food']) == [lesson]
 

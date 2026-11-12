@@ -308,7 +308,7 @@ by Codex may be in flight when cancellation arrives. Requests and logs retain th
 14-day policy. Phone content and task data go to OpenAI under the existing provider policy.
 
 Learning runs through an explicit structured-result contract in the same session. The service
-publishes validated per-app navigation into `CODEX_HOME/skills/android-<package>/SKILL.md`
+publishes validated per-app navigation into `CODEX_HOME/skills/<app-name-and-hash>/SKILL.md`
 and loads it for the next run, even when the model writes no skill file. A small
 `android-learning` skill explains the contract. Only static resource IDs, action enums and
 defined navigation pitfalls are persisted; goals, summaries, screen text, task parameters,

@@ -1,5 +1,6 @@
 """Mandatory, typed app learning. Persistent knowledge contains identifiers and enums only."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -78,6 +79,11 @@ def setup(home, run_dir, outputs=()):
     return root
 
 
+def skill_name(package):
+    slug = re.sub('[^a-z0-9-]', '-', package)[:40]
+    return 'android-' + slug + '-' + hashlib.sha256(package.encode()).hexdigest()[:8]
+
+
 def publish(home, lessons):
     validated = [Lesson.model_validate(item) for item in lessons]
     root = Path(home) / 'skills'
@@ -91,8 +97,8 @@ def publish(home, lessons):
                                       + [step.model_dump() for step in lesson.steps]))[-40:]
             lesson = Lesson(package=lesson.package, steps=[{'action': a, 'resource_id': r} for a, r in steps],
                             pitfalls=list(dict.fromkeys(prior[0]['pitfalls'] + lesson.pitfalls)))
-        path = Path(home) / 'skills' / ('android-' + lesson.package) / 'SKILL.md'
-        content = (f'---\nname: android-{lesson.package}\ndescription: Observed navigation in {lesson.package}.\n'
+        path = Path(home) / 'skills' / skill_name(lesson.package) / 'SKILL.md'
+        content = (f'---\nname: {skill_name(lesson.package)}\ndescription: Observed navigation in {lesson.package}.\n'
                    '---\nUse only when it matches the current goal and screen.\n'
                    + '\n'.join(f'- {step.action}: `{step.resource_id}`' for step in lesson.steps)
                    + '\n' + '\n'.join('- ' + item for item in lesson.pitfalls) + '\n')
@@ -106,14 +112,16 @@ def load(home, apps):
     result = []
     root = Path(home) / 'skills'
     for path in sorted(root.glob('android-*/SKILL.md'))[:100]:
-        package = path.parent.name.removeprefix('android-')
-        if not re.fullmatch(PACKAGE, package) or (apps and package not in apps):
-            continue
         if path.is_symlink() or path.parent.is_symlink() or path.stat().st_size > 16384:
+            continue
+        text = path.read_text()
+        match = re.search(r'^description: Observed navigation in ([a-z_.]+)\.$', text, re.MULTILINE)
+        package = match[1] if match else ''
+        if not re.fullmatch(PACKAGE, package) or path.parent.name != skill_name(package) or (apps and package not in apps):
             continue
         # Reconstruct from the constrained lines, dropping all other content.
         steps, pitfalls = [], []
-        for line in path.read_text().splitlines():
+        for line in text.splitlines():
             match = re.fullmatch(r'- (tap|read|wait|scroll): `([^`]+)`', line)
             if match:
                 steps.append({'action': match[1], 'resource_id': match[2]})
