@@ -519,8 +519,24 @@ def tiden_reply(specs):
             'pagination': {'totalCount': len(specs), 'nextPageToken': None}}
 
 
+ORCH = 'thr_orch000001'  # the orchestrator thread of config.json
+
+
+def thread_row(w):
+    """A bb `thread list --json` row from the test's shorthand: name, id, projectName (default deedkit), branch,
+    archivedAt, createdAt (ISO) and status (default idle)."""
+    name = w.get('projectName', 'deedkit')
+    row = {'id': w['id'], 'title': w['name'], 'projectId': autoloop.PROJECT if name == 'deedkit' else name,
+           'status': w.get('status', 'idle'), 'parentThreadId': ORCH, 'archivedAt': 1 if w.get('archivedAt') else None,
+           'deletedAt': None, 'environmentBranchName': w.get('branch')}
+    if w.get('createdAt'):
+        row['createdAt'] = int(datetime.fromisoformat(w['createdAt'].replace('Z', '+00:00')).timestamp() * 1000)
+    return row
+
+
 class Fakes:
-    """Stand-ins for the export over SSH, Tiden, superset and gh; each records its calls."""
+    """Stand-ins for the export over SSH, Tiden, bb and gh; each records its calls. `workspaces` are the worker
+    threads bb lists, in the shorthand of `thread_row`; `terminals` maps a thread ID to its running terminals."""
 
     def __init__(self, submissions=(), workspaces=(), terminals=None, runs=(), open_prs=(), merged=()):
         self.submissions, self.terminals = list(submissions), terminals or {}
@@ -529,6 +545,7 @@ class Fakes:
         self.prs = [dict({'state': 'OPEN', 'headRepository': {'nameWithOwner': autoloop.REPO}}, **p) for p in open_prs] + \
             [dict({'state': 'MERGED', 'headRepository': {'nameWithOwner': autoloop.REPO}}, **p) for p in merged]
         self.calls, self.fail, self.truncate, self.runner_calls, self.runs_missing = [], set(), False, [], 0
+        self.stdins = []  # (argv, stdin) of each bb call that was given a prompt
         # The build stage (ANYM-572): Tiden main, compare files by head, pushed branches, open PRs' files.
         self.specs, self.compares, self.branches, self.pr_files = list(SNAPSHOT['main']), {}, [], {}
         self.rest_files = {}  # {PR number: REST file rows} of PRs with a rename
@@ -551,16 +568,28 @@ class Fakes:
             reply['pagination']['nextPageToken'] = 'more'
         return reply
 
-    def superset(self, argv):
-        self.calls.append(('superset', argv))
+    def bb(self, argv, stdin=None):
+        self.calls.append(('bb', argv))
+        if stdin is not None:
+            self.stdins.append((argv, stdin))
         if argv[0] in self.fail or ' '.join(argv[:2]) in self.fail:
-            raise triage.Refused('superset failed')
-        if argv[:2] == ['workspaces', 'list']:
-            return [dict(w) for w in self.workspaces]
-        if argv[:2] == ['terminals', 'list']:
-            return {'sessions': [{'terminalId': t, 'exited': False} for t in self.terminals.get(argv[-1], [])]}
-        if argv[:2] == ['terminals', 'close']:
-            self.terminals[argv[4]].remove(argv[6])
+            raise triage.Refused('bb failed')
+        if argv[:2] == ['thread', 'list']:
+            ids = {argv[n + 1] for n, a in enumerate(argv) if a == '--thread'}
+            every = ids or '--include-archived' in argv
+            rows = [thread_row(w) for w in self.workspaces]
+            return [r for r in rows if (r['id'] in ids if ids else True) and (every or not r['archivedAt'])
+                    and ('--project' not in argv or r['projectId'] == autoloop.PROJECT)]
+        if argv[:2] == ['terminal', 'list']:
+            return {'sessions': [{'id': t, 'status': 'running'} for t in self.terminals.get(argv[-1], [])]}
+        if argv[:2] == ['terminal', 'close']:
+            for ids in self.terminals.values():
+                if argv[2] in ids:
+                    ids.remove(argv[2])
+        if argv[:2] == ['thread', 'stop']:
+            for w in self.workspaces:
+                if w['id'] == argv[2] and w['status'] == 'active':
+                    w['status'] = 'idle'
         return {}
 
     def gh(self, argv):
@@ -631,14 +660,14 @@ def loop(tmp_path):
 
 def configure(a, **values):
     path = a / 'config.json'
-    path.write_text(json.dumps(dict({'principals': [OWNER]}, **values)))
+    path.write_text(json.dumps(dict({'principals': [OWNER], 'orchestrator_thread': ORCH}, **values)))
     path.chmod(0o600)
 
 
 def run_tick(loop, fakes, now=NOW, **kw):
     t, a, s = loop
     return autoloop.tick(a, t, s, now=now, ssh=fakes.ssh, read_tiden=fakes.tiden, runner=fakes.runner,
-                         superset=fakes.superset, gh=fakes.gh, **kw)
+                         bb=fakes.bb, gh=fakes.gh, **kw)
 
 
 def intent(a, name, card, status, feedback=(), started=NOW - timedelta(minutes=30), reserved=7200, workspace=None):
@@ -671,7 +700,7 @@ def test_live_false_writes_the_plan_and_starts_nothing(loop):
     plan = triage.load(a / 'plan.json', {})
     assert code == 0 and 'plan only' in line and fakes.runner_calls == []
     assert plan['live'] is False and plan['waiting'] == [D1, D2] and plan['reader'] == 'off (live: false)'
-    assert not (t / 'ledger.json').exists() and not any(c[0] == 'superset' for c in fakes.calls)
+    assert not (t / 'ledger.json').exists() and not any(c[0] == 'bb' for c in fakes.calls)
     assert triage.load(a / 'last-tick.json', {})['outcome'] == 'plan'
 
 
@@ -682,7 +711,7 @@ def test_a_failed_or_truncated_read_ends_the_tick_with_no_write(loop, broken):
     configure(a, live=True)
     fakes = Fakes([submission(D1, 'x')])
     fakes.truncate = broken == 'truncated snapshot'
-    fakes.fail = {'export' if broken == 'failed export' else 'workspaces list'}
+    fakes.fail = {'export' if broken == 'failed export' else 'thread list'}
     intent(a, 'autoloop-card-anym-10', 'ANYM-10', 'unknown')
     with pytest.raises((autoloop.Refused, triage.Refused)):
         run_tick(loop, fakes)
@@ -827,7 +856,7 @@ def test_the_state_is_private_and_the_tick_never_prints_or_stores_feedback_text(
     real = autoloop.tick
     monkeypatch.setattr(autoloop, 'tick', lambda state, triage_state, now: real(
         state, triage_state, s, now=NOW, ssh=fakes.ssh, read_tiden=fakes.tiden, runner=fakes.runner,
-        superset=fakes.superset, gh=fakes.gh))
+        bb=fakes.bb, gh=fakes.gh))
     assert autoloop.main(['tick', '--state', str(a), '--triage-state', str(t)]) == 0
     out = capsys.readouterr()
     stored = [p for p in a.rglob('*') if p.is_file()] + list((t / 'reports').glob('*'))
@@ -847,7 +876,7 @@ def test_the_state_is_private_and_the_tick_never_prints_or_stores_feedback_text(
 
 def cfg(**caps):
     return {'live': True, 'principals': {OWNER}, 'zone': autoloop.ZoneInfo('Europe/Moscow'),
-            'caps': dict(autoloop.CAPS, **caps)}
+            'caps': dict(autoloop.CAPS, **caps), 'orchestrator_thread': ORCH}
 
 
 # spec: ANYM-569
@@ -868,20 +897,20 @@ def test_an_intent_is_written_before_the_start_and_an_unknown_outcome_is_settled
     two, _ = autoloop.admit(a, c, 'card', 'ANYM-10', [D2], NOW)
 
     def lost(i):
-        raise triage.Refused('superset failed: TimeoutExpired')
+        raise triage.Refused('bb failed: TimeoutExpired')
     with pytest.raises(triage.Refused):
         autoloop.launch(a, two['name'], lost, NOW)
     assert autoloop.intents(a)['autoloop-card-anym-10']['status'] == 'unknown'
     with pytest.raises(autoloop.Refused, match='only a reserved intent'):
         autoloop.launch(a, two['name'], start, NOW)
-    # Crash after the start: the workspace of the deedkit project exists, so the intent is started with the time
+    # Crash after the start: the thread of the deedkit project exists, so the intent is started with the time
     # stamped before the call (found an hour later, it is not refunded that hour); one that never came up is lost.
-    listing = [{'name': 'autoloop-card-anym-10', 'id': 'ws-0', 'archivedAt': None, 'projectName': 'deedkit',
-                'createdAt': '2026-10-26T10:00:00Z'},  # older than the launch: not this intent's
-               {'name': 'autoloop-card-anym-10', 'id': 'ws-2', 'archivedAt': None, 'projectName': 'deedkit',
-                'createdAt': '2026-10-26T12:00:05Z'},
-               {'name': 'autoloop-build-anym-11', 'id': 'ws-3', 'archivedAt': None, 'projectName': 'other',
-                'createdAt': '2026-10-26T12:00:05Z'}]
+    listing = [thread_row({'name': 'autoloop-card-anym-10', 'id': 'ws-0', 'projectName': 'deedkit',
+                           'createdAt': '2026-10-26T10:00:00Z'}),  # older than the launch: not this intent's
+               thread_row({'name': 'autoloop-card-anym-10', 'id': 'ws-2', 'projectName': 'deedkit',
+                           'createdAt': '2026-10-26T12:00:05Z'}),
+               thread_row({'name': 'autoloop-build-anym-11', 'id': 'ws-3', 'projectName': 'other',
+                           'createdAt': '2026-10-26T12:00:05Z'})]
     later = NOW + timedelta(hours=1)
     assert autoloop.reconcile(a, listing, later) == ['autoloop-card-anym-10', 'autoloop-card-group-names']
     known = autoloop.intents(a)
@@ -892,6 +921,88 @@ def test_an_intent_is_written_before_the_start_and_an_unknown_outcome_is_settled
     intent(a, 'autoloop-build-anym-11', 'ANYM-11', 'unknown')
     assert autoloop.reconcile(a, listing, NOW) == ['autoloop-build-anym-11']  # another project's workspace
     assert autoloop.intents(a)['autoloop-build-anym-11']['status'] == 'lost'
+
+
+# spec: ANYM-568
+def test_the_bb_wrapper_asks_for_json_feeds_the_prompt_on_stdin_and_reads_an_empty_reply_as_none(monkeypatch):
+    seen = []
+    replies = {'list': '[{"id": "thr_000001"}]', 'stop': ' \n', 'spawn': '{"id": "thr_000002"}', 'bad': 'not json'}
+
+    def run(argv, timeout, stdin=None):
+        seen.append((argv, stdin))
+        return replies[argv[2]]
+    monkeypatch.setattr(autoloop.triage, 'run', run)
+    assert autoloop.bb_cli(['thread', 'list', '--project', 'p']) == [{'id': 'thr_000001'}]
+    assert seen[-1] == (['bb', 'thread', 'list', '--project', 'p', '--json'], None)
+    assert autoloop.bb_cli(['thread', 'stop', 'thr_000001']) is None
+    assert autoloop.bb_cli(['thread', 'spawn', '--prompt-file', '-'], 'the prompt') == {'id': 'thr_000002'}
+    assert seen[-1] == (['bb', 'thread', 'spawn', '--prompt-file', '-', '--json'], 'the prompt')
+    with pytest.raises(triage.Refused, match='bb thread bad: not JSON'):
+        autoloop.bb_cli(['thread', 'bad'])
+
+
+# spec: ANYM-568
+@pytest.mark.parametrize('value', ['x', 'thr_', 'THR_abcdef', 5, ['thr_abcdef'], ''])
+def test_config_refuses_an_orchestrator_thread_that_is_not_a_bb_thread_id(loop, value):
+    t, a, s = loop
+    configure(a, orchestrator_thread=value)
+    with pytest.raises(autoloop.Refused, match='config.json'):
+        autoloop.config(a)
+
+
+# spec: ANYM-568
+def test_config_reads_the_orchestrator_thread_and_it_defaults_to_none(loop):
+    t, a, s = loop
+    configure(a)
+    assert autoloop.config(a)['orchestrator_thread'] == ORCH
+    configure(a, orchestrator_thread=None)
+    assert autoloop.config(a)['orchestrator_thread'] is None
+    (a / 'config.json').unlink()
+    assert autoloop.config(a)['orchestrator_thread'] is None
+
+
+# spec: ANYM-568
+@settings(max_examples=60, deadline=None)
+@given(st.from_regex(autoloop.WORKSPACE, fullmatch=True))
+def test_a_build_terminal_id_is_a_fixed_function_of_the_intent_name_in_bbs_alphabet(name):
+    assert re.fullmatch(r'term_[23456789abcdefghijkmnpqrstuvwxyz]{10}', autoloop.terminal_id(name))
+    assert autoloop.terminal_id(name) == autoloop.terminal_id(name)
+
+
+# spec: ANYM-568
+def test_two_build_intents_never_share_a_terminal_id():
+    assert autoloop.terminal_id('autoloop-build-anym-30') != autoloop.terminal_id('autoloop-build-anym-31')
+
+
+# spec: ANYM-568
+def test_a_started_intent_is_read_by_its_recorded_thread_id_and_an_archived_or_missing_thread_interrupts_it(loop):
+    t, a, s = loop
+    configure(a)
+    intent(a, 'autoloop-card-one', 'new:one', 'started', [D1], workspace='thr_000001')
+    intent(a, 'autoloop-card-two', 'new:two', 'started', [D2], workspace='thr_000002')
+    intent(a, 'autoloop-card-three', 'new:three', 'started', [D3], workspace='thr_000003')
+    fakes = Fakes(workspaces=[{'name': 'autoloop-card-one', 'id': 'thr_000001'},
+                              {'name': 'autoloop-card-two', 'id': 'thr_000002', 'archivedAt': 'x'}])
+    run_tick(loop, fakes)
+    assert {n: i['status'] for n, i in autoloop.intents(a).items()} == {
+        'autoloop-card-one': 'started', 'autoloop-card-two': 'interrupted', 'autoloop-card-three': 'interrupted'}
+    lists = [c[1] for c in fakes.calls if c[1][:2] == ['thread', 'list']]
+    assert lists[0] == ['thread', 'list', '--include-archived', '--thread', 'thr_000001', '--thread', 'thr_000002',
+                        '--thread', 'thr_000003'] and not any('--project' in argv for argv in lists)
+
+
+# spec: ANYM-568
+def test_an_unknown_intent_is_looked_for_by_title_among_the_projects_live_threads_only(loop):
+    t, a, s = loop
+    configure(a)
+    intent(a, 'autoloop-card-one', 'new:one', 'unknown')  # started 30 minutes before NOW
+    fakes = Fakes(workspaces=[
+        {'name': 'autoloop-card-one', 'id': 'thr_000009', 'projectName': 'elsewhere', 'createdAt': '2026-10-26T11:45:00Z'},
+        {'name': 'autoloop-card-one', 'id': 'thr_000001', 'createdAt': '2026-10-26T11:45:00Z'}])
+    run_tick(loop, fakes)
+    found = autoloop.intents(a)['autoloop-card-one']
+    assert (found['status'], found['workspace']) == ('started', 'thr_000001')
+    assert ('bb', ['thread', 'list', '--project', autoloop.PROJECT]) in fakes.calls
 
 
 # spec: ANYM-569
@@ -1045,9 +1156,9 @@ def test_the_fence_closes_loop_terminals_only_cancels_ready_merges_disarms_prs_a
     code, line = run_tick(loop, fakes)
     assert code == 0 and line == 'paused: stop effective; written after stop 2'
     assert fakes.terminals == {'w1': [], 'w2': [], 'w3': ['t4'], 'w4': ['t5'], 'w5': ['t6'], 'w6': ['t7'], 'w8': ['t8']}
-    writes = [c[1] for c in fakes.calls if c[1][:2] in (['terminals', 'close'], ['run', 'cancel'], ['pr', 'merge'])
+    writes = [c[1] for c in fakes.calls if c[1][:2] in (['terminal', 'close'], ['run', 'cancel'], ['pr', 'merge'])
               or (c[1][:2] == ['api', 'graphql'] and 'dequeue' in c[1][3])]
-    assert [w[:3] for w in writes if w[0] != 'terminals'] == [['run', 'cancel', '1'], ['pr', 'merge', '7'],
+    assert [w[:3] for w in writes if w[0] != 'terminal'] == [['run', 'cancel', '1'], ['pr', 'merge', '7'],
                                                                ['api', 'graphql', '-f']]
     result = triage.load(a / 'fence.json', {})
     assert result['effective'] and result['read_back'] == 'clean'
@@ -1056,6 +1167,25 @@ def test_the_fence_closes_loop_terminals_only_cancels_ready_merges_disarms_prs_a
     assert {i['status'] for i in autoloop.intents(a).values()} == {'stopped'}  # the reserved one never starts
     assert not any(c[0] == 'ssh' for c in fakes.calls)
     assert autoloop.gate(a, 'autoloop-card-xyz') == 'paused'
+
+
+# spec: ANYM-568
+def test_the_fence_stops_a_running_worker_turn_and_a_thread_still_stopping_keeps_the_stop_not_effective(loop):
+    t, a, s = loop
+    intent(a, 'autoloop-card-one', 'new:one', 'started', [D1], workspace='thr_000001')
+    intent(a, 'autoloop-card-two', 'new:two', 'started', [D2], workspace='thr_000002')
+    paused(a, NOW - timedelta(minutes=5))
+    fakes = Fakes(workspaces=[{'name': 'autoloop-card-one', 'id': 'thr_000001', 'status': 'active'},
+                              {'name': 'autoloop-card-two', 'id': 'thr_000002', 'status': 'stopping'}])
+    code, line = run_tick(loop, fakes)
+    assert ('bb', ['thread', 'stop', 'thr_000001']) in fakes.calls
+    assert code == 1 and 'NOT effective' in line
+    assert triage.load(a / 'fence.json', {})['alive'] == ['thread autoloop-card-two']
+    assert {n: i['status'] for n, i in autoloop.intents(a).items()} == {
+        'autoloop-card-one': 'stopped', 'autoloop-card-two': 'started'}
+    fakes.workspaces[1]['status'] = 'idle'  # the next paused tick sees it ended
+    code, _ = run_tick(loop, fakes, now=NOW + timedelta(hours=1))
+    assert code == 0 and autoloop.intents(a)['autoloop-card-two']['status'] == 'stopped'
 
 
 # spec: ANYM-569
@@ -1125,7 +1255,7 @@ def test_a_drop_or_a_hold_disarms_the_intents_prs_every_tick_and_closes_the_pr_b
 def test_the_fence_action_runs_without_a_pull_and_only_when_paused(loop, monkeypatch, capsys):
     t, a, s = loop
     calls = []
-    monkeypatch.setattr(autoloop, 'superset_cli', lambda argv: calls.append(argv))
+    monkeypatch.setattr(autoloop, 'bb_cli', lambda argv, stdin=None: calls.append(argv))
     monkeypatch.setattr(autoloop, 'gh_cli', lambda argv: calls.append(argv))
     assert autoloop.main(['fence', '--state', str(a)]) == 0 and 'not paused' in capsys.readouterr().out
     paused(a, NOW)
@@ -1139,14 +1269,14 @@ def test_a_failed_close_or_read_back_leaves_the_stop_not_effective_and_status_ex
     intent(a, 'autoloop-card-xyz', 'new:xyz', 'started', workspace='w1')
     paused(a, NOW - timedelta(minutes=5))
     fakes = Fakes(workspaces=[{'name': 'autoloop-card-xyz', 'id': 'w1'}], terminals={'w1': ['t1']})
-    fakes.fail = {'terminals close'}
+    fakes.fail = {'terminal close'}
     code, line = run_tick(loop, fakes)
     result = triage.load(a / 'fence.json', {})
     assert code == 1 and 'NOT effective' in line and result['alive'] == ['terminal autoloop-card-xyz']
-    assert result['failed'] == ['close autoloop-card-xyz: superset failed']
+    assert result['failed'] == ['close autoloop-card-xyz: bb failed']
     assert autoloop.intents(a)['autoloop-card-xyz']['status'] == 'started'
     assert autoloop.status(a, NOW)[0] == 1 and 'not effective' in autoloop.status(a, NOW)[1]
-    fakes.fail = {'workspaces list'}
+    fakes.fail = {'thread list'}
     code, _ = run_tick(loop, fakes)
     assert code == 1 and triage.load(a / 'fence.json', {})['read_back'].startswith('failed')
 
@@ -1205,15 +1335,17 @@ def new_card(fakes, cards):
 
 
 def creates(fakes, reply):
-    real = fakes.superset
+    """The worker threads the loop spawns (`bb thread spawn` answers `reply`): the argv of each, in order."""
+    real = fakes.bb
 
-    def superset(argv):
-        if argv[:2] == ['workspaces', 'create']:
-            fakes.calls.append(('superset', argv))
+    def bb(argv, stdin=None):
+        if argv[:2] == ['thread', 'spawn']:
+            fakes.calls.append(('bb', argv))
+            fakes.stdins.append((argv, stdin))
             return reply
-        return real(argv)
-    fakes.superset = superset
-    return lambda: [c[1] for c in fakes.calls if c[0] == 'superset' and c[1][:2] == ['workspaces', 'create']]
+        return real(argv, stdin)
+    fakes.bb = bb
+    return lambda: [c[1] for c in fakes.calls if c[0] == 'bb' and c[1][:2] == ['thread', 'spawn']]
 
 
 def notes(t):
@@ -1244,7 +1376,7 @@ def test_a_new_owner_agent_cluster_gets_one_card_worker_whose_prompt_and_project
     configure(a, live=True)
     fakes = Fakes([submission(D1, HOSTILE), submission(D2, CANARY + ' stranger idea', STRANGER, 1)])
     new_card(fakes, {D1: ('group-names', BRIEF), D2: ('stranger-idea', BRIEF)})
-    created = creates(fakes, {'id': 'ws-00001', 'name': 'x'})
+    created = creates(fakes, {'id': 'thr_000001', 'name': 'x'})
     # No template: nothing starts, and the next tick takes the cluster from the ledger.
     assert run_tick(loop, fakes)[0] == 0 and created() == []
     assert triage.load(a / 'plan.json', {})['cards'] == {'*': 'no card brief template'}
@@ -1255,23 +1387,29 @@ def test_a_new_owner_agent_cluster_gets_one_card_worker_whose_prompt_and_project
     assert code == 0 and 'card workers 1' in line and len(created()) == 1
     argv, name, key = created()[0], card_name('new:group-names'), autoloop.opaque('new:group-names')
     projection = a / 'projections' / f'{name}.json'
-    assert argv[argv.index('--name') + 1] == name and argv[argv.index('--agent') + 1] == autoloop.PRESET
-    assert argv[argv.index('--project') + 1] == autoloop.PROJECT_ID
-    assert argv[argv.index('--prompt') + 1] == (
-        f"Read and follow {autoloop.BRIEFS / 'common.md'} and {template}. Intent: {name}. Cluster: {key}. "
-        f"Feedback: {D1}. Projection: {projection}.")
+    assert argv[argv.index('--title') + 1] == name and argv[argv.index('--provider') + 1] == 'claude-code'
+    assert argv[argv.index('--project') + 1] == autoloop.PROJECT == 'proj_nfixav7q2f'
+    assert argv[argv.index('--parent-thread') + 1] == ORCH and argv[argv.index('--prompt-file') + 1] == '-'
+    assert argv[argv.index('--model') + 1] == 'claude-sonnet-5-5' and argv[argv.index('--reasoning-level') + 1] == 'high'
+    assert argv[argv.index('--parent-notifications') + 1] == 'stuck'
+    assert argv[argv.index('--new-environment') + 1] == 'worktree' and argv[argv.index('--base-branch') + 1] == 'main'
+    assert '--prompt' not in argv and fakes.stdins[-1] == (argv, (
+        f"Read and follow {autoloop.BRIEFS / 'common.md'}, then {autoloop.BB_OVERLAY} (it wins on conflict), then "
+        f"{template}. Your orchestrator is bb thread {ORCH}. Intent: {name}. Cluster: {key}. "
+        f"Feedback: {D1}. Projection: {projection}."))
     assert json.loads(projection.read_text()) == {
         'intent': name, 'cluster': key, 'branch': f'proposal/{name}', 'ref': None, 'feedback': [D1],
         'principals': [OWNER], 'classifications': {D1: 'reported-bug'}, 'briefs': {D1: BRIEF}}
     assert stat.S_IMODE(projection.stat().st_mode) == 0o600
     # The stranger's cluster is report-only; no command or file of the loop carries feedback text.
     assert triage.load(a / 'plan.json', {})['cards'] == {'new:group-names': name}
-    assert not any(CANARY in ' '.join(c[1]) or 'ssh' in ' '.join(c[1]) for c in fakes.calls if c[0] == 'superset')
+    assert not any(CANARY in ' '.join(c[1]) or 'ssh' in ' '.join(c[1]) for c in fakes.calls if c[0] == 'bb')
+    assert not any(CANARY in stdin for _, stdin in fakes.stdins)
     assert not any(CANARY in p.read_text() for p in a.rglob('*.json')) and CANARY not in str(capsys.readouterr())
     started = autoloop.intents(a)[name]
-    assert (started['status'], started['workspace'], started['cluster']) == ('started', 'ws-00001', 'new:group-names')
+    assert (started['status'], started['workspace'], started['cluster']) == ('started', 'thr_000001', 'new:group-names')
     # A running worker is never started twice.
-    fakes.workspaces = [{'name': name, 'id': 'ws-00001', 'projectName': 'deedkit'}]
+    fakes.workspaces = [{'name': name, 'id': 'thr_000001', 'projectName': 'deedkit'}]
     run_tick(loop, fakes, now=NOW + timedelta(hours=1))
     assert len(created()) == 1 and triage.load(a / 'plan.json', {})['cards'] == {}
     # The card it bound follows the cluster: an interrupted worker's relaunch keeps the branch and the card, and
@@ -1295,7 +1433,7 @@ def test_a_hold_on_the_bound_card_spares_the_relaunch_and_cancels_the_ready_merg
     configure(a, live=True)
     fakes = Fakes([submission(D1, 'groups lose names')])
     new_card(fakes, {D1: ('group-names', BRIEF)})
-    created = creates(fakes, {'id': 'ws-00001'})
+    created = creates(fakes, {'id': 'thr_000001'})
     run_tick(loop, fakes)
     name = card_name('new:group-names')
     assert autoloop.main(['bind', name, '--card', 'ANYM-77', '--state', str(a)]) == 0
@@ -1308,7 +1446,7 @@ def test_a_hold_on_the_bound_card_spares_the_relaunch_and_cancels_the_ready_merg
     run_tick(loop, fakes, now=NOW + timedelta(hours=2))
     assert len(created()) == 2 and autoloop.intents(a)[f'{name}-r1']['branch'] == f'proposal/{name}'
     # The relaunch dispatched a ready merge of the first branch; a hold now cancels it.
-    fakes.workspaces = [{'name': f'{name}-r1', 'id': 'ws-00001', 'projectName': 'deedkit'}]
+    fakes.workspaces = [{'name': f'{name}-r1', 'id': 'thr_000001', 'projectName': 'deedkit'}]
     fakes.runs = [{'databaseId': 9, 'status': 'in_progress', 'conclusion': None, 'updatedAt': '2026-10-26T14:01:00Z',
                    'displayTitle': f'Tiden sync ready merge proposal/{name}'}]
     autoloop.hold(a, 'ANYM-77', 'orchestrator', NOW)
@@ -1326,7 +1464,7 @@ def test_a_brief_that_copies_feedback_is_never_released_and_no_slug_reaches_a_na
     fakes = Fakes([submission(D1, copied), submission(D2, HOSTILE, OWNER, 1)])
     new_card(fakes, {D1: ('group-names', 'Call Ivan Petrov when groups lose their names.'),
                      D2: (CANARY, 'Receipts stop after 12 renames, build 2026-10, phone +7 916 123-45-67.')})
-    created = creates(fakes, {'id': 'ws-00001'})
+    created = creates(fakes, {'id': 'thr_000001'})
     run_tick(loop, fakes)
     released = 'Receipts stop after # renames, build #, phone #.'
     assert triage.load(a / 'briefs.json', {}) == {D2: {'new_card': CANARY, 'card_brief': released,
@@ -1339,7 +1477,7 @@ def test_a_brief_that_copies_feedback_is_never_released_and_no_slug_reaches_a_na
 
 # spec: ANYM-571
 @pytest.mark.parametrize('reply', [{'error': 'timeout'}, {'id': ''}, {'id': '   '}, {'workspace': {'id': 'ws 00001'}},
-                                   ['ws-00001'], {'id': 12345678}])
+                                   ['thr_000001'], {'id': 12345678}])
 def test_a_create_reply_without_a_workspace_id_leaves_the_intent_unknown_and_the_name_settles_it(loop, template, reply):
     t, a, s = loop
     template.parent.mkdir()
@@ -1353,9 +1491,95 @@ def test_a_create_reply_without_a_workspace_id_leaves_the_intent_unknown_and_the
     assert triage.load(a / 'plan.json', {})['cards'] == {'new:group-names': 'start unknown'}
     assert autoloop.intents(a)[name]['status'] == 'unknown'
     fakes.submissions = []
-    fakes.workspaces = [{'name': name, 'id': 'ws-00009', 'projectName': 'deedkit', 'createdAt': '2026-10-26T12:00:20Z'}]
+    fakes.workspaces = [{'name': name, 'id': 'thr_000009', 'projectName': 'deedkit', 'createdAt': '2026-10-26T12:00:20Z'}]
     run_tick(loop, fakes, now=NOW + timedelta(hours=1))
-    assert len(created()) == 1 and autoloop.intents(a)[name]['workspace'] == 'ws-00009'
+    assert len(created()) == 1 and autoloop.intents(a)[name]['workspace'] == 'thr_000009'
+
+
+# spec: ANYM-568
+def test_a_launch_without_an_orchestrator_thread_starts_nothing_and_says_why(tmp_path, template, build_template):
+    t, a = tmp_path / 'triage', tmp_path / 'autoloop'
+    a.mkdir(mode=0o700)
+    template.write_text('brief\n')
+    carded(t, a)
+    fakes = Fakes()
+    created = creates(fakes, {'id': 'thr_000009'})
+    bare = dict(cfg(), orchestrator_thread=None)
+    assert autoloop.launch_cards(a, t, bare, NOW, fakes.bb) == {'*': autoloop.NO_ORCHESTRATOR}
+    assert autoloop.launch_builds(a, t, bare, snap(ready(30)), NOW, fakes.bb, fakes.gh) == {'*': autoloop.NO_ORCHESTRATOR}
+    assert created() == [] and not any(c[1][:2] == ['terminal', 'create'] for c in fakes.calls)
+
+
+def scripted(creates_fail, listed=False):
+    """A bb whose `terminal create` fails as many times as `creates_fail` says (then works) and whose terminal list
+    holds the build terminal or not; it records every call."""
+    calls, outcomes = [], list(creates_fail)
+
+    def bb(argv, stdin=None):
+        calls.append(argv)
+        if argv[:2] == ['thread', 'spawn']:
+            return {'id': 'thr_000009'}
+        if argv[:2] == ['terminal', 'create']:
+            if outcomes.pop(0):
+                raise triage.Refused('bb failed')
+        if argv[:2] == ['terminal', 'list'] and listed:
+            return {'sessions': [{'id': autoloop.terminal_id(BUILD), 'status': 'running'}]}
+        return {'sessions': []} if argv[:2] == ['terminal', 'list'] else {}
+    return bb, calls
+
+
+def build_intent():
+    return {'name': BUILD, 'card': 'ANYM-30'}
+
+
+# spec: ANYM-568
+def test_a_build_terminal_that_failed_to_create_but_is_listed_is_not_created_again(monkeypatch):
+    monkeypatch.setattr(autoloop, 'TERMINAL_WAIT', 0)
+    bb, calls = scripted([True], listed=True)
+    assert autoloop.build_start(bb, cfg())(build_intent()) == 'thr_000009'
+    assert [c[:2] for c in calls] == [['thread', 'spawn'], ['terminal', 'create'], ['terminal', 'list']]
+
+
+# spec: ANYM-568
+def test_a_build_terminal_is_created_again_with_the_same_id_while_the_environment_is_not_ready(monkeypatch):
+    monkeypatch.setattr(autoloop, 'TERMINAL_WAIT', 0)
+    bb, calls = scripted([True, True, False])
+    assert autoloop.build_start(bb, cfg())(build_intent()) == 'thr_000009'
+    creating = [c for c in calls if c[:2] == ['terminal', 'create']]
+    assert len(creating) == 3 and creating[0] == creating[1] == creating[2]
+    assert creating[0][:6] == ['terminal', 'create', '--thread', 'thr_000009', '--id', autoloop.terminal_id(BUILD)]
+    assert not any(c[:2] == ['thread', 'archive'] for c in calls)
+
+
+# spec: ANYM-568
+def test_a_build_thread_whose_terminal_never_came_up_is_archived_and_the_start_is_refused(monkeypatch):
+    monkeypatch.setattr(autoloop, 'TERMINAL_WAIT', 0)
+    bb, calls = scripted([True] * autoloop.TERMINAL_TRIES)
+    with pytest.raises(autoloop.Refused, match='did not start'):
+        autoloop.build_start(bb, cfg())(build_intent())
+    assert sum(c[:2] == ['terminal', 'create'] for c in calls) == autoloop.TERMINAL_TRIES
+    assert calls[-1] == ['thread', 'archive', 'thr_000009']
+
+
+# spec: ANYM-568
+def test_the_driver_and_the_launcher_call_bb_never_superset():
+    for path in ('scripts/autoloop.py', 'deploy/autoloop-runner/launch.py'):
+        assert 'superset' not in (ROOT / path).read_text().lower(), path
+
+
+# spec: ANYM-568
+def test_the_documented_automation_scripts_parse_and_call_the_drivers_own_commands():
+    text = (ROOT / 'docs/operations/feedback-triage.md').read_text()
+    follow, tick = re.findall(r'```bash\n(#!/usr/bin/env bash\n.*?)```', text, re.S)
+    for script in (follow, tick):
+        subprocess.run(['bash', '-n'], input=script, text=True, check=True)
+    assert 'feedback_sync.py auto --apply' in follow
+    assert set(re.findall(r'\bal (\w+)\)', tick)) == {'fence', 'tick', 'status'}
+    choices = re.search(r'\{(tick,fence[^}]*)\}', subprocess.run(
+        [sys.executable, str(ROOT / 'scripts/autoloop.py'), '--help'], capture_output=True, text=True).stdout).group(1)
+    assert {'fence', 'tick', 'status'} <= set(choices.split(','))
+    creates_ = re.findall(r'bb automation create --project proj_nfixav7q2f --name (\S+)[^`]*?--interpreter bash', text, re.S)
+    assert creates_ == ['deedkit-feedback-follow', 'deedkit-autoloop']
 
 
 # spec: ANYM-571
@@ -1406,7 +1630,7 @@ def test_items_over_a_daily_cap_and_items_of_a_worker_the_stop_closed_get_their_
     configure(a, live=True, caps={'items_per_principal': 1, 'card_launches': 0})
     fakes = Fakes([submission(D1, 'groups lose names'), submission(D2, 'b', OWNER, 1)])
     new_card(fakes, {D1: ('group-names', BRIEF)})
-    created = creates(fakes, {'id': 'ws-00001'})
+    created = creates(fakes, {'id': 'thr_000001'})
     run_tick(loop, fakes)
     over = ('received', 'over daily cap, next run 2026-10-27')
     assert notes(t) == {D1: over, D2: over} and created() == []
@@ -1437,14 +1661,14 @@ def test_a_hold_on_the_card_only_a_relaunch_bound_cancels_the_ready_merge_of_the
     configure(a, live=True)
     fakes = Fakes([submission(D1, 'groups lose names')])
     new_card(fakes, {D1: ('group-names', BRIEF)})
-    created = creates(fakes, {'id': 'ws-00001'})
+    created = creates(fakes, {'id': 'thr_000001'})
     run_tick(loop, fakes)
     name = card_name('new:group-names')
     fakes.submissions = []
     run_tick(loop, fakes, now=NOW + timedelta(hours=1))  # the first worker is gone unbound: one relaunch
     assert len(created()) == 2 and not autoloop.intents(a)[name].get('ref')
     assert autoloop.main(['bind', f'{name}-r1', '--card', 'ANYM-77', '--state', str(a)]) == 0
-    fakes.workspaces = [{'name': f'{name}-r1', 'id': 'ws-00001', 'projectName': 'deedkit'}]
+    fakes.workspaces = [{'name': f'{name}-r1', 'id': 'thr_000001', 'projectName': 'deedkit'}]
     fakes.runs = [{'databaseId': 9, 'status': 'in_progress', 'conclusion': None, 'updatedAt': '2026-10-26T13:01:00Z',
                    'displayTitle': f'Tiden sync ready merge proposal/{name}'}]
     autoloop.hold(a, 'ANYM-77', 'orchestrator', NOW)
@@ -1679,22 +1903,26 @@ def test_a_ready_card_from_an_owner_agent_card_worker_gets_one_build_worker_whos
             return tiden_reply([ready(34)])
         return real_tiden(*argv)
     fakes.tiden = tiden
-    created = creates(fakes, {'id': 'ws-00009'})
+    created = creates(fakes, {'id': 'thr_000009'})
     code, line = run_tick(loop, fakes)
     assert code == 0, line
     assert len(created()) == 1
     argv = created()[0]
-    assert argv[argv.index('--name') + 1] == BUILD and argv[argv.index('--branch') + 1] == BUILD
-    # ANYM-574: the build runs in the container runner; the launcher gets the intent and the card only.
-    assert '--agent' not in argv and '--prompt' not in argv
-    assert argv[argv.index('--command') + 1] == f'{sys.executable} {autoloop.LAUNCHER} build {BUILD} ANYM-30'
+    assert argv[argv.index('--title') + 1] == BUILD and argv[argv.index('--model') + 1] == 'claude-haiku-5-5'
+    # ANYM-574: the build runs in the container runner; the launcher gets the intent and the card only, in a terminal
+    # of the thread that hosts it.
+    assert BUILD in fakes.stdins[-1][1] and 'ANYM-30' not in fakes.stdins[-1][1]
+    (terminal,) = [c[1] for c in fakes.calls if c[1][:2] == ['terminal', 'create']]
+    assert terminal[terminal.index('--thread') + 1] == 'thr_000009' and terminal[terminal.index('--id') + 1] == \
+        autoloop.terminal_id(BUILD)
+    assert terminal[terminal.index('--command') + 1] == f'{sys.executable} {autoloop.LAUNCHER} build {BUILD} ANYM-30'
     built = autoloop.intents(a)[BUILD]
     assert (built['status'], built['lane'], built['paths']) == (
         'started', 'messaging', ['services/messaging/groups.py', 'tests/test_groups.py'])
     assert triage.load(a / 'plan.json', {})['builds']['launched'] == {
         'ANYM-30': BUILD, 'ANYM-31': 'epic or over 8 SP', 'ANYM-32': 'category', 'ANYM-34': 'criterion edit'}
     # A running build is never started twice.
-    fakes.workspaces = [{'name': BUILD, 'id': 'ws-00009', 'projectName': 'deedkit'}]
+    fakes.workspaces = [{'name': BUILD, 'id': 'thr_000009', 'projectName': 'deedkit'}]
     run_tick(loop, fakes, now=NOW + timedelta(minutes=5))
     assert len(created()) == 1
 
@@ -1707,15 +1935,15 @@ def test_an_open_pr_or_a_pushed_branch_of_a_live_workspace_on_the_same_path_bloc
     carded(t, a)
     fakes = Fakes(open_prs=[{'number': 5, 'id': 'PR_5', 'headRefName': 'someone-else'}])
     fakes.pr_files = {'someone-else': ['services/messaging/groups.py']}
-    created = creates(fakes, {'id': 'ws-00009'})
+    created = creates(fakes, {'id': 'thr_000009'})
     tiden = snap(ready(30))
 
     def run():
-        return autoloop.launch_builds(a, t, cfg(), tiden, NOW, fakes.superset, fakes.gh)
+        return autoloop.launch_builds(a, t, cfg(), tiden, NOW, fakes.bb, fakes.gh)
     assert run() == {'ANYM-30': 'paths reserved'} and created() == []
     fakes.pr_files = {'someone-else': ['services/calls/app.py']}
-    fakes.workspaces = [{'name': 'other-task', 'id': 'ws-00002', 'branch': 'other-task', 'projectName': 'deedkit'},
-                        {'name': 'archived', 'id': 'ws-00003', 'branch': 'old', 'archivedAt': 'x',
+    fakes.workspaces = [{'name': 'other-task', 'id': 'thr_000002', 'branch': 'other-task', 'projectName': 'deedkit'},
+                        {'name': 'archived', 'id': 'thr_000003', 'branch': 'old', 'archivedAt': 'x',
                          'projectName': 'deedkit'}]
     fakes.branches = ['other-task', 'old']
     fakes.compares = {'other-task': [changed_file('services/messaging/groups.py', 'modified')],
@@ -2219,7 +2447,7 @@ def test_after_deploy_nothing_is_enabled_and_a_paused_autodeploy_is_reported_not
     assert f"{BUILD}: слит {'d' * 12}, автодеплой на паузе — снимает владелец" in \
         autoloop.report(a, t, NOW).read_text()
     mutations = [c for c in fakes.calls if c[0] == 'gh' and c[1][0] in ('pr', 'run')] + \
-        [c for c in fakes.calls if c[0] == 'superset' and c[1][:2] != ['workspaces', 'list']] + \
+        [c for c in fakes.calls if c[0] == 'bb' and c[1][:2] not in (['thread', 'list'], ['terminal', 'list'])] + \
         [c for c in fakes.calls if c[0] == 'ssh' and c[1][:2] not in (['docker', 'inspect'], ['docker', 'run'])]
     assert mutations == []  # no pause removal, no opt-in, grant or other enablement
     monkeypatch.setattr(autoloop.receipt_watch.Watch, 'verdict', lambda self, snapshot: ('LIVE', 'x'))

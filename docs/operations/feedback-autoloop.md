@@ -5,6 +5,12 @@ triage, card, build, merge queue, autodeploy and status back on the feedback ite
 document is the loop's boundary (AGENTS.md section 2, Override of harness tiden.md Card intake
 step 1, owner 10-26). Changing it is an OWNER change.
 
+Runtime (owner 11-12, on moving DeedKit to bb on egor-ryzen: «цикл наверное здесь по-другому, как-то можно
+организовать другим способом ... поискать способ закрыть этот же джобс то би дан только функционалами которые
+есть бб»; «можешь запускать, настраивать все»): the loop's workers and its schedule use the `bb` CLI, no longer
+Superset or launchd. The boundary, envelope, caps and undo below are unchanged; only what starts and lists a
+worker, and what runs the hourly job, moved (a worker is a bb thread, the job a bb script automation).
+
 The driver is `scripts/autoloop.py` (ANYM-569 tick, ANYM-570 reader, ANYM-571 card launcher,
 ANYM-572 build launcher and controller merge, ANYM-573 status and report); feedback statuses move
 through `scripts/feedback_sync.py` (ANYM-536).
@@ -95,18 +101,24 @@ add. Autodeploy classifies the release again before it migrates.
 Config defaults (owner-set): 20 items per principal per day into triage; 24 reader runs a day;
 5 card and 3 build launches a day; 2 card and 2 build workers in flight; 12 worker hours a day
 (card 2 h, build 4 h each, reserved before the start); one relaunch per card. An interrupted or unknown run keeps its reservation; an
-unknown launch is reconciled from `superset workspaces list` by its stable name, never retried. A
+unknown launch is reconciled from `bb thread list` by its stable title, never retried. A
 build reserves its card's lane and expected paths and waits while another live intent, an open PR
-or a pushed branch of a live workspace touches them (details: ANYM-569, ANYM-572).
+or a pushed branch of a live thread touches them (details: ANYM-569, ANYM-572).
 
 ## Card worker (ANYM-571)
 
 With `live: true`, the tick gives each new owner-agent cluster that has a released card brief one
-card worker within the caps. The worker is a local Superset workspace `autoloop-card-c<hash>` with
-the worker preset. Names, branches and prompts use an opaque key (a hash of the cluster), so no
-word of the reader's slug reaches them. The prompt names `~/deedkit-orchestrator/briefs/autoloop-card.md`
-(the template, outside Git), common.md, the intent, the opaque key, the feedback IDs and the
-projection path. The projection (`projections/<intent>.json`, 0600) holds the proposal branch, the
+card worker within the caps. The worker is a bb thread titled `autoloop-card-c<hash>` (project
+`proj_nfixav7q2f`, Claude Code, claude-sonnet-5-5, effort high, a fresh worktree of `main`), a child of
+the orchestrator thread named by `orchestrator_thread` in `config.json`, started with
+`bb thread spawn --parent-thread <orchestrator> --new-environment worktree --base-branch main --title
+<intent> --parent-notifications stuck --prompt-file -` (the prompt on stdin). `stuck` wakes the
+orchestrator for a failure or a question, not for each finished worker (the day's report lists the
+rest). The worker's permission mode follows its parent's. Names, titles and prompts use an opaque key
+(a hash of the cluster), so no word of the reader's slug reaches them. The prompt names
+`~/deedkit-orchestrator/briefs/common.md`, then `bb-overlay.md` (it wins on conflict), then
+`autoloop-card.md` (the template, outside Git), the orchestrator thread, the intent, the opaque key,
+the feedback IDs and the projection path. The projection (`projections/<intent>.json`, 0600) holds the proposal branch, the
 bound card, IDs, principal labels, classifications and the released briefs. No feedback text is in
 it, and none is in the command. With no template, nothing starts.
 
@@ -172,7 +184,7 @@ hold).
 
 **Order.** When there are build intents or `live: true`, each tick runs the build stage before the
 card launches: post-merge audit, controller, new launches (live only), deploy read. When the
-audit pauses the loop, the rest of the stage is skipped. A failed GitHub or Superset read ends the
+audit pauses the loop, the rest of the stage is skipped. A failed GitHub or bb read ends the
 tick with exit 1 and no heartbeat (so `status` reports it) and does not stop the card stage; a
 failed receipt probe reads as deploy `unknown`.
 
@@ -184,13 +196,18 @@ a `Ready:` line, a defect, improvement or feature, at most 8 SP, no epic, no ope
 that lists it, and `Expected paths`, its test files included. A card outside waits with its reason
 in `plan.json`. The launch reserves the card's `Lane` and `Expected paths` and waits while another
 live build has the same lane or an overlapping path, while any open PR (any author) changes an
-overlapping file (both names of a rename), or while the pushed branch of a live Superset workspace
-does. The reservation ends with the intent: PR merged or closed, card declined, held or dropped,
+overlapping file (both names of a rename), or while the pushed branch of a live thread of the
+project (the branch of its environment, `bb thread list --project`) does. The reservation ends with the intent: PR merged or closed, card declined, held or dropped,
 or the worker gone (a lost or interrupted one with no PR is parked "worker gone with no PR").
 Unpushed local work of other workers is invisible here.
 
-**The worker.** A Superset workspace `autoloop-build-anym-<n>` whose terminal runs the container
-runner's launcher with the intent and the card ID (below); the worker's prompt names copies of
+**The worker.** A bb thread titled `autoloop-build-anym-<n>` that only hosts a terminal: its fixed
+prompt (Claude Haiku, no command, no feedback) says so, and `bb terminal create --thread <id> --id
+<term_…> --command '<python> deploy/autoloop-runner/launch.py build <intent> <card>'` starts the container
+runner's launcher with the intent and the card ID (below). The terminal's ID is a hash of the intent name,
+so a second create fails on bb's side instead of running the launcher twice; a try that fails is settled
+by reading the thread's terminals (a few tries while the new environment is not ready), and a thread
+whose terminal never came up is archived and the start stays `unknown`. The worker's prompt names copies of
 `~/deedkit-orchestrator/briefs/autoloop-build.md` (outside Git) and common.md, the intent and the
 card ID, nothing else (no brief template, no start). It builds as the harness says, with no review
 (owner 11-11). The PR carries `Autoloop: <intent>`, `Spec: ANYM-n` and `Change path: AUTO…` lines.
@@ -322,7 +339,7 @@ words. Undo: set `live` back to false, or `PAUSE`.
 
 | Stage | Undo |
 |---|---|
-| Whole loop | `touch ~/.deedkit/autoloop/PAUSE`; `superset automations pause deedkit-autoloop` |
+| Whole loop | `touch ~/.deedkit/autoloop/PAUSE`; `bb automation pause <id> --project proj_nfixav7q2f` for `deedkit-autoloop` (feedback-triage.md, bb automations) |
 | Triage disposition | the triage state (docs/operations/feedback-triage.md); the item status follows its card |
 | Card written or Ready | `autoloop.py hold ANYM-n`; moving or deleting the card is the owner's |
 | Build or open PR | `autoloop.py hold ANYM-n`; `gh pr close <n>` |
@@ -361,9 +378,10 @@ is one line.
 ## Known residual (owner-accepted 10-26)
 
 Card workers, and build workers until ANYM-574 (container runner), use the owner's gh, Tiden,
-Superset and SSH logins, so a steered worker can do what those logins allow. Since ANYM-574 a
-build worker runs in the container runner: no SSH, no route to the production host, no Superset
-login. It still holds the owner's gh and Tiden tokens, so it can do what those allow (a merge
+bb and SSH logins, so a steered worker can do what those logins allow (a card worker is a bb thread
+with its parent's permission mode; `bb-overlay.md` tells it to call no `mcp__claude_ai_*` tool, and that
+instruction is the only barrier now that the Superset worker preset's empty MCP config is gone). Since ANYM-574 a
+build worker runs in the container runner: no SSH, no route to the production host, no bb login. It still holds the owner's gh and Tiden tokens, so it can do what those allow (a merge
 outside the controller included). Brief rules, the gate and the post-merge audit (a merged loop PR
 whose head the controller did not approve pauses the loop) detect this; they do not prevent it.
 
