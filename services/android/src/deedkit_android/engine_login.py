@@ -14,6 +14,7 @@ import struct
 import subprocess
 import sys
 import termios
+import tty
 
 from . import engines
 
@@ -31,7 +32,10 @@ def run_with_terminal(argv, env):
     os.close(slave)
     seen, tail, forward = b'', b'', sys.stdin.isatty()
     token = None
+    saved = termios.tcgetattr(sys.stdin.fileno()) if forward else None
     try:
+        if forward:
+            tty.setraw(sys.stdin.fileno())  # the engine's TUI reads raw bytes: Enter is \r, a paste arrives whole
         while True:
             watch = [master] + ([sys.stdin.fileno()] if forward else [])
             ready, _, _ = select.select(watch, [], [], 0.5)
@@ -62,6 +66,8 @@ def run_with_terminal(argv, env):
             sys.stdout.buffer.write(TOKEN.sub(b'[token hidden]', tail))
             sys.stdout.buffer.flush()
     finally:
+        if saved is not None:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, saved)
         os.close(master)
     return process.wait(), token
 

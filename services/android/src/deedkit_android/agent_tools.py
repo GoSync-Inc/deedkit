@@ -141,6 +141,14 @@ class RunFlowArgs(Strict):
     params: dict[str, str | int | bool] = Field(default_factory=dict, max_length=20)
 
 
+class FlowEmptyArgs(Strict):
+    pass
+
+
+class FlowEditArgs(Strict):
+    yaml: str = Field(min_length=1, max_length=32768)
+
+
 class FinishArgs(Strict):
     summary: str = Field(min_length=1, max_length=2000)
     data: dict[str, object] = Field(default_factory=dict)
@@ -148,7 +156,7 @@ class FinishArgs(Strict):
 
 MODELS = {'screen': ScreenArgs, 'tap': TapArgs, 'type': TypeArgs, 'key': KeyArgs, 'swipe': SwipeArgs, 'wait': WaitArgs,
           'read_text': ReadTextArgs, 'read_list': ReadListArgs, 'open_app': OpenAppArgs, 'run_flow': RunFlowArgs,
-          'finish': FinishArgs}
+          'flow_get': FlowEmptyArgs, 'flow_edit': FlowEditArgs, 'flow_test': FlowEmptyArgs, 'finish': FinishArgs}
 assert set(MODELS) == set(TOOLS)
 
 

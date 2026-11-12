@@ -102,7 +102,8 @@ else:
     emit(type='turn.completed', usage={{'input_tokens': 1000, 'cached_input_tokens': 600, 'cache_write_input_tokens': 0,
          'output_tokens': 50}})
 '''
-TOOLS = ['screen', 'tap', 'type', 'key', 'swipe', 'wait', 'read_text', 'read_list', 'open_app', 'run_flow', 'finish']
+TOOLS = ['screen', 'tap', 'type', 'key', 'swipe', 'wait', 'read_text', 'read_list', 'open_app', 'run_flow', 'flow_get', 'flow_edit',
+         'flow_test', 'finish']
 
 
 def fake_engine(tmp_path, name, steps, **plan):
@@ -132,6 +133,8 @@ class FakePhone:
         self.commands, self.options, self.field, self.stop, self.slow = [], [], '', None, {}
         self.nodes = [('Add to cart', f'{PACKAGE}:id/add', 100, 300), ('Total €12.50', f'{PACKAGE}:id/total', 100, 600)]
         self.package = PACKAGE
+        self.counts, self.fail_from, self.fail_calls, self.stop_nth = {}, {}, {}, {}  # per command: fail from the nth call on, fail
+        # the listed calls, guard-stop the nth
 
     async def call(self, device, command, **options):
         self.commands.append(command)
@@ -141,6 +144,14 @@ class FakePhone:
         if command == '__hierarchy__':
             return {'xml': screen_xml(self.package, self.field, self.nodes)}
         name = next(iter(command))
+        self.counts[name] = self.counts.get(name, 0) + 1
+        if self.counts[name] in self.fail_calls.get(name, ()) or (name in self.fail_from and self.counts[name] >= self.fail_from[name]):
+            raise Refused('element_not_found')
+        if self.stop_nth.get(name) == self.counts[name]:
+            error = Refused('guard_stopped')
+            error.guard = {'rule': 'tap_phrase', 'matched': 'pay now', 'when': 'before', 'package': self.package,
+                           'sensitive': False}
+            raise error
         if self.stop and name in self.stop:
             error = Refused('guard_stopped')
             error.guard = {'rule': 'tap_phrase', 'matched': self.stop[name], 'when': 'before', 'package': self.package,
@@ -154,7 +165,8 @@ class FakePhone:
                 typed = options['secrets'][typed[9:-1]]['value']
             self.field += typed
         if name == 'copyTextFrom':
-            return {'text': self.field}
+            key = (command['copyTextFrom'] or {}).get('key') if isinstance(command['copyTextFrom'], dict) else None
+            return {'text': self.field, **({'key': key} if key else {})}
         if name == 'extendedWaitUntil':
             return {'matched': True}
         return {'success': True}

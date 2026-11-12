@@ -1,12 +1,17 @@
 """`deedkit-android engine login claude|codex`: the owner's one login step per engine (ANYM-972 criterion 4)."""
 
 import os
+import pty
 import stat
 import sys
+import termios
+import threading
+import time
 import uuid
 
 from agent_harness import write_config
 from deedkit_android.config import Configuration
+from deedkit_android.engine_login import run_with_terminal
 from deedkit_android.engine_probe import engine_main
 
 CLAUDE = '''#!{python}
@@ -85,3 +90,31 @@ def test_login_needs_the_engine_and_its_login_path_in_the_config(tmp_path, capfd
     config = write_config(tmp_path)  # no engines configured
     assert engine_main(['login', 'claude', '--config', str(config)]) == 2
     assert 'engine_not_configured' in capfd.readouterr().err
+
+
+# spec: ANYM-972
+def test_the_local_terminal_is_raw_while_the_login_runs_so_enter_and_a_paste_reach_the_tui_unchanged(tmp_path, capfd, monkeypatch):
+    """Claude's setup-token TUI reads raw bytes: a cooked local terminal turned Enter into \\n and the paste never landed."""
+    reader = '#!{python}\nimport os, sys, tty\ntty.setraw(0)\nprint("READY", flush=True)\nprint("GOT " + repr(os.read(0, 7)), flush=True)\n'
+    path = tmp_path / 'reader'
+    path.write_text(reader.format(python=sys.executable))
+    path.chmod(0o755)
+    local, slave = pty.openpty()  # the owner's terminal: our stdin
+    before = termios.tcgetattr(slave)
+    monkeypatch.setattr(sys, 'stdin', os.fdopen(slave, 'rb', buffering=0, closefd=False))
+
+    def type_later():
+        time.sleep(1.5)
+        os.write(local, b'pasted\r')
+
+    typing = threading.Thread(target=type_later)
+    typing.start()
+    code, _ = run_with_terminal([str(path)], dict(os.environ))
+    typing.join()
+    assert code == 0
+    assert "GOT b'pasted\\r'" in capfd.readouterr().out  # Enter stays \r: no ICRNL, no echo, no line buffering
+    after = termios.tcgetattr(slave)
+    pending = getattr(termios, 'PENDIN', 0)  # the kernel sets it by itself after a mode change
+    assert [after[0], after[1], after[2], after[3] & ~pending] == [before[0], before[1], before[2], before[3] & ~pending]
+    assert after[3] & termios.ICANON and after[3] & termios.ECHO  # the owner's terminal is cooked again afterwards
+    os.close(local), os.close(slave)

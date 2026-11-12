@@ -311,6 +311,15 @@ engine's provider (Anthropic for Claude Code, OpenAI for Codex), which is the ow
 - **Foreground gate.** After each action the run checks the foreground app: one of the run's `apps` or a neutral system
   surface (launchers, system UI, permission prompts, keyboards) passes; any other ends the run `stopped_by_guard` with rule
   `foreign_app`.
+- **Saving a run as a scenario (ANYM-973).** `start` accepts `save_as` (a flow name) and `param_names` (names from `params`
+  that become `${NAME}`). On `finish` the service compiles the action log into scenario commands (`open_app` to `launchApp`;
+  each tap by the selector the agent used, with an element wait before it; a point tap by the resolved node's resource-id or
+  exact text when that names one node, else `unstable_point_tap`; typed parameter values to `${NAME}`; secrets stay
+  references; a `read_text` by selector that carries a declared output to a keyed `copyTextFrom`), writes it as the calling
+  principal's draft and test-runs that version in the run's session under the guard. A failing test goes back to the engine
+  (`flow_get`, `flow_edit`, `flow_test`, at most 3 repairs); only a succeeded test of that exact version publishes, through the
+  library's own gate. A test stopped by the guard ends the run `stopped_by_guard` and never publishes. The result carries
+  `scenario {name, version, published, test_request_id, repairs, error}`; a saving failure never changes the run's state.
 - **Stops.** The guard stops a run before pay, order, confirm, send or a PIN screen (`stopped_by_guard`, with its record
   and the stop screen). Other ends: `succeeded` (the engine called `finish`), `timed_out` (SIGTERM to the process group,
   SIGKILL after 5 s), `action_cap`, `failed` (the engine exited without `finish`; `exit_code`), `stopped` and `lost` (the

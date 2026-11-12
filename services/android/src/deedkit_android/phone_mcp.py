@@ -71,6 +71,15 @@ TOOLS = {
                                  'yaml': {'type': 'string', 'maxLength': 32768},
                                  'params': {'type': 'object', 'additionalProperties': {'type': ['string', 'integer',
                                                                                               'boolean']}}}}),
+    'flow_get': ('Only in a run that asked to save a scenario: read the draft scenario (YAML) and its version.',
+                 {'type': 'object', 'additionalProperties': False, 'properties': {}}),
+    'flow_edit': ('Only in a run that asked to save a scenario, after a failed test: replace the draft with corrected '
+                  'YAML (a list of commands; at most 3 repairs). Never edit anything but the draft.',
+                  {'type': 'object', 'additionalProperties': False, 'required': ['yaml'],
+                   'properties': {'yaml': {'type': 'string', 'maxLength': 32768}}}),
+    'flow_test': ("Only in a run that asked to save a scenario: run the draft once on the phone with this run's parameters, "
+                  'under the guard. A passing test publishes the scenario. A failing test returns the failing step.',
+                  {'type': 'object', 'additionalProperties': False, 'properties': {}}),
     'finish': ('End the run. summary says what was done and what the final screen shows; data fills the declared outputs '
                'by name. Call it when the goal is done, when it cannot be done, and on any pay, order, confirm or send '
                'screen.',
