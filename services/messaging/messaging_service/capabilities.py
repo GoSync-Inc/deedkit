@@ -112,7 +112,10 @@ def capabilities(self, token, detail='full', sections=None):
             features['subscription-write']=['create_subscription','update_subscription','configure_subscription_delivery','test_subscription']
             from .delivery_endpoints import TOOLS as delivery_tools
             features['delivery-write']=list(delivery_tools)
-        elif 'feedback-maintainer-read' in p['permissions']:
+        # ANYM-992: the guarded status write is named only to a holder of its permission, with `read` or without it.
+        if 'feedback-maintainer-write' in p['permissions']:
+            features['feedback-maintainer-write']=['set_feedback_triage']
+        if 'read' not in p['permissions'] and 'feedback-maintainer-read' in p['permissions']:
             # ANYM-989: a maintainer key without `read` (the bridge key) is named its own tools only: the metadata read and the
             # subscription calls of a maintainer-only definition (the bodies refuse any other definition).
             features['feedback-maintainer-read']=['export_feedback_metadata','list_subscriptions','get_subscription',

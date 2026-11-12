@@ -101,6 +101,7 @@ export type ToolName =
   | 'messages_search_people'
   | 'messages_send'
   | 'messages_send_message'
+  | 'messages_set_feedback_triage'
   | 'messages_snooze_reply'
   | 'messages_submit_feedback'
   | 'messages_test_delivery_endpoint'

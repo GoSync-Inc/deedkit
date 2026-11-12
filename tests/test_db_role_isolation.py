@@ -723,7 +723,7 @@ def test_upgrade_and_rollback_keep_feed_order_and_cursors(schema36_store, monkey
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '95'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '96'
         assert c.execute('SELECT * FROM archive_migrations WHERE version<=36 ORDER BY version').fetchall() == migrations
     assert feed_state(store) == before
     try:
@@ -1147,7 +1147,7 @@ def test_activity_grants_add_only_the_new_table_to_each_role(seeded, template, b
             'wake_target_subscriptions', 'negotiations', 'negotiation_sources', 'negotiation_times',
             'attachment_structure', 'structure_profiles', 'session_claims', 'poll_results', 'poll_voters',
             'poll_votes', 'telegram_polls', 'journal_contact_birthdays', 'module_links', 'feedback_projections',
-            'subscription_module_links', 'publish_feedback_received') and
+            'subscription_module_links', 'publish_feedback_received', 'set_feedback_triage') and
             grant[:3:2] != ('subscription_module_sources', 'INSERT')} - later == before  # 89: ANYM-919's EXECUTE
         assert {grant[2] for grant in after if grant[0] == 'subscription_activity' and grant[1] == ''} == added
         token = store.issue_key('activity-acl', ['telegram-demo'], permissions=['read', 'subscription-write'],

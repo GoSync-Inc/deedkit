@@ -159,3 +159,7 @@ GRANT SELECT ON feedback_projections TO messaging_gateway;
 -- reads the row's category itself and takes the module journal's counter lock; the API role has no other access to the
 -- module journal's writer. PUBLIC lost EXECUTE in the migration (and in the restore step of Store.migrate).
 GRANT EXECUTE ON FUNCTION public.publish_feedback_received(uuid) TO messaging_gateway;
+-- Schema 96 (ANYM-992): a maintainer key's status write goes through this definer function only (accepted, declined or
+-- duplicate; compare-and-set; idempotent by request ID; the status event in the same transaction); the API role still has no
+-- UPDATE of agent_feedback and no privilege on feedback_triage_requests. PUBLIC lost EXECUTE in the migration.
+GRANT EXECUTE ON FUNCTION public.set_feedback_triage(uuid,text,text,uuid,text,text,timestamptz,text,uuid,text) TO messaging_gateway;

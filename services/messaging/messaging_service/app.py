@@ -470,7 +470,7 @@ def register_tools(mcp, call, async_call):
     register_subscription_tools(mcp, call, async_call, read, upload_write)
     register_delivery_tools(mcp, call, async_call, read, upload_write)
     register_feedback_tools(mcp, call, read, upload_write)
-    register_feedback_maintainer_tools(mcp, call, read)
+    register_feedback_maintainer_tools(mcp, call, read, upload_write)
 
 
 def register_send_tools(mcp, call, async_call, read):
@@ -950,7 +950,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
                     'fetch_subscription_events','ack_subscription_events','wait_for_subscription_events','configure_subscription_delivery','test_subscription','submit_feedback','list_feedback',
                     'register_delivery_endpoint','list_delivery_endpoints','update_delivery_endpoint','delete_delivery_endpoint','test_delivery_endpoint',
                     'list_delivery_attempts','register_wake_target','list_wake_targets','update_wake_target',
-                    'delete_wake_target','confirm_wake_target','list_negotiations','export_feedback_metadata'}
+                    'delete_wake_target','confirm_wake_target','list_negotiations','export_feedback_metadata','set_feedback_triage'}
         method=request.path_params['operation']
         if method not in operations: raise APIError('not_found',404)
         try:

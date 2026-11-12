@@ -20,7 +20,8 @@ MODERATION_PERMISSIONS = frozenset(('groups-moderate',))
 STORY_PERMISSIONS = frozenset(('stories-post',))
 # ANYM-988: every principal's feedback metadata and the feedback loop's released summary (export_feedback_metadata); no
 # existing key ceiling inherits it, and an agent's own reports stay readable through `read` alone (list_feedback).
-MAINTAINER_PERMISSIONS = frozenset(('feedback-maintainer-read',))
+# ANYM-992: the guarded status write (set_feedback_triage: accepted, declined or duplicate) is a permission of its own.
+MAINTAINER_PERMISSIONS = frozenset(('feedback-maintainer-read', 'feedback-maintainer-write'))
 PERMISSIONS = (LEGACY_PERMISSIONS | MESSENGER_PERMISSIONS | SUBSCRIPTION_PERMISSIONS | UPLOAD_PERMISSIONS |
                DELIVERY_PERMISSIONS | BOT_PERMISSIONS | MODERATION_PERMISSIONS | STORY_PERMISSIONS |
                MAINTAINER_PERMISSIONS)
@@ -62,6 +63,8 @@ OPERATION_PERMISSIONS = {
     'list_negotiations':'read',
     # ANYM-988: every principal's feedback metadata with the loop's released summary, for a maintainer key only.
     'export_feedback_metadata':'feedback-maintainer-read',
+    # ANYM-992: the maintainer's guarded status write, for a key that holds the write permission only.
+    'set_feedback_triage':'feedback-maintainer-write',
 }
 # ANYM-989: the subscription reads a key that holds `feedback-maintainer-read` may make without `read` (the Ryzen bridge
 # key has no `read`). The operation permission is `read` or the maintainer one; each body then admits such a key to a
@@ -85,7 +88,7 @@ AUDIT_OPERATIONS = frozenset(OPERATION_PERMISSIONS) - {'resolve_target', 'messag
 AUDIT_CODES = frozenset({
     # ANYM-848: wake target refusals.
     'invalid_wake_target','wake_target_conflict','wake_target_limit','invalid_wake_target_state',
-    'subscription_already_bound',
+    'subscription_already_bound','version_conflict',  # ANYM-992: a lost compare-and-set of the maintainer's status write
     'unauthorized', 'forbidden', 'not_found', 'invalid_limit', 'invalid_query', 'mute_limit_reached',
     'invalid_utc_date', 'invalid_date_range', 'invalid_filter', 'invalid_consumer',
     'consumer_limit', 'invalid_version', 'invalid_receipt', 'stale_ack',

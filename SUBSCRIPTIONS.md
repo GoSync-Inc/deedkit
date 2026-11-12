@@ -646,6 +646,42 @@ section above. It is refused (`forbidden`) unless the key holds `feedback-mainta
   `event_id`, `type`, `occurred_at`, `feedback_id` and `status`; a `feedback.projection_recorded` reference has no
   `status`.
 
+### Maintainer feedback triage (ANYM-992, schema 96)
+
+A status change of a feedback item's task in BB reaches the reporting agent through `set_feedback_triage(feedback_id,
+status, expected_status, expected_changed_at, request_id, spec_ref?, duplicate_of?, note?)` (gateway tool
+`messages_set_feedback_triage`, REST `POST /v1/set_feedback_triage`), for a key that holds the permission
+`feedback-maintainer-write` (the owner issues it; no existing key inherits it; the key needs nothing else, `read` included;
+`capabilities` names the tool only to a holder).
+
+- Statuses: `accepted`, `declined` and `duplicate` only. `fixed` and `verify_requested` come from release evidence,
+  `verified` and `reopened` from the reporting agent (ANYM-344), `received` is where an item starts: each is
+  `invalid_feedback` with a field error on `status`, and nothing is written. The rules are `set-feedback-status`'s: `accepted`
+  needs `spec_ref` (`ANYM-<n>`, the card that plans the item), `duplicate` needs `duplicate_of` (another item of the same
+  reporting key, not itself) or `spec_ref`, `duplicate_of` is only for `duplicate`.
+- `note` (at most 280 characters, no control characters) is shown to the reporting agent in `list_feedback`, so URLs and file
+  paths are stripped from it before it is stored; a note that is blank after that is stored as none. The write replaces the
+  whole disposition (note, `spec_ref`, `duplicate_of`; `fixed_in` is cleared), as the operator's does.
+- Compare-and-set: `expected_status` and `expected_changed_at` are the item's `status` and `status_changed_at` as
+  `export_feedback_metadata` showed them (`null` for an item whose status never changed). Any other value is
+  `version_conflict` (HTTP 409) and nothing is written or recorded; so is an item in `fixed`, `verify_requested` or `verified`
+  (evidence-driven states are never overwritten, whatever the caller read). A caller that loses reads the item again and
+  follows the server.
+- Idempotent by `request_id` (8-128 characters, per key): the same ID and payload returns the stored answer with
+  `replayed: true`, whatever the item looks like now, and writes and publishes nothing; the same ID with another payload is
+  `idempotency_conflict` (409). An unknown item is `not_found`.
+- The reply: `feedback_id`, `status`, `status_changed_at`, `spec_ref`, `duplicate_of`, `replayed`. A changed status publishes
+  the status event of "Feedback status events" in the same transaction (scope the item's key, `previous_status`, `spec_ref`;
+  a status equal to the stored one, the new note alone, publishes none); an event that fails to publish is counted as
+  `subscription_journal_failed` with kind `feedback.status` and the write stays. The call audits as `set_feedback_triage` with
+  the feedback ID only.
+- The API role has no UPDATE on `agent_feedback`: the write is the definer function `public.set_feedback_triage` (schema 96;
+  EXECUTE for the API role only), which re-checks all of the above, so a direct call is no wider than the tool. Its request
+  record is the table `feedback_triage_requests` (key, request ID, payload hash and the answer's fields; no text).
+- The BB bridge (`scripts/feedback_bridge.py`, docs/operations/feedback-bridge.md) sends `accepted` with `spec_ref` from the
+  task's label `spec:ANYM-<n>`, else the primary card of the item's projection; with neither it writes nothing and leaves one
+  task comment that a card is needed.
+
 ## Schema 38: hint timing policy
 
 `configure_subscription_delivery(subscription_id, version, receiver_id, delivery_policy)`

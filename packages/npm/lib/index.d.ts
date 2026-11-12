@@ -387,4 +387,6 @@ export declare class AnyMsgClient {
   listFeedback(args?: {limit?:number}, options?: {signal?:AbortSignal}): Promise<Record<string,unknown>>;
   /** A maintainer key (feedback-maintainer-read): every agent's feedback metadata and the loop's released summary, oldest change first; never the description, references or notes. Pass the previous reply's next_cursor. */
   exportFeedbackMetadata(args?: {cursor?:string; limit?:number}, options?: {signal?:AbortSignal}): Promise<Record<string,unknown>>;
+  /** A maintainer key (feedback-maintainer-write): move one item to accepted (spec_ref ANYM-n required), declined or duplicate (duplicate_of, or spec_ref). Compare-and-set on the status and status_changed_at export_feedback_metadata showed (null if it never changed): a lost race is version_conflict and nothing is written. Idempotent by request_id; URLs and file paths are stripped from note. */
+  setFeedbackTriage(args: {feedback_id:string; status:'accepted'|'declined'|'duplicate'; expected_status:string; expected_changed_at:string|null; request_id:string; spec_ref?:string|null; duplicate_of?:string|null; note?:string|null}, options?: {signal?:AbortSignal}): Promise<Record<string,unknown>>;
 }

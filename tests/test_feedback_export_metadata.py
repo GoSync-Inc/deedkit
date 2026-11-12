@@ -103,7 +103,7 @@ def test_the_maintainer_permission_is_known_gates_the_read_and_is_never_inherite
     assert [row['outcome'] for row in audit_rows(store, 'export_feedback_metadata')].count('denied') == 3
     # The widened CHECKs still refuse any other word on a write.
     with pytest.raises(psycopg.errors.CheckViolation), store.pool.connection() as c:
-        c.execute("UPDATE principals SET permissions=ARRAY['read','feedback-maintainer-write']::text[] WHERE id='maintainer'")
+        c.execute("UPDATE principals SET permissions=ARRAY['read','feedback-maintainer-purge']::text[] WHERE id='maintainer'")
 
 
 # spec: ANYM-988

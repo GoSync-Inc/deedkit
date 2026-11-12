@@ -61,6 +61,9 @@ CLOSED = ('subscription_closed', 'subscription_access_changed', 'not_found')
 UNAVAILABLE = ('forbidden', 'unauthorized', 'unsupported_operation', 'not_found', 'unknown_tool')
 MAX_EXPORT_PAGES, MAX_LIST_PAGES, DEAD = 50, 20, ('closed', 'expired', 'access_changed', 'revoked')
 BACKOFF_MIN, BACKOFF_MAX, MIN_PASS, REVERSE_EVERY, LOCK_WAIT = 1, 60, 1, 120, 300
+NEED_CARD = ('A DeedKit card is needed before this item can be marked accepted: add the label `spec:ANYM-<n>` of the card that '
+    'plans it (or ask the maintainers to give the item a primary card) and move this task again.')
+SPEC_LABEL = re.compile(r'spec:(ANYM-[1-9][0-9]*)')
 DONE_NOTE = ('Done in BB is not fixed or deployed in DeedKit: `fixed` and `verify_requested` come only from release '
     'evidence, so this task\'s status was not written back (DeedKit status: %s).')
 
@@ -289,7 +292,7 @@ class BbTasks:
 class Ledger:
     """One SQLite file, WAL and synchronous=FULL: a committed row survives a crash. One writer holds the flock."""
 
-    COLUMNS = ('fb_status', 'fb_changed_at', 'fp', 'title', 'desc_sha', 'bridge_version', 'seen_version')
+    COLUMNS = ('fb_status', 'fb_changed_at', 'fp', 'title', 'desc_sha', 'bridge_version', 'seen_version', 'primary_spec')
 
     def __init__(self, state_dir):
         state_dir = Path(state_dir)
@@ -302,7 +305,7 @@ class Ledger:
         for statement in (
                 'CREATE TABLE IF NOT EXISTS links(fid TEXT PRIMARY KEY, task_id TEXT, task_key TEXT, skipped INTEGER NOT NULL '
                 'DEFAULT 0, fb_status TEXT, fb_changed_at TEXT, fp TEXT, title TEXT, desc_sha TEXT, bridge_version TEXT, '
-                'seen_version TEXT)',
+                'seen_version TEXT, primary_spec TEXT)',
                 'CREATE UNIQUE INDEX IF NOT EXISTS links_task ON links(task_id) WHERE task_id IS NOT NULL',
                 'CREATE TABLE IF NOT EXISTS pending(fid TEXT PRIMARY KEY, started REAL NOT NULL)',
                 'CREATE TABLE IF NOT EXISTS pending_write(rid TEXT PRIMARY KEY, fid TEXT NOT NULL, version TEXT NOT NULL, '
@@ -311,6 +314,8 @@ class Ledger:
                 'CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)',
                 'CREATE TABLE IF NOT EXISTS unresolved(fid TEXT PRIMARY KEY, attempts INTEGER NOT NULL)'):
             self.db.execute(statement)
+        if 'primary_spec' not in {row['name'] for row in self.db.execute('PRAGMA table_info(links)')}:
+            self.db.execute('ALTER TABLE links ADD COLUMN primary_spec TEXT')  # a ledger of an earlier version (ANYM-992)
         for suffix in ('', '-wal', '-shm'):
             (state_dir / ('ledger.sqlite3' + suffix)).exists() and (state_dir / ('ledger.sqlite3' + suffix)).chmod(0o600)
 
@@ -474,6 +479,12 @@ def render(raw):
     return title, '\n'.join(lines)
 
 
+def task_spec(labels):
+    """The card a task names with its label `spec:ANYM-<n>` (ANYM-992), or None: no such label, or more than one."""
+    found = {m.group(1) for m in map(SPEC_LABEL.fullmatch, [x for x in labels if isinstance(x, str)]) if m}
+    return found.pop() if len(found) == 1 else None
+
+
 def reverse_status(task_status, labels, feedback_status, description):
     """(status, duplicate_of) a task-side change asks DeedKit for, or None. Only accepted, declined, duplicate exist."""
     if task_status in ('todo', 'in_progress', 'in_review') and feedback_status in ('received', 'reopened'):
@@ -616,7 +627,8 @@ class Bridge:
             brief = item['projection']['brief'] if item['projection'] else ''
             self.once_comment('edited:%s:%s' % (fid, fp), key, 'DeedKit status: %s.%s' % (item['status'],
                 '\n> ' + brief if brief else ''))
-        fields = {'fb_status': item['status'], 'fb_changed_at': item['status_changed_at'], 'fp': fp}
+        fields = {'fb_status': item['status'], 'fb_changed_at': item['status_changed_at'], 'fp': fp,
+            'primary_spec': item['projection']['primary_spec'] if item['projection'] else None}
         if changes:
             result = self.tasks.update(key, **changes)
             stats['updated'] += 1
@@ -703,9 +715,17 @@ class Bridge:
             self.ledger.update_link(fid, seen_version=version)
             return None
         wanted_status, duplicate_of = wants
+        # `accepted` names the card that plans the item (the server refuses it without one): the task's label first, else the
+        # primary card of the item's projection; with neither nothing is written and one comment says a card is needed.
+        spec_ref = task_spec(task['labels']) or link['primary_spec'] if wanted_status == 'accepted' else None
+        if wanted_status == 'accepted' and spec_ref is None:
+            self.once_comment('card:%s' % fid, link['task_key'], NEED_CARD)
+            self.ledger.update_link(fid, seen_version=version)
+            return None
         rid = request_id(fid, task['id'], version)
         args = {'feedback_id': fid, 'status': wanted_status, 'request_id': rid, 'expected_status': status,
-            'expected_changed_at': link['fb_changed_at']} | ({'duplicate_of': duplicate_of} if duplicate_of else {})
+            'expected_changed_at': link['fb_changed_at']} | ({'duplicate_of': duplicate_of} if duplicate_of else {}) | (
+            {'spec_ref': spec_ref} if spec_ref else {})
         self.ledger.put_pending_write(rid, fid, version, wanted_status)
         try:
             result = self.write_status(args)
