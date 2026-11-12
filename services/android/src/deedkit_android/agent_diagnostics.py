@@ -11,6 +11,8 @@ def message(text, private=()):
         if len(str(value)) >= 3:
             text = text.replace(str(value), '<task-value>')
     text = re.sub(r'\x1b\[[0-9;]*m', '', text)
+    text = re.sub(r'''(?i)(\b(?:authorization|proxy-authorization|cookie|set-cookie)["']?\s*[:=]\s*)[^\r\n]+''',
+                  r'\1<redacted>', text)
     text = re.sub(r'''(?i)((?:authorization|bearer|api[_-]?key|(?:access[_-]?|refresh[_-]?)?token|password|secret)["']?\s*[:=]?\s*["']?)[^\s,;]+''',
                   r'\1<redacted>', text)
     text = re.sub(r'(?:sk-|eyJ)[A-Za-z0-9_.-]{10,}|[A-Za-z0-9_-]{48,}', '<redacted>', text)
