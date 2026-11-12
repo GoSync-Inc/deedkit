@@ -126,7 +126,7 @@ class FakeThreads:
 
     def rows(self, ids=None):
         self.calls.append(('rows', tuple(ids) if ids else None))
-        return [dict(r) for r in self.threads if ids is None or r['id'] in ids]
+        return [dict(r) for r in self.threads if ids is None or r.get('id') in ids]
 
     def archive(self, thread_id):
         next(r for r in self.threads if r['id'] == thread_id)['archivedAt'] = int(self.clock() * 1000)
@@ -432,6 +432,27 @@ def test_no_feedback_text_reaches_a_command_a_log_or_the_journal(tmp_path, capsy
     sent = json.dumps([rig.threads.calls, rig.tasks.comments, rig.tasks.attached, seen.out, seen.err])
     assert CANARY not in sent and CANARY not in journal and 'canary-slug' not in sent
     assert fid(1) not in sent and fid(2) not in sent
+
+
+# spec: ANYM-991
+def test_a_task_deleted_between_the_listing_and_the_start_is_skipped_and_a_malformed_thread_row_is_ignored(tmp_path):
+    rig = Rig(tmp_path)
+    rig.tasks.add(1)
+    rig.tasks.add(2)
+    show = rig.tasks.show
+
+    def gone_for_the_first(ref):
+        if ref == 'DK-1':
+            raise fb.Refused('task_not_found')
+        return show(ref)
+    rig.tasks.show = gone_for_the_first
+    assert rig.run()['started'] == 1 and [c[1] for c in rig.threads.spawns()] == ['feedback-DK-2']
+    rig.threads.mode = 'uncertain_not_created'
+    rig.tasks.add(3)
+    with pytest.raises(fb.Uncertain):
+        rig.run()
+    rig.threads.threads.append({'title': 'feedback-DK-3', 'projectId': PROJECT, 'createdAt': int(NOW * 1000)})  # no id
+    assert rig.restart().run() == ZERO and rig.rows()[-1] == ('DK-3', 1, 'starting')
 
 
 # spec: ANYM-991

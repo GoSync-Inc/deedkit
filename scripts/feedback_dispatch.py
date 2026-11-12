@@ -315,7 +315,7 @@ class Dispatcher:
         if starting:
             listing, claimed = self.threads.rows(), {r['thread_id'] for r in rows if r['thread_id']}
             for row in starting:
-                found = next((t for t in listing if t['id'] not in claimed and self.ours(row, t)), None)
+                found = next((t for t in listing if self.ours(row, t) and t['id'] not in claimed), None)
                 if found:
                     claimed.add(found['id'])
                     self.journal.set(row['id'], state='started', thread_id=found['id'])
@@ -402,7 +402,10 @@ class Dispatcher:
         key = info['key']
         if [name for name in BRIEF_FILES if not (self.cfg.briefs_dir / name).is_file()]:
             raise fb.ConfigError('brief_missing')
-        fresh = self.tasks.show(key)  # the listing may be minutes old
+        try:
+            fresh = self.tasks.show(key)  # the listing may be minutes old
+        except fb.Refused:
+            return  # the task is gone: nothing to start
         again, action = self.judge(fresh)
         own = {r['thread_id'] for r in self.journal.rows() if r['task_key'] == key and r['thread_id']}
         if (action != 'start' or again['fid'] != info['fid'] or fresh['status'] not in (OPEN if attempt > 1 else FIRST)
