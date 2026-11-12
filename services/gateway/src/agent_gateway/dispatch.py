@@ -11,7 +11,7 @@ from platform_contracts.agent import MAX_CANDIDATES, PLACEHOLDER_REQUEST_ID, val
 from .adapters.calls import receipt_reference  # noqa: F401
 from .adapters import agents
 
-from .catalog import arguments, CATALOG, InvalidArguments, routed
+from .catalog import arguments, CATALOG, InvalidArguments, routed, scopes_met
 from .diagnostics import (FAILURE_FIELDS, discovery, gateway_build, manifest_lacks, manifest_summary, module_conditions,
                           module_health, operation_missing_detail, stale_arguments_hint, unavailable, unknown_tool_denial)
 from .field_errors import root_refusal
@@ -229,7 +229,7 @@ class Dispatch:
         arguments = step.get("arguments") if isinstance(step.get("arguments"), dict) else {}
         name = next((n for n in self.policy.visible(snapshot, agent)
                      if CATALOG[n]["module"] == "messaging" and CATALOG[n]["operation"] == step.get("tool")), None)
-        usable = (name is not None and set(CATALOG[name]["scopes"]) <= set(caps.get("permissions", []))
+        usable = (name is not None and scopes_met(CATALOG[name], caps.get("permissions", []))
                   and self.implemented(CATALOG[name], snapshot, agent, caps, arguments.get("account")))
         if usable and CATALOG[name].get("action_group"):
             allowed = (self.actions(snapshot, agent, caps, arguments["account"]) if "account" in arguments
@@ -364,7 +364,7 @@ class Dispatch:
             if CATALOG[n]["module"] == "gateway"
             or (
                 states.get(CATALOG[n]["module"]) == "ready"
-                and set(CATALOG[n]["scopes"]) <= scopes[CATALOG[n]["module"]]
+                and scopes_met(CATALOG[n], scopes[CATALOG[n]["module"]])
                 and self.implemented(CATALOG[n], current, principal, capabilities[CATALOG[n]["module"]])
                 and (
                     not CATALOG[n].get("action_group")
@@ -475,7 +475,7 @@ class Dispatch:
         cursor-write for get_updates(start_from=now), the backend implementation, the calendar rules ceiling and the
         action group. Returns the gateway actions the call may use; raises Denied otherwise."""
         module = tool["module"]
-        if not set(tool["scopes"]) <= set(caps["permissions"]):
+        if not scopes_met(tool, caps["permissions"]):
             raise Denied()
         if (module == "messaging" and tool["operation"] == "get_updates"
                 and args.get("start_from") == "now"
@@ -557,7 +557,7 @@ class Dispatch:
         """Whether this caller may run the get_context call a guard refusal names, on this account."""
         tool = CATALOG.get(GUARD_CONTEXT_TOOL)
         return (tool is not None and GUARD_CONTEXT_TOOL in self.policy.visible(snapshot, agent)
-                and set(tool["scopes"]) <= set(caps["permissions"])
+                and scopes_met(tool, caps["permissions"])
                 and self.implemented(tool, snapshot, agent, caps, account))
 
     @staticmethod

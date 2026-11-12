@@ -145,7 +145,14 @@ class SubscriptionFeedbackStatuses(TypedDict):
     # checked by the server (invalid_filter), not by this schema.
     __pydantic_config__ = ConfigDict(extra='forbid')
     statuses: list[StrictStr]
-SubscriptionFeedback = Literal[True] | SubscriptionFeedbackStatuses
+class SubscriptionFeedbackMaintainer(TypedDict, total=False):
+    # ANYM-989: the description rides the schema, not the tool description (a tool description stays under 3000 characters).
+    __pydantic_config__ = ConfigDict(extra='forbid')
+    maintainer: Required[Annotated[Literal[True], Field(description="Wakes a key that holds feedback-maintainer-read "
+        "(forbidden otherwise) on every agent's new feedback, recorded summary and status change. Alone it needs no read: "
+        "its fetch, wait and ACK work without it. Statuses beside it add your own report statuses.")]]
+    statuses: list[StrictStr]
+SubscriptionFeedback = Literal[True] | SubscriptionFeedbackStatuses | SubscriptionFeedbackMaintainer
 class SubscriptionEndpoint(TypedDict, total=False):
     __pydantic_config__ = ConfigDict(extra='forbid')
     endpoint_id: Required[EndpointReference]

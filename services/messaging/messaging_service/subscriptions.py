@@ -15,6 +15,7 @@ from uuid import UUID
 
 from psycopg.types.json import Jsonb
 
+from .feedback_events import maintainer_only
 from .policy import effective_permissions, lock_principal, targets
 
 EVENT_KINDS = frozenset(('message.created', 'message.edited', 'message.deleted', 'poll.updated',
@@ -273,14 +274,16 @@ def hint_floor(row):
 
 def _state(c, row, p):
     """ACL changes never revive a previous definition, even after restoration."""
+    # ANYM-989: a maintainer-only definition is held by the maintainer permission instead of `read`.
+    needed = {'feedback-maintainer-read' if maintainer_only(row) else 'read', 'subscription-write'}
     if dynamic(row):
         # ANYM-522: scope and permission versions move without invalidating it; losing read or
         # subscription-write still does (fail closed). Each disclosure point applies the current scope.
-        changed = not {'read', 'subscription-write'} <= set(p['permissions'])
+        changed = not needed <= set(p['permissions'])
     else:
         changed = (row['scope_version'] != p['scope_version'] or
             row['key_permission_version'] != p['key_permission_version'] or
-            not {'read', 'subscription-write'} <= set(p['permissions']))
+            not needed <= set(p['permissions']))
     if not changed and not dynamic(row):
         sources = c.execute('SELECT account,chat FROM subscription_sources WHERE subscription=%s',
             (row['id'],)).fetchall()
@@ -303,6 +306,10 @@ def _owned(c, p, subscription_id):
         AND key_id=%s FOR UPDATE''', (_subscription_id(subscription_id), p['id'], p['key_id'])).fetchone()
     if row is None:
         raise APIError('not_found', 404)
+    if 'read' not in p['permissions'] and not maintainer_only(row):
+        # ANYM-989: a key without `read` (the maintainer's bridge key) addresses only a maintainer-only definition; any
+        # other one, found by its ID under the key's own ownership, is refused.
+        raise APIError('forbidden', 403)
     targets(p, [str(row['id'])])
     return _state(c, row, p)
 
@@ -538,12 +545,17 @@ def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=
         direction='incoming', origins=None, label='', expires_at=None, wake_rules=None, reply_to_send=None,
         delivery=None, module_sources=None, feedback=None):
     from .store import APIError, date_bound
-    if 'read' not in p['permissions']:
-        raise APIError('forbidden', 403)
+    from .feedback_events import attach, check_create, maintainer_requested, maintainer_selector, subscription_types
+    # ANYM-989: `read`, or the maintainer permission for the maintainer source alone (feedback_events.check_create).
+    check_create(p, feedback, (chat_ids, sources, sender_ids, kinds, origins, wake_rules, reply_to_send, delivery,
+        module_sources), direction)
+    # Every role that reads subscriptions sees this marker, so the permission gates and the liveness rule need no other
+    # table (`only`: the maintainer source is the whole definition). Taken here: `sources` is rebound below.
+    marker = maintainer_selector(feedback, chat_ids=chat_ids, sources=sources, sender_ids=sender_ids,
+        wake_rules=wake_rules, reply_to_send=reply_to_send, module_sources=module_sources) if maintainer_requested(feedback) else None
     # ANYM-962: feedback (this key's own report statuses) alone, or beside chat_ids or sources.
     if chat_ids is not None and sources is not None or chat_ids is None and sources is None and feedback is None:
         raise APIError('invalid_filter')
-    from .feedback_events import attach, subscription_types
     if feedback is not None: subscription_types(feedback)  # invalid_filter before anything is written
     if delivery is not None:
         # ANYM-519: bind a self-service endpoint in the same transaction (configure_subscription_delivery's checks).
@@ -636,6 +648,8 @@ def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=
         selector['reply_anchor'].update(confirmed_native_reference(c, anchor))
     if 'reply_to_confirmed_send' in selector.get('wake_rules', []) and 'reply_anchor' not in selector:
         raise APIError('invalid_subscription')
+    if marker:
+        selector['feedback_maintainer'] = marker
     if len(json.dumps(selector, ensure_ascii=False).encode()) > 14000:
         raise APIError('invalid_filter')
     row = c.execute('''INSERT INTO subscriptions(principal,key_id,scope_version,key_permission_version,
@@ -666,8 +680,11 @@ def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=
 def list_subscriptions(store, c, p, *, limit=50):
     from .store import bounded
     bounded(limit)
+    # ANYM-989: a key without `read` (the maintainer's bridge key) lists only its maintainer-only definitions.
     rows = c.execute('''SELECT * FROM subscriptions WHERE principal=%s AND key_id=%s
-        ORDER BY created_at DESC,id DESC LIMIT %s FOR UPDATE''', (p['id'], p['key_id'], limit + 1)).fetchall()
+        AND (%s OR selector->>'feedback_maintainer'='only')
+        ORDER BY created_at DESC,id DESC LIMIT %s FOR UPDATE''',
+        (p['id'], p['key_id'], 'read' in p['permissions'], limit + 1)).fetchall()
     result = [_view(c, _state(c, row, p), p) for row in rows[:limit]]
     targets(p, [str(row['id']) for row in rows[:limit]])
     return {'items': result, 'has_more': len(rows) > limit}
@@ -689,8 +706,8 @@ def get_subscription(store, c, p, subscription_id):
 def update_subscription(store, c, p, subscription_id, version, *, action, resume_policy='catch_up',
         exclude_chats=None, exclusions_revision=None):
     from .store import APIError
-    if 'read' not in p['permissions']:
-        raise APIError('forbidden', 403)
+    if 'read' not in p['permissions'] and 'feedback-maintainer-read' not in p['permissions']:
+        raise APIError('forbidden', 403)  # ANYM-989: without `read`, _owned admits only a maintainer-only definition
     if type(version) is not int or not 1 <= version <= 2**53 - 1:
         raise APIError('invalid_version')
     if action not in ('pause', 'resume', 'close', 'set_exclusions') or resume_policy not in ('catch_up', 'skip'):

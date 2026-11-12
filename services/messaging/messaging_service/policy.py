@@ -63,6 +63,18 @@ OPERATION_PERMISSIONS = {
     # ANYM-988: every principal's feedback metadata with the loop's released summary, for a maintainer key only.
     'export_feedback_metadata':'feedback-maintainer-read',
 }
+# ANYM-989: the subscription reads a key that holds `feedback-maintainer-read` may make without `read` (the Ryzen bridge
+# key has no `read`). The operation permission is `read` or the maintainer one; each body then admits such a key to a
+# maintainer-only definition alone (subscriptions._owned), and create, update and ACK check theirs in their own bodies.
+MAINTAINER_SUBSCRIPTION_READS = frozenset(('list_subscriptions', 'get_subscription', 'get_subscription_events',
+    'fetch_subscription_events', 'wait_for_subscription_events'))
+
+
+def operation_permitted(operation, permissions):
+    """Whether a key with these effective permissions holds the operation's permission (None: any key)."""
+    needed = OPERATION_PERMISSIONS[operation]
+    return (not needed or needed in permissions or
+            operation in MAINTAINER_SUBSCRIPTION_READS and 'feedback-maintainer-read' in permissions)
 # resolve_target is audited as resolve_reference (ANYM-545) and messages_send as its preview_message and
 # send_message steps (ANYM-546): the audit_log CHECK lists operations by migration.
 AUDIT_OPERATIONS = frozenset(OPERATION_PERMISSIONS) - {'resolve_target', 'messages_send'} | {

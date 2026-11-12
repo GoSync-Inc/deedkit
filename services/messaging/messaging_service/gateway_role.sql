@@ -155,3 +155,7 @@ GRANT INSERT ON subscription_module_sources,subscription_module_links TO messagi
 -- Schema 94 (ANYM-988): export_feedback_metadata shows the feedback loop's released summary beside each item's metadata
 -- (a maintainer key only, checked by the operation's permission); read only. The operator's owner connection writes it.
 GRANT SELECT ON feedback_projections TO messaging_gateway;
+-- Schema 95 (ANYM-989): a new submission journals its feedback.received event only through this definer function, which
+-- reads the row's category itself and takes the module journal's counter lock; the API role has no other access to the
+-- module journal's writer. PUBLIC lost EXECUTE in the migration (and in the restore step of Store.migrate).
+GRANT EXECUTE ON FUNCTION public.publish_feedback_received(uuid) TO messaging_gateway;

@@ -3748,6 +3748,29 @@
             "title": "SubscriptionEndpoint",
             "type": "object"
           },
+          "SubscriptionFeedbackMaintainer": {
+            "additionalProperties": false,
+            "properties": {
+              "maintainer": {
+                "const": true,
+                "description": "Wakes a key that holds feedback-maintainer-read (forbidden otherwise) on every agent's new feedback, recorded summary and status change. Alone it needs no read: its fetch, wait and ACK work without it. Statuses beside it add your own report statuses.",
+                "title": "Maintainer",
+                "type": "boolean"
+              },
+              "statuses": {
+                "items": {
+                  "type": "string"
+                },
+                "title": "Statuses",
+                "type": "array"
+              }
+            },
+            "required": [
+              "maintainer"
+            ],
+            "title": "SubscriptionFeedbackMaintainer",
+            "type": "object"
+          },
           "SubscriptionFeedbackStatuses": {
             "additionalProperties": false,
             "properties": {
@@ -3881,6 +3904,9 @@
               },
               {
                 "$ref": "#/$defs/SubscriptionFeedbackStatuses"
+              },
+              {
+                "$ref": "#/$defs/SubscriptionFeedbackMaintainer"
               },
               {
                 "type": "null"

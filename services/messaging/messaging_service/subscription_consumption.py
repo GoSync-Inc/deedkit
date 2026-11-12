@@ -223,8 +223,8 @@ def fetch_subscription_events(store, c, p, subscription_id, *, limit=50):
 
 def ack_subscription_events(store, c, p, subscription_id, receipt, version):
     from .store import APIError
-    if 'read' not in p['permissions']:
-        raise APIError('forbidden', 403)
+    if 'read' not in p['permissions'] and 'feedback-maintainer-read' not in p['permissions']:
+        raise APIError('forbidden', 403)  # ANYM-989: without `read`, _owned admits only a maintainer-only definition
     if type(version) is not int or not 1 <= version <= 2**53 - 1:
         raise APIError('invalid_version')
     from .module_links import fence_use

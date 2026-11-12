@@ -608,6 +608,44 @@ inherits it; `capabilities` names the tool only to a holder) calls `export_feedb
 - The read audits as `export_feedback_metadata` (feedback IDs only); the command audits one `record_feedback_projection`
   row per written item with the operator as actor.
 
+### Maintainer subscription (ANYM-989, schema 95)
+
+A maintainer tool is woken by the server instead of polling for the next change. `create_subscription(feedback={"maintainer": true})`
+attaches the module source `deedkit:feedback` with scope `feedback:all` and these types: `feedback.received` (a
+submission), `feedback.projection_recorded` (the loop recorded its summary of an item) and the six status types of the
+section above. It is refused (`forbidden`) unless the key holds `feedback-maintainer-read`. `{"maintainer": true,
+"statuses": [...]}` adds the key's own report statuses as a second source of the same definition; `feedback=true` and
+`{"statuses": [...]}` stay own-key and need no permission. The definition counts as one toward
+`SUBSCRIPTION_MAX_DEFINITIONS` and starts at the module journal head.
+
+- Events are wake-ups, never the item: `feedback.received` carries `feedback_id`, `status: received` and `category`
+  (the operator's change back to `received` keeps its `previous_status` and no `category`); `feedback.projection_recorded`
+  carries `feedback_id` and the reader's `classification`. Never the description, a note, a reference, a principal or a key
+  ID. Read the item with `export_feedback_metadata`; the event is lost to an error only for its wake-up (the publish runs in
+  a savepoint, is logged as `subscription_journal_failed` with kind `feedback.received` or `feedback.projection_recorded`
+  and counted, and the submission or the recorded projection commits), so a poller of the export stays the fallback.
+- A submission publishes through the definer function `publish_feedback_received(uuid)` (the API role's only way to the
+  module journal; it reads the category itself); a replayed `request_id` publishes nothing. The event's scope is the fixed
+  `feedback:submitted`, never a key ID, so an own-key subscription (`statuses` containing `received`) is woken exactly as
+  before: by the operator's change back to `received`, not by a submission. `record-feedback-projection` publishes one
+  `feedback.projection_recorded` per item it writes (not per `unchanged` one), in its own transaction.
+- The source is live only while its subscription's key holds the permission and is neither revoked nor expired and its
+  principal is enabled and holds it: after `set-key-permissions` drops it the source reads `access_changed` and fetch, wait
+  and the webhook hint deliver none of its events, those matched before the change included.
+- A key with `feedback-maintainer-read`, `subscription-write` and `subscription-ack` and **no `read`** (the Ryzen bridge key)
+  can `create_subscription(feedback={"maintainer": true})` with nothing else selected, and `get_subscription`,
+  `list_subscriptions`, `get_subscription_events`, `fetch_subscription_events`, `wait_for_subscription_events`,
+  `ack_subscription_events` and `update_subscription` (pause, resume, close) on a definition whose only source is
+  `feedback:all` (the definition's `feedback_maintainer` is `only`). Any other definition of that key (a chat or dynamic
+  one, an own-key `feedback`, a maintainer source beside another), `configure_subscription_delivery`,
+  `test_subscription`, every archive read and `list_feedback` are `forbidden`; `capabilities` names it only these tools and
+  `export_feedback_metadata`. A key that also holds `read` works as before. The gateway catalog lists the same calls
+  under `alt_scopes` (`feedback-maintainer-read`, plus `subscription-ack` for the ACK), so the gateway admits the key
+  without `read` and the agent's grant needs no `read` either.
+- A bound webhook endpoint (ANYM-519) of a key that also holds `read` and `delivery-write` gets the reference keys only:
+  `event_id`, `type`, `occurred_at`, `feedback_id` and `status`; a `feedback.projection_recorded` reference has no
+  `status`.
+
 ## Schema 38: hint timing policy
 
 `configure_subscription_delivery(subscription_id, version, receiver_id, delivery_policy)`

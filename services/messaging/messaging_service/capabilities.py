@@ -112,6 +112,13 @@ def capabilities(self, token, detail='full', sections=None):
             features['subscription-write']=['create_subscription','update_subscription','configure_subscription_delivery','test_subscription']
             from .delivery_endpoints import TOOLS as delivery_tools
             features['delivery-write']=list(delivery_tools)
+        elif 'feedback-maintainer-read' in p['permissions']:
+            # ANYM-989: a maintainer key without `read` (the bridge key) is named its own tools only: the metadata read and the
+            # subscription calls of a maintainer-only definition (the bodies refuse any other definition).
+            features['feedback-maintainer-read']=['export_feedback_metadata','list_subscriptions','get_subscription',
+                'get_subscription_events','fetch_subscription_events','wait_for_subscription_events']
+            features['subscription-ack']=['ack_subscription_events']
+            features['subscription-write']=['create_subscription','update_subscription']
         # ANYM-566: module event kinds are named only to a key whose principal has a live module link.
         from .module_links import advertised
         module_events=advertised(c,p) if 'read' in p['permissions'] else None

@@ -159,6 +159,10 @@ def submit_feedback(store, c, p, request_id, category, description, *, operation
         row = c.execute('''INSERT INTO agent_feedback(principal,key_id,request_id,request_hash,
             category,description,operation,refs) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id''',
             (p['id'], p['key_id'], request_id, request_hash, category, description, operation, Jsonb(refs))).fetchone()
+        # ANYM-989: a new item wakes a maintainer subscription at once, in a savepoint of its own (an error is counted and
+        # the submission commits); a replayed request_id (the branch above) publishes nothing.
+        from .feedback_events import publish_received
+        publish_received(c, row['id'])
     targets(p, [str(row['id'])])
     return {'feedback_id': str(row['id']), 'status': 'recorded', 'external_delivery': False}
 

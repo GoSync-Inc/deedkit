@@ -121,7 +121,15 @@ KINDS = {
     # ANYM-962: the feedback ID, two status words, the Tiden ID and the release; never a note, text or principal.
     **{'feedback.' + status: ({'feedback_id': _ref, 'status': _enum(status), 'previous_status': _PREVIOUS,
         'spec_ref': _spec_ref, 'fixed_in': _release}, frozenset(('spec_ref', 'fixed_in')), 'feedback_id')
-        for status in FEEDBACK_STATUSES},
+        for status in FEEDBACK_STATUSES if status != 'received'},
+    # ANYM-989: received has two shapes (validate_event): the operator's change back to received (previous status
+    # present) and a submission (category present, previous status absent).
+    'feedback.received': ({'feedback_id': _ref, 'status': _enum('received'), 'previous_status': _PREVIOUS,
+        'spec_ref': _spec_ref, 'fixed_in': _release, 'category': _enum('bug', 'feature', 'quality', 'other')},
+        frozenset(('previous_status', 'spec_ref', 'fixed_in', 'category')), 'feedback_id'),
+    # ANYM-989: the feedback loop's closed classification of an item (feedback_projection.CLASSES); nothing else.
+    'feedback.projection_recorded': ({'feedback_id': _ref, 'classification': _enum(
+        'reported-bug', 'feature', 'question', 'not-actionable', 'already-live', 'enable-only')}, frozenset(), 'feedback_id'),
 }
 # ANYM-732: a new archived text is batched, an access change is urgent; neither expires.
 RECORDING_URGENCY = {'recording.text.archived': 'batch', 'recording.access.changed': 'now'}
@@ -172,8 +180,13 @@ def validate_event(event):
             event['expires_at'] is not None):
         _fail('access_changed_urgency_or_expiry')
     if event['type'].startswith('feedback.') and (event['urgency'] != 'now' or event['expires_at'] is not None or
-            data['status'] == data['previous_status']):
+            'previous_status' in data and data['status'] == data['previous_status']):
         _fail('feedback_needs_now_and_a_change')
+    if event['type'] == 'feedback.received':
+        # ANYM-989: the operator's shape names a previous status and no category; a submission's the reverse.
+        operator, submission = 'previous_status' in data, 'category' in data
+        if operator == submission or submission and ('spec_ref' in data or 'fixed_in' in data):
+            _fail('feedback_received_shape')
     if event['type'] == 'call.owner_request' and (event['urgency'] != 'now' or event['expires_at'] is None):
         # The decision's stored deadline: an owner request is never held by batching or kept past it.
         _fail('owner_request_needs_now_and_deadline')
@@ -372,6 +385,9 @@ def match(c, row, *, batch_size, maximum, stats):
             break
         # An expired event (a reminder after its start) is never matched, so never hinted late.
         wanted = lookup.get((event['source'], event['scope_ref'])) or lookup.get((event['source'], 'calendar:all'), ())
+        if event['source'] == 'deedkit:feedback':
+            # ANYM-989: a `feedback:all` source gets every event of the source whatever its scope_ref, beside an own-key one.
+            wanted = set(wanted) | set(lookup.get((event['source'], 'feedback:all'), ()))
         # ANYM-577: a calendar event matches only if the linked principal's access to its calendar holds for it.
         if (event['type'] in wanted and not event['expired'] and
                 (event['source'] != 'deedkit:calendar' or event_live(c, row['id'], event))):
