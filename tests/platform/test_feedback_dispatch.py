@@ -612,6 +612,37 @@ def test_the_spawn_command_is_exactly_the_documented_one_with_the_prompt_on_stdi
 
 
 # spec: ANYM-991
+def test_configured_codex_worker_reaches_the_spawn_command_and_a_second_tick_never_repeats_it(tmp_path, monkeypatch):
+    env = write_config(tmp_path, provider='codex', model='gpt-6.1-terra', reasoning='high')
+    tasks = FakeTasks()
+    tasks.add(1)
+    def reply(argv):
+        return (0, json.dumps({'id': 'thr_codex0001'} if 'spawn' in argv else [
+            {'id': 'thr_codex0001', 'projectId': PROJECT, 'status': 'active', 'archivedAt': None}]))
+    runner, calls = runner_for(reply)
+    wrapper = fd.Threads
+    monkeypatch.setattr(fd, 'Threads', lambda **kw: wrapper(runner=runner, **kw))
+    assert fd.main(['run'], environ=env, tasks=tasks, now=lambda: NOW) == 0
+    spawn = next(argv for argv, _ in calls if 'spawn' in argv)
+    assert spawn[spawn.index('--provider') + 1] == 'codex'
+    assert spawn[spawn.index('--model') + 1] == 'gpt-6.1-terra'
+    assert spawn[spawn.index('--reasoning-level') + 1] == 'high'
+    assert tasks.attached == [('DK-1', 'thr_codex0001')]
+    assert fd.main(['run'], environ=env, tasks=tasks, now=lambda: NOW) == 0
+    assert sum('spawn' in argv for argv, _ in calls) == 1
+
+
+# spec: ANYM-991
+def test_worker_configuration_keeps_legacy_defaults_and_refuses_invalid_or_partial_selection(tmp_path):
+    cfg = fd.load_config(environ=write_config(tmp_path))
+    assert (cfg.provider, cfg.model, cfg.reasoning) == ('claude-code', 'claude-sonnet-5-5', 'xhigh')
+    for fields in ({'provider': 'codex'}, {'model': ''}, {'reasoning': None}, {'provider': '--codex'},
+            {'model': ['gpt-6.1-terra']}, {'reasoning': 'high\n--full'}, {'provider': 123}):
+        with pytest.raises(fb.ConfigError, match='config_invalid'):
+            fd.load_config(environ=write_config(tmp_path, **fields))
+
+
+# spec: ANYM-991
 def test_the_threads_wrapper_lists_by_project_or_by_id_and_tells_refusals_from_uncertain_outcomes():
     run, calls = runner_for(lambda argv: (0, json.dumps([{'id': 'thr_a'}])))
     threads = fd.Threads(PROJECT, runner=run)

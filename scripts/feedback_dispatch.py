@@ -48,7 +48,9 @@ CLASSES = ('reported-bug', 'feature')  # the reader's classes that name work; th
 STATUS_OK = ('received', 'accepted', 'reopened')
 SKIP_LABELS = frozenset({'duplicate', 'hold', 'epic'})
 CONFIG_KEYS = frozenset({'dispatch', 'orchestrator_thread', 'principals', 'tracker', 'hold', 'worker_machine', 'max_live',
-    'daily_starts'})
+    'daily_starts', 'provider', 'model', 'reasoning'})
+WORKER_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}')
+REASONING = re.compile(r'[a-z][a-z0-9_]{0,31}')
 MAX_LIVE, GRACE, SLACK, CHUNK = 2, 300, 60, 50
 BRIEF_FILES = ('common.md', 'bb-overlay.md', 'feedback-task.md')
 PROMPT = ('Read and follow {b}/common.md, then {b}/bb-overlay.md (it wins on conflict), then the task brief '
@@ -77,6 +79,9 @@ class Config:
     daily_starts: int
     state_dir: Path
     briefs_dir: Path
+    provider: str = PROVIDER
+    model: str = MODEL
+    reasoning: str = EFFORT
 
 
 def load_config(path=None, environ=None):
@@ -92,7 +97,8 @@ def load_config(path=None, environ=None):
     if not isinstance(raw, dict) or set(raw) - CONFIG_KEYS:
         raise fb.ConfigError('config_invalid')
     values = {'dispatch': False, 'orchestrator_thread': None, 'principals': [], 'tracker': 'DK', 'hold': [],
-        'worker_machine': None, 'max_live': MAX_LIVE, 'daily_starts': 6} | raw
+        'worker_machine': None, 'max_live': MAX_LIVE, 'daily_starts': 6,
+        'provider': PROVIDER, 'model': MODEL, 'reasoning': EFFORT} | raw
     listed = lambda name, pattern: isinstance(values[name], list) and all(isinstance(x, str) and pattern.fullmatch(x) for x in values[name])
     valid = (type(values['dispatch']) is bool and listed('principals', fb.WORD) and listed('hold', KEY)
         and (values['orchestrator_thread'] is None or (isinstance(values['orchestrator_thread'], str) and THREAD.fullmatch(values['orchestrator_thread'])))
@@ -100,6 +106,9 @@ def load_config(path=None, environ=None):
         and isinstance(values['tracker'], str) and re.fullmatch(r'[A-Z][A-Z0-9]{1,9}', values['tracker'])
         and type(values['max_live']) is int and 0 <= values['max_live'] <= MAX_LIVE
         and type(values['daily_starts']) is int and 0 <= values['daily_starts'] <= 100
+        and all(isinstance(values[n], str) and WORKER_ID.fullmatch(values[n]) for n in ('provider', 'model'))
+        and isinstance(values['reasoning'], str) and REASONING.fullmatch(values['reasoning'])
+        and not (values['provider'] != PROVIDER and not {'model', 'reasoning'} <= set(raw))
         and not (values['dispatch'] and (not values['principals'] or not values['orchestrator_thread'])))
     if not valid:
         raise fb.ConfigError('config_invalid')
@@ -168,8 +177,9 @@ class Tasks(fb.BbTasks):
 class Threads:
     """`bb thread` for one project: the listing (with archived threads) and the spawn."""
 
-    def __init__(self, project=PROJECT, runner=None):
+    def __init__(self, project=PROJECT, runner=None, *, provider=PROVIDER, model=MODEL, reasoning=EFFORT):
         self.project, self.runner = project, runner or _run
+        self.provider, self.model, self.reasoning = provider, model, reasoning
 
     def _call(self, argv, timeout=60, stdin=None):
         try:
@@ -204,7 +214,7 @@ class Threads:
 
     def spawn(self, title, prompt, orchestrator, machine=None):
         argv = ['thread', 'spawn', '--project', self.project, '--parent-thread', orchestrator, '--new-environment', 'worktree',
-            '--base-branch', BASE, '--provider', PROVIDER, '--model', MODEL, '--reasoning-level', EFFORT, '--title', title,
+            '--base-branch', BASE, '--provider', self.provider, '--model', self.model, '--reasoning-level', self.reasoning, '--title', title,
             '--prompt-file', '-'] + (['--machine', machine] if machine else [])
         thread = self._call(argv, timeout=180, stdin=prompt)
         if not isinstance(thread, dict) or not isinstance(thread.get('id'), str) or not THREAD.fullmatch(thread['id']):
@@ -461,7 +471,7 @@ def main(argv=None, environ=None, tasks=None, threads=None, now=time.time):
     try:
         cfg = load_config(None, os.environ if environ is None else environ)
         tasks = tasks or Tasks(cfg.tracker, state_dir=cfg.state_dir)
-        dispatcher = Dispatcher(cfg, tasks, threads or Threads(), now=now)
+        dispatcher = Dispatcher(cfg, tasks, threads or Threads(provider=cfg.provider, model=cfg.model, reasoning=cfg.reasoning), now=now)
         if argv[0] == 'check':
             return check(cfg, tasks)
         if argv[0] == 'gate':

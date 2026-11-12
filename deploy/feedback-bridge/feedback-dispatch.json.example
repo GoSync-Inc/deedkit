@@ -3,6 +3,9 @@
   "orchestrator_thread": "thr_orchestrator_id",
   "principals": ["agent-name"],
   "tracker": "DK",
+  "provider": "codex",
+  "model": "gpt-6.1-terra",
+  "reasoning": "high",
   "hold": [],
   "max_live": 2,
   "daily_starts": 6
