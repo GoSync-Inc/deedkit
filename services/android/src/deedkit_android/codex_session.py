@@ -14,8 +14,9 @@ from .config import Refused
 
 
 class CodexSession:
-    def __init__(self, directory, config, host, device):
+    def __init__(self, directory, config, host, device, *, bindings=None, owner=None):
         self.dir, self.config, self.host, self.device = directory, config, host, device
+        self.bindings, self.owner = bindings, owner
         self.process, self.reader, self.stderr_reader = None, None, None
         self.pending, self.serial = {}, 0
         self.thread_id, self.turn_id, self.events = None, None, None
@@ -262,13 +263,58 @@ class CodexSession:
                 pass
             return self.receipt(row)
 
+    def sandbox(self):
+        return {'type': 'workspaceWrite', 'writableRoots': [str(self.dir.resolve())], 'networkAccess': True,
+                'excludeTmpdirEnvVar': True, 'excludeSlashTmp': True}
+
+    def binding_boundary(self, response):
+        """Validate supported effective policy, not a caller assertion or a directory's mode bits."""
+        cwd = str(self.dir.resolve())
+        policy = response.get('sandbox')
+        if (response.get('cwd') != cwd
+                or response.get('runtimeWorkspaceRoots', []) not in ([], [cwd])
+                or response.get('activePermissionProfile') not in (None, {'id': ':workspace', 'extends': None}, {'id': ':workspace'})
+                or not isinstance(policy, dict) or policy.get('type') != 'workspaceWrite'
+                or policy.get('writableRoots') not in ([], [cwd])
+                or policy.get('excludeTmpdirEnvVar') is not True or policy.get('excludeSlashTmp') is not True):
+            raise Refused('native_binding_boundary_unconfirmed')
+        # Both native cwd and its only writable root must exclude the entire host store.
+        state = self.bindings.directory.resolve()
+        if state == self.dir.resolve() or state.is_relative_to(self.dir.resolve()):
+            raise Refused('native_binding_boundary_unconfirmed')
+        return {'version': 1, 'cwd': cwd, 'sandbox': policy, 'approval_policy': response.get('approvalPolicy')}
+
+    def bound_thread(self):
+        if self.bindings is None or not self.owner:
+            raise Refused('native_binding_unverified')
+        row = self.bindings.native_binding(self.owner, self.device)
+        if row is None:
+            # Compatibility files/history are evidence of a prior session, never authority to adopt it.
+            if self.dir.exists() or self.journal.exists():
+                raise Refused('native_binding_unverified')
+            self.bindings.begin_native_binding(self.owner, self.device, self.dir.resolve())
+            return None
+        if row['cwd'] != str(self.dir.resolve()) or not row['thread'] or not row['boundary']:
+            raise Refused('native_binding_unverified')
+        try:
+            proof = json.loads(row['boundary'])
+            if proof.get('version') != 1 or proof.get('approval_policy') != 'never' or self.binding_boundary({'cwd': proof['cwd'],
+                    'sandbox': proof['sandbox'], 'approvalPolicy': proof['approval_policy']}) != proof:
+                raise ValueError()
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise Refused('native_binding_unverified') from None
+        return row['thread']
+
     async def connect(self):
         pinned = (self.config.version == '0.166.0' and await asyncio.to_thread(
             engines.installed_version, self.config.binary) == '0.166.0')
         if not pinned:
             raise Refused('native_version_unsupported')
         self.version_verified = True
+        expected_thread = self.bound_thread()  # before spawning or reading any native-writable compatibility hint
         self.dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temporary = self.dir / 'tmp'
+        temporary.mkdir(mode=0o700, exist_ok=True)
         self.load_interactions()
         # App-server has no -C argument carrying our marker token. A verified executable link
         # keeps that token in argv so restart recovery can identify the group without trusting a PID.
@@ -283,13 +329,15 @@ class CodexSession:
         env = engines.environment('codex', self.config, self.dir)
         env['PATH'] = str(Path(self.host.adb).parent) + os.pathsep + env['PATH']
         env['ANDROID_SERIAL'] = self.host.devices[self.device]
-        for name in ('TMPDIR', 'LANG'):
+        env['TMPDIR'] = str(temporary)
+        for name in ('LANG',):
             if name in os.environ:
                 env[name] = os.environ[name]
         self.process = await asyncio.create_subprocess_exec(
             str(binary), 'app-server', '--strict-config',
             '-c', 'sandbox_mode="workspace-write"', '-c', 'approval_policy="never"',
             '-c', 'sandbox_workspace_write.network_access=true',
+            '-c', 'sandbox_workspace_write.exclude_tmpdir_env_var=true', '-c', 'sandbox_workspace_write.exclude_slash_tmp=true',
             '-c', 'skills.bundled.enabled=false', '-c', 'features.skip_host_skill_discovery=true',
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             env=env, cwd=self.dir, start_new_session=True, limit=4 * 1024 * 1024)
@@ -305,15 +353,22 @@ class CodexSession:
             params = {'cwd': str(self.dir), 'model': self.config.model or PERSISTENT_MODEL,
                       'sandbox': 'workspace-write', 'approvalPolicy': 'never'}
             saved = self.dir / 'thread.json'
-            if saved.exists():
-                self.thread_id = json.loads(saved.read_text())['thread_id']
-                response = await self.rpc('thread/resume', {**params, 'threadId': self.thread_id})
+            if expected_thread is not None:
+                response = await self.rpc('thread/resume', {**params, 'threadId': expected_thread})
             else:
                 response = await self.rpc('thread/start', {**params, 'ephemeral': False})
-            self.thread_id = response['thread']['id']
+            ident = (response.get('thread') or {}).get('id')
+            if not isinstance(ident, str) or not ident or (expected_thread is not None and ident != expected_thread):
+                raise Refused('native_binding_mismatch')
+            boundary = self.binding_boundary(response)
+            if response.get('approvalPolicy') == 'never':
+                self.bindings.confirm_native_binding(self.owner, self.device, ident, boundary)
+            self.thread_id = ident
             self.policy_proven = pinned and response.get('approvalPolicy') == 'never'
-            saved.write_text(json.dumps({'thread_id': self.thread_id}))
-            saved.chmod(0o600)
+            if expected_thread is None:
+                fd = os.open(saved, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, 'w') as stream:
+                    json.dump({'thread_id': self.thread_id}, stream)  # compatibility only, never read as authority
         except BaseException:
             await self.close()
             raise
@@ -466,6 +521,7 @@ class CodexSession:
                 self.policy_proven = receipt.get('approvalPolicy') == 'never'
                 if (receipt.get('thread') or {}).get('id') != self.thread_id or not self.policy_proven:
                     raise Refused('native_selection_unconfirmed')
+                self.binding_boundary(receipt)
                 if effective == expected:
                     break
                 if attempt:
@@ -501,8 +557,7 @@ class CodexSession:
                     'threadId': self.thread_id, 'input': [{'type': 'text', 'text': prompt}],
                     'model': selected['model'], 'effort': selected['effort'], 'serviceTier': selected['service_tier'],
                     'approvalPolicy': 'never',
-                    'sandboxPolicy': {'type': 'workspaceWrite', 'writableRoots': [str(self.dir)],
-                                      'networkAccess': True}})
+                    'sandboxPolicy': self.sandbox()})
                 self.turn_id = response['turn']['id']
                 self.last_turn_id = self.turn_id
                 if on_started:
@@ -579,7 +634,8 @@ class PersistentRun(BareRun):
                         await session.close()
                     digest = hashlib.sha256(json.dumps(key).encode()).hexdigest()
                     directory = self.agents.root / 'sessions' / ('run-live-' + digest)
-                    session = CodexSession(directory, self.config, self.agents.read_config(), self.device)
+                    session = CodexSession(directory, self.config, self.agents.read_config(), self.device,
+                                           bindings=self.agents.db, owner=self.owner)
                     self.session = session
                     await session.connect()
                     self.agents.sessions[key] = session

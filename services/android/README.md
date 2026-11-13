@@ -295,8 +295,20 @@ and follows that request with `get`. An idle conversation holds no phone lease o
 `stop`, time and command caps interrupt only the active turn; the healthy process/thread
 remains usable. Cancellation that cannot be confirmed kills the owned native process before
 releasing the device. Transport loss fails that request and never replays it. A later, new
-request resumes the exact saved thread when the service/process had to restart. Normal task
-completion does not restart it. Owner/device boundaries keep conversations separate.
+request can resume only the original owner/device/thread binding in the host store. The native
+workspace's `thread.json` is a compatibility hint and never authorizes resume; changing or deleting
+it cannot redirect the conversation or create a replacement. Thread creation intent is committed
+before the native request; an uncertain creation receipt cannot be retried under another task ID.
+New bindings require a pinned native effective workspace-write receipt with the original cwd,
+no additional writable roots and both implicit temporary write roots excluded. Command temporary
+files remain inside that cwd. The host store stays outside those roots; each turn retains the
+explicit policy and its effective readback. This write boundary does not hide host files from
+native reads and does not establish the separate protected-input capture fence.
+Legacy metadata without that historical binding remains unavailable before starting a new native
+client. It is not automatically migrated or adopted. Installation must attest the existing original
+conversation and enforce the native write boundary during root's exclusive rollout; protocol fixtures
+alone do not prove installed sandbox enforcement. Normal task completion does not restart the process.
+Owner/device boundaries keep conversations separate.
 
 In persistent bare mode, `android_capabilities.agent.dialogue.available` exposes the implemented
 `reply` and `steer` actions of the same `android_agent` tool. `get` includes the current native

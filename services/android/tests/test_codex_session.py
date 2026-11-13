@@ -31,7 +31,9 @@ for line in sys.stdin:
         emit(id=message['id'], result={{}})
     elif method in ('thread/start', 'thread/resume'):
         thread_id = params.get('threadId', thread_id)
-        emit(id=message['id'], result=dict(thread=dict(id=thread_id),approvalPolicy='never',**selected))
+        emit(id=message['id'], result=dict(thread=dict(id=thread_id),approvalPolicy='never',cwd=os.getcwd(),
+             sandbox=dict(type='workspaceWrite',writableRoots=[os.getcwd()],networkAccess=True,
+                          excludeTmpdirEnvVar=True,excludeSlashTmp=True),**selected))
     elif method == 'model/list':
         emit(id=message['id'],result=dict(data=[dict(id=n,model=n,supportedReasoningEfforts=[dict(reasoningEffort=e) for e in ('minimal','low','medium','high')],serviceTiers=[dict(id='ultrafast')]) for n in ('gpt-6.1-sol','gpt-6.1-terra')],nextCursor=None))
     elif method == 'thread/settings/update':

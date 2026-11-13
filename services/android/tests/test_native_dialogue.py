@@ -2,14 +2,17 @@
 
 import asyncio
 import json
+import sqlite3
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from agent_harness import Service, write_config
 from deedkit_android.codex_session import CodexSession
+from deedkit_android.agent_run import AgentStore
 from deedkit_android.config import Config, Refused
 
 
@@ -36,7 +39,10 @@ for line in sys.stdin:
     method, p=m.get('method'), m.get('params', {{}})
     if method == 'initialize': emit(id=m['id'], result={{}})
     elif method in ('thread/start','thread/resume'):
-        thread=p.get('threadId',thread); emit(id=m['id'], result=dict(thread=dict(id=thread), **selected, **({{'approvalPolicy':{policy!r}}} if {policy!r} is not None else {{}})))
+        thread=p.get('threadId',thread); emit(id=m['id'], result=dict(thread=dict(id=thread),cwd=os.getcwd(),
+            sandbox=dict(type='workspaceWrite',writableRoots=[os.getcwd()],networkAccess=True,
+                         excludeTmpdirEnvVar=True,excludeSlashTmp=True),
+            **selected, **({{'approvalPolicy':{policy!r}}} if {policy!r} is not None else {{}})))
         if pending_selection is not None:
             if {disconnect_before_applied!r}: raise SystemExit
             selected,pending_selection=pending_selection,None
@@ -108,7 +114,11 @@ for line in sys.stdin:
     body['engines']['codex']['version']=version
     path.write_text(json.dumps(body))
     config = Config.model_validate(body)
-    return CodexSession(tmp_path / 'conversation', config.engines['codex'], config, 'home'), record
+    db=sqlite3.connect(tmp_path / 'host.sqlite3')
+    db.row_factory=sqlite3.Row
+    bindings=AgentStore(SimpleNamespace(db=db,directory=tmp_path))
+    return CodexSession(tmp_path / 'conversation', config.engines['codex'], config, 'home',
+                        bindings=bindings,owner='synthetic-owner'), record
 
 
 def messages(record):
@@ -223,7 +233,8 @@ def test_cancelled_question_and_restart_cannot_replay_old_answer(tmp_path):
             await session.reply(**args)
         thread_id = session.thread_id
         await session.close()
-        resumed = CodexSession(session.dir, session.config, session.host, session.device)
+        resumed = CodexSession(session.dir, session.config, session.host, session.device,
+                               bindings=session.bindings,owner=session.owner)
         await resumed.connect()
         try:
             assert resumed.thread_id == thread_id
@@ -248,7 +259,8 @@ def test_lost_answer_outcome_survives_restart_without_resend_or_false_acceptance
         with pytest.raises(OSError):
             await task
         await session.close()
-        resumed = CodexSession(session.dir, session.config, session.host, session.device)
+        resumed = CodexSession(session.dir, session.config, session.host, session.device,
+                               bindings=session.bindings,owner=session.owner)
         await resumed.connect()
         try:
             assert (await resumed.reply(**args))['status'] == 'unknown'
@@ -516,7 +528,8 @@ def test_resumed_thread_requires_its_own_native_effective_policy_receipt(tmp_pat
         source = Path(binary).read_text()
         assert "'approvalPolicy':'never'" in source
         Path(binary).write_text(source.replace("'approvalPolicy':'never'", "'approvalPolicy':'on-request'"))
-        resumed = CodexSession(session.dir, session.config, session.host, session.device)
+        resumed = CodexSession(session.dir, session.config, session.host, session.device,
+                               bindings=session.bindings,owner=session.owner)
         await resumed.connect()
         try:
             assert resumed.thread_id == original_thread
