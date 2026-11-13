@@ -726,7 +726,10 @@ class Agents:
         identity = call.identity()
         existing = self.db.row(owner, call.request_id)
         if existing is not None:
-            if existing['identity'] != identity:
+            # Keep legacy identities usable while distinguishing exact typed model input.
+            saved_params = json.loads(existing['request']).get('params', {})
+            if existing['identity'] != identity or json.dumps(saved_params, sort_keys=True) != json.dumps(
+                    call.params, sort_keys=True):
                 raise Refused('request_id_conflict')
             return self.view(owner, call.request_id, 0)
         config = self.read_config()

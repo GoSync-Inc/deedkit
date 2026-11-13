@@ -101,7 +101,7 @@ def test_bare_default_launch_result_and_mandatory_skill_reuse(tmp_path):
         assert 'sandbox_workspace_write.network_access=true' in argv
         assert 'approval_policy=never' in argv
         assert not any('mcp_servers' in item or 'dangerously' in item or 'ignore-rules' in item for item in argv)
-        assert 'SERIAL' in prompt and 'Order check for me' not in prompt
+        assert 'SERIAL' in prompt and 'Order check for me' in prompt
         assert service.phone.commands == []  # no guard, hierarchy, or phone MCP
         home = Path(seen['env']['CODEX_HOME'])
         skill = home / 'skills' / 'example-food' / 'SKILL.md'
