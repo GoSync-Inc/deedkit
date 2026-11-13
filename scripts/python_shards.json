@@ -356,7 +356,7 @@
   "tests/test_telegram_stories.py": 0.0,
   "tests/test_telegram_window.py": 1.3,
   "tests/test_telemetry.py": 5.8,
-  "tests/test_tiden_ci.py": 109.3,
+  "tests/test_tiden_ci.py": 0.0,
   "tests/test_tiden_drift.py": 17.3,
   "tests/test_tiden_health.py": 56.4,
   "tests/test_tiden_pr_check.py": 32.6,

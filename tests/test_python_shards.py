@@ -69,8 +69,11 @@ def test_the_committed_plan_balances_the_measured_suite_and_job_overheads():
     # work so that no shard job ends more than 10 % after the mean one.
     measured = json.loads((ROOT / "tests/fixtures/python-shards-measured-2026-11-12.json").read_text())
     plan = python_shards.plan(sorted(measured["seconds"]), tiden_ci.PYTHON_SHARDS, WEIGHTS)
+    # The complete reporting module now runs beside the real Go suites, outside the Python shards.
+    # Keep the historical measured fixture and the 10 % bound; model only the work these shards execute.
     ends = [measured["overhead"]["verify" if index == 1 else "python"]
-            + sum(seconds for name, seconds in measured["seconds"].items() if plan[name] == index)
+            + sum(seconds for name, seconds in measured["seconds"].items()
+                  if plan[name] == index and name != "tests/test_tiden_ci.py")
             for index in range(1, tiden_ci.PYTHON_SHARDS + 1)]
     assert max(ends) <= 1.10 * sum(ends) / len(ends), ends
 
@@ -453,4 +456,4 @@ def test_a_partial_rerun_keeps_the_untouched_shard_jobs_fragments(tmp_path):
     assert {job: merged["producers"][job]["attempt"] for job in tiden_ci.SHARD_JOBS} == {
         job: "1" if job in ("python-2", "python-4") else "2" for job in tiden_ci.SHARD_JOBS}
     names = [case.get("name") for case in ET.parse(tmp_path / "ci-evidence" / "python.xml").getroot().iter("testcase")]
-    assert names == ["x", *tiden_ci.SHARD_JOBS]
+    assert names == ["x", *tiden_ci.SHARD_JOBS, "go-reporting"]
