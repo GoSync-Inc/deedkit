@@ -438,6 +438,64 @@ def first_line_id(description):
     return match.group(1) if match else None
 
 
+def ack_positions(sid, page):
+    """Authoritative identity and positions of this feedback-only subscription; no transport token."""
+    sub, module = page.get('subscription'), page.get('module')
+    if not isinstance(sub, dict) or not isinstance(module, dict):
+        return None
+    if (sub.get('subscription_id') != sid or sub.get('label') != LABEL or sub.get('state') != 'active'
+            or page.get('items') != [] or page.get('has_more') is not False
+            or type(module.get('has_more')) is not bool or 'gap' not in sub or 'gap' not in module
+            or page.get('scope_masked') is not False or sub.get('scope_masked') is not False
+            or any((page.get('gap'), sub.get('gap'), module.get('gap')))):
+        return None
+    value = {'sid': sid, 'subscription_version': sub.get('version'), 'version': page.get('ack_version'),
+        'before': page.get('acked_through'), 'through': page.get('next_after'),
+        'module_before': module.get('acked_through'), 'module_through': module.get('next_after')}
+    if (any(type(v) is not int or not 0 <= v <= 2**53 - 1 for k, v in value.items() if k != 'sid')
+            or value['version'] < 1 or value['subscription_version'] < 1 or value['before'] != value['through']
+            or value['module_through'] < value['module_before']):
+        return None
+    return value
+
+
+def event_feedback_id(event):
+    """Do not filter malformed/unmapped events out of a receipt and then authorize a partial ACK."""
+    fields = {'module_event_id', 'specversion', 'id', 'source', 'type', 'subject', 'time', 'data', 'urgency', 'expires_at', 'expired'}
+    if (not isinstance(event, dict) or set(event) != fields or event.get('source') != 'deedkit:feedback'
+            or event.get('specversion') != '1.0' or event.get('urgency') != 'now'
+            or event.get('expires_at') is not None or event.get('expired') is not False):
+        return None
+    seq, data, kind = event.get('module_event_id'), event.get('data'), event.get('type')
+    if type(seq) is not int or seq < 1 or event.get('id') != 'feedback:%d' % seq or not isinstance(data, dict):
+        return None
+    fid = data.get('feedback_id')
+    if not isinstance(fid, str) or not re.fullmatch(UUID, fid) or event.get('subject') != fid:
+        return None
+    try:
+        if datetime.fromisoformat(event['time'].replace('Z', '+00:00')).tzinfo is None:
+            return None
+    except (KeyError, AttributeError, TypeError, ValueError):
+        return None
+    if kind == 'feedback.projection_recorded':
+        return fid if set(data) == {'feedback_id', 'classification'} and data['classification'] in (
+            'reported-bug', 'feature', 'question', 'not-actionable', 'already-live', 'enable-only') else None
+    status = kind.removeprefix('feedback.') if isinstance(kind, str) and kind.startswith('feedback.') else None
+    if (status not in ('received', 'accepted', 'declined', 'duplicate', 'fixed', 'verify_requested') or data.get('status') != status or
+            set(data) - {'feedback_id', 'status', 'previous_status', 'spec_ref', 'fixed_in', 'category'}):
+        return None
+    if ('previous_status' in data and (data['previous_status'] not in FORWARD or data['previous_status'] == status)
+            or status != 'received' and 'previous_status' not in data
+            or 'category' in data and data['category'] not in ('bug', 'feature', 'quality', 'other')
+            or 'spec_ref' in data and (not isinstance(data['spec_ref'], str) or not SPEC.fullmatch(data['spec_ref']))
+            or 'fixed_in' in data and (not isinstance(data['fixed_in'], str) or not RELEASE.fullmatch(data['fixed_in']))):
+        return None
+    if status == 'received' and (('previous_status' in data) == ('category' in data) or
+            'category' in data and ('spec_ref' in data or 'fixed_in' in data)):
+        return None
+    return fid
+
+
 def word(value):
     return value if isinstance(value, str) and WORD.fullmatch(value) else 'unknown'
 
@@ -690,18 +748,79 @@ class Bridge:
         sid = self.ensure_subscription()
         if page is None:
             page = self.events('messages_fetch_subscription_events', sid, {'limit': 100, 'detail': 'compact'})
+        self.reconcile_ack(sid, page)
         stats = {'created': 0, 'updated': 0}
         listed = (page.get('module') or {}).get('items') or []
-        ids = [x['data']['feedback_id'] for x in listed if isinstance(x, dict) and isinstance(x.get('data'), dict)
-            and isinstance(x['data'].get('feedback_id'), str) and re.fullmatch(UUID, x['data']['feedback_id'])]
         self.export_items(lambda raw: self.apply(raw, stats), save=True)
         if listed:
-            if not page.get('receipt') or not isinstance(page.get('ack_version'), int):
-                log('ack_unavailable')
-            elif all([self.ledger.link(f) is not None or self.ledger.bump_unresolved(f) >= 3 for f in ids]):
-                self.gateway.call('messages_ack_subscription_events', {'subscription_id': sid, 'receipt': page['receipt'],
-                    'version': page['ack_version']})
+            self.ack_saved_events(sid, page)
         return stats
+
+    def saved_tasks(self, ids):
+        for fid in set(ids):
+            link = self.ledger.link(fid)
+            if not link or link['skipped'] or not link['task_id'] or not link['task_key']:
+                return False
+            try:
+                task = self.tasks.get(link['task_key'])
+            except BridgeError:
+                return False
+            if (not isinstance(task, dict) or task.get('id') != link['task_id'] or task.get('key') != link['task_key']
+                    or first_line_id(task.get('description')) != fid):
+                return False
+        return bool(ids)
+
+    def reconcile_ack(self, sid, page):
+        raw = self.ledger.meta('pending_ack')
+        if raw is None:
+            return
+        try:
+            pending = json.loads(raw)
+            valid = (isinstance(pending, dict) and set(pending) == {'sid', 'subscription_version', 'version', 'before',
+                'through', 'module_before', 'module_through'} and isinstance(pending['sid'], str)
+                and all(type(v) is int and 0 <= v <= 2**53 - 1 for k, v in pending.items() if k != 'sid'))
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ConfigError('ack_intent_invalid')
+        current = ack_positions(sid, page)
+        if (current and pending['sid'] == sid and current['subscription_version'] == pending['subscription_version']
+                and current['version'] > pending['version'] and current['before'] >= pending['through']
+                and current['module_before'] >= pending['module_through']):
+            self.ledger.del_meta('pending_ack')
+            return
+        # An unchanged snapshot can race an in-flight commit. It never proves non-application and never permits retry.
+        raise Uncertain('ack_outcome_unresolved')
+
+    def ack_saved_events(self, sid, page):
+        intent, listed = ack_positions(sid, page), (page.get('module') or {}).get('items')
+        if (not intent or not isinstance(listed, list) or not listed or not isinstance(page.get('receipt'), str)
+                or not 32 <= len(page['receipt']) <= 128
+                or page.get('ack_available') is not True):
+            log('ack_page_unconfirmed')
+            return
+        ids = [event_feedback_id(event) for event in listed]
+        seq = [event.get('module_event_id') if isinstance(event, dict) else None for event in listed]
+        if (any(fid is None for fid in ids) or len(set(seq)) != len(seq) or seq != sorted(seq)
+                or seq[0] <= intent['module_before'] or seq[-1] != intent['module_through']):
+            log('ack_page_unconfirmed')
+            return
+        if not self.saved_tasks(ids):
+            log('ack_tasks_unconfirmed')
+            return
+        self.ledger.set_meta('pending_ack', json.dumps(intent, separators=(',', ':')))
+        try:
+            result = self.gateway.call('messages_ack_subscription_events', {'subscription_id': sid,
+                'receipt': page['receipt'], 'version': intent['version']})
+        except Refused:
+            self.ledger.del_meta('pending_ack')  # definite non-application, unlike an unknown transport result
+            raise
+        if (result.get('subscription_id') != sid or result.get('provider_read_state_changed') is not False
+                or any(type(result.get(k)) is not int for k in ('ack_version', 'acked_through', 'module_acked_through'))
+                or result['ack_version'] != intent['version'] + 1 or result['acked_through'] != intent['through']
+                or result['module_acked_through'] != intent['module_through']):
+            raise Uncertain('ack_result_unconfirmed')
+        self.ledger.del_meta('pending_ack')
 
     # ---- reverse ----
     def readback(self):

@@ -57,6 +57,7 @@ class FakeGateway:
         self.acked, self.writes, self.on_wait, self.on_ack = 0, {}, None, None
         self.create_mode = self.write_mode = self.crash_after_ack = None
         self.page = 100
+        self.ack_version, self.module_acked = 7, 0
 
     def calls(self, tool):
         return [args for name, args in self.log if name == tool]
@@ -94,36 +95,42 @@ class FakeGateway:
         project_page (module_events.page holds the items)."""
         items = [{'module_event_id': n, 'specversion': '1.0', 'id': 'feedback:%d' % n, 'source': 'deedkit:feedback',
             'type': kind, 'subject': ident, 'time': iso(NOW), 'data': self.event_data(kind, ident), 'urgency': 'now',
-            'expires_at': None, 'expired': False} for n, (kind, ident) in enumerate(self.events, 1)]
+            'expires_at': None, 'expired': False} for n, (kind, ident) in enumerate(self.events, self.module_acked + 1)]
         return {'subscription': {'subscription_id': 'sub-0', 'state': 'active', 'version': 1, 'label': SUB, 'matched_through': 1,
             'matcher_caught_up': True, 'acked_through': 1, 'blocked_reason': None, 'gap': None, 'scope_masked': False},
             'items': [], 'has_more': False, 'next_after': 1, 'consumption': 'explicit_subscription_ack', 'scope_masked': False,
-            'module': {'items': items, 'has_more': False, 'next_after': len(items), 'gap': None, 'acked_through': 0},
+            'module': {'items': items, 'has_more': False, 'next_after': self.module_acked + len(items), 'gap': None,
+                'acked_through': self.module_acked},
             'positions': {'acked_through': 1, 'fetched_through': 1, 'open_receipts': 1 if items else 0,
                 'oldest_open_receipt_expires_at': iso(NOW + 300) if items else None, 'expired_unacked': 0},
-            'ack_version': 7, 'receipt': RECEIPT if items else None, 'acked_through': 1,
+            'ack_version': self.ack_version, 'receipt': RECEIPT if items else None, 'acked_through': 1,
             'receipt_expires_at': iso(NOW + 300) if items else None, 'ack_available': True}
 
     def messages_fetch_subscription_events(self, subscription_id, limit=50, detail=None):
-        return self.page_of()
+        page = self.page_of()
+        page['subscription']['subscription_id'] = subscription_id
+        return page
 
     def messages_wait_for_subscription_events(self, subscription_id, timeout=25, limit=50, detail=None):
         if self.on_wait is not None:
             hook, self.on_wait = self.on_wait, None
             hook()
         page = self.page_of()
+        page['subscription']['subscription_id'] = subscription_id
         return page | {'wait_status': 'events_available' if page['module']['items'] else 'timeout'}
 
     def messages_ack_subscription_events(self, subscription_id, receipt, version):
-        assert receipt == RECEIPT and version == 7
+        assert receipt == RECEIPT and version == self.ack_version
         if self.on_ack is not None:
             self.on_ack()
         self.order.append('ack')
+        self.module_acked += len(self.events)
+        self.ack_version += 1
         self.events, self.acked = [], self.acked + 1
         if self.crash_after_ack:
             raise Crash
-        return {'subscription_id': subscription_id, 'acked_through': 1, 'ack_version': 8, 'provider_read_state_changed': False,
-            'module_acked_through': 1}
+        return {'subscription_id': subscription_id, 'acked_through': 1, 'ack_version': self.ack_version,
+            'provider_read_state_changed': False, 'module_acked_through': self.module_acked}
 
     def messages_export_feedback_metadata(self, cursor=None, limit=50):
         after = int(cursor or 0)
@@ -324,7 +331,8 @@ def test_a_first_run_skips_history_and_closed_items(tmp_path):
     bridge.cycle()
     assert sorted(t['title'] for t in tasks.tasks.values()) == ['bug feedback: messages_search (metadata only)'] * 2
     assert {n: bridge.ledger.link(fid(n))['skipped'] for n in (1, 2, 3, 4, 5)} == {1: 1, 2: 1, 3: 0, 4: 1, 5: 0}
-    assert gw.acked == 1
+    # Owner 11-13: a skipped ledger row is not durable save in BB. Preserve backfill behavior, hold the receipt.
+    assert gw.acked == 0
 
 
 # spec: ANYM-990
@@ -425,7 +433,167 @@ def test_an_event_for_an_item_nobody_returns_is_acked_after_three_cycles(tmp_pat
         bridge.cycle()
         assert gw.acked == 0
     bridge.cycle()
-    assert gw.acked == 1 and not tasks.tasks and bridge.ledger.unresolved(fid(7)) >= 3
+    # Historical identity kept for Tiden. Exact owner 11-13 authority supersedes the old three-cycle assertion:
+    # «Да, разрешаю, если так надо, давай делать. Я разрешаю, конечно.» — only after durable BB save.
+    assert gw.acked == 0 and not tasks.tasks
+
+
+# spec: ANYM-990
+@pytest.mark.parametrize('case', ['malformed', 'empty-id', 'unmapped', 'wrong-subject', 'missing-time',
+    'bad-module-id', 'hidden-through', 'top-message', 'gap', 'scope-masked', 'wrong-subscription', 'private-data',
+    'bad-receipt', 'missing-more', 'bad-status', 'bad-category'])
+def test_every_event_covered_by_a_receipt_must_be_well_formed_feedback_with_actual_bb_evidence(tmp_path, case):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1))
+    bridge.apply(row(1), {'created': 0, 'updated': 0})
+    page = gw.page_of()
+    event = page['module']['items'][0]
+    if case == 'malformed':
+        page['module']['items'].append({'data': {'feedback_id': fid(1)}})
+    elif case == 'empty-id':
+        page['module']['items'] = [{'data': {}}]
+    elif case == 'unmapped':
+        event['type'] = 'calendar.event.created'
+    elif case == 'wrong-subject':
+        event['subject'] = fid(2)
+    elif case == 'missing-time':
+        event.pop('time')
+    elif case == 'bad-module-id':
+        event['module_event_id'] = True
+    elif case == 'hidden-through':
+        page['module']['next_after'] += 1
+    elif case == 'top-message':
+        page['items'] = [{'event_id': 1}]
+    elif case == 'gap':
+        page['module']['gap'] = {'reason': 'retention_gap'}
+    elif case == 'scope-masked':
+        page['scope_masked'] = True
+    elif case == 'wrong-subscription':
+        page['subscription']['subscription_id'] = 'another-subscription'
+    elif case == 'private-data':
+        event['data']['description'] = 'CANARY-private-event'
+    elif case == 'bad-receipt':
+        page['receipt'] = 123
+    elif case == 'missing-more':
+        page['module'].pop('has_more')
+    elif case == 'bad-status':
+        event['data']['status'] = 'accepted'
+    else:
+        event['data']['category'] = 'unmapped-category'
+    bridge.forward(page)
+    assert not gw.calls('messages_ack_subscription_events')
+    assert len(tasks.tasks) == 1
+
+
+# spec: ANYM-990
+@pytest.mark.parametrize('case', ['deleted', 'header-edited', 'wrong-task-id', 'lookup-unavailable'])
+def test_a_local_task_link_is_not_enough_without_a_current_matching_bb_task(tmp_path, case):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1))
+    bridge.apply(row(1), {'created': 0, 'updated': 0})
+    if case == 'header-edited':
+        tasks.human('DK-1', description='A human removed the feedback marker.')
+    else:
+        original = tasks.get
+        def get(ref):
+            if case == 'deleted':
+                raise fb.Refused('not_found')
+            if case == 'lookup-unavailable':
+                raise fb.Uncertain('tasks_timeout')
+            return original(ref) | {'id': 'another-task'}
+        tasks.get = get
+    bridge.forward()
+    assert not gw.calls('messages_ack_subscription_events')
+
+
+# spec: ANYM-990
+def test_an_unknown_ack_is_not_retried_on_unchanged_incomplete_or_other_subscription_readback(tmp_path):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1))
+    gw.fail['messages_ack_subscription_events'] = fb.Uncertain('gateway_unreachable')
+    with pytest.raises(fb.Uncertain):
+        bridge.forward()
+    assert bridge.ledger.meta('pending_ack') and RECEIPT not in bridge.ledger.meta('pending_ack')
+    for change in ('unchanged', 'incomplete', 'other-subscription'):
+        revived, _, _ = make(tmp_path, gateway=gw, tasks=tasks)
+        page = gw.page_of()
+        if change == 'incomplete':
+            page.pop('ack_version')
+        elif change == 'other-subscription':
+            page['subscription']['subscription_id'] = 'another-subscription'
+        with pytest.raises(fb.Uncertain, match='ack_outcome_unresolved'):
+            revived.forward(page)
+        assert len(gw.calls('messages_ack_subscription_events')) == 1
+        assert revived.ledger.meta('pending_ack')
+
+
+# spec: ANYM-990
+def test_definitive_cursor_and_version_readback_reconciles_a_committed_ack_without_resending_it(tmp_path):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1))
+    original = gw.messages_ack_subscription_events
+    def lost(**args):
+        original(**args)
+        raise fb.Uncertain('gateway_unreachable')
+    gw.messages_ack_subscription_events = lost
+    with pytest.raises(fb.Uncertain):
+        bridge.forward()
+    assert bridge.ledger.meta('pending_ack')
+    gw.messages_ack_subscription_events = original
+    revived, _, _ = make(tmp_path, gateway=gw, tasks=tasks)
+    revived.forward()
+    assert revived.ledger.meta('pending_ack') is None
+    assert len(gw.calls('messages_ack_subscription_events')) == 1 and len(tasks.tasks) == 1
+
+
+# spec: ANYM-990
+def test_an_unreadable_successful_ack_reply_keeps_its_intent_until_positive_readback(tmp_path):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1))
+    original = gw.messages_ack_subscription_events
+    def malformed(**args):
+        original(**args)
+        return {}
+    gw.messages_ack_subscription_events = malformed
+    with pytest.raises(fb.Uncertain, match='ack_result_unconfirmed'):
+        bridge.forward()
+    assert bridge.ledger.meta('pending_ack')
+    gw.messages_ack_subscription_events = original
+    bridge.forward()
+    assert bridge.ledger.meta('pending_ack') is None and len(gw.calls('messages_ack_subscription_events')) == 1
+
+
+# spec: ANYM-990
+def test_a_definite_ack_refusal_does_not_masquerade_as_an_unknown_mutation(tmp_path):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1))
+    gw.fail['messages_ack_subscription_events'] = fb.Refused('policy_changed', 409)
+    with pytest.raises(fb.Refused):
+        bridge.forward()
+    assert bridge.ledger.meta('pending_ack') is None
+    gw.fail = {}
+    bridge.forward()
+    assert gw.acked == 1 and len(tasks.tasks) == 1
+
+
+# spec: ANYM-990
+def test_partial_cursor_or_version_advancement_never_clears_an_unknown_ack(tmp_path):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1))
+    gw.fail['messages_ack_subscription_events'] = fb.Uncertain('gateway_unreachable')
+    with pytest.raises(fb.Uncertain):
+        bridge.forward()
+    for case in ('version-only', 'cursor-only', 'definition-changed'):
+        page = gw.page_of()
+        if case != 'cursor-only':
+            page['ack_version'] += 1
+        if case != 'version-only':
+            page['module']['acked_through'] = page['module']['next_after']
+        if case == 'definition-changed':
+            page['subscription']['version'] += 1
+        with pytest.raises(fb.Uncertain, match='ack_outcome_unresolved'):
+            bridge.forward(page)
+    assert len(gw.calls('messages_ack_subscription_events')) == 1 and bridge.ledger.meta('pending_ack')
 
 
 # spec: ANYM-990
@@ -443,6 +611,13 @@ def test_a_crash_at_any_step_leaves_one_task_and_one_ack(tmp_path, point):
         bridge.cycle()
     gw.on_ack = gw.crash_after_ack = None
     revived, _, _ = make(tmp_path, gateway=gw, tasks=tasks)
+    if point == 'link':
+        # Identity/parameters retained. A crash at transport entry is unknown to the bridge: never resend.
+        with pytest.raises(fb.Uncertain, match='ack_outcome_unresolved'):
+            revived.cycle()
+        assert gw.acked == 0 and gw.events and revived.ledger.meta('pending_ack')
+        assert len(tasks.tasks) == 1 and tasks.count('create') == 1
+        return
     revived.cycle()
     assert len(tasks.tasks) == 1 and gw.events == [] and revived.ledger.link(fid(1))['task_key'] == 'DK-1'
     assert tasks.count('create') == (2 if point == 'journal' else 1)
@@ -557,8 +732,11 @@ def test_gateway_down_ends_the_cycle_before_any_task_write_and_a_lost_ack_is_ret
     with pytest.raises(fb.Uncertain):
         bridge.cycle()
     gw.fail = {}
-    bridge.cycle()
-    assert len(tasks.tasks) == 1 and tasks.count('create') == 1 and gw.acked == 1
+    # Historical identity retained: new exact owner authority forbids retry on unchanged readback.
+    with pytest.raises(fb.Uncertain, match='ack_outcome_unresolved'):
+        bridge.cycle()
+    assert len(tasks.tasks) == 1 and tasks.count('create') == 1 and gw.acked == 0
+    assert len(gw.calls('messages_ack_subscription_events')) == 1
 
 
 # spec: ANYM-990
