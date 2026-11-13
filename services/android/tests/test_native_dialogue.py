@@ -13,7 +13,9 @@ from deedkit_android.codex_session import CodexSession
 from deedkit_android.config import Config, Refused
 
 
-def native(tmp_path, *, policy='never', version='0.166.0'):
+def native(tmp_path, *, policy='never', version='0.166.0', models=None, effective=None, delayed_settings=False, disconnect_before_applied=False):
+    if models is None:
+        models = [dict(id=name, model=name, supportedReasoningEfforts=[{'reasoningEffort': e} for e in ('minimal','low','medium','high')],serviceTiers=[{'id':'ultrafast'}]) for name in ('gpt-6.1-sol','gpt-6.1-terra')]
     record = tmp_path / 'wire.jsonl'
     binary = tmp_path / 'native'
     binary.write_text(f'''#!{sys.executable}
@@ -21,6 +23,8 @@ import json, os, sys
 if sys.argv[1:] == ['--version']:
     print({version!r}); raise SystemExit
 thread, turn, mode, count = 'thread-' + str(os.getpid()), None, None, 0
+selected = dict(model='gpt-6.1-sol',reasoningEffort='medium',serviceTier='ultrafast')
+pending_selection = None
 def emit(**body): print(json.dumps(body), flush=True)
 def event(method, **params): emit(method=method, params=dict(threadId=thread, **params))
 def finish():
@@ -32,7 +36,21 @@ for line in sys.stdin:
     method, p=m.get('method'), m.get('params', {{}})
     if method == 'initialize': emit(id=m['id'], result={{}})
     elif method in ('thread/start','thread/resume'):
-        thread=p.get('threadId',thread); emit(id=m['id'], result=dict(thread=dict(id=thread), **({{'approvalPolicy':{policy!r}}} if {policy!r} is not None else {{}})))
+        thread=p.get('threadId',thread); emit(id=m['id'], result=dict(thread=dict(id=thread), **selected, **({{'approvalPolicy':{policy!r}}} if {policy!r} is not None else {{}})))
+        if pending_selection is not None:
+            if {disconnect_before_applied!r}: raise SystemExit
+            selected,pending_selection=pending_selection,None
+            event('thread/settings/updated',threadSettings=dict(model=selected['model'],effort=selected['reasoningEffort'],serviceTier=selected['serviceTier'],approvalPolicy={policy!r}))
+    elif method == 'model/list': emit(id=m['id'],result=dict(data={models!r},nextCursor=None))
+    elif method == 'thread/settings/update':
+        updated=dict(model=p['model'],reasoningEffort=p['effort'],serviceTier=None if p['serviceTier']=='default' else p['serviceTier'])
+        updated.update({effective!r} or {{}})
+        if {delayed_settings!r}:
+            pending_selection=updated
+        else:
+            selected=updated
+        emit(id=m['id'],result={{}})
+        if not {delayed_settings!r}: event('thread/settings/updated',threadSettings=dict(model=selected['model'],effort=selected['reasoningEffort'],serviceTier=selected['serviceTier'],approvalPolicy={policy!r}))
     elif method == 'turn/start':
         count+=1; turn='turn-'+str(os.getpid())+'-'+str(count); mode=p['input'][0]['text']
         if 'Caller input (nonsecret JSON):\\n' in mode:
@@ -42,7 +60,9 @@ for line in sys.stdin:
         event('turn/started', turn=dict(id=turn,status='inProgress'))
         event('turn/completed', turn=dict(id='unrelated-old-turn',status='completed'))
         if mode == 'policy-changed': event('thread/settings/updated',threadSettings=dict(approvalPolicy='on-request'))
-        if mode.startswith('  Home,'): finish()
+        if mode == 'reroute':
+            event('model/rerouted',turnId=turn,fromModel='gpt-6.1-sol',toModel='gpt-6.1-terra',reason='highRiskCyberActivity')
+        elif mode.startswith('  Home,'): finish()
         elif mode == 'mcp-approval' and {policy!r} == 'never':
             # Pinned0.166 mcp_tool_call.rs1655 refuses BEFORE request_user_input dispatch.
             event('item/completed',turnId=turn,item=dict(id='mcp',type='mcpToolCall',status='failed')); finish()
@@ -429,7 +449,8 @@ def test_shared_question_method_requires_native_effective_never_receipt(tmp_path
         await session.connect()
         events = []
         try:
-            assert await asyncio.wait_for(session.turn('mcp-approval', session.config, lambda e: collect(events, e), request_id='original-run'), 2) == 'completed'
+            with pytest.raises(Refused,match='native_selection_unconfirmed'):
+                await session.turn('mcp-approval',session.config,lambda e: collect(events,e),request_id='original-run')
             assert not any(e.get('method') == 'item/tool/requestUserInput' for e in events)
             assert session.receipts('original-run') == []
             assert not any(r['message'].get('result', {}).get('answers') for r in messages(record))
@@ -468,6 +489,11 @@ def test_pinned_never_denies_mcp_before_shared_method_and_does_not_classify_opti
 def test_changed_effective_policy_or_unproven_native_version_refuses_shared_method(tmp_path, mode):
     async def check():
         session, record = native(tmp_path, version='0.166.0' if mode == 'policy-changed' else '9.9.9')
+        if mode == 'question':
+            with pytest.raises(Refused,match='native_version_unsupported'):
+                await session.connect()
+            assert messages(record) == []
+            return
         await session.connect()
         try:
             events = []
@@ -495,9 +521,10 @@ def test_resumed_thread_requires_its_own_native_effective_policy_receipt(tmp_pat
         try:
             assert resumed.thread_id == original_thread
             events = []
-            assert await asyncio.wait_for(resumed.turn('question',resumed.config,lambda e: collect(events,e),request_id='original-run'),2) == 'completed'
+            with pytest.raises(Refused,match='native_selection_unconfirmed'):
+                await resumed.turn('question',resumed.config,lambda e: collect(events,e),request_id='original-run')
             assert resumed.receipts('original-run') == []
-            request = [r['message'] for r in messages(record) if r['message'].get('method') == 'thread/resume'][-1]
+            request = [r['message'] for r in messages(record) if r['message'].get('method') == 'thread/resume' and 'approvalPolicy' in r['message']['params']][-1]
             assert request['params']['approvalPolicy'] == 'never'
         finally:
             await resumed.close()

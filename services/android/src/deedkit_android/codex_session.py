@@ -8,7 +8,7 @@ from pathlib import Path
 import time
 
 from . import engines
-from .agent_bare import BareRun
+from .agent_bare import BareRun, PERSISTENT_MODEL, PERSISTENT_TIER
 from .agent_run import MAX_NOTES, MINUTE_S
 from .config import Refused
 
@@ -25,6 +25,9 @@ class CodexSession:
         self.errors = []
         self.request_id, self.stopping = None, False
         self.policy_proven, self.turn_policy_proven = False, False
+        self.selection, self.version_verified = {}, False
+        self.settings_applied = None
+        self.disconnected = False
         self.interactions, self.interaction_lock = {}, asyncio.Lock()
         self.journal = directory.parent / (directory.name + '.dialogue.json')  # outside native writable cwd
 
@@ -150,7 +153,7 @@ class CodexSession:
                 raise Refused('native_question_policy_unproven')
             if self.thread_id != thread_id or self.last_turn_id != turn_id:
                 raise Refused('native_turn_mismatch')
-            if self.process is None or self.process.returncode is not None or self.process.stdin.is_closing():
+            if self.disconnected or self.process is None or self.process.returncode is not None or self.process.stdin.is_closing():
                 raise Refused('native_session_disconnected')
             self.unresolved_input(request_id, turn_id)
 
@@ -210,7 +213,7 @@ class CodexSession:
                 raise Refused('native_question_policy_unproven')
             if admit:
                 admit(True)
-            if self.process.returncode is not None or self.process.stdin.is_closing():
+            if self.disconnected or self.process.returncode is not None or self.process.stdin.is_closing():
                 raise Refused('native_session_disconnected')  # proven refusal before any write
             row.update(digest=digest, state='unknown', status='unknown')
             self.save_interactions()
@@ -241,7 +244,7 @@ class CodexSession:
             self.active(request_id, thread_id, turn_id)
             if admit:
                 admit(True)
-            if self.process.returncode is not None or self.process.stdin.is_closing():
+            if self.disconnected or self.process.returncode is not None or self.process.stdin.is_closing():
                 raise Refused('native_session_disconnected')
             self.unresolved_input(request_id, turn_id)  # changing the input route cannot bypass an uncertain write
             row = {'kind': 'steer', 'original_request_id': request_id, 'native_thread_id': thread_id,
@@ -262,6 +265,9 @@ class CodexSession:
     async def connect(self):
         pinned = (self.config.version == '0.166.0' and await asyncio.to_thread(
             engines.installed_version, self.config.binary) == '0.166.0')
+        if not pinned:
+            raise Refused('native_version_unsupported')
+        self.version_verified = True
         self.dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.load_interactions()
         # App-server has no -C argument carrying our marker token. A verified executable link
@@ -293,9 +299,10 @@ class CodexSession:
         self.reader = asyncio.create_task(self.read())
         self.stderr_reader = asyncio.create_task(self.read_stderr())
         try:
-            await self.rpc('initialize', {'clientInfo': {'name': 'deedkit_android', 'version': '0.1.0'}})
+            await self.rpc('initialize', {'clientInfo': {'name': 'deedkit_android', 'version': '0.1.0'},
+                                          'capabilities': {'experimentalApi': True}})
             self.send({'method': 'initialized', 'params': {}})
-            params = {'cwd': str(self.dir), 'model': self.config.model,
+            params = {'cwd': str(self.dir), 'model': self.config.model or PERSISTENT_MODEL,
                       'sandbox': 'workspace-write', 'approvalPolicy': 'never'}
             saved = self.dir / 'thread.json'
             if saved.exists():
@@ -312,7 +319,7 @@ class CodexSession:
             raise
 
     def send(self, message):
-        if self.process.returncode is not None:
+        if self.disconnected or self.process.returncode is not None:
             raise OSError('native_session_disconnected')
         self.process.stdin.write(json.dumps(message).encode() + b'\n')
 
@@ -353,6 +360,16 @@ class CodexSession:
                     except Refused as error:
                         # Approval/elicitation/secret requests never become ordinary clarification answers.
                         self.send({'id': message['id'], 'error': {'code': -32601, 'message': error.code}})
+                elif message.get('method') == 'thread/settings/updated':
+                    params = message.get('params') or {}
+                    if params.get('threadId') != self.thread_id:
+                        continue
+                    if (params.get('threadSettings') or {}).get('approvalPolicy') != 'never':
+                        self.policy_proven, self.turn_policy_proven = False, False
+                    if self.settings_applied is not None and not self.settings_applied.done():
+                        self.settings_applied.set_result(None)  # wake hint; a fresh readback must still confirm values
+                    if self.events is not None:
+                        self.events.put_nowait(message)
                 elif self.events is not None:
                     params = message.get('params') or {}
                     if params.get('threadId') != self.thread_id:
@@ -362,9 +379,8 @@ class CodexSession:
                         continue  # late/unrelated turn events cannot complete or mutate this turn
                     if message.get('method') == 'turn/started':
                         self.turn_id = params['turn']['id']
-                    if message.get('method') == 'thread/settings/updated':
-                        if (params.get('threadSettings') or {}).get('approvalPolicy') != 'never':
-                            self.policy_proven, self.turn_policy_proven = False, False
+                    if message.get('method') == 'model/rerouted':
+                        self.stopping = True  # refuse fresh owner input while the turn is being cancelled
                     if message.get('method') == 'item/completed':
                         item = params.get('item') or {}
                         if item.get('type') == 'agentMessage' and item.get('delivery') == 'async':
@@ -386,6 +402,9 @@ class CodexSession:
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             pass
         finally:
+            self.disconnected = True
+            if self.settings_applied is not None and not self.settings_applied.done():
+                self.settings_applied.set_result(None)  # wake only; the required readback will fail closed
             try:
                 self.finish_questions('expired')
             except OSError:
@@ -401,10 +420,76 @@ class CodexSession:
             self.stderr.extend(chunk)
             del self.stderr[:-16384]
 
+    async def select(self, config):
+        """Validate against this process's native catalog, then read effective settings on the SAME thread."""
+        if not self.version_verified:
+            raise Refused('native_version_unsupported')
+        requested = {'model': config.model or PERSISTENT_MODEL, 'effort': config.reasoning_effort,
+                     'service_tier': config.service_tier or PERSISTENT_TIER}
+        self.selection = {'requested': requested, 'effective': None, 'configuration_status': 'unconfirmed',
+                          'provider_service_tier': None, 'provider_tier_observed': False,
+                          'native_thread_id': self.thread_id, 'source': None, 'timings_ms': {}}
+        phase = time.monotonic()
+        cursor, seen, model = None, set(), None
+        while True:
+            page = await self.rpc('model/list', {'limit': 100, 'includeHidden': True, **({'cursor': cursor} if cursor else {})})
+            model = next((row for row in page.get('data', []) if row.get('model') == requested['model']), None)
+            cursor = page.get('nextCursor')
+            if model or not cursor:
+                break
+            if not isinstance(cursor, str) or cursor in seen:
+                raise Refused('native_catalog_unconfirmed')
+            seen.add(cursor)
+        self.selection['timings_ms']['catalog'] = round((time.monotonic() - phase) * 1000, 2)
+        if model is None:
+            raise Refused('native_model_unsupported')
+        if requested['effort'] not in [row.get('reasoningEffort') for row in model.get('supportedReasoningEfforts', [])]:
+            raise Refused('native_effort_unsupported')
+        if requested['service_tier'] != 'default' and requested['service_tier'] not in [
+                row.get('id') for row in model.get('serviceTiers', [])]:
+            raise Refused('native_service_tier_unsupported')
+        expected = {**requested, 'service_tier': None if requested['service_tier'] == 'default' else requested['service_tier']}
+        self.settings_applied = asyncio.get_running_loop().create_future()
+        try:
+            phase = time.monotonic()
+            await self.rpc('thread/settings/update', {'threadId': self.thread_id, 'model': requested['model'],
+                           'effort': requested['effort'], 'serviceTier': requested['service_tier'], 'approvalPolicy': 'never'})
+            self.selection['timings_ms']['settings'] = round((time.monotonic() - phase) * 1000, 2)
+            for attempt in range(2):
+                phase = time.monotonic()
+                receipt = await self.rpc('thread/resume', {'threadId': self.thread_id, 'excludeTurns': True})
+                elapsed = round((time.monotonic() - phase) * 1000, 2)
+                self.selection['timings_ms']['receipt'] = self.selection['timings_ms'].get('receipt', 0) + elapsed
+                effective = {'model': receipt.get('model'), 'effort': receipt.get('reasoningEffort'),
+                             'service_tier': receipt.get('serviceTier')}
+                self.selection.update(effective=effective, source='thread/resume')
+                self.policy_proven = receipt.get('approvalPolicy') == 'never'
+                if (receipt.get('thread') or {}).get('id') != self.thread_id or not self.policy_proven:
+                    raise Refused('native_selection_unconfirmed')
+                if effective == expected:
+                    break
+                if attempt:
+                    raise Refused('native_selection_unconfirmed')
+                phase = time.monotonic()
+                async with asyncio.timeout(30):
+                    await self.settings_applied
+                self.selection['timings_ms']['applied_wait'] = round((time.monotonic() - phase) * 1000, 2)
+        except TimeoutError:
+            raise Refused('native_selection_unconfirmed') from None
+        finally:
+            if not self.settings_applied.done():
+                self.settings_applied.cancel()
+            self.settings_applied = None
+        self.selection['configuration_status'] = 'confirmed'
+        return requested
+
     async def turn(self, prompt, config, consume, *, request_id=None, on_started=None, admit=None):
         async with self.lock:
             if admit:
                 admit()
+            selected = await self.select(config)
+            if admit:
+                admit()  # discovery/settings reads may await; recheck immediately before goal dispatch
             self.finish_questions('expired')  # a later turn cannot answer an older unresolved question
             self.events = asyncio.Queue()
             self.turn_id = None
@@ -414,7 +499,7 @@ class CodexSession:
             try:
                 response = await self.rpc('turn/start', {
                     'threadId': self.thread_id, 'input': [{'type': 'text', 'text': prompt}],
-                    'model': config.model, 'effort': config.reasoning_effort,
+                    'model': selected['model'], 'effort': selected['effort'], 'serviceTier': selected['service_tier'],
                     'approvalPolicy': 'never',
                     'sandboxPolicy': {'type': 'workspaceWrite', 'writableRoots': [str(self.dir)],
                                       'networkAccess': True}})
@@ -440,6 +525,9 @@ class CodexSession:
     async def interrupt(self):
         if self.events is None or self.done.is_set():
             return  # normal completion leaves async questions pending on this conversation
+        if self.disconnected:
+            await self.close()
+            return
         self.stopping = True
         try:
             self.finish_questions('cancelled')
@@ -501,9 +589,26 @@ class PersistentRun(BareRun):
                 if self.state != 'running':
                     return
                 self.engine_started = time.monotonic()
+
+                def admit():
+                    if self.state != 'running' or not self.agents.devices.locks[self.device].locked():
+                        raise Refused('native_turn_mismatch')
+                    current = self.agents.read_config().agent
+                    if not current.enabled or current.guarded or not current.persistent:
+                        raise Refused('agent_disabled')
+                    if self.authorize:
+                        principal = self.authorize()
+                        if principal.id != self.owner or self.device not in principal.devices:
+                            raise Refused('not_found', 404)
+                        if 'android:control' not in principal.permissions:
+                            raise Refused('forbidden', 403)
+                    self.agents.store.check_reservation(self.owner, self.device, self.request.session_id)
+                    if self.input_admit:
+                        self.input_admit()
+
                 status = await session.turn(self.input_text if self.input_text is not None else self.prompt(),
                                             self.config, self.consume, request_id=self.id, on_started=self.input_started,
-                                            admit=self.input_admit)
+                                            admit=admit)
                 if self.state == 'running':
                     await self.end('succeeded' if status == 'completed' and self.finished else 'failed',
                                    exit_code=0 if status == 'completed' else 1)
@@ -517,6 +622,8 @@ class PersistentRun(BareRun):
             self.stream.errors.append('native_session_disconnected_or_start_failed')
             if self.session:
                 self.stream.errors.extend(self.session.errors)
+                if self.session.disconnected:
+                    await self.session.close()
             await self.end('failed', error='native_session_failed')
         finally:
             heartbeat.cancel()
@@ -529,7 +636,13 @@ class PersistentRun(BareRun):
         method, params = event.get('method'), event.get('params') or {}
         item = params.get('item') or {}
         if method == 'turn/started':
+            await self.event('selection', **self.session.selection)
             await self.event('turn', phase='started', native_thread_id=params['threadId'], native_turn_id=params['turn']['id'])
+        elif method == 'model/rerouted':
+            self.session.selection.update(configuration_status='rerouted', rerouted_to=params.get('toModel'))
+            self.stream.model = params.get('toModel')
+            await self.event('selection', **self.session.selection)
+            await self.end('failed', error='native_model_rerouted')
         elif method == 'item/tool/requestUserInput':
             await self.event('question', native_request_id=event['id'], native_thread_id=params['threadId'],
                              native_turn_id=params['turnId'], item_id=params['itemId'],
@@ -575,6 +688,7 @@ class PersistentRun(BareRun):
     async def final(self, state, extra):
         # No skill directory is exposed or inspected; the native thread owns conversational history.
         result = await super().final(state, extra)
+        result['native_selection'] = dict(self.session.selection) if self.session else {}
         result['skills_updated'] = []
         if self.session and self.session.process:
             result['native_session'] = {'thread_id': self.session.thread_id, 'pid': self.session.process.pid,

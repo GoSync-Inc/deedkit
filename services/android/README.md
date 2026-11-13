@@ -346,7 +346,24 @@ sandbox stays `workspace-write` with network access and the existing `approval_p
 only the session workspace is writable. Auth/config are not added to write roots. No new
 listener, login, key, provider session or permission grant is created by this transport.
 
-Defaults remain Terra medium; per-turn `model`/`effort` overrides are passed to native Codex.
+Persistent bare mode requires native 0.166.0 and targets Sol/medium/ultrafast unless the host or
+caller selects `model`, `effort` or `service_tier`. Before every goal, the same native process's
+`model/list` must advertise the exact model, effort and tier. There is no upgrade, alias or cheaper-tier
+fallback. `service_tier=default` explicitly requests standard routing rather than a catalog default.
+Isolated exec retains Terra/medium compatibility and refuses tier selection it cannot receipt.
+
+The service applies typed thread settings and reads `thread/resume(excludeTurns=true)` for the same
+thread's effective model, effort, service tier and `approvalPolicy=never`. A settings RPC reports submission only. If the first read is stale, wait for the native applied-settings
+notification and read once more; never resend the mutation. Missing/mismatched receipts refuse before goal dispatch. This readback preserves the live process, thread and conversation; it
+does not replay a goal or load a replacement thread. Stop, current key/control/device lease and mode
+are checked again after these awaits. Pending questions survive failed preflight. Async owner answers
+continue with the original task's receipted selection. A native model reroute fails explicitly.
+
+`native_selection` and metadata-only selection events distinguish requested and effective configuration.
+The native receipt confirms configuration; `provider_service_tier=null`/`provider_tier_observed=false`
+explicitly leave the provider-served tier unconfirmed. No raw usage-metadata guessing or speed claim
+follows. Catalog/settings/readback phase times contain only elapsed milliseconds. Actual account/model
+tier availability, provider-tier evidence and comparable caller-path timing remain live acceptance work.
 The native runtime handles its context window; there is no extra rotation timer, hard-coded
 context threshold or periodic polling goal. Android can evict background apps; opening an app
 once is preparation, not a guarantee that the OS keeps it resident.

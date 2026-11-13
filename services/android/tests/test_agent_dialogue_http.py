@@ -250,7 +250,7 @@ def test_start_identity_keeps_legacy_fingerprint_despite_optional_dialogue_field
                      goal='Read', owner_instruction='Read status', params={'COUNT': 2})
     body = {key: value for key, value in call.model_dump().items() if key not in {
         'action', 'request_id', 'session_id', 'after', 'wait_s', 'native_thread_id', 'native_turn_id',
-        'native_request_id', 'item_id', 'answers', 'message_id', 'text'}}
+        'native_request_id', 'item_id', 'answers', 'message_id', 'text', 'service_tier'}}
     body.update(apps=[], secrets=[], outputs=[], params={'COUNT': '2'})
     assert call.identity() == hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
 
@@ -359,7 +359,8 @@ def test_concurrent_post_turn_async_answers_start_one_turn_on_original_native_pr
         assert len(writes(record,'turn/start')) == 2
         assert len({r['pid'] for r in messages(record)}) == 1
         assert len(writes(record,'thread/start')) == 1
-        assert writes(record,'thread/resume') == []
+        assert [r['params'] for r in writes(record,'thread/resume')] == [
+            {'threadId':args['native_thread_id'],'excludeTurns':True}] * 2
 
 
 # spec: ANYM-993

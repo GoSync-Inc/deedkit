@@ -12,6 +12,7 @@ from .agent_run import AgentRun, MINUTE_S, MAX_NOTES
 from .config import Refused
 
 MODEL = 'gpt-6.1-terra'
+PERSISTENT_MODEL, PERSISTENT_TIER = 'gpt-6.1-sol', 'ultrafast'
 
 
 def admission(call, config):
@@ -24,8 +25,14 @@ def admission(call, config):
     engine = config.engines.get('codex')
     if engine is None:
         return None
-    return engine.model_copy(update={'model': call.model or engine.model or MODEL,
-                                     'reasoning_effort': call.effort or engine.reasoning_effort})
+    tier = call.service_tier or engine.service_tier
+    if not config.agent.persistent and tier is not None:
+        raise Refused('service_tier_requires_persistent_bare', 422)
+    if config.agent.persistent and engine.version != '0.166.0':
+        raise Refused('native_version_unsupported')
+    return engine.model_copy(update={'model': call.model or engine.model or (PERSISTENT_MODEL if config.agent.persistent else MODEL),
+                                     'reasoning_effort': call.effort or engine.reasoning_effort,
+                                     'service_tier': tier or PERSISTENT_TIER if config.agent.persistent else None})
 
 
 class BareRun(AgentRun):

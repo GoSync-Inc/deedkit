@@ -13,10 +13,11 @@ def live_host(tmp_path, delay=False, crash=False):
     binary.write_text(f'''#!{sys.executable}
 import json, os, sys, threading, time
 if sys.argv[1:] == ['--version']:
-    print('9.9.9'); raise SystemExit
+    print('0.166.0'); raise SystemExit
 turns = 0
 thread_id = 'native-' + str(os.getpid())
 current = None
+selected = dict(model='gpt-6.1-sol',reasoningEffort='medium',serviceTier='ultrafast')
 def emit(**message):
     print(json.dumps(message), flush=True)
 def event(method, **params):
@@ -30,7 +31,12 @@ for line in sys.stdin:
         emit(id=message['id'], result={{}})
     elif method in ('thread/start', 'thread/resume'):
         thread_id = params.get('threadId', thread_id)
-        emit(id=message['id'], result=dict(thread=dict(id=thread_id)))
+        emit(id=message['id'], result=dict(thread=dict(id=thread_id),approvalPolicy='never',**selected))
+    elif method == 'model/list':
+        emit(id=message['id'],result=dict(data=[dict(id=n,model=n,supportedReasoningEfforts=[dict(reasoningEffort=e) for e in ('minimal','low','medium','high')],serviceTiers=[dict(id='ultrafast')]) for n in ('gpt-6.1-sol','gpt-6.1-terra')],nextCursor=None))
+    elif method == 'thread/settings/update':
+        selected=dict(model=params['model'],reasoningEffort=params['effort'],serviceTier=None if params['serviceTier']=='default' else params['serviceTier'])
+        emit(id=message['id'],result={{}})
     elif method == 'turn/start':
         turns += 1; current = 'turn-' + str(turns)
         if {crash!r}:
@@ -52,6 +58,7 @@ for line in sys.stdin:
     config = write_config(tmp_path, codex=binary, default='codex')
     body = json.loads(config.read_text())
     body['agent'].update(guarded=False, persistent=True)
+    body['engines']['codex']['version']='0.166.0'
     config.write_text(json.dumps(body))
     return config, record
 

@@ -58,3 +58,15 @@ def test_async_question_reply_has_native_message_binding_and_natural_text_withou
         assert not result.get('isError'), result
         assert calls == [('android','agent',args)]
         assert 'native_request_id' not in calls[0][2] and 'answers' not in calls[0][2]
+
+
+# spec: ANYM-993
+def test_native_service_tier_is_forwarded_exactly_without_injected_model_or_fallback(tmp_path):
+    app, calls = setup(tmp_path)
+    args=dict(action='start',request_id=str(uuid.uuid4()),device_id='home',session_id='own-lease',
+              goal='Read status',owner_instruction='Read only',service_tier='ultrafast')
+    with TestClient(app) as client:
+        result=call(client,**args)
+        assert not result.get('isError'), result
+        assert calls==[('android','agent',args)]
+        assert 'model' not in calls[0][2] and 'effort' not in calls[0][2]
