@@ -55,6 +55,7 @@ class AgentConfig(Strict):
     # Off until set: while false no run starts and no engine login file is read (ANYM-971 criterion 10).
     enabled: bool = False
     guarded: bool = False
+    persistent: bool = False
 
 
 class Config(Strict):

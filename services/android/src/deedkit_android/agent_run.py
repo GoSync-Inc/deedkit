@@ -559,7 +559,7 @@ class AgentRun:
                 op.cancel()
                 await asyncio.gather(op, return_exceptions=True)
             if self.process is not None:
-                await engines.kill_group(self.process)
+                await self.stop_engine()
                 self.engine_ms = round((time.monotonic() - (self.engine_started or self.started)) * 1000, 2)
             result = await self.final(state, extra)
         except Exception:  # noqa: BLE001 - the row and the lock below must happen whatever the final read did
@@ -571,6 +571,9 @@ class AgentRun:
             finally:
                 self.agents.release(self)
                 self.concluded.set()
+
+    async def stop_engine(self):
+        await engines.kill_group(self.process)
 
     async def final(self, state, extra):
         """The run's result: what it said and read, and a last look at the screen the phone stays on."""
@@ -622,6 +625,7 @@ class Agents:
         self.db, self.runs, self.by_bearer, self.tasks = AgentStore(store), {}, {}, set()
         self.root = Path(store.directory) / 'agent'
         self.root.mkdir(mode=0o700, exist_ok=True)
+        self.sessions = {}
         self.recover()
 
     def recover(self):
@@ -632,11 +636,16 @@ class Agents:
                 if not (leftover / 'marker.json').exists() or engines.kill_by_marker(leftover / 'marker.json'):
                     shutil.rmtree(leftover, ignore_errors=True)
         self.db.mark_lost()
+        for marker in (self.root / 'sessions').glob('run-live-*/marker.json'):
+            if engines.kill_by_marker(marker):
+                marker.unlink(missing_ok=True)
         self.db.purge(time.time() - RETENTION_S)
 
     async def close(self):
         for run in list(self.runs.values()):
             await run.end('lost', error='service_stopped')
+        for session in self.sessions.values():
+            await session.close()
 
     def task_text(self, run):
         request = run.request
@@ -690,6 +699,7 @@ class Agents:
             version = None
         return {'enabled': config.agent.enabled, **({} if config.agent.enabled else {'reason': 'agent_disabled'}),
                 'mode': 'guarded' if config.agent.guarded else 'bare',
+                'persistent': config.agent.persistent and not config.agent.guarded,
                 'default_model': config.engines.get('codex').model or 'gpt-6.1-terra' if config.engines.get('codex') else 'gpt-6.1-terra',
                 'default_effort': config.engines['codex'].reasoning_effort if 'codex' in config.engines else 'medium',
                 'default_engine': default, 'engines': found, 'tools': list(MODELS) if config.agent.guarded else ['codex'], 'preamble_version': version, 'input_schema': AgentCall.model_json_schema(),
@@ -773,7 +783,11 @@ class Agents:
                 'model': call.model or config.engines[name].model,
                 'reasoning_effort': call.effort or config.engines[name].reasoning_effort})
             model = selected.model or engines.DEFAULT_MODEL[name] or 'default'
-            run = (BareRun if bare else AgentRun)(self, owner, call, name, selected, run_dir, secrets_run, texts)
+            run_type = BareRun if bare else AgentRun
+            if bare and config.agent.persistent:
+                from .codex_session import PersistentRun
+                run_type = PersistentRun
+            run = run_type(self, owner, call, name, selected, run_dir, secrets_run, texts)
             request = {**{key: value for key, value in call.model_dump(exclude={'session_id', 'after', 'wait_s'}).items()},
                        'engine': name}
             self.db.insert(owner, call.request_id, identity, call.device_id, name, model, request)
