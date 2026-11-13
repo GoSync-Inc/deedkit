@@ -12,11 +12,11 @@ Python report is about 220 bytes a case (2.2 MB for 9975 cases, 11-02).
 Test jobs run in parallel and each uploads a `ci-evidence-<job>` fragment:
 `checks / verify` the seven checks and its module reports, `checks / load` the
 gateway load gate, `checks / services` the gateway, platform-contracts, calls,
-calls-frontend, inference and agent-runner module reports, and each `checks / python (<n>/9)` job its shard of the root
-Python/PostgreSQL suite. The root suite runs in nine file-level shards
-(`scripts/python_shards.py`): `checks / verify` runs shard 1 and the eight
-`checks / python (<n>/9)` jobs (`python-2` to `python-9`) shards 2-9, each on its
-own runner with its own PostgreSQL. Every test module belongs to exactly one shard, chosen by committed
+calls-frontend, inference and agent-runner module reports, and each `checks / python (<n>/11)` job its shard of the root
+Python/PostgreSQL suite. The root suite runs in eleven file-level shards
+(`scripts/python_shards.py`): `checks / verify` runs shard 1 and the ten
+`checks / python (<n>/11)` jobs (`python-2` to `python-11`) shards 2-11, each on its
+own runner with its own PostgreSQL. Every root test module except `tests/test_tiden_ci.py` belongs to exactly one shard, chosen by committed
 per-file timings (`scripts/python_shards.json`, refreshed with
 `python scripts/python_shards.py weights <python.xml>`); a module without a
 timing still runs in exactly one shard, and a module pytest would collect that
@@ -24,7 +24,7 @@ the plan cannot name (outside `tests/`, through a directory symlink) is a
 collection error. Each job runs pytest through the selector of the workflow's
 own commit (`ci-tools`), so a baseline of a revision without the selector is
 sharded the same way. The `checks / evidence` job merges the fragments into
-`ci-evidence` and the nine shard reports into one `python.xml`, so test
+`ci-evidence` and the eleven shard reports and the Go-owned reporting module into one `python.xml`, so test
 identities do not change. `anymsg-ci::python` passes only when every shard
 passed with its own valid report of executed tests and no failed one, and every
 shard job succeeded. Each shard is a job of its own rather than one matrix, so
@@ -53,7 +53,18 @@ runs `go test -race -count=1 -json ./...` in `whatsapp/whatsmeow` and in
 fragment as module checks `deedkit-ci::whatsmeow` and
 `deedkit-ci::release_router`. The suites also still run in ci.yml's `native`
 job, which production promotion requires; a job of another workflow cannot feed
-this evidence. Go results are not JUnit, because Tiden lowercases JUnit
+this evidence. The complete Python module `tests/test_tiden_ci.py` runs once in
+this Go job after both native suites, using their fresh streams for its frozen
+Go identity proof instead of executing those suites again. Its existing test
+paths, names and parameters stay unchanged. The proof requires this checkout
+SHA, this run attempt and successful native steps; the same parser still rejects
+failed or malformed results and requires every frozen identity and leaf-only
+rows. A standalone local run still executes Go when no same-job reports are
+provided. The shards leave this module to the Go job; its `python-go.xml` and
+Python step outcome merge into the existing `anymsg-ci::python` check. A missing,
+stale or failed Go producer also blocks or fails that Python check. The final
+artifact retains one `python.xml` and the same seven check identities, with no
+new job or token permission. Go results are not JUnit, because Tiden lowercases JUnit
 identities and the existing Go cases and their links would be orphaned.
 `scripts/tiden_ci.py` turns each stream into Tiden result rows named exactly as
 Tiden's own Go reporter named them: signature `<Package>::<Test>` byte for byte

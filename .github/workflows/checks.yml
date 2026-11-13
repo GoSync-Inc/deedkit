@@ -280,7 +280,7 @@ jobs:
           # directory joins pytest's import path; a baseline of an older revision is sharded the same way.
           mkdir -p "$RUNNER_TEMP/shard-plugin"
           cp ci-tools/scripts/python_shards.py ci-tools/scripts/python_shards.json "$RUNNER_TEMP/shard-plugin/"
-          uv run python "$RUNNER_TEMP/shard-plugin/python_shards.py" pytest --tb=short --durations=25 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/python-${DEEDKIT_TEST_SHARD%%/*}.xml" --ignore=tests/test_backup_r2_verifier_native.py \
+          uv run python "$RUNNER_TEMP/shard-plugin/python_shards.py" pytest --tb=short --durations=25 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/python-${DEEDKIT_TEST_SHARD%%/*}.xml" --ignore=tests/test_backup_r2_verifier_native.py --ignore=tests/test_tiden_ci.py \
             --deselect tests/test_collectors.py::test_session_lock_rejects_directory_chowned_to_foreign_uid_as_root \
             --deselect tests/test_audio_native.py::test_optional_cpu_package_loads_without_gpu_or_model_download \
             --deselect tests/test_audio_native.py::test_faster_whisper_decoder_compatibility_without_model tests
@@ -678,7 +678,8 @@ jobs:
     # The native Go suites (the whatsmeow adapter and the release router) as Tiden evidence: the same tests
     # ci.yml's `native` job requires, run again here because a job of another workflow cannot feed this
     # evidence. scripts/tiden_ci.py turns each `go test -json` stream into result rows under the identities
-    # the existing Tiden cases carry.
+    # the existing Tiden cases carry. The complete Tiden reporting Python module runs here once so its
+    # identity proof reads these same-job streams without rerunning the two real suites in a Python shard.
     needs: documentation
     if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
@@ -733,13 +734,32 @@ jobs:
         if: ${{ !cancelled() }}
         working-directory: services/release-router
         run: go test -race -count=1 -json ./... > "$RUNNER_TEMP/ci-evidence/release-router.json"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        if: ${{ !cancelled() }}
+        with: {python-version: '3.13'}
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        if: ${{ !cancelled() }}
+        with: {version: '0.9.26'}
+      - name: Install the Python reporting tests
+        if: ${{ !cancelled() }}
+        run: uv sync --frozen --group dev
+      - name: Test Tiden reporting against this job's real Go suites
+        id: python_reporting
+        if: ${{ !cancelled() }}
+        env:
+          DEEDKIT_GO_REPORTS: ${{ runner.temp }}/ci-evidence
+          DEEDKIT_GO_SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          WHATSMEOW_OUTCOME: ${{ steps.whatsmeow.outcome }}
+          RELEASE_ROUTER_OUTCOME: ${{ steps.release_router.outcome }}
+        run: uv run pytest --tb=short --durations=25 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/python-go.xml" tests/test_tiden_ci.py
       - name: Record the Go outcomes
         if: ${{ always() }}
         env:
           WHATSMEOW_OUTCOME: ${{ steps.whatsmeow.outcome }}
           RELEASE_ROUTER_OUTCOME: ${{ steps.release_router.outcome }}
+          PYTHON_REPORTING_OUTCOME: ${{ steps.python_reporting.outcome }}
         run: |
-          python3 -c 'import json, os, pathlib; pathlib.Path(os.environ["RUNNER_TEMP"], "ci-evidence", "outcomes.json").write_text(json.dumps({"module_checks": {"whatsmeow": os.environ["WHATSMEOW_OUTCOME"], "release_router": os.environ["RELEASE_ROUTER_OUTCOME"]}}))'
+          python3 -c 'import json, os, pathlib; pathlib.Path(os.environ["RUNNER_TEMP"], "ci-evidence", "outcomes.json").write_text(json.dumps({"module_checks": {"whatsmeow": os.environ["WHATSMEOW_OUTCOME"], "release_router": os.environ["RELEASE_ROUTER_OUTCOME"]}, "checks": {"python": os.environ["PYTHON_REPORTING_OUTCOME"]}}))'
       - name: Retain Go evidence even when a test fails
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -752,7 +772,8 @@ jobs:
   python-2:
     # Shards 2-11 of the root Python/PostgreSQL suite, in parallel with verify, which runs shard 1. Each shard has
     # its own runner and PostgreSQL and the same tools, images and environments as verify's suite step; every
-    # test module belongs to exactly one shard (scripts/python_shards.py), and evidence merges their reports.
+    # root module except tests/test_tiden_ci.py belongs to exactly one shard (scripts/python_shards.py).
+    # The Go job owns that complete module; evidence merges all their reports into the Python check.
     # Each shard is a job of its own, not one matrix, so evidence receives each shard job's completed result and
     # captured SHA; python-3 to python-11 repeat this job's steps through the anchor. A shard job does not check
     # the commit receiving the checks: evidence requires its captured SHA to be verify's, and verify checks it,
@@ -906,7 +927,7 @@ jobs:
           # directory joins pytest's import path; a baseline of an older revision is sharded the same way.
           mkdir -p "$RUNNER_TEMP/shard-plugin"
           cp ci-tools/scripts/python_shards.py ci-tools/scripts/python_shards.json "$RUNNER_TEMP/shard-plugin/"
-          uv run python "$RUNNER_TEMP/shard-plugin/python_shards.py" pytest --tb=short --durations=25 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/python-${DEEDKIT_TEST_SHARD%%/*}.xml" --ignore=tests/test_backup_r2_verifier_native.py \
+          uv run python "$RUNNER_TEMP/shard-plugin/python_shards.py" pytest --tb=short --durations=25 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/python-${DEEDKIT_TEST_SHARD%%/*}.xml" --ignore=tests/test_backup_r2_verifier_native.py --ignore=tests/test_tiden_ci.py \
             --deselect tests/test_collectors.py::test_session_lock_rejects_directory_chowned_to_foreign_uid_as_root \
             --deselect tests/test_audio_native.py::test_optional_cpu_package_loads_without_gpu_or_model_download \
             --deselect tests/test_audio_native.py::test_faster_whisper_decoder_compatibility_without_model tests

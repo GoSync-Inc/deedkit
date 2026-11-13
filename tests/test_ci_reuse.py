@@ -79,7 +79,9 @@ def queue_evidence(tmp_path, attempt="2", sha=SHA, git_branch=QUEUE_BRANCH, even
     (go / "attempt").write_text(attempt + "\n")
     for check in tiden_ci.GO_MODULES:
         (go / tiden_ci.MODULE_REPORTS[check][0]).write_text(go_stream(check))
-    (go / "outcomes.json").write_text(json.dumps({"module_checks": dict.fromkeys(tiden_ci.GO_MODULES, "success")}))
+    (go / tiden_ci.GO_PYTHON_REPORT).write_text(CASE.format(name="test_tiden_ci"))
+    (go / "outcomes.json").write_text(json.dumps({"module_checks": dict.fromkeys(tiden_ci.GO_MODULES, "success"),
+                                               "checks": {"python": "success"}}))
     added = fragments / "ci-evidence-added"  # the job that runs only the added tests
     added.mkdir()
     (added / "source-sha").write_text(sha + "\n")

@@ -61,6 +61,8 @@ _VERIFY_MODULES = tuple(name for name in MODULE_REPORTS if name != "load" and na
 PYTHON_SHARDS = 11
 SHARD_REPORTS = tuple(f"python-{index}.xml" for index in range(1, PYTHON_SHARDS + 1))
 SHARD_JOBS = tuple(f"python-{index}" for index in range(2, PYTHON_SHARDS + 1))
+GO_PYTHON_REPORT = "python-go.xml"
+PYTHON_REPORTS = (*SHARD_REPORTS, GO_PYTHON_REPORT)
 # Each test job deletes the files autoloop pull requests add to test directories from its checkout and keeps that
 # exclusion inventory as `exclusions.json` (scripts/added_tests.py, ANYM-578); every fragment's must be the same.
 EXCLUSIONS, ADDED_REPORT = "exclusions.json", "added.json"
@@ -74,13 +76,13 @@ FRAGMENTS = {
     "load": (("load",), ("outcomes.json", MODULE_REPORTS["load"][0], "load.json", EXCLUSIONS)),
     "services": (SERVICE_MODULES, ("outcomes.json", *(MODULE_REPORTS[name][0] for name in SERVICE_MODULES), EXCLUSIONS)),
     **{job: ((), ("outcomes.json", report, EXCLUSIONS)) for job, report in zip(SHARD_JOBS, SHARD_REPORTS[1:])},
-    "go": (GO_MODULES, ("outcomes.json", *(MODULE_REPORTS[name][0] for name in GO_MODULES), EXCLUSIONS)),
+    "go": (GO_MODULES, ("outcomes.json", *(MODULE_REPORTS[name][0] for name in GO_MODULES), GO_PYTHON_REPORT, EXCLUSIONS)),
     "added": ((), ("outcomes.json", ADDED_REPORT, EXCLUSIONS)),
 }
 CONTROL_FILES = {"source-sha", "attempt", "metadata.json", "outcomes.json"}
 # Every file assembly writes besides `source-sha` and `metadata.json`.
 ASSEMBLED_FILES = frozenset({REPORTS["python"], *(name for _, files in FRAGMENTS.values() for name in files
-                                                  if name not in CONTROL_FILES and name not in SHARD_REPORTS)})
+                                                  if name not in CONTROL_FILES and name not in PYTHON_REPORTS)})
 MAX_BYTES = 20 * 1024 * 1024
 # A JUnit report's case bound: a sanity limit of ours (`tiden run report` uploads any number of rows in chunks of 2000).
 # The merged python report is ~220 bytes a case (2.2 MB for 9975 cases, 11-02), so 50000 cases stay far under MAX_BYTES.
@@ -456,6 +458,35 @@ def control_file(fragment: Path, name: str) -> str:
     return path.read_text().strip()
 
 
+def go_identity_reports(root: Path, env=None) -> dict[str, Path] | None:
+    """Use this job's completed real Go streams for the identity proof, without rerunning their suites.
+
+    Only the explicit same-job workflow wiring enables this path. Local standalone pytest keeps running
+    the real suites. Source, attempt, regular files and successful producer steps are required here;
+    go_results and the identity proof still validate every event, verdict and frozen identity.
+    """
+    env = os.environ if env is None else env
+    if not env.get("DEEDKIT_GO_REPORTS"):
+        return None
+    directory = Path(env["DEEDKIT_GO_REPORTS"])
+    sha, attempt = env.get("DEEDKIT_GO_SOURCE_SHA", ""), env.get("GITHUB_RUN_ATTEMPT", "")
+    if directory.is_symlink() or not directory.is_dir() or not re.fullmatch(r"[a-f0-9]{40}", sha) \
+            or not attempt.isdigit() or int(attempt) < 1 or not checkout_tree(sha, root):
+        raise ValueError("Go identity reports must name this checkout and run attempt")
+    if control_file(directory, "source-sha") != sha or control_file(directory, "attempt") != attempt:
+        raise ValueError("Go identity reports belong to another source or attempt")
+    reports = {}
+    for check in GO_MODULES:
+        if env.get(check.upper() + "_OUTCOME") != "success":
+            raise ValueError(f"the real {check} suite did not succeed")
+        name = MODULE_REPORTS[check][0]
+        path = directory / name
+        if path.is_symlink() or not path.is_file() or not 0 < path.stat().st_size <= MAX_BYTES:
+            raise ValueError(f"the real {check} report is missing or invalid")
+        reports[check] = path
+    return reports
+
+
 def added_result(text: str) -> str:
     """The `added` job's result in its `added.json` (scripts/added_tests.py run): passed, none or failed."""
     try:
@@ -492,12 +523,15 @@ def shard_suites(path: Path, root: Path) -> tuple[list[ET.Element], Counter]:
     return suites, counts
 
 
-def shard_outcome(state: str, report: Path, root: Path, suites: list) -> str:
+def shard_outcome(state: str, report: Path, root: Path, suites: list, *, reporting_module=False) -> str:
     """One shard's `python` outcome from its reported step outcome and its report, whose suites join `suites`.
     A shard passes only with a valid report of executed tests and no failed one; without such a report it
     failed, or its verification is incomplete."""
     try:
         found, counts = shard_suites(report, root)
+        if any((case.get("file") == "tests/test_tiden_ci.py") != reporting_module
+               for suite in found for case in suite.findall("testcase")):
+            raise ValueError("the Python report includes tests owned by another producer")
     except (OSError, ValueError, ET.ParseError):
         return state if state in {"failure", "cancelled"} else "skipped"
     suites.extend(found)
@@ -553,7 +587,7 @@ def merge_fragment(assembly, job, names, files):
         assembly.module_checks.update(dict.fromkeys(names, state))
         if job == "verify":
             assembly.checks = dict.fromkeys(CHECKS, state)
-        if job == "verify" or job in SHARD_JOBS:
+        if job in {"verify", "go"} or job in SHARD_JOBS:
             assembly.shards.append(state)
         return
     if control_file(fragment, "source-sha") != assembly.sha or captured != assembly.sha:
@@ -571,6 +605,9 @@ def merge_fragment(assembly, job, names, files):
         reported = outcomes["checks"] if job in SHARD_JOBS else outcomes["module_checks"]
         if job in SHARD_JOBS and set(outcomes) != {"checks"}:
             reported = None
+        if job == "go" and (set(outcomes) != {"module_checks", "checks"}
+                            or not isinstance(outcomes["checks"], dict) or set(outcomes["checks"]) != {"python"}):
+            reported = None
     except (ValueError, KeyError, TypeError):
         reported = None
     if not isinstance(reported, dict) or set(reported) != ({"python"} if job in SHARD_JOBS else set(names)):
@@ -584,8 +621,14 @@ def merge_fragment(assembly, job, names, files):
         assembly.module_checks.update(reported)
         if job == "verify":
             assembly.shards.append(shard_outcome(assembly.checks["python"], fragment / SHARD_REPORTS[0], assembly.source_root, assembly.suites))
+        if job == "go":
+            state = shard_outcome(outcomes["checks"]["python"], fragment / GO_PYTHON_REPORT, assembly.source_root,
+                                  assembly.suites, reporting_module=True)
+            if state == "success" and result != "success":
+                state = result if result in {"failure", "cancelled"} else "skipped"
+            assembly.shards.append(state)
     for path in fragment.iterdir():
-        if path.name not in CONTROL_FILES and path.name not in SHARD_REPORTS:
+        if path.name not in CONTROL_FILES and path.name not in PYTHON_REPORTS:
             (assembly.directory / path.name).write_bytes(path.read_bytes())
     assembly.present.append(job)
 

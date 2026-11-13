@@ -2225,7 +2225,9 @@ def evidence_fragments(tmp_path, *, load_sha="a" * 40, load_outcomes=None, load=
         (fragment / "attempt").write_text("2\n")
         for check, name in (("whatsmeow", "whatsmeow.json"), ("release_router", "release-router.json")):
             (fragment / name).write_text((go_streams or {}).get(check) or passing_go_stream(go_module(tmp_path, check)))
-        (fragment / "outcomes.json").write_text(json.dumps({"module_checks": {"whatsmeow": "success", "release_router": "success"}}))
+        (fragment / "python-go.xml").write_text(shard_report("go-reporting").replace("tests/go-reporting.py", "tests/test_tiden_ci.py"))
+        (fragment / "outcomes.json").write_text(json.dumps({"module_checks": {"whatsmeow": "success", "release_router": "success"},
+                                                         "checks": {"python": "success"}}))
     added = fragments / "ci-evidence-added"  # the job that runs only the added tests (ANYM-578)
     added.mkdir()
     (added / "source-sha").write_text("a" * 40 + "\n")
@@ -2253,7 +2255,7 @@ def test_parallel_load_fragment_is_assembled_with_verify_evidence_of_the_same_co
     assert {path.name for path in out.iterdir()} == {"metadata.json", "source-sha", "python.xml", "load.xml", "load.json",
                                                      "whatsmeow.json", "release-router.json", "exclusions.json", "added.json"}
     # The shard reports merge into the one python report, in shard order, so test identities do not change.
-    assert [case.get("name") for case in ET.parse(out / "python.xml").getroot().iter("testcase")] == ["x", *SHARD_JOBS]
+    assert [case.get("name") for case in ET.parse(out / "python.xml").getroot().iter("testcase")] == ["x", *SHARD_JOBS, "go-reporting"]
     rows = assembled_rows(tmp_path, merged)
     assert rows["deedkit-ci::load"] == rows["anymsg-ci::python"] == rows["deedkit-ci::whatsmeow"] == "passed"
     # A job that succeeded and was not rerun keeps its earlier attempt's fragment, and the evidence says so.
@@ -2332,7 +2334,7 @@ def test_failed_rerun_never_publishes_an_earlier_attempts_passing_fragment(tmp_p
     assert set(merged["checks"].values()) == {"cancelled"}
     # Its stale shard-1 report is never merged; the python report holds only the fresh shards' cases.
     merged_report = ET.parse(tmp_path / "v" / "ci-evidence" / "python.xml").getroot()
-    assert [case.get("name") for case in merged_report.iter("testcase")] == list(SHARD_JOBS)
+    assert [case.get("name") for case in merged_report.iter("testcase")] == [*SHARD_JOBS, "go-reporting"]
     # A stale verify fragment never hides that the failed verify job captured another checkout.
     with pytest.raises(ValueError, match="captured another source"):
         assemble(tmp_path / "v" / "other", stale_verify, ATTEMPT_URL, {**PASSED, "verify": ("failure", "b" * 40)})
@@ -2653,15 +2655,17 @@ def test_the_go_job_uploads_both_native_go_suites_as_a_fragment_the_evidence_job
     assert steps["release_router"]["if"] == "${{ !cancelled() }}"  # runs, into its own file, after a whatsmeow failure
     record = steps["Record the Go outcomes"]
     assert record["if"] == "${{ always() }}" and record["env"] == {
-        "WHATSMEOW_OUTCOME": "${{ steps.whatsmeow.outcome }}", "RELEASE_ROUTER_OUTCOME": "${{ steps.release_router.outcome }}"}
+        "WHATSMEOW_OUTCOME": "${{ steps.whatsmeow.outcome }}", "RELEASE_ROUTER_OUTCOME": "${{ steps.release_router.outcome }}",
+        "PYTHON_REPORTING_OUTCOME": "${{ steps.python_reporting.outcome }}"}
     (tmp_path / "ci-evidence").mkdir()
     recorded = subprocess.run(["bash", "-e", "-c", record["run"]], capture_output=True, text=True, env={
-        "PATH": os.environ["PATH"], "RUNNER_TEMP": str(tmp_path), "WHATSMEOW_OUTCOME": "failure", "RELEASE_ROUTER_OUTCOME": "success"})
+        "PATH": os.environ["PATH"], "RUNNER_TEMP": str(tmp_path), "WHATSMEOW_OUTCOME": "failure", "RELEASE_ROUTER_OUTCOME": "success",
+        "PYTHON_REPORTING_OUTCOME": "success"})
     assert recorded.returncode == 0, recorded.stderr
     assert json.loads((tmp_path / "ci-evidence" / "outcomes.json").read_text()) == {
-        "module_checks": {"whatsmeow": "failure", "release_router": "success"}}
+        "module_checks": {"whatsmeow": "failure", "release_router": "success"}, "checks": {"python": "success"}}
     assert FRAGMENTS["go"] == (("whatsmeow", "release_router"), ("outcomes.json", "whatsmeow.json", "release-router.json",
-                                                                 "exclusions.json"))
+                                                                 "python-go.xml", "exclusions.json"))
     upload = next(step for step in go["steps"] if step.get("uses", "").startswith("actions/upload-artifact"))
     assert upload["if"] == "${{ always() }}" and upload["with"]["name"] == "ci-evidence-go"
     assert upload["with"]["path"] == "${{ runner.temp }}/ci-evidence" and upload["with"]["overwrite"] is True
@@ -2805,24 +2809,95 @@ def test_a_go_test_stream_becomes_one_result_row_per_test_under_its_existing_go_
 
 
 # spec: ANYM-421
+def test_go_identity_reports_require_this_checkout_attempt_and_successful_real_suites(tmp_path, monkeypatch):
+    from scripts import tiden_ci
+    evidence = tmp_path / "go"
+    evidence.mkdir()
+    sha = "a" * 40
+    (evidence / "source-sha").write_text(sha)
+    (evidence / "attempt").write_text("2")
+    for check in tiden_ci.GO_MODULES:
+        (evidence / tiden_ci.MODULE_REPORTS[check][0]).write_text(passing_go_stream("example.com/" + check))
+    env = {"DEEDKIT_GO_REPORTS": str(evidence), "DEEDKIT_GO_SOURCE_SHA": sha, "GITHUB_RUN_ATTEMPT": "2",
+           "WHATSMEOW_OUTCOME": "success", "RELEASE_ROUTER_OUTCOME": "success"}
+    monkeypatch.setattr(tiden_ci, "checkout_tree", lambda source, root: "b" * 40 if source == sha else "")
+    reports = tiden_ci.go_identity_reports(tmp_path, env)
+    assert set(reports) == set(tiden_ci.GO_MODULES)
+    assert tiden_ci.go_identity_reports(tmp_path, {}) is None
+    for key, value in (("DEEDKIT_GO_SOURCE_SHA", "c" * 40), ("GITHUB_RUN_ATTEMPT", "1"),
+                       ("WHATSMEOW_OUTCOME", "failure"), ("RELEASE_ROUTER_OUTCOME", "skipped")):
+        with pytest.raises(ValueError):
+            tiden_ci.go_identity_reports(tmp_path, {**env, key: value})
+    report = reports["whatsmeow"]
+    report.unlink()
+    with pytest.raises(ValueError):
+        tiden_ci.go_identity_reports(tmp_path, env)
+    report.symlink_to(reports["release_router"])
+    with pytest.raises(ValueError):
+        tiden_ci.go_identity_reports(tmp_path, env)
+
+
+# spec: ANYM-421
+def test_ci_executes_the_complete_tiden_reporting_module_once_beside_the_real_go_reports():
+    import yaml
+    root = Path(__file__).resolve().parents[1]
+    jobs = yaml.safe_load((root / ".github/workflows/checks.yml").read_text())["jobs"]
+    for job in ("verify", *SHARD_JOBS):
+        commands = [step.get("run", "") for step in jobs[job]["steps"]]
+        assert sum("--ignore=tests/test_tiden_ci.py" in command for command in commands) == 1
+    go = jobs["go"]
+    step = next(step for step in go["steps"] if step.get("id") == "python_reporting")
+    assert step["if"] == "${{ !cancelled() }}"
+    assert step["run"].endswith(" tests/test_tiden_ci.py")
+    assert "-k " not in step["run"] and "--deselect" not in step["run"]
+    assert step["env"] == {"DEEDKIT_GO_REPORTS": "${{ runner.temp }}/ci-evidence",
+                           "DEEDKIT_GO_SOURCE_SHA": "${{ steps.source.outputs.sha }}",
+                           "WHATSMEOW_OUTCOME": "${{ steps.whatsmeow.outcome }}",
+                           "RELEASE_ROUTER_OUTCOME": "${{ steps.release_router.outcome }}"}
+    assert go["steps"].index(step) > next(index for index, item in enumerate(go["steps"]) if item.get("id") == "release_router")
+
+
+# spec: ANYM-421
+def test_go_owned_python_evidence_never_hides_a_failed_or_incomplete_producer(tmp_path):
+    from scripts.tiden_ci import assemble
+    for state in ("failure", "cancelled", "skipped"):
+        root = tmp_path / state
+        fragments = evidence_fragments(root)
+        merged = assemble(root / "out", fragments, ATTEMPT_URL, {**PASSED, "go": (state, "a" * 40)})
+        assert merged["checks"]["python"] == state
+    root = tmp_path / "missing-report"
+    fragments = evidence_fragments(root)
+    (fragments / "ci-evidence-go/python-go.xml").unlink()
+    assert assemble(root / "out", fragments, ATTEMPT_URL, PASSED)["checks"]["python"] != "success"
+    for job, filename, report in (("go", "python-go.xml", shard_report("another-module")),
+                                  ("python-2", "python-2.xml", shard_report("duplicate").replace("tests/duplicate.py", "tests/test_tiden_ci.py"))):
+        root = tmp_path / (job + "-wrong-owner")
+        fragments = evidence_fragments(root)
+        (fragments / f"ci-evidence-{job}" / filename).write_text(report)
+        assert assemble(root / "out", fragments, ATTEMPT_URL, PASSED)["checks"]["python"] != "success"
+
+
+# spec: ANYM-421
 def test_the_real_go_suites_produce_every_existing_tiden_go_identity(tmp_path):
     import os
     import shutil
     import subprocess
-    from scripts.tiden_ci import MODULE_REPORTS, go_results
-    if shutil.which("go") is None:
+    from scripts.tiden_ci import MODULE_REPORTS, go_identity_reports, go_results
+    root = Path(__file__).resolve().parents[1]
+    reports = go_identity_reports(root)
+    if reports is None and shutil.which("go") is None:
         if os.environ.get("CI"):
             pytest.fail("go is required on CI to check the Go identities")
         pytest.skip("go is not installed")
-    root = Path(__file__).resolve().parents[1]
     rows = []
     for check in ("whatsmeow", "release_router"):
-        stream = tmp_path / f"{check}.json"
-        with stream.open("wb") as output:
-            # reads: whatsapp/whatsmeow/go.mod
-            # reads: services/release-router/go.mod
-            subprocess.run(["go", "test", "-count=1", "-json", "./..."], cwd=root / MODULE_REPORTS[check][2], stdout=output,
-                           stderr=subprocess.DEVNULL, timeout=300, check=False)
+        stream = reports[check] if reports is not None else tmp_path / f"{check}.json"
+        if reports is None:
+            with stream.open("wb") as output:
+                # reads: whatsapp/whatsmeow/go.mod
+                # reads: services/release-router/go.mod
+                subprocess.run(["go", "test", "-count=1", "-json", "./..."], cwd=root / MODULE_REPORTS[check][2], stdout=output,
+                               stderr=subprocess.DEVNULL, timeout=300, check=False)
         found, _, unexplained = go_results(stream, root, MODULE_REPORTS[check][2], ATTEMPT_URL, check)
         assert not unexplained, check
         rows += found
@@ -2919,7 +2994,8 @@ def test_a_missing_go_fragment_leaves_both_go_checks_unpassed_and_fails_the_evid
     assembled_rows(with_go, assemble(with_go / "ci-evidence", evidence_fragments(with_go), ATTEMPT_URL, PASSED))
     blocked = sum(status == "blocked" for status in rows.values())
     assert verdict(out).returncode == 1 and f"records {blocked} blocked check(s)" in verdict(out).stdout
-    assert f"records {blocked - 2} blocked check(s)" in verdict(with_go / "ci-evidence").stdout
+    assert rows["anymsg-ci::python"] == "blocked"  # this module also belongs to the missing Go producer
+    assert f"records {blocked - 3} blocked check(s)" in verdict(with_go / "ci-evidence").stdout
     # A go job that failed in this attempt leaves only an earlier attempt's fragment: still never passed.
     stale = evidence_fragments(tmp_path / "stale")
     (stale / "ci-evidence-go" / "attempt").write_text("1\n")
