@@ -58,7 +58,7 @@ SERVICE_MODULES = ("android", "gateway", "platform_contracts", "calls", "calls_f
 _VERIFY_MODULES = tuple(name for name in MODULE_REPORTS if name != "load" and name not in GO_MODULES and name not in SERVICE_MODULES)
 # The root Python suite runs in file-level shards (scripts/python_shards.py): verify runs shard 1, each
 # `checks / python` matrix job one of the others, and assembly merges their reports into python.xml.
-PYTHON_SHARDS = 9
+PYTHON_SHARDS = 11
 SHARD_REPORTS = tuple(f"python-{index}.xml" for index in range(1, PYTHON_SHARDS + 1))
 SHARD_JOBS = tuple(f"python-{index}" for index in range(2, PYTHON_SHARDS + 1))
 # Each test job deletes the files autoloop pull requests add to test directories from its checkout and keeps that
