@@ -563,10 +563,13 @@ def run_main(monkeypatch, tmp_path, runner_cfg, *argv):
     config.chmod(0o600)
     monkeypatch.setattr(sys, 'argv', ['backup_runner', '--config', str(config), *argv])
     monkeypatch.setattr(backup_runner.signal, 'signal', lambda *_: None)
+    previous_mask = os.umask(0o077)
     try:
         backup_runner.main()
     except SystemExit as stopped:
         return stopped.code
+    finally:
+        os.umask(previous_mask)
     return 0
 
 

@@ -143,7 +143,9 @@ needs_namespace = pytest.mark.skipif(not namespace_ready(), reason='needs sudo, 
 
 
 def in_namespace(script, timeout=120):
-    return subprocess.run(['sudo', '-n', 'unshare', '-n', 'sh', '-ec', script], text=True, capture_output=True,
+    # Only synthetic results in the caller's private tmp_path: sudo may inherit a caller's 0077,
+    # which makes root-created captures/state unreadable to that caller. Leave the parent mask alone.
+    return subprocess.run(['sudo', '-n', 'unshare', '-n', 'sh', '-ec', 'umask 022; ' + script], text=True, capture_output=True,
                           timeout=timeout)
 
 
@@ -287,6 +289,24 @@ def test_ufw_form_passes_iptables_restore_test_for_syntax(tmp_path):
         if 'Permission denied' in result.stderr or 'must be root' in result.stderr or 'sudo' in result.stderr:
             pytest.skip('the runner refuses iptables-restore --test: ' + result.stderr.strip()[:80])
         assert result.returncode == 0, result.stderr
+
+
+# spec: ANYM-693
+@needs_namespace
+def test_namespace_outputs_ignore_caller_umask_without_hiding_exit_or_errors(tmp_path):
+    output, state = tmp_path / 'namespace-output', tmp_path / 'raw-state.json'
+    hook = after_init(tmp_path)
+    previous = os.umask(0o077)
+    try:
+        result = in_namespace(f'umask; printf fixture > {output}; DEEDKIT_RAW_STATE={state} sh {hook} start; '
+                              'printf fixture-error >&2; exit 17')
+        parent_mask = os.umask(0o077)
+    finally:
+        os.umask(previous)
+    assert result.returncode == 17 and result.stderr == 'fixture-error'
+    assert result.stdout.strip() == '0022' and parent_mask == 0o077
+    assert output.stat().st_mode & 0o777 == state.stat().st_mode & 0o777 == 0o644
+    assert output.read_text() == 'fixture' and json.loads(state.read_text())['ok'] is True
 
 
 # spec: ANYM-693
