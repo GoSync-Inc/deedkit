@@ -308,10 +308,29 @@ thread/turn, provide the caller's stable `message_id` and ordinary `text`. Neith
 generic RPC or an approval/secret-input route. Original task words and natural final replies need
 no model-authored JSON schema.
 
+Native asynchronous `agentMessage` questions use `source=async`, the actual `item_id` and original
+`questions` array. They have no RPC or per-question IDs. Reply with the original run/device/session,
+native thread/turn/item, a stable answer `message_id`, and exact natural `text`; omit RPC/answers fields.
+While that turn is active this uses expected-turn steer. After its completion it starts a serialized
+new turn on the same live conversation, retaining the original question binding and durable answer
+intent. A later intervening turn, stop, restart, lost process, busy device or changed permission refuses
+the stale answer; it never starts a replacement process or replays an unknown answer.
+
+Shared-method RPC questions require a verified installed 0.166.0 binary, a native effective
+`approvalPolicy=never` receipt from the exact start/resume, and explicit `never` on the current turn.
+Pinned native source refuses MCP connector approvals before this shared-method dispatch under
+`never`; unknown/version/policy drift fails closed without label heuristics. Distinct approval,
+elicitation and secret-input requests remain refused. Capability describes implemented transports;
+Default-mode/model question-tool exposure is catalog-dependent and remains unverified until the
+integrated native acceptance run. Async wire support and scripted fixtures do not prove model exposure.
+
 `input_receipt` reports input delivery separately from the run result. Answer writes remain
 `status=unknown`, with `native_state=submitted` after local write/drain; native `resolved` can also
 mean cleanup and never proves acceptance of the answer contents. A matching native steer
 `turnId` can confirm `accepted` input, not goal/action success. `get.dialogue` reads the original
+receipt; a native async follow-up `turn/start` acknowledgment can likewise confirm input with its
+separate `continuation_turn_id`. Before that acknowledgment delivery remains `unknown`. Proven
+admission refusal before write is `refused`, distinct from unknown after dispatch. `get` retains the
 receipt after a lost response or restart without starting a native client. Repeating identical
 IDs/content reads that receipt; changed content conflicts, and a new message ID cannot bypass an
 uncertain steer in that original turn. Pending/expired/cancelled questions, closed input,

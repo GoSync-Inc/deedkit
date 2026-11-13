@@ -232,6 +232,8 @@ def test_capability_pairs_dialogue_availability_with_persistent_admission(tmp_pa
         capabilities = service.post('capabilities', {})['agent']
         assert capabilities['dialogue']['available'] is True
         assert capabilities['dialogue']['actions'] == ['reply', 'steer']
+        assert capabilities['dialogue']['model_question_tool'] == 'catalog_dependent_unverified'
+        assert capabilities['dialogue']['question_routes_require'] == ['pinned_0.166.0','native_effective_never']
         assert set(capabilities['input_schema']['properties']['action']['enum']) == {'start', 'get', 'stop', 'reply', 'steer'}
         body = json.loads(config.read_text())
         body['agent']['persistent'] = False
@@ -251,3 +253,173 @@ def test_start_identity_keeps_legacy_fingerprint_despite_optional_dialogue_field
         'native_request_id', 'item_id', 'answers', 'message_id', 'text'}}
     body.update(apps=[], secrets=[], outputs=[], params={'COUNT': '2'})
     assert call.identity() == hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+
+
+# spec: ANYM-993
+@pytest.mark.parametrize('goal', ['async-active', 'async-closed'])
+def test_async_question_reply_preserves_native_item_and_exact_text_without_fabricated_rpc(tmp_path, goal):
+    config, record = host(tmp_path)
+    with Service(config) as service:
+        lease = service.lease()
+        started = service.start(lease, goal=goal)
+        event = question(service, started['request_id'])
+        assert event['source'] == 'async' and event['item_id'] == 'async-item'
+        assert event['questions'] == [{'title': 'Which address?', 'options': ['Home', 'Office']}]
+        assert 'native_request_id' not in event and 'question_ids' not in event
+        if goal == 'async-closed':
+            service.finished(started['request_id'])
+        args = dict(action='reply',request_id=started['request_id'],device_id='home',session_id=lease,
+                    native_thread_id=event['native_thread_id'],native_turn_id=event['native_turn_id'],
+                    item_id=event['item_id'],message_id='owner-answer',text='  Home, apartment two.\nKeep my words.  ')
+        reply = service.post('agent',args)
+        assert reply['input_receipt']['status'] in ('unknown','accepted')
+        service.finished(started['request_id'])
+        receipt = service.post('agent',args)['input_receipt']
+        assert receipt['item_id'] == 'async-item' and receipt['native_turn_id'] == event['native_turn_id']
+        assert receipt['status'] == 'accepted'
+        assert not writes(record)
+        inputs=[m['message'] for m in messages(record) if m['message'].get('method') in ('turn/steer','turn/start')]
+        answers=[m for m in inputs if m['params']['input'][0]['text'] == args['text']]
+        assert len(answers) == 1
+        assert answers[0]['method'] == ('turn/start' if goal == 'async-closed' else 'turn/steer')
+        assert len({r['pid'] for r in messages(record)}) == 1
+        service.post('agent',{**args,'message_id':'replacement','text':'changed'},code=409)
+        assert len([r for r in messages(record) if r['message'].get('method') in ('turn/start','turn/steer')]) == len(inputs)
+
+
+def async_answer(service, lease, request_id):
+    event = question(service, request_id)
+    return dict(action='reply',request_id=request_id,device_id='home',session_id=lease,
+                native_thread_id=event['native_thread_id'],native_turn_id=event['native_turn_id'],
+                item_id=event['item_id'],message_id='owner-answer',text='  Home, exactly my words.  ')
+
+
+# spec: ANYM-993
+@pytest.mark.parametrize('change', ['principal', 'device', 'thread', 'turn', 'item', 'native_rpc'])
+def test_async_reply_http_binding_refuses_before_steer_or_new_turn(tmp_path, change):
+    config, record = host(tmp_path)
+    with Service(config) as service:
+        lease = service.lease()
+        started = service.start(lease,goal='async-closed')
+        args = async_answer(service,lease,started['request_id'])
+        service.finished(started['request_id'])
+        key, code = 'one', 409
+        if change == 'principal':
+            key, code = 'two', 404
+        elif change == 'device':
+            args.update(device_id='desk',session_id=service.lease(device='desk'))
+        elif change == 'native_rpc':
+            args['native_request_id'], code = 12, 422
+        else:
+            args[{'thread':'native_thread_id','turn':'native_turn_id','item':'item_id'}[change]]='unrelated'
+        service.post('agent',args,key=key,code=code)
+        assert len(writes(record,'turn/start')) == 1
+        assert writes(record,'turn/steer') == []
+        assert service.get(started['request_id'])['dialogue'][0]['submission_intent'] is False
+
+
+# spec: ANYM-993
+@pytest.mark.parametrize('invalidate', ['stop', 'later_turn', 'restart'])
+def test_async_cancelled_stale_and_restarted_question_cannot_dispatch_answer(tmp_path, invalidate):
+    config, record = host(tmp_path)
+    with Service(config) as service:
+        lease = service.lease()
+        original = service.start(lease,goal='async-closed')
+        args = async_answer(service,lease,original['request_id'])
+        service.finished(original['request_id'])
+        if invalidate == 'stop':
+            service.post('agent',dict(action='stop',request_id=original['request_id']))
+        elif invalidate == 'later_turn':
+            later = service.start(lease,goal='async-closed')
+            service.finished(later['request_id'])
+        else:
+            service.close()
+            service = Service(config)  # the original live lease is durable across the service restart
+        before = len(messages(record))
+        try:
+            service.post('agent',args,code=409)
+            assert len(messages(record)) == before
+        finally:
+            if invalidate == 'restart':
+                service.close()
+
+
+# spec: ANYM-993
+def test_concurrent_post_turn_async_answers_start_one_turn_on_original_native_process(tmp_path):
+    config, record = host(tmp_path)
+    with Service(config) as service:
+        lease = service.lease()
+        original = service.start(lease,goal='async-closed')
+        args = async_answer(service,lease,original['request_id'])
+        service.finished(original['request_id'])
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            receipts = list(pool.map(lambda _: service.post('agent',args)['input_receipt'],range(2)))
+        assert all(r['item_id'] == 'async-item' and r['submission_intent'] for r in receipts)
+        service.finished(original['request_id'])
+        assert len(writes(record,'turn/start')) == 2
+        assert len({r['pid'] for r in messages(record)}) == 1
+        assert len(writes(record,'thread/start')) == 1
+        assert writes(record,'thread/resume') == []
+
+
+# spec: ANYM-993
+def test_async_answer_lost_after_write_keeps_original_intent_and_never_restarts_or_resends(tmp_path):
+    config, record = host(tmp_path)
+    with Service(config) as service:
+        lease = service.lease()
+        original = service.start(lease,goal='async-closed')
+        args = async_answer(service,lease,original['request_id'])
+        args['text'] = 'LOSE_ANSWER_AFTER_WRITE'
+        service.finished(original['request_id'])
+        assert service.post('agent',args)['input_receipt']['status'] == 'unknown'
+        service.finished(original['request_id'])
+        before = len(messages(record))
+        receipt = service.post('agent',args)['input_receipt']
+        assert receipt['status'] == 'unknown' and receipt['submission_intent'] is True
+        assert len(messages(record)) == before
+    with Service(config) as restarted:
+        assert restarted.post('agent',args)['input_receipt']['status'] == 'unknown'
+        assert len(messages(record)) == before
+        restarted.post('agent',{**args,'message_id':'replacement'},code=409)
+    starts = writes(record,'turn/start')
+    assert len(starts) == 2 and starts[1]['params']['input'] == [{'type':'text','text':args['text']}]
+    assert len({r['pid'] for r in messages(record)}) == 1
+
+
+# spec: ANYM-993
+def test_post_turn_async_answer_rechecks_control_at_serialized_native_write(tmp_path,monkeypatch):
+    config, record = host(tmp_path)
+    entered, released, returned = threading.Event(), threading.Event(), threading.Event()
+    original_turn = CodexSession.turn
+    async def paused(self,prompt,*args,**kwargs):
+        if prompt.startswith('  Home,'):
+            entered.set()
+            while not released.is_set():
+                await asyncio.sleep(.005)
+        try:
+            return await original_turn(self,prompt,*args,**kwargs)
+        finally:
+            if prompt.startswith('  Home,'):
+                returned.set()
+    monkeypatch.setattr(CodexSession,'turn',paused)
+    with Service(config) as service:
+        lease = service.lease()
+        original = service.start(lease,goal='async-closed')
+        args = async_answer(service,lease,original['request_id'])
+        service.finished(original['request_id'])
+        service.post('agent',args)
+        try:
+            assert entered.wait(2)
+            body=json.loads(config.read_text())
+            body['principals'][0]['permissions']=['android:read']
+            config.write_text(json.dumps(body))
+        finally:
+            released.set()
+        assert returned.wait(2)
+        body['principals'][0]['permissions']=['android:read','android:control']
+        config.write_text(json.dumps(body))
+        finished=service.finished(original['request_id'])
+        assert finished['state'] == 'failed' and finished['error'] == 'forbidden'
+        assert finished['dialogue'][0]['status'] == 'refused'
+        assert len(writes(record,'turn/start')) == 1
+        assert len({r['pid'] for r in messages(record)}) == 1

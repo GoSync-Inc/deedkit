@@ -100,7 +100,8 @@ class AgentCall(Strict):
                 raise ValueError('start_fields')
         elif self.action in {'reply', 'steer'}:
             required = {'device_id', 'session_id', 'native_thread_id', 'native_turn_id'} | (
-                {'native_request_id', 'item_id', 'answers'} if self.action == 'reply' else {'message_id', 'text'})
+                ({'native_request_id', 'item_id', 'answers'} if 'answers' in given else {'item_id', 'message_id', 'text'})
+                if self.action == 'reply' else {'message_id', 'text'})
             if (not required <= given or any(getattr(self, name) is None for name in required)
                     or given - required - {'action', 'request_id'}):
                 raise ValueError('dialogue_fields')
@@ -717,7 +718,10 @@ class Agents:
                 'dialogue': {'available': bool(config.agent.enabled and config.agent.persistent and not config.agent.guarded
                                                and found['codex']['available']),
                              'actions': ['reply', 'steer'], 'answer_receipt': 'submitted_unconfirmed',
-                             'readback': 'get.dialogue', 'requires': ['original_ids', 'own_live_session']},
+                             'readback': 'get.dialogue', 'requires': ['original_ids', 'own_live_session'],
+                             'question_routes_require': ['pinned_0.166.0', 'native_effective_never'],
+                             'async_reply': 'active_steer_or_same_conversation_next_turn',
+                             'model_question_tool': 'catalog_dependent_unverified'},
                 'default_model': config.engines.get('codex').model or 'gpt-6.1-terra' if config.engines.get('codex') else 'gpt-6.1-terra',
                 'default_effort': config.engines['codex'].reasoning_effort if 'codex' in config.engines else 'medium',
                 'default_engine': default, 'engines': found, 'tools': list(MODELS) if config.agent.guarded else ['codex'], 'preamble_version': version, 'input_schema': AgentCall.model_json_schema(),
@@ -738,6 +742,7 @@ class Agents:
             run = self.runs.get((owner, request_id))
             if run is not None:
                 await run.end('stopped')
+            self.native_session(owner, row['device']).finish_questions('cancelled', request_id=request_id)
             return self.view(owner, request_id, 0)
         return await self.poll(owner, request_id, call.after, call.wait_s)
 
@@ -773,13 +778,56 @@ class Agents:
                 if (run is None or run.state != 'running' or getattr(run, 'session', None) is not session
                         or not self.devices.locks[call.device_id].locked()):
                     raise Refused('native_turn_mismatch')
-                if not self.read_config().agent.enabled:
+                current = self.read_config().agent
+                if not current.enabled or current.guarded or not current.persistent:
                     raise Refused('agent_disabled')
                 self.store.touch(owner, call.device_id, call.session_id)
 
         args = {'request_id': call.request_id, 'thread_id': call.native_thread_id,
                 'turn_id': call.native_turn_id, 'admit': admit}
-        if call.action == 'reply':
+        if call.action == 'reply' and call.answers is None:
+            async def resume(text, commit, started, refused):
+                # A completed async question may continue only the still-current live conversation.
+                # Restart/lost/cancelled/busy are refusals before the durable dispatch intent.
+                admit(False)
+                if (self.db.row(owner, call.request_id)['state'] != 'succeeded'
+                        or session.events is not None or self.devices.locks[call.device_id].locked()
+                        or not self.read_config().agent.enabled):
+                    raise Refused('native_continuation_unavailable')
+                lock = self.devices.locks[call.device_id]
+                await lock.acquire()
+                run = None
+                try:
+                    admit(False)
+                    from .codex_session import PersistentRun
+                    saved = {k: v for k, v in json.loads(row['request']).items() if k not in DIALOGUE_FIELDS}
+                    original = AgentCall.model_validate({**saved, 'session_id': call.session_id})
+                    directory = Path(tempfile.mkdtemp(prefix='run-', dir=self.root))
+                    directory.chmod(0o700)
+                    run = PersistentRun(self, owner, original, 'codex', session.config, directory,
+                                        SecretRun(self.devices.secrets), (None, ''))
+                    run.input_text, run.input_started = text, started
+                    run.input_refused = refused
+                    run.input_admit = lambda: admit(True)
+                    commit()  # fsynced original answer intent before any native dispatch
+                    self.db.db.execute("UPDATE agent_runs SET state='running',ended=NULL,result=NULL WHERE owner=? AND id=?",
+                                       (owner, call.request_id))
+                    self.db.db.commit()
+                    self.runs[(owner, call.request_id)] = run
+                    run.seq = self.db.add_event(owner, call.request_id, 'state', {'state': 'running'})
+                    task = asyncio.create_task(run.supervise())
+                    self.tasks.add(task)
+                    task.add_done_callback(self.tasks.discard)
+                except BaseException:
+                    if run is not None:
+                        self.release(run)
+                    else:
+                        lock.release()
+                    raise
+
+            receipt = await session.reply_async(**args, item_id=call.item_id, message_id=call.message_id,
+                                                text=call.text, resume=resume)
+        elif call.action == 'reply':
             receipt = await session.reply(**args, native_request_id=call.native_request_id,
                                           item_id=call.item_id, answers=call.answers)
         else:

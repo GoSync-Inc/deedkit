@@ -45,3 +45,16 @@ def test_gateway_refuses_boolean_rpc_ids_and_generic_rpc_fields(tmp_path, extra)
     with TestClient(app) as client:
         assert call(client, **{**args, **extra})['isError']
         assert calls == []
+
+
+# spec: ANYM-993
+def test_async_question_reply_has_native_message_binding_and_natural_text_without_fake_rpc(tmp_path):
+    app, calls = setup(tmp_path)
+    args = dict(action='reply',request_id=str(uuid.uuid4()),device_id='home',session_id='lease',
+                native_thread_id='thread',native_turn_id='original-turn',item_id='original-async-message',
+                message_id='stable-answer',text='  Natural exact owner words.\nKeep whitespace.  ')
+    with TestClient(app) as client:
+        result = call(client,**args)
+        assert not result.get('isError'), result
+        assert calls == [('android','agent',args)]
+        assert 'native_request_id' not in calls[0][2] and 'answers' not in calls[0][2]

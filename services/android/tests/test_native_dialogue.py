@@ -4,6 +4,7 @@ import asyncio
 import json
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -12,13 +13,13 @@ from deedkit_android.codex_session import CodexSession
 from deedkit_android.config import Config, Refused
 
 
-def native(tmp_path):
+def native(tmp_path, *, policy='never', version='0.166.0'):
     record = tmp_path / 'wire.jsonl'
     binary = tmp_path / 'native'
     binary.write_text(f'''#!{sys.executable}
 import json, os, sys
 if sys.argv[1:] == ['--version']:
-    print('9.9.9'); raise SystemExit
+    print({version!r}); raise SystemExit
 thread, turn, mode, count = 'thread-' + str(os.getpid()), None, None, 0
 def emit(**body): print(json.dumps(body), flush=True)
 def event(method, **params): emit(method=method, params=dict(threadId=thread, **params))
@@ -31,15 +32,25 @@ for line in sys.stdin:
     method, p=m.get('method'), m.get('params', {{}})
     if method == 'initialize': emit(id=m['id'], result={{}})
     elif method in ('thread/start','thread/resume'):
-        thread=p.get('threadId',thread); emit(id=m['id'], result=dict(thread=dict(id=thread)))
+        thread=p.get('threadId',thread); emit(id=m['id'], result=dict(thread=dict(id=thread), **({{'approvalPolicy':{policy!r}}} if {policy!r} is not None else {{}})))
     elif method == 'turn/start':
         count+=1; turn='turn-'+str(os.getpid())+'-'+str(count); mode=p['input'][0]['text']
         if 'Caller input (nonsecret JSON):\\n' in mode:
             mode=json.loads(mode.split('Caller input (nonsecret JSON):\\n',1)[1])['goal']
+        if mode == 'LOSE_ANSWER_AFTER_WRITE': raise SystemExit
         emit(id=m['id'], result=dict(turn=dict(id=turn)))
         event('turn/started', turn=dict(id=turn,status='inProgress'))
         event('turn/completed', turn=dict(id='unrelated-old-turn',status='completed'))
-        if mode in ('steer','steer-stall','steer-wrong'):
+        if mode == 'policy-changed': event('thread/settings/updated',threadSettings=dict(approvalPolicy='on-request'))
+        if mode.startswith('  Home,'): finish()
+        elif mode == 'mcp-approval' and {policy!r} == 'never':
+            # Pinned0.166 mcp_tool_call.rs1655 refuses BEFORE request_user_input dispatch.
+            event('item/completed',turnId=turn,item=dict(id='mcp',type='mcpToolCall',status='failed')); finish()
+        elif mode.startswith('async-'):
+            event('item/completed',turnId=turn,item=dict(id='async-item',type='agentMessage',phase='final_answer',
+                  text='Which address?',delivery='async',questions=[dict(title='Which address?',options=['Home','Office'])]))
+            if mode == 'async-closed': finish()
+        elif mode in ('steer','steer-stall','steer-wrong'):
             event('item/started', turnId=turn, item=dict(id='command',type='commandExecution',command='synthetic only'))
         else:
             if mode == 'mid-question':
@@ -54,7 +65,7 @@ for line in sys.stdin:
                  autoResolutionMs=0 if mode=='expired' else None,questions=questions))
             if mode == 'cleared': event('serverRequest/resolved',requestId=rid)
     elif method == 'turn/steer':
-        if mode == 'steer-stall': continue
+        if mode in ('steer-stall','async-stall'): continue
         emit(id=m['id'], result=dict(turnId='unrelated' if mode=='steer-wrong' else turn))
         event('item/completed',turnId=turn,item=dict(id='command',type='commandExecution',exitCode=0))
         finish()
@@ -73,7 +84,10 @@ for line in sys.stdin:
 ''')
     binary.chmod(0o755)
     path = write_config(tmp_path, codex=binary, default='codex')
-    config = Config.model_validate(json.loads(path.read_text()))
+    body=json.loads(path.read_text())
+    body['engines']['codex']['version']=version
+    path.write_text(json.dumps(body))
+    config = Config.model_validate(body)
     return CodexSession(tmp_path / 'conversation', config.engines['codex'], config, 'home'), record
 
 
@@ -404,4 +418,119 @@ def test_mid_turn_steer_preserves_process_and_uses_expected_original_turn(tmp_pa
             await session.close()
             if task:
                 await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(check())
+
+
+# spec: ANYM-993
+@pytest.mark.parametrize('policy', [None, 'on-request'])
+def test_shared_question_method_requires_native_effective_never_receipt(tmp_path, policy):
+    async def check():
+        session, record = native(tmp_path, policy=policy)
+        await session.connect()
+        events = []
+        try:
+            assert await asyncio.wait_for(session.turn('mcp-approval', session.config, lambda e: collect(events, e), request_id='original-run'), 2) == 'completed'
+            assert not any(e.get('method') == 'item/tool/requestUserInput' for e in events)
+            assert session.receipts('original-run') == []
+            assert not any(r['message'].get('result', {}).get('answers') for r in messages(record))
+        finally:
+            await session.close()
+    asyncio.run(check())
+
+
+async def collect(events, event):
+    events.append(event)
+
+
+# spec: ANYM-993
+def test_pinned_never_denies_mcp_before_shared_method_and_does_not_classify_option_labels(tmp_path):
+    async def check():
+        session, record = native(tmp_path)
+        await session.connect()
+        try:
+            events = []
+            assert await asyncio.wait_for(session.turn('mcp-approval', session.config, lambda e: collect(events, e), request_id='original-run'), 2) == 'completed'
+            assert session.receipts('original-run') == []
+            task, event, _ = await start(session, 'question')
+            event['params']['questions'][0]['options'] = [{'label': 'Accept', 'description': 'ordinary shop choice'}]
+            receipt = await session.reply(**binding(session, event), answers={'address': ['Accept'], 'choice': ['Cancel']})
+            assert receipt['status'] == 'unknown'
+            assert await task == 'completed'
+            methods = [r['message'] for r in messages(record)]
+            assert all(m['params']['approvalPolicy'] == 'never' for m in methods if m.get('method') in ('thread/start','turn/start'))
+        finally:
+            await session.close()
+    asyncio.run(check())
+
+
+# spec: ANYM-993
+@pytest.mark.parametrize('mode', ['policy-changed', 'question'])
+def test_changed_effective_policy_or_unproven_native_version_refuses_shared_method(tmp_path, mode):
+    async def check():
+        session, record = native(tmp_path, version='0.166.0' if mode == 'policy-changed' else '9.9.9')
+        await session.connect()
+        try:
+            events = []
+            assert await asyncio.wait_for(session.turn(mode, session.config, lambda e: collect(events, e), request_id='original-run'), 2) == 'completed'
+            assert session.receipts('original-run') == []
+            assert not any(r['message'].get('result', {}).get('answers') for r in messages(record))
+        finally:
+            await session.close()
+    asyncio.run(check())
+
+
+# spec: ANYM-993
+def test_resumed_thread_requires_its_own_native_effective_policy_receipt(tmp_path):
+    async def check():
+        session, record = native(tmp_path)
+        await session.connect()
+        original_thread = session.thread_id
+        await session.close()
+        binary = session.config.binary
+        source = Path(binary).read_text()
+        assert "'approvalPolicy':'never'" in source
+        Path(binary).write_text(source.replace("'approvalPolicy':'never'", "'approvalPolicy':'on-request'"))
+        resumed = CodexSession(session.dir, session.config, session.host, session.device)
+        await resumed.connect()
+        try:
+            assert resumed.thread_id == original_thread
+            events = []
+            assert await asyncio.wait_for(resumed.turn('question',resumed.config,lambda e: collect(events,e),request_id='original-run'),2) == 'completed'
+            assert resumed.receipts('original-run') == []
+            request = [r['message'] for r in messages(record) if r['message'].get('method') == 'thread/resume'][-1]
+            assert request['params']['approvalPolicy'] == 'never'
+        finally:
+            await resumed.close()
+    asyncio.run(check())
+
+
+# spec: ANYM-993
+def test_unknown_async_answer_cannot_be_bypassed_through_new_steer_identity(tmp_path):
+    async def check():
+        session, record = native(tmp_path)
+        await session.connect()
+        queue=asyncio.Queue()
+        task=asyncio.create_task(session.turn('async-stall',session.config,queue.put,request_id='original-run'))
+        try:
+            while True:
+                event=await asyncio.wait_for(queue.get(),2)
+                if (event.get('params',{}).get('item') or {}).get('id') == 'async-item':
+                    break
+            answer=asyncio.create_task(session.reply_async(request_id='original-run',thread_id=session.thread_id,
+                turn_id=session.turn_id,item_id='async-item',message_id='original-answer',text='Home',
+                admit=lambda _:None,resume=None))
+            async def sent():
+                while not any(r['message'].get('method') == 'turn/steer' for r in messages(record)):
+                    await asyncio.sleep(.005)
+            await asyncio.wait_for(sent(),2)
+            answer.cancel()
+            await asyncio.gather(answer,return_exceptions=True)
+            with pytest.raises(Refused,match='native_input_unresolved'):
+                await session.steer(request_id='original-run',thread_id=session.thread_id,turn_id=session.turn_id,
+                                    message_id='replacement-route',text='Home')
+            assert len([r for r in messages(record) if r['message'].get('method') == 'turn/steer']) == 1
+            assert session.receipts('original-run')[0]['status'] == 'unknown'
+        finally:
+            await session.close()
+            await asyncio.gather(task,return_exceptions=True)
     asyncio.run(check())

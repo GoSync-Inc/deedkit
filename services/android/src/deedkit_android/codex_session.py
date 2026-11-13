@@ -24,6 +24,7 @@ class CodexSession:
         self.stderr = bytearray()
         self.errors = []
         self.request_id, self.stopping = None, False
+        self.policy_proven, self.turn_policy_proven = False, False
         self.interactions, self.interaction_lock = {}, asyncio.Lock()
         self.journal = directory.parent / (directory.name + '.dialogue.json')  # outside native writable cwd
 
@@ -42,10 +43,11 @@ class CodexSession:
         finally:
             os.close(directory)
 
-    def finish_questions(self, state):
+    def finish_questions(self, state, *, include_async=True, request_id=None):
         changed = False
         for row in self.interactions.values():
-            if row['kind'] == 'question' and row['state'] == 'waiting':
+            if (row['kind'] in (('question', 'async_question') if include_async else ('question',))
+                    and row['state'] == 'waiting' and (request_id is None or row['original_request_id'] == request_id)):
                 row['state'], changed = state, True
         if changed:
             self.save_interactions()
@@ -59,11 +61,16 @@ class CodexSession:
     def receipt(row):
         status = row.get('status', 'pending' if row['state'] == 'waiting' else 'refused')
         return {key: row[key] for key in ('original_request_id', 'native_thread_id', 'native_turn_id',
-                'native_request_id', 'item_id', 'question_ids', 'message_id') if key in row} | {
+                'native_request_id', 'item_id', 'question_ids', 'message_id', 'continuation_turn_id') if key in row} | {
                     'status': status, 'native_state': row['state'], 'submission_intent': 'digest' in row}
 
     def receipts(self, request_id):
         return [self.receipt(row) for row in self.interactions.values() if row['original_request_id'] == request_id]
+
+    def unresolved_input(self, request_id, turn_id):
+        if any(r['kind'] in ('steer', 'async_question') and r['original_request_id'] == request_id
+               and r['native_turn_id'] == turn_id and r.get('status') == 'unknown' for r in self.interactions.values()):
+            raise Refused('native_input_unresolved')
 
     def load_interactions(self):
         if self.journal.exists():
@@ -83,6 +90,10 @@ class CodexSession:
     def question(self, message):
         params, ident = message.get('params') or {}, message['id']
         self.active(self.request_id, params.get('threadId'), params.get('turnId'))
+        # 0.166 MCP approvals share this method, but native refuses them before dispatch
+        # under effective never (core/src/mcp_tool_call.rs1655). Method/labels alone prove nothing.
+        if not self.turn_policy_proven:
+            raise Refused('native_question_policy_unproven')
         questions = params.get('questions')
         if (type(ident) not in (str, int) or not isinstance(params.get('itemId'), str)
                 or type(params.get('isBlocking')) is not bool or not isinstance(questions, list) or not questions
@@ -106,6 +117,70 @@ class CodexSession:
             'expires_at': time.time() + delay / 1000 if delay is not None else None}
         self.save_interactions()
         self.events.put_nowait(message)
+
+    def async_question(self, params):
+        item = params.get('item') or {}
+        questions = item.get('questions')
+        if (not self.turn_policy_proven or not isinstance(item.get('id'), str)
+                or not isinstance(questions, list) or not questions or not all(
+                    isinstance(q, dict) and isinstance(q.get('title'), str) and q['title'] for q in questions)):
+            return
+        key = self.interaction_key('async_question', self.request_id, self.thread_id, self.turn_id, item['id'])
+        if key not in self.interactions:
+            self.interactions[key] = {'kind': 'async_question', 'original_request_id': self.request_id,
+                'native_thread_id': self.thread_id, 'native_turn_id': self.turn_id, 'item_id': item['id'],
+                'question_count': len(questions), 'state': 'waiting'}
+            self.save_interactions()  # native async questions have no JSONRPC or per-question IDs
+
+    async def reply_async(self, *, request_id, thread_id, turn_id, item_id, message_id, text, admit, resume):
+        async with self.interaction_lock:
+            admit(False)
+            key = self.interaction_key('async_question', request_id, thread_id, turn_id, item_id)
+            row = self.interactions.get(key)
+            if row is None:
+                raise Refused('native_question_mismatch')
+            digest = hashlib.sha256(text.encode()).hexdigest()
+            if 'digest' in row:
+                if row['digest'] != digest or row['message_id'] != message_id:
+                    raise Refused('native_reply_conflict')
+                return self.receipt(row)
+            if row['state'] != 'waiting':
+                raise Refused('question_expired')
+            if not self.policy_proven:
+                raise Refused('native_question_policy_unproven')
+            if self.thread_id != thread_id or self.last_turn_id != turn_id:
+                raise Refused('native_turn_mismatch')
+            if self.process is None or self.process.returncode is not None or self.process.stdin.is_closing():
+                raise Refused('native_session_disconnected')
+            self.unresolved_input(request_id, turn_id)
+
+            def commit():
+                row.update(digest=digest, message_id=message_id, state='unknown', status='unknown')
+                self.save_interactions()
+
+            def started(new_turn_id):
+                row.update(state='accepted', status='accepted', continuation_turn_id=new_turn_id)
+                self.save_interactions()  # turn/start receipt acknowledges input, never goal/action success
+
+            def refused():
+                row.update(state='refused', status='refused')
+                self.save_interactions()  # admission failed before a native write; retain the original intent
+
+            if self.events is None:
+                await resume(text, commit, started, refused)
+            else:
+                self.active(request_id, thread_id, turn_id)
+                admit(True)
+                commit()
+                try:
+                    result = await self.rpc('turn/steer', {'threadId': thread_id, 'expectedTurnId': turn_id,
+                        'clientUserMessageId': message_id, 'input': [{'type': 'text', 'text': text}]})
+                    if result.get('turnId') == turn_id:
+                        row.update(state='accepted', status='accepted')
+                        self.save_interactions()
+                except (OSError, TimeoutError):
+                    pass
+            return self.receipt(row)
 
     async def reply(self, *, request_id, thread_id, turn_id, native_request_id, item_id, answers, admit=None):
         """Explicit ordinary answers only. Submitted bytes have no positive native contents-acceptance ACK."""
@@ -131,6 +206,8 @@ class CodexSession:
                 self.save_interactions()
                 raise Refused('question_expired')
             self.active(request_id, thread_id, turn_id)
+            if not self.turn_policy_proven:
+                raise Refused('native_question_policy_unproven')
             if admit:
                 admit(True)
             if self.process.returncode is not None or self.process.stdin.is_closing():
@@ -166,10 +243,7 @@ class CodexSession:
                 admit(True)
             if self.process.returncode is not None or self.process.stdin.is_closing():
                 raise Refused('native_session_disconnected')
-            if any(r['kind'] == 'steer' and r['original_request_id'] == request_id
-                   and r['native_turn_id'] == turn_id and r.get('status') == 'unknown'
-                   for r in self.interactions.values()):
-                raise Refused('native_input_unresolved')  # a fresh message id cannot bypass an uncertain write
+            self.unresolved_input(request_id, turn_id)  # changing the input route cannot bypass an uncertain write
             row = {'kind': 'steer', 'original_request_id': request_id, 'native_thread_id': thread_id,
                    'native_turn_id': turn_id, 'message_id': message_id, 'digest': digest,
                    'state': 'unknown', 'status': 'unknown'}
@@ -186,6 +260,8 @@ class CodexSession:
             return self.receipt(row)
 
     async def connect(self):
+        pinned = (self.config.version == '0.166.0' and await asyncio.to_thread(
+            engines.installed_version, self.config.binary) == '0.166.0')
         self.dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.load_interactions()
         # App-server has no -C argument carrying our marker token. A verified executable link
@@ -228,6 +304,7 @@ class CodexSession:
             else:
                 response = await self.rpc('thread/start', {**params, 'ephemeral': False})
             self.thread_id = response['thread']['id']
+            self.policy_proven = pinned and response.get('approvalPolicy') == 'never'
             saved.write_text(json.dumps({'thread_id': self.thread_id}))
             saved.chmod(0o600)
         except BaseException:
@@ -266,6 +343,7 @@ class CodexSession:
                             result = message.get('result', {})
                             if self.events is not None and self.turn_id is None and isinstance(result.get('turn'), dict):
                                 self.turn_id = result['turn']['id']
+                                self.turn_policy_proven = self.policy_proven
                             future.set_result(result)
                 elif 'id' in message:
                     try:
@@ -284,9 +362,16 @@ class CodexSession:
                         continue  # late/unrelated turn events cannot complete or mutate this turn
                     if message.get('method') == 'turn/started':
                         self.turn_id = params['turn']['id']
+                    if message.get('method') == 'thread/settings/updated':
+                        if (params.get('threadSettings') or {}).get('approvalPolicy') != 'never':
+                            self.policy_proven, self.turn_policy_proven = False, False
+                    if message.get('method') == 'item/completed':
+                        item = params.get('item') or {}
+                        if item.get('type') == 'agentMessage' and item.get('delivery') == 'async':
+                            self.async_question(params)
                     if message.get('method') == 'turn/completed':
                         self.done.set()
-                        self.finish_questions('expired')
+                        self.finish_questions('expired', include_async=False)
                     if message.get('method') == 'serverRequest/resolved':
                         ident = params.get('requestId')
                         for row in self.interactions.values():
@@ -316,10 +401,14 @@ class CodexSession:
             self.stderr.extend(chunk)
             del self.stderr[:-16384]
 
-    async def turn(self, prompt, config, consume, *, request_id=None):
+    async def turn(self, prompt, config, consume, *, request_id=None, on_started=None, admit=None):
         async with self.lock:
+            if admit:
+                admit()
+            self.finish_questions('expired')  # a later turn cannot answer an older unresolved question
             self.events = asyncio.Queue()
             self.turn_id = None
+            self.turn_policy_proven = False
             self.request_id, self.stopping = request_id, False
             self.done.clear()
             try:
@@ -331,6 +420,8 @@ class CodexSession:
                                       'networkAccess': True}})
                 self.turn_id = response['turn']['id']
                 self.last_turn_id = self.turn_id
+                if on_started:
+                    on_started(self.turn_id)
                 while True:
                     event = await self.events.get()
                     if event is None:
@@ -347,13 +438,13 @@ class CodexSession:
                 self.request_id = None
 
     async def interrupt(self):
+        if self.events is None or self.done.is_set():
+            return  # normal completion leaves async questions pending on this conversation
         self.stopping = True
         try:
             self.finish_questions('cancelled')
         except OSError:
             pass
-        if self.events is None or self.done.is_set():
-            return
         try:
             async with asyncio.timeout(10):
                 while self.turn_id is None:
@@ -382,6 +473,7 @@ class PersistentRun(BareRun):
     def __init__(self, *args):
         super().__init__(*args)
         self.session = None
+        self.input_text, self.input_started, self.input_admit, self.input_refused = None, None, None, None
 
     def skill_files(self):
         return {}
@@ -392,6 +484,8 @@ class PersistentRun(BareRun):
             async with asyncio.timeout(self.request.max_minutes * MINUTE_S):
                 key = (self.owner, self.device)
                 session = self.agents.sessions.get(key)
+                if self.input_text is not None and (session is None or session.process is None or session.process.returncode is not None):
+                    raise Refused('native_session_disconnected')  # a queued answer cannot start a replacement process
                 if session is None or session.process.returncode is not None:
                     if session is not None:
                         await session.close()
@@ -407,12 +501,18 @@ class PersistentRun(BareRun):
                 if self.state != 'running':
                     return
                 self.engine_started = time.monotonic()
-                status = await session.turn(self.prompt(), self.config, self.consume, request_id=self.id)
+                status = await session.turn(self.input_text if self.input_text is not None else self.prompt(),
+                                            self.config, self.consume, request_id=self.id, on_started=self.input_started,
+                                            admit=self.input_admit)
                 if self.state == 'running':
                     await self.end('succeeded' if status == 'completed' and self.finished else 'failed',
                                    exit_code=0 if status == 'completed' else 1)
         except TimeoutError:
             await self.end('timed_out')
+        except Refused as error:
+            if self.input_refused:
+                self.input_refused()
+            await self.end('failed', error=error.code)
         except (OSError, ValueError, KeyError):
             self.stream.errors.append('native_session_disconnected_or_start_failed')
             if self.session:
@@ -433,7 +533,7 @@ class PersistentRun(BareRun):
         elif method == 'item/tool/requestUserInput':
             await self.event('question', native_request_id=event['id'], native_thread_id=params['threadId'],
                              native_turn_id=params['turnId'], item_id=params['itemId'],
-                             questions=params['questions'], is_blocking=params['isBlocking'])
+                             questions=params['questions'], is_blocking=params['isBlocking'], source='rpc')
         elif method == 'serverRequest/resolved':
             await self.event('question_resolved', native_thread_id=params['threadId'], native_request_id=params['requestId'])
         elif method in ('item/started', 'item/completed') and item.get('type') == 'commandExecution':
@@ -451,6 +551,10 @@ class PersistentRun(BareRun):
                 self.actions.append(entry)
                 await self.event('action', **{**entry, 'command': entry['command'][:120]})
         elif method == 'item/completed' and item.get('type') == 'agentMessage':
+            key = self.session.interaction_key('async_question', self.id, params['threadId'], params.get('turnId'), item['id'])
+            if item.get('delivery') == 'async' and key in self.session.interactions:
+                await self.event('question', source='async', native_thread_id=params['threadId'],
+                                 native_turn_id=params['turnId'], item_id=item['id'], questions=item['questions'])
             text = item.get('text', '')
             if item.get('phase') in (None, 'final_answer') and text.strip():
                 self.finished = {'summary': text, 'data': {}}
