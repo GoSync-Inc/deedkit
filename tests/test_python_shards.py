@@ -64,13 +64,14 @@ def test_the_plan_is_deterministic_balanced_and_gives_shard_one_less_work():
 
 # spec: ANYM-624
 def test_the_committed_plan_balances_the_measured_suite_and_job_overheads():
-    # Current full CI runs: each module's median seconds and each job's median time outside its pytest
-    # step (verify builds and runs the other checks). The committed weights and head start must split that measured
+    # Successful post-Go CI runs: each module's median seconds and the job time outside JUnit cases,
+    # including pytest/session residual. The fixed drill uses its current measured cost, not its old retry wait.
+    # The committed weights and head start must split that independently measured
     # work so that no shard job ends more than 10 % after the mean one.
-    measured = json.loads((ROOT / "tests/fixtures/python-shards-measured-2026-11-12.json").read_text())
+    measured = json.loads((ROOT / "tests/fixtures/python-shards-measured-2026-11-13.json").read_text())
     plan = python_shards.plan(sorted(measured["seconds"]), tiden_ci.PYTHON_SHARDS, WEIGHTS)
     # The complete reporting module now runs beside the real Go suites, outside the Python shards.
-    # Keep the historical measured fixture and the 10 % bound; model only the work these shards execute.
+    # Keep the historical fixtures and the 10 % bound; model only the work these shards execute.
     ends = [measured["overhead"]["verify" if index == 1 else "python"]
             + sum(seconds for name, seconds in measured["seconds"].items()
                   if plan[name] == index and name != "tests/test_tiden_ci.py")
