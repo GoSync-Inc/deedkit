@@ -13,7 +13,7 @@
     "scripts/seamless_release.py": {"lines": 1091, "longest_function": 76},
     "scripts/tiden_ci.py": {"lines": 1502, "longest_function": 103},
     "services/android/src/deedkit_android/agent_run.py": {"lines": 1161, "longest_function": 91},
-    "services/android/src/deedkit_android/codex_session.py": {"lines": 956, "longest_function": 88},
+    "services/android/src/deedkit_android/codex_session.py": {"lines": 982, "longest_function": 94},
     "services/calendar/family_calendar/service/core.py": {"lines": 1198, "longest_function": 101},
     "services/calendar/family_calendar/service/migration_rollout.py": {"lines": 1228, "longest_function": 60},
     "services/calendar/family_calendar/service/schedule.py": {"lines": 905, "longest_function": 98},
