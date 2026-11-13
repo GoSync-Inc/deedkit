@@ -328,6 +328,158 @@ def test_a_replayed_event_page_and_a_second_bridge_create_no_second_task(tmp_pat
 
 
 # spec: ANYM-990
+def test_normal_forward_reads_history_but_mutates_only_pending_events_and_actual_linked_tasks(tmp_path):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1, projection=projection('Unrelated historical metadata must stay out of BB.')))
+    gw.submit(row(2))
+    gw.submit(row(3))
+    gw.events = [('feedback.received', fid(2))]
+    bridge.apply(row(3), {'created': 0, 'updated': 0})
+    gw.rows[2]['projection'] = projection('Linked item gained a released brief.')
+    bridge.ledger.set_meta('export_cursor', '0')
+    result = bridge.forward()
+    assert {fb.first_line_id(t['description']) for t in tasks.tasks.values()} == {fid(2), fid(3)}
+    assert bridge.ledger.link(fid(1)) is None
+    assert bridge.ledger.meta('export_cursor') == '0'
+    assert result['metadata_complete'] is True and result['missing'] == result['held'] == 0
+    assert gw.acked == 1 and 'Linked item' in task_of(tasks, 3)['title']
+    snapshot = json.dumps([tasks.tasks, tasks.comments])
+    assert 'Unrelated historical' not in snapshot
+
+
+# spec: ANYM-990
+def test_an_empty_subscription_and_no_linked_tasks_never_create_history_or_move_the_cursor(tmp_path):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1))
+    gw.events = []
+    bridge.forward()
+    assert not tasks.tasks and bridge.ledger.link(fid(1)) is None
+    assert bridge.ledger.meta('export_cursor') is None and gw.acked == 0
+
+
+# spec: ANYM-990
+@pytest.mark.parametrize('case', ['budget', 'missing-more', 'missing-cursor', 'repeated-cursor'])
+def test_scoped_metadata_reads_require_explicit_bounded_completion_and_never_advance_cursor(tmp_path, monkeypatch, case):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1))
+    bridge.ledger.set_meta('export_cursor', '0')
+    monkeypatch.setattr(fb, 'MAX_EXPORT_PAGES', 2)
+    count = 0
+    def listing(cursor=None, limit=100):
+        nonlocal count
+        count += 1
+        out = {'items': [row(1)], 'has_more': True, 'next_cursor': str(count), 'export_head': iso(NOW)}
+        if case == 'missing-more':
+            out.pop('has_more')
+        elif case == 'missing-cursor':
+            out.pop('next_cursor')
+        elif case == 'repeated-cursor':
+            out['next_cursor'] = cursor
+        return out
+    gw.messages_export_feedback_metadata = listing
+    with pytest.raises(fb.Incomplete, match='metadata_listing_incomplete'):
+        bridge.forward()
+    assert count == (2 if case == 'budget' else 1) and bridge.ledger.meta('export_cursor') == '0'
+    assert gw.acked == 0 and len(tasks.tasks) <= 1
+
+
+# spec: ANYM-990
+def test_a_changed_metadata_export_head_is_incomplete_and_cannot_authorize_ack(tmp_path):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1))
+    count = 0
+    def listing(cursor=None, limit=100):
+        nonlocal count
+        count += 1
+        return {'items': [row(1)], 'has_more': count == 1, 'next_cursor': str(count), 'export_head': iso(NOW + count)}
+    gw.messages_export_feedback_metadata = listing
+    with pytest.raises(fb.Incomplete, match='metadata_listing_incomplete'):
+        bridge.forward()
+    assert count == 2 and gw.acked == 0 and bridge.ledger.meta('export_cursor') is None
+
+
+# spec: ANYM-990
+def test_a_page_from_another_subscription_cannot_authorize_any_new_task(tmp_path):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1))
+    page = gw.page_of(); page['subscription']['subscription_id'] = 'another-subscription'
+    assert bridge.forward(page)['held'] == 1
+    assert not tasks.tasks and gw.acked == 0
+
+
+# spec: ANYM-990
+@pytest.mark.parametrize('case', ['masked', 'gap', 'wrong-subscription', 'malformed-module'])
+def test_empty_pages_with_unconfirmed_subscription_scope_are_held_instead_of_ready(tmp_path, case):
+    bridge, gw, tasks = make(tmp_path)
+    page = gw.page_of()
+    if case == 'masked':
+        page['scope_masked'] = True
+    elif case == 'gap':
+        page['module']['gap'] = {'reason': 'retention_gap'}
+    elif case == 'wrong-subscription':
+        page['subscription']['subscription_id'] = 'another-subscription'
+    else:
+        page['module'] = ['malformed']
+    assert bridge.forward(page, read_only=True)['held'] == 1
+    assert not tasks.tasks and gw.acked == 0
+
+
+# spec: ANYM-990
+def test_inspect_never_creates_a_missing_subscription_or_reconciles_pending_ack_by_writing(tmp_path, capsys):
+    bridge, gw, tasks = make(tmp_path, subscription_id=None)
+    env = {'DEEDKIT_FEEDBACK_BRIDGE_ENV': str(write_env(tmp_path, DEEDKIT_FEEDBACK_SUBSCRIPTION_ID=None))}
+    before = '\n'.join(bridge.ledger.db.iterdump())
+    assert fb.main(['inspect'], environ=env, gateway=gw, tasks=tasks) == 1
+    assert not gw.calls('messages_create_subscription') and before == '\n'.join(bridge.ledger.db.iterdump())
+    gw.submit(row(1))
+    gw.fail['messages_ack_subscription_events'] = fb.Uncertain('gateway_unreachable')
+    with pytest.raises(fb.Uncertain):
+        bridge.forward()
+    before = '\n'.join(bridge.ledger.db.iterdump())
+    assert fb.main(['inspect'], environ=env, gateway=gw, tasks=tasks) == 1
+    assert before == '\n'.join(bridge.ledger.db.iterdump()) and len(gw.calls('messages_ack_subscription_events')) == 1
+    assert 'scope_subscription_missing' in capsys.readouterr().err
+
+
+# spec: ANYM-990
+def test_read_only_inspection_of_a_closed_subscription_does_not_clear_its_stored_identity(tmp_path, capsys):
+    bridge, gw, tasks = make(tmp_path, subscription_id=None)
+    gw.submit(row(1)); bridge.forward()
+    env = {'DEEDKIT_FEEDBACK_BRIDGE_ENV': str(write_env(tmp_path, DEEDKIT_FEEDBACK_SUBSCRIPTION_ID=None))}
+    gw.fail['messages_fetch_subscription_events'] = fb.Refused('subscription_closed', 409)
+    before = '\n'.join(bridge.ledger.db.iterdump())
+    assert fb.main(['inspect'], environ=env, gateway=gw, tasks=tasks) == 1
+    assert before == '\n'.join(bridge.ledger.db.iterdump())
+    assert len(gw.calls('messages_create_subscription')) == 1
+    assert 'subscription_closed' in capsys.readouterr().err
+
+
+# spec: ANYM-990
+def test_missing_metadata_and_old_or_closed_in_scope_items_are_explicitly_held_without_ack(tmp_path):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1, age=40 * 86400))
+    gw.submit(row(2, status='declined'))
+    gw.events.append(('feedback.received', fid(3)))
+    result = bridge.forward()
+    assert result['metadata_complete'] is True and result['missing'] == 1 and result['held'] == 3
+    assert not tasks.tasks and gw.acked == 0 and bridge.ledger.meta('export_cursor') is None
+
+
+# spec: ANYM-990
+def test_a_pending_reverse_item_remains_in_read_scope_without_a_new_subscription_event(tmp_path):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1))
+    bridge.forward()
+    bridge.ledger.put_pending_write('original-request', fid(1), 'v-original', 'accepted')
+    gw.events = []
+    gw.rows = []
+    result = bridge.forward()
+    assert result['missing'] == 1 and result['held'] == 1
+    assert bridge.ledger.meta('export_cursor') is None
+    assert bridge.ledger.one('SELECT rid FROM pending_write WHERE fid=?', fid(1))['rid'] == 'original-request'
+
+
+# spec: ANYM-990
 def test_a_first_run_skips_history_and_closed_items(tmp_path):
     bridge, gw, tasks = make(tmp_path)
     day = 86400
@@ -783,7 +935,7 @@ def test_bb_down_means_no_create_no_ack_and_a_later_cycle_catches_up(tmp_path, c
     assert not tasks.tasks and gw.acked == 0 and bridge.ledger.meta('export_cursor') is None
     tasks.fail_all = None
     bridge.cycle()
-    assert len(tasks.tasks) == 2 and gw.acked == 1 and bridge.ledger.meta('export_cursor') is not None
+    assert len(tasks.tasks) == 2 and gw.acked == 1 and bridge.ledger.meta('export_cursor') is None
 
 
 # spec: ANYM-990
@@ -955,6 +1107,231 @@ def test_done_in_bb_is_never_written_back_and_a_comment_says_why_once(tmp_path):
 
 
 # spec: ANYM-990
+@pytest.mark.parametrize('case', ['missing', 'unchanged', 'wrong-spec', 'wrong-duplicate', 'missing-version', 'old-version'])
+def test_unknown_triage_keeps_original_intent_until_all_disposition_fields_and_version_are_observed(tmp_path, case):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1))
+    bridge.forward()
+    duplicate = case == 'wrong-duplicate'
+    tasks.human('DK-1', status='canceled' if duplicate else 'todo', labels=['feedback', 'duplicate'] if duplicate else ['feedback', 'spec:ANYM-990'],
+        description=tasks.get('DK-1')['description'] + ('\nDuplicate-Of: ' + fid(9) if duplicate else ''))
+    original = gw.messages_set_feedback_triage
+    def uncertain(**args):
+        original(**args)
+        item = gw.rows[0]
+        if case == 'missing':
+            gw.rows = []
+        elif case == 'unchanged':
+            item.update(status='received', status_changed_at=None)
+        elif case == 'wrong-spec':
+            item['spec_ref'] = 'ANYM-991'
+        elif case == 'wrong-duplicate':
+            item['duplicate_of'] = fid(8)
+        elif case == 'missing-version':
+            item['status_changed_at'] = None
+        else:
+            item['status_changed_at'] = item['created_at']
+        raise fb.Uncertain('gateway_unreachable')
+    gw.messages_set_feedback_triage = uncertain
+    with pytest.raises(fb.Uncertain, match='triage_outcome_unresolved'):
+        bridge.reverse()
+    pending = bridge.ledger.one('SELECT * FROM pending_write WHERE fid=?', fid(1))
+    assert pending and pending['body']
+    intent = json.loads(pending['body'])
+    assert intent['request_id'] == pending['rid'] and intent['feedback_id'] == fid(1)
+    assert intent['spec_ref' if not duplicate else 'duplicate_of'] == ('ANYM-990' if not duplicate else fid(9))
+    tasks.human('DK-1', title='Later BB version; original pending request must stay fixed.')
+    for _ in range(2):
+        revived, _, _ = make(tmp_path, gateway=gw, tasks=tasks)
+        with pytest.raises(fb.Uncertain, match='triage_outcome_unresolved'):
+            revived.reverse()
+        assert revived.ledger.one('SELECT * FROM pending_write WHERE fid=?', fid(1)) == pending
+    assert len(gw.calls('messages_set_feedback_triage')) == 1
+
+
+# spec: ANYM-990
+def test_a_refused_reconciliation_read_does_not_clear_an_unknown_triage_write(tmp_path):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1)); bridge.forward()
+    tasks.human('DK-1', status='todo', labels=['feedback', 'spec:ANYM-990'])
+    gw.write_mode = 'uncertain_not_applied'
+    gw.fail['messages_export_feedback_metadata'] = fb.Refused('forbidden', 403)
+    for _ in range(2):
+        with pytest.raises(fb.Uncertain, match='triage_outcome_unresolved'):
+            bridge.reverse()
+        assert bridge.ledger.pending_writes(fid(1))
+    assert len(gw.calls('messages_set_feedback_triage')) == 1
+
+
+# spec: ANYM-990
+def test_an_incomplete_success_reply_cannot_clear_a_triage_intent_or_trigger_another_send(tmp_path):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1)); bridge.forward()
+    tasks.human('DK-1', status='todo', labels=['feedback', 'spec:ANYM-990'])
+    gw.messages_set_feedback_triage = lambda **args: {'status_changed_at': iso(NOW + 10)}
+    with pytest.raises(fb.Uncertain, match='triage_outcome_unresolved'):
+        bridge.reverse()
+    assert bridge.ledger.pending_writes(fid(1))
+    with pytest.raises(fb.Uncertain, match='triage_outcome_unresolved'):
+        bridge.reverse()
+    assert len(gw.calls('messages_set_feedback_triage')) == 1
+
+
+# spec: ANYM-990
+def test_a_crash_after_the_pending_triage_journal_never_sends_on_restart_or_new_task_version(tmp_path):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1))
+    bridge.forward()
+    tasks.human('DK-1', status='todo', labels=['feedback', 'spec:ANYM-990'])
+    gw.messages_set_feedback_triage = lambda **args: (_ for _ in ()).throw(Crash)
+    with pytest.raises(Crash):
+        bridge.reverse()
+    pending = bridge.ledger.one('SELECT * FROM pending_write WHERE fid=?', fid(1))
+    tasks.human('DK-1', status='canceled')
+    for _ in range(2):
+        revived, _, _ = make(tmp_path, gateway=gw, tasks=tasks)
+        with pytest.raises(fb.Uncertain, match='triage_outcome_unresolved'):
+            revived.reverse()
+        assert revived.ledger.one('SELECT * FROM pending_write WHERE fid=?', fid(1)) == pending
+    assert len(gw.calls('messages_set_feedback_triage')) == 1
+
+
+# spec: ANYM-990
+def test_a_legacy_pending_triage_without_saved_body_is_held_and_never_reconstructed_or_overwritten(tmp_path):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1)); bridge.forward()
+    tasks.human('DK-1', status='todo', labels=['feedback', 'spec:ANYM-990'])
+    bridge.ledger.put_pending_write('legacy-original', fid(1), 'v-original', 'accepted')
+    with pytest.raises(fb.Uncertain, match='triage_intent_unavailable'):
+        bridge.reverse()
+    assert not gw.calls('messages_set_feedback_triage')
+    assert bridge.ledger.one('SELECT rid FROM pending_write WHERE fid=?', fid(1))['rid'] == 'legacy-original'
+
+
+# spec: ANYM-990
+def test_read_only_initial_inspection_uses_the_normal_scope_without_task_ack_cursor_or_pending_writes(tmp_path, capsys):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1)); gw.submit(row(2, age=40 * 86400))
+    gw.submit(row(3))
+    gw.events = [('feedback.received', fid(2))]
+    bridge.apply(row(1), {'created': 0, 'updated': 0})
+    before = '\n'.join(bridge.ledger.db.iterdump())
+    result = bridge.forward(read_only=True)
+    assert result['metadata_complete'] and result['held'] == 1
+    assert len(tasks.tasks) == 1 and bridge.ledger.link(fid(2)) is bridge.ledger.link(fid(3)) is None
+    assert before == '\n'.join(bridge.ledger.db.iterdump()) and gw.acked == 0
+    env = {'DEEDKIT_FEEDBACK_BRIDGE_ENV': str(write_env(tmp_path))}
+    assert fb.main(['inspect'], environ=env, gateway=gw, tasks=tasks) == 1
+    assert 'scope' in capsys.readouterr().out
+
+
+# spec: ANYM-990
+@pytest.mark.parametrize('scenario', ['unknown', 'applied', 'wrong-spec', 'missing'])
+def test_restarted_real_cli_preserves_scope_and_pending_triage_identity_without_another_send(tmp_path, scenario):
+    import importlib.util
+    import sqlite3
+    import sys
+    import time
+    # Load separate fake-server globals so its authoritative timestamps match this real process experiment.
+    spec = importlib.util.spec_from_file_location('scoped_process_fixtures', Path(__file__))
+    fixtures = importlib.util.module_from_spec(spec); spec.loader.exec_module(fixtures)
+    fixtures.NOW = time.time()
+    gw = fixtures.FakeGateway()
+    gw.submit(fixtures.row(1))
+    gw.submit(fixtures.row(2, projection=projection('CANARY unrelated historical metadata.')))
+    gw.events = [('feedback.received', fid(1))]
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            args = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            status = 200
+            try:
+                out = gw.call(self.path.rsplit('/', 1)[1], args)
+            except fb.Uncertain:
+                if scenario == 'wrong-spec':
+                    gw.rows[0]['spec_ref'] = 'ANYM-991'
+                elif scenario == 'missing':
+                    gw.rows = [r for r in gw.rows if r['feedback_id'] != fid(1)]
+                status, out = 503, {'error': 'synthetic_unknown'}
+            body = json.dumps(out).encode(); self.send_response(status)
+            self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True); worker.start()
+    install, fake = tmp_path / 'lib', tmp_path / 'bin'; install.mkdir(); fake.mkdir()
+    for name in ('feedback_bridge.py', 'feedback_dispatch.py'):
+        (install / name).write_text((REPO / 'scripts' / name).read_text())
+    state = tmp_path / 'bb.json'; state.write_text(json.dumps({'tasks': []}))
+    (fake / 'bb').write_text('''#!/usr/bin/env python3
+import json,os,pathlib,sys
+p=pathlib.Path(os.environ['FAKE_BB_STATE']); data=json.loads(p.read_text()); a=sys.argv[1:]
+def opt(k,d=None): return a[a.index(k)+1] if k in a else d
+if a[:2]==['tasks','create']:
+    n=len(data['tasks'])+1
+    task={'id':'T%d'%n,'key':'DK-%d'%n,'number':n,'title':opt('--title'),'status':'backlog','updatedAt':'v1',
+          'description':pathlib.Path(opt('--description-file')).read_text(),
+          'labels':[a[i+1] for i,x in enumerate(a) if x=='--label']}
+    data['tasks'].append(task); out={'task':task}
+elif a[:2]==['tasks','list']: out={'tasks':data['tasks']}
+elif a[:2] in (['tasks','show'],['tasks','update']):
+    task=next(t for t in data['tasks'] if t['key']==a[2]); out={'task':task}
+    if a[1]=='update':
+        for k in ('title','status'):
+            if opt('--'+k) is not None: task[k]=opt('--'+k)
+        if opt('--description-file'): task['description']=pathlib.Path(opt('--description-file')).read_text()
+        task['updatedAt']+='-bridge'
+elif a[:3]==['tasks','label','list']: out={'labels':[{'name':'feedback'},{'name':'fb-bug'}]}
+elif a[:3]==['tasks','label','create'] or a[:2]==['tasks','comment']: out={'ok':True}
+else: raise SystemExit('unexpected fake call')
+p.write_text(json.dumps(data)); print(json.dumps(out))
+''')
+    (fake / 'bb').chmod(0o755)
+    token = tmp_path / 'synthetic.token'; token.write_text('synthetic-loopback-only'); token.chmod(0o600)
+    env_file = tmp_path / 'bridge.env'; ledger = tmp_path / 'ledger'
+    env_file.write_text('DEEDKIT_GATEWAY_URL=http://127.0.0.1:%d\nDEEDKIT_FEEDBACK_KEY_FILE=%s\nDEEDKIT_BRIDGE_STATE_DIR=%s\n' %
+        (server.server_port, token, ledger)); env_file.chmod(0o600)
+    dispatch = tmp_path / 'dispatch.json'; dispatch.write_text('{"dispatch":false}'); dispatch.chmod(0o600)
+    env = os.environ | {'DEEDKIT_FEEDBACK_BRIDGE_ENV': str(env_file), 'DEEDKIT_FEEDBACK_DISPATCH_CONFIG': str(dispatch),
+        'PATH': str(fake) + os.pathsep + os.environ['PATH'], 'FAKE_BB_STATE': str(state)}
+    env.pop('BB_CLI', None)
+    def run(mode):
+        return subprocess.run([sys.executable, str(install / 'feedback_bridge.py'), mode], env=env,
+            capture_output=True, text=True, timeout=30)
+    def pending():
+        with sqlite3.connect(ledger / 'ledger.sqlite3') as db:
+            return db.execute('SELECT rid,fid,version,status,body FROM pending_write').fetchall()
+    try:
+        first = run('run'); assert first.returncode == 0, first.stderr
+        assert len(json.loads(state.read_text())['tasks']) == 1 and 'CANARY' not in state.read_text()
+        before = (ledger / 'ledger.sqlite3').read_bytes()
+        inspected = run('inspect'); assert inspected.returncode == 0, inspected.stderr
+        assert before == (ledger / 'ledger.sqlite3').read_bytes() and gw.acked == 1
+        data = json.loads(state.read_text()); data['tasks'][0].update(status='todo', updatedAt='human-v2', labels=['feedback', 'spec:ANYM-990'])
+        state.write_text(json.dumps(data))
+        gw.write_mode = 'uncertain_not_applied' if scenario == 'unknown' else 'uncertain_applied'
+        result = run('reverse'); assert result.returncode == (0 if scenario == 'applied' else 1), result.stderr
+        saved = pending()
+        assert len(gw.calls('messages_set_feedback_triage')) == 1
+        if scenario != 'applied':
+            assert len(saved) == 1 and json.loads(saved[0][4])['spec_ref'] == 'ANYM-990'
+            data = json.loads(state.read_text()); data['tasks'][0].update(updatedAt='human-v3', title='Later edit')
+            data['tasks'][0]['labels'] = ['feedback', 'spec:ANYM-991']; state.write_text(json.dumps(data))
+            for mode in ('reverse', 'run', 'reverse'):
+                assert run(mode).returncode == 1
+                assert pending() == saved and len(gw.calls('messages_set_feedback_triage')) == 1
+            item = fixtures.row(1, status='accepted', spec_ref='ANYM-990', status_changed_at=fixtures.iso(fixtures.NOW + 100))
+            gw.rows = [item | {'_seq': 100}]  # authoritative desired state; not proof which request committed
+        assert run('reverse').returncode == 0
+        assert not pending() and len(gw.calls('messages_set_feedback_triage')) == 1
+        assert len(json.loads(state.read_text())['tasks']) == 1
+        with sqlite3.connect(ledger / 'ledger.sqlite3') as db:
+            assert db.execute("SELECT value FROM meta WHERE key='export_cursor'").fetchone() is None
+    finally:
+        server.shutdown(); server.server_close(); worker.join(timeout=5)
+
+
+# spec: ANYM-990
 def test_an_uncertain_status_write_that_applied_is_read_back_and_not_replayed(tmp_path):
     bridge, gw, tasks = make(tmp_path)
     gw.submit(row(1))
@@ -973,10 +1350,19 @@ def test_an_uncertain_status_write_that_did_not_apply_is_replayed_with_the_same_
     bridge.cycle()
     tasks.human(task_of(tasks, 1)['key'], status='todo', labels=['feedback', 'spec:ANYM-990'])
     gw.write_mode = 'uncertain_not_applied'
-    assert bridge.reverse()['written'] == 1
+    # Identity preserved. Existing owner authority never permits retry of an unknown mutation; no new request ID.
+    with pytest.raises(fb.Uncertain, match='triage_outcome_unresolved'):
+        bridge.reverse()
     sent = gw.calls('messages_set_feedback_triage')
-    assert len(sent) == 2 and sent[0]['request_id'] == sent[1]['request_id']
-    assert gw.rows[0]['status'] == 'accepted'
+    assert len(sent) == 1 and gw.rows[0]['status'] == 'received'
+    original = bridge.ledger.one('SELECT * FROM pending_write WHERE fid=?', fid(1))
+    tasks.human(task_of(tasks, 1)['key'], title='A later BB edit must not bypass the pending request.')
+    for _ in range(3):
+        revived, _, _ = make(tmp_path, gateway=gw, tasks=tasks)
+        with pytest.raises(fb.Uncertain, match='triage_outcome_unresolved'):
+            revived.reverse()
+        assert revived.ledger.one('SELECT * FROM pending_write WHERE fid=?', fid(1)) == original
+    assert len(gw.calls('messages_set_feedback_triage')) == 1
 
 
 # spec: ANYM-990
