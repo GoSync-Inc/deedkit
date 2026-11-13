@@ -33,6 +33,13 @@ def run(args, cwd, env=None, input=None, timeout=600):
     return subprocess.run(args, cwd=cwd, env=env, input=input, capture_output=True, timeout=timeout)
 
 
+def npm_environment(home):
+    # Registry failure is deliberate in this offline drill: one real GET proves it without backoff.
+    return {"PATH": os.environ["PATH"], "HOME": str(home), "npm_config_userconfig": str(home / ".npmrc"),
+            "npm_config_globalconfig": str(home / "global.npmrc"), "npm_config_cache": str(home / "cache"),
+            "npm_config_fetch_retries": "0"}
+
+
 def git_output(repository, *args):
     env = {"PATH": os.environ["PATH"], "HOME": str(repository.parent), **SYNTHETIC_GIT}
     result = run(["git", "-C", str(repository), *args], repository, env)
@@ -127,6 +134,48 @@ def evidence_for(tmp_path, name, commit, reports):
 
 
 # spec: ANYM-418
+def test_release_drill_does_not_retry_a_failed_registry_get(tmp_path):
+    home = tmp_path / "npm-home"
+    home.mkdir()
+    package = tmp_path / "package"
+    package.mkdir()
+    name = "deedkit-release-drill-fetch"
+    (package / "package.json").write_text(json.dumps({"name": name, "version": "0.0.0"}))
+    (package / "index.js").write_text("module.exports = {};\n")
+    env = npm_environment(home)
+    # Keep the negative control quick even with npm's original retry count. Real npm still decides
+    # whether to retry a failed HTTP GET; no process, request or registry response is mocked.
+    env.update(npm_config_fetch_retry_mintimeout="1", npm_config_fetch_retry_maxtimeout="1")
+    requests = []
+
+    class DisconnectedRegistry(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append((self.command, self.path))
+            self.close_connection = True
+            self.connection.shutdown(socket.SHUT_RDWR)
+
+        def __getattr__(self, name):
+            if name.startswith("do_"):
+                return self.do_GET
+            raise AttributeError(name)
+
+        def log_message(self, format, *args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), DisconnectedRegistry) as registry:
+        threading.Thread(target=registry.serve_forever, daemon=True).start()
+        try:
+            dry = run(["npm", "publish", str(package), "--dry-run", "--ignore-scripts", "--registry",
+                       f"http://127.0.0.1:{registry.server_port}/"], tmp_path, env, timeout=120)
+        finally:
+            registry.shutdown()
+    assert dry.returncode == 0, dry.stderr
+    assert f"{name}@0.0.0" in dry.stdout.decode()
+    assert requests and {method for method, _ in requests} == {"GET"}
+    assert [path for _, path in requests if path == "/" + name] == ["/" + name], requests
+
+
+# spec: ANYM-418
 def test_release_drill_one_version_and_one_commit_from_tag_to_tiden_release_record(tmp_path, monkeypatch):
     repository, version, head, archived_id, commit = archived_repository(tmp_path)
     # One commit: the archive was made from HEAD, and the throwaway commit, its tag and its tree record it.
@@ -176,8 +225,7 @@ def test_release_drill_one_version_and_one_commit_from_tag_to_tiden_release_reco
     # first run of this drill showed that), so the registry is a closed loopback port, then a recording one.
     home = tmp_path / "npm-home"
     home.mkdir()
-    env = {"PATH": os.environ["PATH"], "HOME": str(home), "npm_config_userconfig": str(home / ".npmrc"),
-           "npm_config_globalconfig": str(home / "global.npmrc"), "npm_config_cache": str(home / "cache")}
+    env = npm_environment(home)
     methods = []
 
     class Registry(BaseHTTPRequestHandler):
