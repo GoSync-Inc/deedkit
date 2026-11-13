@@ -161,14 +161,14 @@ def test_attach_polling_keeps_the_full_deadline_on_the_synthetic_hosts_clock(tmp
     monkeypatch.setattr(p, "run", lambda *args, **kwargs: "synthetic-holder")
     monkeypatch.setattr(p, "holder_log", lambda *args: [])
     assert "within 120 s" in p.holder_attached([], host.settings["projects"][0], [HOLDER], "synthetic")
-    assert clock.monotonic() - start == p.HOLDER_ATTACH_S == 120
+    assert p.HOLDER_ATTACH_S == 120 and clock.monotonic() == start + 120
     assert clock.sleeps == [p.HOLDER_ATTACH_POLL] * 24
     # An attach on the last poll before the bound still passes; the failure path cannot replace the polling loop.
     start = clock.monotonic()
     monkeypatch.setattr(p, "holder_log", lambda *args: ['{"event":"holder.attached"}']
                         if clock.monotonic() - start >= 115 else [])
     assert p.holder_attached([], host.settings["projects"][0], [HOLDER], "synthetic") is None
-    assert clock.monotonic() - start == 115
+    assert clock.monotonic() == start + 115
 
 
 # spec: ANYM-896

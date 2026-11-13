@@ -276,6 +276,9 @@ def test_outbound_query_failure_leaves_the_rest_of_the_status(out, monkeypatch):
 def test_outbound_queue_query_uses_the_pending_index(out):
     from messaging_service.outgoing import OUTBOUND_SQL
     with out.store.pool.connection() as c:
+        # TRUNCATE resets rows but keeps pg_statistic. A previous module's analyzed 5,001-row send history
+        # otherwise makes this empty fixture choose outgoing_expiry instead, depending on shard assignment.
+        c.execute('ANALYZE outgoing_messages')
         c.execute('SET LOCAL enable_seqscan=off')
         plan = '\n'.join(row['QUERY PLAN'] for row in c.execute('EXPLAIN ' + OUTBOUND_SQL, (list(ACCOUNTS),)))
     assert 'outgoing_pending' in plan
