@@ -9501,7 +9501,7 @@
       "android:read"
     ],
     "required_manifest": true,
-    "description": "Find connected Android devices, exclusive session policy and local Codex availability. For ordinary phone tasks and conversational follow-ups, acquire android_session then use android_agent. agent.persistent=true means one continuing live Codex conversation per caller/device, with skills disabled. Direct ADB and workflow APIs are compatibility features and may not be exposed to this caller. Example: {}",
+    "description": "Find connected Android devices, exclusive session policy and local Codex availability. For ordinary phone tasks and conversational follow-ups, acquire android_session then use android_agent. agent.persistent=true means one continuing live Codex conversation per caller/device, with skills disabled. Direct ADB and workflow APIs are compatibility features and may not be exposed to this caller. Example: {} Compatibility UI engine: uiautomator2; the Maestro engine was removed.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},
