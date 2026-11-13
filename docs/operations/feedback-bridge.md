@@ -158,6 +158,16 @@ start with no stored ID would create a second one.
 `scripts/feedback_dispatch.py` starts a process worker for a feedback task. It reads only the tracker `DK` through
 `bb tasks` and starts workers through `bb thread spawn`; it makes no model call and no gateway call, and it is off until
 `"dispatch": true` is set. A bb script automation runs one tick every 10 minutes and prints nothing when nothing is due.
+After a forward pass durably creates or reconciles a feedback task, or applies a changed metadata/released-brief
+fingerprint, the bridge directly invokes one `feedback_dispatch.py run` beside its installed executable. Multiple
+changes in a page coalesce into one wake; unchanged/replayed items do not wake again. This is the same dispatcher,
+with the same lock, start journal, eligibility checks and caps as the ten-minute automation. It adds no task hook,
+plugin, listener or daemon. Its bounded 240-second child process holds no feedback text in argv; output is captured,
+and a missing program, timeout or nonzero result logs only `dispatch_wake_failed` without undoing/replaying task saves.
+The already durable task remains discoverable by the periodic pass. A crash before the wake likewise leaves the BB
+create journal/link and the task for reconciliation; a lost spawn reply keeps the dispatcher's existing `starting` row.
+No exactly-once or latency guarantee is implied. A busy dispatcher can defer pickup until the fallback.
+
 The boundary is docs/operations/feedback-autoloop.md, unchanged: its Envelope and Owner items are what the worker brief
 enforces, and a principal outside the list is report-only.
 
@@ -177,7 +187,10 @@ task, feedback item and cluster (new-card slug, else primary card) ever plus one
 | Automation | `deedkit-feedback-dispatch-run` (`run`, every 10 minutes) |
 
 Every start is journaled before `bb thread spawn`; the thread is titled `feedback-<task key>`, a child of
-`orchestrator_thread`, and `bb tasks attach` links it to the task. A spawn of unknown outcome is found again by that title
+the trusted configured `orchestrator_thread`; `--visibility visible` and `--lifecycle-owner-thread <orchestrator_thread>`
+are explicit, and `bb tasks attach` links it to the task. The automation/bridge's transient `BB_THREAD_ID` is never the
+parent or lifecycle owner. The fixed prompt names ownership of the task's in-scope source/test/docs files, its isolated
+worktree, required checks and preservation of other workers' files/processes. A spawn of unknown outcome is found again by that title
 in the thread list and never repeated; a worker whose thread is archived while its task is not in review gets one relaunch.
 
 ### Install and enable (nothing in the merge does this)
@@ -196,7 +209,8 @@ bb automation create --project proj_nfixav7q2f --name deedkit-feedback-dispatch-
 bb automation list --project proj_nfixav7q2f
 ```
 
-Enable by setting `"dispatch": true` in `feedback-dispatch.json`; the next tick starts workers within the caps. A first
+Enable by setting `"dispatch": true` in `feedback-dispatch.json`; a bridge wake or the next periodic tick starts workers within the caps.
+The recovery installation stays OFF until the root releases normal activation after its initial-scope and readiness checks. A first
 look: `python3 ~/.local/lib/deedkit-feedback-bridge/feedback_dispatch.py status` lists each start (key, attempt, state,
 thread).
 

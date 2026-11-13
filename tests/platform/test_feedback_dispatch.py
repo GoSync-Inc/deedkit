@@ -186,7 +186,10 @@ def test_a_permitted_released_task_starts_one_worker_that_is_attached_and_never_
     briefs = rig.cfg.briefs_dir
     assert (title, orchestrator, machine) == ('feedback-DK-1', ORCH, None)
     assert prompt == ('Read and follow %s/common.md, then %s/bb-overlay.md (it wins on conflict), then the task brief '
-        '%s/feedback-task.md. Your orchestrator is bb thread %s. BB task: DK-1.' % (briefs, briefs, briefs, ORCH))
+        '%s/feedback-task.md. Your orchestrator is bb thread %s. BB task: DK-1. ' % (briefs, briefs, briefs, ORCH) +
+        'Ownership: this task and its in-scope source, tests and docs files only; determine the exact paths from the task '
+        'and AGENTS.md before edits. Workspace: your own new isolated worktree. Checks: a failing-first regression, '
+        'the touched tests and required CI/main/Tiden checks; commit -s. Preserve other workers\' files and processes.')
     assert rig.tasks.attached == [('DK-1', 'thr_w00001')] and rig.rows() == [('DK-1', 1, 'started')]
     assert rig.run() == ZERO and rig.restart().run() == ZERO and len(rig.threads.spawns()) == 1
 
@@ -605,7 +608,7 @@ def test_the_spawn_command_is_exactly_the_documented_one_with_the_prompt_on_stdi
     threads = fd.Threads(PROJECT, runner=run)
     assert threads.spawn('feedback-DK-7', 'PROMPT TEXT', ORCH) == 'thr_abc12345'
     assert calls[0] == (['bb', 'thread', 'spawn', '--project', PROJECT, '--parent-thread', ORCH, '--new-environment',
-        'worktree', '--base-branch', 'main', '--provider', 'claude-code', '--model', 'claude-sonnet-5-5',
+        'worktree', '--visibility', 'visible', '--lifecycle-owner-thread', ORCH, '--base-branch', 'main', '--provider', 'claude-code', '--model', 'claude-sonnet-5-5',
         '--reasoning-level', 'xhigh', '--title', 'feedback-DK-7', '--prompt-file', '-', '--json'], 'PROMPT TEXT')
     threads.spawn('feedback-DK-7', 'P', ORCH, 'ryzen-2')
     assert calls[1][0][-3:] == ['--machine', 'ryzen-2', '--json']
@@ -627,6 +630,9 @@ def test_configured_codex_worker_reaches_the_spawn_command_and_a_second_tick_nev
     assert spawn[spawn.index('--provider') + 1] == 'codex'
     assert spawn[spawn.index('--model') + 1] == 'gpt-6.1-terra'
     assert spawn[spawn.index('--reasoning-level') + 1] == 'high'
+    assert spawn[spawn.index('--visibility') + 1] == 'visible'
+    assert spawn[spawn.index('--lifecycle-owner-thread') + 1] == ORCH
+    assert spawn[spawn.index('--parent-thread') + 1] == ORCH
     assert tasks.attached == [('DK-1', 'thr_codex0001')]
     assert fd.main(['run'], environ=env, tasks=tasks, now=lambda: NOW) == 0
     assert sum('spawn' in argv for argv, _ in calls) == 1
@@ -704,6 +710,118 @@ case "$1 $2" in
   *) echo '{"ok": false, "error": {"code": "unexpected_call", "message": "x"}}'; exit 1 ;;
 esac
 """
+
+
+# spec: ANYM-991
+@pytest.mark.parametrize('scenario', ['normal', 'wakefail', 'crash', 'uncertainspawn', 'scope'])
+def test_a_real_bridge_process_wakes_the_existing_dispatcher_and_preserves_its_launch_guarantees(tmp_path, scenario):
+    import http.server
+    import importlib.util
+    import threading
+    spec = importlib.util.spec_from_file_location('bridge_process_fixtures', REPO / 'tests/platform/test_feedback_bridge.py')
+    fixtures = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixtures)
+    gateway = fixtures.FakeGateway()
+    for n, fields in [(1, {})] + ([(2, {'brief': None}), (3, {'principal': 'other'}), (4, {})] if scenario == 'scope' else []):
+        gateway.submit(raw_row(n, **fields) | {'created_at': datetime.now(timezone.utc).isoformat()})
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            args = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            data = gateway.call(self.path.rsplit('/', 1)[1], args)
+            body = json.dumps(data).encode()
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    install, fake = tmp_path / 'lib', tmp_path / 'bin'
+    install.mkdir(); fake.mkdir()
+    for name in ('feedback_bridge.py', 'feedback_dispatch.py'):
+        (install / name).write_text((REPO / 'scripts' / name).read_text())
+    if scenario == 'wakefail':
+        (install / 'feedback_dispatch.py').rename(install / 'feedback_dispatch.py.held')
+    state = tmp_path / 'fake-bb.json'
+    state.write_text(json.dumps({'tasks': [], 'threads': [], 'calls': [], 'uncertain': scenario == 'uncertainspawn', 'crash': scenario == 'crash'}))
+    (fake / 'bb').write_text('''#!/usr/bin/env python3
+import datetime,json,os,pathlib,sys,time
+p=pathlib.Path(os.environ['FAKE_BB_STATE']); data=json.loads(p.read_text()); a=sys.argv[1:]
+def opt(k,default=None): return a[a.index(k)+1] if k in a else default
+if a[:2]==['tasks','create']:
+    n=len(data['tasks'])+1; labels=[a[i+1] for i,x in enumerate(a) if x=='--label']
+    if n==4: labels.append('hold')
+    task={'id':'T%d'%n,'key':'DK-%d'%n,'number':n,'title':opt('--title'),'status':'backlog','labels':labels,
+          'description':pathlib.Path(opt('--description-file')).read_text(),'updatedAt':'v%d'%n,'taskThreads':[]}
+    data['tasks'].append(task); out={'task':task}
+    if data['crash']:
+        import signal
+        data['crash']=False; p.write_text(json.dumps(data)); os.kill(os.getppid(),signal.SIGKILL); sys.exit(0)
+elif a[:2]==['tasks','list']:
+    out={'tasks':[t for t in data['tasks'] if opt('--label') is None or opt('--label') in t['labels']]}
+elif a[:2] in (['tasks','show'],['tasks','update'],['tasks','attach']):
+    task=next(t for t in data['tasks'] if t['key']==a[2]); out={'task':task,'taskThreads':task['taskThreads']}
+    if a[1]=='attach': task['taskThreads'].append({'threadId':opt('--thread')})
+    if a[1]=='update':
+        for k in ('title','status'):
+            if opt('--'+k) is not None: task[k]=opt('--'+k)
+        if opt('--description-file'): task['description']=pathlib.Path(opt('--description-file')).read_text()
+elif a[:3]==['tasks','label','list']: out={'labels':[{'name':'feedback'},{'name':'fb-bug'}]}
+elif a[:2]==['thread','spawn']:
+    prompt=sys.stdin.read(); data['calls'].append({'argv':a,'prompt':prompt})
+    thread={'id':'thr_fakewake01','projectId':'proj_nfixav7q2f','title':opt('--title'),'createdAt':int(time.time()*1000),
+            'archivedAt':None,'deletedAt':None}
+    data['threads'].append(thread); out=thread
+    if data['uncertain']:
+        data['uncertain']=False; p.write_text(json.dumps(data)); print('lost reply'); sys.exit(1)
+elif a[:2]==['thread','list']: out=data['threads']
+else: out={'ok':True}
+p.write_text(json.dumps(data)); print(json.dumps(out))
+''')
+    (fake / 'bb').chmod(0o755)
+    key = tmp_path / 'synthetic.token'; key.write_text('loopback-only'); key.chmod(0o600)
+    config = tmp_path / 'bridge.env'
+    config.write_text('DEEDKIT_GATEWAY_URL=http://127.0.0.1:%d\nDEEDKIT_FEEDBACK_KEY_FILE=%s\n'
+        'DEEDKIT_BRIDGE_STATE_DIR=%s\n' % (server.server_port, key, tmp_path / 'bridge-state'))
+    config.chmod(0o600)
+    env = os.environ | write_config(tmp_path, provider='codex', model='gpt-6.1-terra', reasoning='high') | {
+        'PATH': str(fake) + os.pathsep + os.environ['PATH'], 'FAKE_BB_STATE': str(state),
+        'DEEDKIT_FEEDBACK_BRIDGE_ENV': str(config), 'BB_THREAD_ID': 'thr_transient0001'}
+    env.pop('BB_CLI', None)
+    def run(name):
+        return subprocess.run([sys.executable, str(install / name), 'run'], env=env, capture_output=True, text=True, timeout=30)
+    try:
+        first = run('feedback_bridge.py')
+        assert first.returncode == (-9 if scenario == 'crash' else 0), first.stderr
+        before = json.loads(state.read_text())
+        assert len(before['tasks']) == (4 if scenario == 'scope' else 1)
+        assert len(before['threads']) == (0 if scenario in ('wakefail', 'crash') else 1)
+        if scenario == 'wakefail':
+            assert first.stderr == 'feedback-bridge: dispatch_wake_failed\n'
+            (install / 'feedback_dispatch.py.held').rename(install / 'feedback_dispatch.py')
+        if scenario == 'uncertainspawn':
+            assert first.stderr == 'feedback-bridge: dispatch_wake_failed\n'
+            assert fd.Journal(tmp_path / 'state').rows()[0]['state'] == 'starting'
+        # Replayed subscription event, then the existing periodic reconciliation path: no task or spawn replay.
+        gateway.events.append(('feedback.received', fid(1)))
+        assert run('feedback_bridge.py').returncode == 0
+        assert run('feedback_dispatch.py').returncode == 0
+        done = json.loads(state.read_text())
+        assert len(done['tasks']) == len(before['tasks']) and len(done['threads']) == len(done['calls']) == 1
+        assert len(done['tasks'][0]['taskThreads']) == 1
+        assert all(not t['taskThreads'] for t in done['tasks'][1:])
+        call = done['calls'][0]; argv = call['argv']
+        for option, value in (('--visibility', 'visible'), ('--parent-thread', ORCH), ('--lifecycle-owner-thread', ORCH),
+                ('--provider', 'codex'), ('--model', 'gpt-6.1-terra'), ('--reasoning-level', 'high')):
+            assert argv[argv.index(option) + 1] == value
+        assert all(x in call['prompt'] for x in ('Ownership:', 'files only', 'Workspace:', 'isolated worktree', 'Checks:', 'Preserve'))
+        assert 'thr_transient0001' not in argv and BRIEF not in call['prompt']
+        assert not gateway.writes  # no provider/phone/model or reverse live-action test
+    finally:
+        server.shutdown(); server.server_close(); worker.join(timeout=5)
 
 
 # spec: ANYM-991

@@ -112,6 +112,17 @@ def report(error):
     log(getattr(error, 'code', 'lock_busy'), getattr(error, 'note', ''))
 
 
+def wake_dispatcher():
+    """One tick of the existing gated dispatcher. Durable BB tasks remain due to its periodic fallback on failure."""
+    try:
+        result = subprocess.run([sys.executable, str(Path(__file__).with_name('feedback_dispatch.py')), 'run'],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=240)
+        if result.returncode:
+            log('dispatch_wake_failed')
+    except (OSError, subprocess.TimeoutExpired):
+        log('dispatch_wake_failed')
+
+
 @dataclass
 class Config:
     gateway_url: str
@@ -589,6 +600,7 @@ class Bridge:
     def __init__(self, cfg, gateway, tasks, now=time.time, rand=random.random):
         self.cfg, self.gateway, self.tasks, self.now, self.rand = cfg, gateway, tasks, now, rand
         self.ledger, self.labels = Ledger(cfg.state_dir), set()
+        self.dispatch_due = False
 
     @contextmanager
     def lock(self, block=False):
@@ -728,6 +740,7 @@ class Bridge:
         if item['status'] == 'duplicate' and item['duplicate_of']:
             self.once_comment('dup:%s' % fid, key, 'Duplicate of feedback %s.' % item['duplicate_of'])
         self.ledger.update_link(fid, **fields)
+        self.dispatch_due = True  # only after the task write/reconcile and committed link/fingerprint
 
     def export_items(self, handler, save):
         cursor = self.ledger.meta('export_cursor')
@@ -751,9 +764,14 @@ class Bridge:
         self.reconcile_ack(sid, page)
         stats = {'created': 0, 'updated': 0}
         listed = (page.get('module') or {}).get('items') or []
-        self.export_items(lambda raw: self.apply(raw, stats), save=True)
-        if listed:
-            self.ack_saved_events(sid, page)
+        try:
+            self.export_items(lambda raw: self.apply(raw, stats), save=True)
+            if listed:
+                self.ack_saved_events(sid, page)
+        finally:
+            if self.dispatch_due:
+                self.dispatch_due = False
+                wake_dispatcher()  # one wake per page, including a partial export/ACK failure after durable saves
         return stats
 
     def saved_tasks(self, ids):
