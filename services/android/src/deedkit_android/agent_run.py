@@ -135,13 +135,33 @@ class AgentCall(Strict):
 class AgentStore:
     def __init__(self, store):
         self.db = store.db
+        self.directory = Path(store.directory)
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS agent_runs (
                 owner TEXT, id TEXT, identity TEXT, state TEXT, device TEXT, engine TEXT, model TEXT,
                 started REAL, ended REAL, request TEXT, result TEXT, PRIMARY KEY(owner, id));
             CREATE TABLE IF NOT EXISTS agent_events (
                 owner TEXT, id TEXT, seq INTEGER, at REAL, kind TEXT, body TEXT, PRIMARY KEY(owner, id, seq));
+            CREATE TABLE IF NOT EXISTS agent_native_bindings (
+                owner TEXT, device TEXT, cwd TEXT, thread TEXT UNIQUE, boundary TEXT,
+                PRIMARY KEY(owner, device));
         """)
+        self.db.commit()
+
+    def native_binding(self, owner, device):
+        return self.db.execute('SELECT * FROM agent_native_bindings WHERE owner=? AND device=?', (owner, device)).fetchone()
+
+    def begin_native_binding(self, owner, device, cwd):
+        # NULL thread is a committed creation intent, including a lost thread/start response.
+        self.db.execute('INSERT INTO agent_native_bindings VALUES(?,?,?,NULL,NULL)', (owner, device, str(cwd)))
+        self.db.commit()
+
+    def confirm_native_binding(self, owner, device, thread, boundary):
+        existing = self.db.execute('SELECT owner,device FROM agent_native_bindings WHERE thread=?', (thread,)).fetchone()
+        if existing is not None and (existing['owner'], existing['device']) != (owner, device):
+            raise Refused('native_binding_mismatch')
+        self.db.execute('UPDATE agent_native_bindings SET thread=?,boundary=? WHERE owner=? AND device=? AND thread IS NULL',
+                        (thread, json.dumps(boundary, sort_keys=True), owner, device))
         self.db.commit()
 
     def row(self, owner, run_id):
