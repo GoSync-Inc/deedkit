@@ -14,7 +14,8 @@ from typing import Literal
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
-from pydantic import Field, ValidationError, model_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 import yaml
 
 from . import engines
@@ -46,6 +47,8 @@ POINT = re.compile(r'\s*\d+(?:\.\d+)?%?\s*,\s*\d+(?:\.\d+)?%?\s*')
 START_ONLY = ('device_id', 'session_id', 'goal', 'owner_instruction', 'apps', 'params', 'secrets', 'outputs',
               'max_minutes', 'max_actions', 'engine', 'model', 'effort', 'service_tier', 'save_as', 'param_names')
 DIALOGUE_FIELDS = {'native_thread_id', 'native_turn_id', 'native_request_id', 'item_id', 'answers', 'message_id', 'text'}
+WAKE_FIELDS = {'wake_id', 'wake_digest', 'snapshot_digest', 'next_check_at'}
+WAKE_ACTIONS = {'fetch', 'read_receipt', 'handoff'}
 
 
 def preamble():
@@ -64,8 +67,16 @@ def preamble():
 
 
 class AgentCall(Strict):
-    action: Literal['start', 'get', 'stop', 'reply', 'steer']
-    request_id: str
+    model_config = {**Strict.model_config, 'json_schema_extra': {'allOf': [
+        {'if': {'properties': {'action': {'enum': sorted(WAKE_ACTIONS)}}},
+         'then': {'required': ['wake_id'], 'properties': {'wake_id': {'type': 'string'}}, 'not': {'required': ['request_id']}},
+         'else': {'required': ['request_id'], 'properties': {'request_id': {'type': 'string'}}}},
+        {'if': {'properties': {'action': {'enum': ['read_receipt', 'handoff']}}},
+         'then': {'required': ['wake_digest'], 'properties': {'wake_digest': {'type': 'string'}}}},
+        {'if': {'properties': {'action': {'const': 'handoff'}}}, 'then': {'required': ['snapshot_digest', 'next_check_at'],
+            'properties': {'snapshot_digest': {'type': 'string'}, 'next_check_at': {'type': 'number'}}}}]}}
+    action: Literal['start', 'get', 'stop', 'reply', 'steer', 'fetch', 'read_receipt', 'handoff']
+    request_id: str | None = Field(default=None, validate_default=True)
     device_id: str | None = None
     session_id: str | None = None
     goal: str | None = Field(default=None, min_length=1, max_length=2000)
@@ -91,13 +102,29 @@ class AgentCall(Strict):
     answers: dict[str, list[str]] | None = None
     message_id: str | None = Field(default=None, min_length=1, max_length=128)
     text: str | None = Field(default=None, min_length=1, max_length=4096)
+    wake_id: str | None = None
+    wake_digest: str | None = Field(default=None, pattern=r'^[a-f0-9]{64}$')
+    snapshot_digest: str | None = Field(default=None, pattern=r'^[a-f0-9]{64}$')
+    next_check_at: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+    @field_validator('request_id')
+    @classmethod
+    def original_request_required(cls, value, info):
+        if value is None and info.data.get('action') not in WAKE_ACTIONS:
+            raise PydanticCustomError('missing', 'Field required')
+        return value
 
     @model_validator(mode='after')
     def fields_of_the_action(self):
         given = self.model_fields_set
-        if self.action == 'start':
+        if self.action in WAKE_ACTIONS:
+            required = {'action', 'wake_id'} | ({'wake_digest'} if self.action != 'fetch' else set()) | (
+                {'snapshot_digest', 'next_check_at'} if self.action == 'handoff' else set())
+            if given != required or any(getattr(self, key) is None for key in required):
+                raise ValueError('wake_fields')
+        elif self.action == 'start':
             missing = {'device_id', 'session_id', 'goal', 'owner_instruction'} - given
-            if missing or self.after or self.wait_s or given & DIALOGUE_FIELDS:
+            if missing or self.after or self.wait_s or given & (DIALOGUE_FIELDS | WAKE_FIELDS):
                 raise ValueError('start_fields')
         elif self.action in {'reply', 'steer'}:
             required = {'device_id', 'session_id', 'native_thread_id', 'native_turn_id'} | (
@@ -106,7 +133,7 @@ class AgentCall(Strict):
             if (not required <= given or any(getattr(self, name) is None for name in required)
                     or given - required - {'action', 'request_id'}):
                 raise ValueError('dialogue_fields')
-        elif given & (set(START_ONLY) | DIALOGUE_FIELDS) or (self.action == 'stop' and given & {'after', 'wait_s'}):
+        elif given & (set(START_ONLY) | DIALOGUE_FIELDS | WAKE_FIELDS) or (self.action == 'stop' and given & {'after', 'wait_s'}):
             raise ValueError('action_fields')
         if (self.param_names and self.save_as is None) or not set(self.param_names) <= set(self.params) or len(
                 set(self.param_names)) != len(self.param_names):
@@ -121,7 +148,7 @@ class AgentCall(Strict):
 
     def identity(self):
         """The canonical fields of a start: the same request_id with these returns its run, others conflict."""
-        body = self.model_dump(exclude={'action', 'request_id', 'session_id', 'after', 'wait_s'} | DIALOGUE_FIELDS)
+        body = self.model_dump(exclude={'action', 'request_id', 'session_id', 'after', 'wait_s'} | DIALOGUE_FIELDS | WAKE_FIELDS)
         if self.service_tier is None:
             body.pop('service_tier')  # preserve every legacy start fingerprint
         body.update(apps=sorted(set(body['apps'] or ())), secrets=sorted(self.secrets), outputs=sorted(self.outputs),
@@ -201,13 +228,23 @@ class AgentStore:
             self.add_event(row['owner'], row['id'], 'state', {'state': 'lost'})
 
     def purge(self, before):
-        """The card's Deletes: runs, events and action logs 14 days after the run ended."""
+        """14-day retention, keeping original tasks while orders/questions/unknown deliveries still need them."""
         old = self.db.execute('SELECT owner, id FROM agent_runs WHERE ended IS NOT NULL AND ended<?', (before,)).fetchall()
+        columns = {r[1] for r in self.db.execute('PRAGMA table_info(android_order_obligations)')}
+        active = "o.lifecycle='active'" if 'task_only' not in columns else "o.task_only=0 AND o.lifecycle='active'"
+        removed = 0
         for row in old:
+            if columns and self.db.execute(f'''SELECT 1 FROM android_order_obligations o WHERE o.owner=?
+                AND o.original_request_id=? AND (({active}) OR EXISTS(
+                    SELECT 1 FROM android_order_wakes w WHERE w.owner=o.owner AND w.order_id=o.order_id
+                    AND w.kind IN ('question','answer','handoff','observation')
+                    AND w.state IN ('pending','sending','unknown','accepted'))) LIMIT 1''', (row['owner'], row['id'])).fetchone():
+                continue  # retain original task words/IDs for active orders, questions and uncertain writes
             self.db.execute('DELETE FROM agent_events WHERE owner=? AND id=?', (row['owner'], row['id']))
             self.db.execute('DELETE FROM agent_runs WHERE owner=? AND id=?', (row['owner'], row['id']))
+            removed += 1
         self.db.commit()
-        return len(old)
+        return removed
 
 
 # --- one run --------------------------------------------------------------------------------------------------------
@@ -665,7 +702,101 @@ class Agents:
         self.root = Path(store.directory) / 'agent'
         self.root.mkdir(mode=0o700, exist_ok=True)
         self.sessions = {}
+        self.orders = None
         self.recover()
+        self.order_control(create=True)
+
+    def order_control(self, *, create=False):
+        from .order_events import OrderEvents
+        from .order_events_control import OrderControl
+        source = self.read_config().agent.order_events
+        if source is None:
+            return None
+        if self.orders is not None:
+            if (self.orders.source_id, self.orders.auth_epoch) != (source.source_id, source.auth_epoch):
+                raise Refused('order_source_changed')
+            return self.orders
+        if not create:
+            raise Refused('order_source_unavailable')
+
+        def authorize(principal, owner, device, provider, source_id, epoch):
+            config = self.read_config()
+            configured = config.agent.order_events
+            identity = getattr(principal, 'id', principal)
+            current = next((p for p in config.principals if p.id == identity), None)
+            return bool(configured == source and source_id == source.source_id and epoch == source.auth_epoch
+                and current and device in current.devices and device in config.devices
+                and ('android:read' in current.permissions or 'android:control' in current.permissions)
+                and any(p.id == owner and device in p.devices and 'android:control' in p.permissions for p in config.principals)
+                and (isinstance(principal, str) or principal == current))
+
+        def original_words(context):
+            row = self.db.row(context.owner, context.request_id)
+            if row is None or row['device'] != context.device_id or context.task_id != context.request_id:
+                raise Refused('original_task_unavailable')
+            return json.loads(row['request'])['owner_instruction']
+
+        events = OrderEvents(self.db.db, authorize)
+        self.orders = OrderControl(events, source_id=source.source_id, auth_epoch=source.auth_epoch,
+                                   original_words=original_words)
+        events.recover()  # Store owns the existing process lock; never replay an uncertain journal delivery
+        return self.orders
+
+    def wake_fetch(self, principal, wake_id):
+        from .order_events import document
+        control = self.order_control()
+        if control is None:
+            raise Refused('order_source_unavailable')
+        wake = control.events.wake(wake_id)
+        if wake['device_id'] not in principal.devices:
+            raise Refused('not_found', 404)
+        source = self.read_config().agent.order_events
+        if principal.id != wake['owner'] and principal.id != source.handoff_principals.get(wake['owner']):
+            raise Refused('not_found', 404)  # shared device access is not cross-principal task disclosure authority
+        content = control.feed.fetch(principal, wake['owner'], wake['device_id'], wake_id)
+        task = self.db.row(wake['owner'], wake['original_request_id'])
+        if task is None or task['device'] != wake['device_id']:
+            raise Refused('original_task_unavailable')
+        request = json.loads(task['request'])
+        if content['original_user_words'] != request['owner_instruction']:
+            raise Refused('original_task_mismatch')
+        original = {'request_id': task['id'], **{k: request[k] for k in (
+            'goal', 'owner_instruction', 'params', 'apps', 'outputs')}}
+        digest = hashlib.sha256((document(content['metadata']) + task['identity'] + json.dumps(
+            [content, original], sort_keys=True, ensure_ascii=False, separators=(',', ':'))).encode()).hexdigest()
+        read = self.db.db.execute("SELECT 1 FROM android_order_feed_receipts WHERE wake_id=? AND kind='read' AND principal=?",
+                                  (wake_id, principal.id)).fetchone()
+        row = control.events._order(wake['owner'], wake['order_id'])
+        session = self.sessions.get((wake['owner'], wake['device_id']))
+        return content | {'wake_digest': digest, 'original_request': original,
+            'read_receipt': {'state': 'recorded' if read else 'not_recorded'},
+            'responsibility': {k: row[k] for k in ('responsible', 'recipient', 'revision', 'next_check_at')},
+            'native_receipts': session.receipts(task['id']) if session else []}
+
+    def wake_action(self, owner, call, authorize):
+        from .order_events import OrderRefused
+        if authorize is None:
+            raise Refused('unauthorized', 401)
+        principal = authorize()
+        if principal.id != owner or 'android:control' not in principal.permissions:
+            raise Refused('forbidden', 403)
+        wake_id = identifier(call.wake_id)
+        try:
+            fetched = self.wake_fetch(principal, wake_id)
+            if call.action == 'fetch':
+                return fetched  # no cursor, receipt, responsibility or native input mutation
+            if not hmac.compare_digest(call.wake_digest, fetched['wake_digest']):
+                raise Refused('wake_digest_mismatch')
+            control = self.order_control()
+            original = fetched['metadata']
+            if call.action == 'read_receipt':
+                return control.feed.ack_read(principal, original['owner_id'], original['device_id'], wake_id)
+            return control.feed.ack_handoff(principal, original['owner_id'], original['device_id'], wake_id,
+                snapshot_digest=call.snapshot_digest, next_check_at=call.next_check_at)
+        except OrderRefused as error:
+            if str(error) in ('wake_not_found', 'wake_not_owned', 'access_changed', 'receipt_not_owned'):
+                raise Refused('not_found', 404) from None
+            raise Refused(str(error)) from None
 
     def recover(self):
         """After a restart: kill the process group of each run directory left behind, by its private marker, mark the
@@ -757,12 +888,20 @@ class Agents:
                 'native_selection': {'available': bool(persistent and found['codex']['available']),
                                      'catalog': 'checked_before_goal', 'configuration_receipt': 'thread/resume',
                                      'provider_tier_observed': False, 'unsupported': 'refused_without_fallback'},
+                'order_events': {'configured': config.agent.order_events is not None,
+                    'source_id': config.agent.order_events.source_id if config.agent.order_events else None,
+                    'auth_epoch': config.agent.order_events.auth_epoch if config.agent.order_events else None,
+                    'native_registration': 'fresh_thread_start_only', 'legacy_hot_add': 'unavailable',
+                    'public_actions': ['fetch', 'read_receipt', 'handoff'], 'read_receipt': 'local_metadata_mutation',
+                    'native_receipt': 'submitted_unconfirmed', 'protected_input': 'fence_unavailable'},
                 'default_effort': config.engines['codex'].reasoning_effort if 'codex' in config.engines else 'medium',
                 'default_engine': default, 'engines': found, 'tools': list(MODELS) if config.agent.guarded else ['codex'], 'preamble_version': version, 'input_schema': AgentCall.model_json_schema(),
                 'limits': {'max_minutes': 15, 'max_actions': 300, 'max_images': 3, 'wait_s': 25, 'apps': 5}}
 
     async def handle(self, owner, args, authorize=None):
         call = AgentCall.model_validate(args) if not isinstance(args, AgentCall) else args
+        if call.action in WAKE_ACTIONS:
+            return self.wake_action(owner, call, authorize)
         request_id = identifier(call.request_id)
         call = call.model_copy(update={'request_id': request_id})
         if call.action == 'start':
@@ -948,7 +1087,7 @@ class Agents:
                 run_type = PersistentRun
             run = run_type(self, owner, call, name, selected, run_dir, secrets_run, texts)
             run.authorize = authorize
-            request = {**{key: value for key, value in call.model_dump(exclude={'session_id', 'after', 'wait_s'}).items()},
+            request = {**{key: value for key, value in call.model_dump(exclude={'session_id', 'after', 'wait_s'} | WAKE_FIELDS).items()},
                        'engine': name}
             self.db.insert(owner, call.request_id, identity, call.device_id, name, model, request)
         except BaseException:

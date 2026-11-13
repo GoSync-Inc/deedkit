@@ -225,11 +225,12 @@ def test_async_continuation_retains_original_receipted_selection_after_owner_ans
 def test_explicit_tier_changes_start_identity_while_absent_tier_retains_legacy_hash():
     import hashlib
     import json
-    from deedkit_android.agent_run import AgentCall,DIALOGUE_FIELDS
+    from deedkit_android.agent_run import AgentCall,DIALOGUE_FIELDS,WAKE_FIELDS
     call=AgentCall(action='start',request_id='original',device_id='home',session_id='lease',goal='Read',owner_instruction='Read only')
-    body=call.model_dump(exclude={'action','request_id','session_id','after','wait_s','service_tier'}|DIALOGUE_FIELDS)
+    body=call.model_dump(exclude={'action','request_id','session_id','after','wait_s','service_tier'}|DIALOGUE_FIELDS|WAKE_FIELDS)
     body.update(apps=[],secrets=[],outputs=[],params={})
     assert call.identity()==hashlib.sha256(json.dumps(body,sort_keys=True).encode()).hexdigest()
+    assert call.identity()=='06712b3700fa88e9f4e46c4e4283c1ae09aa1cfd0c72eed13376dc835cc6e7c9'
     first=call.model_copy(update={'service_tier':'ultrafast'})
     second=call.model_copy(update={'service_tier':'default'})
     assert len({call.identity(),first.identity(),second.identity()})==3

@@ -12,6 +12,27 @@ from .agent_bare import BareRun, PERSISTENT_MODEL, PERSISTENT_TIER
 from .agent_run import MAX_NOTES, MINUTE_S
 from .config import Refused
 
+ORDER_FIELDS = {'bind': ['package', 'provider_order_id', 'source_order_id', 'next_check_at', 'state'],
+                'update': ['obligation_ref', 'changes'], 'next_check': ['obligation_ref', 'at', 'checked_wake_id'],
+                'notify': ['obligation_ref', 'message'], 'handoff': ['obligation_ref', 'target_principal', 'withdraw_wake_id']}
+ORDER_TOOL = {'type': 'function', 'name': 'android_order_control',
+    'description': 'Retain order responsibilities, choose next checks, notify the owner or propose acknowledged handoff.',
+    'inputSchema': {'type': 'object', 'properties': {'operation': {'type': 'string', 'enum': list(ORDER_FIELDS)},
+        'payload': {'type': 'object'}}, 'required': ['operation', 'payload'], 'additionalProperties': False}}
+ORDER_PROPERTIES = {name: {'type': 'string'} for name in set().union(*map(set, ORDER_FIELDS.values()))}
+ORDER_PROPERTIES.update(package={'type': ['string', 'null']}, provider_order_id={'type': ['string', 'null']},
+    source_order_id={'type': ['string', 'null']}, state={'type': 'object'},
+    changes={'type': 'object', 'description': 'Empty reads state; otherwise package/provider/source/state/lifecycle only.'},
+    next_check_at={'type': 'number', 'description': 'Chosen future UNIX seconds.'}, at={'type': 'number'},
+    message={'type': 'string', 'minLength': 1, 'maxLength': 8192})
+ORDER_PROPERTIES['target_principal']['description'] = 'The host-configured handoff_principal returned by this tool.'
+ORDER_REQUIRED = {'bind': ['next_check_at'], 'update': [], 'next_check': ['obligation_ref', 'at'],
+                  'notify': ['message'], 'handoff': ['obligation_ref']}
+ORDER_TOOL['inputSchema']['anyOf'] = [{'properties': {'operation': {'const': op}, 'payload': {
+    'type': 'object', 'properties': {k: ORDER_PROPERTIES[k] for k in keys},
+    'required': ORDER_REQUIRED[op], 'additionalProperties': False}}} for op, keys in ORDER_FIELDS.items()]
+ORDER_REGISTRATION = hashlib.sha256(json.dumps(ORDER_TOOL, sort_keys=True).encode()).hexdigest()
+
 
 class CodexSession:
     def __init__(self, directory, config, host, device, *, bindings=None, owner=None):
@@ -29,6 +50,8 @@ class CodexSession:
         self.selection, self.version_verified = {}, False
         self.settings_applied = None
         self.disconnected = False
+        self.order_control_registered, self.control, self.control_admit = False, None, None
+        self.control_tasks, self.native_items = set(), {}
         self.interactions, self.interaction_lock = {}, asyncio.Lock()
         self.journal = directory.parent / (directory.name + '.dialogue.json')  # outside native writable cwd
 
@@ -65,8 +88,10 @@ class CodexSession:
     def receipt(row):
         status = row.get('status', 'pending' if row['state'] == 'waiting' else 'refused')
         return {key: row[key] for key in ('original_request_id', 'native_thread_id', 'native_turn_id',
-                'native_request_id', 'item_id', 'question_ids', 'message_id', 'continuation_turn_id') if key in row} | {
-                    'status': status, 'native_state': row['state'], 'submission_intent': 'digest' in row}
+                'native_request_id', 'item_id', 'question_ids', 'message_id', 'continuation_turn_id',
+                'native_call_id', 'native_namespace', 'operation', 'operation_status', 'operation_intent') if key in row} | {
+                    'status': status, 'native_state': row['state'],
+                    'submission_intent': row.get('response_intent', False) if row['kind'] == 'control' else 'digest' in row}
 
     def receipts(self, request_id):
         return [self.receipt(row) for row in self.interactions.values() if row['original_request_id'] == request_id]
@@ -83,6 +108,10 @@ class CodexSession:
                     raise ValueError()
                 self.interactions = json.loads(self.journal.read_text())
                 self.finish_questions('expired')  # a detached/restarted adapter never replays old questions
+                for row in self.interactions.values():
+                    if row['kind'] == 'control' and row['state'] == 'waiting':
+                        row.update(state='expired', status='refused', operation_status='refused', operation_intent=False)
+                self.save_interactions()
             except (ValueError, KeyError, TypeError, AttributeError):
                 raise OSError('native_dialogue_journal_invalid') from None
 
@@ -282,7 +311,8 @@ class CodexSession:
         state = self.bindings.directory.resolve()
         if state == self.dir.resolve() or state.is_relative_to(self.dir.resolve()):
             raise Refused('native_binding_boundary_unconfirmed')
-        return {'version': 1, 'cwd': cwd, 'sandbox': policy, 'approval_policy': response.get('approvalPolicy')}
+        return {'version': 1, 'cwd': cwd, 'sandbox': policy, 'approval_policy': response.get('approvalPolicy'),
+                'device_identity': hashlib.sha256(self.host.devices[self.device].encode()).hexdigest()}
 
     def bound_thread(self):
         if self.bindings is None or not self.owner:
@@ -298,14 +328,18 @@ class CodexSession:
             raise Refused('native_binding_unverified')
         try:
             proof = json.loads(row['boundary'])
+            registration = proof.pop('order_control', None)
+            if registration is not None and (not isinstance(registration, str) or len(registration) != 64):
+                raise ValueError()
             if proof.get('version') != 1 or proof.get('approval_policy') != 'never' or self.binding_boundary({'cwd': proof['cwd'],
                     'sandbox': proof['sandbox'], 'approvalPolicy': proof['approval_policy']}) != proof:
                 raise ValueError()
         except (ValueError, KeyError, TypeError, AttributeError):
             raise Refused('native_binding_unverified') from None
+        self.order_control_registered = registration == ORDER_REGISTRATION
         return row['thread']
 
-    async def connect(self):
+    async def connect(self, *, order_control=False):
         pinned = (self.config.version == '0.166.0' and await asyncio.to_thread(
             engines.installed_version, self.config.binary) == '0.166.0')
         if not pinned:
@@ -356,11 +390,15 @@ class CodexSession:
             if expected_thread is not None:
                 response = await self.rpc('thread/resume', {**params, 'threadId': expected_thread})
             else:
-                response = await self.rpc('thread/start', {**params, 'ephemeral': False})
+                response = await self.rpc('thread/start', {**params, 'ephemeral': False,
+                    **({'dynamicTools': [ORDER_TOOL]} if order_control else {})})
             ident = (response.get('thread') or {}).get('id')
             if not isinstance(ident, str) or not ident or (expected_thread is not None and ident != expected_thread):
                 raise Refused('native_binding_mismatch')
             boundary = self.binding_boundary(response)
+            if expected_thread is None and order_control:
+                boundary['order_control'] = ORDER_REGISTRATION
+                self.order_control_registered = True
             if response.get('approvalPolicy') == 'never':
                 self.bindings.confirm_native_binding(self.owner, self.device, ident, boundary)
             self.thread_id = ident
@@ -377,6 +415,107 @@ class CodexSession:
         if self.disconnected or self.process.returncode is not None:
             raise OSError('native_session_disconnected')
         self.process.stdin.write(json.dumps(message).encode() + b'\n')
+
+    def queue_control(self, message):
+        p, ident = message.get('params') or {}, message['id']
+        self.active(self.request_id, p.get('threadId'), p.get('turnId'))
+        if not self.order_control_registered or p.get('tool') != ORDER_TOOL['name'] or p.get('namespace') is not None:
+            raise Refused('unregistered_native_control')
+        if not self.turn_policy_proven or self.control is None:
+            raise Refused('native_control_unavailable')
+        args = p.get('arguments')
+        if (type(ident) not in (str, int) or not isinstance(p.get('callId'), str) or not p['callId']
+                or set(p) - {'threadId', 'turnId', 'callId', 'namespace', 'tool', 'arguments'}
+                or not isinstance(args, dict) or set(args) != {'operation', 'payload'}):
+            raise Refused('invalid_native_control')
+        operation, payload = args['operation'], args['payload']
+        if operation == 'request_protected_input':
+            raise Refused('protected_input_unavailable')  # no actual reader/capture fence exists here
+        if (not isinstance(operation, str) or operation not in ORDER_FIELDS or not isinstance(payload, dict)
+                or set(payload) - set(ORDER_FIELDS[operation])):
+            raise Refused('invalid_native_control')
+        digest = hashlib.sha256(json.dumps(args, sort_keys=True).encode()).hexdigest()
+        for row in self.interactions.values():
+            if (row['kind'] == 'control' and row['native_thread_id'] == self.thread_id
+                    and row['native_turn_id'] == self.turn_id and (row['native_call_id'] == p['callId'] or (
+                        type(row['native_request_id']) is type(ident) and row['native_request_id'] == ident))):
+                if row['digest'] != digest or row['native_call_id'] != p['callId'] or (
+                        type(row['native_request_id']) is not type(ident) or row['native_request_id'] != ident):
+                    raise Refused('native_control_conflict')
+                return  # neither the host operation nor an uncertain native response is replayed
+        key = self.interaction_key('control', self.request_id, self.thread_id, self.turn_id, ident)
+        context = {'owner': self.owner, 'device_id': self.device, 'task_id': self.request_id,
+            'request_id': self.request_id, 'native_thread_id': self.thread_id, 'native_turn_id': self.turn_id,
+            'native_call_id': p['callId'], 'native_request_id': ident, 'native_namespace': p.get('namespace'),
+            'item_id': self.native_items.get((self.turn_id, p['callId']))}
+        row = {**{k: v for k, v in context.items() if k not in ('owner', 'device_id', 'task_id', 'request_id')},
+            'kind': 'control', 'original_request_id': self.request_id, 'digest': digest, 'operation': operation,
+            'state': 'waiting', 'status': 'pending'}
+        self.interactions[key] = row
+        self.save_interactions()
+        task = asyncio.create_task(self.dispatch_control(row, context, operation, payload, self.control, self.control_admit))
+        self.control_tasks.add(task)
+        task.add_done_callback(self.control_tasks.discard)
+
+    async def dispatch_control(self, row, context, operation, payload, control, admit):
+        async with self.interaction_lock:
+            if row['state'] != 'waiting':
+                return
+            try:
+                self.active(context['request_id'], context['native_thread_id'], context['native_turn_id'])
+                if admit is None:
+                    raise Refused('native_control_unauthorized')
+                admit()
+            except Refused as error:
+                row.update(state='refused', status='refused', operation_status='refused', operation_intent=False)
+                self.save_interactions()
+                try:
+                    self.active(context['request_id'], context['native_thread_id'], context['native_turn_id'])
+                    self.send({'id': context['native_request_id'], 'error': {'code': -32601, 'message': error.code}})
+                except (Refused, OSError):
+                    pass
+                return
+            row.update(state='unknown', status='unknown', operation_status='unknown', operation_intent=True)
+            self.save_interactions()  # original action intent BEFORE any await/host operation
+            try:
+                result = await control(context, operation, payload)
+                if (not isinstance(result, dict) or result.get('status') not in ('applied', 'unknown', 'refused')
+                        or result.get('effect') != 'metadata_only'):
+                    raise ValueError()
+            except Exception:
+                result = {'status': 'unknown', 'effect': 'metadata_only', 'error': 'native_control_unconfirmed'}
+            try:
+                row['operation_status'] = result['status']
+                self.save_interactions()
+                self.active(context['request_id'], context['native_thread_id'], context['native_turn_id'])
+                admit()
+                row['response_intent'] = True
+                self.save_interactions()
+                self.send({'id': context['native_request_id'], 'result': {'success': result['status'] == 'applied',
+                    'contentItems': [{'type': 'inputText', 'text': json.dumps(result)}]}})
+                await self.process.stdin.drain()
+                if row['state'] == 'unknown':
+                    row['state'] = 'submitted'
+                self.save_interactions()  # write/drain is not positive native contents acceptance
+            except Exception:
+                pass  # retain original unknown; never execute again under replacement correlation
+
+    async def stop_controls(self):
+        tasks = list(self.control_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        changed = False
+        for row in self.interactions.values():
+            if row['kind'] == 'control' and row['state'] == 'waiting':
+                row.update(state='cancelled' if self.stopping else 'expired', status='refused',
+                           operation_status='refused', operation_intent=False)
+                changed = True
+        if changed:
+            try:
+                self.save_interactions()
+            except OSError:
+                self.errors.append('native_control_journal_unavailable')  # still interrupt native before device release
 
     async def rpc(self, method, params):
         self.serial += 1
@@ -409,6 +548,9 @@ class CodexSession:
                             future.set_result(result)
                 elif 'id' in message:
                     try:
+                        if message.get('method') == 'item/tool/call':
+                            self.queue_control(message)
+                            continue
                         if message.get('method') != 'item/tool/requestUserInput':
                             raise Refused('unsupported_native_request')
                         self.question(message)
@@ -440,16 +582,23 @@ class CodexSession:
                         item = params.get('item') or {}
                         if item.get('type') == 'agentMessage' and item.get('delivery') == 'async':
                             self.async_question(params)
+                    if message.get('method') == 'item/started':
+                        item = params.get('item') or {}
+                        if (item.get('type') == 'dynamicToolCall' and item.get('tool') == ORDER_TOOL['name']
+                                and item.get('namespace') is None and isinstance(item.get('id'), str)):
+                            self.native_items[(self.turn_id, item['id'])] = item['id']
                     if message.get('method') == 'turn/completed':
                         self.done.set()
                         self.finish_questions('expired', include_async=False)
                     if message.get('method') == 'serverRequest/resolved':
                         ident = params.get('requestId')
                         for row in self.interactions.values():
-                            if (row['kind'] == 'question' and row['native_turn_id'] == self.turn_id
+                            if (row['kind'] in ('question', 'control') and row['native_turn_id'] == self.turn_id
                                     and type(ident) is type(row['native_request_id']) and ident == row['native_request_id']):
                                 if row['state'] == 'waiting':
                                     row['state'] = 'expired'
+                                    if row['kind'] == 'control':
+                                        row.update(status='refused', operation_status='refused', operation_intent=False)
                                 elif row['state'] in ('unknown', 'submitted'):
                                     row['state'] = 'resolved'
                         self.save_interactions()  # cleared is not proof that the submitted answer contents were used
@@ -539,7 +688,7 @@ class CodexSession:
         self.selection['configuration_status'] = 'confirmed'
         return requested
 
-    async def turn(self, prompt, config, consume, *, request_id=None, on_started=None, admit=None):
+    async def turn(self, prompt, config, consume, *, request_id=None, on_started=None, admit=None, control=None):
         async with self.lock:
             if admit:
                 admit()
@@ -548,6 +697,7 @@ class CodexSession:
                 admit()  # discovery/settings reads may await; recheck immediately before goal dispatch
             self.finish_questions('expired')  # a later turn cannot answer an older unresolved question
             self.events = asyncio.Queue()
+            self.control, self.control_admit, self.native_items = control, admit, {}
             self.turn_id = None
             self.turn_policy_proven = False
             self.request_id, self.stopping = request_id, False
@@ -573,11 +723,16 @@ class CodexSession:
                 await self.interrupt()
                 raise
             finally:
+                await self.stop_controls()
+                self.control, self.control_admit = None, None
                 self.events = None
                 self.turn_id = None
                 self.request_id = None
 
     async def interrupt(self):
+        if self.events is not None and not self.done.is_set():
+            self.stopping = True
+        await self.stop_controls()
         if self.events is None or self.done.is_set():
             return  # normal completion leaves async questions pending on this conversation
         if self.disconnected:
@@ -599,6 +754,7 @@ class CodexSession:
 
     async def close(self):
         self.stopping = True
+        await self.stop_controls()
         try:
             self.finish_questions('cancelled')
         except OSError:
@@ -626,6 +782,7 @@ class PersistentRun(BareRun):
         try:
             async with asyncio.timeout(self.request.max_minutes * MINUTE_S):
                 key = (self.owner, self.device)
+                control = self.agents.order_control(create=True)
                 session = self.agents.sessions.get(key)
                 if self.input_text is not None and (session is None or session.process is None or session.process.returncode is not None):
                     raise Refused('native_session_disconnected')  # a queued answer cannot start a replacement process
@@ -637,7 +794,7 @@ class PersistentRun(BareRun):
                     session = CodexSession(directory, self.config, self.agents.read_config(), self.device,
                                            bindings=self.agents.db, owner=self.owner)
                     self.session = session
-                    await session.connect()
+                    await session.connect(order_control=control is not None)
                     self.agents.sessions[key] = session
                 self.session, self.process = session, session.process
                 self.stderr = session.stderr
@@ -664,7 +821,7 @@ class PersistentRun(BareRun):
 
                 status = await session.turn(self.input_text if self.input_text is not None else self.prompt(),
                                             self.config, self.consume, request_id=self.id, on_started=self.input_started,
-                                            admit=admit)
+                                            admit=admit, control=self.order_bridge)
                 if self.state == 'running':
                     await self.end('succeeded' if status == 'completed' and self.finished else 'failed',
                                    exit_code=0 if status == 'completed' else 1)
@@ -688,6 +845,50 @@ class PersistentRun(BareRun):
     async def stop_engine(self):
         await self.session.interrupt()
 
+    def order_context(self, context):
+        from .order_events_control import NativeOrderContext
+        if self.authorize is None:
+            raise Refused('unauthorized', 401)
+        principal = self.authorize()
+        if (principal.id != self.owner or context['owner'] != self.owner or context['device_id'] != self.device
+                or context['request_id'] != self.id or context['task_id'] != self.id
+                or self.device not in principal.devices or 'android:control' not in principal.permissions
+                or self.state != 'running' or not self.agents.devices.locks[self.device].locked()):
+            raise Refused('native_turn_mismatch')
+        self.agents.store.check_reservation(self.owner, self.device, self.request.session_id)
+        return NativeOrderContext(principal=principal, **context)
+
+    async def order_bridge(self, context, operation, payload):
+        from .order_events import OrderRefused
+        try:
+            actual = self.order_context(context)
+            control = self.agents.order_control()
+            if control is None:
+                raise Refused('order_source_unavailable')
+            source = self.agents.read_config().agent.order_events
+            recipient = source.handoff_principals.get(self.owner, self.owner)
+            if operation == 'handoff' and 'target_principal' in payload and payload['target_principal'] != recipient:
+                raise Refused('handoff_target_unconfigured')
+            return (await control(actual, operation, payload)) | {'handoff_principal': recipient}
+        except (OrderRefused, Refused) as error:
+            return {'status': 'refused', 'effect': 'metadata_only', 'error': str(error)}
+
+    async def order_question(self, params, item_id, questions, native_request_id=None):
+        from .order_events import OrderRefused
+        try:
+            control = self.agents.order_control()
+            if control is None:
+                return
+            context = self.order_context({'owner': self.owner, 'device_id': self.device, 'task_id': self.id,
+                'request_id': self.id, 'native_thread_id': params['threadId'], 'native_turn_id': params['turnId'],
+                'native_call_id': None, 'native_request_id': native_request_id, 'item_id': item_id,
+                'native_namespace': None})
+            control.observe_native_question(context, item_id=item_id, message_id=None, questions=questions,
+                native_request_id=native_request_id,
+                question_ids=[q['id'] for q in questions] if native_request_id is not None else [])
+        except (OrderRefused, Refused) as error:
+            await self.event('order_notice', status='unavailable', error=str(error))
+
     async def consume(self, event):
         method, params = event.get('method'), event.get('params') or {}
         item = params.get('item') or {}
@@ -700,6 +901,7 @@ class PersistentRun(BareRun):
             await self.event('selection', **self.session.selection)
             await self.end('failed', error='native_model_rerouted')
         elif method == 'item/tool/requestUserInput':
+            await self.order_question(params, params['itemId'], params['questions'], event['id'])
             await self.event('question', native_request_id=event['id'], native_thread_id=params['threadId'],
                              native_turn_id=params['turnId'], item_id=params['itemId'],
                              questions=params['questions'], is_blocking=params['isBlocking'], source='rpc')
@@ -722,6 +924,7 @@ class PersistentRun(BareRun):
         elif method == 'item/completed' and item.get('type') == 'agentMessage':
             key = self.session.interaction_key('async_question', self.id, params['threadId'], params.get('turnId'), item['id'])
             if item.get('delivery') == 'async' and key in self.session.interactions:
+                await self.order_question(params, item['id'], item['questions'])
                 await self.event('question', source='async', native_thread_id=params['threadId'],
                                  native_turn_id=params['turnId'], item_id=item['id'], questions=item['questions'])
             text = item.get('text', '')
@@ -748,5 +951,6 @@ class PersistentRun(BareRun):
         result['skills_updated'] = []
         if self.session and self.session.process:
             result['native_session'] = {'thread_id': self.session.thread_id, 'pid': self.session.process.pid,
-                                        'turn_id': self.session.turn_id or self.session.last_turn_id, 'persistent': True}
+                                        'turn_id': self.session.turn_id or self.session.last_turn_id, 'persistent': True,
+                                        'order_control_registered': self.session.order_control_registered}
         return result

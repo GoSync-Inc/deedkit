@@ -222,3 +222,20 @@ def test_unusable_host_binding_never_falls_back_to_native_hint_or_new_thread(tmp
         assert result['state'] == 'failed' and result['error'] == 'native_binding_unverified'
     assert len(calls(record)) == before
     assert len(native_calls(record, 'thread/start')) == 1
+
+
+# spec: ANYM-993
+def test_rebinding_same_device_label_to_another_serial_never_resumes_original_phone_context(tmp_path):
+    config, record = live_host(tmp_path)
+    with Service(config) as service:
+        lease = service.lease()
+        first = service.finished(service.start(lease)['request_id'])
+    before = len(calls(record))
+    body = json.loads(config.read_text())
+    body['devices']['home'] = 'OTHER-SYNTHETIC-SERIAL'
+    config.write_text(json.dumps(body))
+    with Service(config) as service:
+        result = service.finished(service.start(lease)['request_id'])
+        assert result['state'] == 'failed' and result['error'] == 'native_binding_unverified'
+        assert service.finished(first['request_id'])['native_session']['thread_id'] == first['native_session']['thread_id']
+    assert len(calls(record)) == before

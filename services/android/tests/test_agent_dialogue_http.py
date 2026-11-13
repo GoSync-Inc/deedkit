@@ -234,7 +234,8 @@ def test_capability_pairs_dialogue_availability_with_persistent_admission(tmp_pa
         assert capabilities['dialogue']['actions'] == ['reply', 'steer']
         assert capabilities['dialogue']['model_question_tool'] == 'catalog_dependent_unverified'
         assert capabilities['dialogue']['question_routes_require'] == ['pinned_0.166.0','native_effective_never']
-        assert set(capabilities['input_schema']['properties']['action']['enum']) == {'start', 'get', 'stop', 'reply', 'steer'}
+        assert set(capabilities['input_schema']['properties']['action']['enum']) == {
+            'start', 'get', 'stop', 'reply', 'steer', 'fetch', 'read_receipt', 'handoff'}
         body = json.loads(config.read_text())
         body['agent']['persistent'] = False
         config.write_text(json.dumps(body))
@@ -250,9 +251,11 @@ def test_start_identity_keeps_legacy_fingerprint_despite_optional_dialogue_field
                      goal='Read', owner_instruction='Read status', params={'COUNT': 2})
     body = {key: value for key, value in call.model_dump().items() if key not in {
         'action', 'request_id', 'session_id', 'after', 'wait_s', 'native_thread_id', 'native_turn_id',
-        'native_request_id', 'item_id', 'answers', 'message_id', 'text', 'service_tier'}}
+        'native_request_id', 'item_id', 'answers', 'message_id', 'text', 'service_tier',
+        'wake_id', 'wake_digest', 'snapshot_digest', 'next_check_at'}}
     body.update(apps=[], secrets=[], outputs=[], params={'COUNT': '2'})
     assert call.identity() == hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    assert call.identity() == '75025f9038b8feaa6be5b1e94234ea698b706e7a4140deb4b6a137c09719dfb6'
 
 
 # spec: ANYM-993

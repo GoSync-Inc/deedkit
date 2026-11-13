@@ -20,6 +20,7 @@ from platform_contracts.release import ReleaseRuntime
 
 from .catalog import CATALOG, public
 from .adapters.android import content as android_content
+from .adapters.android import wake_loop
 from .diagnostics import with_catalog
 from .field_errors import root_refusal
 from .dispatch import Dispatch, PLAIN_PATH, Route, admitted
@@ -298,7 +299,12 @@ def create_app(policy_path, public_url, *, transports=None):
         try:
             async with clients:
                 async with transport.router.lifespan_context(transport):
-                    yield
+                    task = asyncio.create_task(wake_loop(dispatch, app.state.android_wakes))
+                    try:
+                        yield
+                    finally:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
         finally:
             tickets.clear()
 
@@ -310,6 +316,7 @@ def create_app(policy_path, public_url, *, transports=None):
         dispatch,
     )
     app.state.release = release
+    app.state.android_wakes = []  # metadata-only local producer state; never a public/shared event cursor
 
     @app.get("/healthz")
     async def health():
