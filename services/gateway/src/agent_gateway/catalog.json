@@ -10218,7 +10218,6 @@
         "action",
         "request_id"
       ],
-      "title": "AgentCall",
       "type": "object"
     },
     "annotations": {
