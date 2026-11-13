@@ -1002,3 +1002,33 @@ native delivery and provider/phone acceptance still require root's exclusive liv
 Actual protected fencing/automatic entry and safe context compaction remain integration obligations.
 No timing receipt or held tool establishes a protected read/capture fence, and no real
 model/phone/provider performance savings are claimed.
+
+Persistent results include a per-turn `native_context` receipt from matching native thread/turn
+notifications: native `last`/`total` token fields, optional `modelContextWindow`, and original
+`contextCompaction` item IDs with separately observed started/completed flags. Missing or invalid
+counts remain unknown; a model window is not an auto-compaction threshold or proof of remaining
+usable context. The resolved auto-compaction threshold is not in the pinned0.166 notification, so
+`auto_compact_limit_tokens` stays null. Receipts contain no history, summaries, commands or tool
+payloads. Native `cacheWriteInputTokens`, when reported, contributes to existing cache-write usage.
+Each new turn has an independent receipt on the same native conversation; this receipt does not
+sum whole-order work or change its durable obligation journal.
+
+Pinned0.166 already owns model-aware automatic compaction before/during sampling and a conditional
+post-turn compaction path. See its [context calculation](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/session/context_window.rs)
+and [turn lifecycle](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/session/turn.rs).
+This host records those native lifecycle items without invoking compaction, replacing history,
+rotating threads, changing native thresholds or clearing outstanding orders/questions/unknown input.
+Native compaction completion is no evidence that an answer was accepted or an obligation settled.
+An optional future host-requested idle/all-orders-closed maintenance operation would still require
+verified effective native support, current serialized authority and no unresolved/protected/busy
+state; no such operation is enabled here. Actual installed behavior remains root live acceptance.
+
+Native command yields are maximum waits, not mandatory sleeps:0.166's output collector wakes on
+process exit and output closure. Interactive execution defaults to10s initial yield; empty stdin
+polls have a5s minimum requested yield, but can still finish earlier on exit. Its separately selected
+one-shot tool variant supports a completion timeout and terminates on timeout/cancellation; that
+variant's actual model exposure has not been attested for the installed session. See the pinned
+[handler](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs)
+and [collector](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/unified_exec/process_manager.rs).
+The host keeps the native phone/shell tools and cancellation path. No polling rewrite, timing-based
+quiescence claim or real speed improvement follows from these static facts.

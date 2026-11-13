@@ -4,6 +4,51 @@ import re
 import time
 
 
+class NativeContext:
+    """Observed per-turn native metadata; context size is not an auto-compaction threshold."""
+
+    TOKEN_FIELDS = ('inputTokens', 'cachedInputTokens', 'cacheWriteInputTokens',
+                    'outputTokens', 'reasoningOutputTokens', 'totalTokens')
+
+    def __init__(self):
+        self.thread_id = self.turn_id = self.usage = self.window = None
+        self.compactions = {}
+
+    def bind(self, thread_id, turn_id):
+        if self.turn_id is None and all(isinstance(v, str) and v for v in (thread_id, turn_id)):
+            self.thread_id, self.turn_id = thread_id, turn_id
+
+    def observe(self, event):
+        params = event.get('params') or {}
+        if (self.turn_id is None or params.get('threadId') != self.thread_id
+                or params.get('turnId') != self.turn_id):
+            return
+        method = event.get('method')
+        if method == 'thread/tokenUsage/updated':
+            usage = params.get('tokenUsage')
+            if not isinstance(usage, dict):
+                return
+            self.usage = {}
+            for section in ('last', 'total'):
+                values = usage.get(section)
+                self.usage[section] = {key: values[key] for key in self.TOKEN_FIELDS
+                    if isinstance(values, dict) and type(values.get(key)) is int and values[key] >= 0}
+            value = usage.get('modelContextWindow')
+            self.window = value if type(value) is int and value > 0 else None
+        elif method in ('item/started', 'item/completed'):
+            item = params.get('item') or {}
+            ident = item.get('id')
+            if item.get('type') == 'contextCompaction' and isinstance(ident, str) and ident:
+                row = self.compactions.setdefault(ident, {'item_id': ident, 'started': False, 'completed': False})
+                row['started' if method == 'item/started' else 'completed'] = True
+
+    def receipt(self):
+        return {'native_thread_id': self.thread_id, 'native_turn_id': self.turn_id,
+            'token_usage': {key: dict(value) for key, value in self.usage.items()} if self.usage is not None else None,
+            'model_context_window': self.window, 'auto_compact_limit_tokens': None,
+            'compactions': [dict(value) for value in self.compactions.values()]}
+
+
 class NativeTiming:
     """Host arrival intervals, never provider/model time or proof of command quiescence."""
 
