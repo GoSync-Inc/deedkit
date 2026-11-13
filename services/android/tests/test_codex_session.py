@@ -160,3 +160,17 @@ def test_service_restart_resumes_exact_saved_thread_without_replaying_task(tmp_p
         assert first['native_session']['pid'] != second['native_session']['pid']
         assert any(r['message']['method'] == 'thread/resume' for r in calls(record))
         assert len([r for r in calls(record) if r['message']['method'] == 'turn/start']) == 2
+
+
+# spec: ANYM-993
+def test_orphan_marker_identifies_the_native_process_before_recovery(tmp_path):
+    from deedkit_android import engines
+    config, record = live_host(tmp_path)
+    with Service(config) as service:
+        session = service.lease()
+        first = service.finished(service.start(session)['request_id'])
+        marker, = (tmp_path / 'state' / 'agent' / 'sessions').glob('run-live-*/marker.json')
+        assert engines.kill_by_marker(marker)  # PID alone is never authority to kill a reused process
+        assert not alive(first['native_session']['pid'])
+        second = service.finished(service.start(session)['request_id'])
+        assert second['native_session']['thread_id'] == first['native_session']['thread_id']

@@ -25,6 +25,16 @@ class CodexSession:
 
     async def connect(self):
         self.dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # App-server has no -C argument carrying our marker token. A verified executable link
+        # keeps that token in argv so restart recovery can identify the group without trusting a PID.
+        binary = self.dir / 'codex'
+        if binary.is_symlink():
+            if binary.resolve() != Path(self.config.binary).resolve():
+                raise OSError('native_binary_link_changed')
+        elif binary.exists():
+            raise OSError('native_binary_link_changed')
+        else:
+            binary.symlink_to(Path(self.config.binary).resolve())
         env = engines.environment('codex', self.config, self.dir)
         env['PATH'] = str(Path(self.host.adb).parent) + os.pathsep + env['PATH']
         env['ANDROID_SERIAL'] = self.host.devices[self.device]
@@ -32,7 +42,7 @@ class CodexSession:
             if name in os.environ:
                 env[name] = os.environ[name]
         self.process = await asyncio.create_subprocess_exec(
-            self.config.binary, 'app-server', '--strict-config',
+            str(binary), 'app-server', '--strict-config',
             '-c', 'sandbox_mode="workspace-write"', '-c', 'approval_policy="never"',
             '-c', 'sandbox_workspace_write.network_access=true',
             '-c', 'skills.bundled.enabled=false', '-c', 'features.skip_host_skill_discovery=true',
