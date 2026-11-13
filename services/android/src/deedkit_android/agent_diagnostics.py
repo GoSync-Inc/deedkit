@@ -1,6 +1,115 @@
 """Bounded native error receipts. No raw stderr, request bodies or phone dumps are persisted."""
 
 import re
+import time
+
+
+class NativeTiming:
+    """Host arrival intervals, never provider/model time or proof of command quiescence."""
+
+    STOP_SOURCES = frozenset(('deadline', 'owner_stop', 'service_shutdown', 'action_cap',
+        'adapter_failure', 'adapter_cancelled', 'native_disconnected', 'model_rerouted'))
+
+    def __init__(self, *, clock=time.monotonic):
+        self.clock = clock
+        self.started = self.phase_started = clock()
+        self.ended, self.initiator, self.terminal = None, None, None
+        self.thread_id, self.turn_id = None, None
+        self.current_phase, self.phases = 'connect', {}
+        self.commands, self.questions = set(), set()
+        self.seen_commands = set()
+        self.command_started = self.question_started = None
+        self.command_seconds = self.question_seconds = 0
+        self.commands_started = self.commands_completed = self.blocking_questions = 0
+
+    def phase(self, name):
+        if self.ended is not None or name not in ('preflight', 'submission', 'native_turn') or name == self.current_phase:
+            return
+        now = self.clock()
+        self.phases[self.current_phase] = self.phases.get(self.current_phase, 0) + now - self.phase_started
+        self.current_phase, self.phase_started = name, now
+
+    def bind(self, thread_id, turn_id):
+        if self.turn_id is None and self.ended is None:
+            self.thread_id, self.turn_id = thread_id, turn_id
+            self.phase('native_turn')
+
+    def request_stop(self, source):
+        if self.initiator is None and source in self.STOP_SOURCES:
+            self.initiator = source
+
+    def finish(self, source):
+        if self.ended is not None:
+            return
+        self.ended = self.clock()
+        self.phases[self.current_phase] = self.phases.get(self.current_phase, 0) + self.ended - self.phase_started
+        if self.command_started is not None:
+            self.command_seconds += self.ended - self.command_started
+            self.command_started = None
+        if self.question_started is not None:
+            self.question_seconds += self.ended - self.question_started
+            self.question_started = None
+        self.source = source if source in self.STOP_SOURCES or source in (
+            'native_completed', 'native_failed', 'native_interrupted') else 'native_terminal_unknown'
+
+    def observe(self, event):
+        params = event.get('params') or {}
+        method, item = event.get('method'), params.get('item') or {}
+        turn = params.get('turnId') or (params.get('turn') or {}).get('id')
+        if (self.ended is not None or self.turn_id is None or params.get('threadId') != self.thread_id
+                or (turn != self.turn_id and not (method == 'serverRequest/resolved' and turn is None))):
+            return
+        now = self.clock()
+        if method in ('item/started', 'item/completed') and item.get('type') == 'commandExecution':
+            ident = item.get('id')
+            if not isinstance(ident, str):
+                return
+            if method == 'item/started' and ident not in self.seen_commands:
+                if not self.commands:
+                    self.command_started = now
+                self.commands.add(ident)
+                self.seen_commands.add(ident)
+                self.commands_started += 1
+            elif method == 'item/completed' and ident in self.commands:
+                self.commands.remove(ident)
+                self.commands_completed += 1
+                if not self.commands:
+                    self.command_seconds += now - self.command_started
+                    self.command_started = None
+        elif method == 'item/tool/requestUserInput' and params.get('isBlocking') is True:
+            ident = event.get('id')
+            if type(ident) not in (str, int) or (type(ident), ident) in self.questions:
+                return
+            if not self.questions:
+                self.question_started = now
+            self.questions.add((type(ident), ident))
+            self.blocking_questions += 1
+        elif method == 'serverRequest/resolved':
+            ident = params.get('requestId')
+            if type(ident) in (str, int) and (type(ident), ident) in self.questions:
+                self.questions.remove((type(ident), ident))
+                if not self.questions:
+                    self.question_seconds += now - self.question_started
+                    self.question_started = None
+        elif method == 'turn/completed':
+            status = (params.get('turn') or {}).get('status')
+            self.terminal = status if status in ('completed', 'interrupted', 'failed') else 'unknown'
+            self.finish('native_' + self.terminal)
+
+    def receipt(self):
+        now = self.ended if self.ended is not None else self.clock()
+        phases = dict(self.phases)
+        if self.ended is None:
+            phases[self.current_phase] = phases.get(self.current_phase, 0) + now - self.phase_started
+        return {'native_thread_id': self.thread_id, 'native_turn_id': self.turn_id,
+            'phase_ms': {key: round(value * 1000, 2) for key, value in phases.items()},
+            'elapsed_ms': round((now - self.started) * 1000, 2),
+            'command_wall_ms': round((self.command_seconds + (now - self.command_started if self.command_started is not None else 0)) * 1000, 2),
+            'blocking_question_pending_ms': round((self.question_seconds + (now - self.question_started if self.question_started is not None else 0)) * 1000, 2),
+            'commands_started': self.commands_started, 'commands_completed': self.commands_completed,
+            'commands_incomplete': len(self.commands), 'blocking_questions': self.blocking_questions,
+            'stop_source': self.initiator or getattr(self, 'source', 'running'), 'native_terminal': self.terminal,
+            'model_time_observed': False, 'network_time_observed': False}
 
 
 def message(text, private=()):

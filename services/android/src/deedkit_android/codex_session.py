@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import time
 
-from . import engines
+from . import agent_diagnostics, engines
 from .agent_bare import BareRun, PERSISTENT_MODEL, PERSISTENT_TIER
 from .agent_run import MAX_NOTES, MINUTE_S
 from .config import Refused
@@ -48,6 +48,7 @@ class CodexSession:
         self.request_id, self.stopping = None, False
         self.policy_proven, self.turn_policy_proven = False, False
         self.selection, self.version_verified = {}, False
+        self.timing = None
         self.settings_applied = None
         self.disconnected = False
         self.order_control_registered, self.control, self.control_admit = False, None, None
@@ -149,6 +150,8 @@ class CodexSession:
             'item_id': params['itemId'], 'question_ids': ids, 'state': 'waiting',
             'expires_at': time.time() + delay / 1000 if delay is not None else None}
         self.save_interactions()
+        if self.timing:
+            self.timing.observe(message)
         self.events.put_nowait(message)
 
     def async_question(self, params):
@@ -545,6 +548,8 @@ class CodexSession:
                             if self.events is not None and self.turn_id is None and isinstance(result.get('turn'), dict):
                                 self.turn_id = result['turn']['id']
                                 self.turn_policy_proven = self.policy_proven
+                                if self.timing:
+                                    self.timing.bind(self.thread_id, self.turn_id)
                             future.set_result(result)
                 elif 'id' in message:
                     try:
@@ -576,6 +581,8 @@ class CodexSession:
                         continue  # late/unrelated turn events cannot complete or mutate this turn
                     if message.get('method') == 'turn/started':
                         self.turn_id = params['turn']['id']
+                    if self.timing:
+                        self.timing.observe(message)
                     if message.get('method') == 'model/rerouted':
                         self.stopping = True  # refuse fresh owner input while the turn is being cancelled
                     if message.get('method') == 'item/completed':
@@ -607,6 +614,8 @@ class CodexSession:
             pass
         finally:
             self.disconnected = True
+            if self.timing:
+                self.timing.finish('native_disconnected')
             if self.settings_applied is not None and not self.settings_applied.done():
                 self.settings_applied.set_result(None)  # wake only; the required readback will fail closed
             try:
@@ -688,8 +697,10 @@ class CodexSession:
         self.selection['configuration_status'] = 'confirmed'
         return requested
 
-    async def turn(self, prompt, config, consume, *, request_id=None, on_started=None, admit=None, control=None):
+    async def turn(self, prompt, config, consume, *, request_id=None, on_started=None, admit=None, control=None, timing=None):
         async with self.lock:
+            self.timing = timing or agent_diagnostics.NativeTiming()
+            self.timing.phase('preflight')
             if admit:
                 admit()
             selected = await self.select(config)
@@ -703,12 +714,14 @@ class CodexSession:
             self.request_id, self.stopping = request_id, False
             self.done.clear()
             try:
+                self.timing.phase('submission')
                 response = await self.rpc('turn/start', {
                     'threadId': self.thread_id, 'input': [{'type': 'text', 'text': prompt}],
                     'model': selected['model'], 'effort': selected['effort'], 'serviceTier': selected['service_tier'],
                     'approvalPolicy': 'never',
                     'sandboxPolicy': self.sandbox()})
                 self.turn_id = response['turn']['id']
+                self.timing.bind(self.thread_id, self.turn_id)
                 self.last_turn_id = self.turn_id
                 if on_started:
                     on_started(self.turn_id)
@@ -772,6 +785,7 @@ class PersistentRun(BareRun):
     def __init__(self, *args):
         super().__init__(*args)
         self.session = None
+        self.timing = agent_diagnostics.NativeTiming()
         self.input_text, self.input_started, self.input_admit, self.input_refused = None, None, None, None
 
     def skill_files(self):
@@ -821,17 +835,20 @@ class PersistentRun(BareRun):
 
                 status = await session.turn(self.input_text if self.input_text is not None else self.prompt(),
                                             self.config, self.consume, request_id=self.id, on_started=self.input_started,
-                                            admit=admit, control=self.order_bridge)
+                                            admit=admit, control=self.order_bridge, timing=self.timing)
                 if self.state == 'running':
                     await self.end('succeeded' if status == 'completed' and self.finished else 'failed',
                                    exit_code=0 if status == 'completed' else 1)
         except TimeoutError:
             await self.end('timed_out')
         except Refused as error:
+            self.timing.request_stop('adapter_failure')
             if self.input_refused:
                 self.input_refused()
             await self.end('failed', error=error.code)
         except (OSError, ValueError, KeyError):
+            if not self.session or not self.session.disconnected:
+                self.timing.request_stop('adapter_failure')
             self.stream.errors.append('native_session_disconnected_or_start_failed')
             if self.session:
                 self.stream.errors.extend(self.session.errors)
@@ -843,7 +860,10 @@ class PersistentRun(BareRun):
             await asyncio.gather(heartbeat, return_exceptions=True)
 
     async def stop_engine(self):
+        self.timing.request_stop({'stopped': 'owner_stop', 'timed_out': 'deadline', 'lost': 'service_shutdown',
+                                  'action_cap': 'action_cap'}.get(self.state))
         await self.session.interrupt()
+        self.timing.finish('native_disconnected' if self.session.disconnected else 'adapter_failure')
 
     def order_context(self, context):
         from .order_events_control import NativeOrderContext
@@ -896,6 +916,7 @@ class PersistentRun(BareRun):
             await self.event('selection', **self.session.selection)
             await self.event('turn', phase='started', native_thread_id=params['threadId'], native_turn_id=params['turn']['id'])
         elif method == 'model/rerouted':
+            self.timing.request_stop('model_rerouted')
             self.session.selection.update(configuration_status='rerouted', rerouted_to=params.get('toModel'))
             self.stream.model = params.get('toModel')
             await self.event('selection', **self.session.selection)
@@ -946,7 +967,12 @@ class PersistentRun(BareRun):
 
     async def final(self, state, extra):
         # No skill directory is exposed or inspected; the native thread owns conversational history.
+        self.timing.request_stop({'stopped': 'owner_stop', 'timed_out': 'deadline', 'lost': 'service_shutdown',
+                                  'action_cap': 'action_cap'}.get(state))
+        self.timing.finish('native_disconnected' if self.session and self.session.disconnected else 'adapter_failure')
         result = await super().final(state, extra)
+        result['native_timing'] = self.timing.receipt()
+        result['timings']['model_ms'] = None  # native/command wall-time subtraction cannot measure model work
         result['native_selection'] = dict(self.session.selection) if self.session else {}
         result['skills_updated'] = []
         if self.session and self.session.process:

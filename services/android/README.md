@@ -376,6 +376,22 @@ The native receipt confirms configuration; `provider_service_tier=null`/`provide
 explicitly leave the provider-served tier unconfirmed. No raw usage-metadata guessing or speed claim
 follows. Catalog/settings/readback phase times contain only elapsed milliseconds. Actual account/model
 tier availability, provider-tier evidence and comparable caller-path timing remain live acceptance work.
+
+Persistent results also expose `native_timing`: monotonic host-observed connection, preflight,
+submission and native-turn phase intervals, union wall time of overlapping command items, pending
+blocking-question time, command counts and the stop initiator alongside the native terminal status.
+These receipts contain actual thread/turn IDs and numeric metadata only; no command, output,
+question, owner answer or error payload is copied into them. Each turn starts fresh counters on the
+same conversation. Native terminal timing freezes before later idle time or final screenshot capture.
+Deadline/owner stop remains distinct from the resulting native interruption; transport loss is
+distinct from adapter failure. A blocking question ends its measured pending interval on original
+typed request resolution or turn termination. That interval includes transport/native delay after
+an answer write, so it is not measured owner wait and proves no answer acceptance. Async questions
+do not block native execution and add no blocking-question time. Intervals can overlap; they do not
+separate model work from network delay or prove command quiescence. Persistent `timings.model_ms`
+is therefore `null`; `model_time_observed` and `network_time_observed` are false. No performance
+savings or protected-entry permission follows from these diagnostics.
+
 The native runtime handles its context window; there is no extra rotation timer, hard-coded
 context threshold or periodic polling goal. Android can evict background apps; opening an app
 once is preparation, not a guarantee that the OS keeps it resident.
