@@ -284,7 +284,8 @@ def create_app(config_path, agent_url=None):
                 options = {key: value for key, value in args.items() if key != 'yaml'}
                 result = store.library.manage(owner, source=args['yaml'], **options)
         elif operation == "agent":
-            result = await request.app.state.agents.handle(owner, AgentCall.model_validate(raw))
+            result = await request.app.state.agents.handle(owner, AgentCall.model_validate(raw),
+                authorize=lambda: configuration.authenticate(request.headers.get('authorization', '')))
         elif operation == "get_operation":
             result = await devices.receipt(owner, identifier(args["request_id"]), args["wait_s"])
         elif operation == "upload":

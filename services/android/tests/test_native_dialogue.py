@@ -1,0 +1,407 @@
+"""Pinned native request/reply/steer shapes on synthetic stdio, without a phone or provider."""
+
+import asyncio
+import json
+import sys
+import time
+
+import pytest
+
+from agent_harness import Service, write_config
+from deedkit_android.codex_session import CodexSession
+from deedkit_android.config import Config, Refused
+
+
+def native(tmp_path):
+    record = tmp_path / 'wire.jsonl'
+    binary = tmp_path / 'native'
+    binary.write_text(f'''#!{sys.executable}
+import json, os, sys
+if sys.argv[1:] == ['--version']:
+    print('9.9.9'); raise SystemExit
+thread, turn, mode, count = 'thread-' + str(os.getpid()), None, None, 0
+def emit(**body): print(json.dumps(body), flush=True)
+def event(method, **params): emit(method=method, params=dict(threadId=thread, **params))
+def finish():
+    event('item/completed', turnId=turn, item=dict(id='final', type='agentMessage', phase='final_answer', text='ordinary reply'))
+    event('turn/completed', turn=dict(id=turn, status='completed', error=None))
+for line in sys.stdin:
+    m=json.loads(line)
+    with open({str(record)!r}, 'a') as f: f.write(json.dumps(dict(pid=os.getpid(), message=m))+'\\n')
+    method, p=m.get('method'), m.get('params', {{}})
+    if method == 'initialize': emit(id=m['id'], result={{}})
+    elif method in ('thread/start','thread/resume'):
+        thread=p.get('threadId',thread); emit(id=m['id'], result=dict(thread=dict(id=thread)))
+    elif method == 'turn/start':
+        count+=1; turn='turn-'+str(os.getpid())+'-'+str(count); mode=p['input'][0]['text']
+        if 'Caller input (nonsecret JSON):\\n' in mode:
+            mode=json.loads(mode.split('Caller input (nonsecret JSON):\\n',1)[1])['goal']
+        emit(id=m['id'], result=dict(turn=dict(id=turn)))
+        event('turn/started', turn=dict(id=turn,status='inProgress'))
+        event('turn/completed', turn=dict(id='unrelated-old-turn',status='completed'))
+        if mode in ('steer','steer-stall','steer-wrong'):
+            event('item/started', turnId=turn, item=dict(id='command',type='commandExecution',command='synthetic only'))
+        else:
+            if mode == 'mid-question':
+                event('item/started',turnId=turn,item=dict(id='observation',type='commandExecution',command='synthetic observation'))
+                event('item/completed',turnId=turn,item=dict(id='observation',type='commandExecution',exitCode=0))
+            rid='12' if mode == 'string-id' else 12
+            kind={{'approval':'item/commandExecution/requestApproval','file-approval':'item/fileChange/requestApproval',
+                  'permissions':'item/permissions/requestApproval','elicitation':'mcpServer/elicitation/request'}}.get(mode,'item/tool/requestUserInput')
+            questions=[dict(id='address',header='Address',question='Which address?',options=None,isSecret=mode=='secret'),
+                       dict(id='choice',header='Choice',question='Which shop?',options=None)]
+            emit(id=rid,method=kind,params=dict(threadId=thread,turnId=turn,itemId='question-item',isBlocking=True,
+                 autoResolutionMs=0 if mode=='expired' else None,questions=questions))
+            if mode == 'cleared': event('serverRequest/resolved',requestId=rid)
+    elif method == 'turn/steer':
+        if mode == 'steer-stall': continue
+        emit(id=m['id'], result=dict(turnId='unrelated' if mode=='steer-wrong' else turn))
+        event('item/completed',turnId=turn,item=dict(id='command',type='commandExecution',exitCode=0))
+        finish()
+    elif method == 'turn/interrupt':
+        emit(id=m['id'], result={{}})
+        event('serverRequest/resolved',requestId='12' if mode=='string-id' else 12)
+        event('turn/completed',turn=dict(id=turn,status='interrupted',error=None))
+    elif method is None and 'id' in m:
+        if 'error' in m: finish()
+        elif mode == 'disconnect': raise SystemExit
+        else:
+            event('serverRequest/resolved',requestId=m['id'])
+            event('item/started',turnId=turn,item=dict(id='selection',type='commandExecution',command='synthetic selection'))
+            event('item/completed',turnId=turn,item=dict(id='selection',type='commandExecution',exitCode=0))
+            finish()
+''')
+    binary.chmod(0o755)
+    path = write_config(tmp_path, codex=binary, default='codex')
+    config = Config.model_validate(json.loads(path.read_text()))
+    return CodexSession(tmp_path / 'conversation', config.engines['codex'], config, 'home'), record
+
+
+def messages(record):
+    return [json.loads(line) for line in record.read_text().splitlines()] if record.exists() else []
+
+
+async def start(session, mode, request_id='original-run'):
+    queue = asyncio.Queue()
+    task = asyncio.create_task(session.turn(mode, session.config, queue.put, request_id=request_id))
+    while True:
+        event = await asyncio.wait_for(queue.get(), 2)
+        if 'id' in event or (mode.startswith('steer') and event.get('method') == 'item/started'):
+            return task, event, queue
+
+
+def binding(session, request):
+    p = request['params']
+    return dict(request_id='original-run', thread_id=p['threadId'], turn_id=p['turnId'],
+                native_request_id=request['id'], item_id=p['itemId'])
+
+
+# spec: ANYM-993
+def test_question_event_is_owner_scoped_in_existing_http_cursor(tmp_path):
+    native(tmp_path)
+    path = tmp_path / 'config.json'
+    config = json.loads(path.read_text())
+    config['agent'].update(guarded=False, persistent=True)
+    path.write_text(json.dumps(config))
+    with Service(path) as service:
+        run = service.start(service.lease())
+        deadline = time.monotonic() + 3
+        while True:
+            view = service.get(run['request_id'], wait_s=1)
+            questions = [event for event in view['events'] if event['kind'] == 'question']
+            if questions:
+                break
+            assert time.monotonic() < deadline
+        question, = questions
+        assert question['native_request_id'] == 12 and type(question['native_request_id']) is int
+        assert question['item_id'] == 'question-item' and question['questions'][0]['id'] == 'address'
+        assert view['request_id'] == run['request_id'] and view['state'] == 'running'
+        service.get(run['request_id'], key='two', code=404)
+        assert service.phone.commands == []
+        assert service.post('agent', {'action': 'stop', 'request_id': run['request_id']})['state'] == 'stopped'
+
+
+# spec: ANYM-993
+@pytest.mark.parametrize('mode', ['question', 'string-id', 'mid-question'])
+def test_native_question_precedes_selection_and_exact_reply_is_sent_once(tmp_path, mode):
+    async def check():
+        session, record = native(tmp_path)
+        await session.connect()
+        task = None
+        try:
+            task, question, _ = await start(session, mode)
+            assert question['method'] == 'item/tool/requestUserInput'
+            assert question['params']['questions'][0]['options'] is None
+            assert not task.done() and not session.done.is_set()  # unrelated old completion was ignored
+            pending, = session.receipts('original-run')
+            assert pending['status'] == 'pending' and pending['submission_intent'] is False
+            assert not any(r['message'].get('result', {}).get('answers') for r in messages(record))
+            kwargs = {**binding(session, question), 'answers': {'address': ['Apartment two'], 'choice': ['Shop A']}}
+            first, second = await asyncio.gather(session.reply(**kwargs), session.reply(**kwargs))
+            assert first['status'] == second['status'] == 'unknown'  # no native acceptance ack for answer contents
+            assert first['submission_intent'] is second['submission_intent'] is True
+            assert await task == 'completed'
+            wire = [r['message'] for r in messages(record)]
+            replies = [m for m in wire if m.get('result', {}).get('answers')]
+            assert replies == [{'id': question['id'], 'result': {'answers': {
+                'address': {'answers': ['Apartment two']}, 'choice': {'answers': ['Shop A']}}}}]
+            assert len({r['pid'] for r in messages(record)}) == 1
+            assert not session.journal.is_relative_to(session.dir)  # native workspace cannot author its own receipts
+            journal = session.journal.read_text()
+            assert 'Apartment two' not in journal and 'Which address?' not in journal
+        finally:
+            await session.close()
+            if task:
+                await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(check())
+
+
+# spec: ANYM-993
+@pytest.mark.parametrize('mode', ['approval', 'file-approval', 'permissions', 'elicitation', 'secret'])
+def test_server_approvals_elicitation_and_secret_questions_are_never_answered_as_clarification(tmp_path, mode):
+    async def check():
+        session, record = native(tmp_path)
+        await session.connect()
+        events = []
+        async def consume(event):
+            events.append(event)
+        try:
+            assert await session.turn(mode, session.config, consume, request_id='original-run') == 'completed'
+            replies = [r['message'] for r in messages(record) if r['message'].get('id') == 12]
+            assert len(replies) == 1 and 'error' in replies[0]
+            assert not any(e.get('method') == 'item/tool/requestUserInput' for e in events)
+            assert session.receipts('original-run') == []
+        finally:
+            await session.close()
+    asyncio.run(check())
+
+
+# spec: ANYM-993
+def test_cancelled_question_and_restart_cannot_replay_old_answer(tmp_path):
+    async def check():
+        session, record = native(tmp_path)
+        await session.connect()
+        task, question, _ = await start(session, 'question')
+        args = {**binding(session, question), 'answers': {'address': ['two'], 'choice': ['shop']}}
+        await session.interrupt()
+        assert await task == 'interrupted'
+        with pytest.raises(Refused, match='question_expired'):
+            await session.reply(**args)
+        thread_id = session.thread_id
+        await session.close()
+        resumed = CodexSession(session.dir, session.config, session.host, session.device)
+        await resumed.connect()
+        try:
+            assert resumed.thread_id == thread_id
+            with pytest.raises(Refused, match='question_expired'):
+                await resumed.reply(**args)
+            assert resumed.receipts('original-run')[0]['native_state'] == 'cancelled'
+            assert not any(r['message'].get('result', {}).get('answers') for r in messages(record))
+            assert len([r for r in messages(record) if r['message'].get('method') == 'turn/start']) == 1
+        finally:
+            await resumed.close()
+    asyncio.run(check())
+
+
+# spec: ANYM-993
+def test_lost_answer_outcome_survives_restart_without_resend_or_false_acceptance(tmp_path):
+    async def check():
+        session, record = native(tmp_path)
+        await session.connect()
+        task, question, _ = await start(session, 'disconnect')
+        args = {**binding(session, question), 'answers': {'address': ['two'], 'choice': ['shop']}}
+        assert (await session.reply(**args))['status'] == 'unknown'
+        with pytest.raises(OSError):
+            await task
+        await session.close()
+        resumed = CodexSession(session.dir, session.config, session.host, session.device)
+        await resumed.connect()
+        try:
+            assert (await resumed.reply(**args))['status'] == 'unknown'
+            changed = {**args, 'answers': {'address': ['changed'], 'choice': ['shop']}}
+            with pytest.raises(Refused, match='native_reply_conflict'):
+                await resumed.reply(**changed)
+            replies = [r for r in messages(record) if r['message'].get('result', {}).get('answers')]
+            assert len(replies) == 1
+            assert any(r['message'].get('method') == 'thread/resume' for r in messages(record))
+        finally:
+            await resumed.close()
+    asyncio.run(check())
+
+
+# spec: ANYM-993
+def test_uncertain_steer_cancellation_prevents_retry_and_new_id_bypass(tmp_path):
+    async def check():
+        session, record = native(tmp_path)
+        await session.connect()
+        task = None
+        try:
+            task, _, _ = await start(session, 'steer-stall')
+            args = dict(request_id='original-run', thread_id=session.thread_id, turn_id=session.turn_id,
+                        message_id='original-steer-id', text='Read existing order only.')
+            steering = asyncio.create_task(session.steer(**args))
+            async with asyncio.timeout(2):
+                while not any(r['message'].get('method') == 'turn/steer' for r in messages(record)):
+                    await asyncio.sleep(.005)
+            steering.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await steering
+            assert (await session.steer(**args))['status'] == 'unknown'
+            with pytest.raises(Refused, match='native_input_unresolved'):
+                await session.steer(**{**args, 'message_id': 'new-bypass-id'})
+            assert len([r for r in messages(record) if r['message'].get('method') == 'turn/steer']) == 1
+            await session.interrupt()
+            assert await task == 'interrupted'
+        finally:
+            await session.close()
+            if task:
+                await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(check())
+
+
+# spec: ANYM-993
+def test_mismatched_steer_receipt_never_becomes_accepted(tmp_path):
+    async def check():
+        session, _ = native(tmp_path)
+        await session.connect()
+        task = None
+        try:
+            task, _, _ = await start(session, 'steer-wrong')
+            result = await session.steer(request_id='original-run', thread_id=session.thread_id,
+                turn_id=session.turn_id, message_id='original-message', text='Read status.')
+            assert result['status'] == 'unknown'
+            assert await task == 'completed'  # unrelated status/progress is still consumed normally
+        finally:
+            await session.close()
+            if task:
+                await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(check())
+
+
+# spec: ANYM-993
+def test_closed_input_refuses_before_creating_a_reply_intent(tmp_path):
+    async def check():
+        session, record = native(tmp_path)
+        await session.connect()
+        task = None
+        try:
+            task, question, _ = await start(session, 'question')
+            session.process.stdin.close()
+            with pytest.raises(Refused, match='native_session_disconnected'):
+                await session.reply(**binding(session, question), answers={'address': ['two'], 'choice': ['shop']})
+            assert all('digest' not in row for row in session.interactions.values())
+            assert not any(r['message'].get('result', {}).get('answers') for r in messages(record))
+        finally:
+            await session.close()
+            if task:
+                await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(check())
+
+
+# spec: ANYM-993
+def test_concurrent_turns_are_serial_and_other_conversation_cannot_answer(tmp_path):
+    async def check():
+        session, record = native(tmp_path)
+        other_dir = tmp_path / 'unrelated-owner-device'
+        other_dir.mkdir()
+        other, _ = native(other_dir)
+        await session.connect()
+        await other.connect()
+        first = second = None
+        try:
+            first, question, _ = await start(session, 'question')
+            kwargs = {**binding(session, question), 'answers': {'address': ['two'], 'choice': ['shop']}}
+            with pytest.raises(Refused):
+                await other.reply(**kwargs)
+            queue = asyncio.Queue()
+            second = asyncio.create_task(session.turn('question', session.config, queue.put, request_id='second-run'))
+            await asyncio.sleep(.02)
+            assert len([r for r in messages(record) if r['message'].get('method') == 'turn/start']) == 1
+            await session.reply(**kwargs)
+            assert await first == 'completed'
+            while True:
+                question2 = await asyncio.wait_for(queue.get(), 2)
+                if 'id' in question2:
+                    break
+            assert question2['params']['turnId'] != question['params']['turnId']
+            kwargs2 = {**binding(session, question2), 'request_id': 'second-run',
+                       'answers': {'address': ['three'], 'choice': ['shop']}}
+            await session.reply(**kwargs2)
+            assert await second == 'completed'
+            assert len({r['pid'] for r in messages(record)}) == 1
+        finally:
+            await session.close()
+            await other.close()
+            await asyncio.gather(*[t for t in (first, second) if t], return_exceptions=True)
+    asyncio.run(check())
+
+
+# spec: ANYM-993
+@pytest.mark.parametrize('change', ['request_id', 'thread_id', 'turn_id', 'native_request_id', 'item_id', 'answers'])
+def test_reply_mismatches_never_reach_native(tmp_path, change):
+    async def check():
+        session, record = native(tmp_path)
+        await session.connect()
+        task = None
+        try:
+            task, question, _ = await start(session, 'question')
+            kwargs = {**binding(session, question), 'answers': {'address': ['two'], 'choice': ['shop']}}
+            kwargs[change] = {'foreign-question': ['two']} if change == 'answers' else (
+                '12' if change == 'native_request_id' else 'unrelated')
+            with pytest.raises(Refused):
+                await session.reply(**kwargs)
+            assert not any(r['message'].get('result', {}).get('answers') for r in messages(record))
+            await session.interrupt()
+            assert await task == 'interrupted'
+        finally:
+            await session.close()
+            if task:
+                await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(check())
+
+
+# spec: ANYM-993
+@pytest.mark.parametrize('mode', ['expired', 'cleared'])
+def test_expired_or_cleared_question_refuses_late_reply(tmp_path, mode):
+    async def check():
+        session, record = native(tmp_path)
+        await session.connect()
+        task = None
+        try:
+            task, question, queue = await start(session, mode)
+            if mode == 'cleared':
+                while (await asyncio.wait_for(queue.get(), 2)).get('method') != 'serverRequest/resolved':
+                    pass
+            with pytest.raises(Refused, match='question_expired'):
+                await session.reply(**binding(session, question), answers={'address': ['two'], 'choice': ['shop']})
+            assert not any(r['message'].get('result', {}).get('answers') for r in messages(record))
+        finally:
+            await session.interrupt()
+            await session.close()
+            if task:
+                await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(check())
+
+
+# spec: ANYM-993
+def test_mid_turn_steer_preserves_process_and_uses_expected_original_turn(tmp_path):
+    async def check():
+        session, record = native(tmp_path)
+        await session.connect()
+        task = None
+        try:
+            task, _, _ = await start(session, 'steer')
+            args = dict(request_id='original-run', thread_id=session.thread_id, turn_id=session.turn_id,
+                        message_id='original-steer-id', text='Read only; keep the existing order.')
+            first, second = await asyncio.gather(session.steer(**args), session.steer(**args))
+            assert first['status'] == second['status'] == 'accepted'
+            assert await task == 'completed'
+            steering, = [r['message'] for r in messages(record) if r['message'].get('method') == 'turn/steer']
+            assert steering['params'] == dict(threadId=args['thread_id'], expectedTurnId=args['turn_id'],
+                                              clientUserMessageId=args['message_id'], input=[{'type': 'text', 'text': args['text']}])
+            assert len({r['pid'] for r in messages(record)}) == 1
+        finally:
+            await session.close()
+            if task:
+                await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(check())

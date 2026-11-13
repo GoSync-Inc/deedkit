@@ -298,6 +298,27 @@ releasing the device. Transport loss fails that request and never replays it. A 
 request resumes the exact saved thread when the service/process had to restart. Normal task
 completion does not restart it. Owner/device boundaries keep conversations separate.
 
+In persistent bare mode, `android_capabilities.agent.dialogue.available` exposes the implemented
+`reply` and `steer` actions of the same `android_agent` tool. `get` includes the current native
+thread/turn and owner-scoped `question` cursor events with the original typed `native_request_id`,
+`item_id` and `questions[].id`. For `reply`, retain the original run `request_id`, device and live
+`session_id`, native thread/turn/RPC/item IDs, and pass `answers` mapping every question ID to a
+list of ordinary answer strings. For `steer`, retain the active run/device/session and native
+thread/turn, provide the caller's stable `message_id` and ordinary `text`. Neither action is a
+generic RPC or an approval/secret-input route. Original task words and natural final replies need
+no model-authored JSON schema.
+
+`input_receipt` reports input delivery separately from the run result. Answer writes remain
+`status=unknown`, with `native_state=submitted` after local write/drain; native `resolved` can also
+mean cleanup and never proves acceptance of the answer contents. A matching native steer
+`turnId` can confirm `accepted` input, not goal/action success. `get.dialogue` reads the original
+receipt after a lost response or restart without starting a native client. Repeating identical
+IDs/content reads that receipt; changed content conflicts, and a new message ID cannot bypass an
+uncertain steer in that original turn. Pending/expired/cancelled questions, closed input,
+mismatched IDs, device/lease and current permissions are checked before any native write.
+Current key/grants are rechecked after serialization. The metadata-only no-replay journal lives
+outside the native writable workspace. Guarded and isolated-exec modes do not admit mid-turn input.
+
 Results retain the ordinary natural final, timings, command progress, tokens and screenshot;
 `native_session` includes `thread_id`, `pid`, `turn_id` and `persistent`. Native session history
 is stored privately under the existing dedicated `CODEX_HOME`; no transcript is exported or
