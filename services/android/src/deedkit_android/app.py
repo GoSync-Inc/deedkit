@@ -27,6 +27,14 @@ class Device(Strict):
     session_id: str
 
 
+class OrderSourceRead(Strict):
+    device_id: str
+    source_id: str = Field(min_length=1, max_length=256)
+    auth_epoch: int = Field(ge=1)
+    after: int = Field(default=0, ge=0, le=9223372036854775807)
+    limit: int = Field(default=4, ge=1, le=16)
+
+
 class Crop(Strict):
     x: int = Field(ge=0)
     y: int = Field(ge=0)
@@ -163,6 +171,34 @@ def create_app(config_path, agent_url=None):
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     install_routes(app)
+
+    @app.post('/internal/v1/order-source')
+    async def order_source(request: Request):
+        from .order_events import OrderRefused
+        principal = configuration.authenticate(request.headers.get('authorization', ''))
+        if 'android:read' not in principal.permissions:
+            raise Refused('forbidden', 403)
+        body = await request.body()
+        if len(body) > 4096:
+            raise Refused('request_too_large', 413)
+        try:
+            args = OrderSourceRead.model_validate_json(body)
+        except ValidationError as invalid:
+            raise Refused('invalid_arguments', 422, field_errors(invalid, OrderSourceRead)) from None
+        principal = configuration.authenticate(request.headers.get('authorization', ''))
+        if 'android:read' not in principal.permissions:
+            raise Refused('forbidden', 403)
+        if args.device_id not in principal.devices:
+            raise Refused('not_found', 404)
+        control = request.app.state.agents.order_control()
+        if control is None:
+            raise Refused('order_source_unavailable')
+        if (args.source_id, args.auth_epoch) != (control.source_id, control.auth_epoch):
+            raise Refused('order_source_changed')
+        try:
+            return control.feed.read_source(principal, principal.id, args.device_id, args.after, args.limit)
+        except OrderRefused as error:
+            raise Refused(str(error)) from None
 
     @app.exception_handler(Refused)
     async def refused(request, error):

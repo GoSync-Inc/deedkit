@@ -52,11 +52,18 @@ class EngineConfig(Strict):
     codex_home: str | None = None
 
 
+class OrderSourceConfig(Strict):
+    source_id: str = Field(min_length=1, max_length=256)
+    auth_epoch: int = Field(ge=1)
+    handoff_principals: dict[str, str] = Field(default_factory=dict, max_length=8)  # trusted original-task owner -> recipient
+
+
 class AgentConfig(Strict):
     # Off until set: while false no run starts and no engine login file is read (ANYM-971 criterion 10).
     enabled: bool = False
     guarded: bool = False
     persistent: bool = False
+    order_events: OrderSourceConfig | None = None
 
 
 class Config(Strict):

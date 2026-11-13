@@ -62,12 +62,22 @@ class Principal(Strict):
     actions: dict[str, list[str]] = Field(default_factory=dict)
 
 
+class AndroidWakeRoute(Strict):
+    principal_id: str = Field(min_length=1, max_length=128)
+    owner_id: str = Field(min_length=1, max_length=128)
+    device_id: str = Field(min_length=1, max_length=128)
+    source_id: str = Field(min_length=1, max_length=256)
+    auth_epoch: int = Field(ge=1)
+    enabled: bool = False
+
+
 class Document(Strict):
     version: int
     revision: int = Field(ge=1)
     deployment: Deployment
     profiles: dict[str, Profile]
     principals: list[Principal]
+    android_wakes: list[AndroidWakeRoute] = Field(default_factory=list, max_length=8)
 
 
 def read_private(path, limit=1024 * 1024):
@@ -152,6 +162,10 @@ class Policy:
                     ):
                         raise ValueError
             ids, keys, runner_keys = set(), set(), set()
+            bindings = [(r['owner_id'], r['device_id']) for r in doc['android_wakes']]
+            if len(bindings) != len(set(bindings)) or any(
+                    not any(p['id'] == r['principal_id'] for p in doc['principals']) for r in doc['android_wakes']):
+                raise ValueError('invalid_android_wake_routes')
             for profile in doc["profiles"].values():
                 if set(profile["tools"]) - CATALOG.keys() or len(profile["tools"]) != len(
                     set(profile["tools"])

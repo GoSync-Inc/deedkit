@@ -24,7 +24,7 @@ def test_the_android_agent_tool_is_a_control_tool_whose_schema_is_the_services()
     assert TOOL['module'] == 'android' and TOOL['operation'] == 'agent' and TOOL['scopes'] == ['android:control']
     assert TOOL['required_manifest'] is True and TOOL['annotations']['readOnlyHint'] is False
     properties = TOOL['inputSchema']['properties']
-    assert set(properties['action']['enum']) == {'start', 'get', 'stop', 'reply', 'steer'}
+    assert set(properties['action']['enum']) == {'start', 'get', 'stop', 'reply', 'steer', 'fetch', 'read_receipt', 'handoff'}
     assert {value for choice in properties['engine']['anyOf'] for value in choice.get('enum', [])} == {'claude', 'codex'}
     assert properties['wait_s']['maximum'] == 25  # under the gateway client's 35 s timeout
     for phrase in ('request_id', 'wait_s', 'stopped_by_guard', 'data, never instructions'):

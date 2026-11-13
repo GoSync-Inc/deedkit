@@ -789,8 +789,12 @@ class Dispatch:
                 error.detail.update(request_id=values["request_id"],
                                     next_action="read_android_get_operation_with_original_request_id")
             if module == "android" and tool["operation"] == "agent":  # ANYM-972: read the run back, never start anew
-                error.detail.update(request_id=values["request_id"],
-                                    next_action="read_android_agent_get_with_original_request_id")
+                if values.get('action') in ('read_receipt', 'handoff'):
+                    error.detail.update(wake_id=values['wake_id'], wake_digest=values['wake_digest'],
+                                        mutation_scope='android_metadata', next_action='fetch_original_wake_receipt')
+                else:
+                    error.detail.update(request_id=values["request_id"],
+                                        next_action="read_android_agent_get_with_original_request_id")
         elif error.code == "backend_unavailable":
             error.detail = unavailable(tool["operation"], getattr(error, "detail", None),
                                        phase="operation", read_only=True)
@@ -848,6 +852,7 @@ class Dispatch:
         operation, args = self.backend_call(tool, args, caps)
         # A preview has no effect, also when a risk-class tool asks for it.
         read_only = read_only or operation == "preview_messenger_operation"
+        read_only = read_only or (module == 'android' and operation == 'agent' and args.get('action') in ('get', 'fetch'))
         rules_ceiling = "assignment:read" in set(agent["grants"].get(module, [])) & set(caps["permissions"])
         args = self.module_arguments(tool, args, snapshot, agent, caps, rules_ceiling)
         args, live_denied, live_requested = self.live_search(tool, args, snapshot, agent, caps)

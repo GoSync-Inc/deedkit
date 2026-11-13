@@ -197,6 +197,8 @@ class Clients:
         # ANYM-820: the agent runner has REST routes; every other module takes POST /v1/<operation>.
         method, path, query, payload = (agents.request(operation, arguments) if module == agents.MODULE
                                      else ("POST", "/v1/" + operation, None, arguments))
+        if module == 'android' and operation == 'order_source':
+            path = '/internal/v1/order-source'  # private producer path, never a public catalog operation
         async with budget.slot():
             try:
                 async with (

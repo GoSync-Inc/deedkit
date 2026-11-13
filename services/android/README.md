@@ -878,3 +878,67 @@ Checkpoint `remaining_yaml` retains explicit historical map versions and can be
 submitted under a new request UUID after the checkpoint is resolved.
 Application-specific navigation stays in scenario data. Existing command lists,
 raw ADB, sessions, receipt polling and screenshot downloads retain their entry points.
+
+### Native order metadata and owner wakes (ANYM-993/997)
+
+`agent.order_events: {source_id: "<trusted configured source>", auth_epoch: 1}` supplies host
+source provenance. Cross-principal handoff additionally needs a trusted `handoff_principals` mapping
+from the original task principal to its authorized same-owner/delegated Grok recipient; without that
+mapping only the original principal can accept. Device access or a model-supplied principal string
+is insufficient, and public fetch checks both this admission and the actual original wake recipient.
+Root must verify owner authority/Data Policy before configuring any different live recipient.
+An absent source is unavailable; the model/caller cannot provide it, create a
+receiver, select a credential or activate a routine. A configured fresh native `thread/start`
+registers the narrow `android_order_control` dynamic function for bind/update/next_check/notify/handoff.
+The host injects authenticated owner/device/task and original native call/RPC/thread/turn identities;
+model arguments contain only operation metadata. Provider order/package/source references may be
+absent until an order exists. Later calls may inspect earlier active obligations on that same
+owner/device/thread without replacing their originating task or exact user words. Direct native ADB
+remains the phone tool path. This function does not execute phone actions or relay arbitrary RPCs.
+
+Only an actual original start receipt records the registration hash. A resumed unregistered/legacy
+conversation stays on its original thread with control unavailable; there is no public supported hot-add
+or replacement-thread workaround. The installed original-thread transition remains a root rollout
+obligation. Actual model exposure/default-mode behavior is not proven by static schemas or fixtures.
+Host bindings also retain the original configured device serial digest: reassigning the same label to
+another serial refuses resume. Legacy records lacking that identity require trusted attestation.
+
+A local journal result `status: applied, effect: metadata_only` confirms that metadata transaction.
+The native response still reads unknown/submitted/resolved; writing/draining or `serverRequest/resolved`
+is not positive contents acceptance, goal success or approval. Original call/RPC identities and a
+no-replay intent survive cancellation/restart. Pending questions and unknown deliveries retain their
+original task words beyond normal result retention. Actual async AgentMessage arrays keep their
+observed item ID and have no fabricated RPC/question IDs; preorder owner notices need no provider ID.
+
+The same `android_agent` tool adds these wake-scoped actions:
+
+- `fetch(wake_id)` is a pure read. It returns the trusted original goal/owner_instruction/typed
+  context, original IDs, immutable `wake_digest`, recorded local read status and current responsibility.
+  It changes no receipt, source cursor, server/subscription ACK or responsibility.
+- `read_receipt(wake_id, wake_digest)` explicitly records an idempotent LOCAL Android event read
+  receipt. This is a metadata mutation, separate from native answer delivery, provider/subscription ACK
+  and responsibility. A lost response is reconciled by fetching the original wake receipt, without an
+  automatic resend or replacement ID.
+- `handoff(wake_id, wake_digest, snapshot_digest, next_check_at)` explicitly acknowledges the offered
+  current responsibility snapshot and future next check. A stale/foreign/unsettled proposal refuses.
+  Codex stays responsible after fetch/read and until this separate authenticated acknowledgment succeeds.
+
+A wake hint contains no task replacement ID: fetch returns the actual task for ordinary `reply`,
+which retains the native RPC/async route and exact natural owner answer on the same conversation.
+Wake actions reject a caller-supplied task/device override. The four-tool Android profile is unchanged.
+`request_protected_input` remains unavailable before any reference/channel access: no actual protected
+capture/read fence exists here, and a held parallel dynamic call would not establish quiescence.
+
+The private `/internal/v1/order-source` endpoint requires the existing backend principal, current device
+rights and configured source/epoch. It exports at most16 metadata rows; original words/questions stay
+on authenticated fetch. Gateway policy may contain up to8 `android_wakes` routes with technical
+`principal_id`, actual Android `owner_id/device_id/source_id/auth_epoch`, and `enabled: false` by default.
+Routes use only existing backend credentials/URLs and the existing gateway lifespan's bounded30s metadata
+step. The server's actual verified binding/routine must be ready before source ingestion; a paused or
+missing binding stops before reading Android. No module/message/subscription cursor is changed.
+Install code before adding policy fields to an older strict reader. Configuration is not a live receipt;
+root retains endpoint/routine/installed listener/native/phone acceptance and all live actions.
+
+Native timer delivery through the existing device/session gate, actual protected fencing/entry and safe
+context compaction remain integration obligations. Persisted chosen deadlines or source-only tests do
+not prove those installed behaviors; no real model/phone/provider benchmark is claimed.
