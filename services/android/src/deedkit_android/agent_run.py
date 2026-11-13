@@ -45,6 +45,7 @@ NAME = r'^[A-Z][A-Z0-9_]{0,63}$'
 POINT = re.compile(r'\s*\d+(?:\.\d+)?%?\s*,\s*\d+(?:\.\d+)?%?\s*')
 START_ONLY = ('device_id', 'session_id', 'goal', 'owner_instruction', 'apps', 'params', 'secrets', 'outputs',
               'max_minutes', 'max_actions', 'engine', 'model', 'effort', 'save_as', 'param_names')
+DIALOGUE_FIELDS = {'native_thread_id', 'native_turn_id', 'native_request_id', 'item_id', 'answers', 'message_id', 'text'}
 
 
 def preamble():
@@ -63,7 +64,7 @@ def preamble():
 
 
 class AgentCall(Strict):
-    action: Literal['start', 'get', 'stop']
+    action: Literal['start', 'get', 'stop', 'reply', 'steer']
     request_id: str
     device_id: str | None = None
     session_id: str | None = None
@@ -82,15 +83,29 @@ class AgentCall(Strict):
     param_names: list[str] = Field(default_factory=list, max_length=20)
     after: int = Field(default=0, ge=0)
     wait_s: int = Field(default=0, ge=0, le=25)
+    native_thread_id: str | None = Field(default=None, min_length=1, max_length=128)
+    native_turn_id: str | None = Field(default=None, min_length=1, max_length=128)
+    native_request_id: str | int | None = None
+    item_id: str | None = Field(default=None, min_length=1, max_length=128)
+    answers: dict[str, list[str]] | None = None
+    message_id: str | None = Field(default=None, min_length=1, max_length=128)
+    text: str | None = Field(default=None, min_length=1, max_length=4096)
 
     @model_validator(mode='after')
     def fields_of_the_action(self):
         given = self.model_fields_set
         if self.action == 'start':
             missing = {'device_id', 'session_id', 'goal', 'owner_instruction'} - given
-            if missing or self.after or self.wait_s:
+            if missing or self.after or self.wait_s or given & DIALOGUE_FIELDS:
                 raise ValueError('start_fields')
-        elif given & set(START_ONLY) or (self.action == 'stop' and given & {'after', 'wait_s'}):
+        elif self.action in {'reply', 'steer'}:
+            required = {'device_id', 'session_id', 'native_thread_id', 'native_turn_id'} | (
+                ({'native_request_id', 'item_id', 'answers'} if 'answers' in given else {'item_id', 'message_id', 'text'})
+                if self.action == 'reply' else {'message_id', 'text'})
+            if (not required <= given or any(getattr(self, name) is None for name in required)
+                    or given - required - {'action', 'request_id'}):
+                raise ValueError('dialogue_fields')
+        elif given & (set(START_ONLY) | DIALOGUE_FIELDS) or (self.action == 'stop' and given & {'after', 'wait_s'}):
             raise ValueError('action_fields')
         if (self.param_names and self.save_as is None) or not set(self.param_names) <= set(self.params) or len(
                 set(self.param_names)) != len(self.param_names):
@@ -105,7 +120,7 @@ class AgentCall(Strict):
 
     def identity(self):
         """The canonical fields of a start: the same request_id with these returns its run, others conflict."""
-        body = self.model_dump(exclude={'action', 'request_id', 'session_id', 'after', 'wait_s'})
+        body = self.model_dump(exclude={'action', 'request_id', 'session_id', 'after', 'wait_s'} | DIALOGUE_FIELDS)
         body.update(apps=sorted(set(body['apps'] or ())), secrets=sorted(self.secrets), outputs=sorted(self.outputs),
                     params={name: str(value) for name, value in self.params.items()})
         return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
@@ -700,12 +715,19 @@ class Agents:
         return {'enabled': config.agent.enabled, **({} if config.agent.enabled else {'reason': 'agent_disabled'}),
                 'mode': 'guarded' if config.agent.guarded else 'bare',
                 'persistent': config.agent.persistent and not config.agent.guarded,
+                'dialogue': {'available': bool(config.agent.enabled and config.agent.persistent and not config.agent.guarded
+                                               and found['codex']['available']),
+                             'actions': ['reply', 'steer'], 'answer_receipt': 'submitted_unconfirmed',
+                             'readback': 'get.dialogue', 'requires': ['original_ids', 'own_live_session'],
+                             'question_routes_require': ['pinned_0.166.0', 'native_effective_never'],
+                             'async_reply': 'active_steer_or_same_conversation_next_turn',
+                             'model_question_tool': 'catalog_dependent_unverified'},
                 'default_model': config.engines.get('codex').model or 'gpt-6.1-terra' if config.engines.get('codex') else 'gpt-6.1-terra',
                 'default_effort': config.engines['codex'].reasoning_effort if 'codex' in config.engines else 'medium',
                 'default_engine': default, 'engines': found, 'tools': list(MODELS) if config.agent.guarded else ['codex'], 'preamble_version': version, 'input_schema': AgentCall.model_json_schema(),
                 'limits': {'max_minutes': 15, 'max_actions': 300, 'max_images': 3, 'wait_s': 25, 'apps': 5}}
 
-    async def handle(self, owner, args):
+    async def handle(self, owner, args, authorize=None):
         call = AgentCall.model_validate(args) if not isinstance(args, AgentCall) else args
         request_id = identifier(call.request_id)
         call = call.model_copy(update={'request_id': request_id})
@@ -714,12 +736,103 @@ class Agents:
         row = self.db.row(owner, request_id)
         if row is None:
             raise Refused('not_found', 404)
+        if call.action in {'reply', 'steer'}:
+            return await self.interact(owner, call, authorize)
         if call.action == 'stop':
             run = self.runs.get((owner, request_id))
             if run is not None:
                 await run.end('stopped')
+            self.native_session(owner, row['device']).finish_questions('cancelled', request_id=request_id)
             return self.view(owner, request_id, 0)
         return await self.poll(owner, request_id, call.after, call.wait_s)
+
+    def native_session(self, owner, device):
+        session = self.sessions.get((owner, device))
+        if session is None:
+            from .codex_session import CodexSession
+            digest = hashlib.sha256(json.dumps((owner, device)).encode()).hexdigest()
+            session = CodexSession(self.root / 'sessions' / ('run-live-' + digest), None, None, device)
+            session.load_interactions()  # metadata readback only; never connect/start native for a retry
+        return session
+
+    async def interact(self, owner, call, authorize):
+        if authorize is None:
+            raise Refused('unauthorized', 401)
+        row = self.db.row(owner, call.request_id)
+        if row['device'] != call.device_id:
+            raise Refused('request_device_mismatch')
+        config = self.read_config()
+        if config.agent.guarded or not config.agent.persistent:
+            raise Refused('native_dialogue_unavailable')
+        session = self.native_session(owner, call.device_id)
+
+        def admit(write):
+            principal = authorize()  # recheck key/grants AFTER waiting on native interaction serialization
+            if principal.id != owner or call.device_id not in principal.devices:
+                raise Refused('not_found', 404)
+            if 'android:control' not in principal.permissions:
+                raise Refused('forbidden', 403)
+            self.store.check_reservation(owner, call.device_id, call.session_id)
+            if write:
+                run = self.runs.get((owner, call.request_id))
+                if (run is None or run.state != 'running' or getattr(run, 'session', None) is not session
+                        or not self.devices.locks[call.device_id].locked()):
+                    raise Refused('native_turn_mismatch')
+                current = self.read_config().agent
+                if not current.enabled or current.guarded or not current.persistent:
+                    raise Refused('agent_disabled')
+                self.store.touch(owner, call.device_id, call.session_id)
+
+        args = {'request_id': call.request_id, 'thread_id': call.native_thread_id,
+                'turn_id': call.native_turn_id, 'admit': admit}
+        if call.action == 'reply' and call.answers is None:
+            async def resume(text, commit, started, refused):
+                # A completed async question may continue only the still-current live conversation.
+                # Restart/lost/cancelled/busy are refusals before the durable dispatch intent.
+                admit(False)
+                if (self.db.row(owner, call.request_id)['state'] != 'succeeded'
+                        or session.events is not None or self.devices.locks[call.device_id].locked()
+                        or not self.read_config().agent.enabled):
+                    raise Refused('native_continuation_unavailable')
+                lock = self.devices.locks[call.device_id]
+                await lock.acquire()
+                run = None
+                try:
+                    admit(False)
+                    from .codex_session import PersistentRun
+                    saved = {k: v for k, v in json.loads(row['request']).items() if k not in DIALOGUE_FIELDS}
+                    original = AgentCall.model_validate({**saved, 'session_id': call.session_id})
+                    directory = Path(tempfile.mkdtemp(prefix='run-', dir=self.root))
+                    directory.chmod(0o700)
+                    run = PersistentRun(self, owner, original, 'codex', session.config, directory,
+                                        SecretRun(self.devices.secrets), (None, ''))
+                    run.input_text, run.input_started = text, started
+                    run.input_refused = refused
+                    run.input_admit = lambda: admit(True)
+                    commit()  # fsynced original answer intent before any native dispatch
+                    self.db.db.execute("UPDATE agent_runs SET state='running',ended=NULL,result=NULL WHERE owner=? AND id=?",
+                                       (owner, call.request_id))
+                    self.db.db.commit()
+                    self.runs[(owner, call.request_id)] = run
+                    run.seq = self.db.add_event(owner, call.request_id, 'state', {'state': 'running'})
+                    task = asyncio.create_task(run.supervise())
+                    self.tasks.add(task)
+                    task.add_done_callback(self.tasks.discard)
+                except BaseException:
+                    if run is not None:
+                        self.release(run)
+                    else:
+                        lock.release()
+                    raise
+
+            receipt = await session.reply_async(**args, item_id=call.item_id, message_id=call.message_id,
+                                                text=call.text, resume=resume)
+        elif call.action == 'reply':
+            receipt = await session.reply(**args, native_request_id=call.native_request_id,
+                                          item_id=call.item_id, answers=call.answers)
+        else:
+            receipt = await session.steer(**args, message_id=call.message_id, text=call.text)
+        return {**self.view(owner, call.request_id, 0), 'input_receipt': receipt}
 
     async def start(self, owner, call):
         self.db.purge(time.time() - RETENTION_S)
@@ -825,6 +938,11 @@ class Agents:
                 'started_at': row['started'], 'events': events, 'next_cursor': events[-1]['seq'] if events else after}
         if row['state'] != 'running':
             view.update(json.loads(row['result'] or '{}'))
+        dialogue = self.native_session(owner, row['device'])
+        view['dialogue'] = dialogue.receipts(request_id)
+        if row['state'] == 'running' and dialogue.request_id == request_id and dialogue.process is not None:
+            view['native_session'] = {'thread_id': dialogue.thread_id, 'turn_id': dialogue.turn_id,
+                                      'pid': dialogue.process.pid, 'persistent': True}
         return view
 
     def authenticate(self, authorization):
