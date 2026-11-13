@@ -283,6 +283,12 @@ new turn in that same conversation, including questions and follow-ups about pri
 There is no automatic reflection, skill-writing instruction, task recipe, or result schema.
 Bundled and host skill discovery are disabled. The only task prompt is the phone location,
 owner-agent role and caller goal/context. Existing dedicated native owner preferences remain.
+The nonsecret caller input preserves `goal`, `owner_instruction` verbatim (including its
+restrictions), typed `params`, `apps` and requested `outputs` in a small JSON envelope. These
+are caller-supplied instructions, not an independent owner authorization. Principal/device/request
+provenance and enforced run limits stay in transport/storage; lease/auth tokens and secret
+declarations are excluded from model input. Natural replies remain valid, without a required
+output format.
 
 The caller still acquires `android_session`, submits a durable `request_id` with `start`,
 and follows that request with `get`. An idle conversation holds no phone lease or device lock.

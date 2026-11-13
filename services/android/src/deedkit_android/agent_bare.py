@@ -39,14 +39,15 @@ class BareRun(AgentRun):
 
     def prompt(self):
         host = self.agents.read_config()
+        request = self.request
+        # Use the validated request, not executor substitutions: those stringify bools/ints.
+        # Lease/auth tokens and secret declarations have no place in model input.
+        body = {name: getattr(request, name) for name in (
+            'goal', 'owner_instruction', 'params', 'apps', 'outputs')}
         prompt = (f'Android phone on this host: {host.adb} -s {host.devices[self.device]}.\n'
                   "You are the owner's agent that does orders and tasks on this phone.\n"
-                  f'Goal: {self.request.goal}\n')
-        if self.params:
-            prompt += 'Parameters: ' + json.dumps(self.params) + '\n'
-        if self.request.apps:
-            prompt += 'Apps: ' + ', '.join(self.request.apps) + '\n'
-        return prompt
+                  'Caller input (nonsecret JSON):\n')
+        return prompt + json.dumps(body, ensure_ascii=False) + '\n'
 
     def skill_files(self):
         """Change metadata only. Codex authors and discovers ordinary skills itself."""
@@ -201,7 +202,7 @@ class BareRun(AgentRun):
                             'model_ms': max(0, self.engine_ms - self.device_ms)},
                 'tokens': self.stream.tokens(), 'token_usage_observed': observed,
                 'engine': 'codex', 'model': self.config.model,
-                'effort': self.config.reasoning_effort, 'mode': 'bare', 'prompt_version': 1,
+                'effort': self.config.reasoning_effort, 'mode': 'bare', 'prompt_version': 2,
                 'skills_updated': self.skills_updated, 'learning_error': self.learning_error,
                 'engine_errors': agent_diagnostics.receipt(self.stream.errors, bytes(self.stderr),
                     [self.request.goal, self.request.owner_instruction, *self.params.values()]), **extra}

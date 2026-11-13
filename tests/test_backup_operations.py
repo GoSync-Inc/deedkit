@@ -383,8 +383,11 @@ def test_concurrent_cli_cannot_recover_or_stop_lock_owners_job(tmp_path,monkeypa
     monkeypatch.setattr(sys,'argv',['backup_runner','--config','unused'])
     monkeypatch.setattr(backup_runner.signal,'signal',lambda *_:None)
     before=(tmp_path/'journal.json').read_bytes()
+    previous_mask=os.umask(0o077)
     try:
         with pytest.raises(SystemExit):backup_runner.main()
-    finally:os.close(lock)
+    finally:
+        os.umask(previous_mask)
+        os.close(lock)
     assert called==[] and docker.calls==[]
     assert (tmp_path/'journal.json').read_bytes()==before
