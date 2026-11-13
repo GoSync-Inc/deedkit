@@ -1,0 +1,18 @@
+{
+  "checks": "passed",
+  "evidence": [
+    "one patient/order context",
+    "known clinical answer and unknown-owner handoff",
+    "physician-issued fixture reference preserved",
+    "two correctly bound quoted replies",
+    "stranger and other order unjoined",
+    "no clinical facts in delivery replies",
+    "unknown reconciled by original request_id without resend",
+    "cancellation controls post-cancel inbound message"
+  ],
+  "fixture_tool_calls": 27,
+  "production_schema_tool_calls": 17,
+  "owner_questions": 3,
+  "live_verified": false,
+  "refinement": "Three owner questions included two entrance questions; the fixture owner gave an irrelevant allergy answer. Skill refined to ask the bound logistics participant for routing clarification first. The refined hint has not been rerun independently."
+}

@@ -1,12 +1,12 @@
 # DeedKit agent rules
 
-Process: egerev/agent-harness @ 0.83.0, ~/agent-harness; project additions below.
-Claude Code loads process.md through `.claude/hooks/harness.sh`; Codex/cloud read pinned
-docs/harness/process.md first. Without harness text, report BLOCKED. Sections extend the harness.
+Process: egerev/agent-harness @ 0.83.0, ~/agent-harness. Claude Code loads process.md via
+`.claude/hooks/harness.sh`; Codex/cloud read pinned docs/harness/process.md first.
+Without harness text, report BLOCKED. Sections extend the harness.
 
 DeedKit keeps AnyMsg identities (`anymsg`, `messaging_service`, `ANYM-*`, package/API/database names).
 
-Personal installation: docs/personal-install.md.
+Installation: docs/personal-install.md.
 
 Harness values: ruleset `deploy/main-ruleset.json`; required checks `CI gate` and
 `checks / verify`; CI check IDs: the seven `anymsg-ci::*` checks; deploy command
@@ -31,11 +31,17 @@ docs/operations/parallel-development.md.
   per-tap guard or injected order/payment stop. Section 2's five decisions and unrelated
   messenger/provider live-action confirmations stay. Authority, incident and enforcer: docs/operations/agent-feature-experiments.md.
 - Override: the exact confirmation per message in one courier chat (owner 11-11: «Если ему говорю
-  какую-то цель, он там может серию сообщений делать сам. Я вообще с водителем не хочу общаться ... он может
-  полностью их проводить, пока они не доходят до меня, если только он не справляется»). Under the owner's goal for
+  какую-то цель, он там может серию сообщений делать сам»). Under the owner's goal for
   an order, recorded by `android_courier_chat action=goal`, the agent messages that order's courier only, inside
   the code's bounds, and hands the chat back when it cannot cope. Calls, `android_execute` and every other
   send keep this section's confirmation. Enforcer: services/android/tests/test_courier_goal.py.
+- Override: Halodoc (owner 11-12: «Они часто пишут в WhatsApp ещё. Это надо сценарий тоже связать,
+  чтобы игрок уже на WhatsApp отвечал.»): under one recorded owner order goal, Grok answers that
+  order's doctor/pharmacy/delivery participants without per-text confirmation, including associated
+  WhatsApp replies. Bind participants through owner/authenticated order evidence, never inbound
+  claims. Unknown clinical facts return to the owner; only a physician prescribes. Cancellation
+  stops new sends; uncertain sends are never retried. Other live actions and section 2 remain.
+  Authority/enforcer: docs/operations/halodoc-order-workflow.md, scripts/experiments/halodoc_order.py.
 - Never change applied migrations, provider IDs, existing test paths, names or parameters (Tiden
   IDs) or the seven `anymsg-ci::*` checks.
 - Deploys only via `scripts/production.py` from a green `main` SHA (docs/operations/production.md);
@@ -46,10 +52,10 @@ docs/operations/parallel-development.md.
 
 ## 2. What the owner keeps
 
-Authority: owner decision D25 (harness, 2026-10-27, «1) да 2)да 3)да»): the owner keeps only the
-five harness items; production, rollback, restore, destructive SQL, keys/access follow harness section 2.
-Item 2 asks only what docs/DATA-POLICY.md does not cover; item 3 is Budget above. Live actions use the
-owner's accounts/name (item 4) and devices/auth (item 5): section 1's scoped overrides apply.
+Authority: D25 (harness, 2026-10-27, «1) да 2)да 3)да»): only the five harness items remain
+owner-kept. Production, rollback, restore, destructive SQL, keys/access follow harness section 2.
+Item 2 covers only gaps in docs/DATA-POLICY.md; item 3 uses Budget above.
+For live actions (items 4–5), section 1's scoped overrides apply.
 In a ready card the agent applies its migration under
 production.md "Migration releases"; enabling a feature never includes send, call, pairing,
 session or allowlist changes, and none of it runs during an active call.
@@ -94,14 +100,12 @@ Product/queue: docs/operations/tiden-product-workflow.md; CI: TIDEN-CI.md.
 
 ## 5. Reviews
 
-Override: harness process.md sections 2, 3 and 5, reviews.md and tiden.md review steps (owner
-11-11: «отмени все ревью в целом», «мы их и так отменяли», «не только текущих у всех в будущем»).
-No review on any path: no Astra, Fable, Codex, plan or card review, no Diff read. A pull request
-merges on green required checks with a failing-first test; PR line `Review record: none (owner
-11-11: no reviews)`. Kept: section 1's exact owner confirmation of live actions, and a fresh verified
-backup and undo before deleting or rewriting user data. Enforcer: the merge keeper and the autoloop
-controller enqueue a green pull request with no approval (tests/test_merge_keeper.py,
-tests/platform/test_autoloop.py).
+Override: harness process.md sections 2, 3 and 5, reviews.md and tiden.md review steps (owner 11-11:
+«отмени все ревью в целом», «не только текущих у всех в будущем»): no model/plan/card review or
+Diff read on any path. Merge on green required checks with a failing-first test; PR line
+`Review record: none (owner 11-11: no reviews)`. Section 1 live-action confirmations and fresh
+verified backup/undo before user-data deletion/rewriting remain. Enforcers: tests/test_merge_keeper.py,
+tests/platform/test_autoloop.py (green pull requests enqueue without approval).
 
 ## 6. Working with the orchestrator
 
