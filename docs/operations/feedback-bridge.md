@@ -46,6 +46,49 @@ A task's first description line is `Feedback-ID: <uuid>`; the bridge finds a tas
 A human edit of the title or description is kept and a comment shows the new summary instead. An item older than
 `DEEDKIT_BRIDGE_BACKFILL_DAYS` (default 14) and every item that is already closed gets no task.
 
+## ACK after durable BB save
+
+Owner authority, 2026-11-13: «Да, разрешаю, если так надо, давай делать. Я разрешаю, конечно.» The quoted question's
+scope is only the dedicated feedback-bridge subscription, after its events are durably saved in BB, for the bounded
+verification and normal operation; an unknown result must not be retried. No other subscription or provider action is
+included. Enforcer: `feedback_bridge.py` receipt validation, actual BB task readback and pending-ACK reconciliation.
+
+Every event covered by an ACK must be a valid mapped feedback event on that subscription. There must be no message
+items, scope mask, gap or hidden through-position. Each feedback ID needs a non-skipped ledger link AND a successful
+current `bb tasks show` matching the linked task ID/key and exact first description line. A skipped/history/closed
+ledger row, exhausted unresolved attempts, a malformed event or an empty filtered ID list never authorizes ACK.
+Valid items may still be applied while the receipt stays unacknowledged. Backfill filtering itself is unchanged.
+
+Before one ACK attempt, the existing SQLite `meta.pending_ack` records subscription identity/version and before/through
+positions for both streams, not the transport receipt. A successful matching response clears it. An unknown response
+or crash leaves it across restart. Only authoritative readback of the same subscription/definition with a newer ACK
+version and ACK positions covering both saved through-positions clears it without resending. Unchanged, incomplete,
+masked, changed-definition or different-subscription readback remains `ack_outcome_unresolved`; no new receipt is ACKed.
+A definite API refusal clears that attempt's intent because it proves non-application. Never delete the intent merely
+to retry: if positive readback cannot reconcile it, stop for an operator's definitive receipt/transaction investigation.
+
+The historical test `test_an_event_for_an_item_nobody_returns_is_acked_after_three_cycles` retains its Tiden identity;
+its assertion now requires no ACK after three cycles under this owner authority. Existing crash/retry test identities
+also remain; an unknown transport-entry crash holds, while a committed ACK is reconciled from positions without retry.
+
+### Initial scope before normal activation
+
+Keep the unit, fallback automation and dispatcher OFF until the root's fresh activation decision. This correction does
+not authorize the default 14-day metadata export/backfill and does not move its cursor. The completed bounded live
+fixture must not be submitted, created or ACKed again.
+
+The smallest initial pass uses only the stored existing subscription and its intended event IDs, targeted durable BB
+task reconciliation, and a metadata cursor bounded immediately before the intended submission/change. Require every
+returned metadata row and event to belong to that intended set; stop on another row, incomplete page or ambiguous
+range. Apply only those intended rows and ACK only after their actual BB task evidence passes the normal ACK code.
+An old/closed/orphaned event is held, never silently dropped or ACKed to advance the page.
+
+The current metadata tool has cursor/limit, no ID filter. If an existing receipt cannot be isolated this way, leave the
+boundary stopped: either DevOps supplies an exact whitelisted metadata packet for the explicitly intended IDs, or a
+separate scoped change adds ID filtering to that existing metadata read under its existing permission. Neither option
+needs a new service, credential or broader subscription. The normal broad forward/backfill path is not an initial-scope
+substitute; any event-scoped follow-up needs its own explicit root scope before activation.
+
 ## Install (nothing in the merge does this)
 
 Prerequisites from DevOps: the maintainer key file (0600) and the gateway URL. Run from a clean checkout of `main`.
