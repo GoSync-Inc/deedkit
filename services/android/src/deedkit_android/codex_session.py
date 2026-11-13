@@ -813,6 +813,7 @@ class PersistentRun(BareRun):
         super().__init__(*args)
         self.session = None
         self.timing = agent_diagnostics.NativeTiming()
+        self.context_usage = agent_diagnostics.NativeContext()
         self.native_previous_turn = self.native_admitted_turn = self.native_completed_turn = self.native_boundary = None
         self.input_text, self.input_started, self.input_admit, self.input_refused = None, None, None, None
 
@@ -899,6 +900,7 @@ class PersistentRun(BareRun):
             if not isinstance(turn_id, str) or not turn_id:
                 raise OSError('native_turn_receipt_invalid')
             self.native_admitted_turn = turn_id
+            self.context_usage.bind(session.thread_id, turn_id)
             if self.input_started:
                 self.input_started(turn_id)
 
@@ -960,6 +962,7 @@ class PersistentRun(BareRun):
             await self.event('order_notice', status='unavailable', error=str(error))
 
     async def consume(self, event):
+        self.context_usage.observe(event)
         method, params = event.get('method'), event.get('params') or {}
         item = params.get('item') or {}
         if method == 'turn/started':
@@ -1005,9 +1008,10 @@ class PersistentRun(BareRun):
                 self.notes += 1
                 await self.event('note', text=text[:300])
         elif method == 'thread/tokenUsage/updated':
-            usage = (params.get('tokenUsage') or {}).get('last') or {}
+            usage = (self.context_usage.usage or {}).get('last', {})
             self.stream.final = {target: usage[source] for source, target in (
                 ('inputTokens', 'input_tokens'), ('cachedInputTokens', 'cached_input_tokens'),
+                ('cacheWriteInputTokens', 'cache_write_input_tokens'),
                 ('outputTokens', 'output_tokens')) if type(usage.get(source)) is int}
         elif method == 'turn/completed':
             await self.event('turn', phase='completed', native_thread_id=params['threadId'],
@@ -1022,6 +1026,7 @@ class PersistentRun(BareRun):
         self.timing.finish('native_disconnected' if self.session and self.session.disconnected else 'adapter_failure')
         result = await super().final(state, extra)
         result['native_timing'] = self.timing.receipt()
+        result['native_context'] = self.context_usage.receipt()
         result['timings']['model_ms'] = None  # native/command wall-time subtraction cannot measure model work
         result['native_selection'] = dict(self.session.selection) if self.session else {}
         result['skills_updated'] = []
