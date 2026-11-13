@@ -99,7 +99,8 @@ class OrderEvents:
 
     def _authorize(self, principal, row):
         try:
-            allowed = self.authorize(principal, row['owner'], row['device_id'], row['order_id'],
+            provider = row.get('provider_order_id') if row.get('task_id') is not None else row['order_id']
+            allowed = self.authorize(principal, row['owner'], row['device_id'], provider,
                                      row['source_id'], row['auth_epoch']) is True
         except Exception:
             allowed = False
@@ -149,7 +150,7 @@ class OrderEvents:
             AND kind='observation' AND state IN ('pending','sending','unknown','accepted')''',
             (row['owner'], row['order_id'])).fetchone()
         if active:
-            if active['state'] == 'pending':
+            if active['state'] == 'pending' and active['payload'] is None:
                 self.db.execute('UPDATE android_order_wakes SET through=? WHERE wake_id=?',
                                 (row['seen'], active['wake_id']))
             return active['wake_id']
@@ -187,7 +188,11 @@ class OrderEvents:
                 if not rows:
                     raise OrderRefused('order_not_bound')
             else:
-                rows = [self._order(observation.owner, observation.order_id)]
+                task_columns = {r[1] for r in self.db.execute('PRAGMA table_info(android_order_obligations)')}
+                matched = self.db.execute('''SELECT * FROM android_order_obligations WHERE owner=?
+                    AND device_id=? AND package=? AND provider_order_id=? AND task_id IS NOT NULL''',
+                    (observation.owner, observation.device_id, observation.package, observation.order_id)).fetchall() if 'task_id' in task_columns else []
+                rows = [dict(r) for r in matched] or [self._order(observation.owner, observation.order_id)]
             recorded = False
             for row in rows:
                 self._authorize(principal, row)
@@ -260,7 +265,7 @@ class OrderEvents:
                                (row['device_id'],)).fetchone():
                 return False
             # Freeze exactly the admitted snapshot before any await/downstream write.
-            payload = self._payload(wake, row)
+            payload = json.loads(wake['payload']) if wake['payload'] else self._payload(wake, row)
             self.db.execute("UPDATE android_order_wakes SET state='sending',hold_reason=NULL,payload=? WHERE wake_id=?",
                             (document(payload), wake_id))
             return True
@@ -268,7 +273,8 @@ class OrderEvents:
     def _payload(self, wake, row):
         if wake['kind'] != 'observation':
             return json.loads(wake['payload'])
-        return {'wake_id': wake['wake_id'], 'order_id': row['order_id'], 'source': row['source_id'],
+        provider = row.get('provider_order_id') if row.get('task_id') is not None else row['order_id']
+        return {'wake_id': wake['wake_id'], 'order_id': provider, 'source': row['source_id'],
                 'package': row['package'], 'through': wake['through'], 'observations_untrusted': True,
                 'next_check_at': row['next_check_at'], 'state': json.loads(row['state_json']),
                 'observations': self.observations(wake['principal'], row['owner'], row['order_id'])[-100:]}
@@ -291,7 +297,7 @@ class OrderEvents:
             if receipt.get(field) != wake[field]:
                 raise OrderRefused('receipt_identity_mismatch')
         payload = json.loads(wake['payload']) if wake['payload'] else {}
-        for field in ('native_request_id', 'item_id'):
+        for field in ('native_request_id', 'item_id', 'message_id', 'native_call_id', 'native_namespace', 'question_ids'):
             if field in payload and (type(receipt.get(field)) is not type(payload[field])
                                      or receipt.get(field) != payload[field]):
                 raise OrderRefused('receipt_identity_mismatch')
@@ -313,7 +319,7 @@ class OrderEvents:
         with self.tx():
             wake = self.wake(wake_id)
             self._authorize(principal, self._order(wake['owner'], wake['order_id']))
-            if principal != wake['principal']:
+            if getattr(principal, 'id', principal) != wake['principal']:
                 raise OrderRefused('receipt_not_owned')
             if wake['state'] != 'unknown' or receipt.get('status') != 'accepted':
                 raise OrderRefused('receipt_not_confirmation')
@@ -331,6 +337,10 @@ class OrderEvents:
                             "WHERE state='sending'")
 
     def checked(self, principal, wake_id, *, next_check_at, state, lifecycle='active'):
+        with self.tx():
+            return self._checked(principal, wake_id, next_check_at=next_check_at, state=state, lifecycle=lifecycle)
+
+    def _checked(self, principal, wake_id, *, next_check_at, state, lifecycle='active'):
         if lifecycle not in ('active', 'received', 'cancelled'):
             raise OrderRefused('invalid_lifecycle')
         if lifecycle == 'active':
@@ -340,64 +350,81 @@ class OrderEvents:
         elif next_check_at is not None:
             raise OrderRefused('closed_order_has_timer')
         state_json = document(state)
-        with self.tx():
-            wake = self.wake(wake_id)
-            row = self._order(wake['owner'], wake['order_id'])
-            self._authorize(principal, row)
-            expected = row['recipient'] if row['responsible'] == 'grok' else row['owner']
-            if principal != expected or wake['state'] != 'accepted' or wake['kind'] != 'observation':
-                raise OrderRefused('check_not_owned')
-            self.db.execute("UPDATE android_order_wakes SET state='done' WHERE wake_id=?", (wake_id,))
-            self.db.execute('''UPDATE android_order_obligations SET handled=?,state_json=?,next_check_at=?,
-                lifecycle=?,revision=revision+1 WHERE owner=? AND order_id=?''',
-                (wake['through'], state_json, next_check_at, lifecycle, row['owner'], row['order_id']))
-            if lifecycle != 'active':
-                self.db.execute("UPDATE android_order_wakes SET state='cancelled' WHERE owner=? AND order_id=? "
-                                "AND state='pending'", (row['owner'], row['order_id']))
-            elif row['seen'] > wake['through']:
-                self._stage(self._order(row['owner'], row['order_id']))
+        wake = self.wake(wake_id)
+        row = self._order(wake['owner'], wake['order_id'])
+        self._authorize(principal, row)
+        expected = row['recipient'] if row['responsible'] == 'grok' else row['owner']
+        if getattr(principal, 'id', principal) != expected or wake['state'] != 'accepted' or wake['kind'] != 'observation':
+            raise OrderRefused('check_not_owned')
+        self.db.execute("UPDATE android_order_wakes SET state='done' WHERE wake_id=?", (wake_id,))
+        self.db.execute('''UPDATE android_order_obligations SET handled=?,state_json=?,next_check_at=?,
+            lifecycle=?,revision=revision+1 WHERE owner=? AND order_id=?''',
+            (wake['through'], state_json, next_check_at, lifecycle, row['owner'], row['order_id']))
+        if lifecycle != 'active':
+            self.db.execute("UPDATE android_order_wakes SET state='cancelled' WHERE owner=? AND order_id=? "
+                            "AND state='pending'", (row['owner'], row['order_id']))
+        elif row['seen'] > wake['through']:
+            self._stage(self._order(row['owner'], row['order_id']))
 
     def _snapshot(self, row):
-        return {key: row[key] for key in ('owner', 'order_id', 'device_id', 'source_id', 'package',
+        snapshot = {key: row[key] for key in ('owner', 'order_id', 'device_id', 'source_id', 'package',
                 'original_request_id', 'native_thread_id', 'native_turn_id', 'question_id', 'original_user_words',
                 'next_check_at', 'state_json', 'revision', 'seen', 'handled')}
+        if row.get('task_id') is not None:
+            snapshot.update(obligation_ref=row['order_id'], order_id=row['provider_order_id'],
+                            task_id=row['task_id'], origin=json.loads(row['origin_json']))
+            snapshot['questions'] = [dict(wake_id=q['wake_id'], delivery_state=q['state'],
+                native_status='not_observed', payload=json.loads(q['payload'])) for q in self.db.execute('''
+                SELECT wake_id,state,payload FROM android_order_wakes WHERE owner=? AND order_id=?
+                AND kind='question' AND state NOT IN ('done','cancelled','refused') ORDER BY rowid''',
+                (row['owner'], row['order_id']))]
+        return snapshot
 
     def propose_handoff(self, principal, owner, order_id, *, target_principal):
+        with self.tx():
+            return self._propose_handoff(principal, owner, order_id, target_principal=target_principal)
+
+    def _propose_handoff(self, principal, owner, order_id, *, target_principal):
         if not isinstance(target_principal, str) or not 1 <= len(target_principal) <= 128:
             raise OrderRefused('invalid_recipient')
-        with self.tx():
-            row = self._order(owner, order_id)
-            self._authorize(principal, row)
-            if principal != owner or row['responsible'] != 'codex' or row['lifecycle'] != 'active':
-                raise OrderRefused('handoff_not_owned')
-            if self.db.execute("SELECT 1 FROM android_order_wakes WHERE owner=? AND order_id=? "
-                               "AND state IN ('sending','unknown','accepted')", (owner, order_id)).fetchone():
-                raise OrderRefused('order_delivery_unsettled')
-            snapshot = self._snapshot(row)
-            payload = {'snapshot': snapshot, 'snapshot_digest': hashlib.sha256(document(snapshot).encode()).hexdigest(),
-                       'responsibility_proposal': True, 'source': 'codex'}
-            ident = str(uuid.uuid4())
-            try:
-                self.db.execute('''INSERT INTO android_order_wakes
-                    (wake_id,owner,order_id,device_id,kind,target,principal,through,revision,payload,
-                     original_request_id,native_thread_id,native_turn_id,question_id)
-                    VALUES(?,?,?,?,'handoff','grok',?,?,?,?,?,?,?,?)''',
-                    (ident, owner, order_id, row['device_id'], target_principal, row['seen'], row['revision'],
-                     document(payload), row['original_request_id'], row['native_thread_id'], row['native_turn_id'],
-                     row['question_id']))
-            except sqlite3.IntegrityError:
-                raise OrderRefused('handoff_already_pending') from None
-            return ident
+        row = self._order(owner, order_id)
+        self._authorize(principal, row)
+        if getattr(principal, 'id', principal) != owner or row['responsible'] != 'codex' or row['lifecycle'] != 'active':
+            raise OrderRefused('handoff_not_owned')
+        unsettled = "state IN ('sending','unknown','accepted')"
+        if row.get('task_id') is not None:
+            # An explicit transfer includes delivered caller questions in its immutable snapshot.
+            # Grok read is not native acceptance; uncertain sends and native work still block transfer.
+            unsettled = "(state IN ('sending','unknown') OR state='accepted' AND (target='codex' OR kind='handoff'))"
+        if self.db.execute("SELECT 1 FROM android_order_wakes WHERE owner=? AND order_id=? AND " + unsettled,
+                           (owner, order_id)).fetchone():
+            raise OrderRefused('order_delivery_unsettled')
+        snapshot = self._snapshot(row)
+        payload = {'snapshot': snapshot, 'snapshot_digest': hashlib.sha256(document(snapshot).encode()).hexdigest(),
+                   'responsibility_proposal': True, 'source': 'codex'}
+        ident = str(uuid.uuid4())
+        try:
+            self.db.execute('''INSERT INTO android_order_wakes
+                (wake_id,owner,order_id,device_id,kind,target,principal,through,revision,payload,
+                 original_request_id,native_thread_id,native_turn_id,question_id)
+                VALUES(?,?,?,?,'handoff','grok',?,?,?,?,?,?,?,?)''',
+                (ident, owner, order_id, row['device_id'], target_principal, row['seen'], row['revision'],
+                 document(payload), row['original_request_id'], row['native_thread_id'], row['native_turn_id'],
+                 row['question_id']))
+        except sqlite3.IntegrityError:
+            raise OrderRefused('handoff_already_pending') from None
+        return ident
 
     def ack_handoff(self, principal, wake_id, *, snapshot_digest):
         with self.tx():
             wake = self.wake(wake_id)
             row = self._order(wake['owner'], wake['order_id'])
             self._authorize(principal, row)
-            if principal != wake['principal'] or wake['kind'] != 'handoff':
+            identity = getattr(principal, 'id', principal)
+            if identity != wake['principal'] or wake['kind'] != 'handoff':
                 raise OrderRefused('handoff_not_delivered')
             payload = json.loads(wake['payload'])
-            if (wake['state'] == 'done' and row['responsible'] == 'grok' and row['recipient'] == principal
+            if (wake['state'] == 'done' and row['responsible'] == 'grok' and row['recipient'] == identity
                     and snapshot_digest == payload['snapshot_digest']):
                 return {'responsible': 'grok', 'acknowledged': True}
             if wake['state'] != 'accepted':
@@ -408,23 +435,26 @@ class OrderEvents:
                                "AND state IN ('sending','unknown','accepted')", (row['owner'], row['order_id'])).fetchone():
                 raise OrderRefused('order_delivery_unsettled')
             self.db.execute("UPDATE android_order_obligations SET responsible='grok',recipient=? "
-                            "WHERE owner=? AND order_id=?", (principal, row['owner'], row['order_id']))
+                            "WHERE owner=? AND order_id=?", (identity, row['owner'], row['order_id']))
             self.db.execute("UPDATE android_order_wakes SET state='done' WHERE wake_id=?", (wake_id,))
             self.db.execute("UPDATE android_order_wakes SET target='grok',principal=? "
                             "WHERE owner=? AND order_id=? AND state='pending' AND kind='observation'",
-                            (principal, row['owner'], row['order_id']))
+                            (identity, row['owner'], row['order_id']))
             return {'responsible': 'grok', 'acknowledged': True}
 
     def withdraw_handoff(self, principal, wake_id):
         """Supersede a known unswitched proposal. An unknown send still requires reconciliation."""
         with self.tx():
-            wake = self.wake(wake_id)
-            row = self._order(wake['owner'], wake['order_id'])
-            self._authorize(principal, row)
-            if (principal != row['owner'] or row['responsible'] != 'codex' or wake['kind'] != 'handoff'
-                    or wake['state'] not in ('pending', 'accepted', 'refused')):
-                raise OrderRefused('handoff_not_withdrawable')
-            self.db.execute("UPDATE android_order_wakes SET state='cancelled' WHERE wake_id=?", (wake_id,))
+            return self._withdraw_handoff(principal, wake_id)
+
+    def _withdraw_handoff(self, principal, wake_id):
+        wake = self.wake(wake_id)
+        row = self._order(wake['owner'], wake['order_id'])
+        self._authorize(principal, row)
+        if (getattr(principal, 'id', principal) != row['owner'] or row['responsible'] != 'codex' or wake['kind'] != 'handoff'
+                or wake['state'] not in ('pending', 'accepted', 'refused')):
+            raise OrderRefused('handoff_not_withdrawable')
+        self.db.execute("UPDATE android_order_wakes SET state='cancelled' WHERE wake_id=?", (wake_id,))
 
     def notify(self, principal, owner, order_id, *, notice_id, kind, native_turn_id,
                question_id=None, native_request_id=None, item_id=None, payload):
