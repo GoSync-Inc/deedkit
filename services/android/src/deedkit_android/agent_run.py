@@ -44,7 +44,7 @@ STATES = ('running', 'succeeded', 'stopped_by_guard', 'timed_out', 'action_cap',
 NAME = r'^[A-Z][A-Z0-9_]{0,63}$'
 POINT = re.compile(r'\s*\d+(?:\.\d+)?%?\s*,\s*\d+(?:\.\d+)?%?\s*')
 START_ONLY = ('device_id', 'session_id', 'goal', 'owner_instruction', 'apps', 'params', 'secrets', 'outputs',
-              'max_minutes', 'max_actions', 'engine', 'model', 'effort', 'save_as', 'param_names')
+              'max_minutes', 'max_actions', 'engine', 'model', 'effort', 'service_tier', 'save_as', 'param_names')
 DIALOGUE_FIELDS = {'native_thread_id', 'native_turn_id', 'native_request_id', 'item_id', 'answers', 'message_id', 'text'}
 
 
@@ -79,6 +79,7 @@ class AgentCall(Strict):
     engine: Literal['claude', 'codex'] | None = None
     model: str | None = Field(default=None, pattern=r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
     effort: Literal['minimal', 'low', 'medium', 'high'] | None = None
+    service_tier: str | None = Field(default=None, pattern=r'^[a-z][a-z0-9_-]{0,31}$')
     save_as: str | None = Field(default=None, pattern=r'^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$')
     param_names: list[str] = Field(default_factory=list, max_length=20)
     after: int = Field(default=0, ge=0)
@@ -121,6 +122,8 @@ class AgentCall(Strict):
     def identity(self):
         """The canonical fields of a start: the same request_id with these returns its run, others conflict."""
         body = self.model_dump(exclude={'action', 'request_id', 'session_id', 'after', 'wait_s'} | DIALOGUE_FIELDS)
+        if self.service_tier is None:
+            body.pop('service_tier')  # preserve every legacy start fingerprint
         body.update(apps=sorted(set(body['apps'] or ())), secrets=sorted(self.secrets), outputs=sorted(self.outputs),
                     params={name: str(value) for name, value in self.params.items()})
         return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
@@ -203,6 +206,7 @@ class AgentRun:
         self.saver, self.resolved, self.read_value, self.pending = Saver(self) if request.save_as else None, None, None, None
         self.busy, self.cond, self.seq = asyncio.Lock(), asyncio.Condition(), 0
         self.concluded, self.tasks = asyncio.Event(), []
+        self.authorize = None
         self.started, self.started_at, self.engine_started, self.engine_ms, self.device_ms = time.monotonic(), time.time(), None, 0.0, 0.0
 
     # events and the progress cursor
@@ -707,6 +711,12 @@ class Agents:
                             'reason': 'agent_disabled'} for name in ('claude', 'codex')}
         if not config.agent.guarded:
             found['claude'] = {**found['claude'], 'available': False, 'reason': 'bare_mode_codex_only'}
+        persistent = config.agent.persistent and not config.agent.guarded
+        codex = config.engines.get('codex')
+        if persistent and codex and codex.version != '0.166.0':
+            found['codex'] = {**found['codex'], 'available': False, 'reason': 'native_version_unsupported'}
+        if persistent and codex and config.agent.enabled:
+            found['codex']['model'] = codex.model or 'gpt-6.1-sol'
         default = (config.default_engine or 'claude') if config.agent.guarded else 'codex'
         try:
             version = preamble()[0] if config.agent.guarded else None
@@ -722,7 +732,11 @@ class Agents:
                              'question_routes_require': ['pinned_0.166.0', 'native_effective_never'],
                              'async_reply': 'active_steer_or_same_conversation_next_turn',
                              'model_question_tool': 'catalog_dependent_unverified'},
-                'default_model': config.engines.get('codex').model or 'gpt-6.1-terra' if config.engines.get('codex') else 'gpt-6.1-terra',
+                'default_model': (codex.model if codex else None) or ('gpt-6.1-sol' if persistent else 'gpt-6.1-terra'),
+                'default_service_tier': (codex.service_tier if codex else None) or 'ultrafast' if persistent else None,
+                'native_selection': {'available': bool(persistent and found['codex']['available']),
+                                     'catalog': 'checked_before_goal', 'configuration_receipt': 'thread/resume',
+                                     'provider_tier_observed': False, 'unsupported': 'refused_without_fallback'},
                 'default_effort': config.engines['codex'].reasoning_effort if 'codex' in config.engines else 'medium',
                 'default_engine': default, 'engines': found, 'tools': list(MODELS) if config.agent.guarded else ['codex'], 'preamble_version': version, 'input_schema': AgentCall.model_json_schema(),
                 'limits': {'max_minutes': 15, 'max_actions': 300, 'max_images': 3, 'wait_s': 25, 'apps': 5}}
@@ -732,7 +746,7 @@ class Agents:
         request_id = identifier(call.request_id)
         call = call.model_copy(update={'request_id': request_id})
         if call.action == 'start':
-            return await self.start(owner, call)
+            return await self.start(owner, call, authorize)
         row = self.db.row(owner, request_id)
         if row is None:
             raise Refused('not_found', 404)
@@ -802,9 +816,14 @@ class Agents:
                     from .codex_session import PersistentRun
                     saved = {k: v for k, v in json.loads(row['request']).items() if k not in DIALOGUE_FIELDS}
                     original = AgentCall.model_validate({**saved, 'session_id': call.session_id})
+                    selected = json.loads(row['result'] or '{}').get('native_selection', {}).get('requested')
+                    if not selected or not all(selected.get(k) for k in ('model', 'effort', 'service_tier')):
+                        raise Refused('native_continuation_selection_unconfirmed')
+                    engine = session.config.model_copy(update={'model': selected['model'],
+                        'reasoning_effort': selected['effort'], 'service_tier': selected['service_tier']})
                     directory = Path(tempfile.mkdtemp(prefix='run-', dir=self.root))
                     directory.chmod(0o700)
-                    run = PersistentRun(self, owner, original, 'codex', session.config, directory,
+                    run = PersistentRun(self, owner, original, 'codex', engine, directory,
                                         SecretRun(self.devices.secrets), (None, ''))
                     run.input_text, run.input_started = text, started
                     run.input_refused = refused
@@ -834,7 +853,7 @@ class Agents:
             receipt = await session.steer(**args, message_id=call.message_id, text=call.text)
         return {**self.view(owner, call.request_id, 0), 'input_receipt': receipt}
 
-    async def start(self, owner, call):
+    async def start(self, owner, call, authorize=None):
         self.db.purge(time.time() - RETENTION_S)
         identity = call.identity()
         existing = self.db.row(owner, call.request_id)
@@ -849,9 +868,13 @@ class Agents:
         if not config.agent.enabled:
             raise Refused('agent_disabled')
         bare = not config.agent.guarded
+        if not bare and call.service_tier is not None:
+            raise Refused('service_tier_requires_persistent_bare', 422)
         from .agent_bare import BareRun, admission
         selected = admission(call, config) if bare else None
         name = 'codex' if bare else call.engine or config.default_engine or 'claude'
+        if not bare and config.engines.get(name) and config.engines[name].service_tier is not None:
+            raise Refused('service_tier_requires_persistent_bare', 422)
         if not bare and not call.apps:
             raise Refused('apps_required', 422)
         offered = await asyncio.to_thread(engines.status, self.store.directory, name, config.engines.get(name), not bare)
@@ -904,6 +927,7 @@ class Agents:
                 from .codex_session import PersistentRun
                 run_type = PersistentRun
             run = run_type(self, owner, call, name, selected, run_dir, secrets_run, texts)
+            run.authorize = authorize
             request = {**{key: value for key, value in call.model_dump(exclude={'session_id', 'after', 'wait_s'}).items()},
                        'engine': name}
             self.db.insert(owner, call.request_id, identity, call.device_id, name, model, request)
@@ -941,6 +965,7 @@ class Agents:
         dialogue = self.native_session(owner, row['device'])
         view['dialogue'] = dialogue.receipts(request_id)
         if row['state'] == 'running' and dialogue.request_id == request_id and dialogue.process is not None:
+            view['native_selection'] = dict(dialogue.selection)
             view['native_session'] = {'thread_id': dialogue.thread_id, 'turn_id': dialogue.turn_id,
                                       'pid': dialogue.process.pid, 'persistent': True}
         return view

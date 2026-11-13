@@ -47,6 +47,7 @@ class EngineConfig(Strict):
     version: str = Field(min_length=1, max_length=64)
     model: str | None = Field(default=None, min_length=1, max_length=128)
     reasoning_effort: Literal['minimal', 'low', 'medium', 'high'] = 'medium'
+    service_tier: str | None = Field(default=None, pattern=r'^[a-z][a-z0-9_-]{0,31}$')
     token_file: str | None = None
     codex_home: str | None = None
 
