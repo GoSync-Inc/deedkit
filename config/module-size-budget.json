@@ -5,7 +5,7 @@
     "scripts/autoloop.py": {"lines": 2484, "longest_function": 96},
     "scripts/calendar_rotate.py": {"lines": 1167, "longest_function": 52},
     "scripts/deedkit_admin.py": {"lines": 2282, "longest_function": 105},
-    "scripts/feedback_bridge.py": {"lines": 1020, "longest_function": 39},
+    "scripts/feedback_bridge.py": {"lines": 1140, "longest_function": 41},
     "scripts/feedback_sync.py": {"lines": 975, "longest_function": 99},
     "scripts/production.py": {"lines": 5752, "longest_function": 126},
     "scripts/release_enroll.py": {"lines": 1432, "longest_function": 146},

@@ -16,6 +16,7 @@ from messaging_service.subscriptions import match_subscriptions
 import scripts.feedback_bridge as fb
 from test_event_delivery import identity
 from test_feedback_bridge import KEY, SUB, FakeGateway, FakeTasks, fid, projection as fake_projection, row as fake_row
+from test_feedback_bridge import isolate_dispatch_wake  # noqa: F401  (autouse fixture: no host dispatcher from fake tasks)
 from test_feedback_events import submit
 from test_feedback_maintainer_subscription import key, modules  # noqa: F401  (the fixture empties the feedback tables)
 from test_feedback_export_metadata import projection as server_projection, record
@@ -96,17 +97,20 @@ def test_a_lost_subscription_answer_is_adopted_through_the_real_listing_and_not_
 def test_a_forward_cycle_on_the_real_server_makes_the_tasks_shows_the_release_and_acks_the_page(tmp_path, server):
     store, token = server
     bridge, tasks = make(tmp_path, server)
-    sid = bridge.ensure_subscription()
     agent = identity(store)
+    history = submit(store, agent, 99)  # before the stream starts: metadata reads it, the task handler must ignore it
+    sid = bridge.ensure_subscription()
     one, two = submit(store, agent, 1), submit(store, agent, 2)
     record(store, server_projection(two, primary_spec='ANYM-12'))
     store.set_feedback_status([one], 'fixed', spec_ref='ANYM-988', fixed_in=MERGED)
     match_subscriptions(store)
-    assert bridge.forward() == {'created': 2, 'updated': 1}  # the fixed item's task moves from backlog to in_review
+    assert bridge.forward() == {'created': 2, 'updated': 1, 'metadata_complete': True, 'missing': 0, 'held': 0}
+    assert bridge.ledger.link(history) is None and bridge.ledger.meta('export_cursor') is None
     assert 'Fixed in: ' + MERGED + '\n' in task_for(tasks, one)['description']
     assert 'A synthetic problem in plain words.' in task_for(tasks, two)['description']
     assert store.fetch_subscription_events(token, sid)['module']['items'] == []  # the real server took the ACK
-    assert bridge.forward() == {'created': 0, 'updated': 0} and len(tasks.tasks) == 2
+    assert bridge.forward() == {'created': 0, 'updated': 0, 'metadata_complete': True, 'missing': 0, 'held': 0}
+    assert len(tasks.tasks) == 2 and bridge.ledger.meta('export_cursor') is None
 
 
 # spec: ANYM-990

@@ -5,6 +5,7 @@
     feedback_bridge.py run        one forward + reverse cycle (the 10-minute bb script automation; exit 75 when busy)
     feedback_bridge.py reverse    one reverse pass (task changes to the feedback status)
     feedback_bridge.py check      read-only: env, file modes, tracker, labels
+    feedback_bridge.py inspect    read-only initial scope/completeness/held counts; no task, ACK or cursor writes
 
 Reads feedback metadata through the DeedKit gateway with a maintainer key (messages_export_feedback_metadata, the
 maintainer subscription of ANYM-989) and writes tasks through the local `bb tasks` CLI. No raw feedback text is ever
@@ -335,8 +336,16 @@ class Ledger:
 
     COLUMNS = ('fb_status', 'fb_changed_at', 'fp', 'title', 'desc_sha', 'bridge_version', 'seen_version', 'primary_spec')
 
-    def __init__(self, state_dir):
+    def __init__(self, state_dir, read_only=False):
         state_dir = Path(state_dir)
+        if read_only:
+            try:
+                self.db = sqlite3.connect((state_dir / 'ledger.sqlite3').resolve().as_uri() + '?mode=ro', uri=True)
+            except sqlite3.Error:
+                raise ConfigError('ledger_unavailable') from None
+            self.db.row_factory = sqlite3.Row
+            self.db.execute('PRAGMA query_only=ON')
+            return
         state_dir.mkdir(parents=True, exist_ok=True)
         state_dir.chmod(0o700)
         self.db = sqlite3.connect(state_dir / 'ledger.sqlite3', timeout=30, isolation_level=None)
@@ -357,6 +366,8 @@ class Ledger:
             self.db.execute(statement)
         if 'primary_spec' not in {row['name'] for row in self.db.execute('PRAGMA table_info(links)')}:
             self.db.execute('ALTER TABLE links ADD COLUMN primary_spec TEXT')  # a ledger of an earlier version (ANYM-992)
+        if 'body' not in {row['name'] for row in self.db.execute('PRAGMA table_info(pending_write)')}:
+            self.db.execute('ALTER TABLE pending_write ADD COLUMN body TEXT')  # old unknown intents remain held, never guessed
         for suffix in ('', '-wal', '-shm'):
             (state_dir / ('ledger.sqlite3' + suffix)).exists() and (state_dir / ('ledger.sqlite3' + suffix)).chmod(0o600)
 
@@ -428,8 +439,13 @@ class Ledger:
         row = self.one('SELECT attempts FROM unresolved WHERE fid=?', fid)
         return 0 if row is None else row['attempts']
 
-    def put_pending_write(self, rid, fid, version, status):
-        self.db.execute('INSERT OR IGNORE INTO pending_write(rid,fid,version,status) VALUES(?,?,?,?)', (rid, fid, version, status))
+    def put_pending_write(self, rid, fid, version, status, body=None):
+        self.db.execute('INSERT OR IGNORE INTO pending_write(rid,fid,version,status,body) VALUES(?,?,?,?,?)',
+            (rid, fid, version, status, None if body is None else json.dumps(body, sort_keys=True, separators=(',', ':'))))
+
+    def pending_writes(self, fid=None):
+        return [dict(r) for r in self.db.execute('SELECT * FROM pending_write' + (' WHERE fid=?' if fid else ''),
+            (fid,) if fid else ())]
 
     def drop_pending_write(self, rid):
         self.db.execute('DELETE FROM pending_write WHERE rid=?', (rid,))
@@ -441,6 +457,36 @@ def sha(text):
 
 def request_id(feedback_id, task_id, version):
     return sha('\0'.join((feedback_id, task_id, str(version))))[:32]
+
+
+def triage_matches(args, item):
+    """Intended state observed, not proof which request committed: exact disposition and a strictly later version."""
+    if (not isinstance(item, dict) or item.get('feedback_id') != args['feedback_id'] or item.get('status') != args['status']
+            or any(item.get(k) != args[k] for k in ('spec_ref', 'duplicate_of') if k in args)):
+        return False
+    try:
+        changed = datetime.fromisoformat(item['status_changed_at'].replace('Z', '+00:00'))
+        baselines = [datetime.fromisoformat(v.replace('Z', '+00:00'))
+            for v in (args['expected_changed_at'], item.get('created_at')) if v is not None]
+        return changed.tzinfo is not None and all(before.tzinfo is not None and changed > before for before in baselines)
+    except (KeyError, AttributeError, TypeError, ValueError):
+        return False
+
+
+def pending_request(row):
+    try:
+        args = json.loads(row.get('body') or 'null')
+        required = {'feedback_id', 'status', 'request_id', 'expected_status', 'expected_changed_at'}
+        valid = (isinstance(args, dict) and required <= set(args) <= required | {'spec_ref', 'duplicate_of'}
+            and args['feedback_id'] == row['fid'] and args['request_id'] == row['rid'] and args['status'] == row['status']
+            and args['status'] in ('accepted', 'declined', 'duplicate') and args['expected_status'] in FORWARD
+            and (args['status'] != 'accepted' or isinstance(args.get('spec_ref'), str) and SPEC.fullmatch(args['spec_ref']))
+            and ('duplicate_of' not in args or isinstance(args['duplicate_of'], str) and re.fullmatch(UUID, args['duplicate_of'])))
+    except (ValueError, TypeError):
+        valid = False
+    if not valid:
+        raise Uncertain('triage_intent_unavailable')
+    return args
 
 
 def first_line_id(description):
@@ -597,9 +643,9 @@ def reverse_status(task_status, labels, feedback_status, description):
 
 
 class Bridge:
-    def __init__(self, cfg, gateway, tasks, now=time.time, rand=random.random):
+    def __init__(self, cfg, gateway, tasks, now=time.time, rand=random.random, read_only=False):
         self.cfg, self.gateway, self.tasks, self.now, self.rand = cfg, gateway, tasks, now, rand
-        self.ledger, self.labels = Ledger(cfg.state_dir), set()
+        self.ledger, self.labels = Ledger(cfg.state_dir, read_only=read_only), set()
         self.dispatch_due = False
 
     @contextmanager
@@ -744,32 +790,74 @@ class Bridge:
 
     def export_items(self, handler, save):
         cursor = self.ledger.meta('export_cursor')
+        head = None
         for _ in range(MAX_EXPORT_PAGES):
             data = self.gateway.call('messages_export_feedback_metadata', {'limit': 100} | ({'cursor': cursor} if cursor else {}))
-            if not isinstance(data.get('items'), list):
-                raise Uncertain('gateway_bad_response')
+            following = data.get('next_cursor')
+            page_head = stamp(data.get('export_head'))
+            if (not isinstance(data.get('items'), list) or type(data.get('has_more')) is not bool
+                    or not isinstance(following, str) or not following or data['has_more'] and following == cursor
+                    or page_head is None or head is not None and head != page_head):
+                raise Incomplete('metadata_listing_incomplete')
+            head = page_head
             for raw in data['items']:
                 handler(raw)
-            following = data.get('next_cursor')
             if save and isinstance(following, str) and following:
                 self.ledger.set_meta('export_cursor', following)
-            if not data.get('has_more') or not isinstance(following, str):
-                return
+            if not data['has_more']:
+                return True
             cursor = following
+        raise Incomplete('metadata_listing_incomplete')
 
-    def forward(self, page=None):
-        sid = self.ensure_subscription()
+    def scope_ids(self, sid, page):
+        module = page.get('module')
+        listed = module.get('items') if isinstance(module, dict) else None
+        positions = ack_positions(sid, page)
+        ids = [event_feedback_id(e) for e in listed] if isinstance(listed, list) and positions else []
+        pending = {fid for fid in ids if fid is not None}
+        linked = {r['fid'] for r in self.ledger.db.execute('SELECT fid FROM links WHERE skipped=0') if self.saved_tasks([r['fid']])}
+        reverse = {r['fid'] for r in self.ledger.pending_writes()}
+        invalid = positions is None or not isinstance(listed, list) or any(fid is None for fid in ids)
+        return pending | reverse, pending | reverse | linked, invalid
+
+    def forward(self, page=None, read_only=False):
+        sid = (self.cfg.subscription_id or self.ledger.meta('subscription_id')) if read_only else self.ensure_subscription()
+        if not sid:
+            raise ConfigError('scope_subscription_missing')
         if page is None:
-            page = self.events('messages_fetch_subscription_events', sid, {'limit': 100, 'detail': 'compact'})
-        self.reconcile_ack(sid, page)
-        stats = {'created': 0, 'updated': 0}
-        listed = (page.get('module') or {}).get('items') or []
+            args = {'limit': 100, 'detail': 'compact'}
+            page = (self.gateway.call('messages_fetch_subscription_events', {'subscription_id': sid} | args) if read_only
+                else self.events('messages_fetch_subscription_events', sid, args))
+        if not read_only:
+            self.reconcile_ack(sid, page)
+        stats = {'created': 0, 'updated': 0, 'metadata_complete': False, 'missing': 0, 'held': 0}
+        module = page.get('module')
+        listed = module.get('items') if isinstance(module, dict) else None
+        required, allowed, invalid = self.scope_ids(sid, page)
+        seen = set()
+        def apply_scoped(raw):
+            item = normalize(raw)
+            if item is None:
+                log('item_malformed')
+            elif item['feedback_id'] in allowed:
+                if not read_only:
+                    self.apply(raw, stats)
+                seen.add(item['feedback_id'])
         try:
-            self.export_items(lambda raw: self.apply(raw, stats), save=True)
-            if listed:
-                self.ack_saved_events(sid, page)
+            stats['metadata_complete'] = self.export_items(apply_scoped, save=False) if allowed else True
+            stats['missing'] = len(required - seen)
+            held = (required - seen) | {fid for fid in required if not self.saved_tasks([fid])}
+            if read_only:
+                held |= {r['fid'] for r in self.ledger.pending_writes()}
+            stats['held'] = len(held) + int(invalid)
+            if read_only and self.ledger.meta('pending_ack'):
+                stats['held'] += 1
+            if stats['held']:
+                log('scope_items_held')
+            elif listed and not read_only and not self.ack_saved_events(sid, page):
+                stats['held'] = len(listed)
         finally:
-            if self.dispatch_due:
+            if self.dispatch_due and not read_only:
                 self.dispatch_due = False
                 wake_dispatcher()  # one wake per page, including a partial export/ACK failure after durable saves
         return stats
@@ -816,16 +904,16 @@ class Bridge:
                 or not 32 <= len(page['receipt']) <= 128
                 or page.get('ack_available') is not True):
             log('ack_page_unconfirmed')
-            return
+            return False
         ids = [event_feedback_id(event) for event in listed]
         seq = [event.get('module_event_id') if isinstance(event, dict) else None for event in listed]
         if (any(fid is None for fid in ids) or len(set(seq)) != len(seq) or seq != sorted(seq)
                 or seq[0] <= intent['module_before'] or seq[-1] != intent['module_through']):
             log('ack_page_unconfirmed')
-            return
+            return False
         if not self.saved_tasks(ids):
             log('ack_tasks_unconfirmed')
-            return
+            return False
         self.ledger.set_meta('pending_ack', json.dumps(intent, separators=(',', ':')))
         try:
             result = self.gateway.call('messages_ack_subscription_events', {'subscription_id': sid,
@@ -839,27 +927,51 @@ class Bridge:
                 or result['module_acked_through'] != intent['module_through']):
             raise Uncertain('ack_result_unconfirmed')
         self.ledger.del_meta('pending_ack')
+        return True
 
     # ---- reverse ----
     def readback(self):
         """The metadata rows from the stored cursor on (nothing saved), by feedback ID: what the server holds now."""
         found = {}
+        allowed = {r['fid'] for r in self.ledger.db.execute('SELECT fid FROM links WHERE skipped=0')}
+        allowed |= {r['fid'] for r in self.ledger.pending_writes()}
 
         def note(raw):
             item = normalize(raw)
-            if item is not None:
+            if item is not None and item['feedback_id'] in allowed:
                 found[item['feedback_id']] = item
         self.export_items(note, save=False)
         return found
 
+    def observed_pending_write(self, row):
+        args = pending_request(row)
+        try:
+            item = self.readback().get(row['fid'])
+        except BridgeError:
+            raise Uncertain('triage_outcome_unresolved') from None  # refusal of a READ says nothing about the prior write
+        if not triage_matches(args, item):
+            raise Uncertain('triage_outcome_unresolved')
+        return item
+
+    def reconcile_write(self, fid):
+        rows = self.ledger.pending_writes(fid)
+        if len(rows) != 1:
+            raise Uncertain('triage_intent_unavailable')
+        row = rows[0]
+        item = self.observed_pending_write(row)
+        with self.ledger.tx():
+            self.ledger.drop_pending_write(row['rid'])
+            self.ledger.update_link(fid, fb_status=item['status'], fb_changed_at=item['status_changed_at'], seen_version=row['version'])
+        return True
+
     def write_status(self, args):
         try:
-            return self.gateway.call('messages_set_feedback_triage', args)
+            result = self.gateway.call('messages_set_feedback_triage', args)
         except Uncertain:
-            item = self.readback().get(args['feedback_id'])
-            if item is not None and item['status'] == args['status']:
-                return {'status_changed_at': item['status_changed_at']}
-            return self.gateway.call('messages_set_feedback_triage', args)
+            result = None
+        if triage_matches(args, result):
+            return result
+        return self.observed_pending_write(self.ledger.one('SELECT * FROM pending_write WHERE rid=?', args['request_id']))
 
     def conflict(self, link, task, wanted_status):
         item = self.readback().get(link['fid'])
@@ -874,6 +986,8 @@ class Bridge:
 
     def reverse_one(self, link, task, version):
         fid, status = link['fid'], link['fb_status']
+        if self.ledger.pending_writes(fid):
+            return self.reconcile_write(fid)  # before a new task version can derive any new request identity
         if task['status'] == 'done' and status != 'verified':
             self.once_comment('done:%s:%s' % (fid, status), link['task_key'], DONE_NOTE % status)
         wants = reverse_status(task['status'], task['labels'], status, task.get('description'))
@@ -895,7 +1009,7 @@ class Bridge:
         args = {'feedback_id': fid, 'status': wanted_status, 'request_id': rid, 'expected_status': status,
             'expected_changed_at': link['fb_changed_at']} | ({'duplicate_of': duplicate_of} if duplicate_of else {}) | (
             {'spec_ref': spec_ref} if spec_ref else {})
-        self.ledger.put_pending_write(rid, fid, version, wanted_status)
+        self.ledger.put_pending_write(rid, fid, version, wanted_status, args)
         try:
             result = self.write_status(args)
         except Refused as error:
@@ -913,8 +1027,9 @@ class Bridge:
         return True
 
     def reverse(self):
-        written = 0
-        for task in self.tasks.list_tasks('feedback'):
+        tasks = self.tasks.list_tasks('feedback')  # a complete task listing before any write/reconciliation
+        written = sum(self.reconcile_write(fid) for fid in sorted({r['fid'] for r in self.ledger.pending_writes()}))
+        for task in tasks:
             link = self.ledger.link_by_task(task['id'])
             version = task.get('updatedAt')
             if link is None or link['skipped'] or version in (link['bridge_version'], link['seen_version']):
@@ -983,7 +1098,7 @@ def check(cfg, tasks):
 
 def main(argv=None, environ=None, gateway=None, tasks=None, now=time.time, sleep=time.sleep, stop=None):
     argv = sys.argv[1:] if argv is None else argv
-    if len(argv) != 1 or argv[0] not in ('watch', 'run', 'reverse', 'check'):
+    if len(argv) != 1 or argv[0] not in ('watch', 'run', 'reverse', 'check', 'inspect'):
         print(__doc__, file=sys.stderr)
         return 64
     try:
@@ -991,7 +1106,12 @@ def main(argv=None, environ=None, gateway=None, tasks=None, now=time.time, sleep
         tasks = tasks or BbTasks(cfg.tracker, state_dir=cfg.state_dir)
         if argv[0] == 'check':
             return check(cfg, tasks)
-        bridge = Bridge(cfg, gateway or Gateway(cfg.gateway_url, cfg.key), tasks, now=now)
+        bridge = Bridge(cfg, gateway or Gateway(cfg.gateway_url, cfg.key), tasks, now=now, read_only=argv[0] == 'inspect')
+        if argv[0] == 'inspect':
+            result = bridge.forward(read_only=True)
+            print('feedback-bridge: scope complete=%s missing=%d held=%d' %
+                ('yes' if result['metadata_complete'] else 'no', result['missing'], result['held']))
+            return 1 if result['held'] else 0
         if argv[0] == 'watch':
             event = threading.Event()
             for name in (signal.SIGTERM, signal.SIGINT):

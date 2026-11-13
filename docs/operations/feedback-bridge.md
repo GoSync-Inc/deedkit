@@ -77,17 +77,43 @@ Keep the unit, fallback automation and dispatcher OFF until the root's fresh act
 not authorize the default 14-day metadata export/backfill and does not move its cursor. The completed bounded live
 fixture must not be submitted, created or ACKed again.
 
-The smallest initial pass uses only the stored existing subscription and its intended event IDs, targeted durable BB
-task reconciliation, and a metadata cursor bounded immediately before the intended submission/change. Require every
-returned metadata row and event to belong to that intended set; stop on another row, incomplete page or ambiguous
-range. Apply only those intended rows and ACK only after their actual BB task evidence passes the normal ACK code.
-An old/closed/orphaned event is held, never silently dropped or ACKed to advance the page.
+The normal forward handler permits task mutations only for validated pending events of the stored dedicated
+subscription, actual existing linked BB tasks, and pending reverse feedback IDs. It can read broader authorised metadata
+pages without creating or updating unrelated historical tasks. It does not store those raw pages in BB or the ledger.
+Every pass uses `save=False`: the existing `export_cursor` stays byte-for-byte unchanged, including absence; no reset or
+silent rewind. Skipped/history/closed ledger rows alone do not enter the linked-task mutation set.
 
-The current metadata tool has cursor/limit, no ID filter. If an existing receipt cannot be isolated this way, leave the
-boundary stopped: either DevOps supplies an exact whitelisted metadata packet for the explicitly intended IDs, or a
-separate scoped change adds ID filtering to that existing metadata read under its existing permission. Neither option
-needs a new service, credential or broader subscription. The normal broad forward/backfill path is not an initial-scope
-substitute; any event-scoped follow-up needs its own explicit root scope before activation.
+Metadata is ordered by `(greatest(created_at, status_changed_at, projection.recorded_at), id)`. Each export has one fixed
+head; its last cursor would start the next export ten minutes behind that head, but this scoped path does not persist it.
+Reads stop at 50 pages of 100, requiring explicit `has_more=false`, a valid continuation, progress and a consistent head.
+Budget exhaustion, malformed continuation or a changed head is `metadata_listing_incomplete`, never permission to ACK.
+Missing required metadata and old/closed in-scope items with no actual BB evidence remain held; unrelated rows are read
+and ignored by the mutation handler. No unresolved event is dropped or ACKed just to advance receipt coverage.
+
+Run the installed `feedback_bridge.py inspect` for a read-only initial reconciliation. It requires the existing stored
+subscription, opens the existing ledger read-only, fetches metadata and actual BB evidence through the normal scope,
+and prints completeness/missing/held counts only. It never creates/adopts a subscription, writes a task/cursor/intent,
+wakes dispatch, sends triage or ACKs. A held result exits 1. Keep runtime OFF until this source's installed proof and the
+root's actual initial-page readiness decision; normal authorised metadata reading needs no additional owner ACK grant.
+
+If a required row lies before the existing cursor or beyond the bounded scan, stop and report the missing/held condition.
+Do not reset the cursor, create historical tasks or weaken ACK evidence. Exact targeted metadata or a separately scoped
+read improvement remains an operator follow-up if the current read cannot complete. No API/catalog change is in this fix.
+
+### Unknown reverse writes
+
+The existing `pending_write` row now also saves the exact original metadata-only request body (including request ID,
+expected server version and requested spec/duplicate), alongside its original BB task version. Existing rows and IDs
+remain; a nullable local SQLite column is added, and an old pending row without its body is held, never reconstructed.
+Before every next cycle, restart or direct reverse call, a pending item blocks any new send or new task-version-derived
+request ID. Timeout, crash, absent/unchanged/partial/mismatching metadata or refusal of a reconciliation read keeps it.
+Only a definite refusal of the actual write clears that attempt as known non-application.
+
+A positive complete read must match exact feedback ID, status, every requested `spec_ref`/`duplicate_of`, and an aware
+changed-at strictly after the saved expected version and the observed creation time. This establishes the intended state
+was observed; metadata has no request ID and does not prove that exact request committed. There is no automatic resend.
+The historical `test_an_uncertain_status_write_that_did_not_apply_is_replayed_with_the_same_request_id` keeps its Tiden
+identity with the conflicting replay assertion replaced by durable hold/no-new-ID under the existing owner authority.
 
 ## Install (nothing in the merge does this)
 
