@@ -61,9 +61,17 @@ def run(store, stop, *, transport=_transport, resolver=None, interval=2, proxy=N
         resolver = resolver or _addresses
     served = {}
     def endpoint_step(first):
+        android_first = False
         def step():
+            nonlocal android_first
+            from .android_wake import dispatch as dispatch_android
+            android_first = not android_first
+            extra = dispatch_android(store, transport=transport, resolver=resolver, served=served) if android_first else {}
             result = dispatch_hints(store, lane='endpoint', limit=1, served=served, transport=transport,
                 resolver=resolver)
+            if not android_first:
+                extra = dispatch_android(store, transport=transport, resolver=resolver, served=served)
+            for key,value in extra.items(): result[key] = result.get(key,0)+value
             if first:
                 # One test per pass, in the lanes' shared key order: a key's tests never run a batch ahead.
                 tests = endpoint_tests(store, transport=transport, resolver=resolver, limit=1, served=served)

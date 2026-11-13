@@ -245,15 +245,20 @@ def _hint_target(c, row):
     return binding if endpoint_stageable(c, binding['endpoint']) else None
 
 
-def endpoint_queue_full(c, row):
+def endpoint_queue_full(c, row, *, adding=1):
     """True when the key holds ENDPOINT_QUEUE_PER_KEY queued endpoint hints of any kind and subscription.
 
     Callers hold the key's subscription-hints lock (budget_slot), so no writer passes the count concurrently.
     """
-    return c.execute('''SELECT count(*)>=%s AS full
+    from .android_wake import tables
+    android=tables(c)
+    added=(" UNION ALL SELECT 1 FROM android_wake_intents WHERE principal=%s AND key_id=%s "
+           "AND state IN ('pending','sending')") if android else ''
+    return c.execute('''SELECT count(*)+%s>%s AS full FROM (SELECT 1
         FROM subscription_outbox o JOIN subscriptions s ON s.id=o.subscription WHERE o.endpoint IS NOT NULL
-        AND o.state IN ('pending','leased') AND s.principal=%s AND s.key_id=%s''',
-        (ENDPOINT_QUEUE_PER_KEY, row['principal'], row['key_id'])).fetchone()['full']
+        AND o.state IN ('pending','leased') AND s.principal=%s AND s.key_id=%s'''+added+') q',
+        (adding,ENDPOINT_QUEUE_PER_KEY,row['principal'],row['key_id'],
+         *((row['principal'],row['key_id']) if android else ()))).fetchone()['full']
 
 
 def enqueue_hint(c, row, through, *, kind='events', request_id='', capped=True):
@@ -542,6 +547,8 @@ def next_endpoint_item(c, served, kind, lock, strict=True):
     """
     c.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', (ENDPOINT_LANE_LOCK,))
     for row in sorted(c.execute(_ENDPOINT_QUEUE).fetchall(), key=lambda row: served.get((row['principal'], row['key_id']), 0)):
+        from .android_wake import busy as android_busy
+        if android_busy(c,row['principal'],row['key_id']): continue
         if row['kind'] != kind:
             if strict:
                 return None

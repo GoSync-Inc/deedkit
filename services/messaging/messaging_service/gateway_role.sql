@@ -163,3 +163,9 @@ GRANT EXECUTE ON FUNCTION public.publish_feedback_received(uuid) TO messaging_ga
 -- duplicate; compare-and-set; idempotent by request ID; the status event in the same transaction); the API role still has no
 -- UPDATE of agent_feedback and no privilege on feedback_triage_requests. PUBLIC lost EXECUTE in the migration.
 GRANT EXECUTE ON FUNCTION public.set_feedback_triage(uuid,text,text,uuid,text,text,timestamptz,text,uuid,text) TO messaging_gateway;
+
+-- ANYM-997/schema97: only new Android metadata/outbox tables; activation stays root-only.
+GRANT SELECT ON android_wake_bindings TO messaging_gateway;
+GRANT UPDATE(journal_id,after_seq) ON android_wake_bindings TO messaging_gateway;
+GRANT SELECT,INSERT ON android_wake_intents TO messaging_gateway;
+GRANT EXECUTE ON FUNCTION public.lock_android_wake_binding(text,uuid,text) TO messaging_gateway;
