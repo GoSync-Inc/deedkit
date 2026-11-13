@@ -18,7 +18,7 @@ import stat
 from typing import AsyncContextManager, Callable, Protocol
 
 from .protected_input import (
-    InputBinding, InputPurpose, InputTransport, ManualProtectedInput,
+    ProtectedBinding, InputPurpose, InputTransport, ManualProtectedInput,
     ProtectedInputError, ProtectedInputRequest, ProtectedInputResult, _identifier,
 )
 
@@ -55,13 +55,13 @@ class LocalInputReference:
 
     reference_id: str
     operation_id: str
-    binding: InputBinding
+    binding: ProtectedBinding
     expires_at: float
 
     def __post_init__(self):
         _identifier(self.reference_id)
         _identifier(self.operation_id)
-        if (not isinstance(self.binding, InputBinding) or type(self.expires_at) not in (float, int)
+        if (not isinstance(self.binding, ProtectedBinding) or type(self.expires_at) not in (float, int)
                 or not math.isfinite(self.expires_at) or self.expires_at <= 0):
             raise ProtectedInputError('protected_input_invalid')
 
@@ -176,7 +176,7 @@ class ProtectedWindow(Protocol):
     a shared-UID 0600 file alone does not satisfy this dependency.
     """
 
-    binding: InputBinding
+    binding: ProtectedBinding
     channel: ExistingInputChannel
     basket_approved: bool  # Existing complete-basket provenance, not a new Pay-button gate.
 
@@ -189,7 +189,7 @@ class ProtectedWindow(Protocol):
 async def enter_password_once(
     journal: ManualProtectedInput, item: ProtectedInputRequest, reference: LocalInputReference, *,
     private_directory: Path,
-    protected_window: Callable[[InputBinding], AsyncContextManager[ProtectedWindow]] | None = None,
+    protected_window: Callable[[ProtectedBinding], AsyncContextManager[ProtectedWindow]] | None = None,
 ) -> ProtectedInputResult:
     """Source-only until core supplies its actual protected_window and authorized existing channel.
 

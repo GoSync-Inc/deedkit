@@ -1,6 +1,6 @@
 """Metadata-only manual protected-input handoff (ANYM-998), not a secret store or input executor.
 
-The native owner must hold its device/question lock, suspend all observation before
+The native owner must hold its device/blocking-request lock, suspend all observation before
 request(), and prove the sensitive screen has gone before completing DONE. All
 context/booleans come from that trusted integration, NEVER from tool arguments.
 No method accepts a secret, reads an environment value, runs a process or captures UI.
@@ -17,6 +17,7 @@ import re
 import sqlite3
 import stat
 import time
+from typing import Literal
 
 
 class ProtectedInputError(Exception):
@@ -81,17 +82,64 @@ class InputBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class OwnedToolInputBinding:
+    """Actual blocking registered tool call. Never manufacture async question/item identities.
+
+    Core injects all identity from authenticated native state and checks the registered
+    namespace. task_id is the original external task request ID; operation_id remains
+    the stable host-owned protected intent on ProtectedInputRequest.
+    """
+
+    owner: str
+    device_id: str
+    task_id: str
+    native_thread_id: str
+    native_turn_id: str
+    native_request_id: str | int
+    native_call_id: str
+    package: str
+    target_id: str
+    purpose: InputPurpose
+    native_namespace: str | None = None
+    tool_name: Literal['android_order_control'] = 'android_order_control'
+    operation: Literal['request_protected_input'] = 'request_protected_input'
+    binding_kind: Literal['owned_tool_call'] = 'owned_tool_call'
+    binding_version: Literal[2] = 2
+
+    def __post_init__(self):
+        for name in ('owner', 'device_id', 'task_id', 'native_thread_id', 'native_turn_id',
+                     'native_call_id', 'package', 'target_id'):
+            _identifier(getattr(self, name))
+        if type(self.native_request_id) is not int:
+            _identifier(self.native_request_id)
+        if self.native_namespace is not None:
+            _identifier(self.native_namespace)
+        if (not isinstance(self.purpose, InputPurpose) or self.tool_name != 'android_order_control'
+                or self.operation != 'request_protected_input' or self.binding_kind != 'owned_tool_call'
+                or type(self.binding_version) is not int or self.binding_version != 2):
+            _invalid()
+
+    def identity(self):
+        return (self.binding_kind, self.binding_version, self.owner, self.device_id, self.task_id,
+                self.native_thread_id, self.native_turn_id, type(self.native_request_id), self.native_request_id,
+                self.native_call_id, self.native_namespace, self.tool_name, self.operation)
+
+
+ProtectedBinding = InputBinding | OwnedToolInputBinding
+
+
+@dataclass(frozen=True, slots=True)
 class ProtectedInputRequest:
     request_id: str
-    operation_id: str  # Original protected operation; changing question/turn never mints another attempt.
-    binding: InputBinding
+    operation_id: str  # Original protected intent; changing native request/turn never grants another attempt.
+    binding: ProtectedBinding
     expires_at: float
     transport: InputTransport = InputTransport.MANUAL
 
     def __post_init__(self):
         _identifier(self.request_id)
         _identifier(self.operation_id)
-        if not isinstance(self.binding, InputBinding) or not isinstance(self.transport, InputTransport):
+        if not isinstance(self.binding, ProtectedBinding) or not isinstance(self.transport, InputTransport):
             _invalid()
         if (type(self.expires_at) not in (float, int) or not math.isfinite(self.expires_at)
                 or self.expires_at <= 0):
@@ -109,10 +157,26 @@ class ProtectedInputResult:
     native_request_id: str | int | None = None
     native_item_id: str | None = None
     resume_once: bool = False
+    binding_kind: str | None = None
+    binding_version: int | None = None
+    task_id: str | None = None
+    native_call_id: str | None = None
+    native_namespace: str | None = None
+    tool_name: str | None = None
+    operation: str | None = None
 
     def metadata(self):
         """For the authorized result consumer only; webhooks still carry their existing reference-only hints."""
-        return asdict(self)
+        value = asdict(self)
+        if self.binding_kind is None:
+            # Preserve the released legacy result shape exactly, including its original IDs.
+            for name in ('binding_kind', 'binding_version', 'task_id', 'native_call_id',
+                         'native_namespace', 'tool_name', 'operation'):
+                value.pop(name)
+        else:
+            value.pop('question_id')
+            value.pop('native_item_id')
+        return value
 
 
 class ManualProtectedInput:
@@ -175,6 +239,12 @@ class ManualProtectedInput:
     @staticmethod
     def _result(item, status, *, resume_once=False):
         b = item.binding
+        if isinstance(b, OwnedToolInputBinding):
+            return ProtectedInputResult(status, item.request_id, item.operation_id,
+                b.native_thread_id, b.native_turn_id, native_request_id=b.native_request_id,
+                resume_once=resume_once, binding_kind=b.binding_kind, binding_version=b.binding_version,
+                task_id=b.task_id, native_call_id=b.native_call_id, native_namespace=b.native_namespace,
+                tool_name=b.tool_name, operation=b.operation)
         return ProtectedInputResult(status, item.request_id, item.operation_id, b.native_thread_id,
                                     b.native_turn_id, b.question_id, b.native_request_id,
                                     b.native_item_id, resume_once)
@@ -183,7 +253,15 @@ class ManualProtectedInput:
     def _load(row):
         data = json.loads(row['request'])
         data['binding']['purpose'] = InputPurpose(data['binding']['purpose'])
-        data['binding'] = InputBinding(**data['binding'])
+        binding = data['binding']
+        if 'binding_kind' in binding or 'binding_version' in binding:
+            if (binding.get('binding_kind') != 'owned_tool_call' or type(binding.get('binding_version')) is not int
+                    or binding['binding_version'] != 2):
+                _invalid()
+            data['binding'] = OwnedToolInputBinding(**binding)
+        else:
+            # Untagged released rows keep their original class/identity/key; never infer a new kind.
+            data['binding'] = InputBinding(**binding)
         data['transport'] = InputTransport(data['transport'])
         return ProtectedInputRequest(**data)
 
@@ -193,13 +271,17 @@ class ManualProtectedInput:
 
     @staticmethod
     def _question_key(current):
+        if isinstance(current, OwnedToolInputBinding):
+            return json.dumps([current.binding_kind, current.binding_version, current.task_id,
+                               current.native_turn_id, current.native_request_id, current.native_call_id,
+                               current.native_namespace, current.tool_name, current.operation])
         return json.dumps([current.native_turn_id, current.native_request_id,
                            current.native_item_id, current.question_id])
 
-    def request(self, item: ProtectedInputRequest, *, current: InputBinding, channel_available: bool = True,
+    def request(self, item: ProtectedInputRequest, *, current: ProtectedBinding, channel_available: bool = True,
                 capture_suspended: bool = False, basket_approved: bool = False) -> ProtectedInputResult:
-        """Register the active manual question. All safety inputs are trusted native state under its lock."""
-        if not isinstance(item, ProtectedInputRequest) or not isinstance(current, InputBinding):
+        """Register manual entry for a blocking request; safety inputs are trusted native state under its lock."""
+        if not isinstance(item, ProtectedInputRequest) or not isinstance(current, ProtectedBinding):
             _invalid()
         if item.binding != current:
             return ProtectedInputResult('binding_mismatch', item.request_id)
@@ -262,7 +344,7 @@ class ManualProtectedInput:
             self._set(db, item.request_id, status)
             return self._result(item, status, resume_once=status == 'owner_done')
 
-    def complete(self, request_id: str, *, current: InputBinding, outcome: Completion,
+    def complete(self, request_id: str, *, current: ProtectedBinding, outcome: Completion,
                  capture_suspended: bool = False, safe_to_resume: bool = False,
                  channel_available: bool = True, basket_approved: bool = False) -> ProtectedInputResult:
         """One correlated owner outcome. DONE permits only resuming the original protected question."""
@@ -272,7 +354,7 @@ class ManualProtectedInput:
                             safe_to_resume=safe_to_resume, channel_available=channel_available,
                             basket_approved=basket_approved)
 
-    def revoke(self, request_id: str, *, current: InputBinding) -> ProtectedInputResult:
+    def revoke(self, request_id: str, *, current: ProtectedBinding) -> ProtectedInputResult:
         """Native owner revokes before releasing/changing the question; reconcile uncertain input first.
 
         This releases the device hold, but permanently keeps the operation/question tombstone.
@@ -283,7 +365,7 @@ class ManualProtectedInput:
     def _finish(self, request_id, current, status, *, capture_suspended=False, safe_to_resume=False,
                 channel_available=True, basket_approved=False):
         _identifier(request_id)
-        if not isinstance(current, InputBinding):
+        if not isinstance(current, ProtectedBinding):
             _invalid()
         with self._transaction() as db:
             row = db.execute('SELECT * FROM inputs WHERE request_id=?', (request_id,)).fetchone()
