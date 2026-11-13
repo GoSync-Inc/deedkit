@@ -50,7 +50,7 @@ IMAGE = 'ghcr.io/gosync-inc/deedkit-backup'
 # The tokenless attestation verifier production.py runs (tools/attest-verify), installed
 # by hand; a test keeps this hash equal to tools/attest-verify/attest-verify.linux-amd64.sha256.
 ATTEST_VERIFIER = Path('/usr/local/libexec/deedkit/attest-verify')
-ATTEST_SHA256 = '2a71d64a594ce2d95d876b8164a210f14693ded6a3f48f83ed80ac2a2ff73640'
+ATTEST_SHA256 = '456af78b7c5950f889fea30d0a1800dbb8c958da5e62198ab4ae574927f0fb50'
 DIGEST = re.compile(r'sha256:[0-9a-f]{64}')
 # The verifier's refusal lines, read as scripts/production.py reads them: only a registry
 # 404 proves the image is not published yet; an unread registry is retried.

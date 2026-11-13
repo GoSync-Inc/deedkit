@@ -92,7 +92,7 @@ REGISTRY = "ghcr.io/gosync-inc/deedkit-"
 # The tokenless attestation verifier, built reproducibly from tools/attest-verify and installed by the owner;
 # tests keep this hash equal to tools/attest-verify/attest-verify.linux-amd64.sha256.
 VERIFIER = Path("/usr/local/libexec/deedkit/attest-verify")
-VERIFIER_SHA256 = "2a71d64a594ce2d95d876b8164a210f14693ded6a3f48f83ed80ac2a2ff73640"
+VERIFIER_SHA256 = "456af78b7c5950f889fea30d0a1800dbb8c958da5e62198ab4ae574927f0fb50"
 VERIFIER_RECORD = "tools/attest-verify/attest-verify.linux-amd64.sha256"
 IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 # The pinned verifier's refusal lines (tools/attest-verify main.go, registry.go). Only a registry 404 for the image
