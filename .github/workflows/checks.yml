@@ -280,7 +280,7 @@ jobs:
           # directory joins pytest's import path; a baseline of an older revision is sharded the same way.
           mkdir -p "$RUNNER_TEMP/shard-plugin"
           cp ci-tools/scripts/python_shards.py ci-tools/scripts/python_shards.json "$RUNNER_TEMP/shard-plugin/"
-          uv run python "$RUNNER_TEMP/shard-plugin/python_shards.py" pytest --tb=short --durations=25 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/python-${DEEDKIT_TEST_SHARD%%/*}.xml" --ignore=tests/test_backup_r2_verifier_native.py \
+          uv run python "$RUNNER_TEMP/shard-plugin/python_shards.py" pytest --tb=short --durations=0 --durations-min=0.1 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/python-${DEEDKIT_TEST_SHARD%%/*}.xml" --ignore=tests/test_backup_r2_verifier_native.py \
             --deselect tests/test_collectors.py::test_session_lock_rejects_directory_chowned_to_foreign_uid_as_root \
             --deselect tests/test_audio_native.py::test_optional_cpu_package_loads_without_gpu_or_model_download \
             --deselect tests/test_audio_native.py::test_faster_whisper_decoder_compatibility_without_model tests
@@ -906,7 +906,7 @@ jobs:
           # directory joins pytest's import path; a baseline of an older revision is sharded the same way.
           mkdir -p "$RUNNER_TEMP/shard-plugin"
           cp ci-tools/scripts/python_shards.py ci-tools/scripts/python_shards.json "$RUNNER_TEMP/shard-plugin/"
-          uv run python "$RUNNER_TEMP/shard-plugin/python_shards.py" pytest --tb=short --durations=25 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/python-${DEEDKIT_TEST_SHARD%%/*}.xml" --ignore=tests/test_backup_r2_verifier_native.py \
+          uv run python "$RUNNER_TEMP/shard-plugin/python_shards.py" pytest --tb=short --durations=0 --durations-min=0.1 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/python-${DEEDKIT_TEST_SHARD%%/*}.xml" --ignore=tests/test_backup_r2_verifier_native.py \
             --deselect tests/test_collectors.py::test_session_lock_rejects_directory_chowned_to_foreign_uid_as_root \
             --deselect tests/test_audio_native.py::test_optional_cpu_package_loads_without_gpu_or_model_download \
             --deselect tests/test_audio_native.py::test_faster_whisper_decoder_compatibility_without_model tests

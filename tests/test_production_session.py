@@ -11,7 +11,7 @@ import time
 import pytest
 
 from scripts import production as p
-from test_production import OLD_IMAGE, KeepHost
+from test_production import OLD_IMAGE, Clock, KeepHost
 
 from messaging_service import whatsapp_holder
 
@@ -35,7 +35,11 @@ def no_host_state(tmp_path, monkeypatch):
                  "BACKUP_LOCK", "INFERENCE_WORKER_RECEIPT"):
         monkeypatch.setattr(p, name, tmp_path / "absent" / name.lower())
     monkeypatch.setattr(p, "APPLY_SETTLE_SECONDS", 0)
-    monkeypatch.setattr(p, "HOLDER_ATTACH_POLL", 0)
+    # Keep the real attach interval and deadline, advancing only this synthetic host's time. Setting the poll
+    # interval to zero left three negative cases spinning on the real monotonic clock for 120 seconds each.
+    clock = Clock()
+    clock.now = time.monotonic()
+    monkeypatch.setattr(p, "time", clock)
 
 
 def wita(day, hour, minute=0):
@@ -145,6 +149,26 @@ def first(tmp_path, monkeypatch, holders=("1",)):
     host = HolderHost(tmp_path, monkeypatch, holders=holders)
     released(host, SHAS[0], wita(10, 9))
     return host
+
+
+# spec: ANYM-896
+def test_attach_polling_keeps_the_full_deadline_on_the_synthetic_hosts_clock(tmp_path, monkeypatch):
+    host = first(tmp_path, monkeypatch)
+    assert p.time is not time, "the synthetic host must advance its own clock, without waiting in real time"
+    clock = p.time
+    clock.sleeps.clear()
+    start = clock.monotonic()
+    monkeypatch.setattr(p, "run", lambda *args, **kwargs: "synthetic-holder")
+    monkeypatch.setattr(p, "holder_log", lambda *args: [])
+    assert "within 120 s" in p.holder_attached([], host.settings["projects"][0], [HOLDER], "synthetic")
+    assert clock.monotonic() - start == p.HOLDER_ATTACH_S == 120
+    assert clock.sleeps == [p.HOLDER_ATTACH_POLL] * 24
+    # An attach on the last poll before the bound still passes; the failure path cannot replace the polling loop.
+    start = clock.monotonic()
+    monkeypatch.setattr(p, "holder_log", lambda *args: ['{"event":"holder.attached"}']
+                        if clock.monotonic() - start >= 115 else [])
+    assert p.holder_attached([], host.settings["projects"][0], [HOLDER], "synthetic") is None
+    assert clock.monotonic() - start == 115
 
 
 # spec: ANYM-896
