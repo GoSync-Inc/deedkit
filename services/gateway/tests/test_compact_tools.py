@@ -87,7 +87,7 @@ def test_compact_descriptions_guide_a_runnable_first_call(tmp_path):
                        path='/mcp/compact')['structuredContent']
         descriptions = {tool['name']: tool['description'] for tool in section['tools']}
         assert 'android_session' in descriptions['android_capabilities']
-        assert 'android_observe' in descriptions['android_capabilities']
+        assert 'android_agent' in descriptions['android_capabilities']
         assert 'android_maestro' in descriptions['android_run_flow']
         assert 'android_run_flow' in descriptions['android_maestro']
         assert 'android_download' in descriptions['android_observe']

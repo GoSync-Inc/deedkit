@@ -276,66 +276,40 @@ screen; it is not a gate, because the app's chat title is unverified until the f
 
 ## Local agent (bare Codex, ANYM-993)
 
-The default `android_agent start` path runs ordinary `codex exec` against the configured phone
-with serial-specific adb. Its task prompt gives the phone location, the owner-agent role and
-the caller goal. It follows that goal, including any order/payment boundary the caller states.
-Native Codex `workspace-write` sandbox and safeguards remain, with network enabled for adb;
-there is no custom per-action guard, phone MCP or guarded preamble in this path. The existing
-`agent.enabled` switch stays required.
+With `agent: {enabled: true, guarded: false, persistent: true}`, `android_agent` is a
+front for one live ordinary Codex conversation per authenticated owner and phone. The native
+`codex app-server` process and thread remain alive between goals; a subsequent `start` is a
+new turn in that same conversation, including questions and follow-ups about prior work.
+There is no automatic reflection, skill-writing instruction, task recipe, or result schema.
+Bundled and host skill discovery are disabled. The only task prompt is the phone location,
+owner-agent role and caller goal/context. Existing dedicated native owner preferences remain.
 
-```json
-{"agent": {"enabled": true, "guarded": false},
- "engines": {"codex": {"binary": "/absolute/path/codex", "version": "YOUR_PINNED_VERSION",
-                       "codex_home": "/private/engine/codex-home",
-                       "model": "gpt-6.1-terra", "reasoning_effort": "medium"}}}
-```
+The caller still acquires `android_session`, submits a durable `request_id` with `start`,
+and follows that request with `get`. An idle conversation holds no phone lease or device lock.
+`stop`, time and command caps interrupt only the active turn; the healthy process/thread
+remains usable. Cancellation that cannot be confirmed kills the owned native process before
+releasing the device. Transport loss fails that request and never replays it. A later, new
+request resumes the exact saved thread when the service/process had to restart. Normal task
+completion does not restart it. Owner/device boundaries keep conversations separate.
 
-`start` accepts `model` and `effort` (`minimal`, `low`, `medium`, `high`) per call; defaults
-are Terra medium, then host config, then call overrides. `apps` is optional.
-`owner_instruction` remains in the private request record; it is not injected into the prompt.
-Bare mode rejects `engine=claude`, `secrets`, `save_as` and `param_names`; it never resolves
-the app secret store. Login and pinned CLI version are checked without the guarded phone probe.
-The process receives only PATH (adb first), a private HOME, CODEX_HOME, ANDROID_SERIAL,
-and TMPDIR/LANG when configured.
+Results retain the ordinary natural final, timings, command progress, tokens and screenshot;
+`native_session` includes `thread_id`, `pid`, `turn_id` and `persistent`. Native session history
+is stored privately under the existing dedicated `CODEX_HOME`; no transcript is exported or
+copied into source. MCP request/event records retain their existing 14-day policy. Native
+sandbox stays `workspace-write` with network access and the existing `approval_policy=never`;
+only the session workspace is writable. Auth/config are not added to write roots. No new
+listener, login, key, provider session or permission grant is created by this transport.
 
-The run holds the phone lock until finalization. `get` long-polls by cursor and original
-request ID; `stop`, timeout and restart cancel its process group. Results include summary,
-data, missing outputs, command timings, tokens, effective model/effort, mode, and the final
-screenshot as an owner-scoped downloadable file. If capture fails, `final_screenshot` says
-`unavailable`. `model_ms` is elapsed engine time less observed command time, not a model-server
-measurement. `max_actions` is a command-count cancellation limit; a command already submitted
-by Codex may be in flight when cancellation arrives. Requests and logs retain the existing
-14-day policy. Phone content and task data go to OpenAI under the existing provider policy.
+Defaults remain Terra medium; per-turn `model`/`effort` overrides are passed to native Codex.
+The native runtime handles its context window; there is no extra rotation timer, hard-coded
+context threshold or periodic polling goal. Android can evict background apps; opening an app
+once is preparation, not a guarantee that the OS keeps it resident.
 
-The prompt contains the phone location, owner-agent role and caller goal/context. There is
-no bootstrap learning instruction, result schema or required final JSON. The native final
-message is returned unchanged as `summary`; bare-mode `data` is empty and any legacy
-`outputs` remain listed in `missing_outputs`. A nonzero native exit or absent final message
-remains a failed run. JSON-looking natural output is not interpreted as a result contract.
-
-Codex can author ordinary app `SKILL.md` files and supporting resources itself. Its existing
-dedicated `CODEX_HOME/skills` directory is available through the run's standard `.agents/skills`
-location and is writable with native `--add-dir`; auth/config outside it remain outside the
-write grant. Native skill discovery/reuse handles the files; the service injects no skill body,
-resource-ID grammar, enum list or generic-content filter. `skills_updated` lists changed paths
-relative to that directory, not a claim that a useful lesson was learned. No file written means
-no learned-skill claim. Native file writes persist as ordinary workspace writes, including when
-a later task fails or is stopped. Skills are for generic app navigation/verified shortcuts;
-private patient/order facts belong in task context. Existing retention and egress policy stays.
-See [native Codex skills](https://developers.openai.com/codex/skills/).
-
-On an upgrade from the structured-learning release, move its service-generated `android-learning`
-bootstrap skill aside before ordinary runs so native discovery cannot pick up stale instructions.
-Preserve other app skills and the original files for undo; do not change auth or global settings.
-Bounded sanitized engine_errors and exit_code report native startup errors; raw stderr and
-phone dumps are never logged. timings.commands_started counts submissions independently
-of completed commands, including when cancellation interrupts one. token_usage_observed
-distinguishes reported usage from zero-filled counters when no usage report was received;
-those counters are not evidence of zero billing.
-
-Rollback: with zero active runs, set `agent.guarded: true` and reload/restart the service
-through the documented mini release route. The previous phone-tool path below then applies.
-No existing learned app skill is deleted.
+For compatibility, `persistent` defaults to false. In that mode the prior isolated ordinary
+`codex exec` path remains available, including native skill discovery; `guarded: true` keeps
+the older guarded phone-tool engine. Change modes only when no task is running, through the
+normal green-main release route. Existing app skill files need not be deleted for persistent
+mode: discovery is disabled, and no skill directory is mounted into its workspace.
 
 ### Guarded compatibility path
 

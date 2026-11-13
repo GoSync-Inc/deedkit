@@ -303,11 +303,14 @@ def test_list_birthdays_sorts_across_the_year_boundary_and_counts_not_shared_wit
 # spec: ANYM-919
 def test_a_contact_whose_chat_the_key_cannot_read_is_neither_listed_nor_counted(bd):
     worker, store = bd
+    # This checks chat scope, not a fixed season: both known contacts must stay in the upcoming window.
+    first_day = datetime.now(timezone.utc).date() + timedelta(days=1)
+    second_day = first_day + timedelta(days=1)
     with store.pool.connection() as c:
         for user in ('5201', '5202', '5203', '5204'):
             contact(c, user)
-        known(c, '5201', 12, 11)
-        known(c, '5202', 13, 11)
+        known(c, '5201', first_day.day, first_day.month)
+        known(c, '5202', second_day.day, second_day.month)
         birthdays.store(c, ACCOUNT, '5204', None)
     scoped = store.issue_key('bd-scoped', [ACCOUNT], chats=['bd-chat-5201', 'bd-chat-5203'],
         permissions=['contacts-read'], key_permissions=['contacts-read'])
