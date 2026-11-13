@@ -955,6 +955,50 @@ missing binding stops before reading Android. No module/message/subscription cur
 Install code before adding policy fields to an older strict reader. Configuration is not a live receipt;
 root retains endpoint/routine/installed listener/native/phone acceptance and all live actions.
 
-Native timer delivery through the existing device/session gate, actual protected fencing/entry and safe
-context compaction remain integration obligations. Persisted chosen deadlines or source-only tests do
-not prove those installed behaviors; no real model/phone/provider benchmark is claimed.
+Native supervision uses only an existing still-live admitted reservation, process and conversation.
+After a successful foreground turn, explicit active Codex order obligations can retain that original
+token and authorization callback in host memory. No token is copied into task/feed/timing/receipt
+metadata, read back for adoption, acquired or reconstructed after restart. One bounded metadata
+timer renews that same matching live token within a fixed idle interval. The original `max_minutes`
+and `max_actions` budget is cumulative work across the initial run and every continuation: allocation,
+preflight, commands, open-turn/blocked-RPC waits, cancellation and final observation are charged once.
+Delivery idle after terminal work is not charged; another task neither spends nor refills this budget.
+Only a genuinely successful own check establishes another fixed interval, capped to the original
+admitted lease duration (at most900s). Ticks and other tasks never slide it. A small remaining active
+budget can wait on a valid bounded lease before a small check; it does not force repeated model calls.
+The next check uses only remaining active time/actions. Schedules beyond the current idle interval
+stay visibly held. A bounded renewal never shortens another task's valid reservation. Idle supervision
+holds no execution lock; unknown/failed/incomplete native work cannot establish another interval.
+
+Due observations enter through the existing device/native gate after current key/control/device,
+source epoch, lease, original task and same live process/thread/registration checks. A successful
+tracked foreground task on the identical owner/device/private token/session/process/thread can advance
+an older order's expected head after checking both original and current rights under native/device
+serialization. Its original context, spent budget and idle deadline stay unchanged. A private metadata
+audit retains original head, actual foreground task/turn and new expected head, without token/content.
+Untracked/foreign/uncertain heads refuse. Outstanding owner questions, unconfirmed input, known native
+commands, expiry/release/replacement, missing registration or a restart hold the wake. Pending async
+questions remain visible across later foreground tasks; old-turn answers still fail binding. A terminal
+turn with outstanding command work has unconfirmed accounting and cannot reauthorize idle supervision;
+late original command events remain metadata, not a protected quiescence proof.
+Foreground demand cancels an unsubmitted timer preflight; submitted work retains normal
+stop semantics. Explicit release cancels only its matching unsubmitted timer before releasing the lease;
+in-flight submitted/foreground work still requires stop. Current admission is checked after native
+selection awaits and before renewal/input. The final coalesced observation is frozen and a durable
+original-wake input intent is committed before bytes. Original goal/words/typed parameters/apps/outputs
+come from the trusted task store as existing-task context; observation data stays explicitly untrusted.
+Its positive `turn/start` receipt acknowledges
+input delivery only, recording the continuation turn separately from the original wake turn. Unknown
+delivery is never resent or replaced with a new wake ID. Authenticated fetch includes that separate
+`native_wake_receipt`; `get.native_supervision` reports retained/held/unavailable metadata.
+
+Owner stop, revocation, release, terminal/handoff obligations or finite budget exhaustion end retention
+without releasing another task's reservation. Public native control metadata exposes current-task
+remaining work/actions and maximum idle interval so the model can choose checks or a handoff.
+A crash/restart loses in-memory authority: obligations
+and unknown receipts survive as visible holds, and no native client/process/thread/lease is created to
+recover them. The installed original conversation's registration transition, listener/Grok/idle
+native delivery and provider/phone acceptance still require root's exclusive live verification.
+Actual protected fencing/automatic entry and safe context compaction remain integration obligations.
+No timing receipt or held tool establishes a protected read/capture fence, and no real
+model/phone/provider performance savings are claimed.

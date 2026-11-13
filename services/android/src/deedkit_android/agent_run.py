@@ -705,6 +705,8 @@ class Agents:
         self.orders = None
         self.recover()
         self.order_control(create=True)
+        from .order_supervision import Supervision
+        self.supervision = Supervision(self)
 
     def order_control(self, *, create=False):
         from .order_events import OrderEvents
@@ -771,6 +773,7 @@ class Agents:
         return content | {'wake_digest': digest, 'original_request': original,
             'read_receipt': {'state': 'recorded' if read else 'not_recorded'},
             'responsibility': {k: row[k] for k in ('responsible', 'recipient', 'revision', 'next_check_at')},
+            'native_wake_receipt': self.supervision.receipt(wake_id),
             'native_receipts': session.receipts(task['id']) if session else []}
 
     def wake_action(self, owner, call, authorize):
@@ -812,6 +815,7 @@ class Agents:
         self.db.purge(time.time() - RETENTION_S)
 
     async def close(self):
+        await self.supervision.close()
         for run in list(self.runs.values()):
             await run.end('lost', error='service_stopped')
         for session in self.sessions.values():
@@ -892,6 +896,7 @@ class Agents:
                     'source_id': config.agent.order_events.source_id if config.agent.order_events else None,
                     'auth_epoch': config.agent.order_events.auth_epoch if config.agent.order_events else None,
                     'native_registration': 'fresh_thread_start_only', 'legacy_hot_add': 'unavailable',
+                    'native_supervision': 'same_live_lease_bounded_no_restart_adoption',
                     'public_actions': ['fetch', 'read_receipt', 'handoff'], 'read_receipt': 'local_metadata_mutation',
                     'native_receipt': 'submitted_unconfirmed', 'protected_input': 'fence_unavailable'},
                 'default_effort': config.engines['codex'].reasoning_effort if 'codex' in config.engines else 'medium',
@@ -912,6 +917,7 @@ class Agents:
         if call.action in {'reply', 'steer'}:
             return await self.interact(owner, call, authorize)
         if call.action == 'stop':
+            await self.supervision.forget(owner, request_id)
             run = self.runs.get((owner, request_id))
             if run is not None:
                 await run.end('stopped')
@@ -984,6 +990,9 @@ class Agents:
                     directory.chmod(0o700)
                     run = PersistentRun(self, owner, original, 'codex', engine, directory,
                                         SecretRun(self.devices.secrets), (None, ''))
+                    run.authorize = authorize
+                    budget = self.supervision.budget(owner, call.request_id, call.session_id)
+                    run.request = original.model_copy(update={'max_actions': budget['limit'] - budget['used']})
                     run.input_text, run.input_started = text, started
                     run.input_refused = refused
                     run.input_admit = lambda: admit(True)
@@ -1013,6 +1022,12 @@ class Agents:
         return {**self.view(owner, call.request_id, 0), 'input_receipt': receipt}
 
     async def start(self, owner, call, authorize=None):
+        if self.db.row(owner, call.request_id) is not None:
+            return await self._start(owner, call, authorize)  # an idempotent read is not foreground demand
+        async with self.supervision.foreground(call.device_id):
+            return await self._start(owner, call, authorize)
+
+    async def _start(self, owner, call, authorize=None):
         self.db.purge(time.time() - RETENTION_S)
         identity = call.identity()
         existing = self.db.row(owner, call.request_id)
@@ -1090,6 +1105,8 @@ class Agents:
             request = {**{key: value for key, value in call.model_dump(exclude={'session_id', 'after', 'wait_s'} | WAKE_FIELDS).items()},
                        'engine': name}
             self.db.insert(owner, call.request_id, identity, call.device_id, name, model, request)
+            if bare and config.agent.persistent:
+                self.supervision.admitted(run)
         except BaseException:
             if run is not None:
                 shutil.rmtree(run.dir, ignore_errors=True)
@@ -1123,6 +1140,8 @@ class Agents:
             view.update(json.loads(row['result'] or '{}'))
         dialogue = self.native_session(owner, row['device'])
         view['dialogue'] = dialogue.receipts(request_id)
+        if self.read_config().agent.order_events is not None:
+            view['native_supervision'] = self.supervision.status(owner, request_id)
         if row['state'] == 'running' and dialogue.request_id == request_id and dialogue.process is not None:
             view['native_selection'] = dict(dialogue.selection)
             view['native_session'] = {'thread_id': dialogue.thread_id, 'turn_id': dialogue.turn_id,

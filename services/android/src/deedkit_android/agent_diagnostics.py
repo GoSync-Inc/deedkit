@@ -8,7 +8,7 @@ class NativeTiming:
     """Host arrival intervals, never provider/model time or proof of command quiescence."""
 
     STOP_SOURCES = frozenset(('deadline', 'owner_stop', 'service_shutdown', 'action_cap',
-        'adapter_failure', 'adapter_cancelled', 'native_disconnected', 'model_rerouted'))
+        'adapter_failure', 'adapter_cancelled', 'native_disconnected', 'model_rerouted', 'supervision_revoked'))
 
     def __init__(self, *, clock=time.monotonic):
         self.clock = clock

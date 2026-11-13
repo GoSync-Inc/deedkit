@@ -52,7 +52,9 @@ class CodexSession:
         self.settings_applied = None
         self.disconnected = False
         self.order_control_registered, self.control, self.control_admit = False, None, None
+        self.boundary_receipt = None
         self.control_tasks, self.native_items = set(), {}
+        self.pending_commands = {}  # actual (turn,item)->task; no command/output payload
         self.interactions, self.interaction_lock = {}, asyncio.Lock()
         self.journal = directory.parent / (directory.name + '.dialogue.json')  # outside native writable cwd
 
@@ -402,6 +404,9 @@ class CodexSession:
             if expected_thread is None and order_control:
                 boundary['order_control'] = ORDER_REGISTRATION
                 self.order_control_registered = True
+            if self.order_control_registered:
+                boundary['order_control'] = ORDER_REGISTRATION
+            self.boundary_receipt = hashlib.sha256(json.dumps(boundary, sort_keys=True).encode()).hexdigest()
             if response.get('approvalPolicy') == 'never':
                 self.bindings.confirm_native_binding(self.owner, self.device, ident, boundary)
             self.thread_id = ident
@@ -537,6 +542,7 @@ class CodexSession:
         try:
             async for line in self.process.stdout:
                 message = json.loads(line)
+                self.observe_command(message)
                 if 'id' in message and 'method' not in message:
                     future = self.pending.get(message['id']) if type(message['id']) is int else None
                     if future is not None and not future.done():
@@ -633,6 +639,21 @@ class CodexSession:
             self.stderr.extend(chunk)
             del self.stderr[:-16384]
 
+    def observe_command(self, message):
+        params, method = message.get('params') or {}, message.get('method')
+        item = params.get('item') or {}
+        if (not isinstance(self.thread_id, str) or params.get('threadId') != self.thread_id
+                or item.get('type') != 'commandExecution' or not isinstance(item.get('id'), str)
+                or not isinstance(params.get('turnId'), str)):
+            return
+        key = (params['turnId'], item['id'])
+        if method == 'item/started' and self.events is not None and params['turnId'] == self.turn_id:
+            self.pending_commands[key] = self.request_id
+        elif method == 'item/completed' and key in self.pending_commands and (
+                (type(item.get('exitCode')) is int and item.get('status') in (None, 'completed', 'failed'))
+                or item.get('status') == 'declined'):
+            self.pending_commands.pop(key)
+
     async def select(self, config):
         """Validate against this process's native catalog, then read effective settings on the SAME thread."""
         if not self.version_verified:
@@ -697,7 +718,8 @@ class CodexSession:
         self.selection['configuration_status'] = 'confirmed'
         return requested
 
-    async def turn(self, prompt, config, consume, *, request_id=None, on_started=None, admit=None, control=None, timing=None):
+    async def turn(self, prompt, config, consume, *, request_id=None, on_started=None, admit=None, control=None, timing=None,
+                   before_submit=None):
         async with self.lock:
             self.timing = timing or agent_diagnostics.NativeTiming()
             self.timing.phase('preflight')
@@ -706,15 +728,19 @@ class CodexSession:
             selected = await self.select(config)
             if admit:
                 admit()  # discovery/settings reads may await; recheck immediately before goal dispatch
-            self.finish_questions('expired')  # a later turn cannot answer an older unresolved question
+            self.finish_questions('expired', include_async=False)  # preserve async obligations; old-turn answers still fail binding
             self.events = asyncio.Queue()
             self.control, self.control_admit, self.native_items = control, admit, {}
             self.turn_id = None
             self.turn_policy_proven = False
             self.request_id, self.stopping = request_id, False
             self.done.clear()
+            submitted = False
             try:
+                if before_submit:
+                    prompt = before_submit()  # freeze exact observation and original-wake intent before bytes
                 self.timing.phase('submission')
+                submitted = True
                 response = await self.rpc('turn/start', {
                     'threadId': self.thread_id, 'input': [{'type': 'text', 'text': prompt}],
                     'model': selected['model'], 'effort': selected['effort'], 'serviceTier': selected['service_tier'],
@@ -733,7 +759,8 @@ class CodexSession:
                     if event.get('method') == 'turn/completed':
                         return event['params']['turn']['status']
             except BaseException:
-                await self.interrupt()
+                if submitted:
+                    await self.interrupt()
                 raise
             finally:
                 await self.stop_controls()
@@ -786,6 +813,7 @@ class PersistentRun(BareRun):
         super().__init__(*args)
         self.session = None
         self.timing = agent_diagnostics.NativeTiming()
+        self.native_previous_turn = self.native_admitted_turn = self.native_completed_turn = self.native_boundary = None
         self.input_text, self.input_started, self.input_admit, self.input_refused = None, None, None, None
 
     def skill_files(self):
@@ -794,7 +822,7 @@ class PersistentRun(BareRun):
     async def supervise(self):
         heartbeat = asyncio.create_task(self.keep_lease())
         try:
-            async with asyncio.timeout(self.request.max_minutes * MINUTE_S):
+            async with asyncio.timeout(min(self.request.max_minutes * MINUTE_S, self.agents.supervision.remaining(self))):
                 key = (self.owner, self.device)
                 control = self.agents.order_control(create=True)
                 session = self.agents.sessions.get(key)
@@ -817,25 +845,7 @@ class PersistentRun(BareRun):
                     return
                 self.engine_started = time.monotonic()
 
-                def admit():
-                    if self.state != 'running' or not self.agents.devices.locks[self.device].locked():
-                        raise Refused('native_turn_mismatch')
-                    current = self.agents.read_config().agent
-                    if not current.enabled or current.guarded or not current.persistent:
-                        raise Refused('agent_disabled')
-                    if self.authorize:
-                        principal = self.authorize()
-                        if principal.id != self.owner or self.device not in principal.devices:
-                            raise Refused('not_found', 404)
-                        if 'android:control' not in principal.permissions:
-                            raise Refused('forbidden', 403)
-                    self.agents.store.check_reservation(self.owner, self.device, self.request.session_id)
-                    if self.input_admit:
-                        self.input_admit()
-
-                status = await session.turn(self.input_text if self.input_text is not None else self.prompt(),
-                                            self.config, self.consume, request_id=self.id, on_started=self.input_started,
-                                            admit=admit, control=self.order_bridge, timing=self.timing)
+                status = await self.execute(session)
                 if self.state == 'running':
                     await self.end('succeeded' if status == 'completed' and self.finished else 'failed',
                                    exit_code=0 if status == 'completed' else 1)
@@ -858,6 +868,45 @@ class PersistentRun(BareRun):
         finally:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
+
+    async def execute(self, session, *, before_submit=None):
+        """Drive an already selected live session; this method never connects or replaces it."""
+        def admit():
+            if self.state != 'running' or not self.agents.devices.locks[self.device].locked():
+                raise Refused('native_turn_mismatch')
+            current = self.agents.read_config().agent
+            if not current.enabled or current.guarded or not current.persistent:
+                raise Refused('agent_disabled')
+            if self.authorize:
+                principal = self.authorize()
+                if principal.id != self.owner or self.device not in principal.devices:
+                    raise Refused('not_found', 404)
+                if 'android:control' not in principal.permissions:
+                    raise Refused('forbidden', 403)
+            self.agents.store.check_reservation(self.owner, self.device, self.request.session_id)
+            if self.input_admit:
+                self.input_admit()
+
+        prompt = self.input_text if self.input_text is not None else self.prompt()
+
+        def commit():
+            self.native_previous_turn = session.last_turn_id
+            if session.order_control_registered:
+                self.native_boundary = self.agents.supervision.boundary(session, self.owner, self.device)
+            return before_submit() if before_submit else prompt
+
+        def started(turn_id):
+            if not isinstance(turn_id, str) or not turn_id:
+                raise OSError('native_turn_receipt_invalid')
+            self.native_admitted_turn = turn_id
+            if self.input_started:
+                self.input_started(turn_id)
+
+        status = await session.turn(prompt, self.config, self.consume, request_id=self.id, on_started=started,
+            admit=admit, control=self.order_bridge, timing=self.timing, before_submit=commit)
+        if status == 'completed' and self.native_admitted_turn == session.last_turn_id:
+            self.native_completed_turn = self.native_admitted_turn
+        return status
 
     async def stop_engine(self):
         self.timing.request_stop({'stopped': 'owner_stop', 'timed_out': 'deadline', 'lost': 'service_shutdown',
@@ -889,7 +938,8 @@ class PersistentRun(BareRun):
             recipient = source.handoff_principals.get(self.owner, self.owner)
             if operation == 'handoff' and 'target_principal' in payload and payload['target_principal'] != recipient:
                 raise Refused('handoff_target_unconfigured')
-            return (await control(actual, operation, payload)) | {'handoff_principal': recipient}
+            budget = self.agents.supervision.native_budget(self)
+            return (await control(actual, operation, payload)) | {'handoff_principal': recipient, 'supervision': budget}
         except (OrderRefused, Refused) as error:
             return {'status': 'refused', 'effect': 'metadata_only', 'error': str(error)}
 
@@ -979,4 +1029,8 @@ class PersistentRun(BareRun):
             result['native_session'] = {'thread_id': self.session.thread_id, 'pid': self.session.process.pid,
                                         'turn_id': self.session.turn_id or self.session.last_turn_id, 'persistent': True,
                                         'order_control_registered': self.session.order_control_registered}
+        self.agents.supervision.account(self)
+        if state == 'succeeded' and self.session:
+            async with self.session.lock:
+                self.agents.supervision.finished(self)
         return result
