@@ -38,7 +38,9 @@ def no_host_state(tmp_path, monkeypatch):
     # Keep the real attach interval and deadline, advancing only this synthetic host's time. Setting the poll
     # interval to zero left three negative cases spinning on the real monotonic clock for 120 seconds each.
     clock = Clock()
-    clock.now = time.monotonic()
+    # Integer virtual ticks stay exact even across floating-point exponent boundaries. Keep the epoch within
+    # one real second because the call-window tests also compare the supplied deadline with the real clock.
+    clock.now = int(time.monotonic())
     monkeypatch.setattr(p, "time", clock)
 
 
@@ -156,6 +158,7 @@ def test_attach_polling_keeps_the_full_deadline_on_the_synthetic_hosts_clock(tmp
     host = first(tmp_path, monkeypatch)
     assert p.time is not time, "the synthetic host must advance its own clock, without waiting in real time"
     clock = p.time
+    assert clock.now == int(clock.now)
     clock.sleeps.clear()
     start = clock.monotonic()
     monkeypatch.setattr(p, "run", lambda *args, **kwargs: "synthetic-holder")
