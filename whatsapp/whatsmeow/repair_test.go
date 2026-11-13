@@ -585,7 +585,11 @@ func TestRepairStopsDuringAnActiveTickOnShutdownOrDisconnectAndKeepsNothing(t *t
 			for _, f := range repairFixtures()[:3] {
 				journalUnknown(t, s, f.msg, f.raw)
 			}
+			// Reach the stop signal even when one real row outlasts the time slice.
+			// TestRepairTimeSliceEndsTheTickAndTheNextTickContinues checks the slice separately.
+			clock := time.Unix(1700000000, 0)
 			p := newRepairPass(s)
+			p.now = func() time.Time { return clock }
 			p.tick(context.Background()) // loads, counts all three, done
 			if !p.done {
 				t.Fatal("setup pass did not finish")
@@ -594,6 +598,7 @@ func TestRepairStopsDuringAnActiveTickOnShutdownOrDisconnectAndKeepsNothing(t *t
 				t.Fatal(err)
 			}
 			p = newRepairPass(s)
+			p.now = func() time.Time { return clock }
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			connected := true
@@ -611,10 +616,13 @@ func TestRepairStopsDuringAnActiveTickOnShutdownOrDisconnectAndKeepsNothing(t *t
 			}
 			p.tick(ctx)
 			if p.lastError != "" || p.lastSeq != 0 || p.scanned != 0 || p.done || durableLastSeq(t, s) != 0 {
-				t.Fatalf("%s mid-tick kept progress: last=%d scanned=%d err=%q", stop, p.lastSeq, p.scanned, p.lastError)
+				t.Fatalf("%s mid-tick kept progress: last=%d scanned=%d err=%q calls=%d ctx=%v connected=%v", stop, p.lastSeq, p.scanned, p.lastError, calls, ctx.Err(), connected)
 			}
 			if calls != 2 {
 				t.Fatalf("%s mid-tick classified %d rows", stop, calls)
+			}
+			if stop == "shutdown" && ctx.Err() != context.Canceled || stop == "disconnect" && connected {
+				t.Fatalf("%s stop signal missing: ctx=%v connected=%v", stop, ctx.Err(), connected)
 			}
 		})
 	}
