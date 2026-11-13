@@ -100,11 +100,23 @@ class Store:
         if not row or row["expires"] <= time.time() or row["owner"] != owner or row["token"] != token:
             raise Refused("reservation_expired_or_forbidden")
 
-    def touch(self, owner, device, token):
+    def reservation_window(self, owner, device, token):
+        self.check_reservation(owner, device, token)
+        row = self.db.execute('SELECT seconds FROM reservation_options WHERE device=?', (device,)).fetchone()
+        return min(900, row['seconds'] if row else 300)
+
+    def touch(self, owner, device, token, *, until=None):
         self.check_reservation(owner, device, token)
         row = self.db.execute("SELECT seconds FROM reservation_options WHERE device=?", (device,)).fetchone()
         seconds = row["seconds"] if row else 300
         expires = time.time() + seconds
+        if until is not None:
+            expires = min(expires, until)
+            if expires <= time.time():
+                raise Refused('supervision_expired')
+            # A bounded renewal cannot shorten an existing owner/other-task reservation.
+            previous = self.db.execute('SELECT expires FROM reservations WHERE device=?', (device,)).fetchone()
+            expires = max(previous['expires'], expires)
         self.db.execute("UPDATE reservations SET expires=? WHERE device=?", (expires, device))
         self.db.commit()
         return expires

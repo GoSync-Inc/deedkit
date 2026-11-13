@@ -160,6 +160,7 @@ def create_app(config_path, agent_url=None):
         # The local agent (ANYM-971): runs reach this service on agent_url with their own per-run bearer.
         agents = Agents(devices, store, configuration, agent_url)
         app.state.devices, app.state.store, app.state.agents = devices, store, agents
+        agents.supervision.start()
         try:
             yield
         finally:
@@ -261,9 +262,17 @@ def create_app(config_path, agent_url=None):
             except Refused:
                 result["agent"] = {"enabled": False, "reason": "unavailable"}
         elif operation == "session":
+            if args['action'] == 'release':
+                store.check_reservation(owner, device, args['session_id'])
+                await request.app.state.agents.supervision.release_pending(owner, device, args['session_id'])
+                current = configuration.authenticate(request.headers.get('authorization', ''))
+                if current.id != owner or device not in current.devices or 'android:control' not in current.permissions:
+                    raise Refused('forbidden', 403)
             if devices.locks[device].locked() and args["action"] != "renew":
                 raise Refused("device_busy")
             result = store.reserve(owner, device, args["action"], args["session_id"], args["seconds"])
+            if args['action'] == 'release':
+                await request.app.state.agents.supervision.released(owner, device, args['session_id'])
         elif operation == "observe":
             result = await devices.observe(owner, device, args["session_id"], args["screenshot"], args["hierarchy"],
                                            args["image_mode"], args["crop"])
