@@ -543,14 +543,14 @@ def test_schema63_upgrade_preserves_grants_and_backups_and_is_repeatable(sender,
         old_ledger = c.execute('SELECT * FROM archive_migrations ORDER BY version').fetchall()
     s.migrate(); s.migrate()
     with s.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '96'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '97'
         assert c.execute('SELECT * FROM archive_migrations WHERE version<63 ORDER BY version').fetchall() == old_ledger
         assert c.execute("SELECT oid,relacl::text FROM pg_class WHERE relnamespace='public'::regnamespace AND relname NOT IN ('outgoing_expiry','messenger_commands_press') ORDER BY oid").fetchall() == grants
         assert c.execute("SELECT proacl::text FROM pg_proc WHERE oid='public.collector_account_guard()'::regprocedure").fetchone() == guard_acl
     destination = tmp_path/'schema63-snapshot'
     backup.create_snapshot(s,destination,[sys.executable,'-c','print("synthetic dump stub")'])
     assert backup.verify_snapshot(s,destination)['status'] == 'verified'
-    assert backup.verify_bundle(destination)['schema_version'] == 96
+    assert backup.verify_bundle(destination)['schema_version'] == 97
 
 
 # spec: ANYM-655

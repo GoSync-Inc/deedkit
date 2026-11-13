@@ -49,3 +49,9 @@ GRANT SELECT,INSERT,DELETE ON delivery_attempts TO messaging_event_delivery;
 GRANT UPDATE(state,version,updated_at) ON delivery_endpoints TO messaging_event_delivery;
 -- Schema 90 (ANYM-564): under the fence, a module hint announces only call references whose link is live.
 GRANT SELECT ON module_links,subscription_module_links TO messaging_event_delivery;
+
+-- ANYM-997/schema97: existing sender reads the new binding and owns only outbox transport state.
+GRANT SELECT ON android_wake_bindings,android_wake_intents TO messaging_event_delivery;
+GRANT UPDATE(state,hold_reason,attempts,lease_until,admitted_at,next_attempt_at)
+    ON android_wake_intents TO messaging_event_delivery;
+GRANT EXECUTE ON FUNCTION public.lock_android_wake_binding(text,uuid,text) TO messaging_event_delivery;

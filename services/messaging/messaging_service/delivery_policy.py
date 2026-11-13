@@ -104,10 +104,15 @@ def quiet_until(c, policy, at):
 def _slot(c, owner, column, now):
     limit = _bound_setting('SUBSCRIPTION_MAX_HINTS_PER_HOUR', 200, 1, 1000)
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))', ('subscription-hints:' + str(owner['key_id']),))
-    charged = c.execute('''SELECT o.{0} AS t FROM subscription_outbox o JOIN subscriptions s ON s.id=o.subscription
-        WHERE s.principal=%s AND s.key_id=%s AND o.{0}>%s-interval '1 hour'
-        ORDER BY o.{0} DESC OFFSET %s LIMIT 1'''.format(column),
-        (owner['principal'], owner['key_id'], now, limit - 1)).fetchone()
+    from .android_wake import tables
+    android = tables(c)
+    added = (" UNION ALL SELECT a.{0} AS t FROM android_wake_intents a WHERE a.principal=%s "
+             "AND a.key_id=%s AND a.{0}>%s-interval '1 hour'").format(column) if android else ''
+    charged = c.execute(("SELECT t FROM (SELECT o.{0} AS t FROM subscription_outbox o JOIN subscriptions s "
+        "ON s.id=o.subscription WHERE s.principal=%s AND s.key_id=%s AND o.{0}>%s-interval '1 hour'"
+        + added + ") q ORDER BY t DESC OFFSET %s LIMIT 1").format(column),
+        (owner['principal'],owner['key_id'],now, *((owner['principal'],owner['key_id'],now) if android else ()),
+         limit-1)).fetchone()
     return None if charged is None else charged['t'] + timedelta(hours=1)
 
 
@@ -145,9 +150,14 @@ def host_admission_slot(c, endpoint, now):
         return None
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))', ('delivery-host:' + host['host'],))
     # subscription_hint_host_admission (052) starts the read at the hour's first admission, never the history.
-    charged = c.execute('''SELECT o.admitted_at AS t FROM subscription_outbox o JOIN delivery_endpoints e
-        ON e.id=o.endpoint WHERE e.host=%s AND o.admitted_at>%s-interval '1 hour'
-        ORDER BY o.admitted_at DESC OFFSET %s LIMIT 1''', (host['host'], now, limit - 1)).fetchone()
+    from .android_wake import tables
+    android = tables(c)
+    added = (" UNION ALL SELECT a.admitted_at AS t FROM android_wake_intents a JOIN delivery_endpoints e "
+             "ON e.id=a.endpoint WHERE e.host=%s AND a.admitted_at>%s-interval '1 hour'") if android else ''
+    charged = c.execute("SELECT t FROM (SELECT o.admitted_at AS t FROM subscription_outbox o JOIN delivery_endpoints e "
+        "ON e.id=o.endpoint WHERE e.host=%s AND o.admitted_at>%s-interval '1 hour'"+added+
+        ") q ORDER BY t DESC OFFSET %s LIMIT 1",
+        (host['host'],now,*((host['host'],now) if android else ()),limit-1)).fetchone()
     return None if charged is None else charged['t'] + timedelta(hours=1)
 
 

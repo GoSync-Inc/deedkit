@@ -75,3 +75,6 @@ GRANT SELECT,INSERT,UPDATE,DELETE ON subscription_activity TO messaging_subscrip
 GRANT EXECUTE ON FUNCTION public.journal_contact_birthdays(text) TO messaging_subscriptions;
 -- Schema 90 (ANYM-564): the matcher matches a call source only while its link is live. Read only.
 GRANT SELECT ON module_links,subscription_module_links TO messaging_subscriptions;
+
+-- ANYM-997/schema97: combined shared budgets only; no Android identity, payload or binding access.
+GRANT SELECT(principal,key_id,state,created_at,admitted_at) ON android_wake_intents TO messaging_subscriptions;

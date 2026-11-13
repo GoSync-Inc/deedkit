@@ -1017,6 +1017,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
             headers={**SECURITY_HEADERS,'X-Request-ID':detail['request_id']})
     app.add_exception_handler(Exception,unexpected_error)
     # Preserve the SDK lifespan; no separate MCP protocol implementation.
+    from .android_wake import routes as android_wake_routes
+    app.routes.extend(android_wake_routes(store))
     app.routes.extend([Route('/v1/{operation}',rest,methods=['POST']),
                        Route('/v1/download/{grant}',download,methods=['GET'])])
     sdk_lifespan=app.router.lifespan_context
