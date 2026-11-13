@@ -54,7 +54,10 @@ REASONING = re.compile(r'[a-z][a-z0-9_]{0,31}')
 MAX_LIVE, GRACE, SLACK, CHUNK = 2, 300, 60, 50
 BRIEF_FILES = ('common.md', 'bb-overlay.md', 'feedback-task.md')
 PROMPT = ('Read and follow {b}/common.md, then {b}/bb-overlay.md (it wins on conflict), then the task brief '
-    '{b}/feedback-task.md. Your orchestrator is bb thread {o}. BB task: {k}.')
+    '{b}/feedback-task.md. Your orchestrator is bb thread {o}. BB task: {k}. '
+    'Ownership: this task and its in-scope source, tests and docs files only; determine the exact paths from the task '
+    'and AGENTS.md before edits. Workspace: your own new isolated worktree. Checks: a failing-first regression, '
+    'the touched tests and required CI/main/Tiden checks; commit -s. Preserve other workers\' files and processes.')
 REPORT_ONLY = ("feedback-dispatch: report-only. This task's principal is not on the dispatch list, so no worker was "
     'started for it; a person may start one by hand.')
 SUMMARY = "Summary (the loop's released brief"
@@ -214,6 +217,7 @@ class Threads:
 
     def spawn(self, title, prompt, orchestrator, machine=None):
         argv = ['thread', 'spawn', '--project', self.project, '--parent-thread', orchestrator, '--new-environment', 'worktree',
+            '--visibility', 'visible', '--lifecycle-owner-thread', orchestrator,
             '--base-branch', BASE, '--provider', self.provider, '--model', self.model, '--reasoning-level', self.reasoning, '--title', title,
             '--prompt-file', '-'] + (['--machine', machine] if machine else [])
         thread = self._call(argv, timeout=180, stdin=prompt)

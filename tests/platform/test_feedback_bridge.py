@@ -24,6 +24,14 @@ REQUEST_ID = re.compile(r'[a-zA-Z0-9_.:-]{8,128}')  # feedback_triage.REQUEST_ID
 SERVER_SPEC = re.compile(r'ANYM-[1-9][0-9]{0,5}')  # feedback.SPEC_REF
 
 
+@pytest.fixture(autouse=True)
+def isolate_dispatch_wake(monkeypatch):
+    # Bridge unit fixtures must never reach the host dispatcher/config or start a real worker.
+    real_wake = fb.wake_dispatcher
+    monkeypatch.setattr(fb, 'wake_dispatcher', lambda: None)
+    return real_wake
+
+
 def fid(n):
     return '33333333-3333-4333-8333-%012d' % n
 
@@ -423,6 +431,64 @@ def test_a_card_number_longer_than_the_servers_pattern_names_no_card():
     assert fb.task_spec(['feedback', 'spec:ANYM-123456']) == 'ANYM-123456' and fb.task_spec(['spec:ANYM-1234567']) is None  # feedback.SPEC_REF
     item = fb.normalize(row(1, projection=projection() | {'primary_spec': 'ANYM-1234567'}))
     assert item['projection']['primary_spec'] is None and fb.normalize(row(1, spec_ref='ANYM-1234567'))['spec_ref'] is None
+
+
+# spec: ANYM-991
+def test_durable_forward_changes_wake_once_per_page_and_replayed_events_do_not_wake_again(tmp_path, monkeypatch):
+    bridge, gw, tasks = make(tmp_path)
+    seen = []
+    def wake():
+        assert all(bridge.ledger.link(r['feedback_id']) for r in gw.rows)
+        assert all(tasks.get('DK-%d' % n)['description'].startswith('Feedback-ID: ') for n in (1, 2))
+        seen.append(len(tasks.tasks))
+    monkeypatch.setattr(fb, 'wake_dispatcher', wake)
+    gw.submit(row(1))
+    gw.submit(row(2))
+    bridge.forward()
+    assert seen == [2]
+    gw.events.append(('feedback.received', fid(1)))
+    bridge.forward()
+    assert seen == [2] and len(tasks.tasks) == 2
+    gw.rows[0]['projection'] = projection('A newly released synthetic brief.')
+    gw.rows[0]['_seq'] += 10
+    bridge.forward()
+    assert seen == [2, 2]
+
+
+# spec: ANYM-991
+@pytest.mark.parametrize('failure', ['exit', 'unavailable', 'timeout'])
+def test_dispatch_wake_is_bounded_and_failure_does_not_escape_or_expose_child_output(monkeypatch, capsys,
+        isolate_dispatch_wake, failure):
+    calls = []
+    def runner(argv, **kw):
+        calls.append((argv, kw))
+        if failure == 'unavailable':
+            raise OSError('CANARY-child-path')
+        if failure == 'timeout':
+            raise subprocess.TimeoutExpired(argv, kw['timeout'], output=b'CANARY-child-output')
+        return subprocess.CompletedProcess(argv, 1, b'CANARY-child-output', b'CANARY-child-error')
+    monkeypatch.setattr(fb.subprocess, 'run', runner)
+    isolate_dispatch_wake()
+    assert capsys.readouterr() == ('', 'feedback-bridge: dispatch_wake_failed\n')
+    argv, kw = calls[0]
+    assert argv == [fb.sys.executable, str(Path(fb.__file__).with_name('feedback_dispatch.py')), 'run']
+    assert kw == {'stdin': subprocess.DEVNULL, 'capture_output': True, 'timeout': 240}
+
+
+# spec: ANYM-991
+def test_a_reconciled_unknown_task_create_wakes_the_same_dispatcher_without_creating_again(tmp_path, monkeypatch):
+    bridge, gw, tasks = make(tmp_path)
+    gw.submit(row(1))
+    tasks.next_create = 'uncertain_created'
+    with pytest.raises(fb.Uncertain):
+        bridge.forward()
+    assert len(tasks.tasks) == 1
+    wakes = []
+    monkeypatch.setattr(fb, 'wake_dispatcher', lambda: wakes.append(len(tasks.tasks)))
+    tasks.next_create = None
+    revived, _, _ = make(tmp_path, gateway=gw, tasks=tasks)
+    revived.forward()
+    assert wakes == [1] and len(tasks.tasks) == 1
 
 
 # spec: ANYM-990
