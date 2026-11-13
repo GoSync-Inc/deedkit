@@ -18,6 +18,7 @@ class CodexSession:
         self.process, self.reader, self.stderr_reader = None, None, None
         self.pending, self.serial = {}, 0
         self.thread_id, self.turn_id, self.events = None, None, None
+        self.last_turn_id = None
         self.done, self.lock = asyncio.Event(), asyncio.Lock()
         self.stderr = bytearray()
         self.errors = []
@@ -129,6 +130,7 @@ class CodexSession:
                     'sandboxPolicy': {'type': 'workspaceWrite', 'writableRoots': [str(self.dir)],
                                       'networkAccess': True}})
                 self.turn_id = response['turn']['id']
+                self.last_turn_id = self.turn_id
                 while True:
                     event = await self.events.get()
                     if event is None:
@@ -250,5 +252,5 @@ class PersistentRun(BareRun):
         result['skills_updated'] = []
         if self.session and self.session.process:
             result['native_session'] = {'thread_id': self.session.thread_id, 'pid': self.session.process.pid,
-                                        'turn_id': self.session.turn_id, 'persistent': True}
+                                        'turn_id': self.session.turn_id or self.session.last_turn_id, 'persistent': True}
         return result

@@ -72,6 +72,8 @@ def test_same_live_process_thread_and_context_across_mcp_goals(tmp_path):
         assert second['summary'] == 'Remembered turn 2'
         assert first['native_session']['thread_id'] == second['native_session']['thread_id']
         assert first['native_session']['pid'] == second['native_session']['pid']
+        assert first['native_session']['turn_id'] == 'turn-1'
+        assert second['native_session']['turn_id'] == 'turn-2'
         pid = first['native_session']['pid']
         assert alive(pid) and second['timings']['commands'] == 1
         assert second['tokens'] == dict(input=20, output=3, cache_read=5, cache_write=0)
