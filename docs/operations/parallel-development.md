@@ -37,6 +37,27 @@ per provider, and migration numbers are sequential with immutable checksums. `ci
   complete result; production promotes only a SHA whose own push run succeeded
   ([production.md](production.md)).
 
+## Orchestration host
+
+From the move (owner 11-12: «можно тогда переезжать теперь на этот, на райзен») the orchestrator and its
+workers run in bb on egor-ryzen, project `proj_nfixav7q2f`, not in Paradev on the owner's laptop. Where
+harness `orchestration.md` or a brief names a Paradev command, DeedKit uses its bb equivalent:
+
+| Paradev | bb |
+| --- | --- |
+| `superset workspaces create` (worker) | `bb thread spawn --project proj_nfixav7q2f --parent-thread <orchestrator> --new-environment worktree --base-branch main --provider claude-code --model claude-sonnet-5-5 --reasoning-level xhigh --prompt-file <brief>` |
+| ListAgents, `superset workspaces list` | `bb thread list --parent-thread <orchestrator>` |
+| `superset terminals read`, `superset agents explain` | `bb thread show`, `bb thread log`, `bb thread output` |
+| worker DONE/BLOCKED by SendMessage | the worker's final message reaches its parent; mid-turn `bb thread tell <orchestrator>` |
+| orchestrator message to a worker | `bb thread tell <worker>` |
+| `superset workspaces archive` | `bb thread archive <worker>` (bb removes the worktree) |
+| `superset automations` (wakes, triage) | `bb automation create --at/--cron --target-thread <id>` |
+
+The `SUPERSET_WORKER_DONE` and `SUPERSET_WORKER_BLOCKED` block names stay. bb starts Claude Code
+itself, so a thread gets no per-worker `--settings` or `--strict-mcp-config`: a worker may see the
+claude.ai connectors and calls none of them unless its brief names one. The feedback autoloop's
+controller still drives Paradev (`scripts/autoloop.py`) and stays on the laptop until it is ported.
+
 ## Merge keeper
 
 The merge keeper (`scripts/merge_keeper.py`) enqueues green pull requests, so nothing green waits for a person or the
