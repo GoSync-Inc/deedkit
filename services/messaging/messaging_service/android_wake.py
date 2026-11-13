@@ -201,6 +201,7 @@ def _settle(c,row,state,reason=None,delay=2):
 
 def dispatch(store,*,transport,resolver,served=None):
     """One bounded sender turn in an existing endpoint lane. No standalone worker."""
+    if getattr(store,'pool',None) is None: return {'android_unavailable':1}
     from .event_delivery import ENDPOINT_LANE_LOCK,KEY_IN_FLIGHT
     from .subscriptions import _worker_identity
     from .delivery_policy import admission_slot,host_admission_slot

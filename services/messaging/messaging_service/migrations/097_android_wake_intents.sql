@@ -2,7 +2,7 @@
 -- ANYM-997: Android's own metadata-only outbox. No transport subscription, existing cursor,
 -- message/module kind, existing-table grant or applied migration is changed. Default PAUSED;
 -- only root's separate binding/routine/installed verification can activate a binding.
-CREATE TABLE android_wake_bindings (
+CREATE TABLE IF NOT EXISTS android_wake_bindings (
  principal text NOT NULL REFERENCES principals(id),
  key_id uuid NOT NULL REFERENCES api_keys(id),
  device_id text NOT NULL CHECK(length(device_id) BETWEEN 1 AND 128),
@@ -19,7 +19,7 @@ CREATE TABLE android_wake_bindings (
  after_seq bigint NOT NULL DEFAULT 0 CHECK(after_seq>=0),
  PRIMARY KEY(principal,key_id,device_id)
 );
-CREATE TABLE android_wake_intents (
+CREATE TABLE IF NOT EXISTS android_wake_intents (
  principal text NOT NULL REFERENCES principals(id),
  key_id uuid NOT NULL REFERENCES api_keys(id),
  wake_id uuid NOT NULL,
@@ -41,13 +41,13 @@ CREATE TABLE android_wake_intents (
  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
  PRIMARY KEY(principal,key_id,wake_id)
 );
-CREATE INDEX android_wake_due ON android_wake_intents(state,next_attempt_at);
-CREATE INDEX android_wake_admitted ON android_wake_intents(key_id,admitted_at);
-CREATE UNIQUE INDEX android_wake_one_sending ON android_wake_intents(principal,key_id) WHERE state='sending';
-CREATE UNIQUE INDEX android_wake_original_native_event ON android_wake_intents(principal,key_id,origin_hash);
+CREATE INDEX IF NOT EXISTS android_wake_due ON android_wake_intents(state,next_attempt_at);
+CREATE INDEX IF NOT EXISTS android_wake_admitted ON android_wake_intents(key_id,admitted_at);
+CREATE UNIQUE INDEX IF NOT EXISTS android_wake_one_sending ON android_wake_intents(principal,key_id) WHERE state='sending';
+CREATE UNIQUE INDEX IF NOT EXISTS android_wake_original_native_event ON android_wake_intents(principal,key_id,origin_hash);
 
 -- Read-lock only: the dispatcher cannot mutate activation, routing or source cursors.
-CREATE FUNCTION public.lock_android_wake_binding(p_principal pg_catalog.text,p_key pg_catalog.uuid,
+CREATE OR REPLACE FUNCTION public.lock_android_wake_binding(p_principal pg_catalog.text,p_key pg_catalog.uuid,
     p_device pg_catalog.text) RETURNS SETOF public.android_wake_bindings
 LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path=pg_catalog AS $$
     SELECT b.* FROM public.android_wake_bindings AS b

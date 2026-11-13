@@ -536,7 +536,7 @@ def test_schema63_upgrade_preserves_grants_and_backups_and_is_repeatable(sender,
     # Synthetic disposable database only: reconstruct the exact N-1 guard and ledger.
     with s.pool.connection() as c:
         c.execute(previous[start:end]); c.execute('DROP INDEX outgoing_expiry'); c.execute('DROP INDEX messenger_commands_press')
-        c.execute('DELETE FROM archive_migrations WHERE version IN (63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96)')
+        c.execute('DELETE FROM archive_migrations WHERE version IN (63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97)')
         c.execute("UPDATE probe_metadata SET value='62' WHERE name='schema_version'")
         grants = c.execute("SELECT oid,relacl::text FROM pg_class WHERE relnamespace='public'::regnamespace ORDER BY oid").fetchall()
         guard_acl = c.execute("SELECT proacl::text FROM pg_proc WHERE oid='public.collector_account_guard()'::regprocedure").fetchone()

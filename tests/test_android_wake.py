@@ -401,3 +401,43 @@ def test_real_snapshot_restore_keeps_unknown_original_wake_and_android_cursor(wo
         restored.migrate()
         assert aw.dispatch(restored, transport=lambda *a, **kw: pytest.fail('unknown restored wake replay'),
                            resolver=lambda *a: []) == {}
+
+
+# spec: ANYM-997
+def test_replaying_own_migration_twice_preserves_unknown_rows_object_ids_and_exact_grants(world):
+    from test_db_role_isolation import install, remove
+    store, _, actor, _ = world
+    item = event()
+    stage(world, item)
+    roles = [install(store, 'gateway_role.sql', 'messaging_gateway'),
+             install(store, 'delivery_role.sql', 'messaging_event_delivery')]
+    def snapshot():
+        with store.pool.connection() as c:
+            return (c.execute('SELECT * FROM android_wake_bindings').fetchall(),
+                    c.execute('SELECT * FROM android_wake_intents').fetchall(),
+                    c.execute("SELECT oid,relname,relacl FROM pg_class WHERE relnamespace='public'::regnamespace "
+                              "AND relname LIKE 'android_wake_%' ORDER BY oid").fetchall(),
+                    c.execute("SELECT oid,proacl,proowner,prosrc FROM pg_proc WHERE oid="
+                              "'public.lock_android_wake_binding(text,uuid,text)'::regprocedure").fetchall(),
+                    c.execute("SELECT oid,conname,pg_get_constraintdef(oid) AS definition FROM pg_constraint "
+                              "WHERE conrelid IN ('android_wake_bindings'::regclass,'android_wake_intents'::regclass) "
+                              "ORDER BY oid").fetchall())
+    try:
+        with store.pool.connection() as c:
+            c.execute("UPDATE android_wake_intents SET state='unknown',attempts=1,hold_reason='outcome_unknown'")
+        before = snapshot()
+        for _ in range(2):
+            with store.pool.connection() as c:
+                c.execute('DELETE FROM archive_migrations WHERE version=97')
+                c.execute("UPDATE probe_metadata SET value='96' WHERE name='schema_version'")
+            store.migrate()
+            assert snapshot() == before
+            assert aw.call(store, world[1], 'receipt', {'wake_id': item['wake_id']})['transport_state'] == 'unknown'
+        with store.pool.connection() as c:
+            assert not c.execute("SELECT EXISTS(SELECT 1 FROM pg_proc p,"
+                "LATERAL aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a "
+                "WHERE p.oid='public.lock_android_wake_binding(text,uuid,text)'::regprocedure "
+                "AND a.grantee=0 AND a.privilege_type='EXECUTE') AS allowed").fetchone()['allowed']
+            assert aw._binding(c, actor, 'phone')['after_seq'] == 1
+    finally:
+        for role in roles: remove(store, role)

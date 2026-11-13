@@ -1067,7 +1067,7 @@ def test_migration_70_runs_twice_and_keeps_the_counts_and_every_grant(seeded):
         # The replay re-adds migration 90's type check before 91, 93 and 95 widen it again, so rows of the types those add
         # (left by another module of the same shard, such as the feedback tests) would refuse it.
         c.execute("DELETE FROM module_events WHERE type LIKE 'feedback.%' OR type='module.access.changed'")
-        c.execute('DELETE FROM archive_migrations WHERE version IN (70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96)')
+        c.execute('DELETE FROM archive_migrations WHERE version IN (70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97)')
         c.execute("UPDATE probe_metadata SET value='69' WHERE name='schema_version'")
         grants = c.execute("SELECT oid,relacl::text FROM pg_class WHERE relnamespace='public'::regnamespace ORDER BY oid").fetchall()
     store.migrate()
