@@ -972,13 +972,16 @@ def historical_story(ref):
             or main[0].get('productId') != product or main[0].get('status') != 'open'
             or sum(b.get('id') == main[0]['id'] for b in branches['branches']) != 1):
         raise Refused('historical: main branch authority unavailable')
+    # Protocol JSON may omit an empty repeated sources field and its default-zero count independently.
+    # Explicit null/wrong types and incomplete nonempty sources still refuse; flatten keeps the old [] digest.
     if (not isinstance(spec, dict) or not isinstance(spec.get('id'), str) or not triage.UUID.fullmatch(spec['id'])
             or spec.get('productId') != product or spec.get('branchId') != main[0]['id']
             or type(spec.get('seqNum')) is not int or f"ANYM-{spec['seqNum']}" != ref
             or spec.get('type') != 'User Story' or not isinstance(spec.get('status'), str) or not spec['status']
             or not isinstance(spec.get('title'), str) or not isinstance(spec.get('content'), str)
-            or not spec['content'].strip() or not isinstance(spec.get('sources'), list)
-            or type(spec.get('sourceCount')) is not int or spec['sourceCount'] != len(spec['sources'])
+            or not spec['content'].strip() or not isinstance(spec.get('sources', []), list)
+            or type(spec.get('sourceCount', 0)) is not int
+            or spec.get('sourceCount', 0) != len(spec.get('sources', []))
             or spec.get('contentSha256') != hashlib.sha256(spec['content'].encode()).hexdigest()):
         raise Refused('historical: current main story unavailable or incomplete')
     # Reuse every byte/field of the old collect()['main'] normalizer, including str(source) order. Existing
@@ -1005,8 +1008,15 @@ def assess_historical(state, triage_state, feedback_id, sync_state, host, ssh, r
     source = historical_source(state, triage_state, feedback_id, original, entry, cfg, held, host, ssh)
     spec = historical_story(source['spec_ref'])
     if entry is not None:
+        # The unchanged legacy decision may retain secondary matches. Their saved snapshot proves only old
+        # provenance; the fixed primary's current authority/context always comes from the fresh main lookup.
+        try:
+            provenance = triage.known(triage.load(triage_state / 'snapshot.json', {'main': [], 'branches': {}}))
+        except (KeyError, TypeError, AttributeError, ValueError):
+            raise Refused('historical: legacy story provenance unavailable') from None
+        provenance[spec['ref']] = dict(spec, branch='main')
         triage.checked({'id': feedback_id, **{k: entry[k] for k in ('classification', 'reason', 'specs', 'primary')}},
-                       {spec['ref']: dict(spec, branch='main')}, {feedback_id: original['key_id']})
+                       provenance, {feedback_id: original['key_id']})
     observed = (projection_lookup or (lambda i: current_projection(i, host, ssh, allow_missing=True)))(feedback_id)
     identity = {k: observed.get(k) for k in IDENTITY_FIELDS} if isinstance(observed, dict) else {}
     if (not isinstance(observed, dict) or observed.get('feedback_id') != feedback_id or 'projection' not in observed

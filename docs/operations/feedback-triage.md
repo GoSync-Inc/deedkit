@@ -336,10 +336,16 @@ Historical assessment and queued publication each read only the fixed accepted s
 ANYM-n` (CLI KEY-N resolution targets main) and `tiden branch list` metadata, with explicit repository product and
 workspace IDs. The unique open `main` UUID must match the story's branch/product; the exact ref, story UUID/type,
 field shapes, content hash and source count must be complete. These are two bounded CLI calls independent of open
-branch count; no branch spec inventories or cached snapshot substitute. Both paths use the unchanged triage
+branch count. Protocol JSON may omit empty `sources` and default-zero `sourceCount` independently; explicit null,
+wrong types or inconsistent/nonempty missing data still refuse. These defaults preserve the old empty-source digest.
+No branch spec inventories or cached snapshots substitute for these reads. Both paths use the unchanged triage
 normalizer, including raw text and ordered full source metadata stringification, so already queued collector-based
 story digests still match. Any changed normalized field refuses publication. Normal triage/snapshots still inventory
 main and every open branch; unknown publication outcomes still reconcile exact metadata without resending.
+An unchanged ledger decision may retain secondary accepted matches: its saved snapshot/known map validates those
+historical references only, with the primary overridden by the fresh main story. Missing or malformed provenance
+refuses. The reader receives only the fixed fresh primary and cannot route to an old secondary; original ledger
+and snapshot bytes stay intact, and publication still checks the full original-record digest.
 
 `historical-assessments.json` stores a fsynced once-only attempt before charge/invocation: original and story digests,
 current identity, exact prior projection (including explicit absence), then the new validated assessment and exact
