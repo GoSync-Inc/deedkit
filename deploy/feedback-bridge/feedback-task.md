@@ -17,7 +17,7 @@ Owner items once.
   anything.
 - Before every Tiden write, push, ready dispatch and merge arm run
   `python3 ~/.local/lib/deedkit-feedback-bridge/feedback_dispatch.py gate <key>`. On exit 1 stop at once: write nothing
-  more, comment `stopped: <the word it printed>` on the task and end with a `SUPERSET_WORKER_BLOCKED` block.
+  more, comment `stopped: <the word it printed>` on the task and end with a `BB_WORKER_BLOCKED` block.
 
 ## Steps
 1. `tiden intent skip`, then read the task. Its first line is `Feedback-ID: <uuid>`; its `Triage:` line names the cluster
@@ -28,7 +28,7 @@ Owner items once.
 3. Size it. The envelope is at most 8 SP, no epic, no OWNER change path and none of the "Owner items" of
    feedback-autoloop.md (a grant, allowlist, opt-in, key, non-additive migration, live action, secret, criterion weakening).
    Outside it: build nothing, comment on the task `waits for the owner: <what>` or `queued: large card`, set its status back
-   to `todo` and end with a `SUPERSET_WORKER_BLOCKED` block.
+   to `todo` and end with a `BB_WORKER_BLOCKED` block.
 4. A card is needed for a feature, or an improvement that no card covers: one story on `proposal/<slug>`, in your own words,
    with the lines `Feedback: <id>` (the full IDs of this task and of its siblings with the same `Triage:` card or new-card
    slug), `Source: feedback-dispatch <principal>` (the principal of the task's `Source:` line) and `Ready: <date>, author
@@ -41,10 +41,10 @@ Owner items once.
 6. Before you arm anything, run the change-path signal grep and the autoloop protected-path greps of
    docs/operations/review-protocol.md ("Pull request lines") on the real diff at the PR's head. A hit, an OWNER
    `Change path:` or anything in step 3: do not arm and add no `ship` label; leave the PR a draft, comment
-   `waits for the owner: <what>` on the task and end with a `SUPERSET_WORKER_BLOCKED` block that names the hit.
+   `waits for the owner: <what>` on the task and end with a `BB_WORKER_BLOCKED` block that names the hit.
 7. A clean head: gate, mark the PR ready, arm it as common.md says (`gh pr merge --auto`, label `ship`), set the task
    `in_review`, and comment the card, the PR link and the head. Wait for the merge as common.md says; when it has merged,
    comment the squash SHA. Never set `done`: BB done is not fixed or deployed, and only release evidence moves the feedback
    item.
-8. End with one `SUPERSET_WORKER_DONE` block (task key, card, PR, squash SHA, task status) or a `SUPERSET_WORKER_BLOCKED`
+8. End with one `BB_WORKER_DONE` block (task key, card, PR, squash SHA, task status) or a `BB_WORKER_BLOCKED`
    block.

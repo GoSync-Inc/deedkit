@@ -7,8 +7,7 @@ step 1, owner 10-26). Changing it is an OWNER change.
 
 Runtime (owner 11-12, on moving DeedKit to bb on egor-ryzen: «цикл наверное здесь по-другому, как-то можно
 организовать другим способом ... поискать способ закрыть этот же джобс то би дан только функционалами которые
-есть бб»; «можешь запускать, настраивать все»): the loop's workers and its schedule use the `bb` CLI, no longer
-Superset or launchd. The boundary, envelope, caps and undo below are unchanged; only what starts and lists a
+есть бб»; «можешь запускать, настраивать все»): the loop's workers and its schedule use the `bb` CLI. The boundary, envelope, caps and undo below are unchanged; only what starts and lists a
 worker, and what runs the hourly job, moved (a worker is a bb thread, the job a bb script automation). The port
 assumes no host: the controller runs where the export's ssh alias works (DevOps boundary 11-12: egor-ryzen has no
 ssh to `deedkit-prod`; production administration stays on the owner's admin Mac), the ssh alias and host stay
@@ -383,7 +382,7 @@ is one line.
 Card workers, and build workers until ANYM-574 (container runner), use the owner's gh, Tiden,
 bb and SSH logins, so a steered worker can do what those logins allow (a card worker is a bb thread
 with its parent's permission mode; `bb-overlay.md` tells it to call no `mcp__claude_ai_*` tool, and that
-instruction is the only barrier now that the Superset worker preset's empty MCP config is gone). Since ANYM-574 a
+instruction is the barrier for inherited host MCP tools). Since ANYM-574 a
 build worker runs in the container runner: no SSH, no route to the production host, no bb login. It still holds the owner's gh and Tiden tokens, so it can do what those allow (a merge
 outside the controller included). Brief rules, the gate and the post-merge audit (a merged loop PR
 whose head the controller did not approve pauses the loop) detect this; they do not prevent it.
