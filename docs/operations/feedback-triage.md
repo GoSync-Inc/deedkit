@@ -314,6 +314,40 @@ principals stay excluded. Already recorded IDs refuse this command and use proje
 Before/after: retain the selected inbox/refusal evidence and read back its original ID, normal disposition and
 queued projection; all unselected rows stay intact. After a valid triage commit, never undo it by resetting ledger
 or counters: use normal task holds/corrections. Do not loop either recovery command or broaden its UUID scope.
+### Explicit historical accepted assessment (DK-33)
+
+For an original accepted item with no local ledger, or an opaque historical reason, the administrative controller
+may select exactly one UUID with `python3 scripts/autoloop.py repair-brief <uuid> --historical-accepted` and the
+same state arguments. This is a **new projection-only assessment**, explicitly separate from the old triage.
+Without this flag, normal read/repair rules stay unchanged. Do not derive a reason code from old prose or task words.
+
+Before invoking the unchanged pinned, tool-less reader, the command acquires the three normal locks, checks caps,
+principals, PAUSE/STOP/DROP, holds and unsettled operations, and correlates fresh operator source/projection reads
+with the original key/principal/creation time and current accepted primary. It reads the current main story without
+replacing the old snapshot. Existing recorded bug/feature classification and accepted primary remain fixed. Only
+for an inbox original without a ledger may the reader supply a new closed classification. Historical reason reaches
+only that isolated reader as opaque provenance. Author verdicts, enable-only/opt-in, owner requests, already-live,
+unknown or unsafe assessments release no work brief. An actionable answer must select exactly the same accepted
+primary, have no new card/duplicate, and pass the existing 600-character scrub/five-source-words gate against both
+source and provenance. No triage record, disposition, key, cursor, refusal history or historical budget is rewritten.
+Only the normal daily reader charge is added.
+
+`historical-assessments.json` stores a fsynced once-only attempt before charge/invocation: original and story digests,
+current identity, exact prior projection (including explicit absence), then the new validated assessment and exact
+queued projection. It stores no original prose. Every outcome blocks another reader attempt, including ordinary
+automatic/selected reads of that original. Never delete/reset this journal to retry a failed or uncertain attempt.
+
+The normal scheduled publisher also admits these separate identities without manufacturing a triage ledger entry.
+It rechecks original/story/holds, then sends one `expected_initial` guard through the existing operator-only JSON
+command. The database locks the feedback row and projection before comparing the exact identity, accepted primary
+and prior absence or release/digest. An appeared/changed projection or a complete brief refuses atomically. Existing
+`expected_prior` nonempty refinement semantics are unchanged. There are no new permissions, keys, enums or migrations.
+An unknown send remains `dispatching`: only a fresh exact identity/projection read can confirm it; never resend.
+The retained journal reconstructs a lost queue write without invoking the reader again. Read back the published
+projection through the ordinary bridge/dispatcher and verify original state/budget history stayed intact. Source CI
+is not installed-path acceptance; root owns those selected runtime attempts. Before publication, undo by holding the
+item and reverting source while retaining the journal/intent. After publication use the separately authorized correction path.
+
 - A new CLI version needs a new pin: update `CLI_VERSION`, `CLI_SHA256` and `PROFILE` in `scripts/autoloop.py`
   (module docstring, "Reader CLI pin"), then `autoloop.py install-cli`, after the canary run on the Mac: `AUTOLOOP_CANARY=1 uv run pytest tests/platform/test_autoloop.py
   -k canary` (hostile settings, hook, MCP config, plugin, memory file and symlink around the
