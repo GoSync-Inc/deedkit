@@ -410,3 +410,101 @@ def test_the_operator_command_reads_its_file_and_prints_counts_only(monkeypatch,
     with pytest.raises(ValueError, match='invalid_projection_file'):
         operator.main()
     assert [call_[0] for call_ in RecordingStore.calls if call_[0] != 'close'] == []
+
+
+# spec: ANYM-988
+def test_operator_refinement_read_and_atomic_expected_prior_guard(clean):
+    from scripts.autoloop import projection_digest
+    store = clean
+    fid = submit(store, identity(store), 1, description='private synthetic body')
+    store.set_feedback_status([fid], 'accepted', spec_ref='ANYM-988')
+    first = projection(fid, reason_code='matches-card', primary_spec='ANYM-988', new_card=None)
+    record(store, first)
+    before = store.get_feedback_projection(fid)
+    assert before['feedback_id'] == fid and before['status'] == 'accepted'
+    assert 'description' not in before and before['projection']['released_brief'] == first['released_brief']
+    identity_fields = ('principal', 'key_id', 'created_at', 'status', 'status_changed_at', 'spec_ref', 'duplicate_of')
+    expected = {'release': before['projection']['released_at'], 'digest': projection_digest(before['projection']),
+                'identity': {k: before[k] for k in identity_fields}}
+    newer = projection(fid, reason_code='matches-card', primary_spec='ANYM-988', new_card=None,
+                       released_brief='The useful revised synthetic summary.',
+                       released_at=datetime.now(timezone.utc).isoformat())
+    bad = dict(expected, digest='0' * 64)
+    with pytest.raises(ValueError, match='stale_projection'):
+        store.record_feedback_projection({'projections': [newer], 'expected_prior': bad})
+    assert store.get_feedback_projection(fid) == before
+    assert store.record_feedback_projection({'projections': [newer], 'expected_prior': expected}) == {'recorded': 1, 'unchanged': 0}
+    assert store.get_feedback_projection(fid)['projection']['released_brief'] == newer['released_brief']
+    with pytest.raises(ValueError, match='stale_projection'):
+        store.record_feedback_projection({'projections': [newer], 'expected_prior': expected})
+
+
+# spec: ANYM-988
+def test_guard_refuses_status_change_and_never_exposes_original_text(clean):
+    from scripts.autoloop import projection_digest
+    store = clean
+    fid = submit(store, identity(store), 1, description='private synthetic original')
+    store.set_feedback_status([fid], 'accepted', spec_ref='ANYM-988')
+    item = projection(fid, reason_code='matches-card', primary_spec='ANYM-988', new_card=None)
+    record(store, item)
+    before = store.get_feedback_projection(fid)
+    assert 'private synthetic original' not in json.dumps(before)
+    fields = ('principal', 'key_id', 'created_at', 'status', 'status_changed_at', 'spec_ref', 'duplicate_of')
+    guard = {'release': before['projection']['released_at'], 'digest': projection_digest(before['projection']),
+             'identity': {k: before[k] for k in fields}}
+    newer = dict(item, released_brief='A revised safe summary.', released_at=datetime.now(timezone.utc).isoformat())
+    store.set_feedback_status([fid], 'declined')
+    with pytest.raises(ValueError, match='stale_projection'):
+        store.record_feedback_projection({'projections': [newer], 'expected_prior': guard})
+    after = store.get_feedback_projection(fid)
+    assert after['status'] == 'declined' and after['projection'] == before['projection']
+
+
+# spec: ANYM-988
+def test_guard_and_concurrent_status_change_serialize_on_feedback_row(clean):
+    import threading
+    from scripts.autoloop import projection_digest
+    store = clean
+    fid = submit(store, identity(store), 1)
+    store.set_feedback_status([fid], 'accepted', spec_ref='ANYM-988')
+    item = projection(fid, reason_code='matches-card', primary_spec='ANYM-988', new_card=None)
+    record(store, item)
+    before = store.get_feedback_projection(fid)
+    fields = ('principal', 'key_id', 'created_at', 'status', 'status_changed_at', 'spec_ref', 'duplicate_of')
+    guard = {'release': before['projection']['released_at'], 'digest': projection_digest(before['projection']),
+             'identity': {k: before[k] for k in fields}}
+    newer = dict(item, released_brief='A revised safe summary.', released_at=datetime.now(timezone.utc).isoformat())
+    started, errors = threading.Event(), []
+    def guarded_write():
+        started.set()
+        try:
+            store.record_feedback_projection({'projections': [newer], 'expected_prior': guard})
+        except ValueError as error:
+            errors.append(str(error))
+    with store.pool.connection() as c:
+        c.execute("UPDATE agent_feedback SET status='declined',status_changed_at=clock_timestamp(),spec_ref=NULL WHERE id=%s", (fid,))
+        worker = threading.Thread(target=guarded_write)
+        worker.start()
+        assert started.wait(1)
+    worker.join(5)
+    assert not worker.is_alive() and errors == ['stale_projection']
+    assert store.get_feedback_projection(fid)['projection'] == before['projection']
+
+
+# spec: ANYM-988
+def test_operator_projection_read_is_one_uuid_and_remains_operator_only(monkeypatch, tmp_path, capsys):
+    fid = str(uuid4())
+    class ReadStore(RecordingStore):
+        calls = []
+        def get_feedback_projection(self, feedback_id):
+            self.calls.append(('get_feedback_projection', feedback_id))
+            return {'feedback_id': feedback_id, 'projection': None}
+    monkeypatch.setattr(operator, 'Store', ReadStore)
+    dsn = tmp_path / 'synthetic.dsn'
+    dsn.write_text('postgresql://synthetic.invalid/messaging_probe_test')
+    monkeypatch.setenv('DATABASE_URL_FILE', str(dsn))
+    monkeypatch.setattr(sys, 'argv', ['anymsg', 'get-feedback-projection', '--id', fid])
+    operator.main()
+    assert ReadStore.calls == [('get_feedback_projection', fid), ('close',)]
+    assert json.loads(capsys.readouterr().out) == {'feedback_id': fid, 'projection': None}
+    assert 'get_feedback_projection' not in OPERATION_PERMISSIONS

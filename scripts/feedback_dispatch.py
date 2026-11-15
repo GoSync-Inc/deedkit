@@ -22,7 +22,7 @@ try:
 except ImportError:  # run as a script from the install directory
     import feedback_bridge as fb
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
@@ -31,8 +31,10 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 PROJECT = 'proj_nfixav7q2f'  # the bb project of the workers' threads
@@ -225,6 +227,28 @@ class Threads:
             raise fb.Uncertain('spawn_bad_reply')
         return thread['id']
 
+    def idle(self, thread_id):
+        """Positive fresh evidence only: no turn, queue, terminal, workflow or background work."""
+        def quiet():
+            rows = self.rows([thread_id])
+            if len(rows) != 1 or rows[0].get('id') != thread_id:
+                return False
+            row = rows[0]
+            activity = row.get('activity')
+            names = ('activeWorkflowCount', 'activeBackgroundAgentCount', 'activeBackgroundCommandCount', 'activePlanModeCount')
+            return (row.get('status') == 'idle' and row.get('queuedWork') == 'none'
+                    and row.get('hasPendingInteraction') is False and isinstance(activity, dict)
+                    and all(type(activity.get(n)) is int and activity[n] == 0 for n in names))
+        try:
+            if not quiet():
+                return False
+            queue = self._call(['thread', 'queue', 'list', thread_id])
+            terminals = self._call(['terminal', 'list', '--thread', thread_id])
+            return (queue == [] and isinstance(terminals, dict) and isinstance(terminals.get('sessions'), list)
+                    and all(isinstance(s, dict) and s.get('status') == 'exited' for s in terminals['sessions']) and quiet())
+        except fb.BridgeError:
+            return False
+
 
 class Journal:
     """One SQLite file (WAL, synchronous=FULL): a committed row survives a crash. One flock holds the writer."""
@@ -302,10 +326,15 @@ class Dispatcher:
         if not self.cfg.dispatch or self.paused():
             return stats
         with self.lock():
-            self.live, self.statuses = set(), {}
-            self.reconcile(stats)
-            self.attach_pending(stats)
-            self.start_due(stats)
+            try:
+                self.live, self.statuses = set(), {}
+                self.reconcile(stats)
+                self.attach_pending(stats)
+                self.start_due(stats)
+            finally:
+                if self._journal is not None:
+                    self._journal.db.close()  # SQLite's last-close checkpoint also belongs under the writer lock
+                    self._journal = None
         return stats
 
     def task_status(self, key):
@@ -335,6 +364,8 @@ class Dispatcher:
                     self.journal.set(row['id'], state='started', thread_id=found['id'])
                     started.append(dict(row, state='started', thread_id=found['id']))
                     stats['reconciled'] += 1
+                elif row['task_key'] in self.cfg.hold:
+                    self.live.add(row['task_key'])  # unknown spawn cannot prove idle
                 elif self.now() - row['started_at'] >= GRACE:
                     self.journal.set(row['id'], state='lost', ended_at=self.now())
                 else:
@@ -343,7 +374,10 @@ class Dispatcher:
             by_id = {t.get('id'): t for t in self.threads.rows([r['thread_id'] for r in started])}
             for row in started:
                 thread, status = by_id.get(row['thread_id']), self.task_status(row['task_key'])
-                if thread is None or thread.get('archivedAt') or thread.get('deletedAt'):
+                if row['task_key'] in self.cfg.hold:
+                    if thread is None or not self.threads.idle(row['thread_id']):
+                        self.live.add(row['task_key'])
+                elif thread is None or thread.get('archivedAt') or thread.get('deletedAt'):
                     self.journal.set(row['id'], state='finished' if status in ENDED else 'lost', ended_at=self.now())
                 elif status in OPEN:
                     self.live.add(row['task_key'])
@@ -440,7 +474,56 @@ class Dispatcher:
         self.attach({'id': row, 'task_key': key, 'thread_id': thread}, stats)
 
     # ---- commands ----
-    def gate(self, key):
+    def snapshot_rows(self):
+        """Read a WAL-consistent private snapshot under the same lock held by every journal writer."""
+        def identity(info):
+            return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+        state = self.cfg.state_dir
+        fd = os.open(state / 'dispatch.lock', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            lock_stat = os.fstat(fd)
+            if not stat.S_ISREG(lock_stat.st_mode) or identity(os.stat(state / 'dispatch.lock', follow_symlinks=False)) != identity(lock_stat):
+                raise OSError('lock replaced')
+            names = ('dispatch.sqlite3', 'dispatch.sqlite3-wal')
+            copies, before = {}, {}
+            for name in names:
+                path = state / name
+                try:
+                    src = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                except FileNotFoundError:
+                    if name == names[0]:
+                        raise
+                    before[name] = None
+                    continue
+                with os.fdopen(src, 'rb') as stream:
+                    info = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(info.st_mode):
+                        raise OSError('not regular')
+                    copies[name] = stream.read()
+                    if identity(os.fstat(stream.fileno())) != identity(info):
+                        raise OSError('changed during read')
+                    before[name] = identity(info)
+            for name in names:
+                try:
+                    after = identity(os.stat(state / name, follow_symlinks=False))
+                except FileNotFoundError:
+                    after = None
+                if after != before[name]:
+                    raise OSError('changed during snapshot')
+            if identity(os.stat(state / 'dispatch.lock', follow_symlinks=False)) != identity(lock_stat):
+                raise OSError('lock replaced')
+            with tempfile.TemporaryDirectory(prefix='feedback-gate-') as directory:
+                for name, data in copies.items():
+                    (Path(directory) / name).write_bytes(data)
+                with closing(sqlite3.connect(Path(directory) / names[0])) as db:
+                    db.row_factory = sqlite3.Row
+                    return [dict(row) for row in db.execute('SELECT * FROM starts ORDER BY id')]
+        finally:
+            os.close(fd)
+
+    def gate(self, key, reload_config=None):
         """0 while the worker of `key` may go on: no PAUSE, not held, a `starting` or `started` row. No bb call."""
         if not KEY.fullmatch(key):
             reason = 'bad_key'
@@ -448,10 +531,16 @@ class Dispatcher:
             reason = 'paused'
         elif key in self.cfg.hold:
             reason = 'held'
-        elif not any(r['task_key'] == key and r['state'] in ('starting', 'started') for r in self.journal.rows()):
-            reason = 'not_live'
         else:
-            reason = None
+            try:
+                rows = self.snapshot_rows()
+                if reload_config:
+                    self.cfg = reload_config()
+                reason = ('paused' if self.paused() else 'held' if key in self.cfg.hold else
+                          None if any(r['task_key'] == key and r['state'] in ('starting', 'started') for r in rows)
+                          else 'not_live')
+            except (OSError, sqlite3.Error, fb.BridgeError):
+                reason = 'unavailable'
         print('go' if reason is None else 'stop ' + reason)
         return 0 if reason is None else 1
 
@@ -479,9 +568,14 @@ def main(argv=None, environ=None, tasks=None, threads=None, now=time.time):
         if argv[0] == 'check':
             return check(cfg, tasks)
         if argv[0] == 'gate':
-            return dispatcher.gate(argv[1])
+            return dispatcher.gate(argv[1], lambda: load_config(None, os.environ if environ is None else environ))
         if argv[0] == 'status':
-            for r in dispatcher.journal.rows():
+            try:
+                rows = dispatcher.snapshot_rows()
+            except (OSError, sqlite3.Error):
+                log('journal_unavailable')
+                return 1
+            for r in rows:
                 print('%s attempt=%d state=%s thread=%s' % (r['task_key'], r['attempt'], r['state'], r['thread_id'] or '-'))
             return 0
         stats = dispatcher.run()

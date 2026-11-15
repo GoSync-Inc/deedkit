@@ -23,6 +23,8 @@ class Recording(Fakes):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        for row in self.submissions:
+            row.setdefault('status', 'received')
         self.records, self.record_error = [], None
 
     def ssh(self, host, argv, stdin=None):
@@ -154,3 +156,91 @@ def test_config_accepts_the_flag_only_as_a_boolean_and_an_item_older_than_a_week
     calls = []
     assert autoloop.record_projection(a, 'host', lambda *args, **kwargs: calls.append(args), NOW, fresh=False) is None
     assert calls == [] and triage.load(a / 'projection.json', None) == {}
+
+
+# spec: ANYM-988
+def test_pending_projection_drains_before_catalog_failure_but_respects_owner_and_hold_fences(loop):
+    t, a, s = loop
+    configure(a, live=True, record_projection=True)
+    row = submission(D1, 'Synthetic feedback text')
+    fakes = Recording([row])
+    reader_answers(fakes)
+    fakes.record_error = 'ssh exited 1'
+    run_tick(loop, fakes)
+    pending = triage.load(a / 'projection.json', {})
+    assert D1 in pending
+    fakes.record_error = None
+    fakes.records.clear()
+    def fail_catalog(*args, **kwargs):
+        raise triage.Refused('catalog timeout')
+    fakes.tiden = fail_catalog
+    with pytest.raises(triage.Refused, match='catalog timeout'):
+        run_tick(loop, fakes)
+    assert json.loads(fakes.records[0]['stdin'])['projections'] == [pending[D1]]
+
+
+# spec: ANYM-988
+@pytest.mark.parametrize('fence', ['hold-item', 'hold-card', 'drop', 'owner', 'status', 'sync-unknown'])
+def test_pending_projection_remains_queued_when_fresh_fence_refuses(loop, fence):
+    t, a, s = loop
+    configure(a, live=True, record_projection=True)
+    row = submission(D1, 'Synthetic feedback text')
+    fakes = Recording([row])
+    reader_answers(fakes)
+    fakes.record_error = 'ssh exited 1'
+    run_tick(loop, fakes)
+    pending = triage.load(a / 'projection.json', {})
+    fakes.records.clear()
+    fakes.record_error = None
+    if fence == 'hold-item':
+        triage.save(a / 'holds.json', {'cards': {}, 'items': {D1: {}}})
+    elif fence == 'hold-card':
+        triage.save(a / 'holds.json', {'cards': {'new:synthetic-card': {}}, 'items': {}})
+    elif fence == 'drop':
+        fakes.submissions.append(submission(P1, 'AUTOLOOP DROP ' + D1))
+    elif fence == 'owner':
+        row['principal'] = 'other'
+    elif fence == 'status':
+        row['status'] = 'declined'
+    else:
+        s.mkdir(exist_ok=True)
+        (s / 'pending.json').write_text('{}')
+    def fail_catalog(*args):
+        raise triage.Refused('catalog timeout')
+    fakes.tiden = fail_catalog
+    with pytest.raises(triage.Refused, match='catalog timeout'):
+        run_tick(loop, fakes)
+    assert not fakes.records and triage.load(a / 'projection.json', {}) == pending
+
+
+# spec: ANYM-988
+def test_owner_stop_fences_pending_projection_before_catalog(loop):
+    t, a, s = loop
+    configure(a, live=True, record_projection=True)
+    fakes = Recording([submission(D1, 'Synthetic feedback text')])
+    reader_answers(fakes)
+    fakes.record_error = 'ssh exited 1'
+    run_tick(loop, fakes)
+    pending = triage.load(a / 'projection.json', {})
+    fakes.records.clear()
+    fakes.record_error = None
+    fakes.submissions.append(submission(P1, 'AUTOLOOP STOP'))
+    run_tick(loop, fakes)
+    assert (a / 'PAUSE').exists() and not fakes.records
+    assert triage.load(a / 'projection.json', {}) == pending
+
+
+# spec: ANYM-988
+def test_fresh_decisions_do_not_replace_an_existing_pending_timestamp(states):
+    t, a = states
+    run_read(states, decision(P1, 'reported-bug', reason_code='new-idea', new_card='synthetic-card', card_brief=BRIEF))
+    old = autoloop.projection_items(a, NOW)[P1]
+    triage.save(a / autoloop.PROJECTION, {P1: old})
+    sent = []
+    def ssh(host, argv, stdin=None):
+        if argv[:2] == ['docker', 'inspect']:
+            return 'sha256:' + '0' * 64
+        sent.append(json.loads(stdin))
+        return RECORDED
+    autoloop.record_projection(a, 'synthetic', ssh, NOW + timedelta(hours=1), fresh=True)
+    assert sent == [{'projections': [old]}]

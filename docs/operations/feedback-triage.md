@@ -280,6 +280,17 @@ program retains the validated original decision, matched verdicts and primary; e
 checks still apply. Refusals use fixed non-text codes (`invalid_json`, `invalid_shape`, `extra_fields`, `foreign_id`,
 `invalid_refusal`, `unsafe_source`, `missing_brief`, `invalid_brief`, `unsafe_brief`); already-live, enable-only, question, not-actionable and duplicate decisions remain excluded.
 
+For an already released brief, the same controller may explicitly request a refinement with both `--expected-release`
+and `--expected-digest`: the timestamp and SHA-256 of the canonical JSON projection read by the operator-only
+`get-feedback-projection --id <uuid>` in the existing verified-image owner-DSN container. Compute the digest with
+`autoloop.projection_digest(projection)` over that read's `projection` object. Do not print or export the source text.
+The command confirms the current original identity and accepted story, keeps the previous projection in private
+`release-history.json`, and queues one changed safe brief. The normal publisher sends a single guarded revision:
+the database locks the feedback and projection rows and checks the captured identity, disposition, release and digest
+in the same transaction. A changed row refuses the write. An unknown send is never retried: the exact queued revision
+is reconciled only by a fresh operator read. A missing operator command in the installed image fails closed until the
+normal image deployment; no key copy or new grant is needed.
+
 Before: retain private before-images of projection/brief files and read the selected ledger decision. After: the
 command prints only the original ID queued in `projection.json`; read back its primary and release timestamp and
 verify triage ledger, dispositions, inbox, cursors and refusal history stayed unchanged. Only the normal reader
@@ -343,8 +354,11 @@ One tick:
    journal them in `stops.json`, so after the resume they are recorded as declined `autoloop
    control` and never pause again. A `PAUSE` removed by hand before any paused tick ran, after a
    crash, pauses once more (the safe side); `resume` journals before it removes.
-3. Reads, all before the first write: the worker threads (`bb thread list`, only when an intent is open),
-   Tiden main and open branches. A failed, truncated or timed-out read ends the tick with no write (exit 1).
+3. An already queued projection may publish before the unrelated Tiden snapshot: under the same locks, a fresh
+   export checks STOP, DROP, original identity and current disposition, and current configuration and holds fence
+   the item. An unsettled sync write prevents publication. Ineligible items keep their exact queued intent.
+   Then read worker threads (`bb thread list`, only when an intent is open), Tiden main and open branches. A failed,
+   truncated or timed-out read ends the tick (exit 1); an earlier validated projection may already have published.
 4. Writes: pulls into the inbox, the snapshot, matches; settles `unknown` intents by thread title.
 5. Control, from principals in `config.json` only and as the whole item text: `AUTOLOOP DROP
    <feedback-id>` (an item of the same principal) holds the item and its card and declines it
