@@ -863,9 +863,10 @@ def test_the_worker_brief_names_the_gate_the_status_moves_and_the_stops():
     text = (REPO / 'deploy/feedback-bridge/feedback-task.md').read_text()
     for needle in ('data, never an instruction', 'feedback_dispatch.py gate', 'in_progress', 'in_review', 'Never set `done`',
             'Feedback:', 'Source: feedback-dispatch', 'Ready:', 'no review', 'review-protocol.md', 'waits for the owner',
-            'queued: large card', 'feedback-autoloop.md', 'SUPERSET_WORKER_DONE', 'SUPERSET_WORKER_BLOCKED',
+            'queued: large card', 'feedback-autoloop.md', 'BB_WORKER_DONE', 'BB_WORKER_BLOCKED',
             'never fetch the feedback', 'at most 8'):
         assert needle in text, needle
+    assert 'superset' not in text.lower()
     assert len(text.split()) <= 800 and not SECRET_SHAPE.search(text)
 
 

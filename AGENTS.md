@@ -103,9 +103,10 @@ tests/test_merge_keeper.py, tests/platform/test_autoloop.py.
 ## 6. Working with the orchestrator
 
 - Word cap: 1,000 words (`wc -w`).
-- Covered fixes use task-flow.md's three-field brief, one executor and touched tests locally;
-  CI owns full suites. Dispatch current scope and exceptions, not the feature roadmap or
-  completed incidents. One receipt/PR indexes evidence. Consume exact CI/publication/B receipts
-  once; duplicate test/link listings need a concrete gap (ci-worker-handoff.md). Correct a
-  contradictory brief before dispatch; interrupt only for changed authority, a blocker or
-  wrong direction. This replaces expanded per-fix handoffs (owner 11-15).
+- Runtime: BB (`bb thread`, `bb tasks`); parent delivery and `BB_WORKER_*`.
+  Overrides legacy harness orchestration.md commands.
+- Covered fixes: task-flow.md's Problem/Expected/Proof; one executor; touched local tests,
+  full CI suites. Dispatch scope/exceptions, not roadmap/history. One receipt/PR indexes evidence.
+  Consume exact CI/publication/B once; duplicate inventories require a concrete gap
+  (ci-worker-handoff.md). Correct contradictory briefs before dispatch; interrupt only for
+  changed authority, blockers or wrong direction. Replaces expanded handoffs (owner 11-15).
