@@ -104,6 +104,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import feedback_triage as triage  # noqa: E402
+import autoloop_github  # noqa: E402
 import receipt_watch  # noqa: E402
 
 STATE = Path.home() / '.deedkit' / 'autoloop'
@@ -1246,6 +1247,8 @@ def bb_cli(argv, stdin=None):
 
 
 def gh_cli(argv):
+    if argv[:2] == ['api', 'graphql'] and any(a.startswith('q=repo:') for a in argv):
+        return autoloop_github.read(argv, CALL_TIMEOUT)
     return triage.run(['gh', *argv], CALL_TIMEOUT)
 
 
@@ -2138,22 +2141,8 @@ def disarm(gh, pr, failed):
 
 
 def search_merged(gh, since):
-    """Every merged PR of the repository since `since` (forks too), read whole; the audit picks the loop's."""
-    query = ('query($q: String!, $after: String) { search(query: $q, type: ISSUE, first: 100, after: $after) { '
-             f'pageInfo {{ hasNextPage endCursor }} nodes {{ ... on PullRequest {{ {PR} }} }} }} }}')
-    q, out, after = f'repo:{REPO} is:pr is:merged merged:>={since.date().isoformat()}', [], None
-    for _ in range(10):
-        argv = ['api', 'graphql', '-f', 'query=' + query, '-f', 'q=' + q] + (['-f', f'after={after}'] if after else [])
-        reply = triage.parse(gh(argv), 'gh api graphql search')
-        try:
-            found = reply['data']['search']
-            out += [p for p in found['nodes'] if p]
-            if not found['pageInfo']['hasNextPage']:
-                return out
-            after = found['pageInfo']['endCursor']
-        except (KeyError, TypeError, AttributeError):
-            raise Refused('gh api graphql search: unexpected reply') from None
-    raise Refused('gh: more than 1000 merged pull requests to audit')
+    """Every merged PR since `since` (forks too), complete or an explicit bounded read failure."""
+    return autoloop_github.search(gh, since, REPO)
 
 
 def audit(state, prs, now):

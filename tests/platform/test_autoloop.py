@@ -1008,7 +1008,7 @@ class Fakes:
         elif argv[:2] == ['api', 'graphql'] and 'search(' in argv[3]:
             found = [p for p in self.prs if p['state'] == 'MERGED']
             return json.dumps({'data': {'search': {'pageInfo': {'hasNextPage': False, 'endCursor': None},
-                                                   'nodes': found}}})
+                                                   'issueCount': len(found), 'nodes': found}}})
         elif argv[0] == 'api' and re.fullmatch(r'repos/[^/]+/[^/]+/pulls/\d+/files\?per_page=100', argv[1]):
             return json.dumps(self.rest_files.get(int(argv[1].split('/')[4]), []))
         elif argv[:2] == ['api', 'graphql'] and 'pullRequests(states: OPEN' in argv[3]:
@@ -3799,3 +3799,147 @@ def test_refinement_unchanged_reply_is_not_assumed_to_be_our_release(brief_repai
                                    projection_lookup=lambda _: observed_projection(r, previous))
     assert P1 in triage.load(r.a / autoloop.PROJECTION, {})
     assert triage.load(r.a / 'refinement.json', {})[P1]['sent'] is True
+
+
+def audit_page(rows=(), total=None, more=False, cursor=None):
+    return {'data': {'search': {'issueCount': len(rows) if total is None else total, 'nodes': list(rows),
+                                'pageInfo': {'hasNextPage': more, 'endCursor': cursor}}}}
+
+
+# spec: ANYM-572
+@pytest.mark.parametrize('stderr, code', [('gh: HTTP 504: ' + CANARY, 'http-504'),
+                                         ('dial tcp: i/o timeout ' + CANARY, 'transport-timeout'),
+                                         (CANARY, 'command-failed')])
+def test_merged_audit_transport_reports_only_fixed_diagnostics(monkeypatch, stderr, code):
+    calls = []
+
+    def run(argv, **kw):
+        calls.append((argv, kw))
+        return subprocess.CompletedProcess(argv, 1, stdout=CANARY, stderr=stderr)
+    monkeypatch.setattr(subprocess, 'run', run)
+    with pytest.raises((autoloop.Refused, triage.Refused)) as error:
+        autoloop.search_merged(autoloop.gh_cli, NOW)
+    assert code in str(error.value) and 'page=1' in str(error.value)
+    assert CANARY not in str(error.value) and len(calls) == 1
+    assert calls[0][1]['timeout'] <= autoloop.CALL_TIMEOUT
+    assert calls[0][1]['stdin'] == subprocess.DEVNULL
+
+
+# spec: ANYM-572
+def test_merged_audit_subprocess_timeout_has_no_partial_output_or_retry(monkeypatch):
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        raise subprocess.TimeoutExpired(argv, kw['timeout'], output=CANARY, stderr=CANARY)
+    monkeypatch.setattr(subprocess, 'run', run)
+    with pytest.raises((autoloop.Refused, triage.Refused), match='read-timeout') as error:
+        autoloop.search_merged(autoloop.gh_cli, NOW)
+    assert CANARY not in str(error.value) and len(calls) == 1
+
+
+# spec: ANYM-572
+@pytest.mark.parametrize('failure, code', [
+    (dict(audit_page(), errors=[{'message': CANARY}]), 'graphql-errors'),
+    (audit_page(total=1001), 'search-limit'),
+    (audit_page(total=1), 'incomplete-inventory'),
+    (audit_page(more=True, total=2), 'invalid-cursor'),
+    (audit_page([None]), 'invalid-node'),
+    (audit_page(more='false'), 'invalid-page'),
+])
+def test_merged_audit_refuses_partial_or_ambiguous_inventory(failure, code):
+    calls = []
+
+    def gh(argv):
+        calls.append(argv)
+        return json.dumps(failure)
+    with pytest.raises((autoloop.Refused, triage.Refused), match=code) as error:
+        autoloop.search_merged(gh, NOW)
+    assert CANARY not in str(error.value) and len(calls) == 1
+
+
+# spec: ANYM-572
+def test_merged_audit_reads_all_pages_and_preserves_fork_provenance():
+    rows = [dict(build_pr(n), state='MERGED', headRepository={'nameWithOwner': 'fork/repo'}) for n in range(1, 4)]
+    pages = [audit_page(rows[:2], total=3, more=True, cursor='opaque'), audit_page(rows[2:], total=3)]
+    calls = []
+
+    def gh(argv):
+        calls.append(argv)
+        return json.dumps(pages.pop(0))
+    assert autoloop.search_merged(gh, NOW) == rows
+    assert len(calls) == 2 and 'after=opaque' in calls[1]
+    assert 'issueCount' in calls[0][3] and 'first: 25' in calls[0][3]
+    assert 'commits(' not in calls[0][3]  # audit has no check-rollup consumer
+
+
+# spec: ANYM-572
+@pytest.mark.parametrize('second, code', [
+    (audit_page([dict(build_pr(2), state='MERGED')], total=2, more=True, cursor='opaque'), 'invalid-cursor'),
+    (audit_page([dict(build_pr(1), state='MERGED')], total=2), 'duplicate-node'),
+    (audit_page([dict(build_pr(2), state='MERGED')], total=3), 'inventory-changed'),
+    ({'errors': [{'message': CANARY}], 'data': None}, 'graphql-errors'),
+])
+def test_merged_audit_failed_later_page_keeps_checkpoint_and_blocks_controller(tmp_path, monkeypatch, second, code):
+    triage.save(tmp_path / 'audit.json', {'at': triage.stamp(NOW - timedelta(days=2)), 'findings': {}})
+    before = (tmp_path / 'audit.json').read_bytes()
+    pages = [audit_page([dict(build_pr(1), state='MERGED')], total=2, more=True, cursor='opaque'), second]
+    calls = []
+
+    def gh(argv):
+        calls.append(argv)
+        return json.dumps(pages.pop(0))
+    monkeypatch.setattr(autoloop, 'controller', lambda *a: pytest.fail('controller after incomplete audit'))
+    with pytest.raises((autoloop.Refused, triage.Refused), match=code) as error:
+        autoloop.builds(tmp_path, tmp_path, {'live': True}, {}, NOW, None, gh, None, None)
+    assert 'page=2' in str(error.value) and CANARY not in str(error.value)
+    assert (tmp_path / 'audit.json').read_bytes() == before and len(calls) == 2
+    assert not (tmp_path / 'PAUSE').exists()
+
+
+# spec: ANYM-572
+def test_merged_audit_cli_graphql_error_is_explicit_even_on_nonzero_exit(monkeypatch):
+    monkeypatch.setattr(subprocess, 'run', lambda argv, **kw: subprocess.CompletedProcess(
+        argv, 1, stdout=json.dumps({'errors': [{'message': CANARY}], 'data': None}), stderr=CANARY))
+    with pytest.raises((autoloop.Refused, triage.Refused), match='graphql-errors') as error:
+        autoloop.search_merged(autoloop.gh_cli, NOW)
+    assert CANARY not in str(error.value)
+
+
+# spec: ANYM-572
+def test_merged_audit_accepts_the_complete_search_limit_without_losing_rows():
+    rows = [dict(build_pr(n), state='MERGED') for n in range(1, 1001)]
+    calls = []
+
+    def gh(argv):
+        start = len(calls) * 25
+        calls.append(argv)
+        end = start + 25
+        return json.dumps(audit_page(rows[start:end], total=1000, more=end < 1000, cursor=str(end)))
+    assert autoloop.search_merged(gh, NOW) == rows and len(calls) == 40
+    assert 'after=975' in calls[-1]
+
+
+# spec: ANYM-572
+def test_merged_audit_deadline_does_not_accept_late_success_or_advance_checkpoint(tmp_path, monkeypatch):
+    before = {'at': triage.stamp(NOW - timedelta(days=2)), 'findings': {}}
+    triage.save(tmp_path / 'audit.json', before)
+    ticks = iter([0, 0, 121])
+    monkeypatch.setattr(autoloop.autoloop_github, 'monotonic', lambda: next(ticks))
+    calls = []
+
+    def gh(argv):
+        calls.append(argv)
+        return json.dumps(audit_page())
+    with pytest.raises((autoloop.Refused, triage.Refused), match='audit-time-budget'):
+        autoloop.builds(tmp_path, tmp_path, {'live': True}, {}, NOW, None, gh, None, None)
+    assert triage.load(tmp_path / 'audit.json', {}) == before and len(calls) == 1
+
+
+# spec: ANYM-572
+def test_merged_audit_keeps_unknown_merge_sha_as_an_owner_finding(tmp_path):
+    row = dict(build_pr(1), state='MERGED', mergeCommit=None, body='Autoloop: test\n')
+    prs = autoloop.search_merged(lambda argv: json.dumps(audit_page([row])), NOW)
+    assert autoloop.audit(tmp_path, prs, NOW) == [1]
+    assert triage.load(tmp_path / 'audit.json', {})['findings']['1']['merge_sha'] is None
+    assert (tmp_path / 'PAUSE').exists()
