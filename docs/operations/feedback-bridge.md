@@ -204,6 +204,15 @@ reopened, a `Triage:` classification `reported-bug` or `feature`); a released su
 task, feedback item and cluster (new-card slug, else primary card) ever plus one relaunch of a lost worker, and
 `daily_starts` (default 6) per UTC day. A report-only task gets one comment and never a worker.
 
+An existing accepted story needs the same released summary as a new-card proposal. The reader may supply
+`card_brief` for its accepted primary without inventing a `new_card`; the projection binds that brief to the same
+primary. A duplicate, all-declined match or ineligible class cannot gain admission by attaching a brief. With
+projection enabled, missing/unsafe actionable summaries remain pending in triage under the usual refusal cap.
+An already recorded metadata-only item can use the controller's explicit, single-ID
+[`repair-brief` route](feedback-triage.md#repair-a-recorded-existing-story-summary-dk-27): it preserves the original
+decision and history, queues only a scrubbed projection, and lets this bridge update its existing task. The source
+fix and synthetic admission proof do not establish installation or that a real worker started.
+
 | Piece | Where |
 |---|---|
 | Program | `~/.local/lib/deedkit-feedback-bridge/feedback_dispatch.py` (beside `feedback_bridge.py`, which it imports) |
