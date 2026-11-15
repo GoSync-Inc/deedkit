@@ -332,6 +332,15 @@ primary, have no new card/duplicate, and pass the existing 600-character scrub/f
 source and provenance. No triage record, disposition, key, cursor, refusal history or historical budget is rewritten.
 Only the normal daily reader charge is added.
 
+Historical assessment and queued publication each read only the fixed accepted story: supported `tiden spec get
+ANYM-n` (CLI KEY-N resolution targets main) and `tiden branch list` metadata, with explicit repository product and
+workspace IDs. The unique open `main` UUID must match the story's branch/product; the exact ref, story UUID/type,
+field shapes, content hash and source count must be complete. These are two bounded CLI calls independent of open
+branch count; no branch spec inventories or cached snapshot substitute. Both paths use the unchanged triage
+normalizer, including raw text and ordered full source metadata stringification, so already queued collector-based
+story digests still match. Any changed normalized field refuses publication. Normal triage/snapshots still inventory
+main and every open branch; unknown publication outcomes still reconcile exact metadata without resending.
+
 `historical-assessments.json` stores a fsynced once-only attempt before charge/invocation: original and story digests,
 current identity, exact prior projection (including explicit absence), then the new validated assessment and exact
 queued projection. It stores no original prose. Every outcome blocks another reader attempt, including ordinary

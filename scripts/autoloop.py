@@ -947,6 +947,46 @@ def historical_answer(text, source, entry, spec):
     return decision, brief
 
 
+def historical_story(ref):
+    """One fresh accepted main story; no snapshot or open-branch spec inventory (DK-34)."""
+    if not isinstance(ref, str) or not SPEC_REF.fullmatch(ref):
+        raise Refused('historical: invalid story ref')
+    # DeedKit's canonical identity (docs/operations/tiden-product-workflow.md). A fresh checkout has no ignored
+    # local .tiden binding; neither that file nor the caller's CLI defaults may redirect this accepted story.
+    product, workspace = '75bd0580-2af4-4d5a-b236-c5a9d7ff7ce1', '1dc18e09-4a09-4d74-8300-cd4302622357'
+    scope = ('--product-id', product, '--workspace-id', workspace)
+    # CLI 0.53 KEY-N resolution explicitly targets main; get has no --branch flag. Independently verify its
+    # branch UUID against fresh metadata, never trust a default branch or read that branch's spec inventory.
+    try:
+        spec = triage.tiden('spec', 'get', ref, *scope)
+        branches = triage.tiden('branch', 'list', *scope)
+    except triage.Refused:
+        raise Refused('historical: current story lookup failed') from None
+    if not isinstance(branches, dict) or not isinstance(branches.get('branches'), list) \
+            or any(not isinstance(b, dict) for b in branches['branches']):
+        raise Refused('historical: main branch authority unavailable')
+    if branches.get('pagination') is not None:
+        triage.complete(branches, len(branches['branches']), 'historical branches')
+    main = [b for b in branches['branches'] if b.get('name') == 'main']
+    if (len(main) != 1 or not isinstance(main[0].get('id'), str) or not triage.UUID.fullmatch(main[0]['id'])
+            or main[0].get('productId') != product or main[0].get('status') != 'open'
+            or sum(b.get('id') == main[0]['id'] for b in branches['branches']) != 1):
+        raise Refused('historical: main branch authority unavailable')
+    if (not isinstance(spec, dict) or not isinstance(spec.get('id'), str) or not triage.UUID.fullmatch(spec['id'])
+            or spec.get('productId') != product or spec.get('branchId') != main[0]['id']
+            or type(spec.get('seqNum')) is not int or f"ANYM-{spec['seqNum']}" != ref
+            or spec.get('type') != 'User Story' or not isinstance(spec.get('status'), str) or not spec['status']
+            or not isinstance(spec.get('title'), str) or not isinstance(spec.get('content'), str)
+            or not spec['content'].strip() or not isinstance(spec.get('sources'), list)
+            or type(spec.get('sourceCount')) is not int or spec['sourceCount'] != len(spec['sources'])
+            or spec.get('contentSha256') != hashlib.sha256(spec['content'].encode()).hexdigest()):
+        raise Refused('historical: current main story unavailable or incomplete')
+    # Reuse every byte/field of the old collect()['main'] normalizer, including str(source) order. Existing
+    # queued assessments must compare the same digest; neither strip text nor canonicalize/drop source metadata.
+    return triage.flatten({'requirements': [dict(spec, children=[])], 'pagination': {'totalCount': 1}},
+                          'historical story')[0]
+
+
 def assess_historical(state, triage_state, feedback_id, sync_state, host, ssh, runner, now, projection_lookup):
     """Explicit once-only new assessment; caller holds all three normal locks. Never re-record old triage."""
     if not isinstance(feedback_id, str) or not triage.UUID.fullmatch(feedback_id):
@@ -963,13 +1003,10 @@ def assess_historical(state, triage_state, feedback_id, sync_state, host, ssh, r
     if feedback_id in triage.load(state / PROJECTION, {}) or historical_unsettled(state, sync_state):
         raise Refused('historical: pending or unknown operation')
     source = historical_source(state, triage_state, feedback_id, original, entry, cfg, held, host, ssh)
-    snap = triage.collect()  # fresh authority; preserve the old on-disk snapshot byte-for-byte
-    spec = next((s for s in snap['main'] if s['ref'] == source['spec_ref']), None)
-    if spec is None:
-        raise Refused('historical: current main story unavailable')
+    spec = historical_story(source['spec_ref'])
     if entry is not None:
         triage.checked({'id': feedback_id, **{k: entry[k] for k in ('classification', 'reason', 'specs', 'primary')}},
-                       triage.known(snap), {feedback_id: original['key_id']})
+                       {spec['ref']: dict(spec, branch='main')}, {feedback_id: original['key_id']})
     observed = (projection_lookup or (lambda i: current_projection(i, host, ssh, allow_missing=True)))(feedback_id)
     identity = {k: observed.get(k) for k in IDENTITY_FIELDS} if isinstance(observed, dict) else {}
     if (not isinstance(observed, dict) or observed.get('feedback_id') != feedback_id or 'projection' not in observed
@@ -1080,8 +1117,8 @@ def publish_historical(state, triage_state, sync_state, item, host, ssh, project
                 or projection_digest(original) != attempt['origin_digest']):
             raise Refused('historical: publication held or original changed')
         historical_source(state, triage_state, fid, original, entry, cfg, held, host, ssh)
-        spec = next((s for s in triage.collect()['main'] if s['ref'] == attempt['identity']['spec_ref']), None)
-        if spec is None or projection_digest(spec) != attempt['spec_digest']:
+        spec = historical_story(attempt['identity']['spec_ref'])
+        if projection_digest(spec) != attempt['spec_digest']:
             raise Refused('historical: current story changed')
         image = ssh(host, ['docker', 'inspect', '--format', '{{.Image}}', triage.API_CONTAINER]).strip()
         if not triage.IMAGE.fullmatch(image):
