@@ -9,7 +9,7 @@ never authorization for a send, new session, replay or access change.
 
 1. Pause unrelated development and releases. Tell the owner what is broken and
    start the smallest recovery immediately. Do not wait for a new card, a full
-   rollout, independent review, fresh full backups or a restore drill for a
+   rollout, fresh full backups or a restore drill for a
    recovery that changes no schema or stored data.
 2. Read current service/image identity, active calls and relevant queue/health
    state. Keep a short private incident receipt with the time, selected service,
@@ -23,7 +23,7 @@ never authorization for a send, new session, replay or access change.
    active call; a narrow release must still check the deployed calls service.
 4. A new source hotfix stays small, has a focused synthetic regression check,
    and goes through PR, required CI, merge queue and its exact main push CI.
-   Its independent review may finish after recovery. Never deploy a feature
+   Never deploy a feature
    branch, copied patch or ad hoc image. Existing open blocking/major findings
    are not waived: choose another recovery that excludes them.
 5. Separate transport recovery from schema work and unrelated services. Prove
@@ -50,10 +50,8 @@ independent service recovery.
 ## Close before other work
 
 After recovery, report the deployed revision and operational evidence, with any
-unverified delivery claim explicit. Finish the deferred independent review,
-focused regression checks, Tiden/feedback links and release/incident receipts.
-Address findings immediately; use the normal review/recheck routing, or the
-owner's explicitly authorized substitute when the reviewer is unavailable.
+unverified delivery claim explicit. Finish focused regression checks,
+Tiden/feedback links and release/incident receipts. Address findings immediately.
 Identify why the incident happened and what delayed recovery; reconcile the
 process documents and automation before resuming the feature backlog. A deferred
 check remains work, not a claim that it passed. Keep rollback images and stop
@@ -72,9 +70,9 @@ Owner, 2026-10-30, after delayed recovery of Telegram sends:
 > «И только после этого уже продолжаем работу над задачами.»
 
 This replaces, for the bounded recovery above, the ready-card ordering of
-process.md sections 1 and 4, pre-merge independent review ordering of sections 3
-and 5 / reviews.md Round 8, and AGENTS.md section 1's per-action confirmation for
-restarting the existing service/session. Review and records move after recovery.
+process.md sections 1 and 4 and AGENTS.md section 1's per-action confirmation for
+restarting the existing service/session. Records move after recovery. Owner
+11-11 removed reviews altogether (AGENTS.md section 5).
 A stateless recovery takes no fresh backup under harness process.md section 2
 itself (owner 11-04). The green-main promotion and owner-kept boundaries
 above remain. The responding agent enforces this order and records deferred checks.
@@ -83,3 +81,16 @@ The motivating incident already has synthetic queue-isolation regression tests
 in PR #485. Its narrow Telegram promotion retained schema 62 and left the full
 schema-63 rollout separate. Future incidents likewise choose an available
 reversible mitigation before coupling recovery to unrelated rollout work.
+
+## Collector reboot incident, 2026-11-15
+
+After planned maintenance, Telegram and two WhatsApp collectors stayed up but
+waited on unreleased claims from the previous boot; their leases expired and
+receiving heartbeats stopped. Container and API availability did not establish
+capture. The operator authenticated the dead boot, verified the claim identities
+and applied the existing exact compare-and-set release once per account; waiting
+collectors reacquired and fresh leases and receiving heartbeats were observed.
+Natural Telegram and one WhatsApp commit were observed; a new commit on the
+other WhatsApp account was not observed. The cross-boot guard worked as designed;
+the omission was postboot acceptance of actual collector ownership and receiving.
+Planned shutdown and postboot checks are in [COLLECTORS.md](../../COLLECTORS.md).
