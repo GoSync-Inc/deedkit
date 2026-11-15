@@ -885,3 +885,120 @@ def test_the_dispatcher_install_material_enables_nothing_and_holds_no_secret():
         assert needle in section, needle
     is_blocked = doc_commands.load_is_blocked(REPO / '.claude/hooks/block_secret_env_reads.py')
     assert not [block for block in doc_commands.fenced_shell_blocks(section) if is_blocked(block)]
+
+
+# spec: ANYM-991
+def test_gate_reads_wal_without_creating_or_changing_state(tmp_path, capsys):
+    rig = Rig(tmp_path)
+    assert rig.main('gate', 'DK-1') == 1
+    assert not rig.state.exists()
+    rig.tasks.add(1)
+    rig.run()
+    with rig.d.lock():
+        journal = rig.d.journal
+        journal.begin('DK-8', fid(8), 'spec:ANYM-108', 1, 'feedback-DK-8', NOW)
+    assert (rig.state / 'dispatch.sqlite3-wal').stat().st_size > 0
+    before = {p.name: (p.stat().st_mode, p.stat().st_mtime_ns, p.read_bytes()) for p in rig.state.iterdir()}
+    assert rig.main('gate', 'DK-1') == 0
+    assert rig.main('gate', 'DK-8') == 0
+    assert {p.name: (p.stat().st_mode, p.stat().st_mtime_ns, p.read_bytes()) for p in rig.state.iterdir()} == before
+    journal.db.close()
+
+
+# spec: ANYM-991
+@pytest.mark.parametrize(('idle', 'expected'), [(True, 1), (False, 0), (None, 0)])
+def test_held_worker_releases_slot_only_with_positive_idle_evidence(tmp_path, idle, expected):
+    rig = Rig(tmp_path, max_live=1)
+    rig.tasks.add(1)
+    rig.run()
+    rig.tasks.add(2)
+    rig.cfg.hold = ['DK-1']
+    write_config(tmp_path, max_live=1, hold=['DK-1'])
+    rig.threads.idle = lambda thread_id: idle is True
+    assert rig.run()['started'] == expected
+    assert rig.rows()[0] == ('DK-1', 1, 'started')
+    assert rig.main('gate', 'DK-1') == 1
+
+
+# spec: ANYM-991
+def test_read_only_gate_fails_closed_when_writer_holds_lock(tmp_path):
+    rig = Rig(tmp_path)
+    rig.tasks.add(1)
+    rig.run()
+    with rig.d.lock():
+        assert rig.main('gate', 'DK-1') == 1
+    assert rig.main('gate', 'DK-1') == 0
+
+
+# spec: ANYM-991
+def test_idle_requires_fresh_empty_activity_queue_and_terminals():
+    activity = dict(activeWorkflowCount=0, activeBackgroundAgentCount=0, activeBackgroundCommandCount=0,
+                    activePlanModeCount=0)
+    row = dict(id='thr_idle0001', status='idle', queuedWork='none', hasPendingInteraction=False, activity=activity)
+    replies = {'thread list': [row], 'thread queue': [], 'terminal list': {'sessions': []}}
+    def runner(argv, timeout, stdin):
+        key = ' '.join(argv[1:3])
+        return 0, json.dumps(replies[key])
+    threads = fd.Threads(runner=runner)
+    assert threads.idle(row['id'])
+    for change in ({'activeBackgroundCommandCount': 1}, {'activeWorkflowCount': 1}, {'activeBackgroundAgentCount': 1},
+                   {'activePlanModeCount': 1}, {'activeBackgroundCommandCount': None}):
+        row['activity'] = activity | change
+        assert not threads.idle(row['id'])
+    row['activity'] = activity
+    replies['thread queue'] = [{'id': 'queued'}]
+    assert not threads.idle(row['id'])
+    replies['thread queue'] = []
+    replies['terminal list'] = {'sessions': [{'status': 'running'}]}
+    assert not threads.idle(row['id'])
+    replies['terminal list'] = {}
+    assert not threads.idle(row['id'])
+
+
+# spec: ANYM-991
+def test_gate_reloads_hold_after_snapshot_and_status_does_not_mutate_state(tmp_path, monkeypatch):
+    rig = Rig(tmp_path)
+    rig.tasks.add(1)
+    rig.run()
+    before = {p.name: (p.stat().st_mode, p.read_bytes()) for p in rig.state.iterdir()}
+    assert rig.main('status') == 0
+    assert {p.name: (p.stat().st_mode, p.read_bytes()) for p in rig.state.iterdir()} == before
+    original = fd.Dispatcher.snapshot_rows
+    def hold_during_read(dispatcher):
+        rows = original(dispatcher)
+        write_config(tmp_path, hold=['DK-1'])
+        return rows
+    monkeypatch.setattr(fd.Dispatcher, 'snapshot_rows', hold_during_read)
+    assert rig.main('gate', 'DK-1') == 1
+
+
+# spec: ANYM-991
+def test_gate_rejects_a_symlinked_lock_without_following_it(tmp_path):
+    rig = Rig(tmp_path)
+    rig.tasks.add(1)
+    rig.run()
+    lock = rig.state / 'dispatch.lock'
+    lock.unlink()
+    target = tmp_path / 'other-lock'
+    target.write_text('unchanged')
+    lock.symlink_to(target)
+    assert rig.main('gate', 'DK-1') == 1
+    assert target.read_text() == 'unchanged' and lock.is_symlink()
+
+
+# spec: ANYM-991
+def test_held_worker_with_missing_thread_or_unknown_start_keeps_its_slot(tmp_path):
+    rig = Rig(tmp_path, max_live=1)
+    rig.tasks.add(1)
+    rig.run()
+    rig.tasks.add(2)
+    rig.cfg.hold = ['DK-1']
+    rig.threads.threads.clear()
+    assert rig.run()['started'] == 0
+    assert rig.rows()[0] == ('DK-1', 1, 'started')
+    with rig.d.lock():
+        row = rig.d.journal.rows()[0]
+        rig.d.journal.set(row['id'], state='starting', thread_id=None)
+    rig.clock.t += fd.GRACE + 1
+    assert rig.run()['started'] == 0
+    assert rig.rows()[0] == ('DK-1', 1, 'starting')

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 from datetime import timedelta
+import hashlib
 import json
 import re
 
@@ -42,6 +43,30 @@ CLOCK_SKEW = timedelta(minutes=10)
 OVERLAP = timedelta(minutes=10)
 NIL = '00000000-0000-0000-0000-000000000000'
 CURSOR_KEYS = {'v', 't', 'i', 'h'}
+PROJECTION_FIELDS = ('classification', 'reason_code', 'primary_spec', 'new_card', 'released_brief', 'released_at', 'reader_pin')
+IDENTITY_FIELDS = ('principal', 'key_id', 'created_at', 'status', 'status_changed_at', 'spec_ref', 'duplicate_of')
+
+
+def projection_digest(projection):
+    return hashlib.sha256(json.dumps(projection, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
+
+
+def get_projection(c, feedback_id):
+    """Operator-only, bounded read: identity, current disposition and projection; never source content."""
+    from .store import serial
+    if not isinstance(feedback_id, str) or not UUID.fullmatch(feedback_id):
+        raise ValueError('invalid_feedback_id')
+    c.execute('SET TRANSACTION READ ONLY')
+    c.execute("SET LOCAL transaction_timeout='5s'")
+    row = c.execute('''SELECT f.id AS feedback_id,f.principal,f.key_id,f.created_at,f.status,f.status_changed_at,
+        f.spec_ref,f.duplicate_of,p.classification,p.reason_code,p.primary_spec,p.new_card,p.released_brief,
+        p.released_at,p.reader_pin FROM agent_feedback f LEFT JOIN feedback_projections p ON p.feedback_id=f.id
+        WHERE f.id=%s::uuid''', (feedback_id,)).fetchone()
+    if row is None:
+        raise ValueError('unknown_feedback')
+    out = {name: row[name] for name in ('feedback_id', *IDENTITY_FIELDS)}
+    out['projection'] = {name: row[name] for name in PROJECTION_FIELDS} if row['released_at'] is not None else None
+    return serial(out)
 
 
 def _item_codes(item):
@@ -73,11 +98,19 @@ def _item_codes(item):
 
 def projection_errors(document):
     """The refusal codes of a whole file, in one fixed order; empty when it is valid."""
-    if not isinstance(document, dict) or set(document) != {'projections'} or not isinstance(document['projections'], list):
+    if not isinstance(document, dict) or set(document) not in ({'projections'}, {'projections', 'expected_prior'}) \
+            or not isinstance(document['projections'], list):
         return ['invalid_projection_file']
     items = document['projections']
     if not 1 <= len(items) <= MAX_ITEMS:
         return ['projections_1_to_100']
+    if 'expected_prior' in document:
+        guard = document['expected_prior']
+        if (len(items) != 1 or not isinstance(guard, dict) or set(guard) != {'release', 'digest', 'identity'}
+                or not isinstance(guard['release'], str) or not isinstance(guard['digest'], str)
+                or not re.fullmatch(r'[0-9a-f]{64}', guard['digest']) or not isinstance(guard['identity'], dict)
+                or set(guard['identity']) != set(IDENTITY_FIELDS)):
+            return ['invalid_expected_prior']
     codes = []
     for item in items:
         codes += [code for code in _item_codes(item) if code not in codes]
@@ -106,10 +139,28 @@ def record_projections(c, document):
     if any(moment > now + CLOCK_SKEW for moment in released.values()):
         raise ValueError('invalid_released_at')
     names = sorted(items)
-    rows = c.execute('SELECT id,principal,key_id FROM agent_feedback WHERE id=ANY(%s::uuid[]) ORDER BY id FOR KEY SHARE',
+    guarded = document.get('expected_prior')
+    columns = 'id,principal,key_id,created_at,status,status_changed_at,spec_ref,duplicate_of' if guarded else 'id,principal,key_id'
+    lock = 'UPDATE' if guarded else 'KEY SHARE'
+    rows = c.execute(f'SELECT {columns} FROM agent_feedback WHERE id=ANY(%s::uuid[]) ORDER BY id FOR {lock}',
         (names,)).fetchall()
     if len(rows) != len(names):
         raise ValueError('unknown_feedback: %d of %d IDs' % (len(names) - len(rows), len(names)))
+    if guarded:
+        from .store import serial
+        row, item = rows[0], items[names[0]]
+        previous = c.execute('SELECT ' + ','.join(PROJECTION_FIELDS) +
+            ' FROM feedback_projections WHERE feedback_id=%s FOR UPDATE', (row['id'],)).fetchone()
+        old = serial({name: previous[name] for name in PROJECTION_FIELDS}) if previous else None
+        identity = serial({name: row[name] for name in IDENTITY_FIELDS})
+        if (identity != guarded['identity'] or identity['status'] != 'accepted' or identity['duplicate_of'] is not None
+                or identity['spec_ref'] != item.get('primary_spec') or old is None
+                or old['classification'] not in ('reported-bug', 'feature') or old['reason_code'] in ('already-live', 'needs-opt-in')
+                or old['new_card'] is not None or not old['released_brief'] or old['released_brief'] == item.get('released_brief')
+                or old['released_at'] != guarded['release'] or projection_digest(old) != guarded['digest']
+                or any(old[k] != item.get(k) for k in ('classification', 'reason_code', 'primary_spec', 'new_card'))
+                or released[names[0]] <= _timestamp(guarded['release'], 'invalid_expected_prior')):
+            raise ValueError('stale_projection')
     recorded = 0
     for row in rows:
         item = items[str(row['id'])]

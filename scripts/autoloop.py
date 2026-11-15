@@ -165,7 +165,8 @@ branch). Answer with one JSON object and nothing else: {{"decisions": [...]}}, a
 No other field.
 If mode is brief_repair, ignore the decision schema above: return exactly {{"id": "<item id>", "card_brief": "<paraphrase>"}}
 or {{"id": "<item id>", "refusal": "unsafe_source"}} when a safe factual paraphrase is impossible. Do not classify or
-include any other field."""
+include any other field. Preserve useful symptom, expected behavior and trigger in your own words. The limit is
+{BRIEF_LIMIT} characters, not four words: never repeat five consecutive source words."""
 PROMPT = 'Decide every item of the JSON on stdin. Reply with the JSON object only.'
 SYNC_STATE = Path.home() / '.deedkit' / 'feedback-sync'  # feedback_sync.STATE: the lock of its ANYM-536 `auto`
 REPO = 'GoSync-Inc/deedkit'
@@ -647,6 +648,23 @@ RECORD = [('deedkit-feedback-projection' if word == 'deedkit-feedback-export' el
 RECORD.insert(RECORD.index('--rm') + 1, '-i')
 
 
+def projection_digest(projection):
+    return hashlib.sha256(json.dumps(projection, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
+
+
+def current_projection(feedback_id, host, ssh):
+    """Operator-only metadata read using the verified image and existing owner-DSN container route."""
+    ssh = ssh or triage.remote
+    image = ssh(host, ['docker', 'inspect', '--format', '{{.Image}}', triage.API_CONTAINER]).strip()
+    if not triage.IMAGE.fullmatch(image):
+        raise Refused('the API container image is not a digest')
+    result = triage.parse(ssh(host, triage.EXPORT + [image, 'python', '-m', 'messaging_service',
+                          'get-feedback-projection', '--id', feedback_id]), 'projection read')
+    if not isinstance(result, dict) or result.get('feedback_id') != feedback_id or not isinstance(result.get('projection'), dict):
+        raise Refused('refinement: current projection unavailable')
+    return result
+
+
 def projection_items(state, now, decisions=None, briefs=None):
     """{ID: item} of the last read run's decisions, in the shape of `record-feedback-projection`'s file."""
     briefs = triage.load(state / 'briefs.json', {}) if briefs is None else briefs
@@ -678,7 +696,7 @@ def projection_items(state, now, decisions=None, briefs=None):
 
 
 def repair_brief(state, triage_state, feedback_id, *, sync_state=None, host=triage.HOST, ssh=None,
-                 runner=None, now=None):
+                 runner=None, now=None, expected_release=None, expected_digest=None, projection_lookup=None):
     """One explicitly selected recorded decision: release only a missing projection brief, never triage it again.
     The caller is the authorised operator on the administrative controller; source text stays in reader memory.
     Queue publication belongs to the next normal tick, with its original idempotent release timestamp."""
@@ -720,8 +738,36 @@ def repair_brief(state, triage_state, feedback_id, *, sync_state=None, host=tria
         if feedback_id in pending:
             raise Refused('repair: projection already pending; preserve its exact intent')
         stored_briefs = triage.load(state / 'briefs.json', {})
-        if 'released_brief' in projection_items(state, now, [original], stored_briefs)[feedback_id]:
+        existing = projection_items(state, now, [original], stored_briefs)[feedback_id]
+        refining = expected_release is not None or expected_digest is not None
+        refinement = triage.load(state / 'refinement.json', {})
+        if feedback_id in refinement or (sync_state or SYNC_STATE).joinpath('pending.json').exists():
+            raise Refused('repair: pending or unknown operation')
+        if 'released_brief' in existing and not refining:
             raise Refused('repair: a released brief already exists')
+        previous = None
+        if refining:
+            if (not isinstance(expected_release, str) or not isinstance(expected_digest, str)
+                    or not re.fullmatch(r'[0-9a-f]{64}', expected_digest) or 'released_brief' not in existing):
+                raise Refused('refinement: expected release and digest required')
+            observed = (projection_lookup or (lambda i: current_projection(i, host, ssh)))(feedback_id)
+            previous = observed.get('projection') if isinstance(observed, dict) else None
+            identity_fields = ('principal', 'key_id', 'created_at', 'status', 'status_changed_at', 'spec_ref', 'duplicate_of')
+            identity = {k: observed.get(k) for k in identity_fields} if isinstance(observed, dict) else {}
+            try:
+                prior_at = triage.when(expected_release)
+            except (ValueError, TypeError):
+                raise Refused('refinement: invalid release time') from None
+            if (not isinstance(previous, dict) or observed.get('feedback_id') != feedback_id
+                    or any(identity.get(k) != entry.get(k) for k in ('principal', 'key_id', 'created_at'))
+                    or identity.get('status') != 'accepted' or identity.get('spec_ref') != ref
+                    or identity.get('duplicate_of') is not None or not isinstance(identity.get('status_changed_at'), str)
+                    or previous.get('released_at') != expected_release
+                    or projection_digest(previous) != expected_digest
+                    or any(previous.get(k) != existing.get(k) for k in ('classification', 'reason_code', 'primary_spec', 'released_brief'))
+                    or previous.get('new_card') is not None or not isinstance(previous.get('reader_pin'), str)
+                    or prior_at >= now):
+                raise Refused('refinement: prior release changed')
         # The existing operator export enforces access. Correlate its current disposition and immutable identity
         # before giving ONLY this selected source to the same isolated reader; never save or print the raw export.
         items, _ = triage.export_pages(host, triage.when(entry['created_at']), ssh)
@@ -737,7 +783,8 @@ def repair_brief(state, triage_state, feedback_id, *, sync_state=None, host=tria
                 or source.get('duplicate_of') is not None or not isinstance(source.get('description'), str) \
                 or not source['description'].strip():
             raise Refused('repair: source identity or current disposition differs')
-        projected = {'mode': 'brief_repair', 'items': [{'id': feedback_id, 'category': source.get('category'),
+        projected = {'mode': 'brief_repair', 'max_characters': BRIEF_LIMIT, 'max_consecutive_source_words': VERBATIM - 1,
+            'items': [{'id': feedback_id, 'category': source.get('category'),
             'principal': source['principal'], 'operation': source.get('operation'), 'text': source['description']}]}
         charge_reader(state, cfg, now, feedback_id, source)
         text = checked_stream(runner(projected)).strip()
@@ -764,40 +811,87 @@ def repair_brief(state, triage_state, feedback_id, *, sync_state=None, host=tria
         safe = released(brief, {feedback_id: source})
         if not safe:
             raise Refused('repair: unsafe_brief')
+        if previous is not None and safe == previous['released_brief']:
+            raise Refused('refinement: unchanged brief')
         briefs = {feedback_id: {'new_card': None, 'primary': ref, 'card_brief': safe, 'release': RELEASE}}
         item = projection_items(state, now, [original], briefs)[feedback_id]
         if 'released_brief' not in item:
             raise Refused('repair: no released brief')
+        if previous is not None:
+            history = triage.load(state / 'release-history.json', {})
+            prior = {'projection': previous, 'digest': expected_digest}
+            entries = history.setdefault(feedback_id, [])
+            if prior not in entries:
+                entries.append(prior)
+            triage.save(state / 'release-history.json', history)
+            triage.save(state / 'refinement.json', refinement | {feedback_id: {
+                'expected_release': expected_release, 'expected_digest': expected_digest, 'identity': identity, 'sent': False}})
         # Store the exact intent first. If a later write or publisher fails, another repair refuses this pending ID.
         triage.save(state / PROJECTION, pending | {feedback_id: item})
         triage.save(state / 'briefs.json', stored_briefs | briefs)
         return feedback_id
 
 
-def record_projection(state, host, ssh, now, fresh):
+def record_projection(state, host, ssh, now, fresh, allowed=None, projection_lookup=None):
     """One call per tick: the pending items (this run's, with `fresh`) in one operator-container call of at most
     PROJECTION_BATCH, on stdin. A refusal or a failed call raises with the run's own fixed message and keeps the items,
     which the next tick sends again (the command is idempotent: an item replaces the stored one only when newer)."""
     ssh = ssh or triage.remote
     pending = triage.load(state / PROJECTION, {})
     keep = triage.stamp(now - PROJECTION_KEEP)
-    pending = {i: item for i, item in pending.items() if item.get('released_at', '') >= keep}
+    refinements = triage.load(state / 'refinement.json', {})
+    pending = {i: item for i, item in pending.items() if i in refinements or item.get('released_at', '') >= keep}
     if fresh:
-        pending.update(projection_items(state, now))
+        for i, item in projection_items(state, now).items():
+            pending.setdefault(i, item)
     triage.save(state / PROJECTION, pending)
     if not pending:
         return None
-    batch = [pending[i] for i in sorted(pending)[:PROJECTION_BATCH]]
+    batch = [pending[i] for i in sorted(pending) if allowed is None or i in allowed][:PROJECTION_BATCH]
+    if not batch:
+        return None
+    refined = next((item for item in batch if item['feedback_id'] in refinements), None)
+    if refined:
+        batch = [refined]  # an unknown refined write cannot make other items ambiguous
+        fid = refined['feedback_id']
+        guard = refinements[fid]
+        observed = (projection_lookup or (lambda i: current_projection(i, host, ssh)))(fid)
+        current = observed.get('projection') if isinstance(observed, dict) else None
+        if guard.get('sent') is True:
+            fields = ('classification', 'reason_code', 'primary_spec', 'new_card', 'released_brief', 'released_at', 'reader_pin')
+            if not isinstance(current, dict) or any(current.get(k) != refined.get(k) for k in fields):
+                raise Refused('refinement: publication outcome unknown')
+            pending.pop(fid)
+            triage.save(state / PROJECTION, pending)
+            refinements.pop(fid)
+            triage.save(state / 'refinement.json', refinements)
+            return 'refinement reconciled'
+        if (guard.get('sent') is not False or not isinstance(current, dict)
+                or current.get('released_at') != guard.get('expected_release')
+                or projection_digest(current) != guard.get('expected_digest')):
+            raise Refused('refinement: prior release changed')
     image = ssh(host, ['docker', 'inspect', '--format', '{{.Image}}', triage.API_CONTAINER]).strip()
     if not triage.IMAGE.fullmatch(image):
         raise Refused('the API container image is not a digest')
+    document = {'projections': batch}
+    if refined:
+        document['expected_prior'] = {'release': guard['expected_release'], 'digest': guard['expected_digest'],
+                                      'identity': guard['identity']}
+        refinements[fid] = dict(guard, sent=True)
+        triage.save(state / 'refinement.json', refinements)
     reply = triage.parse(ssh(host, RECORD + [image, 'python', '-m', 'messaging_service', 'record-feedback-projection',
-                                             '--file', '/dev/stdin'], stdin=json.dumps({'projections': batch})), 'record')
+                                             '--file', '/dev/stdin'], stdin=json.dumps(document)), 'record')
     if not isinstance(reply, dict) or any(type(reply.get(k)) is not int for k in ('recorded', 'unchanged')):
         raise Refused('record: unexpected reply')
+    if refined and (reply['recorded'], reply['unchanged']) != (1, 0):
+        # A newer competing release yields unchanged, not proof that this revision landed.
+        raise Refused('refinement: publication outcome unknown')
     for item in batch:
         pending.pop(item['feedback_id'], None)
     triage.save(state / PROJECTION, pending)
+    if refined:
+        refinements.pop(refined['feedback_id'])
+        triage.save(state / 'refinement.json', refinements)
     return f"recorded {reply['recorded']}, unchanged {reply['unchanged']}"
 
 
@@ -2451,10 +2545,45 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
         # The export first and checked whole: an owner STOP in it writes PAUSE (the one write before the other
         # reads) and needs neither Tiden nor bb. Its item is recorded by the first tick after the resume.
         items, head = triage.export_pages(host, triage.since(triage_state), ssh)
-        stop, _, _ = control(*incoming(triage_state, items), cfg, consumed(state))
+        stop, incoming_drops, _ = control(*incoming(triage_state, items), cfg, consumed(state))
         if stop:
             triage.private_write(state / 'PAUSE', f"stop by feedback {' '.join(stop)} at {triage.stamp(now)}\n")
             return fenced(state, now, bb, gh, triage_state)
+        projected = None
+        pending = triage.load(state / PROJECTION, {})
+        if cfg['live'] and cfg['record_projection'] and pending and not (sync_state or SYNC_STATE).joinpath('pending.json').exists():
+            ledger, held = triage.load(triage_state / 'ledger.json', {}), holds(state)
+            candidates = {i: ledger[i] for i in pending if i in ledger and i not in incoming_drops
+                          and i not in held['items'] and ledger[i].get('primary') not in held['cards']
+                          and ledger[i].get('cluster') not in held['cards']
+                          and ledger[i].get('principal') in cfg['principals'] and ledger[i].get('created_at')}
+            if candidates:
+                current, _ = triage.export_pages(host, min(triage.when(e['created_at']) for e in candidates.values()), ssh)
+                stop2, drops2, _ = control(*incoming(triage_state, current), cfg, consumed(state))
+                if stop2:
+                    triage.private_write(state / 'PAUSE', f"stop by feedback {' '.join(stop2)} at {triage.stamp(now)}\n")
+                    return fenced(state, now, bb, gh, triage_state)
+                cfg, held = config(state), holds(state)
+                by_id = {}
+                for item in current:
+                    by_id.setdefault(item.get('id'), []).append(item)
+                allowed = set()
+                for i, entry in candidates.items():
+                    rows = by_id.get(i, [])
+                    if len(rows) == 1 and i not in drops2 and i not in held['items'] \
+                            and entry.get('primary') not in held['cards'] and entry.get('cluster') not in held['cards'] \
+                            and entry.get('principal') in cfg['principals'] and cfg['live'] and cfg['record_projection'] \
+                            and not (state / 'PAUSE').exists() \
+                            and rows[0].get('status') in ('received', 'reopened', 'accepted') \
+                            and rows[0].get('duplicate_of') is None \
+                            and (rows[0].get('status') != 'accepted' or rows[0].get('spec_ref') == entry.get('primary')) \
+                            and all(rows[0].get(k) == entry.get(k) for k in ('principal', 'key_id', 'created_at')):
+                        allowed.add(i)
+                if allowed:
+                    try:
+                        projected = record_projection(state, host, ssh, now, False, allowed)
+                    except (Refused, triage.Refused) as error:
+                        projected = f'projection: {error}'
         # Reads: each finishes before the first write; a failed, truncated or timed-out one ends the tick here.
         known = intents(state)
         listing = loop_listing(bb, known) if any(i['status'] in ('unknown', 'started') for i in known.values()) else None
@@ -2489,10 +2618,15 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
             count, _ = read(state, triage_state, runner, chosen, now)
             refused = sorted(i for i, e in refusals(state).items() if e['count'] > before.get(i, {}).get('count', 0))
             reader = 'ran'
-        projected = None
-        if cfg['record_projection']:  # ANYM-988: off by default; a failed call never fails the tick or the reader's record
+        if cfg['record_projection'] and count:
+            queued = triage.load(state / PROJECTION, {})
+            for i, item in projection_items(state, now).items():
+                queued.setdefault(i, item)
+            triage.save(state / PROJECTION, queued)
+        if (cfg['record_projection'] and projected is None and count and not pending
+                and not (sync_state or SYNC_STATE).joinpath('pending.json').exists()):
             try:
-                projected = record_projection(state, host, ssh, now, count > 0)
+                projected = record_projection(state, host, ssh, now, False)
             except (Refused, triage.Refused) as error:
                 projected = f'projection: {error}'
         try:  # the build stage (ANYM-572): a failed read there leaves the card stage and the reader as they are
@@ -2560,6 +2694,8 @@ def main(argv_=None):
     parser.add_argument('--card', help='bind: the card ANYM-n the worker created')
     parser.add_argument('--from', dest='source', type=Path, help='install-cli: the pinned build to copy')
     parser.add_argument('--feedback-id', help='read: one explicit original inbox ID, including a parked row')
+    parser.add_argument('--expected-release', help='repair-brief refinement: current release timestamp')
+    parser.add_argument('--expected-digest', help='repair-brief refinement: SHA-256 of current projection')
     parser.add_argument('--state', type=Path, default=Path(os.environ.get('AUTOLOOP_STATE', STATE)))
     parser.add_argument('--triage-state', type=Path,
                         default=Path(os.environ.get('FEEDBACK_TRIAGE_STATE', triage.STATE)))
@@ -2575,6 +2711,8 @@ def main(argv_=None):
         parser.error('--from goes with install-cli only')
     if args.feedback_id is not None and args.action != 'read':
         parser.error('--feedback-id goes with read only')
+    if (args.expected_release is not None or args.expected_digest is not None) and args.action != 'repair-brief':
+        parser.error('expected release and digest go with repair-brief only')
     if os.environ.get('AUTOLOOP_RUNNER'):  # inside the container runner (ANYM-574)
         return runner_request(Path(os.environ['AUTOLOOP_RUNNER']), args.action, args.name, args.reason)
     now = datetime.now(timezone.utc)
@@ -2620,7 +2758,8 @@ def main(argv_=None):
                 print(f'read {count} decisions; report {written}' if written else 'inbox empty')
             return 0
         if args.action == 'repair-brief':
-            print('queued repaired projection: ' + repair_brief(args.state, args.triage_state, args.name))
+            print('queued repaired projection: ' + repair_brief(args.state, args.triage_state, args.name,
+                  expected_release=args.expected_release, expected_digest=args.expected_digest))
             return 0
         if args.action == 'install-cli':
             print(f'installed {install_cli(args.source)}')

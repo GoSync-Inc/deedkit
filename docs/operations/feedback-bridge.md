@@ -260,8 +260,12 @@ python3 ~/.local/lib/deedkit-feedback-bridge/feedback_dispatch.py gate DK-12
 
 `PAUSE` stops every action of the tick (no start, reconcile or attach) and makes a worker's `gate` exit 1, so a running
 worker stops at its next Tiden write, push or merge arm. A key in the config's `hold` list does the same for that task;
-the label `hold` on a task only stops a start. Workers run `gate <key>` themselves (the brief says so); it makes no bb
-call and prints `go` or `stop <reason>`.
+an existing held worker gives up its concurrency slot only when fresh thread activity, queue and terminal reads
+positively show no work. Missing or failed evidence retains the slot; the attempt and thread remain journaled.
+The label `hold` on a task only stops a start. Workers run `gate <key>` themselves (the brief says so); it makes no bb
+call and prints `go` or `stop <reason>`. Gate and status take a shared nonblocking lock on the existing journal and
+read a private DB and WAL snapshot; missing state, a busy lock or an inconsistent snapshot stops the check. They never
+create or change shared journal files. Journal writers keep the exclusive lock through SQLite's close/checkpoint.
 
 ### Reading a failure
 

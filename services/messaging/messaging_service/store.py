@@ -1433,6 +1433,11 @@ class Store:
         with self.pool.connection() as c:
             return record_projections(c, document)
 
+    def get_feedback_projection(self, feedback_id):
+        from .feedback_projection import get_projection
+        with self.pool.connection() as c, c.transaction():
+            return get_projection(c, feedback_id)
+
     def export_feedback(self, **options):
         # Operator CLI only (ANYM-265): every principal's feedback, read-only; no MCP tool, REST route or gateway action.
         from .feedback import export_feedback

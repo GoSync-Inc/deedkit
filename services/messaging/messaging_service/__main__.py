@@ -59,7 +59,7 @@ def main():
     parser.add_argument('command',choices=['serve','init','migrate','issue-key','revoke-key',
         'replay','snapshot','verify-restore','quarantine-restore','register-account',
         'set-access','list-keys','audit-tail','set-sending','set-key-permissions',
-        'set-messenger-operations','extend-key','set-feedback-status','export-feedback','record-feedback-projection',
+        'set-messenger-operations','extend-key','set-feedback-status','export-feedback','record-feedback-projection','get-feedback-projection',
         'release-retention-hold',
         'set-subscription-retention','link-person','unlink-person','delete-person','list-people','set-person-channel','key-info',
         'principal-info','delivery-endpoints-list','disable-delivery-endpoint','enable-delivery-endpoint',
@@ -283,6 +283,9 @@ def main():
             try: document=json.loads(args.file.read_bytes()[:1<<20])
             except (OSError,ValueError): raise ValueError('invalid_projection_file') from None
             print(json.dumps(store.record_feedback_projection(document)))
+        elif args.command=='get-feedback-projection':
+            if not args.feedback_ids or len(args.feedback_ids)!=1: parser.error('get-feedback-projection requires one --id')
+            print(json.dumps(store.get_feedback_projection(args.feedback_ids[0])))
         elif args.command=='export-feedback':
             print(json.dumps(store.export_feedback(since=args.since,changed_since=args.changed_since,page=args.page,
                 overlap=args.overlap,limit=args.limit)))

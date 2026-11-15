@@ -3676,3 +3676,126 @@ def test_a_retire_that_locks_a_mark_another_retire_removed_keeps_the_proxy_a_lau
     assert proxies.get(old) == 'img:old' and (marks / old).exists()  # that launcher keeps its proxy and mark
     for fd in launcher.LEASES:
         os.close(fd)
+
+
+# spec: ANYM-991
+def test_historical_repair_reader_has_useful_safe_release_context(brief_repair):
+    r = brief_repair
+    r.proposal['card_brief'] = 'When a synced group is opened, participants disappear; the full membership should remain visible.'
+    autoloop.repair_brief(r.a, r.t, P1, runner=r.runner)
+    context = r.seen[0]
+    assert context['max_consecutive_source_words'] == 4
+    assert context['max_characters'] == 600
+    assert 'max_words' not in context
+    assert triage.load(r.a / autoloop.PROJECTION, {})[P1]['released_brief'] == autoloop.released(
+        r.proposal['card_brief'], {P1: r.rows[0]})
+
+
+def observed_projection(repair, projection):
+    row = repair.rows[0]
+    return {'feedback_id': P1, 'principal': row['principal'], 'key_id': row['key_id'],
+            'created_at': row['created_at'], 'status': 'accepted', 'status_changed_at': '2026-11-14T00:00:00+00:00',
+            'spec_ref': 'ANYM-10', 'duplicate_of': None, 'projection': projection}
+
+
+# spec: ANYM-991
+def test_explicit_refinement_checks_confirmed_release_and_preserves_original_history(brief_repair):
+    r = brief_repair
+    previous = {'classification': 'reported-bug', 'reason_code': 'matches-card', 'primary_spec': 'ANYM-10',
+        'new_card': None, 'released_brief': 'Group participants disappear.', 'released_at': '2026-11-14T00:00:00+00:00',
+        'reader_pin': autoloop.READER_PIN}
+    triage.save(r.a / 'briefs.json', {P1: {'primary': 'ANYM-10', 'new_card': None,
+        'card_brief': previous['released_brief'], 'release': autoloop.RELEASE}})
+    before = (r.t / 'ledger.json').read_bytes()
+    digest = autoloop.projection_digest(previous)
+    r.proposal['card_brief'] = 'After group sync, members vanish; the member list should stay complete.'
+    autoloop.repair_brief(r.a, r.t, P1, runner=r.runner, expected_release=previous['released_at'],
+                          expected_digest=digest, projection_lookup=lambda _: observed_projection(r, previous))
+    assert (r.t / 'ledger.json').read_bytes() == before
+    assert triage.load(r.a / 'release-history.json', {})[P1][0]['projection'] == previous
+    pending = triage.load(r.a / autoloop.PROJECTION, {})[P1]
+    assert pending['feedback_id'] == P1 and pending['primary_spec'] == 'ANYM-10'
+    assert pending['released_at'] > previous['released_at']
+    assert triage.load(r.a / 'refinement.json', {})[P1]['expected_digest'] == digest
+    with pytest.raises(autoloop.Refused, match='pending'):
+        autoloop.repair_brief(r.a, r.t, P1, runner=r.runner, expected_release=previous['released_at'],
+                              expected_digest=digest, projection_lookup=lambda _: observed_projection(r, previous))
+
+
+# spec: ANYM-991
+def test_refinement_uncertain_publication_never_retries_and_reconciles_only_exact_result(brief_repair):
+    r = brief_repair
+    previous = {'classification': 'reported-bug', 'reason_code': 'matches-card', 'primary_spec': 'ANYM-10',
+        'new_card': None, 'released_brief': 'Group participants disappear.', 'released_at': '2026-11-14T00:00:00+00:00',
+        'reader_pin': autoloop.READER_PIN}
+    triage.save(r.a / 'briefs.json', {P1: {'primary': 'ANYM-10', 'new_card': None,
+        'card_brief': previous['released_brief'], 'release': autoloop.RELEASE}})
+    r.proposal['card_brief'] = 'After sync, the group member list becomes incomplete.'
+    autoloop.repair_brief(r.a, r.t, P1, runner=r.runner, expected_release=previous['released_at'],
+        expected_digest=autoloop.projection_digest(previous), projection_lookup=lambda _: observed_projection(r, previous))
+    calls = []
+    def uncertain(host, argv, **kwargs):
+        calls.append(argv)
+        if argv[:2] == ['docker', 'inspect']:
+            return 'sha256:' + '0' * 64
+        raise triage.Refused('uncertain')
+    now = autoloop.datetime.now(autoloop.timezone.utc)
+    with pytest.raises(triage.Refused, match='uncertain'):
+        autoloop.record_projection(r.a, 'synthetic', uncertain, now, False, projection_lookup=lambda _: observed_projection(r, previous))
+    pending = triage.load(r.a / autoloop.PROJECTION, {})[P1]
+    with pytest.raises(autoloop.Refused, match='outcome unknown'):
+        autoloop.record_projection(r.a, 'synthetic', uncertain, now, False, projection_lookup=lambda _: observed_projection(r, previous))
+    assert len(calls) == 2
+    landed = {k: pending.get(k) for k in ('classification', 'reason_code', 'primary_spec', 'new_card',
+                                          'released_brief', 'released_at', 'reader_pin')}
+    assert autoloop.record_projection(r.a, 'synthetic', uncertain, now, False,
+                                      projection_lookup=lambda _: observed_projection(r, landed)) == 'refinement reconciled'
+    assert triage.load(r.a / autoloop.PROJECTION, {}) == {} and len(calls) == 2
+
+
+# spec: ANYM-991
+@pytest.mark.parametrize('fault', ['release', 'digest', 'decision', 'sync-unknown', 'refinement-unknown'])
+def test_refinement_refuses_changed_or_unsettled_prior_state(brief_repair, fault):
+    r = brief_repair
+    previous = {'classification': 'reported-bug', 'reason_code': 'matches-card', 'primary_spec': 'ANYM-10',
+        'new_card': None, 'released_brief': 'Group participants disappear.', 'released_at': '2026-11-14T00:00:00+00:00',
+        'reader_pin': autoloop.READER_PIN}
+    triage.save(r.a / 'briefs.json', {P1: {'primary': 'ANYM-10', 'new_card': None,
+        'card_brief': previous['released_brief'], 'release': autoloop.RELEASE}})
+    digest, released_at = autoloop.projection_digest(previous), previous['released_at']
+    if fault == 'release':
+        released_at = '2026-11-13T00:00:00+00:00'
+    elif fault == 'digest':
+        digest = '0' * 64
+    elif fault == 'decision':
+        previous['primary_spec'] = 'ANYM-20'
+        digest = autoloop.projection_digest(previous)
+    elif fault == 'sync-unknown':
+        (r.t.parent / 'sync').mkdir(exist_ok=True)
+        (r.t.parent / 'sync' / 'pending.json').write_text('{}')
+    else:
+        triage.save(r.a / 'refinement.json', {P1: {'sent': True}})
+    with pytest.raises(autoloop.Refused):
+        autoloop.repair_brief(r.a, r.t, P1, runner=r.runner, expected_release=released_at,
+                              expected_digest=digest, projection_lookup=lambda _: observed_projection(r, previous))
+    assert not r.seen and not (r.a / autoloop.PROJECTION).exists()
+
+
+# spec: ANYM-991
+def test_refinement_unchanged_reply_is_not_assumed_to_be_our_release(brief_repair):
+    r = brief_repair
+    previous = {'classification': 'reported-bug', 'reason_code': 'matches-card', 'primary_spec': 'ANYM-10',
+        'new_card': None, 'released_brief': 'Group participants disappear.', 'released_at': '2026-11-14T00:00:00+00:00',
+        'reader_pin': autoloop.READER_PIN}
+    triage.save(r.a / 'briefs.json', {P1: {'primary': 'ANYM-10', 'new_card': None,
+        'card_brief': previous['released_brief'], 'release': autoloop.RELEASE}})
+    r.proposal['card_brief'] = 'After sync, the group member list becomes incomplete.'
+    autoloop.repair_brief(r.a, r.t, P1, runner=r.runner, expected_release=previous['released_at'],
+        expected_digest=autoloop.projection_digest(previous), projection_lookup=lambda _: observed_projection(r, previous))
+    def unchanged(host, argv, **kwargs):
+        return 'sha256:' + '0' * 64 if argv[:2] == ['docker', 'inspect'] else json.dumps({'recorded': 0, 'unchanged': 1})
+    with pytest.raises(autoloop.Refused, match='outcome unknown'):
+        autoloop.record_projection(r.a, 'synthetic', unchanged, autoloop.datetime.now(autoloop.timezone.utc), False,
+                                   projection_lookup=lambda _: observed_projection(r, previous))
+    assert P1 in triage.load(r.a / autoloop.PROJECTION, {})
+    assert triage.load(r.a / 'refinement.json', {})[P1]['sent'] is True
