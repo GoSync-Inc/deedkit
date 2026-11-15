@@ -54,7 +54,9 @@ Decision per item: `{"id", "classification", "reason", "specs": [{"ref", "verdic
   accepted spec: delivered, waits for the owner's opt-in). The agent's own category never decides
   it. `reason`: one line. `answer`: a question's one-line answer (≤250 characters, no spec).
 - `specs`: every matched spec from the snapshot with `accepted` or `declined`; `primary` is the
-  card that removes the reported failure. An unmatched bug or feature names `new_card` (a slug):
+  card that removes the reported failure, accepted if any spec is accepted. These are dispositions of matched work,
+  not candidate similarity scores: unrelated candidates are omitted, all matched specs declined means declined
+  feedback. An unmatched bug or feature names `new_card` (a slug), with empty `specs` and null `primary`:
   the proposed card is its cluster. `duplicate_of` names a known item of the same key. A verdict
   row (proposal/2026-10-17-feedback-reverify) names its target in `verdict_of` and joins the
   target's cluster.
@@ -253,9 +255,52 @@ inbox it makes no model call; it only publishes ledger entries a stopped run lef
   `already-live` needs one accepted Done spec on main and is recorded as an accepted bug or
   feature, which the ANYM-536 follower moves to `verify_requested`.
 - `answer` and `card_brief` lose URLs, URIs, addresses, code fences, shell patterns and paths
-  and stay untrusted; card briefs go to `briefs.json` in the autoloop state, and the card worker
+  and stay untrusted. A non-duplicate bug or feature may supply `card_brief` (≤600 characters) for either a new card
+  or an accepted primary in its matched specs; the other classes and all-declined matches cannot supply one.
+  `new_card` still cannot accompany matched specs, including all-declined specs. Briefs pass the same number
+  redaction and five-consecutive-word copy check. Existing-story briefs bind to that primary; a changed primary,
+  old release, control character or oversized brief projects no summary. With `record_projection: true`, an
+  actionable decision lacking a released brief stays in the inbox and counts as a refusal (the existing two-refusal
+  park still applies), rather than silently leaving only a metadata task. Projection off keeps legacy dispositions.
+  Briefs go to `briefs.json` in the autoloop state, and the card worker
   (ANYM-571) takes one only through `committed_briefs`: its item is in the ledger with the same
   new card.
+
+### Repair a recorded existing-story summary (DK-27)
+
+Only the authorised administrative controller runs `python3 scripts/autoloop.py repair-brief <original-feedback-uuid>`
+with its existing `--state` and `--triage-state`. This selects one already recorded, accepted bug/feature with an
+accepted primary and no valid released brief. It needs `live` and `record_projection`, an allowed principal, no
+PAUSE/card hold/item drop, the normal reader/item caps, and the normal triage → feedback-sync → autoloop locks.
+It reads the original through the existing operator export and checks ID, key, principal, creation time and current
+accepted status/story. Missing/ambiguous source or authority refuses visibly. It never derives a summary from a
+spec title or metadata. Only that item's original text reaches the same isolated, pinned reader in memory; the
+closed parser, scrub and release checks still apply. Any proposed change to the original decision, matched verdicts
+or primary refuses; already-live, enable-only, question, not-actionable and duplicate decisions remain excluded.
+
+Before: retain private before-images of projection/brief files and read the selected ledger decision. After: the
+command prints only the original ID queued in `projection.json`; read back its primary and release timestamp and
+verify triage ledger, dispositions, inbox, cursors and refusal history stayed unchanged. Only the normal reader
+usage counters are charged. The normal scheduled publisher delivers the queued projection; this command publishes
+nothing and does not re-record triage, create a card or write Tiden. A pending projection blocks another repair;
+an uncertain publisher result keeps the exact queued intent/timestamp for its normal idempotent reconciliation.
+Do not delete/reset history, replay status writes or rerun the reader to resolve an uncertain publication.
+
+Undo before publication: under those same locks restore only this ID's previous projection/brief entries, preserving
+other queued work. After publication, a source revert does not undo the stored projection; hold the BB task and
+coordinate a separately authorised projection correction. Source delivery alone does not prove installed repair.
+
+For an original ID still in the inbox (including a two-refusal parked row), the explicit controller command is
+`python3 scripts/autoloop.py read --feedback-id <original-feedback-uuid>` with the same state arguments. It makes
+one ordinary triage attempt for that ID only, under the same three locks, permissions and reader caps. It checks
+the existing operator export still has the same source/key/principal/time and a received or reopened disposition.
+It bypasses only automatic parked-row selection, preserving refusal counts/history: another invalid or unsafe
+answer increments the existing count, exits 1 and keeps the original inbox row. A valid answer records its normal
+decision once and queues its released projection for the normal publisher. Held items/cards and report-only
+principals stay excluded. Already recorded IDs refuse this command and use projection-only repair instead.
+Before/after: retain the selected inbox/refusal evidence and read back its original ID, normal disposition and
+queued projection; all unselected rows stay intact. After a valid triage commit, never undo it by resetting ledger
+or counters: use normal task holds/corrections. Do not loop either recovery command or broaden its UUID scope.
 - A new CLI version needs a new pin: update `CLI_VERSION`, `CLI_SHA256` and `PROFILE` in `scripts/autoloop.py`
   (module docstring, "Reader CLI pin"), then `autoloop.py install-cli`, after the canary run on the Mac: `AUTOLOOP_CANARY=1 uv run pytest tests/platform/test_autoloop.py
   -k canary` (hostile settings, hook, MCP config, plugin, memory file and symlink around the

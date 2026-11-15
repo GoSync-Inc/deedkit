@@ -21,6 +21,9 @@ from hypothesis import given, settings, strategies as st
 import pytest
 
 import scripts.autoloop as autoloop
+import scripts.feedback_bridge as feedback_bridge
+import scripts.feedback_dispatch as feedback_dispatch
+from messaging_service import feedback_projection
 
 triage = autoloop.triage
 ROOT = Path(__file__).resolve().parents[2]
@@ -326,6 +329,364 @@ def test_answer_and_card_brief_lose_urls_code_fences_shell_patterns_and_paths():
 def run_read(states, *decisions):
     t, a = states
     return autoloop.read(a, t, runner=lambda projection: stream(answer(*decisions)))
+
+
+def projected_task(states, feedback_id=P1):
+    t, a = states
+    projected = autoloop.projection_items(a, autoloop.datetime(2026, 11, 15, tzinfo=autoloop.timezone.utc))[feedback_id]
+    assert feedback_projection.projection_errors({'projections': [projected]}) == []
+    entry = triage.load(t / 'ledger.json', {})[feedback_id]
+    title, description = feedback_bridge.render({'feedback_id': feedback_id, 'principal': 'agent-grok',
+        'category': 'bug', 'operation': 'messages_search', 'created_at': entry['created_at'],
+        'status': entry['disposition']['status'], 'projection': projected})
+    task = {'key': 'DK-1', 'number': 1, 'status': 'todo', 'labels': ['feedback'],
+            'title': title, 'description': description}
+    dispatcher = feedback_dispatch.Dispatcher(types.SimpleNamespace(principals=['agent-grok'], hold=[]), None, None)
+    return projected, task, dispatcher.judge(task)
+
+
+# spec: ANYM-991
+@pytest.mark.parametrize('classification', ['reported-bug', 'feature'])
+def test_an_existing_accepted_story_releases_a_brief_through_the_real_dispatch_admission(states, classification):
+    t, a = states
+    count, _ = run_read(states, decision(P1, classification,
+        specs=[{'ref': 'ANYM-10', 'verdict': 'accepted'}, {'ref': 'ANYM-20', 'verdict': 'declined'}],
+        primary='ANYM-10', card_brief='Group participants disappear. See https://private.invalid /private/file `shell` 12345.'))
+    assert count == 1
+    projected, task, (info, action) = projected_task(states)
+    assert projected['released_brief'] == 'Group participants disappear. See #.'
+    assert projected['primary_spec'] == 'ANYM-10' and 'new_card' not in projected
+    assert action == 'start' and info['cluster'] == 'spec:ANYM-10'
+    assert '> Group participants disappear. See #' in task['description']
+    assert 'untrusted text' in task['description'] and CANARY not in task['description']
+    assert autoloop.committed_briefs(a, t) == {}  # no new-card worker for an existing story
+    assert triage.load(t / 'ledger.json', {})[P1]['disposition']['status'] == 'accepted'
+
+
+# spec: ANYM-991
+@pytest.mark.parametrize('change', [
+    {'duplicate_of': P3, 'reason_code': 'duplicate'},
+    {'primary': 'ANYM-11'},
+    {'specs': [{'ref': 'ANYM-10', 'verdict': 'declined'}]},
+    {'classification': 'not-actionable'},
+    {'classification': 'question'},
+    {'classification': 'already-live', 'reason_code': 'already-live'},
+    {'classification': 'enable-only', 'reason_code': 'needs-opt-in'},
+    {'new_card': 'another-card'},
+])
+def test_an_existing_story_brief_cannot_bypass_decision_guards(states, change):
+    t, a = states
+    d = decision(P1, 'reported-bug', specs=[{'ref': 'ANYM-10', 'verdict': 'accepted'}], primary='ANYM-10',
+                 card_brief='Group participants disappear.') | change
+    count, _ = run_read(states, d)
+    assert count == 0 and P1 in triage.load(t / 'inbox.json', {})
+    assert triage.load(t / 'ledger.json', {}) == {} and triage.load(a / 'briefs.json', {}) == {}
+    assert autoloop.projection_items(a, autoloop.datetime.now(autoloop.timezone.utc)) == {}
+
+
+# spec: ANYM-988
+@pytest.mark.parametrize('brief', [HOSTILE, 'https://private.invalid /private/file `shell`'])
+def test_an_unsafe_existing_story_brief_never_reaches_dispatch(states, brief):
+    count, _ = run_read(states, decision(P1, 'reported-bug',
+        specs=[{'ref': 'ANYM-10', 'verdict': 'accepted'}], primary='ANYM-10', card_brief=brief))
+    assert count == 1  # legacy recording remains supported; no summary means no admission
+    projected, _, (info, action) = projected_task(states)
+    assert 'released_brief' not in projected and not info['released'] and action is None
+
+
+# spec: ANYM-988
+@pytest.mark.parametrize('change', [{'primary': 'ANYM-11'}, {'release': 0}, {'card_brief': 'two\nlines'},
+                                    {'card_brief': 'x' * 601}])
+def test_a_stale_or_invalid_existing_story_brief_is_not_projected(states, change):
+    t, a = states
+    run_read(states, decision(P1, 'reported-bug', specs=[{'ref': 'ANYM-10', 'verdict': 'accepted'}],
+                              primary='ANYM-10', card_brief='Group participants disappear.'))
+    briefs = triage.load(a / 'briefs.json', {})
+    briefs[P1].update(change)
+    triage.save(a / 'briefs.json', briefs)
+    projected, _, (_, action) = projected_task(states)
+    assert 'released_brief' not in projected and action is None
+
+
+# spec: ANYM-991
+@pytest.mark.parametrize('change', [
+    {'classification': 'already-live', 'reason_code': 'already-live'},
+    {'classification': 'enable-only', 'reason_code': 'needs-opt-in'},
+    {'classification': 'question', 'specs': [], 'primary': None, 'reason_code': 'question-answered'},
+    {'classification': 'not-actionable'},
+    {'duplicate_of': P3, 'reason_code': 'duplicate'},
+    {'specs': [{'ref': 'ANYM-11', 'verdict': 'declined'}]},
+])
+def test_a_previous_story_brief_cannot_release_a_later_held_decision(states, change):
+    t, a = states
+    d = decision(P1, 'reported-bug', specs=[{'ref': 'ANYM-11', 'verdict': 'accepted'}], primary='ANYM-11')
+    assert run_read(states, d | {'card_brief': 'Group participants disappear.'})[0] == 1
+    # Simulate a later validated projection decision, without re-recording an existing ledger item.
+    checked, briefs, refused = autoloop.sorted_answer([d | change], INBOX, SPECS, {i: 'k1' for i in INBOX})
+    assert len(checked) == 1 and not briefs and not refused
+    triage.save(a / 'decisions.json', checked)
+    projected, _, (_, action) = projected_task(states)
+    assert 'released_brief' not in projected and action is None
+
+
+# spec: ANYM-991
+def test_an_unmatched_new_card_keeps_its_released_projection_and_dispatch_admission(states):
+    t, a = states
+    assert run_read(states, decision(P1, 'reported-bug', reason_code='new-idea', new_card='group-participants',
+                                    card_brief='Group participants disappear.'))[0] == 1
+    projected, _, (info, action) = projected_task(states)
+    assert projected['new_card'] == 'group-participants' and 'primary_spec' not in projected
+    assert action == 'start' and info['cluster'] == 'new:group-participants'
+    assert list(autoloop.committed_briefs(a, t)) == [P1]
+
+
+# spec: ANYM-991
+def test_candidate_verdicts_do_not_turn_a_matched_decline_into_a_new_card(states):
+    t, a = states
+    d = decision(P1, 'reported-bug', specs=[{'ref': 'ANYM-10', 'verdict': 'declined'}], primary='ANYM-10')
+    count, _ = run_read(states, d | {'new_card': 'another-card', 'card_brief': 'Group participants disappear.'})
+    assert count == 0 and 'new_card only' in autoloop.refusals(a)[P1]['why']
+    count, _ = run_read(states, d)
+    assert count == 1 and triage.load(t / 'ledger.json', {})[P1]['disposition']['status'] == 'declined'
+    assert projected_task(states)[2][1] is None
+
+
+# spec: ANYM-991
+@pytest.mark.parametrize('brief', [None, HOSTILE, 'https://private.invalid /private/file `shell`'])
+def test_projection_recording_keeps_an_actionable_story_pending_until_its_brief_is_safe(states, brief):
+    t, a = states
+    triage.save(a / 'config.json', {'record_projection': True})
+    d = decision(P1, 'reported-bug', specs=[{'ref': 'ANYM-10', 'verdict': 'accepted'}],
+                 primary='ANYM-10', card_brief=brief)
+    before = triage.load(t / 'inbox.json', {})
+    count, _ = autoloop.read(a, t, runner=lambda projection: stream(answer(d)))
+    assert count == 0 and triage.load(t / 'inbox.json', {}) == before
+    assert triage.load(t / 'ledger.json', {}) == {} and triage.load(a / 'decisions.json', []) == []
+    assert 'released card_brief' in autoloop.refusals(a)[P1]['why']
+    # A later safe answer retains the original feedback ID; no reset or replay is needed.
+    d['card_brief'] = 'Group participants disappear.'
+    count, _ = autoloop.read(a, t, runner=lambda projection: stream(answer(d)))
+    assert count == 1 and projected_task(states)[2][1] == 'start'
+
+
+@pytest.fixture
+def brief_repair(states, monkeypatch):
+    t, a = states
+    source = triage.load(t / 'inbox.json', {})[P1]
+    d = decision(P1, 'reported-bug', specs=[{'ref': 'ANYM-10', 'verdict': 'accepted'},
+                                          {'ref': 'ANYM-20', 'verdict': 'declined'}], primary='ANYM-10')
+    assert run_read(states, d)[0] == 1  # historical legacy record, already removed from inbox
+    triage.save(a / 'config.json', {'live': True, 'record_projection': True, 'principals': ['agent-grok']})
+    triage.save(a / 'refused.json', {P1: {'count': 2, 'at': 'old', 'why': 'old'}})
+    source.update(status='accepted', spec_ref='ANYM-10', duplicate_of=None)
+    rows, seen = [source], []
+    monkeypatch.setattr(triage, 'export_pages', lambda *args: (rows, '2026-11-15T00:00:00+00:00'))
+    monkeypatch.setattr(autoloop, 'SYNC_STATE', t.parent / 'sync')
+    proposal = d | {'card_brief': 'Group participants disappear.'}
+    def runner(projected):
+        seen.append(projected)
+        return stream(answer(proposal))
+    monkeypatch.setattr(autoloop, 'run_reader', runner)  # main must resolve the same injected runner
+    return types.SimpleNamespace(t=t, a=a, rows=rows, seen=seen, proposal=proposal, runner=runner)
+
+
+# spec: ANYM-991
+def test_selected_historical_brief_repair_only_queues_a_projection_and_preserves_triage(brief_repair):
+    r = brief_repair
+    before = {str(p.relative_to(r.t)): p.read_bytes() for p in r.t.rglob('*') if p.is_file()}
+    refused = (r.a / 'refused.json').read_bytes()
+    assert autoloop.repair_brief(r.a, r.t, P1, runner=r.runner) == P1
+    assert {str(p.relative_to(r.t)): p.read_bytes() for p in r.t.rglob('*') if p.is_file() and p.name != 'lock'} == before
+    assert (r.a / 'refused.json').read_bytes() == refused
+    pending = triage.load(r.a / autoloop.PROJECTION, {})
+    assert list(pending) == [P1] and pending[P1]['primary_spec'] == 'ANYM-10'
+    assert pending[P1]['released_brief'] == 'Group participants disappear.'
+    assert feedback_projection.projection_errors({'projections': list(pending.values())}) == []
+    assert len(r.seen) == 1 and [x['id'] for x in r.seen[0]['items']] == [P1]
+    assert r.seen[0]['repair_decision']['specs'] == r.proposal['specs']
+    assert projected_task((r.t, r.a))[2][1] == 'start'
+    assert autoloop.committed_briefs(r.a, r.t) == {}
+    assert HOSTILE not in (r.a / autoloop.PROJECTION).read_text()
+    assert next(iter(triage.load(r.a / 'ledger.json', {})['days'].values()))['reader_runs'] == 1
+    with pytest.raises(autoloop.Refused, match='already pending'):
+        autoloop.repair_brief(r.a, r.t, P1, runner=r.runner)
+    assert triage.load(r.a / autoloop.PROJECTION, {}) == pending and len(r.seen) == 1
+    # The normal publisher alone owns delivery and keeps the original timestamp after an uncertain result.
+    def lost(*args, **kwargs):
+        raise triage.Refused('ssh exited 1')
+    with pytest.raises(triage.Refused):
+        autoloop.record_projection(r.a, 'synthetic', lost, autoloop.datetime.now(autoloop.timezone.utc), False)
+    assert triage.load(r.a / autoloop.PROJECTION, {}) == pending
+
+
+# spec: ANYM-991
+def test_historical_brief_repair_cli_uses_the_same_selected_reader_path(brief_repair, capsys):
+    r = brief_repair
+    assert autoloop.main(['repair-brief', P1, '--state', str(r.a), '--triage-state', str(r.t)]) == 0
+    assert capsys.readouterr().out == f'queued repaired projection: {P1}\n'
+    assert list(triage.load(r.a / autoloop.PROJECTION, {})) == [P1]
+    assert len(r.seen) == 1
+
+
+# spec: ANYM-991
+def test_historical_brief_repair_refuses_missing_or_ambiguous_source_and_existing_release(brief_repair):
+    r = brief_repair
+    original = r.rows.pop()
+    with pytest.raises(autoloop.Refused, match='source missing'):
+        autoloop.repair_brief(r.a, r.t, P1, runner=r.runner)
+    r.rows.extend([original, original])
+    with pytest.raises(autoloop.Refused, match='source missing or ambiguous'):
+        autoloop.repair_brief(r.a, r.t, P1, runner=r.runner)
+    r.rows.pop()
+    triage.save(r.a / 'briefs.json', {P1: {'primary': 'ANYM-10', 'new_card': None,
+        'card_brief': 'Group participants disappear.', 'release': autoloop.RELEASE}})
+    with pytest.raises(autoloop.Refused, match='already exists'):
+        autoloop.repair_brief(r.a, r.t, P1, runner=r.runner)
+    with pytest.raises(autoloop.Refused, match='unknown feedback'):
+        autoloop.repair_brief(r.a, r.t, P3, runner=r.runner)
+    assert not r.seen and not (r.a / autoloop.PROJECTION).exists()
+
+
+# spec: ANYM-991
+@pytest.mark.parametrize('change', [
+    {'primary': 'ANYM-20'}, {'classification': 'feature'}, {'reason_code': 'new-idea'},
+    {'specs': [{'ref': 'ANYM-10', 'verdict': 'accepted'}]}, {'new_card': 'invented-card'},
+    {'id': P3}, {'answer': 'yes'}, {'card_brief': HOSTILE}, {'card_brief': '/private/file `shell`'},
+])
+def test_historical_brief_repair_refuses_model_tampering_and_unsafe_output(brief_repair, change):
+    r = brief_repair
+    r.proposal.update(change)
+    before = (r.t / 'ledger.json').read_bytes()
+    with pytest.raises((autoloop.Refused, triage.Refused)):
+        autoloop.repair_brief(r.a, r.t, P1, runner=r.runner)
+    assert not (r.a / autoloop.PROJECTION).exists() and not triage.load(r.a / 'briefs.json', {})
+    assert (r.t / 'ledger.json').read_bytes() == before
+
+
+# spec: ANYM-991
+@pytest.mark.parametrize('change', [
+    {'id': P3}, {'principal': 'foreign'}, {'key_id': 'foreign'}, {'created_at': '2026-11-14T00:00:00Z'},
+    {'status': 'verify_requested'}, {'spec_ref': 'ANYM-11'}, {'duplicate_of': P3}, {'description': ''},
+])
+def test_historical_brief_repair_requires_original_source_identity_and_current_acceptance(brief_repair, change):
+    r = brief_repair
+    r.rows[0].update(change)
+    with pytest.raises(autoloop.Refused, match='source'):
+        autoloop.repair_brief(r.a, r.t, P1, runner=r.runner)
+    assert not r.seen and not (r.a / autoloop.PROJECTION).exists()
+
+
+# spec: ANYM-991
+@pytest.mark.parametrize('change', [
+    {'classification': 'question'}, {'classification': 'not-actionable'}, {'classification': 'enable-only'},
+    {'reason': autoloop.REASONS['already-live']}, {'cluster': 'new:invented-card'},
+    {'disposition': {'status': 'duplicate', 'duplicate_of': P3}},
+])
+def test_historical_brief_repair_keeps_nonactionable_and_live_holds(brief_repair, change):
+    r = brief_repair
+    ledger = triage.load(r.t / 'ledger.json', {})
+    ledger[P1].update(change)
+    triage.save(r.t / 'ledger.json', ledger)
+    with pytest.raises(autoloop.Refused, match='not an actionable'):
+        autoloop.repair_brief(r.a, r.t, P1, runner=r.runner)
+    assert not r.seen and not (r.a / autoloop.PROJECTION).exists()
+
+
+# spec: ANYM-991
+def test_historical_brief_repair_obeys_caps_permissions_pause_and_all_normal_locks(brief_repair):
+    r = brief_repair
+    path = r.a / 'config.json'
+    good = triage.load(path, {})
+    for change in ({'principals': []}, {'live': False}, {'record_projection': False}, {'caps': {'reader_runs': 0}},
+                   {'caps': {'items_per_principal': 0}}):
+        triage.save(path, good | change)
+        with pytest.raises(autoloop.Refused):
+            autoloop.repair_brief(r.a, r.t, P1, runner=r.runner)
+    triage.save(path, good)
+    (r.a / 'PAUSE').touch()
+    with pytest.raises(autoloop.Refused, match='paused'):
+        autoloop.repair_brief(r.a, r.t, P1, runner=r.runner)
+    (r.a / 'PAUSE').unlink()
+    for manager in (triage.locked(r.t), triage.locked(r.t.parent / 'sync'), autoloop.own_lock(r.a)):
+        with manager, pytest.raises(autoloop.Busy):
+            autoloop.repair_brief(r.a, r.t, P1, runner=r.runner)
+    assert not r.seen and not (r.a / autoloop.PROJECTION).exists()
+
+
+@pytest.fixture
+def selected_read(states, monkeypatch):
+    t, a = states
+    source = dict(triage.load(t / 'inbox.json', {})[P1], status='received')
+    triage.save(a / 'config.json', {'live': True, 'record_projection': True, 'principals': ['agent-grok']})
+    triage.save(a / 'refused.json', {P1: {'count': 2, 'at': 'old', 'why': 'old'}})
+    rows, seen = [source], []
+    monkeypatch.setattr(triage, 'export_pages', lambda *args: (rows, '2026-11-15T00:00:00+00:00'))
+    monkeypatch.setattr(autoloop, 'SYNC_STATE', t.parent / 'sync')
+    proposal = decision(P1, 'reported-bug', specs=[{'ref': 'ANYM-10', 'verdict': 'accepted'}],
+                        primary='ANYM-10', card_brief='Group participants disappear.')
+    def runner(projected):
+        seen.append(projected)
+        return stream(answer(proposal))
+    monkeypatch.setattr(autoloop, 'run_reader', runner)
+    return types.SimpleNamespace(t=t, a=a, rows=rows, seen=seen, proposal=proposal, runner=runner)
+
+
+# spec: ANYM-991
+def test_a_selected_parked_inbox_read_preserves_refusal_history_and_queues_the_original_id(selected_read):
+    r = selected_read
+    before = triage.load(r.t / 'inbox.json', {})
+    refused = (r.a / 'refused.json').read_bytes()
+    assert P1 in autoloop.parked(r.a, before)
+    assert autoloop.main(['read', '--feedback-id', P1, '--state', str(r.a), '--triage-state', str(r.t)]) == 0
+    assert (r.a / 'refused.json').read_bytes() == refused
+    assert triage.load(r.t / 'inbox.json', {}) == {i: v for i, v in before.items() if i != P1}
+    assert list(triage.load(r.t / 'ledger.json', {})) == [P1]
+    assert list(triage.load(r.a / autoloop.PROJECTION, {})) == [P1]
+    assert [x['id'] for x in r.seen[0]['items']] == [P1] and projected_task((r.t, r.a))[2][1] == 'start'
+    with pytest.raises(autoloop.Refused, match='recorded ID'):
+        autoloop.read_selected(r.a, r.t, P1, runner=r.runner)
+    assert len(r.seen) == 1
+
+
+# spec: ANYM-991
+@pytest.mark.parametrize('change', [
+    {'new_card': 'invented-card'}, {'primary': 'ANYM-11'}, {'card_brief': HOSTILE},
+    {'classification': 'already-live', 'specs': []},
+])
+def test_a_selected_parked_inbox_read_still_refuses_invalid_decisions(selected_read, change, capsys):
+    r = selected_read
+    r.proposal.update(change)
+    before = (r.t / 'inbox.json').read_bytes()
+    assert autoloop.main(['read', '--feedback-id', P1, '--state', str(r.a), '--triage-state', str(r.t)]) == 1
+    assert 'remains pending' in capsys.readouterr().err
+    assert (r.t / 'inbox.json').read_bytes() == before and triage.load(r.t / 'ledger.json', {}) == {}
+    assert autoloop.refusals(r.a)[P1]['count'] == 3 and not (r.a / autoloop.PROJECTION).exists()
+
+
+# spec: ANYM-991
+@pytest.mark.parametrize('failure', ['foreign', 'held-item', 'held-card', 'cap', 'missing', 'stale'])
+def test_selected_inbox_recovery_preserves_permission_holds_caps_and_current_source(selected_read, failure):
+    r = selected_read
+    if failure == 'foreign':
+        triage.save(r.a / 'config.json', {'live': True, 'record_projection': True, 'principals': []})
+    elif failure.startswith('held'):
+        triage.save(r.a / 'holds.json', {'items': {P1: 'held'} if failure == 'held-item' else {},
+                                       'cards': {'ANYM-10': 'held'} if failure == 'held-card' else {}})
+    elif failure == 'cap':
+        triage.save(r.a / 'config.json', {'live': True, 'record_projection': True, 'principals': ['agent-grok'],
+                                         'caps': {'reader_runs': 0}})
+    elif failure == 'missing':
+        r.rows.clear()
+    else:
+        r.rows[0]['status'] = 'accepted'
+    if failure == 'held-card':
+        assert autoloop.read_selected(r.a, r.t, P1, runner=r.runner)[0] == 0
+    else:
+        with pytest.raises(autoloop.Refused):
+            autoloop.read_selected(r.a, r.t, P1, runner=r.runner)
+        assert not r.seen
+    assert P1 in triage.load(r.t / 'inbox.json', {}) and not triage.load(r.t / 'ledger.json', {})
+    assert not (r.a / autoloop.PROJECTION).exists()
 
 
 # spec: ANYM-570
