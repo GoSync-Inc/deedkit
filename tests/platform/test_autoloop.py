@@ -482,10 +482,10 @@ def brief_repair(states, monkeypatch):
     rows, seen = [source], []
     monkeypatch.setattr(triage, 'export_pages', lambda *args: (rows, '2026-11-15T00:00:00+00:00'))
     monkeypatch.setattr(autoloop, 'SYNC_STATE', t.parent / 'sync')
-    proposal = d | {'card_brief': 'Group participants disappear.'}
+    proposal = {'id': P1, 'card_brief': 'Group participants disappear.'}
     def runner(projected):
         seen.append(projected)
-        return stream(answer(proposal))
+        return stream(json.dumps(proposal))
     monkeypatch.setattr(autoloop, 'run_reader', runner)  # main must resolve the same injected runner
     return types.SimpleNamespace(t=t, a=a, rows=rows, seen=seen, proposal=proposal, runner=runner)
 
@@ -503,7 +503,9 @@ def test_selected_historical_brief_repair_only_queues_a_projection_and_preserves
     assert pending[P1]['released_brief'] == 'Group participants disappear.'
     assert feedback_projection.projection_errors({'projections': list(pending.values())}) == []
     assert len(r.seen) == 1 and [x['id'] for x in r.seen[0]['items']] == [P1]
-    assert r.seen[0]['repair_decision']['specs'] == r.proposal['specs']
+    assert 'repair_decision' not in r.seen[0]
+    assert triage.load(r.t / 'ledger.json', {})[P1]['specs'] == [
+        {'ref': 'ANYM-10', 'verdict': 'accepted'}, {'ref': 'ANYM-20', 'verdict': 'declined'}]
     assert projected_task((r.t, r.a))[2][1] == 'start'
     assert autoloop.committed_briefs(r.a, r.t) == {}
     assert HOSTILE not in (r.a / autoloop.PROJECTION).read_text()
@@ -561,6 +563,23 @@ def test_historical_brief_repair_refuses_model_tampering_and_unsafe_output(brief
         autoloop.repair_brief(r.a, r.t, P1, runner=r.runner)
     assert not (r.a / autoloop.PROJECTION).exists() and not triage.load(r.a / 'briefs.json', {})
     assert (r.t / 'ledger.json').read_bytes() == before
+
+
+# spec: ANYM-991
+@pytest.mark.parametrize(('response', 'reason'), [
+    ({'id': P1}, 'missing_brief'),
+    ({'id': P3, 'card_brief': 'Safe summary.'}, 'foreign_id'),
+    ({'id': P1, 'card_brief': 'Safe summary.', 'primary': 'ANYM-20'}, 'extra_fields'),
+    ({'id': P1, 'refusal': 'unsafe_source'}, 'unsafe_source'),
+    ({'id': P1, 'refusal': 'private arbitrary text'}, 'invalid_refusal'),
+    ({'id': P1, 'card_brief': HOSTILE}, 'unsafe_brief'),
+])
+def test_historical_brief_repair_closed_response_codes(brief_repair, response, reason):
+    r = brief_repair
+    with pytest.raises(autoloop.Refused, match=reason) as exc:
+        autoloop.repair_brief(r.a, r.t, P1, runner=lambda _: stream(json.dumps(response)))
+    assert 'private arbitrary text' not in str(exc.value)
+    assert not (r.a / autoloop.PROJECTION).exists()
 
 
 # spec: ANYM-991

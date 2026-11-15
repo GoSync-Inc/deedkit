@@ -275,8 +275,10 @@ PAUSE/card hold/item drop, the normal reader/item caps, and the normal triage â†
 It reads the original through the existing operator export and checks ID, key, principal, creation time and current
 accepted status/story. Missing/ambiguous source or authority refuses visibly. It never derives a summary from a
 spec title or metadata. Only that item's original text reaches the same isolated, pinned reader in memory; the
-closed parser, scrub and release checks still apply. Any proposed change to the original decision, matched verdicts
-or primary refuses; already-live, enable-only, question, not-actionable and duplicate decisions remain excluded.
+dedicated closed response accepts only the selected ID and a brief, or the fixed refusal `unsafe_source`. The
+program retains the validated original decision, matched verdicts and primary; extra fields refuse. Scrub and release
+checks still apply. Refusals use fixed non-text codes (`invalid_json`, `invalid_shape`, `extra_fields`, `foreign_id`,
+`invalid_refusal`, `unsafe_source`, `missing_brief`, `invalid_brief`, `unsafe_brief`); already-live, enable-only, question, not-actionable and duplicate decisions remain excluded.
 
 Before: retain private before-images of projection/brief files and read the selected ledger decision. After: the
 command prints only the original ID queued in `projection.json`; read back its primary and release timestamp and

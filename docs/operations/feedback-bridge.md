@@ -210,7 +210,8 @@ primary. A duplicate, all-declined match or ineligible class cannot gain admissi
 projection enabled, missing/unsafe actionable summaries remain pending in triage under the usual refusal cap.
 An already recorded metadata-only item can use the controller's explicit, single-ID
 [`repair-brief` route](feedback-triage.md#repair-a-recorded-existing-story-summary-dk-27): it preserves the original
-decision and history, queues only a scrubbed projection, and lets this bridge update its existing task. The source
+decision and history in program control, asks the isolated reader only for a brief or a fixed refusal, queues only a
+scrubbed projection, and lets this bridge update its existing task. The source
 fix and synthetic admission proof do not establish installation or that a real worker started.
 
 | Piece | Where |
