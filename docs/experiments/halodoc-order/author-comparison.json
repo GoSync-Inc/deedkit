@@ -1,0 +1,37 @@
+{
+  "kind": "author-driven synthetic authority/tool comparison",
+  "baseline": {
+    "kind": "author-driven synthetic tool exercise",
+    "checks": "passed",
+    "tool_calls": 16,
+    "sends": 2,
+    "owner_questions": 3,
+    "script_wall_s": 0.0493,
+    "model_time_s": null,
+    "model_turns": null,
+    "live_verified": false
+  },
+  "proposed": {
+    "kind": "author-driven synthetic tool exercise",
+    "checks": "passed",
+    "tool_calls": 16,
+    "sends": 2,
+    "owner_questions": 1,
+    "script_wall_s": 0.05,
+    "model_time_s": null,
+    "model_turns": null,
+    "live_verified": false,
+    "rejected_negative_controls": [
+      "invented_clinical_fact",
+      "unrelated_sender",
+      "resend_after_unknown",
+      "send_after_cancel"
+    ]
+  },
+  "limitations": [
+    "Caller chooses transcript; not an independent model benchmark.",
+    "Question count is synthetic; fixture wall time is not model or phone time.",
+    "No live medication order, doctor, prescription or WhatsApp send."
+  ],
+  "baseline_requirement_failure": "Only clinical unknown should require owner input: baseline has3 synthetic questions, proposed has1."
+}
