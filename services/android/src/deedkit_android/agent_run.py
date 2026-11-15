@@ -707,6 +707,8 @@ class Agents:
         self.order_control(create=True)
         from .order_supervision import Supervision
         self.supervision = Supervision(self)
+        from .order_usb_host import UsbLifecycle
+        self.usb = UsbLifecycle(self)
 
     def order_control(self, *, create=False):
         from .order_events import OrderEvents
@@ -815,9 +817,11 @@ class Agents:
         self.db.purge(time.time() - RETENTION_S)
 
     async def close(self):
+        self.usb.stop_all()
         await self.supervision.close()
         for run in list(self.runs.values()):
             await run.end('lost', error='service_stopped')
+        await self.usb.close()
         for session in self.sessions.values():
             await session.close()
 
@@ -917,6 +921,7 @@ class Agents:
         if call.action in {'reply', 'steer'}:
             return await self.interact(owner, call, authorize)
         if call.action == 'stop':
+            self.usb.stop(owner, request_id)
             await self.supervision.forget(owner, request_id)
             run = self.runs.get((owner, request_id))
             if run is not None:
@@ -1142,6 +1147,7 @@ class Agents:
         view['dialogue'] = dialogue.receipts(request_id)
         if self.read_config().agent.order_events is not None:
             view['native_supervision'] = self.supervision.status(owner, request_id)
+            view['usb_source'] = self.usb.status(owner, row['device'])
         if row['state'] == 'running' and dialogue.request_id == request_id and dialogue.process is not None:
             view['native_selection'] = dict(dialogue.selection)
             view['native_session'] = {'thread_id': dialogue.thread_id, 'turn_id': dialogue.turn_id,

@@ -312,6 +312,9 @@ class Supervision:
     async def tick(self):
         if self.closing:
             return
+        usb = getattr(self.agents, 'usb', None)
+        if usb is not None:
+            usb.refresh()
         handles = list(self.handles.items())
         offset = self.handle_cursor % len(handles) if handles else 0
         page = (handles + handles)[offset:offset + min(BATCH, len(handles))]
