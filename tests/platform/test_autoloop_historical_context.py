@@ -261,3 +261,52 @@ def test_dispatching_unknown_keeps_exact_journal_and_does_not_lookup_or_resend(t
     with pytest.raises(autoloop.Refused, match='authoritative identity changed'):
         publish()
     assert frozen(r.a) == before and len(r.cli) == 4 and len(sent) == 1 and len(r.calls) == 1
+
+
+# spec: ANYM-991
+@pytest.mark.parametrize('omitted', [('sources', 'sourceCount'), ('sources',), ('sourceCount',), ()])
+def test_zero_source_protocol_defaults_preserve_old_digest_in_assessment_and_publication(targeted, monkeypatch, omitted):
+    r = targeted
+    r.raw['sources'], r.raw['sourceCount'] = [], 0
+    old = triage.flatten({'requirements': [copy.deepcopy(r.raw)], 'pagination': {'totalCount': 1}}, 'old main')[0]
+    for field in omitted:
+        r.raw.pop(field)
+    before = frozen(r.t)
+    assert command(r) == 0 and len(r.cli) == 2 and len(r.calls) == 1
+    assert r.calls[0]['candidates'][FID] == [dict(old, branch='main')]
+    attempt = triage.load(r.a / autoloop.HISTORICAL, {})[FID]
+    assert attempt['spec_digest'] == autoloop.projection_digest(old) and old['sources'] == []
+    # Publication sees the other legal encoding of the same empty repeated field/default scalar.
+    if omitted:
+        r.raw.update(sources=[], sourceCount=0)
+    else:
+        r.raw.pop('sources')
+        r.raw.pop('sourceCount')
+    _, sent, publish = publisher(r, monkeypatch)
+    assert publish() == 'historical projection confirmed'
+    assert len(r.cli) == 4 and len(sent) == 1 and len(r.calls) == 1 and frozen(r.t) == before
+    assert triage.load(r.a / autoloop.HISTORICAL, {})[FID]['spec_digest'] == attempt['spec_digest']
+
+
+# spec: ANYM-991
+@pytest.mark.parametrize('stage', ['assessment', 'publication'])
+@pytest.mark.parametrize('fields', [
+    {'sources': [{'sourceType': 'text', 'title': 'Nonempty'}]}, {'sourceCount': 1},
+    {'sources': None}, {'sourceCount': None}, {'sources': {}}, {'sourceCount': '0'},
+    {'sourceCount': True}, {'sourceCount': -1}, {'sources': [], 'sourceCount': 2}])
+def test_zero_source_defaults_never_hide_invalid_or_incomplete_source_fields(targeted, monkeypatch, stage, fields):
+    r = targeted
+    if stage == 'publication':
+        assert command(r) == 0
+    _, sent, publish = publisher(r, monkeypatch)
+    before_a, before_t = frozen(r.a), frozen(r.t)
+    r.raw.pop('sources')
+    r.raw.pop('sourceCount')
+    r.raw.update(copy.deepcopy(fields))
+    if stage == 'assessment':
+        assert command(r) == 1 and not r.calls
+    else:
+        with pytest.raises(autoloop.Refused, match='current main story unavailable or incomplete'):
+            publish()
+        assert len(r.calls) == 1
+    assert not sent and frozen(r.a) == before_a and frozen(r.t) == before_t

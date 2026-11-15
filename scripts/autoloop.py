@@ -972,13 +972,16 @@ def historical_story(ref):
             or main[0].get('productId') != product or main[0].get('status') != 'open'
             or sum(b.get('id') == main[0]['id'] for b in branches['branches']) != 1):
         raise Refused('historical: main branch authority unavailable')
+    # Protocol JSON may omit an empty repeated sources field and its default-zero count independently.
+    # Explicit null/wrong types and incomplete nonempty sources still refuse; flatten keeps the old [] digest.
     if (not isinstance(spec, dict) or not isinstance(spec.get('id'), str) or not triage.UUID.fullmatch(spec['id'])
             or spec.get('productId') != product or spec.get('branchId') != main[0]['id']
             or type(spec.get('seqNum')) is not int or f"ANYM-{spec['seqNum']}" != ref
             or spec.get('type') != 'User Story' or not isinstance(spec.get('status'), str) or not spec['status']
             or not isinstance(spec.get('title'), str) or not isinstance(spec.get('content'), str)
-            or not spec['content'].strip() or not isinstance(spec.get('sources'), list)
-            or type(spec.get('sourceCount')) is not int or spec['sourceCount'] != len(spec['sources'])
+            or not spec['content'].strip() or not isinstance(spec.get('sources', []), list)
+            or type(spec.get('sourceCount', 0)) is not int
+            or spec.get('sourceCount', 0) != len(spec.get('sources', []))
             or spec.get('contentSha256') != hashlib.sha256(spec['content'].encode()).hexdigest()):
         raise Refused('historical: current main story unavailable or incomplete')
     # Reuse every byte/field of the old collect()['main'] normalizer, including str(source) order. Existing

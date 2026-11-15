@@ -336,7 +336,9 @@ Historical assessment and queued publication each read only the fixed accepted s
 ANYM-n` (CLI KEY-N resolution targets main) and `tiden branch list` metadata, with explicit repository product and
 workspace IDs. The unique open `main` UUID must match the story's branch/product; the exact ref, story UUID/type,
 field shapes, content hash and source count must be complete. These are two bounded CLI calls independent of open
-branch count; no branch spec inventories or cached snapshot substitute. Both paths use the unchanged triage
+branch count. Protocol JSON may omit empty `sources` and default-zero `sourceCount` independently; explicit null,
+wrong types or inconsistent/nonempty missing data still refuse. These defaults preserve the old empty-source digest.
+No branch spec inventories or cached snapshots substitute for these reads. Both paths use the unchanged triage
 normalizer, including raw text and ordered full source metadata stringification, so already queued collector-based
 story digests still match. Any changed normalized field refuses publication. Normal triage/snapshots still inventory
 main and every open branch; unknown publication outcomes still reconcile exact metadata without resending.
