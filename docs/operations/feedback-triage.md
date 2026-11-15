@@ -342,6 +342,10 @@ No branch spec inventories or cached snapshots substitute for these reads. Both 
 normalizer, including raw text and ordered full source metadata stringification, so already queued collector-based
 story digests still match. Any changed normalized field refuses publication. Normal triage/snapshots still inventory
 main and every open branch; unknown publication outcomes still reconcile exact metadata without resending.
+An unchanged ledger decision may retain secondary accepted matches: its saved snapshot/known map validates those
+historical references only, with the primary overridden by the fresh main story. Missing or malformed provenance
+refuses. The reader receives only the fixed fresh primary and cannot route to an old secondary; original ledger
+and snapshot bytes stay intact, and publication still checks the full original-record digest.
 
 `historical-assessments.json` stores a fsynced once-only attempt before charge/invocation: original and story digests,
 current identity, exact prior projection (including explicit absence), then the new validated assessment and exact

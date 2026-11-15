@@ -8,7 +8,7 @@ import types
 import pytest
 
 from scripts import autoloop
-from test_autoloop_legacy_briefs import FID, REF, command, frozen, historical, publisher  # noqa: F401
+from test_autoloop_legacy_briefs import FID, REF, command, frozen, historical, publisher, seam  # noqa: F401
 
 triage = autoloop.triage
 REAL_TIDEN = triage.tiden
@@ -310,3 +310,75 @@ def test_zero_source_defaults_never_hide_invalid_or_incomplete_source_fields(tar
             publish()
         assert len(r.calls) == 1
     assert not sent and frozen(r.a) == before_a and frozen(r.t) == before_t
+
+
+@pytest.fixture
+def legacy_matches(targeted):
+    r = targeted
+    r.entry['specs'] += [{'ref': 'ANYM-701', 'verdict': 'accepted'}, {'ref': 'ANYM-702', 'verdict': 'accepted'}]
+    r.snap['main'] += [{'ref': 'ANYM-701', 'title': 'Historical main match', 'status': 'Backlog',
+                       'text': 'Synthetic prior main context.', 'sources': []}]
+    r.snap['branches'] = {'proposal/old-fixture': [
+        {'ref': 'ANYM-702', 'title': 'Historical branch match', 'status': 'Backlog',
+         'text': 'Synthetic prior branch context.', 'sources': []}]}
+    triage.save(r.t / 'ledger.json', {FID: r.entry})
+    triage.save(r.t / 'snapshot.json', r.snap)
+    return r
+
+
+# spec: ANYM-991
+def test_legacy_secondary_matches_use_retained_provenance_and_fresh_primary_only(legacy_matches, monkeypatch):
+    r = legacy_matches
+    before = frozen(r.t)
+    assert command(r) == 0 and len(r.calls) == 1 and len(r.cli) == 2
+    fresh = triage.flatten({'requirements': [r.raw], 'pagination': {'totalCount': 1}}, 'fresh main')[0]
+    assert r.calls[0]['candidates'][FID] == [dict(fresh, branch='main')]
+    assert fresh != r.snap['main'][0]  # stale primary never supplies current authority or reader context
+    attempt = triage.load(r.a / autoloop.HISTORICAL, {})[FID]
+    assert attempt['origin_digest'] == autoloop.projection_digest(r.entry)
+    assert attempt['spec_digest'] == autoloop.projection_digest(fresh)
+    db, sent, publish = publisher(r, monkeypatch)
+    assert publish() == 'historical projection confirmed'
+    assert seam(r, {'feedback_id': FID, **db.prior})[1] == 'start'
+    assert len(r.cli) == 4 and len(sent) == 1 and len(r.calls) == 1 and frozen(r.t) == before
+
+
+# spec: ANYM-991
+@pytest.mark.parametrize('fault', ['unknown-secondary', 'bad-verdict', 'missing-snapshot', 'malformed-snapshot',
+                                  'missing-primary', 'wrong-primary', 'changed-old-record', 'secondary-routing'])
+def test_retained_provenance_cannot_authorize_invalid_history_or_a_new_target(legacy_matches, monkeypatch, fault):
+    r = legacy_matches
+    if fault == 'changed-old-record':
+        assert command(r) == 0
+        r.entry['reason'] = 'Synthetic changed original record.'
+    elif fault == 'unknown-secondary':
+        r.entry['specs'].append({'ref': 'ANYM-703', 'verdict': 'accepted'})
+    elif fault == 'bad-verdict':
+        r.entry['specs'][1]['verdict'] = 'invented'
+    elif fault == 'missing-snapshot':
+        (r.t / 'snapshot.json').unlink()
+    elif fault == 'malformed-snapshot':
+        triage.save(r.t / 'snapshot.json', {'main': None})
+    elif fault == 'missing-primary':
+        r.raw = {}
+    elif fault == 'wrong-primary':
+        r.raw['seqNum'] = 701
+    elif fault == 'secondary-routing':
+        r.response['decisions'][0]['primary'] = 'ANYM-701'
+        r.response['decisions'][0]['specs'] = [{'ref': 'ANYM-701', 'verdict': 'accepted'}]
+    triage.save(r.t / 'ledger.json', {FID: r.entry})
+    _, sent, publish = publisher(r, monkeypatch)
+    before_a, before_t = frozen(r.a), frozen(r.t)
+    if fault == 'changed-old-record':
+        with pytest.raises(autoloop.Refused, match='historical: publication held or original changed'):
+            publish()
+        assert frozen(r.a) == before_a and len(r.calls) == 1
+    else:
+        assert command(r) == 1
+        assert not (r.a / autoloop.PROJECTION).exists()
+        if fault == 'secondary-routing':
+            assert len(r.calls) == 1
+            assert triage.load(r.a / autoloop.HISTORICAL, {})[FID]['phase'] == 'refused'
+        else:
+            assert not r.calls and frozen(r.a) == before_a
+    assert not sent and frozen(r.t) == before_t
