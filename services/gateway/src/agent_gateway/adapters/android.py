@@ -8,13 +8,41 @@ import json
 
 from mcp.types import ImageContent, TextContent
 
+from ..catalog import CATALOG
 from ..policy import Denied
 
 IMAGE_LIMIT = 16 * 1024 * 1024
 ENCODED_LIMIT = ((IMAGE_LIMIT + 2) // 3) * 4
 
 
+def caller_capabilities(result):
+    """Project MCP orientation from Dispatch's effective tools, never the backend's larger catalog."""
+    operations = {CATALOG[name]['operation'] for name in result.get('gateway_tools', [])
+                  if name in CATALOG and CATALOG[name]['module'] == 'android'}
+    result = dict(result)
+    if isinstance(result.get('input_schemas'), dict):
+        result['input_schemas'] = {name: schema for name, schema in result['input_schemas'].items()
+                                   if name in operations}
+    if 'execute' not in operations:
+        result.pop('adb_commands', None)
+    if 'maestro' not in operations:
+        result.pop('maestro', None)
+    if 'agent' not in operations:
+        result.pop('agent', None)
+    if not operations & {'maestro', 'run_flow'}:
+        result.pop('ui', None)
+    elif isinstance(result.get('ui'), dict):
+        ui = dict(result['ui'])
+        for field in ('reference_tool', 'batch_tool'):
+            if ui.get(field) not in result['gateway_tools']:
+                ui.pop(field, None)
+        result['ui'] = ui
+    return result
+
+
 def content(name, result):
+    if name == 'android_capabilities':
+        result = caller_capabilities(result)
     if name != "android_observe" or "image" not in result:
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, separators=(",", ":")))], result
     picture = result["image"]
