@@ -366,6 +366,26 @@ class OrderEvents:
         elif row['seen'] > wake['through']:
             self._stage(self._order(row['owner'], row['order_id']))
 
+    def _handoff_wakes(self, row):
+        """Keep task notices separate from provider orders, with exact originating scope."""
+        return [dict(w) for w in self.db.execute("""
+            SELECT w.*,n.task_id AS correlated_task_id,n.provider_order_id AS correlated_order_id
+            FROM android_order_wakes w JOIN android_order_obligations n
+              ON n.owner=w.owner AND n.order_id=w.order_id
+            WHERE w.owner=? AND (w.order_id=? OR (n.task_only=1 AND n.device_id=?
+              AND n.task_id=? AND n.original_request_id=? AND n.native_thread_id=?))
+              AND w.state NOT IN ('done','cancelled','refused') ORDER BY w.rowid""",
+            (row['owner'], row['order_id'], row['device_id'], row['task_id'],
+             row['original_request_id'], row['native_thread_id']))]
+
+    @staticmethod
+    def _handoff_reference(wake, row):
+        return dict(wake_id=wake['wake_id'], obligation_ref=wake['order_id'],
+                    scope='bound_obligation' if wake['order_id'] == row['order_id'] else 'task_notice',
+                    task_id=wake['correlated_task_id'], order_id=wake['correlated_order_id'],
+                    original_request_id=wake['original_request_id'],
+                    native_thread_id=wake['native_thread_id'], native_turn_id=wake['native_turn_id'])
+
     def _snapshot(self, row):
         snapshot = {key: row[key] for key in ('owner', 'order_id', 'device_id', 'source_id', 'package',
                 'original_request_id', 'native_thread_id', 'native_turn_id', 'question_id', 'original_user_words',
@@ -373,11 +393,13 @@ class OrderEvents:
         if row.get('task_id') is not None:
             snapshot.update(obligation_ref=row['order_id'], order_id=row['provider_order_id'],
                             task_id=row['task_id'], origin=json.loads(row['origin_json']))
-            snapshot['questions'] = [dict(wake_id=q['wake_id'], delivery_state=q['state'],
-                native_status='not_observed', payload=json.loads(q['payload'])) for q in self.db.execute('''
-                SELECT wake_id,state,payload FROM android_order_wakes WHERE owner=? AND order_id=?
-                AND kind='question' AND state NOT IN ('done','cancelled','refused') ORDER BY rowid''',
-                (row['owner'], row['order_id']))]
+            wakes = self._handoff_wakes(row)
+            snapshot['questions'] = [self._handoff_reference(q, row) | dict(delivery_state=q['state'],
+                native_status='not_observed', payload=json.loads(q['payload']))
+                for q in wakes if q['kind'] == 'question']
+            snapshot['unsettled_delivery'] = [self._handoff_reference(w, row) | dict(
+                kind=w['kind'], target=w['target'], delivery_state=w['state'])
+                for w in wakes if w['state'] in ('sending', 'unknown')]
         return snapshot
 
     def propose_handoff(self, principal, owner, order_id, *, target_principal):
@@ -396,6 +418,8 @@ class OrderEvents:
             # An explicit transfer includes delivered caller questions in its immutable snapshot.
             # Grok read is not native acceptance; uncertain sends and native work still block transfer.
             unsettled = "(state IN ('sending','unknown') OR state='accepted' AND (target='codex' OR kind='handoff'))"
+            if any(w['state'] in ('sending', 'unknown') for w in self._handoff_wakes(row)):
+                raise OrderRefused('order_delivery_unsettled')
         if self.db.execute("SELECT 1 FROM android_order_wakes WHERE owner=? AND order_id=? AND " + unsettled,
                            (owner, order_id)).fetchone():
             raise OrderRefused('order_delivery_unsettled')
