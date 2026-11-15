@@ -50,6 +50,8 @@ class CodexSession:
         self.selection, self.version_verified = {}, False
         self.timing = None
         self.settings_applied = None
+        self.settings_snapshot, self.settings_source = None, None
+        self.settings_pending = False
         self.disconnected = False
         self.order_control_registered, self.control, self.control_admit = False, None, None
         self.boundary_receipt = None
@@ -411,6 +413,10 @@ class CodexSession:
                 self.bindings.confirm_native_binding(self.owner, self.device, ident, boundary)
             self.thread_id = ident
             self.policy_proven = pinned and response.get('approvalPolicy') == 'never'
+            if self.policy_proven:
+                self.remember_settings({**response, 'effort': response.get('reasoningEffort'),
+                                        'sandboxPolicy': response.get('sandbox')},
+                                       'thread/resume' if expected_thread is not None else 'thread/start')
             if expected_thread is None:
                 fd = os.open(saved, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
                 with os.fdopen(fd, 'w') as stream:
@@ -572,10 +578,16 @@ class CodexSession:
                     params = message.get('params') or {}
                     if params.get('threadId') != self.thread_id:
                         continue
-                    if (params.get('threadSettings') or {}).get('approvalPolicy') != 'never':
+                    try:
+                        self.remember_settings(params.get('threadSettings') or {}, 'thread/settings/updated')
+                    except Refused as error:
                         self.policy_proven, self.turn_policy_proven = False, False
-                    if self.settings_applied is not None and not self.settings_applied.done():
-                        self.settings_applied.set_result(None)  # wake hint; a fresh readback must still confirm values
+                        self.settings_snapshot, self.settings_source = None, None
+                        if self.settings_applied is not None and not self.settings_applied.done():
+                            self.settings_applied.set_exception(error)
+                    else:
+                        if self.settings_applied is not None and not self.settings_applied.done():
+                            self.settings_applied.set_result(dict(self.settings_snapshot))
                     if self.events is not None:
                         self.events.put_nowait(message)
                 elif self.events is not None:
@@ -623,7 +635,7 @@ class CodexSession:
             if self.timing:
                 self.timing.finish('native_disconnected')
             if self.settings_applied is not None and not self.settings_applied.done():
-                self.settings_applied.set_result(None)  # wake only; the required readback will fail closed
+                self.settings_applied.set_exception(OSError('native_session_disconnected'))
             try:
                 self.finish_questions('expired')
             except OSError:
@@ -654,8 +666,28 @@ class CodexSession:
                 or item.get('status') == 'declined'):
             self.pending_commands.pop(key)
 
+    def remember_settings(self, receipt, source):
+        """Only a native effective snapshot, including the unchanged binding boundary, is authority."""
+        if (not all(key in receipt for key in ('model', 'effort', 'serviceTier', 'cwd', 'sandboxPolicy'))
+                or receipt.get('approvalPolicy') != 'never' or not isinstance(receipt['model'], str)
+                or not receipt['model'] or receipt['effort'] not in (None, 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')
+                or (receipt['serviceTier'] is not None and not isinstance(receipt['serviceTier'], str))):
+            raise Refused('native_selection_unconfirmed')
+        try:
+            boundary = self.binding_boundary({**receipt, 'sandbox': receipt['sandboxPolicy']})
+            if self.order_control_registered:
+                boundary['order_control'] = ORDER_REGISTRATION
+            if hashlib.sha256(json.dumps(boundary, sort_keys=True).encode()).hexdigest() != self.boundary_receipt:
+                raise Refused('native_selection_unconfirmed')
+        except Refused:
+            raise Refused('native_selection_unconfirmed') from None
+        self.settings_snapshot = {'model': receipt['model'], 'effort': receipt['effort'],
+                                  'service_tier': receipt['serviceTier']}
+        self.settings_source, self.policy_proven = source, True
+        self.settings_pending = False
+
     async def select(self, config):
-        """Validate against this process's native catalog, then read effective settings on the SAME thread."""
+        """Confirm live settings without requiring an unmaterialized first-turn rollout."""
         if not self.version_verified:
             raise Refused('native_version_unsupported')
         requested = {'model': config.model or PERSISTENT_MODEL, 'effort': config.reasoning_effort,
@@ -663,6 +695,8 @@ class CodexSession:
         self.selection = {'requested': requested, 'effective': None, 'configuration_status': 'unconfirmed',
                           'provider_service_tier': None, 'provider_tier_observed': False,
                           'native_thread_id': self.thread_id, 'source': None, 'timings_ms': {}}
+        if not self.policy_proven or self.settings_snapshot is None or self.settings_pending:
+            raise Refused('native_selection_unconfirmed')
         phase = time.monotonic()
         cursor, seen, model = None, set(), None
         while True:
@@ -683,32 +717,24 @@ class CodexSession:
                 row.get('id') for row in model.get('serviceTiers', [])]:
             raise Refused('native_service_tier_unsupported')
         expected = {**requested, 'service_tier': None if requested['service_tier'] == 'default' else requested['service_tier']}
+        if self.settings_snapshot == expected and self.policy_proven:
+            self.selection.update(effective=dict(self.settings_snapshot), source=self.settings_source,
+                                  configuration_status='confirmed')
+            return requested  # native deduplicates unchanged settings notifications; no mutation/ACK is invented
         self.settings_applied = asyncio.get_running_loop().create_future()
         try:
             phase = time.monotonic()
+            self.settings_pending = True  # before bytes; only a positive native snapshot can reconcile this mutation
             await self.rpc('thread/settings/update', {'threadId': self.thread_id, 'model': requested['model'],
                            'effort': requested['effort'], 'serviceTier': requested['service_tier'], 'approvalPolicy': 'never'})
             self.selection['timings_ms']['settings'] = round((time.monotonic() - phase) * 1000, 2)
-            for attempt in range(2):
-                phase = time.monotonic()
-                receipt = await self.rpc('thread/resume', {'threadId': self.thread_id, 'excludeTurns': True})
-                elapsed = round((time.monotonic() - phase) * 1000, 2)
-                self.selection['timings_ms']['receipt'] = self.selection['timings_ms'].get('receipt', 0) + elapsed
-                effective = {'model': receipt.get('model'), 'effort': receipt.get('reasoningEffort'),
-                             'service_tier': receipt.get('serviceTier')}
-                self.selection.update(effective=effective, source='thread/resume')
-                self.policy_proven = receipt.get('approvalPolicy') == 'never'
-                if (receipt.get('thread') or {}).get('id') != self.thread_id or not self.policy_proven:
-                    raise Refused('native_selection_unconfirmed')
-                self.binding_boundary(receipt)
-                if effective == expected:
-                    break
-                if attempt:
-                    raise Refused('native_selection_unconfirmed')
-                phase = time.monotonic()
-                async with asyncio.timeout(30):
-                    await self.settings_applied
-                self.selection['timings_ms']['applied_wait'] = round((time.monotonic() - phase) * 1000, 2)
+            phase = time.monotonic()
+            async with asyncio.timeout(30):
+                effective = await self.settings_applied
+            self.selection['timings_ms']['applied_wait'] = round((time.monotonic() - phase) * 1000, 2)
+            self.selection.update(effective=effective, source='thread/settings/updated')
+            if effective != expected or not self.policy_proven:
+                raise Refused('native_selection_unconfirmed')
         except TimeoutError:
             raise Refused('native_selection_unconfirmed') from None
         finally:

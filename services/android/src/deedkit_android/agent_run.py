@@ -890,7 +890,7 @@ class Agents:
                 'default_model': (codex.model if codex else None) or ('gpt-6.1-sol' if persistent else 'gpt-6.1-terra'),
                 'default_service_tier': (codex.service_tier if codex else None) or 'ultrafast' if persistent else None,
                 'native_selection': {'available': bool(persistent and found['codex']['available']),
-                                     'catalog': 'checked_before_goal', 'configuration_receipt': 'thread/resume',
+                                     'catalog': 'checked_before_goal', 'configuration_receipt': 'native_effective_settings_snapshot',
                                      'provider_tier_observed': False, 'unsupported': 'refused_without_fallback'},
                 'order_events': {'configured': config.agent.order_events is not None,
                     'source_id': config.agent.order_events.source_id if config.agent.order_events else None,

@@ -364,10 +364,17 @@ caller selects `model`, `effort` or `service_tier`. Before every goal, the same 
 fallback. `service_tier=default` explicitly requests standard routing rather than a catalog default.
 Isolated exec retains Terra/medium compatibility and refuses tier selection it cannot receipt.
 
-The service applies typed thread settings and reads `thread/resume(excludeTurns=true)` for the same
-thread's effective model, effort, service tier and `approvalPolicy=never`. A settings RPC reports submission only. If the first read is stale, wait for the native applied-settings
-notification and read once more; never resend the mutation. Missing/mismatched receipts refuse before goal dispatch. This readback preserves the live process, thread and conversation; it
-does not replay a goal or load a replacement thread. Stop, current key/control/device lease and mode
+The service validates the actual `thread/start` or connect-time `thread/resume` effective snapshot,
+including model, effort, service tier, `approvalPolicy=never` and the unchanged workspace/registration
+boundary. If it already matches, no settings mutation is needed: native0.166 deduplicates unchanged
+settings notifications. A change submits typed settings once and waits for the full same-thread
+`thread/settings/updated` applied snapshot; the empty update response proves submission only. Missing,
+foreign, mismatched or relaxed receipts refuse before the original input intent and goal bytes.
+An unconfirmed settings mutation blocks later requests from resending it; a later positive native
+snapshot may reconcile configuration, never an original failed/unknown goal. Selection performs no
+`thread/resume`: a newly created in-memory thread need not have a rollout before its first user input.
+The same live process/thread and original bindings remain; no alternative conversation is created.
+Stop, current key/control/device lease and mode
 are checked again after these awaits. Pending questions survive failed preflight. Async owner answers
 continue with the original task's receipted selection. A native model reroute fails explicitly.
 
