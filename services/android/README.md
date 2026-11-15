@@ -904,6 +904,23 @@ raw ADB, sessions, receipt polling and screenshot downloads retain their entry p
 
 ### Native order metadata and owner wakes (ANYM-993/997)
 
+With a configured source and an active package-bound obligation, the existing supervision tick
+starts one USB listener connector using an actual admitted run or its retained in-memory lease handle.
+It rechecks the original key, device serial, source epoch, reservation, native process/thread and
+authority generation around waits. It acquires only its own serial-pinned
+`adb forward --no-rebind tcp:0 localabstract:deedkit-order-events`; an existing forward is never adopted.
+The private acquisition intent precedes the command. Uncertain acquisition/removal or a host restart
+leaves a durable hold, without automatic retry, lease acquisition or native session reconstruction.
+The authenticated agent status includes metadata-only `usb_source` state and cleanup status.
+
+Stop, reservation release and service shutdown close the connector. While the original authority is
+still valid, cleanup sends an empty watch and requires the listener's valid hello before reporting
+collection cleared; the existing listener may take 30 seconds, within a 40-second cleanup budget.
+Only the positively owned forward is removed. Missing authority/hello or uncertain cleanup stays
+visible as a hold. Source metadata feeds the existing order journal and same-lease native due admission;
+it does not establish native input acceptance. Listener installation/grant and actual installed
+collection, wake delivery and phone behavior require separate live verification.
+
 `agent.order_events: {source_id: "<trusted configured source>", auth_epoch: 1}` supplies host
 source provenance. Cross-principal handoff additionally needs a trusted `handoff_principals` mapping
 from the original task principal to its authorized same-owner/delegated Grok recipient; without that

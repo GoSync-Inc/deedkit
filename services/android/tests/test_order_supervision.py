@@ -275,20 +275,49 @@ def test_idle_ticks_keep_fixed_deadline_and_cap_the_existing_reservation_expiry(
 
 # spec: ANYM-993, ANYM-997
 def test_timer_checks_spend_original_cumulative_command_budget_without_renewing_task_deadline(tmp_path, monkeypatch):
+    from deedkit_android import store as store_module
     config, record = host(tmp_path, monkeypatch, delay=.25, repeat=True)
+    binary = Path(json.loads(config.read_text())['engines']['codex']['binary'])
+    source = binary.read_text()
+    next_check = "at=time.time()+.12,checked_wake_id=wake['wake_id']"
+    assert next_check in source
+    binary.write_text(source.replace(next_check,
+        "at=wake['observation']['next_check_at']+1,checked_wake_id=wake['wake_id']"))
     with Service(config) as service:
         token = service.lease()
         request = service.start(token, goal='native-control', max_actions=10, max_minutes=1)
         service.finished(request['request_id'])
         supervision = service.app.state.agents.supervision
+        stop_ticker(service, supervision.task.get_loop())
+        initial_wall, real_mono, extra = time.time(), time.monotonic, [0]
+        def wall():
+            return initial_wall + extra[0]
+        supervision.wall, supervision.clock = wall, lambda: real_mono() + extra[0]
+        service.app.state.agents.orders.events.clock = wall
+        monkeypatch.setattr(store_module, 'time', SimpleNamespace(time=wall))
         handle = supervision.handles[('one', request['request_id'])]
         deadline = handle.time_limit
-        until(lambda: len([r for r in messages(record) if r['message'].get('method') == 'turn/start']) == 10)
-        until(lambda: not supervision.handles and not supervision.active)
+        for expected in range(2, 11):
+            obligation, = rows(service, 'SELECT next_check_at FROM android_order_obligations WHERE task_only=0')
+            extra[0] = obligation['next_check_at'] - initial_wall + .001
+            asyncio.run_coroutine_threadsafe(supervision.tick(), supervision.task.get_loop()).result(3)
+            try:
+                until(lambda: len([r for r in messages(record) if r['message'].get('method') == 'turn/start']) == expected)
+                until(lambda: not supervision.active)
+            except AssertionError as error:
+                diagnostic = {'expected_turn_starts': expected,
+                    'turn_starts': len([r for r in messages(record) if r['message'].get('method') == 'turn/start']),
+                    'commands': handle.commands, 'status': supervision.status('one', request['request_id']),
+                    'active': bool(supervision.active), 'wake_states': [(r['state'], r['hold_reason']) for r in wakes(service)]}
+                raise AssertionError(str(diagnostic)) from error
+        assert len([r for r in messages(record) if r['message'].get('method') == 'turn/start']) == 10
+        assert not supervision.handles and not supervision.active
         assert handle.commands == 10 and handle.time_limit == deadline
         assert len([r for r in messages(record) if r['message'].get('method') == 'thread/start']) == 1
         assert len(rows(service, 'SELECT * FROM android_order_native_inputs')) == 9
-        until(lambda: wakes(service)[-1]['hold_reason'] == 'supervision_budget_unavailable')
+        extra[0] += 1
+        asyncio.run_coroutine_threadsafe(supervision.tick(), supervision.task.get_loop()).result(3)
+        assert wakes(service)[-1]['hold_reason'] == 'supervision_budget_unavailable'
         assert not service.app.state.devices.locks['home'].locked()
 
 
