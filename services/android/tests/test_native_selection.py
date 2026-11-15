@@ -63,10 +63,10 @@ def test_native_catalog_and_actual_thread_receipt_confirm_config_without_inventi
             assert receipt['effective']==receipt['requested']
             assert receipt['configuration_status']=='confirmed'
             assert receipt['provider_service_tier'] is None and receipt['provider_tier_observed'] is False
-            assert receipt['source']=='thread/resume' and receipt['native_thread_id']==original_thread
+            assert receipt['source']=='thread/start' and receipt['native_thread_id']==original_thread
             seen=[r['message'] for r in messages(record)]
-            resume=[m for m in seen if m.get('method')=='thread/resume'][-1]
-            assert resume['params']=={'threadId':original_thread,'excludeTurns':True}
+            assert not [m for m in seen if m.get('method')=='thread/resume']
+            assert len([m for m in seen if m.get('method')=='thread/start'])==1
             assert turns(record)[0]['params']['serviceTier']=='ultrafast'
             assert len({r['pid'] for r in messages(record)})==1
         finally:
@@ -309,7 +309,7 @@ def test_submitted_settings_wait_for_native_applied_event_and_fresh_receipt_with
             assert session.selection['effective']=={'model':'gpt-6.1-terra','effort':'high','service_tier':None}
             methods=[r['message']['method'] for r in messages(record)]
             assert methods.count('thread/settings/update')==1
-            assert methods.count('thread/resume')==2
+            assert methods.count('thread/resume')==0
             assert len(turns(record))==1
             assert methods.index('thread/settings/update')<methods.index('turn/start')
             assert len({r['pid'] for r in messages(record)})==1

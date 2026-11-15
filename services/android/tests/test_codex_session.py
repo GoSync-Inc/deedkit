@@ -39,6 +39,8 @@ for line in sys.stdin:
     elif method == 'thread/settings/update':
         selected=dict(model=params['model'],reasoningEffort=params['effort'],serviceTier=None if params['serviceTier']=='default' else params['serviceTier'])
         emit(id=message['id'],result={{}})
+        event('thread/settings/updated',threadSettings=dict(model=selected['model'],effort=selected['reasoningEffort'],serviceTier=selected['serviceTier'],approvalPolicy='never',cwd=os.getcwd(),
+              sandboxPolicy=dict(type='workspaceWrite',writableRoots=[os.getcwd()],networkAccess=True,excludeTmpdirEnvVar=True,excludeSlashTmp=True)))
     elif method == 'turn/start':
         turns += 1; current = 'turn-' + str(turns)
         if {crash!r}:

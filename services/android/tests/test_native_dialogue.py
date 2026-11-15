@@ -22,11 +22,12 @@ def native(tmp_path, *, policy='never', version='0.166.0', models=None, effectiv
     record = tmp_path / 'wire.jsonl'
     binary = tmp_path / 'native'
     binary.write_text(f'''#!{sys.executable}
-import json, os, sys
+import json, os, sys, threading, time
 if sys.argv[1:] == ['--version']:
     print({version!r}); raise SystemExit
 thread, turn, mode, count = 'thread-' + str(os.getpid()), None, None, 0
 selected = dict(model='gpt-6.1-sol',reasoningEffort='medium',serviceTier='ultrafast')
+selected.update({effective!r} or {{}})
 pending_selection = None
 def emit(**body): print(json.dumps(body), flush=True)
 def event(method, **params): emit(method=method, params=dict(threadId=thread, **params))
@@ -51,12 +52,16 @@ for line in sys.stdin:
     elif method == 'thread/settings/update':
         updated=dict(model=p['model'],reasoningEffort=p['effort'],serviceTier=None if p['serviceTier']=='default' else p['serviceTier'])
         updated.update({effective!r} or {{}})
-        if {delayed_settings!r}:
-            pending_selection=updated
-        else:
-            selected=updated
         emit(id=m['id'],result={{}})
-        if not {delayed_settings!r}: event('thread/settings/updated',threadSettings=dict(model=selected['model'],effort=selected['reasoningEffort'],serviceTier=selected['serviceTier'],approvalPolicy={policy!r}))
+        if {disconnect_before_applied!r}: raise SystemExit
+        def applied():
+            global selected
+            if {delayed_settings!r}: time.sleep(.03)
+            selected=updated
+            event('thread/settings/updated',threadSettings=dict(model=selected['model'],effort=selected['reasoningEffort'],serviceTier=selected['serviceTier'],approvalPolicy={policy!r},cwd=os.getcwd(),
+                  sandboxPolicy=dict(type='workspaceWrite',writableRoots=[os.getcwd()],networkAccess=True,excludeTmpdirEnvVar=True,excludeSlashTmp=True)))
+        if {delayed_settings!r}: threading.Thread(target=applied,daemon=True).start()
+        else: applied()
     elif method == 'turn/start':
         count+=1; turn='turn-'+str(os.getpid())+'-'+str(count); mode=p['input'][0]['text']
         if 'Caller input (nonsecret JSON):\\n' in mode:

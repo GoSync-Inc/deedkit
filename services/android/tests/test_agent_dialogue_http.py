@@ -362,8 +362,8 @@ def test_concurrent_post_turn_async_answers_start_one_turn_on_original_native_pr
         assert len(writes(record,'turn/start')) == 2
         assert len({r['pid'] for r in messages(record)}) == 1
         assert len(writes(record,'thread/start')) == 1
-        assert [r['params'] for r in writes(record,'thread/resume')] == [
-            {'threadId':args['native_thread_id'],'excludeTurns':True}] * 2
+        assert writes(record,'thread/resume') == []
+        assert all(r['params']['threadId'] == args['native_thread_id'] for r in writes(record,'turn/start'))
 
 
 # spec: ANYM-993
