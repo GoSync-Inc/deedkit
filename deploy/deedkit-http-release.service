@@ -1,0 +1,23 @@
+[Unit]
+Description=Resume only the accepted DeedKit HTTP generation after Docker starts
+Wants=network-online.target
+After=network-online.target docker.service ufw.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=DEEDKIT_DEPLOY_CONFIG=/etc/deedkit/production.json
+Environment=DEEDKIT_HTTP_CONFIG=/etc/deedkit/http-production.json
+Environment=DEEDKIT_BACKUP_LOCK=/opt/personal-os-probe/backups/.runner.lock
+EnvironmentFile=-/etc/deedkit/autodeploy.env
+ExecStart=/usr/bin/python3 /usr/local/lib/deedkit/seamless_release.py resume --config ${DEEDKIT_HTTP_CONFIG} --plan-a-config ${DEEDKIT_DEPLOY_CONFIG}
+TimeoutStartSec=600
+TimeoutStopSec=10s
+KillMode=control-group
+
+[Install]
+WantedBy=docker.service

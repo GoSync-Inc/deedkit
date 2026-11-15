@@ -520,7 +520,7 @@ def compose(project):
     return result
 
 
-def snapshot(project, *, stopped=False, labels=None, conditions=None, exited=()):
+def snapshot(project, *, stopped=False, labels=None, conditions=None, exited=(), inspections=None):
     """The project's Compose document and the identity of each selected service's container. Only rollback and a
     failed health wait (`stopped`) accept a container that exited or keeps restarting: that is when they run, and so
     do the session services named in `exited` (ANYM-896: a stopped holder is recreated at once), which also may be a
@@ -546,6 +546,8 @@ def snapshot(project, *, stopped=False, labels=None, conditions=None, exited=())
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", actual["Image"]):
             raise Refused("running container has no immutable image identity")
         running[service] = {"container": ids[0], "image": actual["Image"], "settings": container_settings(actual)}
+        if inspections is not None:
+            inspections[service] = actual
         if labels is not None:
             steady = condition.get("Running") and not condition.get("Restarting") and not condition.get("Paused")
             labels[service] = ((actual.get("Config") or {}).get("Labels") or {}).get(INPUT_LABEL) if steady else None
@@ -580,6 +582,19 @@ def container_settings(inspected):
 
 def legacy_identities(running):
     return any(not str(identity.get("settings", "")).startswith(SETTINGS_VERSION) for identity in running.values())
+
+
+def container_settings_match(inspected, recorded):
+    """Compare an existing v2 receipt without rewriting it. Docker may serialize empty DNS options/search as null
+    or []; only those two present, empty fields have alternate representations. DNS servers, order and every
+    meaningful setting keep their exact digest semantics. New receipts retain the observed representation."""
+    candidates = [inspected]
+    for key in ("DnsOptions", "DnsSearch"):
+        host = inspected.get("HostConfig") or {}
+        if key in host and (host[key] is None or host[key] == []):
+            candidates += [{**item, "HostConfig": {**item["HostConfig"], key: [] if host[key] is None else None}}
+                           for item in candidates[:]]
+    return any(container_settings(item) == recorded for item in candidates)
 
 
 # The runtime's data/config mount roots, never executable roots.

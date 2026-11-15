@@ -2322,6 +2322,17 @@ both chains); with the rules persisted, also restore the saved copies of the rul
 
 ### Stopped worker: the unit and manual recovery (ANYM-709, ANYM-794)
 
+Docker identity compatibility (DK-26): the worker compares the exact accepted
+container and image IDs, then the recorded v2 settings digest. Only present,
+empty `HostConfig.DnsOptions` and `DnsSearch` accept Docker's equivalent `null`
+and `[]` serializations, independently. Missing keys, nonempty DNS values/order,
+DNS servers, mounts, policy/config and every other setting remain distinct.
+The accepted receipt/hash is never rewritten. Both pre-start identity checks use
+the same comparison; hold, exit 78, call, egress and lock gates stay in place.
+The script requires a matching updated production tool; source delivery does not
+install the worker script or prove its next natural Docker-start outcome.
+HTTP boot admission is separate: see [accepted-generation boot resume](seamless-release.md#accepted-generation-boot-resume-dk-26).
+
 After a host reboot or a Docker restart Docker leaves `enricher-mini` stopped: its restart policy stays `no`, since a policy
 cannot leave out exit 78. `deedkit-inference-worker.service`, a root oneshot wanted by `docker.service` with no `Restart=`
 and no timer, runs `/usr/local/lib/deedkit/inference_worker_start.py` once per Docker start. Nothing requires it and Docker

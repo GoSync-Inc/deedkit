@@ -157,10 +157,13 @@ def held(path):
 def run_main(monkeypatch, *argv):
     monkeypatch.setattr(sys, 'argv', ['backup_runner', *argv])
     monkeypatch.setattr(backup_runner.signal, 'signal', lambda *_: None)
+    previous_mask = os.umask(0o077)
     try:
         backup_runner.main()
     except SystemExit as stopped:
         return stopped.code
+    finally:
+        os.umask(previous_mask)
     return 0
 
 
