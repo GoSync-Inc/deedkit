@@ -657,7 +657,7 @@ class Dispatch:
             raise denied
         snapshot, agent, visible, states, selection = await self.platform(key, route)
         credential = admitted.get()
-        return {
+        answer = {
             "service": "deedkit",
             "version": "0.1.0",
             "principal": agent["id"],
@@ -683,6 +683,17 @@ class Dispatch:
             "capability": Capability("gateway", "capabilities", snapshot["revision"]).to_dict(),
             **recipes.extend(selection, self.policy.visible(snapshot, agent), args),
         }
+        module = args.get("module")
+        if route is not None and route.path == COMPACT_PATH and module is not None:
+            answer["modules_available"] = [row for row in answer["modules_available"] if row["id"] == module]
+            answer["selected_modules"] = [name for name in answer["selected_modules"] if name == module]
+            answer["modules"] = [row["id"] for row in answer["modules_available"] if row["selected"]]
+            answer["tool_paths"] = [row for row in answer["tool_paths"] if CATALOG[row["tool"]]["module"] == module]
+            for field in ("backend_states", "backend_builds", "backend_tool_manifests"):
+                answer[field] = {name: value for name, value in answer[field].items() if name == module}
+            answer["unavailable"] = [row for row in answer["unavailable"] if row["module"] == module]
+            answer.pop("connection_guidance", None)
+        return answer
 
     def call_credential(self, snapshot, agent, module):
         """The agent's key for one backend call; a backend the running clients were not built for needs a restart."""
