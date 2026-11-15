@@ -1,5 +1,6 @@
 """Explicit historical compatibility uses structural authority, never historical text as a reason code."""
 import copy
+import hashlib
 import json
 from pathlib import Path
 import types
@@ -48,7 +49,8 @@ def historical(tmp_path, monkeypatch, request):
         disposition={'status': 'accepted', 'spec_ref': REF, 'duplicate_of': None, 'note': 'Synthetic old note'},
         decided_at='2026-10-26T00:00:00+00:00', reported=True)
     ledger = {} if request.param == 'missing-ledger' else {FID: entry}
-    snap = {'main': [{'ref': REF, 'title': 'Synthetic story', 'status': 'Active', 'text': '', 'sources': []}],
+    snap = {'main': [{'ref': REF, 'title': 'Synthetic story', 'status': 'Active',
+                     'text': 'Synthetic story content.', 'sources': []}],
             'branches': {}}
     for path, value in [(t / 'ledger.json', ledger), (t / 'inbox.json', {FID: source} if not ledger else {}),
             (t / 'snapshot.json', snap), (t / 'state.json', {'position': 'old-cursor'}),
@@ -61,6 +63,19 @@ def historical(tmp_path, monkeypatch, request):
         triage.save(path, value)
     monkeypatch.setattr(autoloop, 'SYNC_STATE', sync)
     monkeypatch.setattr(triage, 'collect', lambda: copy.deepcopy(snap))
+    def tiden(*argv):
+        product, branch = '75bd0580-2af4-4d5a-b236-c5a9d7ff7ce1', '22222222-2222-4222-8222-000000000001'
+        if argv[:2] == ('branch', 'list'):
+            return {'branches': [{'id': branch, 'productId': product, 'name': 'main', 'status': 'open'}]}
+        assert argv[:2] == ('spec', 'get')
+        spec = next((s for s in snap['main'] if s['ref'] == argv[2]), None)
+        if spec is None:
+            raise triage.Refused('synthetic spec not found on main')
+        return {'id': '22222222-2222-4222-8222-000000000002', 'productId': product, 'branchId': branch,
+            'seqNum': int(spec['ref'][5:]), 'type': 'User Story', 'title': spec['title'], 'status': spec['status'],
+            'content': spec['text'], 'sources': copy.deepcopy(spec['sources']), 'sourceCount': len(spec['sources']),
+            'contentSha256': hashlib.sha256(spec['text'].encode()).hexdigest()}
+    monkeypatch.setattr(triage, 'tiden', tiden)
     rows, calls = [source], []
     monkeypatch.setattr(triage, 'export_pages', lambda *args: (copy.deepcopy(rows), '2026-11-16T00:00:00+00:00'))
     observed = {'feedback_id': FID, **{k: source[k] for k in
