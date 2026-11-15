@@ -42,6 +42,16 @@ thread. If Keeper/CI already completes every registered obligation, declare
 `remaining_action: "none"`, `action_owner: "keeper-and-ci"`: green then writes a final
 receipt without waking a model. This declaration cannot erase other delivery duties.
 
+The named owner consumes each delivery receipt once; root uses that result instead of
+repeating the same API inventory. Executed sync B already checks imported marked tests,
+reads their links back, and verifies written anchors/status. Do not manually relist every
+case/link or recheck unchanged specs after each source fix. Keep the separately required
+component readback for merged cards and inspect the authentic publication receipt: a green
+best-effort reporting job alone is not publication. Missing/failed/partial evidence, identity
+changes or a specific unresolved association require investigation of that gap. Source
+receipts never replace the authorized installed-path check. The PR/task receipt holds links;
+handoffs carry source, outcome and the next action, not a second evidence ledger.
+
 ```sh
 python3 scripts/ci_watch.py register --state /absolute/private/registry.json --mapping /absolute/private/handoff.json
 python3 scripts/ci_watch.py status --state /absolute/private/registry.json
