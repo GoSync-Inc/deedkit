@@ -951,11 +951,10 @@ def historical_story(ref):
     """One fresh accepted main story; no snapshot or open-branch spec inventory (DK-34)."""
     if not isinstance(ref, str) or not SPEC_REF.fullmatch(ref):
         raise Refused('historical: invalid story ref')
-    link = triage.load(ROOT / '.tiden' / 'config.json', {})
-    if not isinstance(link, dict) or any(not isinstance(link.get(k), str) or not triage.UUID.fullmatch(link[k])
-                                        for k in ('productId', 'workspaceId')):
-        raise Refused('historical: product identity unavailable')
-    scope = ('--product-id', link['productId'], '--workspace-id', link['workspaceId'])
+    # DeedKit's canonical identity (docs/operations/tiden-product-workflow.md). A fresh checkout has no ignored
+    # local .tiden binding; neither that file nor the caller's CLI defaults may redirect this accepted story.
+    product, workspace = '75bd0580-2af4-4d5a-b236-c5a9d7ff7ce1', '1dc18e09-4a09-4d74-8300-cd4302622357'
+    scope = ('--product-id', product, '--workspace-id', workspace)
     # CLI 0.53 KEY-N resolution explicitly targets main; get has no --branch flag. Independently verify its
     # branch UUID against fresh metadata, never trust a default branch or read that branch's spec inventory.
     try:
@@ -970,11 +969,11 @@ def historical_story(ref):
         triage.complete(branches, len(branches['branches']), 'historical branches')
     main = [b for b in branches['branches'] if b.get('name') == 'main']
     if (len(main) != 1 or not isinstance(main[0].get('id'), str) or not triage.UUID.fullmatch(main[0]['id'])
-            or main[0].get('productId') != link['productId'] or main[0].get('status') != 'open'
+            or main[0].get('productId') != product or main[0].get('status') != 'open'
             or sum(b.get('id') == main[0]['id'] for b in branches['branches']) != 1):
         raise Refused('historical: main branch authority unavailable')
     if (not isinstance(spec, dict) or not isinstance(spec.get('id'), str) or not triage.UUID.fullmatch(spec['id'])
-            or spec.get('productId') != link['productId'] or spec.get('branchId') != main[0]['id']
+            or spec.get('productId') != product or spec.get('branchId') != main[0]['id']
             or type(spec.get('seqNum')) is not int or f"ANYM-{spec['seqNum']}" != ref
             or spec.get('type') != 'User Story' or not isinstance(spec.get('status'), str) or not spec['status']
             or not isinstance(spec.get('title'), str) or not isinstance(spec.get('content'), str)

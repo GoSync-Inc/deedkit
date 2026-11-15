@@ -74,6 +74,18 @@ def test_historical_assessment_and_publication_use_two_exact_cli_calls_each(targ
 
 
 # spec: ANYM-991
+def test_historical_lookup_works_in_fresh_checkout_without_local_tiden_binding(targeted, monkeypatch, tmp_path):
+    r = targeted
+    checkout = tmp_path / 'unbound-checkout'
+    checkout.mkdir()
+    monkeypatch.setattr(autoloop, 'ROOT', checkout)
+    assert not (checkout / '.tiden' / 'config.json').exists()
+    assert command(r) == 0 and len(r.cli) == 2
+    _, sent, publish = publisher(r, monkeypatch)
+    assert publish() == 'historical projection confirmed' and len(r.cli) == 4 and len(sent) == 1
+
+
+# spec: ANYM-991
 @pytest.mark.parametrize('stage', ['assessment', 'publication'])
 @pytest.mark.parametrize('fault', ['wrong-ref', 'bool-seq', 'wrong-branch', 'wrong-product', 'bad-uuid',
     'missing-main', 'duplicate-main', 'shadow-main-id', 'bad-main-id', 'wrong-main-product', 'closed-main',
