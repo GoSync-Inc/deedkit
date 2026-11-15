@@ -424,6 +424,9 @@ The USB service, configuration, limits and deployment order are described in
 
 Connect the existing gateway key to `/mcp/compact` for three tools, subject to the
 profile granting them. `platform_capabilities` reports the available sections.
+With `module`, its compact overview shows that module's paths and diagnostics; the
+gateway tools and discovery fingerprint still describe the connection. Recipes and
+an explicitly requested `since` changelog keep their existing authorization rules.
 `platform_search_tools` accepts a `module`, search `query`, `limit`, `offset` and
 `detail=full` for exact input schemas. `platform_call_tool` takes the discovered
 `name` and its `arguments`. Calls use the ordinary dispatcher, including per-tool
