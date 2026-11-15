@@ -94,15 +94,18 @@ Product/queue: docs/operations/tiden-product-workflow.md; CI: TIDEN-CI.md.
 
 ## 5. Reviews
 
-Override: harness process.md sections 2, 3 and 5, reviews.md and tiden.md review steps (owner
-11-11: «отмени все ревью в целом», «мы их и так отменяли», «не только текущих у всех в будущем»).
-No review on any path: no Astra, Fable, Codex, plan or card review, no Diff read. A pull request
-merges on green required checks with a failing-first test; PR line `Review record: none (owner
-11-11: no reviews)`. Kept: section 1's exact owner confirmation of live actions, and a fresh verified
-backup and undo before deleting or rewriting user data. Enforcer: the merge keeper and the autoloop
-controller enqueue a green pull request with no approval (tests/test_merge_keeper.py,
-tests/platform/test_autoloop.py).
+Override: harness review steps (owner 11-11: «отмени все ревью в целом»,
+«не только текущих у всех в будущем»). No model, plan, card review or Diff read.
+Green required checks and failing-first proof suffice; `Review record: none`.
+Sections 1–2 retain live-action and destructive-data boundaries. Enforcers:
+tests/test_merge_keeper.py, tests/platform/test_autoloop.py.
 
 ## 6. Working with the orchestrator
 
 - Word cap: 1,000 words (`wc -w`).
+- Covered fixes use task-flow.md's three-field brief, one executor and touched tests locally;
+  CI owns full suites. Dispatch current scope and exceptions, not the feature roadmap or
+  completed incidents. One receipt/PR indexes evidence. Consume exact CI/publication/B receipts
+  once; duplicate test/link listings need a concrete gap (ci-worker-handoff.md). Correct a
+  contradictory brief before dispatch; interrupt only for changed authority, a blocker or
+  wrong direction. This replaces expanded per-fix handoffs (owner 11-15).
