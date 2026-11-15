@@ -3,6 +3,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,18 @@ from platform_contracts.release import ReleaseRuntime
 
 from scripts import seamless_release as s
 from test_seamless_release import GEN, IMAGE, ROUTER_ID, SHA, settings
+
+
+@pytest.fixture(autouse=True)
+def preserve_process_umask():
+    # The CLI deliberately hardens its process. An in-process CLI test must not
+    # change the permissions of files later tests create through sudo.
+    previous = os.umask(0o077)
+    os.umask(previous)
+    try:
+        yield
+    finally:
+        os.umask(previous)
 
 
 @pytest.fixture
