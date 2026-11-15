@@ -25,7 +25,7 @@ BOUND = 570
 START_RESERVE = START_TIMEOUT + START_WINDOW
 # What this script uses of the installed production.py; a tool without one of them is too old to start anything.
 REQUIRED = ("Refused", "CallActive", "DEADLINE", "HTTP_CONFIG", "active_config", "compose", "config", "legacy_identities",
-            "lock", "backup_lock", "read", "run", "snapshot", "unresolved", "wait_for_calls")
+            "lock", "backup_lock", "read", "run", "snapshot", "unresolved", "wait_for_calls", "container_settings_match")
 
 
 class Refusal(Exception):
@@ -93,9 +93,9 @@ def recorded_identity(tool, state, name):
         return identity
 
 
-def read_identity(tool, worker):
+def read_identity(tool, worker, inspections):
     try:
-        return tool.snapshot(worker, stopped=True)[1][SERVICE]
+        return tool.snapshot(worker, stopped=True, inspections=inspections)[1][SERVICE]
     except tool.Refused as exc:
         if "exactly one" in str(exc):
             raise Refusal("no_container") from None
@@ -104,8 +104,12 @@ def read_identity(tool, worker):
 
 def check_identity(tool, worker, recorded):
     with step("identity_mismatch"):
-        if read_identity(tool, worker) != recorded:
+        inspections = {}
+        found = read_identity(tool, worker, inspections)
+        if (any(found[key] != recorded[key] for key in ("container", "image"))
+                or not tool.container_settings_match(inspections[SERVICE], recorded["settings"])):
             raise Refusal("identity_mismatch")
+        return found
 
 
 def check_hold():
@@ -177,9 +181,11 @@ def attempt():
             if tool.unresolved(state, http_state(tool, state)):
                 raise Refusal("release_unresolved")
         with step("identity_mismatch"):  # d
-            found = read_identity(tool, worker)
+            inspections = {}
+            found = read_identity(tool, worker, inspections)
         recorded = recorded_identity(tool, state, project["name"])
-        if found != recorded:
+        if (any(found[key] != recorded[key] for key in ("container", "image"))
+                or not tool.container_settings_match(inspections[SERVICE], recorded["settings"])):
             raise Refusal("identity_mismatch")
         check_hold()  # e
         with step("previous_exit_78"):  # f

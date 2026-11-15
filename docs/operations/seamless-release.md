@@ -201,3 +201,49 @@ compatibility of a future schema migration, or a production promotion.
 
 See also: [verified production operator](production.md),
 [platform cutover](platform-cutover.md).
+
+## Accepted-generation boot resume (DK-26)
+
+A restarted API/gateway process starts `warming` even when its generation was
+already accepted. `seamless_release.py resume --config <http-config>
+--plan-a-config <production-config>` resumes only the pair selected by the
+unchanged `http-current.json`, matching `http-result.json` and a resolved serving
+attempt. Both plan A and HTTP must name the same applied SHA. It never deploys,
+creates/starts containers, changes routes, retires a predecessor or rewrites an
+acceptance receipt. An unsettled predecessor requires the existing operator path.
+
+The bounded action takes the backup, global, HTTP and plan A locks without
+waiting. A pause, unresolved/newer publication, changed router or persisted
+route, image/container/policy/Compose identity, foreign control, draining process,
+unready pair or unknown/currently active call refuses activation. Passive
+readiness waits up to the configured ready timeout. Accepted identity and the
+current host boot ID are rechecked after each call wait, before activation. No
+collector claim, ownership heartbeat, auth or provider operation is touched;
+postboot ownership/heartbeat acceptance remains a separate installed obligation.
+
+`http-resume.json` is a separate operation journal, never an acceptance receipt.
+Before the first activation it records `activating` with SHA/generation/boot ID.
+Only confirmed activation and final checks mark it `complete`. A lost reply or
+interruption leaves an uncertain journal and refuses another activation, including
+on a later boot. Preserve it and inspect actual control/current/router state;
+never clear it to retry an uncertain mutation. The whole action is bounded to
+570 seconds (the unit allows 600); failures print only the exception class.
+
+Root installs the source unit `deploy/deedkit-http-release.service` only after
+green-main delivery and exact sync B, with the matching installed `production.py`
+and `seamless_release.py` bundle. Before installation, retain any existing unit
+for undo, verify the current receipts/local `deploy-source.git` ancestry, private
+paths, normal router and container restart policies, configured plan A/HTTP and
+backup paths, and absence of an existing competing boot helper. The disabled
+historical hardpinned helper remains disabled. The new unit uses the same optional
+`autodeploy.env` as autodeploy, runs once when Docker starts, has no timer or
+Restart policy, and respects `autodeploy.pause`. Installation is by the root's
+separately allocated operation: copy the unit, daemon-reload, enable without
+`--now`; no install, enable, service start or reboot is performed by source tests.
+
+Undo: root disables only this unit, restores its saved predecessor (or removes
+only the newly installed unit), daemon-reloads and reads back the result. Keep
+receipts/journal and running containers unchanged. A source test is no proof of
+installed recovery. Root owns the later safe reboot/installed-path observation,
+including both public routes, the exact intended worker set, ownership/heartbeat
+and call state; source delivery leaves that acceptance open.

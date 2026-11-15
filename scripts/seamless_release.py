@@ -540,7 +540,7 @@ def prepare(settings, sha):
     return {'sha': sha, 'generation': generation, 'ci': original['ci'], 'images': original['images'], 'status': 'prepared'}
 
 
-def validate_prepared(settings, receipt):
+def validate_artifacts(settings, receipt):
     if receipt['config_digest'] != p.digest(settings) or p.digest(p.read(receipt['compose'])) != receipt['compose_digest']:
         raise Refused('prepared HTTP configuration changed')
     for filename, expected in receipt['private_files'].items():
@@ -552,6 +552,10 @@ def validate_prepared(settings, receipt):
         labels = actual['Config'].get('Labels', {})
         if actual['Id'] != image or labels.get('org.opencontainers.image.revision') != receipt['sha'] or labels.get('org.opencontainers.image.source') != 'https://github.com/' + p.REPOSITORY:
             raise Refused('prepared HTTP image identity changed')
+
+
+def validate_prepared(settings, receipt):
+    validate_artifacts(settings, receipt)
     for project, item in zip(settings['projects'], receipt['baseline'], strict=True):
         if p.legacy_identities(item['running']):
             raise Refused('HTTP baseline was prepared by an older production.py with order-dependent container settings; prepare again')
@@ -604,6 +608,93 @@ def active_candidate(receipt):
         value = control(path, 'status', receipt['generation'], receipt['sha'])
         if value['phase'] != 'active' or not value['ready']:
             raise Refused('candidate active HTTP readiness no longer passes')
+
+
+def resume_guard(settings, plan, receipt, boot):
+    """No acceptance is manufactured: re-read the committed decision and its exact runtime identities."""
+    state, http = Path(plan['state_directory']), Path(settings['state_directory'])
+    release = http / receipt['sha']
+    if not boot or p.boot_id() != boot or os.path.lexists(p.PAUSE):
+        raise Refused('HTTP resume boot is unknown/changed or autodeploy is paused')
+    attempted = p.read(private_path(release / 'http-attempted.json'))
+    if (p.read(private_path(http / 'http-current.json')) != receipt
+            or p.read(private_path(release / 'http-result.json')) != receipt
+            or attempted.get('status') != 'serving' or attempted.get('sha') != receipt['sha']
+            or settings['http_release']['gateway_policy'] not in receipt['private_files']):
+        raise Refused('HTTP resume requires the unchanged accepted serving receipt')
+    current = p.read(private_path(state / 'current.json'))
+    if (current.get('status') != 'applied' or current.get('sha') != receipt['sha']
+            or p.unresolved(state, http, lambda: state / 'deploy-source.git', receipt['sha'])):
+        raise Refused('HTTP resume refuses an unresolved or different current release')
+    validate_artifacts(settings, receipt)
+    if router_identity(settings) != receipt['router_container']:
+        raise Refused('HTTP resume router identity changed')
+    live, _ = router_get(settings)
+    if (live != receipt['router_after'] or live.get('active') != receipt['generation']
+            or not live['generations'][receipt['generation']]['admit_files']
+            or p.read(private_path(settings['http_release']['router']['config_file'])) != live):
+        raise Refused('HTTP resume router no longer selects the accepted generation')
+    if candidate_identities(receipt) != receipt['containers']:
+        raise Refused('HTTP resume accepted container identity changed')
+
+
+def resume(settings, plan):
+    """One bounded boot action over the already running accepted pair. Never creates a generation or changes routes.
+    An activating journal with a lost reply is left unresolved; a later invocation cannot retry that mutation."""
+    validate_settings(settings)
+    previous_deadline, boot = p.DEADLINE, p.boot_id()
+    p.DEADLINE = min(previous_deadline or float('inf'), time.monotonic() + 570)
+    try:
+        with p.backup_lock(), locks(settings), ExitStack() as held:
+            state, http = Path(plan['state_directory']), Path(settings['state_directory'])
+            if state.resolve() not in {GLOBAL_LOCK.resolve(), http.resolve()}:
+                held.enter_context(p.lock(state))
+            receipt = p.read(private_path(http / 'http-current.json'))
+            if (not re.fullmatch(r'[0-9a-f]{40}', receipt.get('sha', ''))
+                    or not GENERATION.fullmatch(receipt.get('generation', '')) or not p.serving_settled(receipt)
+                    or set(receipt.get('controls', {})) != {'api', 'gateway'}
+                    or set(receipt.get('containers', {})) != {'api', 'gateway'}):
+                raise Refused('HTTP resume requires one settled accepted generation')
+            journal = http / receipt['sha'] / 'http-resume.json'
+            if os.path.lexists(journal) and p.read(private_path(journal)).get('status') != 'complete':
+                raise Refused('HTTP resume has an uncertain activation; inspect before recovery')
+            resume_guard(settings, plan, receipt, boot)
+            deadline = min(p.DEADLINE, time.monotonic() + settings['http_release'].get('ready_timeout', 120))
+            while True:
+                try:
+                    values = {role: control(path, 'status', receipt['generation'], receipt['sha'])
+                              for role, path in receipt['controls'].items()}
+                    if any(value['phase'] == 'draining' for value in values.values()):
+                        raise Refused('HTTP resume never reopens a draining process')
+                    if all(value['ready'] for value in values.values()):
+                        break
+                except OSError:
+                    pass  # Only passive reads may wait. Foreign/invalid control responses fail closed.
+                if time.monotonic() >= deadline:
+                    raise Refused('HTTP resume readiness did not pass')
+                time.sleep(.25)
+            if all(value['phase'] == 'active' for value in values.values()):
+                return {'status': 'already-active', 'sha': receipt['sha'], 'generation': receipt['generation']}
+            record = {'status': 'activating', 'sha': receipt['sha'], 'generation': receipt['generation'], 'boot_id': boot}
+            written = False
+            for role in ('api', 'gateway'):
+                if values[role]['phase'] == 'active':
+                    continue
+                resume_guard(settings, plan, receipt, boot)
+                p.wait_for_calls(plan, min(p.DEADLINE, time.monotonic() + 120))
+                resume_guard(settings, plan, receipt, boot)
+                if not written:
+                    durable_write(journal, record)
+                    written = True
+                value = control(receipt['controls'][role], 'activate', receipt['generation'], receipt['sha'])
+                if value['phase'] != 'active' or not value['ready']:
+                    raise Refused('HTTP resume activation was not confirmed')
+            resume_guard(settings, plan, receipt, boot)
+            active_candidate(receipt)
+            durable_write(journal, {**record, 'status': 'complete'})
+            return {'status': 'resumed', 'sha': receipt['sha'], 'generation': receipt['generation']}
+    finally:
+        p.DEADLINE = previous_deadline
 
 
 def wait_ready(settings, receipt):
@@ -1052,11 +1143,11 @@ def backup_wait_flag(text):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['bootstrap', 'prepare', 'promote', 'retire', 'status', 'clean'])
+    parser.add_argument('action', choices=['bootstrap', 'prepare', 'promote', 'retire', 'resume', 'status', 'clean'])
     parser.add_argument('--sha')
     parser.add_argument('--config', default='/etc/deedkit/http-production.json')
     parser.add_argument('--remove', action='store_true', help='clean: remove the listed containers and then old release images')
-    parser.add_argument('--plan-a-config', help='clean --remove: the plan A configuration for the image pass')
+    parser.add_argument('--plan-a-config', help='resume or clean --remove: the plan A configuration')
     parser.add_argument('--backup-wait', type=backup_wait_flag, default=p.BACKUP_WAIT, metavar='SECONDS',
                         help=f'promote: wait up to this long (0 to {p.BACKUP_WAIT_MAX}, default {p.BACKUP_WAIT}) for a '
                              'running backup, then hold its lock; past it exit 75')
@@ -1066,6 +1157,12 @@ def main(argv=None):
         if os.geteuid() != 0:
             raise Refused('the local production operator must run as root')
         settings = validate_settings(p.config(args.config))
+        if args.action == 'resume':
+            if args.sha or not args.plan_a_config:
+                raise Refused('resume selects only the accepted receipt and requires --plan-a-config')
+            result = resume(settings, p.config(args.plan_a_config))
+            print(json.dumps(result))
+            return
         if args.action in {'bootstrap', 'prepare', 'promote', 'retire'} and not re.fullmatch(r'[0-9a-f]{40}', args.sha or ''):
             raise Refused('an exact lowercase 40-character main SHA is required')
         with locks(settings), ExitStack() as held:
@@ -1084,7 +1181,8 @@ def main(argv=None):
         print(json.dumps(exc.line()))
         parser.exit(p.EX_TEMPFAIL)
     except Exception as exc:
-        parser.exit(1, 'HTTP release refused: ' + (str(exc) if isinstance(exc, Refused) else type(exc).__name__) + '\n')
+        detail = type(exc).__name__ if args.action == 'resume' else str(exc) if isinstance(exc, Refused) else type(exc).__name__
+        parser.exit(1, 'HTTP release refused: ' + detail + '\n')
 
 
 if __name__ == '__main__':

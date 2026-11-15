@@ -125,6 +125,38 @@ def receipt():
     return json.loads(start.RECEIPT.read_text())
 
 
+# spec: ANYM-794
+@pytest.mark.parametrize("recorded_shape,boot_shape", [(None, []), ([], None)])
+def test_boot_accepts_only_equivalent_empty_docker_dns_without_rewriting_acceptance(world, recorded_shape, boot_shape):
+    before = {**INSPECTED, "HostConfig": {"Memory": 1, "DnsOptions": recorded_shape, "DnsSearch": recorded_shape}}
+    current(world, with_identity(world, settings=p.container_settings(before)))
+    accepted = (world.state / "current.json").read_bytes()
+    world.host.inspected = {**before, "HostConfig": {**before["HostConfig"], "DnsOptions": boot_shape, "DnsSearch": boot_shape}}
+    assert start.main() == 0
+    assert world.host.steps.count("start") == 1
+    assert (world.state / "current.json").read_bytes() == accepted
+
+
+# spec: ANYM-794
+@pytest.mark.parametrize("change", [
+    {"HostConfig": {"Memory": 2, "DnsOptions": [], "DnsSearch": []}},
+    {"HostConfig": {"Memory": 1, "DnsOptions": ["ndots:1"], "DnsSearch": []}},
+    {"HostConfig": {"Memory": 1, "DnsOptions": [], "DnsSearch": ["private.invalid"]}},
+    {"HostConfig": {"Memory": 1, "DnsOptions": [], "DnsSearch": [], "Dns": ["192.0.2.1"]}},
+    {"HostConfig": {"Memory": 1, "DnsOptions": [], "DnsSearch": [], "RestartPolicy": {"Name": "always"}}},
+    {"Mounts": [{"Type": "bind", "Source": "/synthetic/foreign", "Destination": "/policy"}]},
+    {"Image": "sha256:" + "c" * 64},
+    {"Config": {"Image": "x", "Env": ["POLICY=changed"]}},
+])
+def test_boot_dns_compatibility_still_rejects_meaningful_identity_changes(world, change):
+    before = {**INSPECTED, "HostConfig": {"Memory": 1, "DnsOptions": None, "DnsSearch": None}}
+    current(world, with_identity(world, settings=p.container_settings(before)))
+    world.host.inspected = {**before, "HostConfig": {"Memory": 1, "DnsOptions": [], "DnsSearch": []}, **change}
+    assert start.main() == 1
+    assert receipt()["reason"] == "identity_mismatch"
+    assert "start" not in world.host.steps
+
+
 FULL = ["running_ps", "config", "snapshot_ps", "snapshot_inspect", "exit_code", "db_ps", "db_health", "calls", "egress",
         "config", "snapshot_ps", "snapshot_inspect", "calls", "start", "window"]
 
@@ -461,3 +493,25 @@ def test_the_runbook_names_the_unit_the_hold_file_and_the_check_before_enabling(
 # spec: ANYM-794
 def test_the_receipt_path_is_the_one_status_reads():
     assert str(start.RECEIPT) == str(p.INFERENCE_WORKER_RECEIPT)
+
+
+# spec: ANYM-794
+@pytest.mark.parametrize("field", ["DnsOptions", "DnsSearch"])
+def test_dns_compatibility_preserves_missing_and_nonempty_order_differences(field):
+    before = {**INSPECTED, "HostConfig": {"Memory": 1, field: ["first", "second"]}}
+    changed = {**before, "HostConfig": {"Memory": 1, field: ["second", "first"]}}
+    assert not p.container_settings_match(changed, p.container_settings(before))
+    missing = {**before, "HostConfig": {"Memory": 1}}
+    empty = {**before, "HostConfig": {"Memory": 1, field: []}}
+    assert not p.container_settings_match(empty, p.container_settings(missing))
+    assert not p.container_settings_match(missing, p.container_settings(empty))
+
+
+# spec: ANYM-794
+@pytest.mark.parametrize("options,search", [(None, []), ([], None)])
+def test_dns_empty_fields_are_compared_independently_against_the_original_digest(world, options, search):
+    before = {**INSPECTED, "HostConfig": {"Memory": 1, "DnsOptions": None, "DnsSearch": None}}
+    current(world, with_identity(world, settings=p.container_settings(before)))
+    world.host.inspected = {**before, "HostConfig": {"Memory": 1, "DnsOptions": options, "DnsSearch": search}}
+    assert start.main() == 0
+    assert world.host.steps.count("start") == 1
