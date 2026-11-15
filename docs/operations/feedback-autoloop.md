@@ -253,6 +253,18 @@ report.
 (forks too) from an `autoloop-` branch or with an `Autoloop:` line whose head is not in
 `approved.json` writes `PAUSE` first, then the finding, once per PR, so the owner's resume holds.
 It becomes an owner item with the revert command; `status` exits 1 while that PAUSE stands.
+The independent GitHub search uses 25 PRs per page and audit metadata, without controller
+check rollups. It requires the full stable `issueCount` inventory (up to GitHub search's
+1,000-result boundary), distinct PRs and progressing cursors. GraphQL errors, null rows,
+changed counts, an incomplete inventory or an exceeded bound fail the tick before the audit
+checkpoint, controller or launches. There is no retry or fallback to partial results.
+Each audit request has a 30-second timeout; the 120-second pagination budget is checked
+before and after each read (an in-flight final request can take up to 30 seconds more).
+Failures name `merged-pr-audit page=N` and a fixed HTTP, timeout, GraphQL or pagination
+code; response bodies, stderr text and cursor values are never copied into diagnostics.
+An upstream failure remains a failed tick. Smaller queries do not guarantee upstream
+availability or establish the cause of an earlier failure. This source correction adds
+no schedule, auth or installed-runtime change (DK-28; ANYM-572).
 
 **Release.** Plain autodeploy. The tick reads one read-only receipt snapshot (receipt_watch's
 LIVE rule; its ancestry check may `git fetch origin main` in the deedkit checkout) and marks each
