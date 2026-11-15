@@ -98,7 +98,8 @@ def _item_codes(item):
 
 def projection_errors(document):
     """The refusal codes of a whole file, in one fixed order; empty when it is valid."""
-    if not isinstance(document, dict) or set(document) not in ({'projections'}, {'projections', 'expected_prior'}) \
+    if not isinstance(document, dict) or set(document) not in ({'projections'}, {'projections', 'expected_prior'},
+                                                           {'projections', 'expected_initial'}) \
             or not isinstance(document['projections'], list):
         return ['invalid_projection_file']
     items = document['projections']
@@ -111,6 +112,15 @@ def projection_errors(document):
                 or not re.fullmatch(r'[0-9a-f]{64}', guard['digest']) or not isinstance(guard['identity'], dict)
                 or set(guard['identity']) != set(IDENTITY_FIELDS)):
             return ['invalid_expected_prior']
+    if 'expected_initial' in document:
+        guard = document['expected_initial']
+        if (len(items) != 1 or not isinstance(guard, dict) or set(guard) != {'identity', 'prior'}
+                or not isinstance(guard['identity'], dict) or set(guard['identity']) != set(IDENTITY_FIELDS)
+                or guard['prior'] is not None and (not isinstance(guard['prior'], dict)
+                    or set(guard['prior']) != {'release', 'digest'} or not isinstance(guard['prior']['release'], str)
+                    or not isinstance(guard['prior']['digest'], str)
+                    or not re.fullmatch(r'[0-9a-f]{64}', guard['prior']['digest']))):
+            return ['invalid_expected_initial']
     codes = []
     for item in items:
         codes += [code for code in _item_codes(item) if code not in codes]
@@ -119,6 +129,29 @@ def projection_errors(document):
         if len(set(names)) != len(names):
             codes.append('duplicate_feedback_id')
     return codes
+
+
+def check_initial(identity, old, item, guard, released):
+    """Distinct initial/brief-less guard: absence is compared while the feedback row is locked FOR UPDATE.
+
+    Every operator writer locks that row before the projection, so even an absent projection cannot appear between
+    this comparison and INSERT. Existing nonempty-refinement callers retain their separate expected_prior contract.
+    """
+    if (identity != guard['identity'] or identity['status'] != 'accepted' or identity['duplicate_of'] is not None
+            or not identity['key_id'] or not identity['principal'] or not identity['status_changed_at']
+            or identity['spec_ref'] != item.get('primary_spec') or item.get('new_card') is not None
+            or item['classification'] not in ('reported-bug', 'feature') or item['reason_code'] != 'matches-card'
+            or not item.get('released_brief')):
+        raise ValueError('stale_initial_projection')
+    prior = guard['prior']
+    if prior is None:
+        if old is not None:
+            raise ValueError('stale_initial_projection')
+    elif (old is None or old['released_brief'] is not None or old['new_card'] is not None
+            or old['released_at'] != prior['release'] or projection_digest(old) != prior['digest']
+            or any(old[k] != item.get(k) for k in ('classification', 'reason_code', 'primary_spec'))
+            or released <= _timestamp(prior['release'], 'invalid_expected_initial')):
+        raise ValueError('stale_initial_projection')
 
 
 def record_projections(c, document):
@@ -140,20 +173,23 @@ def record_projections(c, document):
         raise ValueError('invalid_released_at')
     names = sorted(items)
     guarded = document.get('expected_prior')
-    columns = 'id,principal,key_id,created_at,status,status_changed_at,spec_ref,duplicate_of' if guarded else 'id,principal,key_id'
-    lock = 'UPDATE' if guarded else 'KEY SHARE'
+    initial = document.get('expected_initial')
+    columns = 'id,principal,key_id,created_at,status,status_changed_at,spec_ref,duplicate_of' if guarded or initial else 'id,principal,key_id'
+    lock = 'UPDATE' if guarded or initial else 'KEY SHARE'
     rows = c.execute(f'SELECT {columns} FROM agent_feedback WHERE id=ANY(%s::uuid[]) ORDER BY id FOR {lock}',
         (names,)).fetchall()
     if len(rows) != len(names):
         raise ValueError('unknown_feedback: %d of %d IDs' % (len(names) - len(rows), len(names)))
-    if guarded:
+    if guarded or initial:
         from .store import serial
         row, item = rows[0], items[names[0]]
         previous = c.execute('SELECT ' + ','.join(PROJECTION_FIELDS) +
             ' FROM feedback_projections WHERE feedback_id=%s FOR UPDATE', (row['id'],)).fetchone()
         old = serial({name: previous[name] for name in PROJECTION_FIELDS}) if previous else None
         identity = serial({name: row[name] for name in IDENTITY_FIELDS})
-        if (identity != guarded['identity'] or identity['status'] != 'accepted' or identity['duplicate_of'] is not None
+        if initial:
+            check_initial(identity, old, item, initial, released[names[0]])
+        elif (identity != guarded['identity'] or identity['status'] != 'accepted' or identity['duplicate_of'] is not None
                 or identity['spec_ref'] != item.get('primary_spec') or old is None
                 or old['classification'] not in ('reported-bug', 'feature') or old['reason_code'] in ('already-live', 'needs-opt-in')
                 or old['new_card'] is not None or not old['released_brief'] or old['released_brief'] == item.get('released_brief')
