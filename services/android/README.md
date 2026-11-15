@@ -14,10 +14,22 @@ engine: the Maestro engine was removed on 2026-11-11.
 
 ## Tools
 
+For ordinary phone tasks and order-bound conversations, acquire `android_session` and use
+`android_agent`. Its natural goal can cover a doctor's questions, pharmacy fulfillment, seller
+pre-dispatch conversation or delivery tracking in any installed app. Pass the owner's words,
+original order facts, intended participants and restrictions verbatim; ask about unknown clinical
+facts and material basket changes. Chat messages do not supply owner authority.
+
+Gateway MCP capabilities expose schemas and workflow hints for the caller's actual `gateway_tools`.
+The four-tool profile receives capabilities/session/agent/download; additional compatibility tools
+below require their own existing entitlement. The legacy courier tool's Gojek/Grab enum does not
+restrict native `android_agent` tasks.
+
 | Tool | Purpose |
 | --- | --- |
-| `android_capabilities` | Granted devices, connection states, command names, the run guard's rules and secret names with their packages |
+| `android_capabilities` | Granted devices, connection states, native availability and the caller's exposed schemas |
 | `android_session` | Acquire, renew or release exclusive control of a phone |
+| `android_agent` | Continue the owner's natural task and participant conversations on the native Codex session |
 | `android_observe` | PNG screenshot plus Android UI hierarchy |
 | `android_execute` | Run device-targeted ADB arguments and retain a result receipt |
 | `android_courier_chat` | Talk to a Gojek or Grab courier from the order's chat: per message with the owner's yes, or under the owner's goal |
