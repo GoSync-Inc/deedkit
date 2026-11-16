@@ -1,7 +1,9 @@
 """Local text recognition of one screenshot. Image and text stay on the USB host."""
 
+import errno
 import io
 from pathlib import Path
+import signal
 import subprocess
 import tempfile
 import time
@@ -16,6 +18,7 @@ PNG = b'\x89PNG\r\n\x1a\n'
 IMAGE_CLASSES = ('ImageView', 'TextureView')
 LARGE_IMAGE = 0.6  # an image over this share of the read region is a viewer or the target, not a photo to blank
 MAX_NODES = 5000  # nodes of a dump the tree features read
+OCR_TIMEOUT_S = 20  # one Tesseract run
 HINT = ('Text recognition needs ocr_command (absolute Tesseract path, also the fallback when Apple Vision is the '
         'engine) and optional ocr_languages, for example eng+ind, in the USB host configuration.')
 
@@ -76,19 +79,37 @@ def normalize(image):
     return ImageOps.autocontrast(ImageOps.invert(nearest))
 
 
+def ocr_failed(cause, started, detail):
+    """Refused('ocr_failed') with a fixed internal cause: start_failed, exit_nonzero or timeout.
+
+    The public code stays ocr_failed. The cause and detail (an errno or exception class name, an exit status or a
+    signal name, the limit) ride on error.ocr_cause and an exception note, which tracebacks show and no response
+    carries; never a path, command, stderr, image or recognized text."""
+    error = Refused('ocr_failed')
+    error.ocr_cause = cause
+    error.add_note(f'ocr_cause={cause} {detail} elapsed_ms={round((time.monotonic() - started) * 1000)}')
+    return error
+
+
 def tesseract_lines(image, ocr, origin=(0, 0), min_confidence=60):
     """Tesseract engine lines of one image in full-screen pixels. Raises Refused('ocr_failed')."""
     # A private directory per call; removed on success, failure and timeout.
     with tempfile.TemporaryDirectory(prefix='deedkit-ocr-') as directory:
         path = Path(directory) / 'screen.png'
         normalize(image).save(path, format='PNG', compress_level=1)
+        started = time.monotonic()
         try:
             done = subprocess.run([ocr['command'], str(path), 'stdout', '-l', ocr['languages'], '--psm', '11', 'tsv'],
-                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=20, check=False)
-        except (OSError, subprocess.TimeoutExpired):
-            raise Refused('ocr_failed') from None
+                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=OCR_TIMEOUT_S, check=False)
+        except subprocess.TimeoutExpired:
+            raise ocr_failed('timeout', started, f'limit_s={OCR_TIMEOUT_S}') from None
+        except OSError as error:
+            name = errno.errorcode.get(error.errno, 'none') if isinstance(error.errno, int) else 'none'
+            raise ocr_failed('start_failed', started, f'errno={name} type={type(error).__name__}') from None
     if done.returncode:
-        raise Refused('ocr_failed')
+        status = done.returncode
+        detail = f'signal={signal.Signals(-status).name}' if status < 0 and -status in signal.valid_signals() else f'exit={status}'
+        raise ocr_failed('exit_nonzero', started, detail)
     return engine_lines(done.stdout.decode('utf-8', 'replace'), origin, min_confidence)
 
 

@@ -70,15 +70,21 @@ def native_receipt(service, wake):
     return json.loads(rows(service, 'SELECT receipt FROM android_order_native_inputs WHERE wake_id=?', (wake,))[0]['receipt'])
 
 
-def pause_selection(monkeypatch):
+def pause_selection(monkeypatch, skip=0):
+    """Hold the (skip+1)-th native selection after it completes until release is set.
+
+    Install it before service.start with skip=1: the foreground turn's selection passes, and the timer wake's selection
+    is the one held however late service.finished returns on a loaded runner (the wake is due .35 s after the native
+    next_check_at, so a patch installed after finished could miss it: CI run 43841133700)."""
     from deedkit_android.codex_session import CodexSession
     original = CodexSession.select
-    entered, release, once, loops = threading.Event(), threading.Event(), [True], []
+    entered, release, calls, loops = threading.Event(), threading.Event(), [0], []
 
     async def select(session, config):
+        calls[0] += 1
+        number = calls[0]
         result = await original(session, config)
-        if once[0]:
-            once[0] = False
+        if number == skip + 1:
             loops.append(asyncio.get_running_loop())
             entered.set()
             while not release.is_set():
@@ -187,9 +193,9 @@ def test_authority_change_after_native_preflight_refuses_before_touch_or_input_a
     config, record = host(tmp_path, monkeypatch, delay=.35)
     with Service(config) as service:
         token = service.lease()
+        entered, release, loops = pause_selection(monkeypatch, skip=1)
         original = service.start(token, goal='native-control')
         first = service.finished(original['request_id'])
-        entered, release, loops = pause_selection(monkeypatch)
         assert entered.wait(3)
         stop_ticker(service, loops[0])  # isolate the post-await admission check from metadata-tick cancellation
         touches, touch = [], Store.touch
@@ -233,9 +239,9 @@ def test_foreground_demand_cancels_unsubmitted_timer_preflight_and_wins_same_pro
     config, record = host(tmp_path, monkeypatch, delay=.35)
     with Service(config) as service:
         token = service.lease()
+        entered, release, _ = pause_selection(monkeypatch, skip=1)
         request = service.start(token, goal='native-control')
         first = service.finished(request['request_id'])
-        entered, release, _ = pause_selection(monkeypatch)
         assert entered.wait(3)
         try:
             foreground = service.finished(service.start(token, goal='  Home, ordinary new goal')['request_id'])
@@ -366,9 +372,9 @@ def test_changed_wake_binding_after_selection_never_routes_to_another_principal_
     config, record = host(tmp_path, monkeypatch, delay=.35)
     with Service(config) as service:
         token = service.lease()
+        entered, release, loops = pause_selection(monkeypatch, skip=1)
         original = service.start(token, goal='native-control')
         service.finished(original['request_id'])
-        entered, release, loops = pause_selection(monkeypatch)
         assert entered.wait(3)
         stop_ticker(service, loops[0])
         try:
@@ -395,9 +401,9 @@ def test_observations_coalesced_during_native_preflight_are_frozen_and_delivered
     binary.write_text(binary.read_text().replace('state=dict(pending=True)', "state=dict(pending=True),package='app.synthetic'"))
     with Service(config) as service:
         token = service.lease()
+        entered, release, loops = pause_selection(monkeypatch, skip=1)
         request = service.start(token, goal='native-control', owner_instruction='  Exact original words.\nNo replacement.  ')
         service.finished(request['request_id'])
-        entered, release, loops = pause_selection(monkeypatch)
         assert entered.wait(3)
         stop_ticker(service, loops[0])
         try:
