@@ -1,6 +1,8 @@
 """A failed Tesseract run names a fixed internal cause and nothing raw; the public refusal stays ocr_failed."""
 
 import io
+import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -75,6 +77,23 @@ def test_engine_past_its_limit_is_timeout_and_drops_the_partial_output(tmp_path,
     cause, note = refused({'command': str(tmp_path / CANARY), 'languages': 'eng'})
     assert seen == [20] and screen_text.OCR_TIMEOUT_S == 20  # the limit is unchanged
     assert cause == 'timeout' and note.startswith('ocr_cause=timeout limit_s=20 elapsed_ms=')
+
+
+# spec: ANYM-955
+def test_engine_runs_with_one_openmp_thread_and_keeps_the_rest_of_its_environment(tmp_path, monkeypatch):
+    """CI run 43844885607 timed out at 20 s; an OpenMP Tesseract on 4 contended CPUs took 10-34 s per screen,
+    single-threaded 0.2 s with identical TSV. The limit is per call; the service's own environment is unchanged."""
+    from deedkit_android.screen_text import tesseract_lines
+
+    record = tmp_path / 'env.json'
+    monkeypatch.setenv('OMP_THREAD_LIMIT', '8')
+    monkeypatch.setenv('DEEDKIT_SYNTHETIC_MARK', 'kept')
+    ocr = script(tmp_path, 'import json\n'
+                 f'json.dump({{k: os.environ.get(k) for k in ("OMP_THREAD_LIMIT", "DEEDKIT_SYNTHETIC_MARK")}}, open({str(record)!r}, "w"))\n'
+                 'sys.stdout.write("level\\tpage_num\\tblock_num\\tpar_num\\tline_num\\tword_num\\tleft\\ttop\\twidth\\theight\\tconf\\ttext\\n")')
+    assert tesseract_lines(image(), ocr) == []
+    assert json.loads(record.read_text()) == {'OMP_THREAD_LIMIT': '1', 'DEEDKIT_SYNTHETIC_MARK': 'kept'}
+    assert os.environ['OMP_THREAD_LIMIT'] == '8'
 
 
 # spec: ANYM-955

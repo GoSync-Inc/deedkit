@@ -2,6 +2,7 @@
 
 import errno
 import io
+import os
 from pathlib import Path
 import signal
 import subprocess
@@ -98,9 +99,13 @@ def tesseract_lines(image, ocr, origin=(0, 0), min_confidence=60):
         path = Path(directory) / 'screen.png'
         normalize(image).save(path, format='PNG', compress_level=1)
         started = time.monotonic()
+        # One OpenMP thread: on a busy host Tesseract's thread team turns a 0.1 s screen into 10-34 s (4 contended CPUs,
+        # Tesseract 5.5.0, CI run 43844885607 timed out); single-threaded it stays near 0.2 s with identical TSV.
+        engine_env = {**os.environ, 'OMP_THREAD_LIMIT': '1'}
         try:
             done = subprocess.run([ocr['command'], str(path), 'stdout', '-l', ocr['languages'], '--psm', '11', 'tsv'],
-                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=OCR_TIMEOUT_S, check=False)
+                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=OCR_TIMEOUT_S, check=False,
+                                  env=engine_env)
         except subprocess.TimeoutExpired:
             raise ocr_failed('timeout', started, f'limit_s={OCR_TIMEOUT_S}') from None
         except OSError as error:
