@@ -82,6 +82,18 @@ resends or mints an ID: it reports `held` with a reason, and the same persisted 
 reconciles later. A missing, duplicated, mismatched or non-accepted row stays held. An
 already settled question still records a later read.
 
+The gateway's source page (`OrderFeed.read_source`) is a view of the immutable feed. A row
+whose stored `expires_at` has passed on the source clock, or whose wake is done, cancelled
+or refused, is skipped. The server would refuse it as `android_wake_expired` or must not
+send it. Skipping keeps a later eligible wake from being stranded behind it. The row, its
+original IDs, expiry and sequence stay unchanged. The page keeps the server cursor as
+`after`, and `next_after` is the last returned sequence, so sequences may be sparse. A page
+of only retired rows is empty: no receipt, stage or delivery happens, and the cursor stays.
+Every scanned row is still authorized first. A revoked order, malformed metadata, or
+another owner, device, source or epoch fails closed (`access_changed`,
+`invalid_feed_metadata`) and is never skipped. Pending, sending, unknown and accepted
+wakes stay eligible. The server keeps refusing raw expired input.
+
 The focused conversation tests use real OrderControl, OrderFeed, OrderEvents and
 Supervision with synthetic UI observations and identifiers. They verify context,
 question, scope, timer, uncertainty and responsibility transport, including the

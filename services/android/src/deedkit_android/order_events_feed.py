@@ -88,14 +88,41 @@ class OrderFeed:
             self._export(owner, device_id)
             head = self._head(owner, device_id)
             rows = self.events.db.execute('''SELECT * FROM android_order_feed WHERE owner=? AND device_id=? AND sequence>?
-                ORDER BY sequence LIMIT ?''', (owner, device_id, after, limit)).fetchall()
+                ORDER BY sequence''', (owner, device_id, after))
             items = []
             for row in rows:
+                if len(items) == limit:
+                    break
                 wake = self.events.wake(row['wake_id'])
                 self.events._authorize(principal, self.events._order(owner, wake['order_id']))
-                items.append(json.loads(row['metadata']) | {'sequence': row['sequence']})
+                metadata = self._metadata(row, owner, device_id)
+                if not self._retired(wake, metadata):
+                    items.append(metadata | {'sequence': row['sequence']})
             return dict(journal_id=head['journal_id'], after=after, next_after=items[-1]['sequence'] if items else after,
                         events=items, gap=after > head['sequence'])
+
+    def _metadata(self, row, owner, device):
+        """Fail closed on a stored row that is not this source's own well-formed original metadata."""
+        try:
+            metadata = json.loads(row['metadata'])
+            until = datetime.fromisoformat(metadata['expires_at'])
+            if until.tzinfo is None:
+                raise ValueError
+        except (ValueError, TypeError, KeyError):
+            raise OrderRefused('invalid_feed_metadata') from None
+        if (metadata.get('owner_id'), metadata.get('device_id'), metadata.get('source_id'), metadata.get('auth_epoch')) != (
+                owner, device, self.control.source_id, self.control.auth_epoch):
+            raise OrderRefused('access_changed')
+        return metadata
+
+    def _retired(self, wake, metadata):
+        """An immutable row the server would refuse as expired, or whose wake reached the state export never sends.
+
+        The row, its expiry and its sequence stay; the view skips it so a later eligible wake is not stranded
+        behind it. Sequences after the cursor may therefore be sparse, as the server already accepts.
+        """
+        until = datetime.fromisoformat(metadata['expires_at']).timestamp()
+        return wake['state'] in ('done', 'cancelled', 'refused') or until <= self.events.clock()
 
     def fetch(self, principal, owner, device_id, wake_id):
         self._authorized(principal, owner, device_id, wake_id)
