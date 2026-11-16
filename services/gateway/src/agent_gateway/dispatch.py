@@ -796,7 +796,7 @@ class Dispatch:
                 **safe_error("mutation_outcome_unknown", unknown_outcome=True),
                 **{key: diagnostics[key] for key in FAILURE_FIELDS if key in diagnostics},
             }
-            if module == "android" and tool["operation"] in {"execute", "run_flow", "courier_chat"}:  # ANYM-975
+            if module == "android" and tool["operation"] in {"execute", "run_flow", "courier_chat", "courier_call_sheet"}:
                 error.detail.update(request_id=values["request_id"],
                                     next_action="read_android_get_operation_with_original_request_id")
             if module == "android" and tool["operation"] == "agent":  # ANYM-972: read the run back, never start anew

@@ -83,6 +83,17 @@
         {"tool": "calls_call", "note": "After the owner's exact yes, place the call with the same request and confirm_token; keep call_id."},
         {"tool": "calls_call_result", "note": "Wait for the outcome with call_id and wait_s; never retry an unknown outcome."}
       ]
+    },
+    {
+      "id": "dial_a_courier",
+      "title": "Dial a courier's masked number from the order's call sheet",
+      "when": "android_courier_call_sheet read a number for the owner's call request. No number, or no yes from the owner to dial it: stop and tell the owner.",
+      "steps": [
+        {"tool": "calls_prepare_external_call", "note": "Only after the owner's yes to this number: channel phone, account twilio, destination the probe's number; keep brief_id."},
+        {"tool": "calls_preflight_call", "note": "Read-only: check the brief is callable and the units left."},
+        {"tool": "calls_dial_call", "note": "agent_found with the probe's dial_evidence (order screen and its request_id) and the owner's yes verbatim as owner_instruction.", "arguments": {"brief_id": "brief_id_from_prepare", "destination_source": "agent_found", "destination_evidence": "gojek order <order> call sheet, android_courier_call_sheet request_id <request_id>", "owner_instruction": "<the owner's yes, verbatim>"}},
+        {"tool": "calls_get_call_result", "note": "Transcript, recording and summary; an unknown dial is never retried or given a new request ID."}
+      ]
     }
   ],
   "android": [
