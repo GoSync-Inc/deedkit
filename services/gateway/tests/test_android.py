@@ -68,7 +68,7 @@ def test_android_tools_and_native_image_preserve_structured_screen(tmp_path):
     app, calls = setup(tmp_path)
     with TestClient(app) as client:
         names = {tool['name'] for tool in rpc(client, 'tools/list').json()['result']['tools']}
-        assert len(TOOLS) == 13 and set(TOOLS) <= names
+        assert len(TOOLS) == 14 and set(TOOLS) <= names
         result = rpc(client, 'tools/call', {'name': 'android_observe', 'arguments': {
             'device_id': 'home', 'session_id': 'session'}}).json()['result']
         assert not result.get('isError'), result

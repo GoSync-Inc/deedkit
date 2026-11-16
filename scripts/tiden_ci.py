@@ -162,20 +162,45 @@ def checkout_tree(sha: str, root: Path | None = None) -> str:
         return ""
 
 
+class TreeRead(str):
+    """A tree hash, or empty with `failure` naming why it could not be read: a fixed word or an HTTP status."""
+    failure = ""
+
+
+def tree_read(tree: str, failure: str = "") -> TreeRead:
+    result = TreeRead(tree)
+    result.failure = failure
+    return result
+
+
 def commit_tree(repository: str, sha: str) -> str:
-    """The git tree hash GitHub records for commit `sha` of `repository`, read anonymously from the public API (the
-    tested merge commit of a pull request is in no local history); empty when it cannot be read."""
+    """The git tree hash GitHub records for commit `sha` of `repository`, read once anonymously from the public API
+    (the tested merge commit of a pull request is in no local history); empty when it cannot be read, its `failure`
+    then one of invalid_request, http_<status>, timeout, transport, malformed_response, commit_mismatch or
+    malformed_tree, never response text."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) or not re.fullmatch(r"[a-f0-9]{40}", sha):
-        return ""
+        return tree_read("", "invalid_request")
     request = urllib.request.Request(f"https://api.github.com/repos/{repository}/git/commits/{sha}",
                                      headers={"Accept": "application/vnd.github+json", "User-Agent": "deedkit-tiden-ci"})
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            commit = json.loads(response.read(1_000_000))
-        tree = str((commit.get("tree") or {}).get("sha", "")) if commit.get("sha") == sha else ""
-    except (OSError, ValueError, AttributeError):
-        return ""
-    return tree if re.fullmatch(r"[a-f0-9]{40}", tree) else ""
+            body = response.read(1_000_000)
+    except urllib.error.HTTPError as exc:
+        return tree_read("", f"http_{exc.code}" if isinstance(exc.code, int) and 100 <= exc.code <= 599 else "transport")
+    except (OSError, http.client.HTTPException) as exc:
+        timeout = isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError)
+        return tree_read("", "timeout" if timeout else "transport")
+    try:
+        commit = json.loads(body)
+    except ValueError:
+        return tree_read("", "malformed_response")
+    if not isinstance(commit, dict):
+        return tree_read("", "malformed_response")
+    if commit.get("sha") != sha:
+        return tree_read("", "commit_mismatch")
+    tree = commit.get("tree")
+    tree = tree.get("sha") if isinstance(tree, dict) else None
+    return tree_read(tree) if isinstance(tree, str) and re.fullmatch(r"[a-f0-9]{40}", tree) else tree_read("", "malformed_tree")
 
 
 def source_path(value: str, root: Path) -> str:
@@ -640,6 +665,64 @@ def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict, *, 
     return merged_evidence(assembly, ci_url)
 
 
+class PublicationRefused(ValueError):
+    """A refused publication record; `stage` and `cause` are fixed words (an HTTP status at most), never data."""
+
+    def __init__(self, stage: str, cause: str = "") -> None:
+        self.stage, self.cause = stage, cause if re.fullmatch(r"[a-z0-9_]{0,24}", cause) else "unclassified"
+        super().__init__("the publication record does not name this main push run and its merge queue evidence, "
+                         "or the pull request evidence of exactly this commit's tree (stage: " + stage
+                         + (f", cause: {self.cause}" if self.cause else "") + ")")
+
+
+def publication_checks(record: dict, manifest: dict, run: tuple, trigger: tuple) -> None:
+    """Raise PublicationRefused naming the first failing stage; the one GitHub tree read runs last, never retried."""
+    repository, run_id, attempt, sha, ci_url = run
+    producer, chain = record["producer"], record.get("chain")
+    if not (trigger == ("push", "refs/heads/main") and RUN_ATTEMPT_URL.fullmatch(ci_url)
+            and re.fullmatch(r"[a-f0-9]{40}", sha) is not None
+            and {key: record.get(key) for key in ("schema", "event", "git_branch", "repository", "run_id",
+                                                  "run_attempt", "sha", "ci_url")}
+            == {"schema": 1, "event": "push", "git_branch": "main", "repository": repository, "run_id": run_id,
+                "run_attempt": attempt, "sha": sha, "ci_url": ci_url}):
+        raise PublicationRefused("publisher_identity")
+    producer_url = "https://github.com/{}/actions/runs/{}/attempts/{}".format(
+        repository, producer["run_id"], producer["run_attempt"])
+    if not (set(producer) == set(PRODUCER_FIELDS) and producer["repository"] == repository
+            and producer["workflow"] == ".github/workflows/ci.yml"
+            and str(producer["run_id"]).isdigit() and str(producer["run_attempt"]).isdigit()
+            and str(producer["run_id"]) != run_id and str(producer["artifact_id"]).isdigit()
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", producer["artifact_digest"]) is not None
+            and producer["url"] == producer_url == manifest.get("ci_url")
+            and RUN_ATTEMPT_URL.fullmatch(producer_url) is not None):
+        raise PublicationRefused("producer_record")
+    if chain is None:
+        if not (producer["sha"] == manifest.get("sha") == sha and merge_queue_run(manifest)):
+            raise PublicationRefused("queue_evidence")
+        return
+    tested = producer["sha"]
+    if not (isinstance(chain, dict) and set(chain) == set(CHAIN_FIELDS) and set(record) == {
+                "schema", "event", "git_branch", "repository", "run_id", "run_attempt", "sha", "ci_url", "producer",
+                "chain"}
+            and all(isinstance(chain[key], str) for key in CHAIN_FIELDS)
+            and chain["pull_request"].isdigit() and chain["queue_run_id"].isdigit()
+            and chain["queue_run_attempt"].isdigit() and chain["head_branch"] != ""
+            and isinstance(tested, str) and re.fullmatch(r"[a-f0-9]{40}", tested) is not None
+            and re.fullmatch(r"[a-f0-9]{40}", chain["tree"]) is not None):
+        raise PublicationRefused("chain_malformed")
+    if not (tested == manifest.get("sha") != sha and manifest.get("event") == "pull_request"
+            and manifest.get("git_branch") == chain["head_branch"] and not merge_queue_run(manifest)):
+        raise PublicationRefused("chain_evidence")
+    local = checkout_tree(sha)
+    if not local or local != chain["tree"]:
+        raise PublicationRefused("local_tree_mismatch" if local else "local_checkout_unreadable")
+    remote = commit_tree(repository, tested)
+    if not (isinstance(remote, str) and re.fullmatch(r"[a-f0-9]{40}", remote)):
+        raise PublicationRefused("remote_tree_unavailable", getattr(remote, "failure", "") or "unclassified")
+    if remote != chain["tree"]:
+        raise PublicationRefused("remote_tree_mismatch")
+
+
 def published_manifest(directory: Path, manifest: dict) -> dict:
     """The manifest this run publishes: its own, or with a publication record the merge queue run's evidence.
 
@@ -661,55 +744,29 @@ def published_manifest(directory: Path, manifest: dict) -> dict:
     go_reports: dict[str, list] = {}
     try:
         record = json.loads(control_file(directory, PUBLICATION))
-        producer = record["producer"]
-        producer_url = "https://github.com/{}/actions/runs/{}/attempts/{}".format(
-            repository, producer["run_id"], producer["run_attempt"])
-        chain = record.get("chain")
-        if chain is None:
-            tested = sha
-            source = producer["sha"] == manifest.get("sha") == sha and merge_queue_run(manifest)
-        else:
-            tested = producer["sha"]
-            source = (isinstance(chain, dict) and set(chain) == set(CHAIN_FIELDS) and set(record) == {
-                          "schema", "event", "git_branch", "repository", "run_id", "run_attempt", "sha", "ci_url",
-                          "producer", "chain"}
-                      and all(isinstance(chain[key], str) for key in CHAIN_FIELDS)
-                      and chain["pull_request"].isdigit() and chain["queue_run_id"].isdigit()
-                      and chain["queue_run_attempt"].isdigit() and chain["head_branch"] != ""
-                      and isinstance(tested, str) and re.fullmatch(r"[a-f0-9]{40}", tested) is not None
-                      and tested == manifest.get("sha") != sha and manifest.get("event") == "pull_request"
-                      and manifest.get("git_branch") == chain["head_branch"] and not merge_queue_run(manifest)
-                      and re.fullmatch(r"[a-f0-9]{40}", chain["tree"]) is not None
-                      and checkout_tree(sha) == chain["tree"] == commit_tree(repository, tested))
-        valid = ((event, ref) == ("push", "refs/heads/main") and bool(RUN_ATTEMPT_URL.fullmatch(ci_url))
-                 and re.fullmatch(r"[a-f0-9]{40}", sha) is not None
-                 and {key: record.get(key) for key in ("schema", "event", "git_branch", "repository", "run_id",
-                                                       "run_attempt", "sha", "ci_url")}
-                 == {"schema": 1, "event": "push", "git_branch": "main", "repository": repository, "run_id": run_id,
-                     "run_attempt": attempt, "sha": sha, "ci_url": ci_url}
-                 and source
-                 and set(producer) == set(PRODUCER_FIELDS) and producer["repository"] == repository
-                 and producer["workflow"] == ".github/workflows/ci.yml"
-                 and str(producer["run_id"]).isdigit() and str(producer["run_attempt"]).isdigit()
-                 and str(producer["run_id"]) != run_id and str(producer["artifact_id"]).isdigit()
-                 and re.fullmatch(r"sha256:[0-9a-f]{64}", producer["artifact_digest"]) is not None
-                 and producer["url"] == producer_url == manifest.get("ci_url")
-                 and RUN_ATTEMPT_URL.fullmatch(producer_url) is not None)
-        rows = json.loads(control_file(directory, "ci-checks.json")) if valid else []
+    except (OSError, ValueError):
+        raise PublicationRefused("record_unreadable") from None
+    try:
+        producer, chain = record["producer"], record.get("chain")
+        tested = sha if chain is None else producer["sha"]
+        publication_checks(record, manifest, (repository, run_id, attempt, sha, ci_url), (event, ref))
+    except PublicationRefused:
+        raise
+    except (ValueError, KeyError, TypeError, AttributeError, IndexError):
+        raise PublicationRefused("record_malformed") from None
+    try:
+        rows = json.loads(control_file(directory, "ci-checks.json"))
         published = [{**row, "id": str(uuid.uuid5(uuid.NAMESPACE_URL, ci_url + "/" + row["signature"].split("::", 1)[1])),
                       "message": f"{row['message']}; tested in {producer['url']}"} for row in rows]
         # Go result rows carry IDs too; Tiden deduplicates on them, so this run publishes them under its own.
         for check in GO_MODULES:
-            if normalized_report(check) in manifest["reports"] and valid:
+            if normalized_report(check) in manifest["reports"]:
                 results = json.loads(control_file(directory, normalized_report(check)))
                 go_row_counts(results, go_module_of(Path(__file__).resolve().parents[1], check))
                 go_reports[normalized_report(check)] = [{**row, "id": row_id(ci_url, check, row["signature"])}
                                                         for row in results]
     except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError):
-        valid = False
-    if not valid:
-        raise ValueError("the publication record does not name this main push run and its merge queue evidence, "
-                         "or the pull request evidence of exactly this commit's tree")
+        raise PublicationRefused("evidence_unreadable") from None
     (directory / PUBLISHED_CHECKS).write_text(json.dumps(published, indent=2))
     for name, results in go_reports.items():
         (directory / ("published-" + name)).write_text(json.dumps(results, indent=2))
