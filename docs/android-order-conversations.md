@@ -50,6 +50,31 @@ bypassed with a new proposal or ID. Actual ambiguous chat sends additionally nee
 their original native/provider receipt reconciliation; these fixtures do not
 simulate or prove a real send.
 
+An async task-notice question settles only through the host-only
+`OrderControl.settle_answered_question(principal, owner, device_id, wake_id, receipt)`.
+Its `receipt` is the host's own dialogue `CodexSession.receipt()` of that original
+async_question: same request/thread/turn/item, an answer message and native
+`accepted` (steer acknowledged or turn/start receipt). Accepted means the answer entered
+the conversation, never goal, order or action success. The wake becomes `done` under
+CAS with original IDs, payload and export intact. The receipt evidence is stored once:
+a duplicate reads back and a different answer conflicts. When no unanswered question,
+unread status or uncertain delivery remains, the task notice becomes `settled`. A later
+notice or bind from the same exact task reopens that record. RPC questions (no positive
+contents ACK), bound orders, pending/unknown/refused answers, sending/unknown deliveries,
+foreign principals/devices, revoked rights and another source epoch stay held. Neither a
+read receipt, expiry, idleness nor a finished run settles a question. A caller cannot
+supply this receipt.
+
+The host calls it in three places. An async `reply` that native steer accepts returns
+`order_settlement`. A resumed answer records an `order_settlement` run event after the
+turn/start receipt. An authorized `read_receipt` of an async question reconciles from
+the durable `.dialogue.json` row. That journal path binds owner/device, and the row binds
+request/thread/turn/item. The obligation's checks bind source and epoch. Fetch and
+status stay read-only. A failed settlement never changes the accepted input receipt,
+resends or mints an ID: it reports `held` with a reason, and the same persisted receipt
+reconciles later. A missing, duplicated, mismatched or non-accepted row stays held. An
+already settled question still records a later read.
+
 The focused conversation tests use real OrderControl, OrderFeed, OrderEvents and
 Supervision with synthetic UI observations and identifiers. They verify context,
 question, scope, timer, uncertainty and responsibility transport, including the

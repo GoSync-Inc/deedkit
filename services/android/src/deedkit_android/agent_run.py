@@ -797,13 +797,65 @@ class Agents:
             control = self.order_control()
             original = fetched['metadata']
             if call.action == 'read_receipt':
-                return control.feed.ack_read(principal, original['owner_id'], original['device_id'], wake_id)
+                read = control.feed.ack_read(principal, original['owner_id'], original['device_id'], wake_id)
+                if original['kind'] != 'question' or original['native_request_id'] is not None:
+                    return read
+                ids = (original['request_id'], original['native_thread_id'], original['native_turn_id'], original['item_id'])
+                return read | {'order_settlement': self.answer_settlement(owner, original['device_id'], ids, authorize, wake_id)}
             return control.feed.ack_handoff(principal, original['owner_id'], original['device_id'], wake_id,
                 snapshot_digest=call.snapshot_digest, next_check_at=call.next_check_at)
         except OrderRefused as error:
             if str(error) in ('wake_not_found', 'wake_not_owned', 'access_changed', 'receipt_not_owned'):
                 raise Refused('not_found', 404) from None
             raise Refused(str(error)) from None
+
+    def persisted_answer(self, owner, device, ids):
+        """The durable dialogue row of one async answer. The journal path binds owner/device; the row binds the
+        original request/thread/turn/item. Read only: no session object, connection or expiry rewrite."""
+        from .codex_session import CodexSession
+        digest = hashlib.sha256(json.dumps((owner, device)).encode()).hexdigest()
+        path = self.root / 'sessions' / ('run-live-' + digest + '.dialogue.json')
+        try:
+            if path.stat().st_size > 1024 * 1024:
+                raise ValueError()
+            rows = [r for r in json.loads(path.read_text()).values() if isinstance(r, dict)]
+        except FileNotFoundError:
+            raise Refused('answer_receipt_missing') from None
+        except (OSError, ValueError, AttributeError):
+            raise Refused('native_dialogue_journal_invalid') from None
+        found = [r for r in rows if r.get('kind') == 'async_question' and tuple(r.get(k) for k in (
+            'original_request_id', 'native_thread_id', 'native_turn_id', 'item_id')) == tuple(ids)]
+        if len(found) != 1:
+            raise Refused('answer_correlation_ambiguous' if found else 'answer_receipt_missing')
+        return CodexSession.receipt(found[0])
+
+    def answer_settlement(self, owner, device, ids, authorize, wake_id=None):
+        """Metadata-only journal settlement of one exact accepted async answer from its persisted receipt.
+        Any failure is a visible hold for later reconciliation of the same receipt; it never changes, retries
+        or masks the native input receipt, and accepted input settles only the exchange, never goal/order."""
+        from .order_events import OrderRefused
+        try:
+            control = self.order_control()
+            if control is None:
+                raise Refused('order_source_unavailable')
+            receipt = self.persisted_answer(owner, device, ids)
+            found = control.answered_question_wake(owner, device, receipt)
+            if wake_id is not None and found != wake_id:
+                raise Refused('answer_correlation_mismatch')
+            return control.settle_answered_question(authorize(), owner, device, found, receipt) | {'status': 'settled'}
+        except (OrderRefused, Refused) as error:
+            return {'status': 'held', 'error': str(error), 'effect': 'metadata_only'}
+        except Exception:  # an accepted native input must never surface as a failed answer
+            return {'status': 'held', 'error': 'settlement_unavailable', 'effect': 'metadata_only'}
+
+    def settling(self, started, owner, device, ids, authorize):
+        def accepted(turn_id):
+            started(turn_id)  # the native receipt is persisted first; settlement never undoes it
+            try:
+                self.db.add_event(owner, ids[0], 'order_settlement', self.answer_settlement(owner, device, ids, authorize))
+            except Exception:
+                pass  # a lost hold report is reconciled later from the same persisted receipt
+        return accepted
 
     def recover(self):
         """After a restart: kill the process group of each run directory left behind, by its private marker, mark the
@@ -971,6 +1023,7 @@ class Agents:
 
         args = {'request_id': call.request_id, 'thread_id': call.native_thread_id,
                 'turn_id': call.native_turn_id, 'admit': admit}
+        ids, settlement = (call.request_id, call.native_thread_id, call.native_turn_id, call.item_id), None
         if call.action == 'reply' and call.answers is None:
             async def resume(text, commit, started, refused):
                 # A completed async question may continue only the still-current live conversation.
@@ -1000,7 +1053,7 @@ class Agents:
                     run.authorize = authorize
                     budget = self.supervision.budget(owner, call.request_id, call.session_id)
                     run.request = original.model_copy(update={'max_actions': budget['limit'] - budget['used']})
-                    run.input_text, run.input_started = text, started
+                    run.input_text, run.input_started = text, self.settling(started, owner, call.device_id, ids, authorize)
                     run.input_refused = refused
                     run.input_admit = lambda: admit(True)
                     commit()  # fsynced original answer intent before any native dispatch
@@ -1021,12 +1074,15 @@ class Agents:
 
             receipt = await session.reply_async(**args, item_id=call.item_id, message_id=call.message_id,
                                                 text=call.text, resume=resume)
+            if receipt['status'] == 'accepted':
+                settlement = self.answer_settlement(owner, call.device_id, ids, authorize)
         elif call.action == 'reply':
             receipt = await session.reply(**args, native_request_id=call.native_request_id,
                                           item_id=call.item_id, answers=call.answers)
         else:
             receipt = await session.steer(**args, message_id=call.message_id, text=call.text)
-        return {**self.view(owner, call.request_id, 0), 'input_receipt': receipt}
+        return {**self.view(owner, call.request_id, 0), 'input_receipt': receipt} | (
+            {'order_settlement': settlement} if settlement else {})
 
     async def start(self, owner, call, authorize=None):
         if self.db.row(owner, call.request_id) is not None:

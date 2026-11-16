@@ -40,6 +40,12 @@ TRANSIENT = re.compile(r"(?:HTTP(?: status:)?|status code|StatusCode:) (?:429|5\
 ATTEMPTS, BACKOFF = 4, 5
 # `skopeo copy` tries once more after each of these waits, on any non-zero exit (Registry.push).
 PUSH_WAITS = (15, 45)
+# After `skopeo copy` acknowledged a push, its staging tag is read again only while the registry positively answers
+# "manifest unknown": a read-only check of that exact tag, never another push. Main runs 43827012338 (calls) and
+# 43836203412 (runtime) were refused with one message for both "staging tag absent" and "another config"; which one
+# happened is not known. Waits between reads; the whole check stops VISIBILITY_DEADLINE seconds after the push.
+VISIBILITY_WAITS, VISIBILITY_DEADLINE = (5, 10, 15), 45
+DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 class Refused(RuntimeError):
@@ -281,12 +287,40 @@ def publish_one(registry, target, sha, images, verify=attested, attempt=None):
         # The final tag is written only by promote(), after the attestation of this digest verifies.
         staging = f"{name}:{staging_tag(sha, attempt)}"
         registry.push(directory / "image.tar", staging)
-        found = registry.manifest(staging)
-        if not found or found[1]["config"]["digest"] != artifact["config_digest"]:
-            raise Refused(f"pushed {target} manifest does not carry the tested image config")
+        found = staged_after_push(registry, target, staging, artifact["config_digest"])
     if found is None:
         raise Refused(f"{target} has no manifest after publication")
     return {"target": target, "action": action, "digest": found[0], "attest": action in {"push", "attest"}}
+
+
+def safe_digest(value):
+    """A registry-supplied digest for a diagnostic: printed only when it is a well-formed sha256 digest."""
+    return value if isinstance(value, str) and DIGEST.fullmatch(value) else "a malformed digest"
+
+
+def staged_after_push(registry, target, staging, tested):
+    """The manifest a just-acknowledged push left under its staging tag, carrying exactly the tested config.
+
+    Another config is refused at its first read. Only a positive "manifest unknown" is read again, on the same
+    staging tag, VISIBILITY_WAITS apart until VISIBILITY_DEADLINE; an unreadable registry refuses as every read does
+    (Registry.inspect), and nothing is pushed again."""
+    name, _, tag = staging.rpartition(":")  # the name may carry a registry port (localhost:5000 in the dry run)
+    if not name or "@" in staging or not re.fullmatch(r"[0-9a-f]{40}-attempt-[0-9]+-[0-9]+", tag):
+        raise Refused(f"{target} has no exact staging tag to read back")
+    deadline, reads = time.monotonic() + VISIBILITY_DEADLINE, 0
+    for wait in (*VISIBILITY_WAITS, None):
+        found, reads = registry.manifest(staging), reads + 1
+        if found is not None:
+            actual = (found[1].get("config") or {}).get("digest")
+            if actual != tested:
+                raise Refused(f"pushed {target} manifest {found[0]} carries config {safe_digest(actual)},"
+                              f" not the tested image config {tested}")
+            return found
+        if wait is None or time.monotonic() + wait > deadline:
+            break
+        time.sleep(wait)
+    raise Refused(f"pushed {target} staging tag {tag} is absent from the registry after the push succeeded"
+                  f" ({reads} reads within {VISIBILITY_DEADLINE} s); not pushed again, nothing promoted")
 
 
 def output_key(target):
