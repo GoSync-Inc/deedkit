@@ -81,6 +81,68 @@ needs the owner's existing confirmed complete basket; no model boolean or new
 per-Pay-button gate. Phone unlock/custom keypads remain unsupported. A stored PIN
 cannot restore USB after reboot; no lock/update/security setting changes.
 
+## Native protected window: pinned 0.166 evidence (DK-8)
+
+`codex_session.queue_control` keeps refusing `request_protected_input` with
+`protected_input_unavailable`. It refuses before any host callback, reference read or channel
+use, and answers once under the original typed RPC ID. Grounded in official
+[rust-v0.166.0](https://github.com/openai/codex/tree/rust-v0.166.0/codex-rs) source:
+
+- Holding the call does not stop execution. `DynamicToolHandler::supports_parallel_tool_calls`
+  returns `true` (`core/src/tools/handlers/dynamic.rs:88`), and so does `exec_command`
+  (`core/src/tools/handlers/unified_exec/exec_command.rs`). Both take the shared read lock in
+  `core/src/tools/parallel.rs:286-296`, so sibling commands in the same model response run
+  while the host holds the protected RPC.
+- The original call cannot outlive cancellation. `finishes_on_cancellation` is `true`
+  (`dynamic.rs:177`), and the pending response is dropped through `or_cancel` (`dynamic.rs:240`).
+  After a turn transition, `app-server/src/dynamic_tools.rs:26` discards the client response. So
+  `turn/interrupt` or a stopped foreground turn cannot act as a fence that keeps the exact call.
+- The background-terminal APIs are not a barrier. `thread/backgroundTerminals/clean` only submits
+  `Op::CleanBackgroundTerminals`, with no termination acknowledgement. That op drains the
+  process store; a command that was admitted but not yet stored is stored afterwards.
+  `list` reports `os_pid: None`, and the store holds only spawned non-exited processes. Neither
+  covers setsid/double-forked descendants or work on the device.
+- Commands get direct ADB through `PATH`/`ANDROID_SERIAL`, with network access
+  (`codex_session.connect`). Device-side shell processes and queued requests on the shared
+  adb server are outside every host process scope.
+
+`tests/test_native_protected_window.py` covers this on the real `CodexSession` stdio path. It
+uses a live sibling command, zero tracked commands and a completed item with a possibly detached
+child. In each case the call is refused while the ordinary sibling call is still dispatched
+exactly once. After an interrupt and a restart the call is not answered again, no row can resume
+it, and the original ID keeps its type. A mutant that treats the held call as a fence fails all
+four tests.
+
+**Invariant requirements (none is met, authorized or configured here).** The refusal can only
+be removed when one window gives all of the following:
+
+1. Enrolled host scope: every native process and descendant, including setsid/double-forked ones,
+   stays in one scope that was set up before spawn and that it cannot leave.
+2. Atomic barrier: the host stops execution throughout that scope and gets an acknowledgement,
+   without cancelling app-server's pending call. The barrier is released only after a trusted
+   `sensitive_field_gone` result and one original response. Unknown/cancel/restart keeps the
+   barrier, or ends the scope without a reply, and keeps the tombstones.
+3. Device containment: after the barrier, the device-side observer set must be proven equal to
+   the host-owned baseline. That set covers shell-uid processes, in-flight adb services,
+   accessibility/notification listeners and media projection. The proof runs on the existing host
+   adb server, which stays outside the barrier because it carries the `setText` channel. No
+   current primitive provides this proof atomically. This is the fundamental gap.
+4. Service fence: other service capture paths (`BareRun.final` screenshot/XML, owner reads) stay
+   refused while the window is held.
+
+**No OS mechanism for items 1–2 exists on the current deployment.** The USB/native executor runs
+on macOS (mini, launchd). Linux cgroup v2 is hypothetical research only: a delegated leaf created
+before spawn, `cgroup.freeze` with the `frozen 1` acknowledgement in `cgroup.events`, and
+`cgroup.kill`. It is unavailable on mini. It is not a recipe root can provision there, and
+nothing here proposes a Linux migration or a new executor. Even if items 1–2 were met, item 3
+would still block.
+
+Acceptance is root-owned, on an installed no-model sentinel. The sentinel attempts setsid,
+double-fork, inherited-descriptor and adb-shell `nohup` bypasses during acquisition, and all of
+them must be contained. A synthetic focused-field canary then shows that only the original call
+continues. Undo: release the barrier only after reconciliation, keep tombstones and keep the
+refusal.
+
 ## Storage, platform evidence and remaining acceptance
 
 Official [Grok Vault](https://docs.x.ai/grok-bot/vault) describes model-hidden page
