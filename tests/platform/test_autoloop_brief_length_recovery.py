@@ -33,7 +33,7 @@ def item(i, description, category='bug', minute=0):
             'key_id': 'k1', 'created_at': f'2026-11-16T10:{minute:02d}:00+00:00'}
 
 
-INBOX = {P1: item(P1, 'members drop out of a group'), P2: item(P2, 'contact card opens blank', minute=1),
+INBOX = {P1: item(P1, 'members fall out of a group'), P2: item(P2, 'contact card opens blank', minute=1),
          P3: item(P3, 'how do I list feedback?', 'other', 2), P4: item(P4, 'read receipts do not arrive', minute=3)}
 
 
@@ -144,9 +144,9 @@ def test_a_selected_read_records_the_same_decision_after_one_charged_brief_only_
     decision(P1, classification='enable-only', reason_code='needs-opt-in',
              specs=[{'ref': 'ANYM-12', 'verdict': 'accepted'}], primary='ANYM-12'),
     decision(P1, reason_code='duplicate', duplicate_of=P2),
-    decision(P1, new_card='member-drop'),
+    decision(P1, new_card='member-loss'),
     decision(P1, brief=None),
-    decision(P1, brief=LONG + ' members drop out of a group'),
+    decision(P1, brief=LONG + ' members fall out of a group'),
     decision(P1, brief=' '.join(['/private/path `shell`'] * 60)),
     'held-card', 'held-item',
 ], ids=['decision', 'ref', 'primary', 'reason', 'optin-reason', 'enable-only', 'duplicate', 'newcard', 'missing',
@@ -197,7 +197,7 @@ def test_the_second_call_is_charged_first_under_the_same_daily_caps(states, used
 # spec: ANYM-988
 @pytest.mark.parametrize('reply, result', [
     (repaired(P1, 'x' * 601), 'invalid_brief'),
-    (repaired(P1, CANARY + ' and then members drop out of a group'), 'card_brief_copied'),
+    (repaired(P1, CANARY + ' and then members fall out of a group'), 'card_brief_copied'),
     (repaired(P1, '/private/' + CANARY + ' `shell`'), 'card_brief_unsafe'),
     (repaired(P2, CANARY), 'foreign_id'),
     (repaired(P1, CANARY, note='x'), 'extra_fields'),
@@ -326,7 +326,7 @@ def test_a_good_first_answer_and_a_legacy_read_make_no_repair_call(states):
 def test_the_hourly_tick_charges_both_calls_and_publishes_the_repaired_brief(loop):
     t, a, s = loop
     configure(a, live=True, record_projection=True)
-    fakes = Recording([submission(D1, 'members drop out of a group')])
+    fakes = Recording([submission(D1, 'members fall out of a group')])
     calls = []
     def runner(projected):
         calls.append(projected.get('mode'))
