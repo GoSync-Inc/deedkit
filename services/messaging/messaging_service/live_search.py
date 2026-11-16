@@ -186,6 +186,26 @@ def from_receipt(entry, receipt):
     return result
 
 
+def next_call(entry, item):
+    """ANYM-1000: the existing operation call that reads the next live page of this entry's search.
+
+    The same account, chat and parameters with the cursor match the cursor's binding (ANYM-475); the request_id comes
+    from the cursor, so repeating the suggestion maps to the same operation and asks the provider nothing new."""
+    cursor = entry['next_cursor']
+    digest = hashlib.sha256((entry['account'] + '\0' + cursor).encode()).hexdigest()[:40]
+    return {'tool': 'messages_execute_messenger_operation', 'args': {
+        'account': entry['account'], 'operation': OPERATION, 'chat_id': item['chat_id'],
+        'parameters': {**item['parameters'], 'cursor': cursor}, 'request_id': 'search-live-next:' + digest}}
+
+
+def unarchived(entries):
+    """ANYM-1000: hits of finished live searches the archive did not keep (outside the collection window, a failed
+    store or the deadline), newest first, so an answer whose items miss them still shows them."""
+    found = [{'account': e['account'], **hit, 'stored': False} for e in entries if e.get('state') == 'done'
+             for hit in e.get('hits') or [] if hit.get('stored') is not True]
+    return sorted(found, key=lambda hit: hit.get('time') or '', reverse=True)
+
+
 def queue_failure(entry, error):
     """A refusal to queue is an entry state; the archive answer is unaffected."""
     code = error.code if isinstance(error, APIError) else 'operation_queue_failed'
@@ -257,7 +277,7 @@ async def search(store, token, arguments, *, live='off', wait_s=None, request_id
     paged = bool(arguments.get('after') or arguments.get('before'))
     # A continuation page goes on to the plan, which says first_page_only (S3.1).
     if live == 'auto' and not paged and evidence.get('empty_reason') not in THIN:
-        evidence['live'] = []
+        evidence['live'] = []; first['live_items'] = []
         return first
     try:
         entries, queue = await run(store.live_search_plan, token, arguments, paged=paged,
@@ -266,7 +286,7 @@ async def search(store, token, arguments, *, live='off', wait_s=None, request_id
         # Authorization and argument errors stay the caller's; a database failure only costs the live part.
         if isinstance(error, APIError) and error.code not in PLAN_DEGRADED: raise
         log.warning('live_search_plan_failed exception_type=%s', type(error).__name__)
-        evidence['live'] = []; evidence['live_wait'] = 'failed'
+        evidence['live'] = []; evidence['live_wait'] = 'failed'; first['live_items'] = []
         return first
     pending = []
     for item in queue:
@@ -298,6 +318,8 @@ async def search(store, token, arguments, *, live='off', wait_s=None, request_id
         log.warning('live_search_reread_failed code=%s', error.code)
         second = first; evidence['archive_reread'] = 'failed'
     evidence = second['result_evidence']; evidence.pop('suggested_call', None)
-    evidence['live'] = entries
+    for item in queue:
+        if entries[item['index']].get('next_cursor'): entries[item['index']]['next_call'] = next_call(entries[item['index']], item)
+    evidence['live'] = entries; second['live_items'] = unarchived(entries)
     if waited: evidence['live_wait'] = waited
     return second

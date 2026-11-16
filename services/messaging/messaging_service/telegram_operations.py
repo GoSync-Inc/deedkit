@@ -1646,7 +1646,7 @@ async def live_search(client, job, parameters, governor, rpc, allowed_provider_i
     The query leaves the process only to Telegram: no log line, telemetry or error
     names it. Only counts, duration and FloodWait seconds are logged."""
     from .commands import CommandRejected
-    from .telegram_governor import ProviderRateLimited
+    from .live_text import snippet; from .telegram_governor import ProviderRateLimited  # ANYM-1000: whole words
     bounded_text(parameters.get('query'), 256)
     limit = integer(parameters.get('limit', 20), 1, 50)
     types_wanted = parameters.get('chat_types')
@@ -1738,7 +1738,7 @@ async def live_search(client, job, parameters, governor, rpc, allowed_provider_i
                      'chat_type': kind, 'provider_id': str(message.id),
                      'time': message.date.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z'),
                      'sender': {'id': sender, 'name': entity_name(entities.get(sender)) if sender else None},
-                     'text': safe_text(message.message, LIVE_TEXT) or ''})
+                     **snippet(safe_text(message.message, LIVE_TEXT + 1) or '', LIVE_TEXT)})
         if kept is not None:
             # ANYM-476: the collector archives these after the request; the receipt never carries them.
             # Initialized as iter_messages does for a history page: cached sender and chat, outgoing
@@ -1766,7 +1766,7 @@ async def live_search(client, job, parameters, governor, rpc, allowed_provider_i
         # dropping hits: the fixed fields of 50 hits stay far below the bound, so width 0 always fits.
         width //= 2
         for hit in hits:
-            hit['text'] = hit['text'][:width]
+            hit.update(snippet(hit['text'], width))
             for holder, field in ((hit, 'chat_title'), (hit['sender'], 'name')):
                 if holder[field]:
                     holder[field] = holder[field][:width]
