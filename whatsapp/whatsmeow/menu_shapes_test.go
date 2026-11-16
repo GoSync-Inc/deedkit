@@ -273,36 +273,45 @@ func TestMenuReplyShapesEndsAtASlowLaterRowWhileCaptureKeepsWriting(t *testing.T
 	if err := s.Put(fixtureMessage("FIRST", 1700000011), "live"); err != nil {
 		t.Fatal(err)
 	}
-	// Enough rows that stepping over them all takes at least menuShapeSlowStep, with or
-	// without the race detector: the rows grow until a full uninterrupted pass is that slow.
-	rows, full := 0, time.Duration(0)
-	for full < menuShapeSlowStep {
-		more := menuShapeSlowRows
-		if full > 0 {
-			more = int(float64(rows)*(float64(menuShapeSlowStep)/float64(full))*1.3) - rows
-		}
-		if rows+more > menuShapeMaxSlowRows {
-			t.Fatalf("%d rows step in %v, under %v", rows, full, menuShapeSlowStep)
-		}
-		if _, err := s.db.Exec("WITH RECURSIVE n(i) AS (SELECT ? UNION ALL SELECT i+1 FROM n WHERE i<?) INSERT INTO capture(digest,chat,message_id,source_ts,raw,envelope,published,created_at) SELECT 's'||i,'c','',i,x'',x'',1,0 FROM n", rows+1, rows+more); err != nil {
-			t.Fatal(err)
-		}
-		rows += more
-		// The pager's own statement, uninterrupted: it steps over every slow row. The
-		// fastest of three passes, so a load spike during one pass cannot make the
-		// statement bound below look shorter than the scan's own pass will be.
-		full = 0
-		for range 3 {
-			began := time.Now()
-			var seq int64
-			if err := s.db.QueryRow("SELECT seq FROM capture WHERE seq>1 AND length(raw)>0 ORDER BY seq LIMIT 1").Scan(&seq); !errors.Is(err, sql.ErrNoRows) {
-				t.Fatalf("calibration: %v", err)
-			}
-			if pass := time.Since(began); full == 0 || pass < full {
-				full = pass
+	// A finite run of slow rows, and a statement bound calibrated to how long one
+	// uninterrupted pass of the pager's own statement over them takes on this host.
+	// The rows grow toward menuShapeSlowStep but never past menuShapeMaxSlowRows nor
+	// half of what the capture file's own ceiling (max_page_count) holds, so a fast
+	// host gets a shorter bound, never a full journal.
+	calibration := time.Now()
+	var used, ceiling, free int64
+	pages := func() (int64, int64, error) {
+		for _, q := range []struct {
+			pragma string
+			to     *int64
+		}{{"PRAGMA page_count", &used}, {"PRAGMA max_page_count", &ceiling}, {"PRAGMA freelist_count", &free}} {
+			if err := s.db.QueryRow(q.pragma).Scan(q.to); err != nil {
+				return 0, 0, err
 			}
 		}
+		return used, ceiling, nil
 	}
+	add := func(rows, more int) error {
+		_, err := s.db.Exec("WITH RECURSIVE n(i) AS (SELECT ? UNION ALL SELECT i+1 FROM n WHERE i<?) INSERT INTO capture(digest,chat,message_id,source_ts,raw,envelope,published,created_at) SELECT 's'||i,'c','',i,x'',x'',1,0 FROM n", rows+1, rows+more)
+		return err
+	}
+	pass := func() (time.Duration, error) {
+		began := time.Now()
+		var seq int64
+		if err := s.db.QueryRow("SELECT seq FROM capture WHERE seq>1 AND length(raw)>0 ORDER BY seq LIMIT 1").Scan(&seq); !errors.Is(err, sql.ErrNoRows) {
+			return 0, err
+		}
+		return time.Since(began), nil
+	}
+	rows, full, err := menuShapeCalibrate(add, pass, pages)
+	if err != nil {
+		t.Fatalf("calibration after %d rows (%d of %d pages, %d free): %v", rows, used, ceiling, free, err)
+	}
+	bound, ok := menuShapeSlowBound(full)
+	if !ok {
+		t.Fatalf("%d rows step in %v, under %v", rows, full, menuShapeSlowFloor)
+	}
+	calibrated := time.Since(calibration)
 	if err := s.Put(menuShapeEvent("REPLY2", 1700000012, true, &waE2E.Message{ListResponseMessage: &waE2E.ListResponseMessage{ContextInfo: quoting("NONE")}}), "live"); err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +320,7 @@ func TestMenuReplyShapesEndsAtASlowLaterRowWhileCaptureKeepsWriting(t *testing.T
 		t.Fatal(err)
 	}
 	defer func(d time.Duration) { menuShapeTimeout = d }(menuShapeTimeout)
-	menuShapeTimeout = min(full/5, 300*time.Millisecond)
+	menuShapeTimeout = bound
 	// The owning adapter writes as the scan's second statement starts: the fast first
 	// row ended the first statement at once; the second steps over the slow rows and
 	// must end by journal_read_timeout, so the write lands while the read holds its
@@ -347,7 +356,8 @@ func TestMenuReplyShapesEndsAtASlowLaterRowWhileCaptureKeepsWriting(t *testing.T
 	case <-time.After(10 * time.Second):
 		t.Fatal("the capture write beside the scan never finished")
 	}
-	t.Logf("%d slow rows step in %v; scan %v, capture write %v", rows, full, ended.Sub(started), w.took)
+	t.Logf("%d slow rows (%d of %d pages, %d free) step in %v, calibrated in %v; bound %v; scan %v, capture write %v",
+		rows, used, ceiling, free, full, calibrated, bound, ended.Sub(started), w.took)
 	// No lock starvation: the write does not fail on its busy timeout behind the read.
 	if w.err != nil {
 		t.Fatalf("a capture write failed beside the scan: %v", w.err)
@@ -367,10 +377,141 @@ func TestMenuReplyShapesEndsAtASlowLaterRowWhileCaptureKeepsWriting(t *testing.T
 	}
 }
 
-// The slow rows: a first batch, the pass they must take at least, and a bound on
-// the journal file (max_page_count 131072).
+// spec: ANYM-837
+func TestMenuReplyShapesSlowRowCalibrationStaysInsideTheJournalCeiling(t *testing.T) {
+	ms := time.Millisecond
+	// Synthetic hosts: how long the pager's statement takes per slow row, how many
+	// bytes a row takes in the capture file, and the file's ceiling in 4 KiB pages.
+	// 61 bytes is the measured density of the real fixture; 38ns a row is a fast
+	// host without the race detector, 2250ns the same host with it.
+	for _, c := range []struct {
+		name         string
+		perRow       time.Duration
+		bytes, pages int64
+		spike        bool
+		rows, adds   int
+		full, bound  time.Duration
+		long         bool
+	}{
+		{"slow host: the first batch already passes the step", 2250, 61, 131072, false, 400000, 1, 900 * ms, 180 * ms, true},
+		{"slow host with a load spike: the fastest pass sets the bound", 2250, 61, 131072, true, 400000, 1, 900 * ms, 180 * ms, true},
+		{"slower host: the bound stays at its cap", 5000, 61, 131072, false, 400000, 1, 2 * time.Second, menuShapeMaxBound, true},
+		{"moderate host: grows by the measured rate", 250, 61, 131072, false, 1300000, 2, 325 * ms, 65 * ms, true},
+		{"fast host: stops at the row cap, not the journal ceiling", 38, 61, 131072, false, menuShapeMaxSlowRows, 2, 76 * ms, 15200 * time.Microsecond, true},
+		{"low ceiling: stops at half of it", 100, 61, 16384, false, 549983, 2, 54998300 * time.Nanosecond, 10999660 * time.Nanosecond, true},
+		{"too fast a host: says so instead of filling the journal", 7, 61, 131072, false, menuShapeMaxSlowRows, 2, 14 * ms, 2800 * time.Microsecond, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			rows, adds, passes := 0, 0, 0
+			used := func() int64 { return (int64(rows)*c.bytes + 4095) / 4096 }
+			add := func(from, more int) error {
+				if from != rows || more <= 0 {
+					t.Fatalf("add(%d, %d) after %d rows", from, more, rows)
+				}
+				adds++
+				rows += more
+				if used() > c.pages {
+					return errors.New("database or disk is full")
+				}
+				return nil
+			}
+			pass := func() (time.Duration, error) {
+				passes++
+				d := time.Duration(rows) * c.perRow
+				if c.spike && passes%3 != 2 {
+					d *= 3
+				}
+				return d, nil
+			}
+			pages := func() (int64, int64, error) { return used(), c.pages, nil }
+			got, full, err := menuShapeCalibrate(add, pass, pages)
+			if err != nil {
+				t.Fatalf("calibration filled the journal: %v after %d rows", err, rows)
+			}
+			bound, long := menuShapeSlowBound(full)
+			if got != c.rows || adds != c.adds || full != c.full || bound != c.bound || long != c.long {
+				t.Fatalf("got %d rows in %d adds, pass %v, bound %v (%v); want %d in %d, %v, %v (%v)", got, adds, full, bound, long, c.rows, c.adds, c.full, c.bound, c.long)
+			}
+			if got > menuShapeMaxSlowRows || used() > c.pages/2 || passes != 3*adds {
+				t.Fatalf("%d rows, %d of %d pages, %d passes for %d adds", got, used(), c.pages, passes, adds)
+			}
+			if long && (bound <= 0 || bound*5 > full) {
+				t.Fatalf("bound %v does not end a pass of %v", bound, full)
+			}
+		})
+	}
+}
+
+// The slow rows: a first batch, the pass they grow toward, and a finite cap (about
+// 120 MiB of journal, under half the capture file's max_page_count). The statement
+// bound is a fifth of the measured pass, at most menuShapeMaxBound; a pass under
+// menuShapeSlowFloor (a bound under 5ms) is too short to order the write inside it.
 const (
 	menuShapeSlowRows    = 400000
 	menuShapeSlowStep    = 250 * time.Millisecond
-	menuShapeMaxSlowRows = 9000000
+	menuShapeMaxSlowRows = 2000000
+	menuShapeSlowFloor   = 25 * time.Millisecond
+	menuShapeMaxBound    = 300 * time.Millisecond
 )
+
+// menuShapeCalibrate adds slow rows until the fastest of three passes over them
+// reaches menuShapeSlowStep or no more fit the budget, and returns the rows and
+// that pass. The fastest, so a load spike during one pass cannot make the bound
+// longer than the scan's own pass will be.
+func menuShapeCalibrate(add func(rows, more int) error, pass func() (time.Duration, error), pages func() (used, ceiling int64, err error)) (int, time.Duration, error) {
+	rows, full := 0, time.Duration(0)
+	for more := menuShapeSlowRows; more > 0; {
+		if err := add(rows, more); err != nil {
+			return rows, full, err
+		}
+		rows += more
+		full = 0
+		for range 3 {
+			p, err := pass()
+			if err != nil {
+				return rows, full, err
+			}
+			if full == 0 || p < full {
+				full = p
+			}
+		}
+		used, ceiling, err := pages()
+		if err != nil {
+			return rows, full, err
+		}
+		more = menuShapeSlowGrowth(rows, full, menuShapeSlowBudget(rows, used, ceiling))
+	}
+	return rows, full, nil
+}
+
+// menuShapeSlowBudget is how many rows, at the density measured so far, fill half
+// the capture file's ceiling, at most menuShapeMaxSlowRows.
+func menuShapeSlowBudget(rows int, used, ceiling int64) int {
+	if used <= 0 {
+		return rows
+	}
+	return int(min(int64(menuShapeMaxSlowRows), int64(rows)*(ceiling/2)/used))
+}
+
+// menuShapeSlowGrowth is how many rows to add after rows stepped in full: enough,
+// at the measured rate with a margin, to reach menuShapeSlowStep, within budget.
+func menuShapeSlowGrowth(rows int, full time.Duration, budget int) int {
+	if full >= menuShapeSlowStep || rows >= budget {
+		return 0
+	}
+	want := budget
+	if full > 0 {
+		want = min(budget, int(float64(rows)*(float64(menuShapeSlowStep)/float64(full))*1.3))
+	}
+	// Less than a tenth more is not worth another pass: the budget is reached.
+	if more := want - rows; more*10 >= rows {
+		return more
+	}
+	return 0
+}
+
+// menuShapeSlowBound is the statement bound for a pass of full, and whether the
+// pass is long enough to bound at all.
+func menuShapeSlowBound(full time.Duration) (time.Duration, bool) {
+	return min(full/5, menuShapeMaxBound), full >= menuShapeSlowFloor
+}
