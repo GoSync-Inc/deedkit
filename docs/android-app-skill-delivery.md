@@ -4,9 +4,13 @@ Spec: ANYM-993. Source: `services/android/src/deedkit_android/app_skill_bundle.p
 
 ## What ships
 
-`deedkit_android/app_skills/v1/` holds exact copies of the four app navigation skills from
-PR #1007 at commit `96e2be8429cbb4cef50f4d8eee5f75b2741f2cce`. `SKILLS` records each file's
-package, SHA-256 and Git blob ID. The bundle `DIGEST` covers the version, the source and those
+`deedkit_android/app_skills/v2/` (`VERSION = 2`) holds exact copies of the four canonical
+`skills/android-*-navigation/SKILL.md` files at commit `750e3988600455a099bb26e11d8bea069c6cca7a`
+of PR #1019. Only the Grab skill differs from v1: blob `b4e114a0ebca3c06ab41a406fe76545336186722`
+adds the GrabMart observations of 2026-11-16 and the owner's preference to look for a product
+search across stores first (DK-48). `SKILLS` records each file's package, SHA-256 and Git blob
+ID. `app_skills/v1/` stays byte-identical to PR #1007 (commit
+`96e2be8429cbb4cef50f4d8eee5f75b2741f2cce`) for rollback and lineage; nothing offers it. The bundle `DIGEST` covers the version, the source and those
 records. The wheel and the editable `uv sync` install carry the directory as package data, so
 installing the service needs no extra step.
 
@@ -54,10 +58,13 @@ re-attached. The roots apply when an existing process starts its next relevant t
 process starts after a restart (`thread/resume` keeps the same thread). Root owns installation,
 detection of the installed version, and live A/B measurement.
 
-Rollback: install the previous release. That version never sends `skills/extraRoots/set`, and a new
-process starts with no extra roots.
+Rollback: install the previous release. A release with v1 offers the v1 bundle; one before
+PR #1011 never sends `skills/extraRoots/set`. A new process starts with no extra roots.
 
 ## Refreshing the skills
 
-When the reviewed skill sources change, add `app_skills/v2/` from the exact new blobs, set
-`VERSION`, `SOURCE` and `SKILLS`, and keep `v1` until the release that drops it.
+When a canonical skill changes, add `app_skills/v<N+1>/` from the exact new blobs, set
+`VERSION`, `SOURCE` and `SKILLS`, and keep older directories until the release that drops them.
+`SOURCE` names the earlier commit that holds the canonical blobs, never the bundle commit itself.
+`services/android/tests/test_grabmart_skill_bundle.py` fails while the packaged bundle and the
+canonical skills differ.
