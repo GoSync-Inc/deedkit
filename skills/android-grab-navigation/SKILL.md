@@ -24,8 +24,8 @@ screen differs.
 
 ## Auth barrier
 
-Logging in needs the owner's own account and hands. If this sheet appears, stop and report
-that Grab is signed out instead of attempting login.
+The audit ran signed out and stopped at this sheet without logging in. Whether to log in
+follows the current goal and the existing auth rules; there is no observed shortcut around it.
 
 ## Unverified
 
