@@ -7,6 +7,7 @@ export type ToolName =
   | 'agents_stop_task'
   | 'android_agent'
   | 'android_capabilities'
+  | 'android_courier_call_sheet'
   | 'android_courier_chat'
   | 'android_delete_file'
   | 'android_download'

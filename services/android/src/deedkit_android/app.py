@@ -12,7 +12,7 @@ from pydantic import AliasChoices, Field, ValidationError
 from typing import Literal
 
 from .agent_run import AgentCall, Agents, install_routes
-from . import courier_chat
+from . import courier_call, courier_chat
 from .app_maps import compile_scenario, load, validate_map
 from .config import Configuration, Refused, Strict
 from .device import COMMANDS, Devices
@@ -72,6 +72,14 @@ class CourierChat(Device):  # ANYM-975: preview, then send; ANYM-978: goal, repl
     standing: bool = False
     reason: str | None = Field(default=None, min_length=1, max_length=200)
     timeout_s: int = Field(default=60, ge=10, le=180)
+    wait_s: int = Field(default=15, ge=0, le=25)
+
+
+class CourierCallSheet(Device):  # ANYM-976: one tap on the call entry, then reads; never a call option
+    request_id: str
+    app: Literal["gojek", "grab"]
+    order: str = Field(min_length=3, max_length=80, pattern=r"^[^\r\n]+$")
+    owner_instruction: str = Field(min_length=3, max_length=1500)
     wait_s: int = Field(default=15, ge=0, le=25)
 
 
@@ -142,7 +150,7 @@ class Download(FileRef):
 SCHEMAS = {
     "capabilities": Strict, "maestro": MaestroInfo, "observe": Observe, "execute": Execute, "get_operation": Receipt,
     "run_flow": RunFlow, "flows": Flows, "session": Session, "upload": Upload, "download": Download, "delete_file": FileRef,
-    "courier_chat": CourierChat, "agent": AgentCall,
+    "courier_chat": CourierChat, "agent": AgentCall, "courier_call_sheet": CourierCallSheet,
 }
 # Where runs reach this service; the command line sets it from --host and --port.
 AGENT_URL = None
@@ -290,6 +298,8 @@ def create_app(config_path, agent_url=None):
                                            args["argv"], args["timeout_s"], args["wait_s"])
         elif operation == "courier_chat":
             result = await courier_chat.handle(devices, owner, args)
+        elif operation == "courier_call_sheet":
+            result = await courier_call.handle(devices, owner, args)
         elif operation == "maestro":
             if args["action"] == "reference":
                 result = ui_reference()
