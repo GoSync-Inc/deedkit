@@ -304,7 +304,8 @@ def staged_after_push(registry, target, staging, tested):
     Another config is refused at its first read. Only a positive "manifest unknown" is read again, on the same
     staging tag, VISIBILITY_WAITS apart until VISIBILITY_DEADLINE; an unreadable registry refuses as every read does
     (Registry.inspect), and nothing is pushed again."""
-    if not re.fullmatch(r"[^:@\s]+:[0-9a-f]{40}-attempt-[0-9]+-[0-9]+", staging):
+    name, _, tag = staging.rpartition(":")  # the name may carry a registry port (localhost:5000 in the dry run)
+    if not name or "@" in staging or not re.fullmatch(r"[0-9a-f]{40}-attempt-[0-9]+-[0-9]+", tag):
         raise Refused(f"{target} has no exact staging tag to read back")
     deadline, reads = time.monotonic() + VISIBILITY_DEADLINE, 0
     for wait in (*VISIBILITY_WAITS, None):
@@ -318,7 +319,6 @@ def staged_after_push(registry, target, staging, tested):
         if wait is None or time.monotonic() + wait > deadline:
             break
         time.sleep(wait)
-    tag = staging.rpartition(":")[2]
     raise Refused(f"pushed {target} staging tag {tag} is absent from the registry after the push succeeded"
                   f" ({reads} reads within {VISIBILITY_DEADLINE} s); not pushed again, nothing promoted")
 

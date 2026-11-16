@@ -1041,3 +1041,19 @@ def test_an_unreadable_staging_tag_is_refused_by_the_read_and_never_waited_for_a
     with pytest.raises(pi.Refused, match=message):
         pi.publish_one(pi.Registry("ghcr.io/gosync-inc"), "calls", SHA, tmp_path, never_attested, ATTEMPT)
     assert [argv[1] for argv in calls].count("copy") == 1 and not outcomes and delays == backoff
+
+
+# spec: ANYM-602
+def test_the_dry_run_reads_back_its_staging_tag_on_a_localhost_registry_with_a_port(tmp_path, monkeypatch):
+    # PR 1016 run 43838938324: every images / build dry run refused "no exact staging tag" for localhost:5000/...
+    delays = clock(monkeypatch)
+    registry = LaggingRegistry(hidden=1)
+    registry.prefix = "localhost:5000"
+    tested = exported(tmp_path, "gateway")
+    result = pi.publish_one(registry, "gateway", SHA, tmp_path, never_attested, ATTEMPT)
+    staged = registry.tagged("gateway", STAGING)
+    assert registry.pushes == [f"localhost:5000/deedkit-gateway:{STAGING}"] and delays == [5]
+    assert result["digest"] == staged[0] and staged[1]["config"]["digest"] == tested
+    for reference in (f"localhost:5000/deedkit-gateway:{SHA}", f"localhost:5000/deedkit-gateway@sha256:{'a' * 64}", STAGING):
+        with pytest.raises(pi.Refused, match="no exact staging tag"):
+            pi.staged_after_push(registry, "gateway", reference, tested)
