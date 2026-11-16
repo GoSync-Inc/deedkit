@@ -66,15 +66,18 @@ def main():
         'reload-delivery-policy','set-delivery-features','migrate-expand','set-module-cursor','abandon-module-gap',
         'module-router-status','set-dynamic-subscriptions','set-source-filters',
         'set-source-exclusions','wake-targets-list','disable-wake-target','enable-wake-target','sync-latency',
-        'session-claim-list','session-claim-release','link-module','unlink-module'])
+        'session-claim-list','session-claim-release','link-module','unlink-module',
+        'android-wake-binding-info','android-wake-binding-enroll'])
     parser.add_argument('--principal')
     parser.add_argument('--accounts',nargs='+')
     parser.add_argument('--key-file',type=Path)
     parser.add_argument('--key-id',help='Public credential UUID; never the token or its hash')
+    parser.add_argument('--device',help='android-wake-binding-info: the exact device ID of that principal and key')
     parser.add_argument('--token-file',type=Path,help='issue-key: an existing owner-only file (or /dev/stdin) with the caller\'s token')
     parser.add_argument('--operation-id',help='issue-key, key-info: 1-128 of [A-Za-z0-9._/-]; the same request again replays')
     parser.add_argument('--check',action='store_true',
-        help='issue-key, extend-key, revoke-key, list-keys, key-info, principal-info: validate and report the schema, write nothing')
+        help='issue-key, extend-key, revoke-key, list-keys, key-info, principal-info: validate and report the schema, write nothing; '
+        'android-wake-binding-enroll: validate and propose in a read-only transaction')
     parser.add_argument('--all',action='store_true',dest='all_keys',help='list-keys: every key of every principal; enable-wake-target: every operator-disabled target (with --principal, its own)')
     group=parser.add_mutually_exclusive_group()
     group.add_argument('--chats',nargs='*',default=UNSET)
@@ -423,6 +426,17 @@ def main():
                 elif args.command=='abandon-module-gap':result=event_router.abandon_gap(c,args.source,args.gap_kind,args.after)
                 else:result=event_router.status(c)
             print(json.dumps(result))
+        elif args.command in ('android-wake-binding-info','android-wake-binding-enroll'):
+            # DK-53 (ANYM-997): one exact binding's metadata, or a PAUSED unverified enrollment; never activation.
+            from . import android_wake_admin
+            info=args.command=='android-wake-binding-info'
+            if bool(args.file)==info or (info and (args.check or not (args.principal and args.key_id and args.device))) or (
+                    not info and (args.principal or args.key_id or args.device)):
+                parser.error('info takes exactly --principal, --key-id and --device; enroll only --file (and --check)')
+            result=android_wake_admin.command(store,args.command,principal=args.principal,credential=args.key_id,
+                device=args.device,path=args.file,check=args.check)
+            print(json.dumps(result))
+            if 'error' in result:raise SystemExit(1)
         elif args.command=='audit-tail':
             print(json.dumps(store.audit_tail(args.principal or '',args.limit)))
         else:
