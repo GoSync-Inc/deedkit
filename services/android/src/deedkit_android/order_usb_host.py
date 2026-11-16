@@ -16,11 +16,72 @@ class ForwardJournal:
         self.db.execute('''CREATE TABLE IF NOT EXISTS android_usb_forwards
             (id TEXT PRIMARY KEY,owner TEXT,device TEXT,request_id TEXT,serial TEXT,source_id TEXT,
              auth_epoch INTEGER,port INTEGER,state TEXT,collection TEXT,reason TEXT)''')
-        self.db.execute("UPDATE android_usb_forwards SET state='held',reason=COALESCE(reason,'restart_reconciliation_required') WHERE state IN ('sending','owned','closing')")
+        if 'recovery' not in {r['name'] for r in self.db.execute('PRAGMA table_info(android_usb_forwards)')}:
+            self.db.execute('ALTER TABLE android_usb_forwards ADD COLUMN recovery TEXT')
+        # Keep the interrupted phase: only a never-attempted removal of a proved forward may run later.
+        self.db.execute("""UPDATE android_usb_forwards SET recovery='after_'||state,state='held',
+            reason=COALESCE(reason,'restart_reconciliation_required') WHERE state IN ('sending','owned','closing')""")
         self.db.commit()  # never adopt a port/token/authority from these receipts
 
-    def blocked(self, serial):
-        return self.db.execute("SELECT * FROM android_usb_forwards WHERE serial=? AND state!='closed'",(serial,)).fetchone()
+    @staticmethod
+    def same(entry, row):
+        return (row['owner'],row['device'],row['serial'],row['source_id'],row['auth_epoch'])==(
+            entry.owner,entry.device,entry.serial,entry.source.source_id,entry.source.auth_epoch)
+
+    @staticmethod
+    def settled(row):
+        """The host forward is positively gone; only the phone's persisted watch may remain unknown."""
+        return row['state']=='closed' or row['reason']=='collection_cleanup_unconfirmed' or row['recovery']=='forward_closed'
+
+    def blocked(self, entry, settled=False):
+        """A row this exact owner/device/source/epoch generation can neither reconcile nor supersede."""
+        for row in self.db.execute("SELECT * FROM android_usb_forwards WHERE serial=? AND state!='closed'",(entry.serial,)):
+            if row['state']!='held' or not self.same(entry,row) or (settled and not self.settled(row)):
+                return row
+        return None
+
+    def supersede(self, entry, ident):
+        """A positive hello for this receipt's own watch replaced the phone's whole persisted set."""
+        self.db.execute("""UPDATE android_usb_forwards SET state='closed',recovery='collection_superseded'
+            WHERE serial=? AND owner=? AND device=? AND source_id=? AND auth_epoch=? AND state='held' AND id!=?
+            AND (reason='collection_cleanup_unconfirmed' OR recovery='forward_closed')""",
+            (entry.serial,entry.owner,entry.device,entry.source.source_id,entry.source.auth_epoch,ident))
+        self.db.commit()
+
+    async def reconcile(self, entry):
+        """Read-only proof of absence, or the first removal of a proved owned forward; never a retry."""
+        pending=[dict(r) for r in self.db.execute("SELECT * FROM android_usb_forwards WHERE serial=? AND state='held'",
+                                                  (entry.serial,)) if self.same(entry,r) and not self.settled(r)]
+        if not pending:
+            return
+        actual=await self.listing(entry)
+        entry.admit()
+        for row in pending:
+            port,ident='tcp:'+str(row['port']),row['id']
+            if row['port'] is None:
+                if any(serial==entry.serial and remote==REMOTE for serial,_,remote in actual):
+                    continue  # an unported acquisition may own any of these; never guess or remove
+                outcome='forward_absent'
+            elif (entry.serial,port,REMOTE) not in actual:
+                outcome='forward_absent'
+            elif row['recovery']!='after_owned' or [r for r in actual if r[1]==port]!=[(entry.serial,port,REMOTE)]:
+                continue  # an attempted/unknown removal is never retried
+            else:
+                self.save(ident,recovery='removing')  # intent before the one removal attempt
+                try:
+                    code,_,_=await run_process([entry.adb,'-s',entry.serial,'forward','--remove',port],5,stdout_limit=64)
+                    actual=await self.listing(entry)
+                    if code or any(r[1]==port for r in actual):
+                        raise Refused('usb_forward_cleanup_unknown')
+                except BaseException:
+                    self.save(ident,recovery='removal_unknown')
+                    raise
+                entry.admit()
+                outcome='forward_removed'
+            # Legacy restart rows did not record watch bytes, so their not_started is not proof.
+            known=row['collection']=='confirmed' or row['collection']=='not_started' and (
+                row['port'] is None or row['recovery'] is not None or row['reason']!='restart_reconciliation_required')
+            self.save(ident,state='closed',recovery=outcome) if known else self.save(ident,recovery='forward_closed')
 
     def save(self, ident, **values):
         self.db.execute('UPDATE android_usb_forwards SET '+','.join(k+'=?' for k in values)+' WHERE id=?',
@@ -43,14 +104,18 @@ class ForwardJournal:
 
     async def bind(self, entry, access):
         entry.admit()
-        if access.serial!=entry.serial or self.blocked(entry.serial):
+        if access.serial!=entry.serial or self.blocked(entry):
+            raise Refused('usb_forward_reconciliation_required')
+        await self.reconcile(entry)
+        if self.blocked(entry,settled=True):
             raise Refused('usb_forward_reconciliation_required')
         before=await self.listing(entry)
         entry.admit()
         if any(serial==entry.serial and remote==REMOTE for serial,_,remote in before):
             raise Refused('usb_forward_not_owned')
         ident=str(uuid.uuid4())
-        self.db.execute('INSERT INTO android_usb_forwards VALUES(?,?,?,?,?,?,?,NULL,?,?,NULL)',
+        self.db.execute('''INSERT INTO android_usb_forwards(id,owner,device,request_id,serial,source_id,auth_epoch,state,
+            collection) VALUES(?,?,?,?,?,?,?,?,?)''',
             (ident,entry.owner,entry.device,entry.task,entry.serial,entry.source.source_id,entry.source.auth_epoch,
              'sending','not_started'))
         self.db.commit()  # original acquisition intent before any mutation bytes
@@ -69,15 +134,22 @@ class ForwardJournal:
             raise
         async def close_owned():
             return await self.close(entry,ident,port)
+        def collection(event):
+            row=self.db.execute('SELECT state FROM android_usb_forwards WHERE id=?',(ident,)).fetchone()
+            if row is not None and row['state']=='owned':
+                if event=='watching':
+                    self.save(ident,collection='unconfirmed')  # durable before the phone may persist a watch
+                elif event=='accepted':
+                    self.supersede(entry,ident)
         # B rechecks current admission before opening its socket or sending any watch.
-        return UsbForward(entry.serial,port,close_owned,receipt=ident)
+        return UsbForward(entry.serial,port,close_owned,receipt=ident,collection=collection)
 
     async def close(self, entry, ident, port):
         row=self.db.execute('SELECT * FROM android_usb_forwards WHERE id=?',(ident,)).fetchone()
         if row is None or row['state']!='owned' or row['port']!=port or row['serial']!=entry.serial:
             return False  # no adoption/retry of a held or previously claimed cleanup
         collection='confirmed' if entry.connector.cleanup=='confirmed' else (
-            'not_started' if entry.connector.state=='starting' else 'unconfirmed')
+            'not_started' if entry.connector.state=='starting' and row['collection']=='not_started' else 'unconfirmed')
         self.save(ident,state='closing',collection=collection)
         try:
             actual=await self.listing(entry)
@@ -93,6 +165,8 @@ class ForwardJournal:
                     raise Refused('usb_forward_cleanup_unknown')
             self.save(ident,state='closed' if collection in ('confirmed','not_started') else 'held',
                       reason=None if collection in ('confirmed','not_started') else 'collection_cleanup_unconfirmed')
+            if collection=='confirmed':
+                self.supersede(entry,ident)  # the empty watch's hello cleared the whole persisted set
             return True
         except BaseException:
             self.save(ident,state='held',reason='usb_forward_cleanup_unknown')
@@ -195,15 +269,15 @@ class UsbLifecycle:
             key=(origin.owner,origin.device)
             if key in self.entries:
                 previous=self.entries[key]
-                receipt=self.journal.db.execute('SELECT state FROM android_usb_forwards WHERE id=?',
+                receipt=self.journal.db.execute('SELECT * FROM android_usb_forwards WHERE id=?',
                                                 (previous.receipt,)).fetchone()
-                if (not previous.connector.task.done() or receipt is None or receipt['state']!='closed'
+                if (not previous.connector.task.done() or receipt is None or not self.journal.settled(receipt)
                         or origin is previous.origin or origin is previous.handle):
                     continue
                 del self.entries[key]
             try:
                 entry=Entry(self,origin,handle=handle)
-                if not entry.packages() or self.journal.blocked(entry.serial):
+                if not entry.packages() or self.journal.blocked(entry):
                     continue
                 self.entries[key]=entry
                 entry.admit()

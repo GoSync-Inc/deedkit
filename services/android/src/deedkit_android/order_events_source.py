@@ -18,6 +18,7 @@ class UsbOrderSource:
              PRIMARY KEY(owner,device_id,source_id))''')
         events.db.commit()
         self.epoch = None
+        self.accepted = None  # optional caller hook after a hello answering its own watch is committed
 
     def status(self):
         row = self.events.db.execute('''SELECT epoch,sequence,hold_reason FROM android_order_source_cursors
@@ -53,6 +54,8 @@ class UsbOrderSource:
             self.epoch = epoch
             self._cursor(epoch, oldest - 1 if changed else previous['sequence'],
                          'observation_gap' if gap else previous['hold_reason'])
+            if self.accepted is not None:
+                self.accepted()
             return 'connected'
         if epoch != self.epoch:
             raise OrderRefused('source_not_connected')
