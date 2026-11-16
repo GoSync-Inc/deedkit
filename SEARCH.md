@@ -463,6 +463,17 @@ calls wait at once (separate from send waits); a busy server returns the operati
 `result_evidence.live_wait: "busy"`. `live` other than `off` needs `read-live` and, through the
 gateway, the `search_messages_live` action; MCP clients reconnect after the release to see the fields.
 
+Hits the archive does not keep (ANYM-1000). A live hit older than the account's collection window
+(`reason: "outside_history_window"`), or one whose store failed (`not_stored`) or ran out of time
+(`deadline`), never becomes a row of `items`. With `live` other than `off` the answer has a top-level
+`live_items`: every such hit of a `done` entry, with its `account` and `reason`, newest first (`[]` when
+no live search finished). Read them beside `items`; an empty `items` with `live_items` is not "no match".
+A `done` entry with a `next_cursor` has `next_call`: the `messages_execute_messenger_operation` call of
+`search_messages_live` for the same account, chat and parameters with that `cursor`, and a `request_id`
+derived from it (repeating it asks nothing new). Its receipt is the next live page; its hits are archived
+under the same rules. A hit text longer than 300 characters ends at a word boundary with `…` and carries
+`text_truncated: true`; the full message is in the archive (`get_context`) when the hit was stored.
+
 ## Coverage and diagnostics
 
 Version0.9.2 adds result_evidence, per-chat sync evidence and exact provider ID resolution. Inspect `result_evidence` and call `get_sync_status(chat_id=...)` before interpreting empty or partial results. The archive never substitutes a search error with no matches.
