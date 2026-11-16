@@ -14,6 +14,12 @@ from .config import Refused
 
 MAX_FILE = 256 * 1024 * 1024
 MAX_STORAGE = 512 * 1024 * 1024
+# What a refused session call says to do next, by holder (ANYM-1001).
+NEXT_ACTIONS = {
+    "free": "acquire_a_new_session",
+    "own": "another_session_of_this_key_holds_the_phone_wait_for_expires_at_or_its_release",
+    "other": "another_principal_holds_the_phone_try_again_later",
+}
 
 
 def identifier(value):
@@ -70,10 +76,10 @@ class Store:
         active = row and row["expires"] > time.time()
         if action == "acquire":
             if active:
-                raise Refused("device_reserved")
+                raise self.refusal("device_reserved", owner, device)
             token = str(uuid.uuid4())
         elif not active or row["owner"] != owner or row["token"] != token:
-            raise Refused("reservation_expired_or_forbidden")
+            raise self.refusal("reservation_expired_or_forbidden", owner, device)
         if action == "release":
             self.db.execute("DELETE FROM reservations WHERE device=?", (device,))
             self.db.execute("DELETE FROM reservation_options WHERE device=?", (device,))
@@ -95,10 +101,22 @@ class Store:
             return "free"
         return "own" if row["owner"] == owner else "other"
 
+    def refusal(self, code, owner, device):
+        """`code` naming who holds the phone (ANYM-1001): `free`, `own` or `other` as `session_state` reads it.
+
+        Only a lease of the caller's own key shows its end; no session id or principal name ever leaves."""
+        holder = self.session_state(owner, device)
+        error = Refused(code)
+        error.extra = {"holder": holder, "next_action": NEXT_ACTIONS[holder]}
+        if holder == "own":
+            row = self.db.execute("SELECT expires FROM reservations WHERE device=?", (device,)).fetchone()
+            error.extra["expires_at"] = row["expires"]
+        return error
+
     def check_reservation(self, owner, device, token):
         row = self.db.execute("SELECT * FROM reservations WHERE device=?", (device,)).fetchone()
         if not row or row["expires"] <= time.time() or row["owner"] != owner or row["token"] != token:
-            raise Refused("reservation_expired_or_forbidden")
+            raise self.refusal("reservation_expired_or_forbidden", owner, device)
 
     def reservation_window(self, owner, device, token):
         self.check_reservation(owner, device, token)
