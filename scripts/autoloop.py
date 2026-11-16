@@ -573,7 +573,9 @@ def read(state, triage_state, runner=run_reader, ids=None, now=None, held_cards=
     snap = triage.load(triage_state / 'snapshot.json', None)
     if snap is None:
         raise Refused('no snapshot: run feedback_triage.py snapshot first')
-    projected, inbox = projection(triage_state, ids, triage.load(state / HISTORICAL, {}))
+    now = now or datetime.now(timezone.utc)
+    unsettled = settle_repairs(state, triage_state, now)  # an interrupted brief repair is never sent again here
+    projected, inbox = projection(triage_state, ids, set(triage.load(state / HISTORICAL, {})) | unsettled)
     ledger = triage.load(triage_state / 'ledger.json', {})
     try:
         if not inbox:
@@ -582,36 +584,146 @@ def read(state, triage_state, runner=run_reader, ids=None, now=None, held_cards=
             return 0, triage.record(triage_state, []) if unreported else None
         whole = triage.load(triage_state / 'inbox.json', {})
         keys = {i: entry.get('key_id') for i, entry in ledger.items()} | {i: item.get('key_id') for i, item in whole.items()}
-        decisions, briefs, refused = sorted_answer(answer_object(checked_stream(runner(projected))), inbox,
-                                                   triage.known(snap), keys, checks := {})
+        raw = answer_object(checked_stream(runner(projected)))
+        decisions, briefs, refused = sorted_answer(raw, inbox, triage.known(snap), keys, checks := {})
         blocked = {d['id'] for d in decisions if d.get('primary') in held_cards}
         refused.update({i: f'{i}: primary card is held' for i in blocked})
         checks.update({i: 'primary_held' for i in blocked})
         decisions = [d for d in decisions if d['id'] not in blocked]
         briefs = {i: b for i, b in briefs.items() if i not in blocked}
+        repaired = {}
         if config(state)['record_projection']:
             # Do not remove actionable work from the inbox before the bridge can describe it. Legacy readers
             # without projection keep their dispositions; holds and declined/duplicate decisions need no brief.
-            missing = {d['id'] for d in decisions if d['classification'] in ('reported-bug', 'feature')
-                       and d.get('duplicate_of') is None and d['reason'] != REASONS['already-live']
-                       and (d.get('new_card') or any(s['verdict'] == 'accepted' for s in d['specs']))
-                       and d['id'] not in briefs}
+            missing = {d['id'] for d in decisions if actionable(d) and d['id'] not in briefs}
             refused.update({i: f'{i}: actionable projection needs a released card_brief' for i in missing})
             checks.update({i: checks.get(i, 'card_brief_missing') for i in missing})
             decisions = [d for d in decisions if d['id'] not in missing]
+            repaired = repair_lengths(state, triage_state, raw, (decisions, briefs, refused, checks),
+                                      (inbox, whole, ledger, keys, triage.known(snap), held_cards), projected, runner, now)
         triage.checked_batch(decisions, triage.known(snap), whole, ledger)
         triage.save(state / 'decisions.json', decisions)
         triage.save(state / 'briefs.json', dict(triage.load(state / 'briefs.json', {}), **briefs))
         report = triage.record(triage_state, decisions)
         if refused:
-            at, journal = triage.stamp(now or datetime.now(timezone.utc)), refusals(state)
+            at, journal = triage.stamp(now), refusals(state)
             for i, why in refused.items():
                 journal[i] = {'count': journal.get(i, {}).get('count', 0) + 1, 'at': at, 'why': why}
                 journal[i].update({'check': checks[i]} if i in checks else {})
             triage.save(state / 'refused.json', journal)
+        if config(state)['record_projection'] and repaired:
+            # Only now is a repair attempt settled: its decision is in the ledger or its refusal is in the journal.
+            attempts = triage.load(state / LENGTH_REPAIRS, {})
+            for i, result in repaired.items():
+                attempts[i]['result'] = result
+            synced(state, LENGTH_REPAIRS, attempts)
     except triage.Refused as error:
         raise Refused(f'record: {error}') from None
     return len(decisions), report
+
+
+# --- the bounded brief-length repair (DK-51) -----------------------------------------------------------------------
+# A projection read's decision that is valid in every way but its brief's length gets ONE brief-only paraphrase from
+# the same reader, charged before the call under the same daily caps. Its decision is frozen; only a brief that passes
+# every normal check joins it. Each attempt is journaled (IDs, times and fixed words only) before the call: one with no
+# result was interrupted, and is settled as the original refusal, never sent again.
+LENGTH_REPAIRS = 'brief-length-repairs.json'  # {feedback ID: {at, attempts, result}}; result None: unknown
+
+
+def actionable(d):
+    """A decision that takes actionable work out of the inbox: projection recording needs its released brief."""
+    return (d['classification'] in ('reported-bug', 'feature') and d.get('duplicate_of') is None
+            and d['reason'] != REASONS['already-live']
+            and bool(d.get('new_card') or any(s['verdict'] == 'accepted' for s in d['specs'])))
+
+
+def synced(state, name, value):
+    triage.save(state / name, value)
+    for path in (state / name, state):
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def settle_repairs(state, triage_state, now):
+    """The IDs of brief repairs left without a result (a crash or a kill during the call or before its record).
+    Each is settled now from the triage ledger: recorded, or its original length refusal counted; never re-sent."""
+    attempts = triage.load(state / LENGTH_REPAIRS, {})
+    unknown = {i for i, e in attempts.items() if e.get('result') is None}
+    if not unknown:
+        return set()
+    ledger, inbox, journal = triage.load(triage_state / 'ledger.json', {}), triage.load(triage_state / 'inbox.json', {}), refusals(state)
+    for i in sorted(unknown):
+        attempts[i]['result'] = 'recorded' if i in ledger else 'interrupted'
+        if i not in ledger and i in inbox:
+            journal[i] = {'count': journal.get(i, {}).get('count', 0) + 1, 'at': triage.stamp(now),
+                          'why': f'{i}: brief repair interrupted; not sent again', 'check': 'card_brief_length'}
+    triage.save(state / 'refused.json', journal)
+    synced(state, LENGTH_REPAIRS, attempts)
+    return unknown
+
+
+def length_candidate(d, decisions, context, held):
+    """The frozen decision of a `card_brief_length` refusal that every other check passes, or None. The brief is
+    left out to run the same checks (`brief_check` stops at the length before the classification semantics); the
+    long brief itself must still be eligible, not copied and not unsafe."""
+    inbox, whole, ledger, keys, specs, held_cards = context
+    try:
+        frozen = checked_answer([dict(d, card_brief=None)], inbox, specs)[0][0]
+        triage.checked(frozen, specs, keys)
+        triage.checked_batch(decisions + [frozen], specs, whole, ledger)
+    except (Refused, triage.Refused):
+        return None
+    cards = {frozen.get('primary'), 'new:' + frozen['new_card'] if frozen.get('new_card') else None} - {None}
+    if (not actionable(frozen) or frozen['reason'] == REASONS['needs-opt-in'] or not released(d['card_brief'], inbox)
+            or cards & (set(held_cards) | set(held['cards'])) or d['id'] in held['items']):
+        return None
+    return frozen
+
+
+def repair_lengths(state, triage_state, raw, out, context, projected, runner, now):
+    """Repair at most one brief per input item of this read; `out` (decisions, briefs, refused, checks) is updated in
+    place for each released repair. {ID: result word} of the attempts made."""
+    decisions, briefs, refused, checks = out
+    inbox, whole, keys, specs = context[0], context[1], context[3], context[4]
+    cfg, held, attempts, results = config(state), holds(state), triage.load(state / LENGTH_REPAIRS, {}), {}
+    for d in raw:
+        i = d['id']
+        if checks.get(i) != 'card_brief_length' or i not in refused \
+                or (frozen := length_candidate(d, decisions, context, held)) is None:
+            continue
+        try:
+            charge_reader(state, cfg, now, i, inbox[i])
+        except Refused:
+            continue  # no budget left today: the original refusal stands and no second call is made
+        attempts[i] = {'at': triage.stamp(now), 'attempts': attempts.get(i, {}).get('attempts', 0) + 1, 'result': None}
+        synced(state, LENGTH_REPAIRS, attempts)
+        ask = {'mode': 'brief_repair', 'max_characters': BRIEF_LIMIT, 'max_consecutive_source_words': VERBATIM - 1,
+               'items': [item for item in projected['items'] if item['id'] == i]}
+        try:
+            brief = repair_answer(checked_stream(runner(ask)), i)
+        except Refused as error:
+            results[i] = str(error)[len('repair: '):] if str(error).startswith('repair: ') else 'reader'
+            continue
+        try:
+            one, got = checked_answer([dict(d, card_brief=brief)], inbox, specs, local := {})
+            triage.checked(one[0], specs, keys)
+        except (Refused, triage.Refused) as error:
+            results[i] = getattr(error, 'check', None) or 'changed_decision'
+            continue
+        if one[0] != frozen or i not in got:
+            results[i] = local.get(i, 'changed_decision')
+        elif triage.load(triage_state / 'inbox.json', {}).get(i) != whole.get(i) or holds(state) != held:
+            results[i] = 'source_changed'
+        else:
+            results[i] = 'released'
+            decisions.append(frozen)
+            briefs.update(got)
+            refused.pop(i)
+            checks.pop(i)
+    return results
 
 
 def read_selected(state, triage_state, feedback_id, *, sync_state=None, host=triage.HOST, ssh=None,
@@ -637,6 +749,8 @@ def read_selected(state, triage_state, feedback_id, *, sync_state=None, host=tri
             raise Refused('selected read: controller or principal not enabled')
         if (state / 'PAUSE').exists() or feedback_id in held['items']:
             raise Refused('selected read: paused or dropped')
+        if feedback_id in settle_repairs(state, triage_state, now):
+            raise Refused('selected read: interrupted brief repair settled; never replay')
         rows, _ = triage.export_pages(host, triage.when(source['created_at']), ssh)
         stop, drops, _ = control(*incoming(triage_state, rows), cfg, consumed(state))
         selected = [row for row in rows if row.get('id') == feedback_id]
@@ -839,27 +953,7 @@ def repair_brief(state, triage_state, feedback_id, *, sync_state=None, host=tria
             'items': [{'id': feedback_id, 'category': source.get('category'),
             'principal': source['principal'], 'operation': source.get('operation'), 'text': source['description']}]}
         charge_reader(state, cfg, now, feedback_id, source)
-        text = checked_stream(runner(projected)).strip()
-        fenced = re.fullmatch(r'```(?:json)?\s*(.*?)\s*```', text, flags=re.S)
-        try:
-            response = json.loads(fenced.group(1) if fenced else text)
-        except ValueError:
-            raise Refused('repair: invalid_json') from None
-        if not isinstance(response, dict):
-            raise Refused('repair: invalid_shape')
-        if set(response) - {'id', 'card_brief', 'refusal'}:
-            raise Refused('repair: extra_fields')
-        if response.get('id') != feedback_id:
-            raise Refused('repair: foreign_id')
-        if 'refusal' in response:
-            if set(response) != {'id', 'refusal'} or response['refusal'] != 'unsafe_source':
-                raise Refused('repair: invalid_refusal')
-            raise Refused('repair: unsafe_source')
-        brief = response.get('card_brief')
-        if brief is None:
-            raise Refused('repair: missing_brief')
-        if not isinstance(brief, str) or len(brief) > BRIEF_LIMIT:
-            raise Refused('repair: invalid_brief')
+        brief = repair_answer(checked_stream(runner(projected)), feedback_id)
         safe = released(brief, {feedback_id: source})
         if not safe:
             raise Refused('repair: unsafe_brief')
@@ -882,6 +976,33 @@ def repair_brief(state, triage_state, feedback_id, *, sync_state=None, host=tria
         triage.save(state / PROJECTION, pending | {feedback_id: item})
         triage.save(state / 'briefs.json', stored_briefs | briefs)
         return feedback_id
+
+
+def repair_answer(text, feedback_id):
+    """The card_brief of a closed brief_repair answer for `feedback_id`, at most BRIEF_LIMIT characters; anything
+    else refuses with a fixed `repair: <word>`, never model text."""
+    text = text.strip()
+    fenced = re.fullmatch(r'```(?:json)?\s*(.*?)\s*```', text, flags=re.S)
+    try:
+        response = json.loads(fenced.group(1) if fenced else text)
+    except ValueError:
+        raise Refused('repair: invalid_json') from None
+    if not isinstance(response, dict):
+        raise Refused('repair: invalid_shape')
+    if set(response) - {'id', 'card_brief', 'refusal'}:
+        raise Refused('repair: extra_fields')
+    if response.get('id') != feedback_id:
+        raise Refused('repair: foreign_id')
+    if 'refusal' in response:
+        if set(response) != {'id', 'refusal'} or response['refusal'] != 'unsafe_source':
+            raise Refused('repair: invalid_refusal')
+        raise Refused('repair: unsafe_source')
+    brief = response.get('card_brief')
+    if brief is None:
+        raise Refused('repair: missing_brief')
+    if not isinstance(brief, str) or len(brief) > BRIEF_LIMIT:
+        raise Refused('repair: invalid_brief')
+    return brief
 
 
 # Historical assessments are separate from triage. Every attempted reader call has one durable, non-reusable entry.
@@ -2960,6 +3081,7 @@ def tick(state, triage_state, sync_state=None, now=None, ssh=None, read_tiden=No
             triage.save(state / 'ledger.json', ledger)
             before = refusals(state)
             count, _ = read(state, triage_state, runner, chosen, now)
+            today = counters(triage.load(state / 'ledger.json', {}), cfg, now)  # with any brief repair's charge
             refused = sorted(i for i, e in refusals(state).items() if e['count'] > before.get(i, {}).get('count', 0))
             reader = 'ran'
         if cfg['record_projection'] and count:

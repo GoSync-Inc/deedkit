@@ -128,6 +128,18 @@ A brief is released only after two checks. It is scrubbed, and every number of t
 becomes `#`. A brief that repeats five consecutive words of any item in its batch is not released
 at all: its cluster waits for the orchestrator.
 
+Brief length repair (DK-51). With `record_projection: true`, a read decision that passes every
+check except its brief's 600-character limit gets one brief-only paraphrase (`brief_repair` mode)
+from the same pinned reader. The decision is first checked without its brief: classification,
+reason, specs, primary, duplicate, new card, holds and the batch. Opt-in, already-live, held,
+missing, copied or unsafe briefs get no repair. The second call is charged before it runs, under the
+same daily caps; an item counts once and nothing is refunded. The decision stays frozen. The new
+brief must pass the closed reply shape and every normal brief check, and the source and holds must
+be unchanged, before triage records it. Otherwise the item stays in the inbox with its normal
+`card_brief_length` refusal. `brief-length-repairs.json` holds IDs, times and fixed result words
+only. An attempt left without a result is settled by the next read as recorded or refused, and is
+never sent again; a selected read of that ID stops after settling it. Legacy reads are unchanged.
+
 The worker writes one card, only on the projection's branch `proposal/autoloop-card-c<hash>`. A
 relaunch keeps that branch. Right after the spec exists, the worker runs `autoloop.py bind <intent>
 --card ANYM-n`. From then on, `hold ANYM-n` stops this worker and any relaunch. The card has
