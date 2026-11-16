@@ -118,12 +118,20 @@ class OrderFeed:
                                          (wake_id,)).fetchone()
             if old and old['digest'] != digest:
                 raise OrderRefused('receipt_identity_conflict')
-            if not old:
+            # A question already settled by its exact accepted answer still takes the read; its state stays done.
+            answered = wake['state'] == 'done' and self.events.db.execute(
+                'SELECT 1 FROM android_order_answer_settlements WHERE wake_id=?', (wake_id,)).fetchone()
+            if not old and answered:
+                self.events.db.execute("INSERT INTO android_order_feed_receipts VALUES(?,'read',?,?)",
+                                       (wake_id, principal_id(principal), digest))
+            elif not old:
                 if row['lifecycle'] != 'active' or wake['state'] not in ('pending', 'sending', 'unknown', 'accepted'):
                     raise OrderRefused('receipt_not_current')
                 self.events.db.execute("INSERT INTO android_order_feed_receipts VALUES(?,'read',?,?)",
                                        (wake_id, principal_id(principal), digest))
                 self.events.db.execute("UPDATE android_order_wakes SET state='accepted',hold_reason=NULL WHERE wake_id=?", (wake_id,))
+                if row.get('task_only'):
+                    self.control._close_settled_notice(owner, row['order_id'])
             return dict(wake_id=wake_id, grok_state='read', native_status='not_observed')
 
     def ack_handoff(self, principal, owner, device_id, wake_id, *, snapshot_digest, next_check_at):

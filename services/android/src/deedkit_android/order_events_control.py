@@ -61,6 +61,8 @@ class OrderControl:
                 events.db.execute(f'ALTER TABLE android_order_obligations ADD COLUMN {name} {declaration}')
         events.db.execute('''CREATE TABLE IF NOT EXISTS android_order_controls
             (call_key TEXT PRIMARY KEY,digest TEXT,response TEXT)''')
+        events.db.execute('''CREATE TABLE IF NOT EXISTS android_order_answer_settlements
+            (wake_id TEXT PRIMARY KEY,principal TEXT,digest TEXT,receipt TEXT)''')
         events.db.commit()
         from .order_events_feed import OrderFeed
         self.feed = OrderFeed(self)
@@ -117,7 +119,16 @@ class OrderControl:
         ref = self._task_ref(ctx)
         exists = self.events.db.execute('SELECT 1 FROM android_order_obligations WHERE owner=? AND order_id=?',
                                         (ctx.owner, ref)).fetchone()
-        return self._target(ctx, ref) if exists else self._insert(ctx, ref, notice_only=True)
+        return self._reopen(ctx, self._target(ctx, ref)) if exists else self._insert(ctx, ref, notice_only=True)
+
+    def _reopen(self, ctx, row):
+        # A settled task notice holds no duty; the same exact task's next notice or bind reopens it.
+        if row.get('task_only') and row['lifecycle'] == 'settled':
+            self.events.db.execute('''UPDATE android_order_obligations SET lifecycle='active',revision=revision+1
+                WHERE owner=? AND order_id=? AND lifecycle='settled' AND revision=?''',
+                (row['owner'], row['order_id'], row['revision']))
+            row = self._target(ctx, row['order_id'])
+        return row
 
     def view(self, row, *, compact=False):
         origin = json.loads(row['origin_json']) if row.get('origin_json') else {
@@ -152,7 +163,7 @@ class OrderControl:
         old = self.events.db.execute('SELECT * FROM android_order_obligations WHERE owner=? AND order_id=?',
                                      (ctx.owner, ref)).fetchone()
         if old and old['task_only']:
-            row = self._target(ctx, ref)
+            row = self._reopen(ctx, self._target(ctx, ref))
             changes = {k: v for k, v in payload.items() if k != 'next_check_at'}
             self._change(ctx, row, changes)
             self.events.db.execute('UPDATE android_order_obligations SET task_only=0,next_check_at=? WHERE owner=? AND order_id=?',
@@ -353,3 +364,96 @@ class OrderControl:
                                                             question_ids=ids, source='async' if native_request_id is None else 'rpc'), identity)
             self.feed._export(ctx.owner, ctx.device_id)
             return wake
+
+    ANSWER_RECEIPT = ('original_request_id', 'native_thread_id', 'native_turn_id', 'item_id', 'message_id',
+                      'continuation_turn_id', 'status', 'native_state', 'submission_intent')
+
+    def settle_answered_question(self, principal, owner, device_id, wake_id, receipt):
+        """Host-only: settle one async task-notice question by its exact accepted native input receipt.
+
+        `receipt` is the host's own CodexSession.receipt() of the original async_question interaction, never
+        caller-supplied. Native acceptance means the answer entered the conversation (steer/turn start); it is
+        not goal, order or action success. RPC questions, bound orders and every uncertain state stay held.
+        """
+        if principal_id(principal) != owner or not isinstance(receipt, dict):
+            raise OrderRefused('settlement_not_owned')
+        with self.events.tx():
+            wake = self.events.wake(ident(wake_id))
+            row = self.events._order(owner, wake['order_id'])
+            if wake['owner'] != owner or wake['device_id'] != device_id or row['device_id'] != device_id:
+                raise OrderRefused('settlement_not_owned')
+            self.events._authorize(principal, row)
+            if (row['source_id'], row['auth_epoch']) != (self.source_id, self.auth_epoch):
+                raise OrderRefused('settlement_source_changed')
+            if wake['kind'] != 'question' or wake['target'] != 'grok' or wake['principal'] != owner:
+                raise OrderRefused('settlement_not_question')
+            question = json.loads(wake['payload'])
+            if (question.get('source') != 'async' or question.get('native_request_id') is not None
+                    or question.get('question_ids') != [] or 'native_request_id' in receipt or 'question_ids' in receipt):
+                raise OrderRefused('settlement_not_async')  # RPC submit/resolved has no positive contents ACK
+            if (not row.get('task_only') or row.get('provider_order_id') is not None
+                    or row['task_id'] != row['original_request_id']):
+                raise OrderRefused('settlement_not_task_notice')
+            expected = dict(original_request_id=row['original_request_id'], native_thread_id=row['native_thread_id'],
+                            native_turn_id=wake['native_turn_id'], item_id=question.get('item_id'))
+            if (wake['original_request_id'] != row['original_request_id'] or wake['native_thread_id'] != row['native_thread_id']
+                    or question.get('native_thread_id') != wake['native_thread_id']
+                    or question.get('native_turn_id') != wake['native_turn_id']
+                    or any(type(receipt.get(k)) is not str or receipt[k] != v for k, v in expected.items())):
+                raise OrderRefused('settlement_identity_mismatch')
+            if (receipt.get('status') != 'accepted' or receipt.get('native_state') != 'accepted'
+                    or receipt.get('submission_intent') is not True or type(receipt.get('message_id')) is not str
+                    or not receipt['message_id'] or type(receipt.get('continuation_turn_id', '')) is not str):
+                raise OrderRefused('answer_not_accepted')
+            evidence = {k: receipt[k] for k in self.ANSWER_RECEIPT if k in receipt}
+            digest = hashlib.sha256(document([wake['wake_id'], owner, device_id, evidence]).encode()).hexdigest()
+            previous = self.events.db.execute('SELECT digest FROM android_order_answer_settlements WHERE wake_id=?',
+                                              (wake['wake_id'],)).fetchone()
+            if previous:
+                if previous['digest'] != digest:
+                    raise OrderRefused('settlement_identity_conflict')
+                return self._settled(row, wake)
+            if wake['state'] not in ('pending', 'accepted') or row['lifecycle'] != 'active' or row['responsible'] != 'codex':
+                raise OrderRefused('settlement_delivery_unsettled')
+            changed = self.events.db.execute("UPDATE android_order_wakes SET state='done',hold_reason=NULL "
+                                             "WHERE wake_id=? AND state=?", (wake['wake_id'], wake['state'])).rowcount
+            changed += self.events.db.execute('''UPDATE android_order_obligations SET revision=revision+1 WHERE owner=?
+                AND order_id=? AND revision=? AND lifecycle='active' ''', (owner, row['order_id'], row['revision'])).rowcount
+            if changed != 2:
+                raise OrderRefused('settlement_state_changed')
+            self.events.db.execute('INSERT INTO android_order_answer_settlements VALUES(?,?,?,?)',
+                                   (wake['wake_id'], principal_id(principal), digest, document(evidence)))
+            self._close_settled_notice(owner, row['order_id'])
+            return self._settled(self.events._order(owner, row['order_id']), self.events.wake(wake['wake_id']))
+
+    def answered_question_wake(self, owner, device_id, receipt):
+        """The one async question wake a persisted answer receipt correlates to; none or several stay held."""
+        ids = [receipt.get(k) for k in ('original_request_id', 'native_thread_id', 'native_turn_id', 'item_id')]
+        if not all(type(v) is str for v in ids):
+            raise OrderRefused('settlement_identity_mismatch')
+        rows = [r['wake_id'] for r in self.events.db.execute("""SELECT wake_id,payload FROM android_order_wakes
+            WHERE owner=? AND device_id=? AND kind='question' AND target='grok' AND original_request_id=?
+            AND native_thread_id=? AND native_turn_id=?""", (owner, device_id, *ids[:3]))
+            if json.loads(r['payload']).get('item_id') == ids[3]]
+        if len(rows) != 1:
+            raise OrderRefused('settlement_question_not_found' if not rows else 'settlement_correlation_ambiguous')
+        return rows[0]
+
+    def _close_settled_notice(self, owner, order_id):
+        """Caller owns the transaction. Close an answered task notice only when no duty of its own remains:
+        a settled answer exists, every question is answered, every status read, no pending/uncertain delivery."""
+        db = self.events.db
+        if (db.execute('''SELECT 1 FROM android_order_answer_settlements s JOIN android_order_wakes w
+                    ON w.wake_id=s.wake_id WHERE w.owner=? AND w.order_id=?''', (owner, order_id)).fetchone()
+                and not db.execute('''SELECT 1 FROM android_order_wakes WHERE owner=? AND order_id=?
+                    AND state NOT IN ('done','cancelled','refused') AND NOT (kind='status' AND target='grok'
+                    AND state='accepted')''', (owner, order_id)).fetchone()):
+            db.execute('''UPDATE android_order_obligations SET lifecycle='settled',next_check_at=NULL,revision=revision+1
+                WHERE owner=? AND order_id=? AND task_only=1 AND provider_order_id IS NULL AND lifecycle='active'
+                AND responsible='codex' ''', (owner, order_id))
+
+    @staticmethod
+    def _settled(row, wake):
+        return dict(wake_id=wake['wake_id'], obligation_ref=row['order_id'], delivery_state=wake['state'],
+                    answer='native_input_accepted', goal_status='not_observed', order_status='not_observed',
+                    lifecycle=row['lifecycle'], revision=row['revision'])
