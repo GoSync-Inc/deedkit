@@ -26,6 +26,7 @@ class UsbForward:
     port: int
     close_owned: object
     receipt: object  # host-private original acquisition receipt; never projected/logged
+    collection: object = None  # host journal hook: 'watching' before watch bytes, 'accepted' after its hello
 
 
 class _Hold(Exception):
@@ -98,6 +99,7 @@ class UsbOrderConnector:
         self.interval_s, self.reconnect_s, self.cleanup_s, self.attempts = interval_s, reconnect_s, cleanup_s, attempts
         self.source = UsbOrderSource(events, principal=None, owner=owner, device_id=device_id,
                                      source_id=source_id, auth_epoch=auth_epoch)
+        self.source.accepted = lambda: self._collection('accepted')
         self.task = self.forward = self.writer = self.access = None
         self._unproved_forward = None
         self.serial = None
@@ -153,6 +155,10 @@ class UsbOrderConnector:
         if packages is not None and self._packages(current) != packages:
             raise _Hold('watch_changed')
         return current
+
+    def _collection(self, event):
+        if self.forward is not None and callable(self.forward.collection):
+            self.forward.collection(event)
 
     def _remember_gap(self):
         self.gap |= self.source.status()['hold_reason'] == 'observation_gap'
@@ -279,6 +285,7 @@ class UsbOrderConnector:
                         raise _Hold('no_active_packages')
                     reader, writer = await self._connect(self.access)
                     self._guard(self.access, packages)
+                    self._collection('watching')
                     self.state, self.reason = 'reading', None
                     await self.source.read_stream(_Reader(self, reader, self.access, packages),
                                                   _Writer(self, writer, self.access, packages), packages)

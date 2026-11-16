@@ -86,6 +86,26 @@ source_epoch, after}`. Frames are `hello`, `observation`, `heartbeat`; epoch cha
 journal gaps remain visible holds. EOF keeps next-check fallback. This is event-driven socket
 streaming, not ADB notification polling. Installed delivery remains unproven until root verifies it.
 
+### Restart and USB-loss reconciliation (ANYM-997)
+
+The listener persists the last watched package set across disconnects, so a missing host port never
+proves collection stopped. `android_usb_forwards` keeps each original receipt; restart marks an
+interrupted `sending/owned/closing` row `held` and records that phase in `recovery`. The host durably
+marks `collection=unconfirmed` before any nonempty watch bytes. Reconciliation runs only inside the
+next ordinary admitted acquisition of the same owner/device/source/epoch on that serial, from the
+existing supervision tick; no new session, admission, daemon or poll. It reads `forward --list` once:
+
+- an exact recorded forward absent, or an unported intent with no `deedkit-order-events` forward, is
+  `forward_absent`;
+- an exact forward left by a positively owned, never-cleaned receipt gets one durable-intent removal,
+  `forward_removed`; an attempted/unknown removal is never retried (`removal_unknown` stays held);
+- any other port to the same socket stays held and is never adopted, removed or reused.
+
+Known `confirmed/not_started` collection then closes the row. Unconfirmed collection stays `held`
+(`forward_closed`) until the hello answering a later owned watch, or an empty-watch hello, replaces
+the phone's whole set (`collection_superseded`). Other owners, epochs or devices leave the row held.
+Event identities and cursors still make replayed observations duplicates, one wake per order.
+
 Messaging's signed-hint/Standard Webhooks delivery and wake-relay already provide event identity,
 access fences and ambiguous-delivery rules. They cannot consume Android notifications directly;
 ANYM-844's Codex queue adapter is not the Android native app-server session. Reuse configured
