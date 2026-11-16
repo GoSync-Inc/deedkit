@@ -226,6 +226,12 @@ class Entry:
                     and current.process is self.process and current.request.session_id==self.request.session_id
                     and current.boundary==self.boundary):
                 self.handle=current  # actual same-task successful retention, not DB reconstruction
+            elif (self.origin.state=='succeeded' and current is None
+                    and self.agents.runs.get((self.owner,self.task)) is self.origin
+                    and self.origin.native_completed_turn
+                    and self.origin.native_completed_turn==self.origin.native_admitted_turn
+                    and self.agents.devices.locks[self.device].locked()):
+                pass  # its own completed turn still holds the device until Supervision.finished: same generation
             elif (self.origin.state!='running' or self.agents.runs.get((self.owner,self.task)) is not self.origin
                     or self.session.request_id!=self.task or not self.origin.native_admitted_turn
                     or self.origin.native_admitted_turn!=self.session.turn_id
