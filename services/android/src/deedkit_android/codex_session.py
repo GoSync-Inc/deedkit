@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import time
 
-from . import agent_diagnostics, engines
+from . import agent_diagnostics, app_skill_bundle, engines
 from .agent_bare import BareRun, PERSISTENT_MODEL, PERSISTENT_TIER
 from .agent_run import MAX_NOTES, MINUTE_S
 from .config import Refused
@@ -52,6 +52,7 @@ class CodexSession:
         self.settings_applied = None
         self.settings_snapshot, self.settings_source = None, None
         self.settings_pending = False
+        self.skill_roots = []  # native extra skill roots; None while a set is unconfirmed
         self.disconnected = False
         self.order_control_registered, self.control, self.control_admit = False, None, None
         self.boundary_receipt = None
@@ -745,7 +746,7 @@ class CodexSession:
         return requested
 
     async def turn(self, prompt, config, consume, *, request_id=None, on_started=None, admit=None, control=None, timing=None,
-                   before_submit=None):
+                   before_submit=None, skill_roots=()):
         async with self.lock:
             self.timing = timing or agent_diagnostics.NativeTiming()
             self.timing.phase('preflight')
@@ -754,6 +755,10 @@ class CodexSession:
             selected = await self.select(config)
             if admit:
                 admit()  # discovery/settings reads may await; recheck immediately before goal dispatch
+            if list(skill_roots) != self.skill_roots:  # 0.166 host catalog root; never turn input or thread config
+                self.skill_roots = None
+                await self.rpc('skills/extraRoots/set', {'extraRoots': list(skill_roots)})
+                self.skill_roots = list(skill_roots)
             self.finish_questions('expired', include_async=False)  # preserve async obligations; old-turn answers still fail binding
             self.events = asyncio.Queue()
             self.control, self.control_admit, self.native_items = control, admit, {}
@@ -842,6 +847,7 @@ class PersistentRun(BareRun):
         self.context_usage = agent_diagnostics.NativeContext()
         self.native_previous_turn = self.native_admitted_turn = self.native_completed_turn = self.native_boundary = None
         self.input_text, self.input_started, self.input_admit, self.input_refused = None, None, None, None
+        self.app_skills = None
 
     def skill_files(self):
         return {}
@@ -930,8 +936,10 @@ class PersistentRun(BareRun):
             if self.input_started:
                 self.input_started(turn_id)
 
+        roots, self.app_skills = await asyncio.to_thread(
+            app_skill_bundle.offer, self.request.apps, self.config.codex_home, session.dir)
         status = await session.turn(prompt, self.config, self.consume, request_id=self.id, on_started=started,
-            admit=admit, control=self.order_bridge, timing=self.timing, before_submit=commit)
+            admit=admit, control=self.order_bridge, timing=self.timing, before_submit=commit, skill_roots=roots)
         if status == 'completed' and self.native_admitted_turn == session.last_turn_id:
             self.native_completed_turn = self.native_admitted_turn
         return status
@@ -1056,6 +1064,8 @@ class PersistentRun(BareRun):
         result['timings']['model_ms'] = None  # native/command wall-time subtraction cannot measure model work
         result['native_selection'] = dict(self.session.selection) if self.session else {}
         result['skills_updated'] = []
+        if self.app_skills:
+            result['app_skills'] = self.app_skills
         if self.session and self.session.process:
             result['native_session'] = {'thread_id': self.session.thread_id, 'pid': self.session.process.pid,
                                         'turn_id': self.session.turn_id or self.session.last_turn_id, 'persistent': True,
