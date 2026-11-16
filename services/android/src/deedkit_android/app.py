@@ -277,14 +277,14 @@ def create_app(config_path, agent_url=None):
                 if current.id != owner or device not in current.devices or 'android:control' not in current.permissions:
                     raise Refused('forbidden', 403)
             if devices.locks[device].locked() and args["action"] != "renew":
-                raise Refused("device_busy")
+                raise store.refusal("device_busy", owner, device)  # names the holder (ANYM-1001)
             if args['action'] == 'release':
                 await request.app.state.agents.usb.release(owner, device, args['session_id'])
                 current = configuration.authenticate(request.headers.get('authorization', ''))
                 if current.id != owner or device not in current.devices or 'android:control' not in current.permissions:
                     raise Refused('forbidden', 403)
                 if devices.locks[device].locked():
-                    raise Refused('device_busy')
+                    raise store.refusal('device_busy', owner, device)
             result = store.reserve(owner, device, args["action"], args["session_id"], args["seconds"])
             if args['action'] == 'release':
                 await request.app.state.agents.supervision.released(owner, device, args['session_id'])

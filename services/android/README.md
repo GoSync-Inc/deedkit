@@ -496,6 +496,12 @@ engine's provider (Anthropic for Claude Code, OpenAI for Codex), which is the ow
    it automatically. The default inactivity interval is 900 seconds. Explicit
    `seconds` remains supported from 30 to 900.
 
+A refused session call (`device_reserved`, `device_busy`, `reservation_expired_or_forbidden`)
+names its `holder` and a `next_action` (ANYM-1001): `free` (no live lease: acquire a new
+session), `own` (another session of the same backend key, with the lease's `expires_at`) or
+`other` (another principal; no end time). No session id or principal name is returned. A lapsed
+lease is free at once; nothing force-frees a live one.
+
 A duplicate request UUID with the same device, arguments and command timeout
 returns its existing receipt. Different arguments produce `request_id_conflict`.
 Completed receipts remain readable after reservation expiry. Only one command or
