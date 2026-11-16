@@ -17,6 +17,19 @@ def isolated_processing_lock(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def preserve_process_umask():
+    # An in-process CLI (production.main) hardens the process umask on purpose and keeps it for the test; afterwards
+    # the mask this test started with returns, so files later tests create, through sudo too, keep their modes
+    # whichever shard places them after it (PR #1009 CI).
+    incoming = os.umask(0o077)
+    os.umask(incoming)
+    try:
+        yield
+    finally:
+        os.umask(incoming)
+
+
+@pytest.fixture(autouse=True)
 def no_tiden_retry_delay(monkeypatch):
     # The Tiden scripts pause before the one retry of a read; tests do not wait.
     for name in ('scripts.tiden_drift','scripts.tiden_sync','scripts.tiden_health'):
