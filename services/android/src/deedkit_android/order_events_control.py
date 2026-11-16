@@ -439,6 +439,17 @@ class OrderControl:
             raise OrderRefused('settlement_question_not_found' if not rows else 'settlement_correlation_ambiguous')
         return rows[0]
 
+    def stranded_answer_questions(self, *, limit=64):
+        """Boot candidates only: unsettled question wakes still pending/accepted on an active task-only notice.
+        Metadata read; every ownership, rights, source and receipt check stays in settle_answered_question."""
+        return [dict(r) for r in self.events.db.execute("""SELECT w.wake_id,w.owner,w.device_id,w.principal,
+            w.original_request_id,w.native_thread_id,w.native_turn_id,w.payload FROM android_order_wakes w
+            JOIN android_order_obligations o ON o.owner=w.owner AND o.order_id=w.order_id
+            LEFT JOIN android_order_answer_settlements s ON s.wake_id=w.wake_id
+            WHERE w.kind='question' AND w.target='grok' AND w.state IN ('pending','accepted') AND s.wake_id IS NULL
+            AND o.task_only=1 AND o.provider_order_id IS NULL AND o.lifecycle='active' AND o.responsible='codex'
+            ORDER BY w.rowid LIMIT ?""", (limit,))]
+
     def _close_settled_notice(self, owner, order_id):
         """Caller owns the transaction. Close an answered task notice only when no duty of its own remains:
         a settled answer exists, every question is answered, every status read, no pending/uncertain delivery."""
