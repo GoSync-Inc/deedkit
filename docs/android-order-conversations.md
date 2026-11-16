@@ -63,8 +63,17 @@ notice or bind from the same exact task reopens that record. RPC questions (no p
 contents ACK), bound orders, pending/unknown/refused answers, sending/unknown deliveries,
 foreign principals/devices, revoked rights and another source epoch stay held. Neither a
 read receipt, expiry, idleness nor a finished run settles a question. A caller cannot
-supply this receipt. Root wiring in agent_run (accepted reply and historical
-reconciliation) is a separate seam.
+supply this receipt.
+
+The host calls it in three places. An async `reply` that native steer accepts returns
+`order_settlement`. A resumed answer records an `order_settlement` run event after the
+turn/start receipt. An authorized `read_receipt` of an async question reconciles from
+the durable `.dialogue.json` row. That journal path binds owner/device, and the row binds
+request/thread/turn/item. The obligation's checks bind source and epoch. Fetch and
+status stay read-only. A failed settlement never changes the accepted input receipt,
+resends or mints an ID: it reports `held` with a reason, and the same persisted receipt
+reconciles later. A missing, duplicated, mismatched or non-accepted row stays held. An
+already settled question still records a later read.
 
 The focused conversation tests use real OrderControl, OrderFeed, OrderEvents and
 Supervision with synthetic UI observations and identifiers. They verify context,

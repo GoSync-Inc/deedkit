@@ -90,8 +90,8 @@ def test_exact_accepted_async_answer_settles_the_stranded_task_notice_without_ne
     with pytest.raises(OrderRefused, match='settlement_identity_conflict'):
         n.control.settle_answered_question(n.owner, 'owner', 'phone', wake_id, n.answer(message_id='another'))
     assert journal(n.events, wake_id) == (wake, row)
-    with pytest.raises(OrderRefused, match='receipt_not_current'):
-        n.control.feed.ack_read(n.owner, 'owner', 'phone', wake_id)
+    assert n.control.feed.ack_read(n.owner, 'owner', 'phone', wake_id)['grok_state'] == 'read'  # late read, still done
+    assert journal(n.events, wake_id) == (wake, row)
     assert n.control.feed.read_source(n.owner, 'owner', 'phone', 1)['events'] == []
     n.events.db.close()
     events, control = n.open_store()  # restart keeps the settlement and its idempotent readback

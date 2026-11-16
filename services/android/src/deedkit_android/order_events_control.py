@@ -426,6 +426,19 @@ class OrderControl:
             self._close_settled_notice(owner, row['order_id'])
             return self._settled(self.events._order(owner, row['order_id']), self.events.wake(wake['wake_id']))
 
+    def answered_question_wake(self, owner, device_id, receipt):
+        """The one async question wake a persisted answer receipt correlates to; none or several stay held."""
+        ids = [receipt.get(k) for k in ('original_request_id', 'native_thread_id', 'native_turn_id', 'item_id')]
+        if not all(type(v) is str for v in ids):
+            raise OrderRefused('settlement_identity_mismatch')
+        rows = [r['wake_id'] for r in self.events.db.execute("""SELECT wake_id,payload FROM android_order_wakes
+            WHERE owner=? AND device_id=? AND kind='question' AND target='grok' AND original_request_id=?
+            AND native_thread_id=? AND native_turn_id=?""", (owner, device_id, *ids[:3]))
+            if json.loads(r['payload']).get('item_id') == ids[3]]
+        if len(rows) != 1:
+            raise OrderRefused('settlement_question_not_found' if not rows else 'settlement_correlation_ambiguous')
+        return rows[0]
+
     def _close_settled_notice(self, owner, order_id):
         """Caller owns the transaction. Close an answered task notice only when no duty of its own remains:
         a settled answer exists, every question is answered, every status read, no pending/uncertain delivery."""
