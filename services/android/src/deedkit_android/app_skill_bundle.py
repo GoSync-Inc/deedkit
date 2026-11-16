@@ -10,14 +10,14 @@ import json
 import os
 from pathlib import Path
 
-VERSION = 1
+VERSION = 2  # v1 (PR 1007) stays shipped byte-identical beside it for rollback and lineage
 ROOT = Path(__file__).parent / 'app_skills' / f'v{VERSION}'
-SOURCE = {'pull_request': 1007, 'commit': '96e2be8429cbb4cef50f4d8eee5f75b2741f2cce'}
+SOURCE = {'pull_request': 1019, 'commit': '750e3988600455a099bb26e11d8bea069c6cca7a'}
 SKILLS = {  # name: (package, sha256, git blob of skills/<name>/SKILL.md at SOURCE)
     'android-gojek-navigation': ('com.gojek.app',
         '542a0cb1af0533ee5988acf62bf6b88cd1163974ba4f69a9becf89f9e41ef894', '14a5fe87f2f3e998e26003eee178eb7d20a69e5e'),
     'android-grab-navigation': ('com.grabtaxi.passenger',
-        '8ef1224be63cfe2aa190c652f67ab04254399c0467708e7dc7d7c54ffea7c2f7', 'f5013385e14c5defd4596d3ac8291770ba8028c7'),
+        'a92a67064b54e79ebef5c710bcea4d6578ac4534f9a92840664c89fccfe42078', 'b4e114a0ebca3c06ab41a406fe76545336186722'),
     'android-halodoc-navigation': ('com.linkdokter.halodoc.android',
         '5847c6abbfb360faa296c667805bd0693049d68f1bfe9a15ef69dc74a6b9a408', '0b8ff9aebb0f6fa06149d08ebb6a480686af06a7'),
     'android-tokopedia-navigation': ('com.tokopedia.tkpd',

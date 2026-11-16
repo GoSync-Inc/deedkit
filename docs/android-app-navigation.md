@@ -10,11 +10,14 @@ nothing injects them into the prompt and they impose no per-step rule.
 
 `BareRun` (`agent: {guarded: false, persistent: false}`) runs `codex exec` with the configured
 `codex_home`, links `<codex_home>/skills` into the run's `.agents/skills` and adds it with
-`--add-dir`; Codex discovers skills there natively. The persistent app-server mode disables
-skill discovery (`services/android/README.md`, Local agent), so these skills do not reach it.
+`--add-dir`; Codex discovers skills there natively. The persistent app-server mode is offered an
+exact versioned copy of these skills as a read-only extra root
+([android-app-skill-delivery.md](android-app-skill-delivery.md)); native 0.166 also keeps its
+ordinary host discovery there.
 
-The repository has no install step for this directory: neither the Android wheel nor
-`scripts/production.py` ships it. `services/android/tests/test_app_navigation_skills.py` checks
+The repository has no install step for this directory into `<codex_home>/skills`: the Android
+wheel carries only the versioned copy for persistent mode, and `scripts/production.py` does not
+ship it. `services/android/tests/test_app_navigation_skills.py` checks
 the Codex frontmatter and that a copy under `<codex_home>/skills/` is discovered unchanged.
 
 ## Install (root, on the Android host)
@@ -38,6 +41,11 @@ Approved audit reports, 2026-11-15; versions from static metadata:
   (@thread:thr_rvtmd7svmc). GoFood-versus-GoMart and the Pay wallet shortcut are provisional,
   caller-described hints.
 - Grab 5.430.0: signed-out audit stopped at the Food login gate (@thread:thr_tv5eek76wr).
+- GrabMart, 2026-11-16 (app version not recorded): retained screens of three signed-in owner
+  runs, read privately on the phone host (DK-48, @thread:thr_5mz4jwqkh6). They show the Home
+  search field and Mart entry, the store-only "Search this store" and merchant results; a
+  cross-store product search was not observed. The skill also quotes the owner's preference to
+  look for one first. Merchant names and frames stay on the host.
 - Halodoc 31.000: doctor directory and Health Store audit (@thread:thr_69aesa8kiz).
 - Tokopedia 45.0.7: search, product, filter and Transaction audit (@thread:thr_dnb4442wqb).
 

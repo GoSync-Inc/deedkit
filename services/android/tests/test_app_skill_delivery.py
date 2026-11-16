@@ -70,7 +70,7 @@ def test_relevant_goal_offers_exact_bundle_through_native_extra_roots_without_ch
     for turn in (r['message']['params'] for r in seen if r['message'].get('method') == 'turn/start'):
         assert [item['type'] for item in turn['input']] == ['text']
         assert 'GoFood' not in turn['input'][0]['text'] and 'SKILL' not in turn['input'][0]['text']
-    receipt = {'version': 1, 'source': bundle.SOURCE, 'skills': NAMES, 'digest': bundle.DIGEST,
+    receipt = {'version': bundle.VERSION, 'source': bundle.SOURCE, 'skills': NAMES, 'digest': bundle.DIGEST,
                'apps': [GOJEK], 'status': 'offered'}
     assert first['app_skills'] == second['app_skills'] == receipt
     assert 'app_skills' not in third and third['summary'] == 'Remembered turn 3'
@@ -117,7 +117,7 @@ def test_copied_read_only_bundle_is_offered_and_codex_home_is_never_written(tmp_
 def test_unsafe_bundle_or_same_name_host_skill_refuses_without_touching_files(tmp_path):
     root = copied(tmp_path)
     roots, receipt = offer(tmp_path, tmp_path / 'missing')
-    assert roots == [] and receipt == {'version': 1, 'source': bundle.SOURCE, 'skills': NAMES, 'digest': bundle.DIGEST,
+    assert roots == [] and receipt == {'version': bundle.VERSION, 'source': bundle.SOURCE, 'skills': NAMES, 'digest': bundle.DIGEST,
                                        'apps': [GOJEK], 'status': 'refused', 'reason': 'bundle_unavailable'}
 
     skill = root / NAMES[0] / 'SKILL.md'
