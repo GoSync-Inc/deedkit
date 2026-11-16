@@ -707,6 +707,7 @@ class Agents:
         self.orders = None
         self.recover()
         self.order_control(create=True)
+        self.reconcile_answers()
         from .order_supervision import Supervision
         self.supervision = Supervision(self)
         from .order_usb_host import UsbLifecycle
@@ -856,6 +857,26 @@ class Agents:
             except Exception:
                 pass  # a lost hold report is reconciled later from the same persisted receipt
         return accepted
+
+    def reconcile_answers(self):
+        """Boot only, after recover() and before any session, supervision or route: settle each stranded async
+        task-notice question whose exact answer the persisted dialogue already accepted. The host acts as the wake's
+        own recorded principal, re-checked against current config exactly as the journal's claim/export do; no
+        caller, native object, dispatch, replay or new ID. Anything uncertain stays held for a later reconciliation."""
+        try:
+            stranded = self.orders.stranded_answer_questions() if self.orders is not None else []
+        except Exception:
+            return
+        for wake in stranded:
+            try:
+                ids = (wake['original_request_id'], wake['native_thread_id'], wake['native_turn_id'],
+                       json.loads(wake['payload'] or '{}').get('item_id'))
+                result = self.answer_settlement(wake['owner'], wake['device_id'], ids, lambda w=wake: w['principal'],
+                                                wake['wake_id'])
+                if result['status'] == 'settled' and self.db.row(wake['owner'], ids[0]) is not None:
+                    self.db.add_event(wake['owner'], ids[0], 'order_settlement', result | {'reconciled': 'restart'})
+            except Exception:
+                continue  # the same persisted receipt reconciles at the next boot or authorized read
 
     def recover(self):
         """After a restart: kill the process group of each run directory left behind, by its private marker, mark the

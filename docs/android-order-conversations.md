@@ -65,7 +65,14 @@ foreign principals/devices, revoked rights and another source epoch stay held. N
 read receipt, expiry, idleness nor a finished run settles a question. A caller cannot
 supply this receipt.
 
-The host calls it in three places. An async `reply` that native steer accepts returns
+The host calls it in four places. Service boot, after process recovery and before any
+native session, supervision or route, reconciles each still pending/accepted question
+of an active task-only notice that has no settlement yet (at most 64 per boot). The host
+acts as the wake's own recorded principal, re-checked against current config as the
+journal's existing claim and export do; no caller, forged header, native object,
+dispatch, replay or new ID. Only a settled outcome adds one `order_settlement` run event
+with `reconciled: restart`; a hold changes nothing and the next boot or an authorized read
+retries the same receipt. An async `reply` that native steer accepts returns
 `order_settlement`. A resumed answer records an `order_settlement` run event after the
 turn/start receipt. An authorized `read_receipt` of an async question reconciles from
 the durable `.dialogue.json` row. That journal path binds owner/device, and the row binds
