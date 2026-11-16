@@ -126,8 +126,8 @@ class AgentCall(Strict):
                 raise ValueError('wake_fields')
         elif self.action == 'start':
             missing = {'device_id', 'session_id', 'goal', 'owner_instruction'} - given
-            if missing or self.after or self.wait_s or given & (DIALOGUE_FIELDS | WAKE_FIELDS):
-                raise ValueError('start_fields')
+            if missing or self.after or self.wait_s or given & (DIALOGUE_FIELDS | WAKE_FIELDS):  # omitted ones by name (ANYM-984)
+                raise ValidationError.from_exception_data('AgentCall', [{'type': 'missing', 'loc': (name,), 'input': None} for name in sorted(missing)]) if missing else ValueError('start_fields')
         elif self.action in {'reply', 'steer'}:
             required = {'device_id', 'session_id', 'native_thread_id', 'native_turn_id'} | (
                 ({'native_request_id', 'item_id', 'answers'} if 'answers' in given else {'item_id', 'message_id', 'text'})
