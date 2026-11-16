@@ -924,3 +924,120 @@ def test_any_sequence_of_failed_attempts_never_moves_or_strands_the_final_tag(fa
             if fault == "none":
                 break
     assert final is not None
+
+
+class LaggingRegistry(FakeRegistry):
+    """A registry whose staging tags read as "manifest unknown" for the first `hidden` reads after the push."""
+
+    def __init__(self, hidden, rewrite=False):
+        super().__init__(rewrite)
+        self.hidden = hidden
+
+    def manifest(self, reference):
+        if "-attempt-" in reference and reference in self.tags and self.hidden:
+            self.hidden -= 1
+            self.reads.append(reference)
+            return None
+        return super().manifest(reference)
+
+
+def clock(monkeypatch, *now):
+    """Recorded waits and a monotonic clock that answers `now` in turn, then stays at its last value."""
+    delays, now = [], list(now or [0])
+    monkeypatch.setattr(pi.time, "sleep", delays.append)
+    monkeypatch.setattr(pi.time, "monotonic", lambda: now.pop(0) if len(now) > 1 else now[0])
+    return delays
+
+
+STAGED_REF = f"ghcr.io/gosync-inc/deedkit-calls:{STAGING}"
+
+
+# spec: ANYM-602
+def test_a_staging_tag_still_absent_after_its_push_is_refused_as_absent_without_a_second_push(tmp_path, monkeypatch):
+    # Main runs 43827012338 and 43836203412 refused with "pushed ... manifest does not carry the tested image config"
+    # for an absent staging tag and for another config alike; an absent tag now says so, after bounded reads only.
+    delays = clock(monkeypatch)
+    registry = LaggingRegistry(hidden=99)
+    exported(tmp_path, "calls")
+    with pytest.raises(pi.Refused, match=rf"pushed calls staging tag {STAGING} is absent from the registry after the push "
+                                         r"succeeded \(4 reads within 45 s\); not pushed again, nothing promoted") as refused:
+        pi.publish_one(registry, "calls", SHA, tmp_path, never_attested, ATTEMPT)
+    assert "config" not in str(refused.value)
+    assert registry.pushes == [STAGED_REF] and registry.reads.count(STAGED_REF) == 4 and delays == [5, 10, 15]
+    assert not registry.puts and f"ghcr.io/gosync-inc/deedkit-calls:{SHA}" not in registry.tags
+
+
+# spec: ANYM-602
+def test_a_staging_tag_that_becomes_visible_publishes_its_exact_digest(tmp_path, monkeypatch):
+    delays = clock(monkeypatch)
+    registry, outputs = LaggingRegistry(hidden=2), tmp_path / "outputs"
+    tested = exported(tmp_path, "calls")
+    result = pi.publish(registry, SHA, tmp_path, str(outputs), never_attested, ("calls",), ATTEMPT)[0]
+    staged = registry.tagged("calls", STAGING)
+    assert result == {"target": "calls", "action": "push", "digest": staged[0], "attest": True}
+    assert staged[1]["config"]["digest"] == tested and registry.pushes == [STAGED_REF] and delays == [5, 10]
+    assert outputs.read_text() == f"digest_calls={staged[0]}\nattest_calls=true\n"
+
+
+# spec: ANYM-602
+@pytest.mark.parametrize("hidden, waits", [(0, []), (1, [5])], ids=["first-read", "after-a-lag"])
+def test_a_staging_tag_with_another_config_is_refused_at_once_naming_both_configs(tmp_path, monkeypatch, hidden, waits):
+    delays = clock(monkeypatch)
+    registry = LaggingRegistry(hidden=hidden, rewrite=True)
+    tested = exported(tmp_path, "runtime")
+    with pytest.raises(pi.Refused, match="tested image config") as refused:
+        pi.publish_one(registry, "runtime", SHA, tmp_path, never_attested, ATTEMPT)
+    staged_ref = f"ghcr.io/gosync-inc/deedkit-runtime:{STAGING}"
+    staged = registry.tagged("runtime", STAGING)
+    assert str(refused.value) == (f"pushed runtime manifest {staged[0]} carries config {staged[1]['config']['digest']},"
+                                  f" not the tested image config {tested}")
+    assert registry.reads.count(staged_ref) == hidden + 2 and delays == waits and len(registry.pushes) == 1  # +1: tagged()
+
+
+# spec: ANYM-602
+def test_the_staging_read_back_stops_at_its_deadline_and_prints_no_registry_text(tmp_path, monkeypatch):
+    # Each read may itself wait out transient failures; the read-back never extends past 45 s after the push.
+    delays = clock(monkeypatch, 0, 38)
+    registry = LaggingRegistry(hidden=99)
+    exported(tmp_path, "calls")
+    with pytest.raises(pi.Refused, match=r"\(2 reads within 45 s\)"):
+        pi.publish_one(registry, "calls", SHA, tmp_path, never_attested, ATTEMPT)
+    assert delays == [5] and registry.reads.count(STAGED_REF) == 2
+    assert pi.safe_digest("sha256:" + "a" * 64) == "sha256:" + "a" * 64
+    assert pi.safe_digest("sha256:<script>") == pi.safe_digest(None) == "a malformed digest"
+    with pytest.raises(pi.Refused, match="no exact staging tag"):
+        pi.staged_after_push(registry, "calls", f"ghcr.io/gosync-inc/deedkit-calls:{SHA}", "sha256:" + "a" * 64)
+
+
+# spec: ANYM-602
+def test_a_push_without_an_acknowledgement_reads_nothing_back(tmp_path, monkeypatch):
+    delays = clock(monkeypatch)
+    registry = LaggingRegistry(hidden=99)
+    registry.lose_push = True
+    exported(tmp_path, "calls")
+    with pytest.raises(pi.Refused, match="skopeo copy failed"):
+        pi.publish_one(registry, "calls", SHA, tmp_path, never_attested, ATTEMPT)
+    assert registry.pushes == [STAGED_REF] and STAGED_REF not in registry.reads and delays == []
+
+
+# spec: ANYM-602
+@pytest.mark.parametrize("staged, message, backoff", [
+    ([(1, "", "Error: unauthorized: authentication required")], "cannot read .*unauthorized", []),
+    ([(1, "", TRANSIENT_FAILURES[8])] * pi.ATTEMPTS, "cannot read .*Service Unavailable", [pi.BACKOFF, 2 * pi.BACKOFF, 4 * pi.BACKOFF]),
+], ids=["read-auth", "transient"])
+def test_an_unreadable_staging_tag_is_refused_by_the_read_and_never_waited_for_as_absent(tmp_path, monkeypatch, staged, message, backoff):
+    # Only skopeo's "manifest unknown" is absence; an auth or a persisting network failure refuses as every read does.
+    exported(tmp_path, "calls")
+    calls, outcomes = [], list(staged)
+    def run(argv, check=True):
+        calls.append(argv[:2] + argv[-1:])
+        if argv[1] == "copy":
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[-1].endswith(":" + SHA):
+            return subprocess.CompletedProcess(argv, 1, "", "manifest unknown: manifest unknown")
+        return subprocess.CompletedProcess(argv, *outcomes.pop(0))
+    monkeypatch.setattr(pi, "run", run)
+    delays = clock(monkeypatch)
+    with pytest.raises(pi.Refused, match=message):
+        pi.publish_one(pi.Registry("ghcr.io/gosync-inc"), "calls", SHA, tmp_path, never_attested, ATTEMPT)
+    assert [argv[1] for argv in calls].count("copy") == 1 and not outcomes and delays == backoff
