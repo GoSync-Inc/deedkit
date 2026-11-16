@@ -21,7 +21,7 @@ STORY = '22222222-2222-4222-8222-000000000002'
 
 
 @pytest.fixture
-def targeted(historical, monkeypatch):
+def targeted(historical, monkeypatch):  # noqa: F811 - the imported fixture, requested by name
     r = historical
     # Order and Python str(dict) bytes matter: collect/flatten has always kept them in the digest.
     r.raw = {'id': STORY, 'productId': PRODUCT, 'branchId': MAIN, 'seqNum': int(REF[5:]),
