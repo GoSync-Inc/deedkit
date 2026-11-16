@@ -293,7 +293,12 @@ front for one live ordinary Codex conversation per authenticated owner and phone
 `codex app-server` process and thread remain alive between goals; a subsequent `start` is a
 new turn in that same conversation, including questions and follow-ups about prior work.
 There is no automatic reflection, skill-writing instruction, task recipe, or result schema.
-Bundled and host skill discovery are disabled. The only task prompt is the phone location,
+The process starts with `skills.bundled.enabled=false` and `features.skip_host_skill_discovery=true`.
+These are requested settings, not proof of an empty skill catalog: native 0.166 app-server ignores
+the skip flag. Its ordinary host discovery still scans `$CODEX_HOME/skills`, the session directory's
+`.agents/skills` (the directory is also the process `HOME`) and `/etc/codex/skills`. A turn whose
+`apps` match the versioned read-only navigation bundle also receives that bundle as a native extra
+root; see [Android app skill delivery](../../docs/android-app-skill-delivery.md). The only task prompt is the phone location,
 owner-agent role and caller goal/context. Existing dedicated native owner preferences remain.
 The nonsecret caller input preserves `goal`, `owner_instruction` verbatim (including its
 restrictions), typed `params`, `apps` and requested `outputs` in a small JSON envelope. These
@@ -419,7 +424,9 @@ For compatibility, `persistent` defaults to false. In that mode the prior isolat
 `codex exec` path remains available, including native skill discovery; `guarded: true` keeps
 the older guarded phone-tool engine. Change modes only when no task is running, through the
 normal green-main release route. Existing app skill files need not be deleted for persistent
-mode: discovery is disabled, and no skill directory is mounted into its workspace.
+mode, and no skill directory is mounted into its workspace. Files left in `$CODEX_HOME/skills`
+remain visible to native 0.166 host discovery; keeping one out of the catalog means moving it out
+of the discovered roots.
 
 ### Guarded compatibility path
 
