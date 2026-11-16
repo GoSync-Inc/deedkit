@@ -113,29 +113,35 @@ exactly once. After an interrupt and a restart the call is not answered again, n
 it, and the original ID keeps its type. A mutant that treats the held call as a fence fails all
 four tests.
 
-**Prerequisite (root allocation; none of this is authorized or configured here).** An exact
-original-call window needs all of the following before the refusal can be removed:
+**Invariant requirements (none is met, authorized or configured here).** The refusal can only
+be removed when one window gives all of the following:
 
-1. Enrolled host scope: native app-server starts inside a dedicated delegated cgroup v2 leaf,
-   created before spawn. Its sandbox must deny writes to `cgroup.procs`, so descendants cannot
-   migrate out.
-2. Atomic barrier: set `cgroup.freeze=1` and wait until `cgroup.events` shows `frozen 1`.
-   This also freezes app-server while it holds the pending call, without cancelling it. The
-   barrier is released only after a trusted `sensitive_field_gone` result and one original
-   response. Unknown/cancel/restart keeps the freeze, or uses `cgroup.kill` without a reply, plus
-   tombstones.
-3. Device containment: the device-side observer set must be proven equal to the host-owned
-   baseline after the freeze. That set covers shell-uid processes, in-flight adb services,
-   accessibility/notification listeners and media projection. The proof runs on the existing
-   host adb server, which stays outside the frozen scope because it carries the `setText`
-   channel. No current primitive provides this proof atomically. This is the fundamental gap.
+1. Enrolled host scope: every native process and descendant, including setsid/double-forked ones,
+   stays in one scope that was set up before spawn and that it cannot leave.
+2. Atomic barrier: the host stops execution throughout that scope and gets an acknowledgement,
+   without cancelling app-server's pending call. The barrier is released only after a trusted
+   `sensitive_field_gone` result and one original response. Unknown/cancel/restart keeps the
+   barrier, or ends the scope without a reply, and keeps the tombstones.
+3. Device containment: after the barrier, the device-side observer set must be proven equal to
+   the host-owned baseline. That set covers shell-uid processes, in-flight adb services,
+   accessibility/notification listeners and media projection. The proof runs on the existing host
+   adb server, which stays outside the barrier because it carries the `setText` channel. No
+   current primitive provides this proof atomically. This is the fundamental gap.
 4. Service fence: other service capture paths (`BareRun.final` screenshot/XML, owner reads) stay
    refused while the window is held.
+
+**No OS mechanism for items 1–2 exists on the current deployment.** The USB/native executor runs
+on macOS (mini, launchd). Linux cgroup v2 is hypothetical research only: a delegated leaf created
+before spawn, `cgroup.freeze` with the `frozen 1` acknowledgement in `cgroup.events`, and
+`cgroup.kill`. It is unavailable on mini. It is not a recipe root can provision there, and
+nothing here proposes a Linux migration or a new executor. Even if items 1–2 were met, item 3
+would still block.
 
 Acceptance is root-owned, on an installed no-model sentinel. The sentinel attempts setsid,
 double-fork, inherited-descriptor and adb-shell `nohup` bypasses during acquisition, and all of
 them must be contained. A synthetic focused-field canary then shows that only the original call
-continues. Undo: thaw only after reconciliation, keep tombstones and keep the refusal.
+continues. Undo: release the barrier only after reconciliation, keep tombstones and keep the
+refusal.
 
 ## Storage, platform evidence and remaining acceptance
 
