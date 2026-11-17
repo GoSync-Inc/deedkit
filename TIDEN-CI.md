@@ -336,10 +336,16 @@ without replacement objects or inherited `GIT_*` settings. A changed queue or
 pull request run, a rerun or any mismatch fails the push run. The record also
 names the pull request, its head branch, the queue run attempt and the tree;
 `tiden_ci.py publish` and `release` accept it only when the tree GitHub records
-for the tested commit (one anonymous read of the public API), the record's tree
+for the tested commit (one read of the public API), the record's tree
 and their own checkout's tree of this commit are one tree. The Tiden run then names this commit, with
 `tested_sha` the tested merge commit and `tested_in` the pull request run
-attempt. `production.py verify` follows the same chain to the pull request run
+attempt. The publication and main-release validation steps use their existing
+`contents: read` job tokens for this fixed `api.github.com` request, through
+`TIDEN_GITHUB_READ_TOKEN`; other steps do not receive that variable.
+Without it, the read remains anonymous. Authenticated
+reads refuse redirects and never retry anonymously; credentials and response
+text never enter diagnostics. A refused read still prevents publication.
+`production.py verify` follows the same chain to the pull request run
 when the push run skipped `checks / verify` after such a queue run; within one
 deploy it re-reads the queue run, the pull request run and the push run.
 `tiden_ci.py publish` and `release` accept the record only when it names their

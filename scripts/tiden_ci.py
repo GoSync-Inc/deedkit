@@ -173,17 +173,27 @@ def tree_read(tree: str, failure: str = "") -> TreeRead:
     return result
 
 
+class NoCredentialRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, url):
+        return None
+
+
 def commit_tree(repository: str, sha: str) -> str:
-    """The git tree hash GitHub records for commit `sha` of `repository`, read once anonymously from the public API
-    (the tested merge commit of a pull request is in no local history); empty when it cannot be read, its `failure`
-    then one of invalid_request, http_<status>, timeout, transport, malformed_response, commit_mismatch or
-    malformed_tree, never response text."""
+    """Read one exact public GitHub tree, using the publisher's existing read credential when configured.
+    No credential redirect or fallback retry; failures contain only a fixed code, never response text."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) or not re.fullmatch(r"[a-f0-9]{40}", sha):
         return tree_read("", "invalid_request")
+    token = os.environ.get("TIDEN_GITHUB_READ_TOKEN", "")
+    if token and not re.fullmatch(r"[!-~]{1,4096}", token):
+        return tree_read("", "invalid_credential")
     request = urllib.request.Request(f"https://api.github.com/repos/{repository}/git/commits/{sha}",
                                      headers={"Accept": "application/vnd.github+json", "User-Agent": "deedkit-tiden-ci"})
+    read = urllib.request.urlopen
+    if token:
+        request.add_header("Authorization", "Bearer " + token)
+        read = urllib.request.build_opener(NoCredentialRedirect()).open
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with read(request, timeout=30) as response:
             body = response.read(1_000_000)
     except urllib.error.HTTPError as exc:
         return tree_read("", f"http_{exc.code}" if isinstance(exc.code, int) and 100 <= exc.code <= 599 else "transport")
