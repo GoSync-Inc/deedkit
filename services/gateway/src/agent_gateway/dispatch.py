@@ -284,7 +284,7 @@ class Dispatch:
         action = tool.get("required_action")
         return not action or action in self.actions(snapshot, agent, caps, account)
 
-    async def backend_capabilities(self, snapshot, agent, module, timeout=2):
+    async def backend_capabilities(self, snapshot, agent, module, timeout=2, operation="capabilities"):
         target = snapshot["deployment"]["backends"].get(module)
         if target != self.clients.deployment["backends"].get(module):
             raise Denied("backend_configuration_requires_restart", 503)
@@ -295,7 +295,8 @@ class Dispatch:
             return dict(agents.ADMISSION_CAPABILITIES)
         try:
             async with asyncio.timeout(timeout):
-                result = await self.full_capabilities(module, credential)
+                result = (await self.full_capabilities(module, credential) if operation == 'capabilities'
+                          else await self.clients.call(module, operation, credential, {}))
         except TimeoutError:
             error = Denied("backend_unavailable", 503)
             error.detail = {"error": "backend_unavailable", "reason": "capabilities_timeout"}
@@ -707,6 +708,9 @@ class Dispatch:
         """The backend's capabilities for one call; an unreachable backend says the capabilities phase failed."""
         try:
             # Discovery keeps a short bound; one call may wait for a busy pool.
+            if tool['module'] == 'android' and tool['operation'] == 'task':
+                return await self.backend_capabilities(snapshot, agent, 'android', timeout=6,
+                                                       operation='task_capabilities')
             return await self.backend_capabilities(snapshot, agent, tool["module"], timeout=6)
         except Denied as error:
             if error.code == "backend_unavailable":
@@ -716,6 +720,9 @@ class Dispatch:
 
     def call_admission(self, key, name, snapshot, agent, tool, args, caps):
         """The call's allowed actions; a refusal for an operation the module build lacks gets its detailed body."""
+        if tool['module'] == 'android' and tool['operation'] == 'task' and not (
+                caps.get('bb_conversation') or {}).get('enabled'):
+            raise Denied('android_conversation_unavailable', 503)
         try:
             return self.argument_admission(tool, args, snapshot, agent, caps)
         except Denied as denied:
@@ -799,6 +806,9 @@ class Dispatch:
             if module == "android" and tool["operation"] in {"execute", "run_flow", "courier_chat", "courier_call_sheet"}:
                 error.detail.update(request_id=values["request_id"],
                                     next_action="read_android_get_operation_with_original_request_id")
+            if module == 'android' and tool['operation'] == 'task':
+                error.detail.update(request_id=values.get('request_id'),
+                                    next_action='read_android_task_receipt_without_resending')
             if module == "android" and tool["operation"] == "agent":  # ANYM-972: read the run back, never start anew
                 if values.get('action') in ('read_receipt', 'handoff'):
                     error.detail.update(wake_id=values['wake_id'], wake_digest=values['wake_digest'],
@@ -858,6 +868,7 @@ class Dispatch:
         module = tool["module"]
         credential = self.call_credential(snapshot, agent, module)
         read_only = tool.get("annotations", {}).get("readOnlyHint", False)
+        read_only = read_only or (module == 'android' and tool['operation'] == 'task' and args.get('action') != 'message')
         caps = await self.call_capabilities(snapshot, agent, tool, read_only)
         allowed_actions = self.call_admission(key, name, snapshot, agent, tool, args, caps)
         operation, args = self.backend_call(tool, args, caps)

@@ -18,6 +18,7 @@
   {"name": "android_observe", "read_only": true},
   {"name": "android_run_flow", "read_only": false},
   {"name": "android_session", "read_only": false},
+  {"name": "android_task", "read_only": false},
   {"name": "android_upload", "read_only": false},
   {"name": "calendar_agenda", "read_only": true},
   {"name": "calendar_apply", "read_only": false},

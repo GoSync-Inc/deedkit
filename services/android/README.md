@@ -8,13 +8,19 @@ existing server and exposes the `android` module through `/mcp/modules/android`.
 Grok → DeedKit MCP gateway → private HTTP → USB host → ADB → Android apps
 ```
 
-The client agent chooses each action. A persistent uiautomator2 worker on the USB
-host executes selector-based actions and reusable workflows. It is the only UI
-engine: the Maestro engine was removed on 2026-11-11.
+The configured `android_task` route forwards the owner's words to one existing BB
+Codex conversation on the USB host. That Codex uses direct ADB and its app skills;
+YAML flows and a persistent UIAutomator worker are optional compatibility tools.
+Direct `adb uiautomator dump` is forbidden. Managed UIAutomator uses its existing
+explicit lifecycle. The Maestro engine was removed on 2026-11-11.
 
 ## Tools
 
-For ordinary phone tasks and order-bound conversations, acquire `android_session` and use
+When an existing BB conversation is configured, use `android_task` for the original
+goal, clarifications, status and latest result. No separate session or native agent
+is started by that route. See [configuration, acceptance and undo](../../docs/android-bb-conversation.md).
+
+For the separate legacy native path and order-bound conversations, acquire `android_session` and use
 `android_agent`. Its natural goal can cover a doctor's questions, pharmacy fulfillment, seller
 pre-dispatch conversation or delivery tracking in any installed app. Pass the owner's words,
 original order facts, intended participants and restrictions verbatim; ask about unknown clinical
@@ -27,6 +33,7 @@ restrict native `android_agent` tasks.
 
 | Tool | Purpose |
 | --- | --- |
+| `android_task` | Send to the configured existing BB conversation, or read its status, latest result and original delivery receipt |
 | `android_capabilities` | Granted devices, connection states, native availability and the caller's exposed schemas |
 | `android_session` | Acquire, renew or release exclusive control of a phone |
 | `android_agent` | Continue the owner's natural task and participant conversations on the native Codex session |
