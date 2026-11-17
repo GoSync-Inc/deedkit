@@ -109,6 +109,7 @@ class UsbOrderConnector:
         self._uncertain = False
         self._claimed = False
         self._close_requested = False
+        self._finishing = False
 
     def status(self):
         return {'state': self.state, 'reason': self.reason, 'cleanup': self.cleanup,
@@ -229,6 +230,8 @@ class UsbOrderConnector:
             await self._close_writer()
 
     async def _finish(self):
+        # Reading has ended. Undo keeps the original key/session checks but must not need a retained run.
+        self.closing = self._finishing = True
         self._remember_gap()
         deadline = asyncio.get_running_loop().time() + self.cleanup_s
         try:
@@ -318,7 +321,8 @@ class UsbOrderConnector:
         if self.task is not None:
             if not self._close_requested and not self.task.done():
                 self._close_requested = True
-                self.task.cancel()
+                if not self._finishing:
+                    self.task.cancel()
             try:
                 await asyncio.shield(self.task)
             except asyncio.CancelledError:
