@@ -123,6 +123,11 @@ relative to the repository root (`services/messaging/messaging_service/<file>.py
 like Tiden component paths. Older events used `messaging_service/<file>.py`; component
 runtime paths match both path forms (TIDEN-CI.md), and a recurring error may appear once
 under each.
+The fixed exception vocabulary includes PostgreSQL `QueryCanceled`,
+`LockNotAvailable`, `InsufficientPrivilege`, `UndefinedTable`, `UndefinedColumn`,
+`DeadlockDetected`, `SerializationFailure` and `ReadOnlySqlTransaction`.
+These names survive both sanitization passes; other unknown types still become
+`UnexpectedError`. No SQLSTATE or database diagnostic fields are inspected.
 It excludes exception text, cause chains, locals, source lines, absolute paths,
 HTTP bodies/headers/URLs, account/chat/person identifiers, search terms, messages,
 files and model inputs/outputs. SDK request/user/breadcrumb extras are discarded.

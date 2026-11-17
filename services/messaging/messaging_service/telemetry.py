@@ -42,7 +42,10 @@ FRAME_PREFIX = 'services/messaging/messaging_service/'
 EXCEPTION_TYPES = {'RuntimeError', 'ValueError', 'TypeError', 'KeyError', 'AttributeError',
     'OSError', 'TimeoutError', 'ConnectionError', 'PermissionError', 'FileNotFoundError',
     'OperationalError', 'InterfaceError', 'PoolTimeout', 'IntegrityError', 'ProgrammingError',
-    'AssertionError', 'MemoryError', 'RecursionError', 'OverflowError', 'IndexError'}
+    'AssertionError', 'MemoryError', 'RecursionError', 'OverflowError', 'IndexError',
+    # Fixed PostgreSQL classes only: never inspect SQL, messages or database diagnostics.
+    'QueryCanceled', 'LockNotAvailable', 'InsufficientPrivilege', 'UndefinedTable',
+    'UndefinedColumn', 'DeadlockDetected', 'SerializationFailure', 'ReadOnlySqlTransaction'}
 _reporter = None
 log = logging.getLogger('anymsg.telemetry')
 
