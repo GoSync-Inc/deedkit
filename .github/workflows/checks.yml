@@ -153,6 +153,7 @@ jobs:
         # 30 s on the sibling jobs, and on 2026-11-11 every Canonical host (azure, archive, security.ubuntu.com) was
         # unreachable from the runners for hours: the helper probes the mirrors, bounds each apt attempt and moves
         # to the next answering mirror, outside Canonical's network too (.github/scripts/apt-install.sh).
+        # zsh executes the existing ANYM-684/691 undo variants alongside bash on every root-suite shard.
         timeout-minutes: 9
         run: |
           "$GITHUB_WORKSPACE/ci-tools/.github/scripts/apt-install.sh" poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus ffmpeg age libglib2.0-0 libsndfile1 libopus0 zsh
@@ -841,6 +842,7 @@ jobs:
         # 30 s on the sibling jobs, and on 2026-11-11 every Canonical host (azure, archive, security.ubuntu.com) was
         # unreachable from the runners for hours: the helper probes the mirrors, bounds each apt attempt and moves
         # to the next answering mirror, outside Canonical's network too (.github/scripts/apt-install.sh).
+        # zsh executes the existing ANYM-684/691 undo variants alongside bash on every root-suite shard.
         timeout-minutes: 9
         run: |
           "$GITHUB_WORKSPACE/ci-tools/.github/scripts/apt-install.sh" poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus ffmpeg age libglib2.0-0 libsndfile1 libopus0 zsh
