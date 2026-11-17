@@ -75,8 +75,9 @@ placing the order. Verify busy/unknown/repeat behavior on synthetic tests, not a
 real purchase. Remove the old caller tool path only as a separate final step after
 replacement acceptance; do not stop or delete the original conversation.
 
-Undo: restore the prior gateway profile/policy revision and remove the optional
-`bb_conversation` config object. If reverting binaries, first remove the tool from
+Undo: restore the prior tool membership in a new, higher gateway policy revision,
+preserving concurrent fields with the normal comparison checks; never lower an
+accepted revision. Remove the optional `bb_conversation` config object. If reverting binaries, first remove the tool from
 the profile, then restore the accepted prior package through normal lifecycle
 checks. Preserve the state database, BB history and send receipts; never restore
 an old database to undo a code change. No live patch of immutable releases.
