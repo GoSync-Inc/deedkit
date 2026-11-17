@@ -86,8 +86,8 @@ def test_auth_device_grants_and_reservation(service):
     assert post(service, 'session', {'device_id': 'home', 'action': 'acquire'}, key='two').status_code == 409
     assert post(service, 'observe', {'device_id': 'home', 'session_id': token}, key='two').status_code == 409
     observed = post(service, 'observe', {'device_id': 'home', 'session_id': token}).json()
-    assert observed['elements'][0]['text'] == ''
-    assert observed['elements'][1]['text'] == 'Search'
+    assert observed['hierarchy_error'] == 'managed_uiautomator_required'
+    assert 'elements' not in observed
     assert base64.b64decode(observed['image']['data']).startswith(b'\x89PNG')
 
 
@@ -230,19 +230,22 @@ def test_gateway_catalog_matches_service_schemas():
 
 
 def test_hierarchy_timeout_still_returns_screenshot(service, monkeypatch):
-    from deedkit_android import device
+    class ManagedTimeout:
+        async def ensure_fenced_process_stopped(self, device):
+            pass
 
-    original = device.run_process
-
-    async def capture(argv, *args, **kwargs):
-        if any('uiautomator' in arg for arg in argv):
+        async def call(self, device, operation):
+            assert operation == '__hierarchy__'
             raise TimeoutError
-        return await original(argv, *args, **kwargs)
 
-    monkeypatch.setattr(device, 'run_process', capture)
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(service[0].app.state.devices, 'ui', ManagedTimeout())
     token = session(service)
     result = post(service, 'observe', {'device_id': 'home', 'session_id': token}).json()
-    assert result['hierarchy_error'] == 'capture_failed'
+    assert result['hierarchy_source'] == 'uiautomator2'
+    assert result['hierarchy_error'] == 'unavailable'
     assert base64.b64decode(result['image']['data']).startswith(b'\x89PNG')
 
 

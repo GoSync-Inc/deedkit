@@ -18,6 +18,7 @@ export type ToolName =
   | 'android_observe'
   | 'android_run_flow'
   | 'android_session'
+  | 'android_task'
   | 'android_upload'
   | 'calendar_agenda'
   | 'calendar_apply'

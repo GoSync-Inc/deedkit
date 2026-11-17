@@ -66,12 +66,27 @@ class AgentConfig(Strict):
     order_events: OrderSourceConfig | None = None
 
 
+class BBConversationConfig(Strict):
+    principal_id: str = Field(min_length=1, max_length=128)
+    device_id: str = Field(min_length=1, max_length=128)
+    node: str
+    cli: str
+    cli_sha256: str = Field(pattern=r'^[0-9a-f]{64}$')
+    server_url: str = Field(pattern=r'^http://127\.0\.0\.1:[1-9][0-9]{0,4}$')
+    thread_id: str = Field(min_length=1)
+    project_id: str = Field(min_length=1)
+    environment_id: str = Field(min_length=1)
+    host_id: str = Field(min_length=1)
+    workspace: str
+
+
 class Config(Strict):
     adb: str
     state_dir: str
     engines: dict[Literal["claude", "codex"], EngineConfig] = Field(default_factory=dict)
     default_engine: Literal["claude", "codex"] | None = None
     agent: AgentConfig = Field(default_factory=AgentConfig)
+    bb_conversation: BBConversationConfig | None = None
     # Removed engine (owner 11-11): a config that still names it fails at start.
     maestro: str | None = None
     java_home: str | None = None
@@ -124,6 +139,10 @@ class Configuration:
                 raise ValueError("invalid_engine_login")
         if config.default_engine is not None and config.default_engine not in config.engines:
             raise ValueError("default_engine_not_configured")
+        if config.bb_conversation and any(not Path(value).is_absolute() for value in (
+            config.bb_conversation.node, config.bb_conversation.cli, config.bb_conversation.workspace,
+        )):
+            raise ValueError('absolute_runtime_paths_required')
         ids = [p.id for p in config.principals]
         keys = [p.key_sha256 for p in config.principals]
         if len(set(config.devices.values())) != len(config.devices) or any(

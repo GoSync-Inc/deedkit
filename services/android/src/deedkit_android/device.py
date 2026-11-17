@@ -17,7 +17,6 @@ from PIL import Image
 import yaml
 import tempfile
 import time
-import uuid
 from xml.etree import ElementTree
 
 from .config import Refused
@@ -206,23 +205,8 @@ class Devices:
                 return {'hierarchy_source': 'uiautomator2', 'elements': elements}
             except (TimeoutError, OSError, Refused, ValueError, KeyError):
                 return {'hierarchy_source': 'uiautomator2', 'hierarchy_error': 'unavailable'}
-        path = "/data/local/tmp/deedkit-" + uuid.uuid4().hex + ".xml"
-        script = f"uiautomator dump {path} >/dev/null && cat {path}; result=$?; rm -f {path}; exit $result"
-        try:
-            code, data, stderr = await run_process([*self.adb(device), "shell", script], 8)
-            root = ElementTree.fromstring(data[data.index(b"<?xml"):])
-            elements = []
-            for node in root.iter("node"):
-                item = dict(node.attrib)
-                if item.get("password") == "true":
-                    item["text"], item["content-desc"] = "", ""
-                elements.append(item)
-            return {"elements": elements, "hierarchy_source": "adb"}
-        except (TimeoutError, OSError, Refused):
-            return {"hierarchy_error": "capture_failed"}
-        except (ValueError, ElementTree.ParseError):
-            return {"hierarchy_error": "unavailable", "hierarchy_exit_code": code,
-                    "hierarchy_diagnostic": stderr.decode(errors="replace")[:1000]}
+        # Direct ADB hierarchy dump is not an alternate UI client (owner 2026-11-17).
+        return {'hierarchy_error': 'managed_uiautomator_required'}
 
     def prepare(self, owner, device, argv, temporary):
         if not argv or argv[0] not in COMMANDS:

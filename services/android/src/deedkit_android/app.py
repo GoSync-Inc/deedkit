@@ -12,6 +12,8 @@ from pydantic import AliasChoices, Field, ValidationError
 from typing import Literal
 
 from .agent_run import AgentCall, Agents, install_routes
+from . import bb_conversation
+from .bb_conversation import TaskCall
 from . import courier_call, courier_chat
 from .app_maps import compile_scenario, load, validate_map
 from .config import Configuration, Refused, Strict
@@ -150,7 +152,7 @@ class Download(FileRef):
 SCHEMAS = {
     "capabilities": Strict, "maestro": MaestroInfo, "observe": Observe, "execute": Execute, "get_operation": Receipt,
     "run_flow": RunFlow, "flows": Flows, "session": Session, "upload": Upload, "download": Download, "delete_file": FileRef,
-    "courier_chat": CourierChat, "agent": AgentCall, "courier_call_sheet": CourierCallSheet,
+    "courier_chat": CourierChat, "agent": AgentCall, "task": TaskCall, "courier_call_sheet": CourierCallSheet,
 }
 # Where runs reach this service; the command line sets it from --host and --port.
 AGENT_URL = None
@@ -180,6 +182,16 @@ def create_app(config_path, agent_url=None):
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     install_routes(app)
+
+    @app.post('/internal/v1/bb-conversation-capabilities')
+    async def conversation_capabilities(request: Request):
+        authorization = request.headers.get('authorization', '')
+        principal = configuration.authenticate(authorization)
+        if 'android:control' not in principal.permissions:
+            raise Refused('forbidden', 403)
+        # Read configuration only: no Devices.status, engine/login probe or BB turn.
+        return JSONResponse(bb_conversation.capabilities(configuration, authorization, {'task': TaskCall}),
+                            headers={'Cache-Control': 'no-store'})
 
     @app.post('/internal/v1/order-source')
     async def order_source(request: Request):
@@ -246,7 +258,11 @@ def create_app(config_path, agent_url=None):
         if device is not None and device not in principal.devices:
             raise Refused("not_found", 404)
         owner = principal.id
-        if operation == "capabilities":
+        if operation == 'task':
+            result = await bb_conversation.handle(configuration, request.headers.get('authorization', ''), store, args)
+        elif operation == 'capabilities' and bb_conversation.configured_for(configuration, owner):
+            result = bb_conversation.capabilities(configuration, request.headers.get('authorization', ''), SCHEMAS)
+        elif operation == "capabilities":
             try:
                 secrets = {"secrets": devices.secrets.listing()}  # Names and packages only, never a value.
             except Refused:

@@ -179,7 +179,8 @@ def phone_state(caps):
     if not isinstance(devices, list):
         return {}
     rows = [row for row in devices if isinstance(row, dict)]
-    result = {"device": "attached" if any(row.get("state") == "device" for row in rows) else "none"}
+    result = ({"device": "attached" if any(row.get("state") == "device" for row in rows) else "none"}
+              if caps.get('device_status_observed') is not False else {})
     words = {row.get("session") for row in rows}
     for word in ("own", "other", "free"):
         if word in words:
