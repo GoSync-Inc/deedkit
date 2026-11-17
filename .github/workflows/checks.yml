@@ -155,7 +155,7 @@ jobs:
         # to the next answering mirror, outside Canonical's network too (.github/scripts/apt-install.sh).
         timeout-minutes: 9
         run: |
-          "$GITHUB_WORKSPACE/ci-tools/.github/scripts/apt-install.sh" poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus ffmpeg age libglib2.0-0 libsndfile1 libopus0
+          "$GITHUB_WORKSPACE/ci-tools/.github/scripts/apt-install.sh" poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus ffmpeg age libglib2.0-0 libsndfile1 libopus0 zsh
       - name: Install pinned dependencies
         run: uv sync --frozen --group dev
       - name: Every uv.lock matches its pyproject.toml
@@ -843,7 +843,7 @@ jobs:
         # to the next answering mirror, outside Canonical's network too (.github/scripts/apt-install.sh).
         timeout-minutes: 9
         run: |
-          "$GITHUB_WORKSPACE/ci-tools/.github/scripts/apt-install.sh" poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus ffmpeg age libglib2.0-0 libsndfile1 libopus0
+          "$GITHUB_WORKSPACE/ci-tools/.github/scripts/apt-install.sh" poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus ffmpeg age libglib2.0-0 libsndfile1 libopus0 zsh
       - name: Install pinned dependencies
         run: uv sync --frozen --group dev
       - name: Build the distributions the packaging tests inspect
