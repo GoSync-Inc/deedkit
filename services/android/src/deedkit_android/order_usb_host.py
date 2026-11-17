@@ -277,8 +277,10 @@ class UsbLifecycle:
                 previous=self.entries[key]
                 receipt=self.journal.db.execute('SELECT * FROM android_usb_forwards WHERE id=?',
                                                 (previous.receipt,)).fetchone()
+                # Retention can arrive after connector finish, before Entry.admit attached its handle.
+                # That handle is still the original request, never authority for another acquisition.
                 if (not previous.connector.task.done() or receipt is None or not self.journal.settled(receipt)
-                        or origin is previous.origin or origin is previous.handle):
+                        or (origin.task if handle else origin.id)==previous.task):
                     continue
                 del self.entries[key]
             try:
