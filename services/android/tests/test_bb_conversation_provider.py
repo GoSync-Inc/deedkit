@@ -226,3 +226,36 @@ def test_a_changed_cli_refuses_a_claude_code_target_before_any_bb_process(tmp_pa
     with TestClient(create_app(tmp_path / 'config.json')) as client:
         response = post(client, 'status')
     assert response.status_code == 409 and response.json()['error'] == 'bb_cli_changed'
+
+
+# spec: ANYM-993
+def test_a_switch_neither_migrates_nor_resends_an_unknown_codex_request_and_rollback_keeps_it_unknown(
+        tmp_path, monkeypatch):
+    config, bb = backend(tmp_path, monkeypatch, 'codex', 'codex')
+    request = str(uuid.uuid4())
+    bb.fail = True
+    with TestClient(create_app(config)) as client:
+        assert post(client, 'message', request_id=request, text='Codex goal').json()['delivery'] == 'unknown'
+    bb.fail = False
+    receipts = sorted((tmp_path / 'state').rglob('bb-message-*.json'))
+    before = {path: path.read_bytes() for path in receipts}
+    # Switch to the claude-code thread: the unknown Codex request is refused under its original ID, whatever the text.
+    bb.reported['thread'].update(id='thread-claude-2', providerId='claude-code')
+    write(tmp_path, {**TARGET, 'thread_id': 'thread-claude-2', 'provider': 'claude-code'})
+    with TestClient(create_app(config)) as client:
+        for action, extra in (('message', {'request_id': request, 'text': 'Codex goal'}),
+                              ('message', {'request_id': request, 'text': 'Codex goal, edited'}),
+                              ('receipt', {'request_id': request})):
+            response = post(client, action, **extra)
+            assert response.status_code == 409, response.text
+            assert response.json()['error'] in ('receipt_binding_changed', 'request_id_conflict')
+    assert sorted((tmp_path / 'state').rglob('bb-message-*.json')) == receipts
+    assert {path: path.read_bytes() for path in receipts} == before  # no migration to the new thread
+    # Rollback: the original receipt reads back still unknown; nothing was ever resent.
+    bb.reported['thread'].update(id=TARGET['thread_id'], providerId='codex')
+    write(tmp_path, {**TARGET, 'provider': 'codex'})
+    with TestClient(create_app(config)) as client:
+        receipt = post(client, 'receipt', request_id=request).json()
+        assert receipt['delivery'] == 'unknown' and receipt['task_id'] == TARGET['thread_id']
+        assert post(client, 'message', request_id=request, text='Codex goal').json() == receipt
+    assert [call[1] for call in bb.sends()] == ['Codex goal']
