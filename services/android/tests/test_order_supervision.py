@@ -558,14 +558,25 @@ def test_forty_five_minutes_delivery_idle_uses_only_original_cumulative_native_w
 
 # spec: ANYM-993, ANYM-997
 def test_exhausted_active_budget_refuses_due_input_before_any_native_preflight(tmp_path, monkeypatch):
+    from deedkit_android import order_supervision
+    real, gate = order_supervision.Supervision.tick, threading.Event()
+
+    async def tick(self):
+        if gate.is_set():  # no tick (budget prune or due-wake admission) before this test exhausts the budget
+            await real(self)
+    monkeypatch.setattr(order_supervision.Supervision, 'tick', tick)  # monkeypatch restores it at teardown
     config, record = host(tmp_path, monkeypatch, delay=.3)
     with Service(config) as service:
-        request = service.start(service.lease(), goal='native-control')
-        service.finished(request['request_id'])
-        supervision = service.app.state.agents.supervision
-        budget = supervision.budgets[('one', request['request_id'])]
-        budget['seconds_used'] = budget['seconds_limit']
-        before = record.read_text()
+        try:
+            request = service.start(service.lease(), goal='native-control')
+            service.finished(request['request_id'])
+            supervision = service.app.state.agents.supervision
+            # A runner slower than the .3 s timer must not admit the wake first (CI run 44355808074).
+            budget = supervision.budgets[('one', request['request_id'])]
+            budget['seconds_used'] = budget['seconds_limit']
+            before = record.read_text()
+        finally:
+            gate.set()
         until(lambda: wakes(service) and wakes(service)[0]['hold_reason'] == 'lease_unavailable')
         assert record.read_text() == before
         assert not rows(service, 'SELECT * FROM android_order_native_inputs')
