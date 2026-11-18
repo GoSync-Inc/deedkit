@@ -4,7 +4,8 @@ bounds (read-only root, capabilities, limits) are proved by tests/test_compose_r
 
 Two later decisions shape the current contract and are asserted as such: readiness events go only through the fenced
 publish_file_enrichment_event function (ANYM-254 revokes the direct events/feed_counter writes), and the role may read
-four subscription columns and three source columns to apply the on-request media policy (ANYM-805, owner 2026-11-06)."""
+four subscription columns and three source columns to apply the on-request media policy (ANYM-805, owner 2026-11-06).
+ANYM-78 criteria 3 and 4 state this same boundary, citing ANYM-254 criterion 1 and ANYM-805 criterion 1."""
 from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
