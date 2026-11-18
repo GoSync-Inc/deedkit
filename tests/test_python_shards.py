@@ -369,7 +369,8 @@ def test_the_python_producer_names_every_shard_job_of_the_matrix(tmp_path):
     base = [sys.executable, str(ROOT / "scripts/tiden_ci.py"), "assemble", "--fragments", str(tmp_path / "fragments"),
             "--producer", "verify:success:" + "a" * 40, "--producer", "load:success:" + "a" * 40,
             "--producer", "services:success:" + "a" * 40,
-            "--producer", "go:success:" + "a" * 40, "--producer", "added:success:" + "a" * 40]
+            "--producer", "go:success:" + "a" * 40, "--producer", "added:success:" + "a" * 40,
+            "--producer", "vision-macos:success:" + "a" * 40, "--producer", "deedkit-windows:success:" + "a" * 40]
     shards = [argument for job in tiden_ci.SHARD_JOBS for argument in ("--producer", f"{job}:success:" + "a" * 40)]
     passed = subprocess.run([*base, "--directory", str(tmp_path / "ok"), *shards], env=env, capture_output=True, text=True)
     assert passed.returncode == 0, passed.stderr
@@ -425,6 +426,7 @@ def test_a_shard_job_that_fails_after_uploading_a_passing_fragment_never_reads_a
     needs = {"verify": {"result": "success", "sha": "a" * 40}, "load": {"result": "success", "sha": "a" * 40},
              "services": {"result": "success", "sha": "a" * 40},
              "go": {"result": "success", "sha": "a" * 40}, "added": {"result": "success", "sha": "a" * 40},
+             "vision-macos": {"result": "success", "sha": "a" * 40}, "deedkit-windows": {"result": "success", "sha": "a" * 40},
              **{job: {"result": "success", "sha": "a" * 40} for job in tiden_ci.SHARD_JOBS}}
     needs["python-3"]["result"] = late
     work = tmp_path / "work"

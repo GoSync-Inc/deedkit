@@ -262,7 +262,10 @@ def validate(directory: Path, sha: str, producer_url: str, attempt: int, pull_re
     if not isinstance(added, dict) or added.get("result") not in {"passed", "none"}:
         raise Refused("the added tests of the evidence did not pass")
     reports = [tiden_ci.normalized_report(check) for check in REPORT_CHECKS]
-    if sorted(manifest.get("reports") or []) != sorted([*reports, "ci-checks.json"]):
+    # DK65: the native platform reports travel in their own ordered list for the second report phase.
+    native = [tiden_ci.normalized_report(check) for check in tiden_ci.NATIVE_MODULES]
+    if sorted(manifest.get("reports") or []) != sorted([*(r for r in reports if r not in native), "ci-checks.json"]) \
+            or manifest.get("platform_reports") != native:
         raise Refused("the evidence manifest does not list every required report")
     totals = {}
     for check, report in zip(REPORT_CHECKS, reports):

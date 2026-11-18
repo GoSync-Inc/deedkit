@@ -2154,7 +2154,8 @@ ATTEMPT_URL ="https://github.com/example/repo/actions/runs/1/attempts/2"
 LOAD_REPORT = '<testsuite><testcase name="budgets" file="tests/platform/benchmarks/gateway_read_load.py"/></testsuite>'
 PASSED = {"verify": ("success", "a" * 40), "load": ("success", "a" * 40), "services": ("success", "a" * 40),
           **dict.fromkeys(SHARD_JOBS, ("success", "a" * 40)),
-          "go": ("success", "a" * 40), "added": ("success", "a" * 40)}
+          "go": ("success", "a" * 40), "added": ("success", "a" * 40),
+          "vision-macos": ("success", "a" * 40), "deedkit-windows": ("success", "a" * 40)}
 # Synthetic Go modules at the module directories of the two Go checks; `go_results` reads only go.mod and *_test.go.
 GO_MODULE_PATHS = {"whatsmeow": "example.com/whatsmeow", "release_router": "example.com/release/router"}
 
@@ -2234,6 +2235,12 @@ def evidence_fragments(tmp_path, *, load_sha="a" * 40, load_outcomes=None, load=
     (added / "attempt").write_text("2\n")
     (added / "added.json").write_text('{"result": "none", "runs": []}')
     (added / "outcomes.json").write_text('{"module_checks": {}}')
+    for job in ("vision-macos", "deedkit-windows"):  # the hosted native jobs (DK65), like services without reports here
+        fragment = fragments / f"ci-evidence-{job}"
+        fragment.mkdir()
+        (fragment / "source-sha").write_text("a" * 40 + "\n")
+        (fragment / "attempt").write_text("2\n")
+        (fragment / "outcomes.json").write_text(json.dumps({"module_checks": dict.fromkeys(FRAGMENTS[job][0], "success")}))
     for fragment in fragments.iterdir():  # every job keeps the same exclusion inventory
         (fragment / "exclusions.json").write_text('{"files": [], "provenance": []}')
     return fragments
@@ -2250,7 +2257,7 @@ def test_parallel_load_fragment_is_assembled_with_verify_evidence_of_the_same_co
     out = tmp_path / "ci-evidence"
     merged = assemble(out, evidence_fragments(tmp_path), ATTEMPT_URL, PASSED)
     # The assembling attempt names the evidence, so a rerun of one test job publishes under new row identities.
-    assert merged["ci_url"] == ATTEMPT_URL and merged["fragments"] == ["verify", "load", "services", *SHARD_JOBS, "go", "added"] and merged["missing"] == []
+    assert merged["ci_url"] == ATTEMPT_URL and merged["fragments"] == ["verify", "load", "services", *SHARD_JOBS, "go", "added", "vision-macos", "deedkit-windows"] and merged["missing"] == []
     assert merged["module_checks"]["load"] == "success" and set(merged["module_checks"]) == set(MODULE_REPORTS)
     assert {path.name for path in out.iterdir()} == {"metadata.json", "source-sha", "python.xml", "load.xml", "load.json",
                                                      "whatsmeow.json", "release-router.json", "exclusions.json", "added.json"}
@@ -2260,10 +2267,10 @@ def test_parallel_load_fragment_is_assembled_with_verify_evidence_of_the_same_co
     assert rows["deedkit-ci::load"] == rows["anymsg-ci::python"] == rows["deedkit-ci::whatsmeow"] == "passed"
     # A job that succeeded and was not rerun keeps its earlier attempt's fragment, and the evidence says so.
     earlier = assemble(tmp_path / "earlier", evidence_fragments(tmp_path / "e", load_attempt="1"), ATTEMPT_URL, PASSED)
-    assert earlier["fragments"] == ["verify", "load", "services", *SHARD_JOBS, "go", "added"]
+    assert earlier["fragments"] == ["verify", "load", "services", *SHARD_JOBS, "go", "added", "vision-macos", "deedkit-windows"]
     assert earlier["producers"] == {"verify": {"result": "success", "sha": "a" * 40, "attempt": "2"},
                                     "load": {"result": "success", "sha": "a" * 40, "attempt": "1"},
-                                    **{job: {"result": "success", "sha": "a" * 40, "attempt": "2"} for job in ("services", *SHARD_JOBS, "go", "added")}}
+                                    **{job: {"result": "success", "sha": "a" * 40, "attempt": "2"} for job in ("services", *SHARD_JOBS, "go", "added", "vision-macos", "deedkit-windows")}}
     # Assembling again into a used directory could keep a report the new fragments no longer supply.
     with pytest.raises(ValueError, match="new or empty"):
         assemble(out, evidence_fragments(tmp_path / "again", load=False), ATTEMPT_URL, PASSED)
@@ -2314,7 +2321,7 @@ def test_assembly_refuses_a_fragment_of_another_commit_or_of_foreign_checks(tmp_
 def test_missing_load_fragment_is_recorded_as_an_unrun_check(tmp_path):
     from scripts.tiden_ci import assemble
     merged = assemble(tmp_path / "ci-evidence", evidence_fragments(tmp_path, load=False), ATTEMPT_URL, PASSED)
-    assert merged["fragments"] == ["verify", "services", *SHARD_JOBS, "go", "added"] and merged["missing"] == ["load"] and merged["module_checks"]["load"] == "skipped"
+    assert merged["fragments"] == ["verify", "services", *SHARD_JOBS, "go", "added", "vision-macos", "deedkit-windows"] and merged["missing"] == ["load"] and merged["module_checks"]["load"] == "skipped"
     assert assembled_rows(tmp_path, merged)["deedkit-ci::load"] == "blocked"
 
 
@@ -2357,7 +2364,9 @@ def test_evidence_step_records_and_then_fails_a_run_without_every_fragment(tmp_p
                            **{f"PYTHON_{index}": f"python-{index}:${{{{ needs.python-{index}.result }}}}:${{{{ needs.python-{index}.outputs.source_sha }}}}"
                               for index in range(2, PYTHON_SHARDS + 1)},
                            "GO": "go:${{ needs.go.result }}:${{ needs.go.outputs.source_sha }}",
-                           "ADDED": "added:${{ needs.added.result }}:${{ needs.added.outputs.source_sha }}"}
+                           "ADDED": "added:${{ needs.added.result }}:${{ needs.added.outputs.source_sha }}",
+                           "VISION_MACOS": "vision-macos:${{ needs.vision-macos.result }}:${{ needs.vision-macos.outputs.source_sha }}",
+                           "DEEDKIT_WINDOWS": "deedkit-windows:${{ needs.deedkit-windows.result }}:${{ needs.deedkit-windows.outputs.source_sha }}"}
     work = tmp_path / "work"
     work.mkdir()
     (work / "ci-tools").symlink_to(root, target_is_directory=True)
@@ -2367,7 +2376,8 @@ def test_evidence_step_records_and_then_fails_a_run_without_every_fragment(tmp_p
     env = {"PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin", "RUNNER_TEMP": str(temp), "GITHUB_REPOSITORY": "example/repo",
            "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "2", "VERIFY": "verify:success:" + "a" * 40,
            "LOAD": "load:success:" + "a" * 40, "SERVICES": "services:success:" + "a" * 40, **{f"PYTHON_{index}": f"python-{index}:success:" + "a" * 40 for index in range(2, PYTHON_SHARDS + 1)},
-           "GO": "go:success:" + "a" * 40, "ADDED": "added:success:" + "a" * 40}
+           "GO": "go:success:" + "a" * 40, "ADDED": "added:success:" + "a" * 40,
+           "VISION_MACOS": "vision-macos:success:" + "a" * 40, "DEEDKIT_WINDOWS": "deedkit-windows:success:" + "a" * 40}
     result = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=work, capture_output=True, text=True, env=env)
     assert result.returncode != 0, result.stderr
     rows = json.loads((temp / "ci-evidence" / "ci-checks.json").read_text())  # the evidence still exists for upload
@@ -2423,7 +2433,7 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
         assert upload["with"]["name"] == f"ci-evidence-{job}" and upload["if"] == "${{ always() }}"
         assert upload["with"]["overwrite"] is True
     evidence = jobs["evidence"]
-    assert evidence["needs"] == ["documentation", "verify", "load", "services", *SHARD_JOBS, "go", "added"] and evidence["if"] == "${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}"
+    assert evidence["needs"] == ["documentation", "verify", "load", "services", *SHARD_JOBS, "go", "added", "vision-macos", "deedkit-windows"] and evidence["if"] == "${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}"
     assert jobs["tiden"]["needs"] == ["documentation", "evidence"]
     steps = {step.get("name") or step["uses"].split("@")[0]: step for step in evidence["steps"]}
     assert steps["actions/download-artifact"]["with"]["pattern"] == "ci-evidence-*"
@@ -2435,7 +2445,9 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
     assert require["env"] == {"VERIFY_RESULT": "${{ needs.verify.result }}", "LOAD_RESULT": "${{ needs.load.result }}",
                               "SERVICES_RESULT": "${{ needs.services.result }}",
                               **{f"PYTHON_{index}_RESULT": f"${{{{ needs.python-{index}.result }}}}" for index in range(2, PYTHON_SHARDS + 1)},
-                              "GO_RESULT": "${{ needs.go.result }}", "ADDED_RESULT": "${{ needs.added.result }}"}
+                              "GO_RESULT": "${{ needs.go.result }}", "ADDED_RESULT": "${{ needs.added.result }}",
+                              "VISION_MACOS_RESULT": "${{ needs.vision-macos.result }}",
+                              "DEEDKIT_WINDOWS_RESULT": "${{ needs.deedkit-windows.result }}"}
     for verify, load_result, shards, go in [("success", "success", "success", "success"), ("success", "failure", "success", "success"),
                                             ("success", "cancelled", "success", "success"), ("success", "skipped", "success", "success"),
                                             ("failure", "success", "success", "success"), ("skipped", "success", "success", "success"),
@@ -2444,7 +2456,8 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
         result = subprocess.run(["bash", "-e", "-c", require["run"]], capture_output=True,
                                 env={"VERIFY_RESULT": verify, "LOAD_RESULT": load_result, "GO_RESULT": go,
                                      **{f"PYTHON_{index}_RESULT": "success" for index in range(2, PYTHON_SHARDS + 1)},
-                                     "PYTHON_3_RESULT": shards, "ADDED_RESULT": "success", "SERVICES_RESULT": "success"})
+                                     "PYTHON_3_RESULT": shards, "ADDED_RESULT": "success", "SERVICES_RESULT": "success",
+                                     "VISION_MACOS_RESULT": "success", "DEEDKIT_WINDOWS_RESULT": "success"})
         assert (result.returncode == 0) == (verify == load_result == shards == go == "success"), (verify, load_result, shards, go)
 
 

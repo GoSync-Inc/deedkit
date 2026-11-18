@@ -18,7 +18,7 @@ import yaml
 from scripts.tiden_ci import MODULE_REPORTS, REQUIRED_EXECUTIONS, SHARD_JOBS
 from tests.test_tiden_ci import (ATTEMPT_URL, RUN_URL, evidence_fragments, main_push_manifest, main_run, node_report, release_cli,
                                  run_release)
-from tests.test_ci_reuse import go_stream
+from tests.test_ci_reuse import go_stream, native_fragments
 
 ROOT = Path(__file__).resolve().parents[1]
 SYNTHETIC_GIT = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "Synthetic", "GIT_AUTHOR_EMAIL": "synthetic@example.invalid",
@@ -116,9 +116,14 @@ def evidence_for(tmp_path, name, commit, reports):
         (fragments / "ci-evidence-verify" / MODULE_REPORTS[module][0]).write_text(node_report(*sorted(required)))
     for report in SERVICE_REPORTS:
         (fragments / "ci-evidence-services" / report).write_text(PASSING_CASE)
+    for job in ("vision-macos", "deedkit-windows"):  # the hosted native jobs (DK65): their one canonical case, passed
+        shutil.rmtree(fragments / f"ci-evidence-{job}")
+    native_fragments(fragments, commit, "2")
+    for job in ("vision-macos", "deedkit-windows"):
+        (fragments / f"ci-evidence-{job}" / "exclusions.json").write_text('{"files": [], "provenance": []}')
     for fragment, report in reports.items():
         (fragments / "ci-evidence-verify" / fragment).write_text(report)
-    producers = [f"{job}:success:{commit}" for job in ("verify", "load", "services", *SHARD_JOBS, "go", "added")]
+    producers = [f"{job}:success:{commit}" for job in ("verify", "load", "services", *SHARD_JOBS, "go", "added", "vision-macos", "deedkit-windows")]
     env = {"PATH": os.environ["PATH"], "GITHUB_REPOSITORY": "example/repo", "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "2"}
     directory = tmp_path / f"{name}-evidence"
     tool = ["scripts/tiden_ci.py"]

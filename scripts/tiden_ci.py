@@ -49,6 +49,10 @@ MODULE_REPORTS = {
     # `go test -json` streams of the `go` job, published as result rows (go_results), not JUnit.
     "whatsmeow": ("whatsmeow.json", "go", "whatsapp/whatsmeow"),
     "release_router": ("release-router.json", "go", "services/release-router"),
+    # DK65: hosted macOS and Windows jobs run the one platform-only case of a Linux module natively, under that
+    # case's canonical identity; the Linux report keeps its own SKIP of it. Published in the second report phase.
+    "android_vision": ("android-vision.xml", "python", "services/android"),
+    "deedkit_npm_windows": ("deedkit-npm-windows.xml", "node", "packages/deedkit"),
 }
 # A module that runs named root-suite nodes passes only when its report holds exactly these executions (file::name),
 # each once and passed; the shards deselect them, so assembly refuses evidence whose python.xml holds one of them.
@@ -58,10 +62,21 @@ REQUIRED_EXECUTIONS = {
                                  "tests/test_audio_native.py::test_faster_whisper_decoder_compatibility_without_model[wav]",
                                  "tests/test_audio_native.py::test_faster_whisper_decoder_compatibility_without_model[ogg]"}),
 }
+# The same exact rule for the native platform modules (DK65): their one case, once and passed. A SKIP, a failure, any
+# other case or a second one fails the module check. The Linux module keeps its own row of that case.
+NATIVE_EXECUTIONS = {
+    "android_vision": frozenset({"services/android/tests/test_screen_quality.py::"
+                                 "test_vision_corpus_character_error_rate_and_list_items_meet_the_bar"}),
+    "deedkit_npm_windows": frozenset({"packages/deedkit/test/download.test.js::a Windows alternate-stream output name is refused"}),
+}
+NATIVE_MODULES = tuple(NATIVE_EXECUTIONS)
+# A Windows fragment names its checkout root (GITHUB_WORKSPACE); its report's absolute files map only under it.
+WINDOWS_MODULES = ("deedkit_npm_windows",)
 GO_MODULES = tuple(name for name, (_, framework, _) in MODULE_REPORTS.items() if framework == "go")
 # The gateway, its contract package, the calls, inference and agent-runner services run on a runner of their own, in parallel with verify.
 SERVICE_MODULES = ("android", "gateway", "platform_contracts", "calls", "calls_frontend", "inference", "agent_runner")
-_VERIFY_MODULES = tuple(name for name in MODULE_REPORTS if name != "load" and name not in GO_MODULES and name not in SERVICE_MODULES)
+_VERIFY_MODULES = tuple(name for name in MODULE_REPORTS if name != "load" and name not in GO_MODULES and name not in SERVICE_MODULES
+                        and name not in NATIVE_MODULES)
 # The root Python suite runs in file-level shards (scripts/python_shards.py): verify runs shard 1, each
 # `checks / python` matrix job one of the others, and assembly merges their reports into python.xml.
 PYTHON_SHARDS = 11
@@ -84,6 +99,10 @@ FRAGMENTS = {
     **{job: ((), ("outcomes.json", report, EXCLUSIONS)) for job, report in zip(SHARD_JOBS, SHARD_REPORTS[1:])},
     "go": (GO_MODULES, ("outcomes.json", *(MODULE_REPORTS[name][0] for name in GO_MODULES), GO_PYTHON_REPORT, EXCLUSIONS)),
     "added": ((), ("outcomes.json", ADDED_REPORT, EXCLUSIONS)),
+    # The reusable hosted-runner workflows vision-macos.yml and deedkit-windows.yml (DK65).
+    "vision-macos": (("android_vision",), ("outcomes.json", MODULE_REPORTS["android_vision"][0], EXCLUSIONS)),
+    "deedkit-windows": (("deedkit_npm_windows",), ("outcomes.json", MODULE_REPORTS["deedkit_npm_windows"][0], EXCLUSIONS,
+                                                    "checkout-root")),
 }
 CONTROL_FILES = {"source-sha", "attempt", "metadata.json", "outcomes.json"}
 # Every file assembly writes besides `source-sha` and `metadata.json`.
@@ -225,7 +244,31 @@ def source_path(value: str, root: Path) -> str:
     return value
 
 
-def normalize_junit(path: Path, root: Path, framework: str, source_prefix: str = "") -> tuple[bytes, Counter]:
+WINDOWS_PART = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]*")
+
+
+def windows_source_path(value: object, workspace: object, allowed: frozenset) -> str:
+    """The repository path of a hosted Windows runner's Node JUnit `file` (absolute, under the job's declared
+    GITHUB_WORKSPACE, e.g. D:\\a\\deedkit\\deedkit). Only an exact allowed file maps; a path outside the workspace,
+    another drive, a UNC or device path, traversal or any other file refuses (DK65)."""
+    def parts(text):
+        return text.split("\\")
+    if not isinstance(workspace, str) or not re.fullmatch(r"[A-Za-z]:(\\[^\\]+)+", workspace) or not all(
+            WINDOWS_PART.fullmatch(part) and part.strip(".") for part in parts(workspace)[1:]):
+        raise ValueError("invalid Windows workspace")
+    if not isinstance(value, str) or not value.startswith(workspace + "\\"):
+        raise ValueError("Windows test file outside the declared workspace")
+    rest = parts(value[len(workspace) + 1:])
+    if not all(WINDOWS_PART.fullmatch(part) and part.strip(".") for part in rest):
+        raise ValueError("malformed Windows test file path")
+    path = "/".join(rest)
+    if path not in allowed:
+        raise ValueError("Windows test file is not one this module may report")
+    return path
+
+
+def normalize_junit(path: Path, root: Path, framework: str, source_prefix: str = "", windows_workspace: str | None = None,
+                    allowed_files: frozenset = frozenset()) -> tuple[bytes, Counter]:
     data = path.read_bytes()
     if len(data) > MAX_BYTES or b"<!DOCTYPE" in data.upper() or b"<!ENTITY" in data.upper():
         raise ValueError("unsafe or oversized JUnit report")
@@ -240,7 +283,9 @@ def normalize_junit(path: Path, root: Path, framework: str, source_prefix: str =
         if not case.get("name"):
             raise ValueError("test identity is missing")
         file = case.get("file", "")
-        if not file and framework == "python":
+        if windows_workspace is not None:  # a hosted Windows fragment: only its declared workspace's allowed files
+            file = windows_source_path(file, windows_workspace, allowed_files)
+        elif not file and framework == "python":
             # pytest xunit2 omits file; xunit1 in CI preserves the actual path.
             candidate = case.get("classname", "").replace(".", "/") + ".py"
             if (root / candidate).is_file():
@@ -447,7 +492,7 @@ def prepare(root: Path, directory: Path, metadata: dict) -> dict:
         checks.update(module_checks)
     check_names = CHECKS + (tuple(MODULE_REPORTS) if module_checks is not None else ())
     rows = []
-    reports = []
+    reports, platform = [], []
     counts = Counter()
     for check in check_names:
         outcome = checks.get(check, "skipped")
@@ -462,17 +507,19 @@ def prepare(root: Path, directory: Path, metadata: dict) -> dict:
                     results, totals, unexplained = go_results(directory / filename, root, prefix, metadata["ci_url"], check)
                     normalized = json.dumps(results, indent=2).encode()
                 else:
-                    normalized, totals = normalize_junit(directory / filename, root, framework, prefix)
+                    windows ={"windows_workspace": control_file(directory, "checkout-root"), "allowed_files": frozenset(
+                        name.split("::")[0] for name in NATIVE_EXECUTIONS[check])} if check in WINDOWS_MODULES else {}
+                    normalized, totals = normalize_junit(directory / filename, root, framework, prefix, **windows)
                 filename = normalized_report(check)
                 (directory / filename).write_bytes(normalized)
-                reports.append(filename)
+                (platform if check in NATIVE_MODULES else reports).append(filename)
                 counts.update(totals)
                 if (totals["failed"] or unexplained) and outcome == "success":
                     outcome = "failure"
                 if not totals["passed"] and not totals["failed"]:
                     outcome, reason = "skipped", "No tests executed; only skipped tests"
-                if check in REQUIRED_EXECUTIONS and executions(ET.fromstring(normalized).iter("testcase"), root) != Counter(
-                        (name, "passed") for name in REQUIRED_EXECUTIONS[check]):
+                exact = REQUIRED_EXECUTIONS.get(check) or NATIVE_EXECUTIONS.get(check)
+                if exact and executions(ET.fromstring(normalized).iter("testcase"), root) != Counter((name, "passed") for name in exact):
                     outcome, reason = "failure", "The report does not hold exactly the required executions, each once and passed"
             except (OSError, ValueError, ET.ParseError):
                 outcome, reason = "skipped", "Missing or invalid test report; verification incomplete"
@@ -486,7 +533,7 @@ def prepare(root: Path, directory: Path, metadata: dict) -> dict:
             "message": reason or f"GitHub Actions step outcome: {outcome}",
         })
     (directory / "ci-checks.json").write_text(json.dumps(rows, indent=2))
-    manifest = {**metadata, "schema": 1, "reports": reports + ["ci-checks.json"],
+    manifest = {**metadata, "schema": 1, "reports": reports + ["ci-checks.json"], **({"platform_reports": platform} if platform else {}),
                 "test_counts": dict(counts), "check_counts": dict(Counter(r["execution"]["status"] for r in rows))}
     (directory / "manifest.json").write_text(json.dumps(manifest, indent=2))
     return manifest
@@ -909,6 +956,22 @@ def evidence_paths(directory, manifest):
     return paths
 
 
+def platform_paths(directory, manifest):
+    """The manifest's native platform reports (DK65): plain, present, bounded, none a base report; none means no
+    second report phase."""
+    names = manifest.get("platform_reports", [])
+    if not isinstance(names, list) or len(set(names)) != len(names) or set(names) & set(manifest["reports"]):
+        raise ValueError("invalid platform evidence list")
+    paths = []
+    for filename in names:
+        if not isinstance(filename, str) or Path(filename).name != filename or (directory / filename).is_symlink():
+            raise ValueError("invalid evidence file path")
+        if not (directory / filename).is_file() or (directory / filename).stat().st_size > MAX_BYTES:
+            raise ValueError("missing or oversized evidence")
+        paths.append(str((directory / filename).resolve()))
+    return paths
+
+
 def wait_for_live_doc(call, seq, result):
     """Poll the run until Tiden's live-doc sync has finished (at most 20 reads, 3 seconds apart)."""
     for attempt in range(20):
@@ -999,8 +1062,12 @@ def publish(directory: Path, manifest: dict, branch: str | None, product: str, c
         named = routed_target(run["branchName"], branch) if routed else run["branchName"] == branch
         if not named or run["buildSha"] != manifest["sha"]:
             raise RuntimeError("Tiden rewrote the explicit source association")
-        paths = evidence_paths(directory, manifest)
+        paths, platform = evidence_paths(directory, manifest), platform_paths(directory, manifest)
         call(["run", "report", seq, *paths], "report")
+        # DK65: native platform reports re-execute cases a base report already sent, under the same identity. They
+        # go in one later call, only after the base call returned, so they never race it; a failure aborts the run.
+        if platform:
+            call(["run", "report", seq, *platform], "platform report")
         result = call(["run", "complete", seq], "complete", allow_verdict=True)
         completed = True
         result = wait_for_live_doc(call, seq, result)
