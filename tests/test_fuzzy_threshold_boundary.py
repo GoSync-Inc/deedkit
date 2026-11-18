@@ -59,3 +59,40 @@ def test_the_reference_threshold_never_leaks_past_its_own_transaction(seeded):
     reference(s, *CASES['at'][:2])
     with s.pool.connection() as c:
         assert c.execute("SELECT current_setting('pg_trgm.word_similarity_threshold') AS v").fetchone()['v'] == before
+
+
+# spec: ANYM-33
+def test_a_lower_threshold_already_set_in_the_search_transaction_does_not_reach_the_fallback(seeded, monkeypatch):
+    """The fallback applies its own 0.6 whatever threshold its transaction carries when it starts.
+
+    A narrow seam wraps Store.identity, which the search calls on its own connection inside its own transaction.
+    The wrapper sets pg_trgm's threshold to 0.59 for that transaction only, then calls the original unchanged. At 0.59
+    PostgreSQL admits the just-below pair; the search must still answer as the 0.6 reference does."""
+    from messaging_service.store import Store
+    s, _, b = seeded
+    query, body, _ = CASES['below']
+    with s.pool.connection() as c:
+        before = c.execute("SELECT current_setting('pg_trgm.word_similarity_threshold') AS v").fetchone()['v']
+    with s.pool.connection() as c:
+        c.execute("SELECT set_config('pg_trgm.word_similarity_threshold','0.59',true)")
+        assert c.execute('SELECT lower(%s) %%> lower(%s) AS hit', (body, query)).fetchone()['hit'] is True  # 0.59 admits it
+    with s.pool.connection() as c:  # that setting ended with its own transaction
+        assert c.execute("SELECT current_setting('pg_trgm.word_similarity_threshold') AS v").fetchone()['v'] == before
+    assert before != '0.59' and reference(s, query, body)[1] is False  # the 0.6 reference does not admit it
+    with s.pool.connection() as c:
+        c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
+            VALUES('edge','telegram-demo','telegram-demo-chat','edge','person',%s,%s,'incoming')''',
+                  (body, datetime(2026, 10, 1, 12, tzinfo=timezone.utc)))
+    original, seeded_values = Store.identity, []
+
+    def identity(c, token):
+        c.execute("SELECT set_config('pg_trgm.word_similarity_threshold','0.59',true)")
+        seeded_values.append(c.execute("SELECT current_setting('pg_trgm.word_similarity_threshold') AS v").fetchone()['v'])
+        return original(c, token)
+    monkeypatch.setattr(Store, 'identity', staticmethod(identity))
+    result = s.search(b, query, fuzzy=True, order='relevance', limit=100)
+    assert seeded_values == ['0.59']  # the seam ran inside the search's transaction, before the fallback
+    assert result['search']['fuzzy_used'] is True and result['items'] == []
+    monkeypatch.undo()
+    with s.pool.connection() as c:  # the pooled connection carries no setting out of that transaction
+        assert c.execute("SELECT current_setting('pg_trgm.word_similarity_threshold') AS v").fetchone()['v'] == before
