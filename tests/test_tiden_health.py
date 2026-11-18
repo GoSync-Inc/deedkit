@@ -576,7 +576,6 @@ VENDORED = {"node_modules", ".venv", "vendor"}
 # active case is itself a finding ("not reporting", tiden_health.py). The test fails when a prefix matches no tracked
 # test file any more, so this list cannot rot; a new entry needs its reason on the same line.
 UNPUBLISHED = {
-    "packages/deedkit/": "checks.yml runs these with no Tiden evidence file yet (ANYM-261)",
     "tools/attest-verify/": "checks.yml runs only govulncheck there, never its Go tests",
 }
 # Suites that have no tracked test file by design: their cases are CI module checks under .github/.

@@ -9,6 +9,10 @@ A JUnit report may hold at most `MAX_JUNIT_CASES` (50000) test cases and `MAX_BY
 local sanity bounds, since `tiden run report` uploads any number of rows in chunks of 2000. The merged
 Python report is about 220 bytes a case (2.2 MB for 9975 cases, 11-02).
 
+The DeedKit JavaScript client's `npm test` set (`packages/deedkit/test/*.test.js`) runs in the `checks / verify`
+step `deedkit_npm` through Node's native JUnit reporter and reports as module check `deedkit-ci::deedkit_npm`
+(`deedkit-npm.xml`, ANYM-261): a failing test fails the step and the check, and a skipped test stays skipped.
+
 Test jobs run in parallel and each uploads a `ci-evidence-<job>` fragment:
 `checks / verify` the seven checks and its module reports, `checks / load` the
 gateway load gate, `checks / services` the gateway, platform-contracts, calls,

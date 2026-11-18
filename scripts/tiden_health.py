@@ -54,7 +54,7 @@ CATEGORIES = ("missing-spec", "helper", "trivial", "duplicate", "dead-code")
 ENTRY_FIELDS = {"caseId", "externalId", "category", "reason"}
 # Fixed suites, one path rule each, in this order; anything else is unassigned and fails by itself.
 SUITES = ("root-python", "calendar", "calls-frontend", "calls", "gateway", "android", "inference", "agent-runner", "platform-contracts",
-          "release-router-go", "whatsmeow-go", "whatsapp-node", "npm", "ci")
+          "release-router-go", "whatsmeow-go", "whatsapp-node", "npm", "deedkit-js", "ci")
 CALLS_WITHOUT_PATH = ("s:tests.test_voice", "s:tests.test_webrtc")
 BARE_GO_TEST = re.compile(r"[^/]*_test\.go")
 # Tiden's Go reporter records bare file names, so the router's cases are told apart by their package.
@@ -107,6 +107,8 @@ def suite(case: dict) -> str:
         return "whatsapp-node"
     if path.startswith(("packages/npm/", "packages/wake-relay/")):  # one `npm` CI step runs both
         return "npm"
+    if path.startswith("packages/deedkit/"):  # its own `deedkit_npm` step and module report (ANYM-261)
+        return "deedkit-js"
     if path.startswith(".github/"):
         return "ci"
     return "unassigned"

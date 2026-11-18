@@ -364,10 +364,12 @@ jobs:
         # The wake relay shares this report: a new evidence file would need its own scripts/tiden_ci.py fragment entry.
         run: node --test --test-reporter=junit test/*.test.js ../wake-relay/test/*.test.mjs > "$RUNNER_TEMP/ci-evidence/npm.xml"
       - name: DeedKit JavaScript client and CLI tests
-        # packages/deedkit (ANYM-261) has no Tiden evidence file yet: a failure fails this job like any other step.
+        # packages/deedkit's `npm test` set through the native JUnit reporter: module check deedkit-ci::deedkit_npm
+        # (ANYM-261). A failing test still fails this step and the job.
         id: deedkit_npm
         if: ${{ !cancelled() }}
-        run: npm test --prefix packages/deedkit
+        working-directory: packages/deedkit
+        run: node --test --test-reporter=junit test/*.test.js > "$RUNNER_TEMP/ci-evidence/deedkit-npm.xml"
       - name: Real synthetic MCP and HTTP with restricted gateway role
         id: smoke
         run: uv run python scripts/smoke.py --dsn-file "$RUNNER_TEMP/anymsg-test.dsn"
@@ -399,7 +401,7 @@ jobs:
           CHECK_OUTCOMES: >-
             {"build":"${{ steps.build.outcome }}","release":"${{ steps.release.outcome }}","python":"${{ steps.python.outcome }}","collector":"${{ steps.collector.outcome }}","npm":"${{ steps.npm.outcome }}","smoke":"${{ steps.smoke.outcome }}","distributions":"${{ steps.distributions.outcome }}"}
           MODULE_OUTCOMES: >-
-            {"calendar":"${{ steps.calendar.outcome }}","backup_restore":"${{ steps.backup_restore.outcome }}","root_session_lock":"${{ steps.root_session_lock.outcome }}","enricher_audio":"${{ steps.enricher_audio.outcome }}"}
+            {"calendar":"${{ steps.calendar.outcome }}","backup_restore":"${{ steps.backup_restore.outcome }}","root_session_lock":"${{ steps.root_session_lock.outcome }}","enricher_audio":"${{ steps.enricher_audio.outcome }}","deedkit_npm":"${{ steps.deedkit_npm.outcome }}"}
           SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}
           TIDEN_BRANCH_OVERRIDE: ${{ inputs.tiden_branch }}
         run: |
