@@ -31,6 +31,16 @@ def test_module_reports_add_identities_without_changing_existing_checks(tmp_path
                 json.dumps({"Action": "pass", "Package": module, "Test": "TestSame"}) + "\n"
             )
             continue
+        if name in ci.WINDOWS_MODULES:
+            # A hosted Windows report names absolute files under its declared checkout root (DK65).
+            workspace = "D:\\a\\repo\\repo"
+            (allowed,) = {node.split("::")[0] for node in ci.NATIVE_EXECUTIONS[name]}
+            (tmp_path / "checkout-root").write_text(workspace + "\n")
+            (tmp_path / filename).write_text(
+                f'<testsuite><testcase name="same" classname="test" file="{workspace}\\{allowed.replace("/", chr(92))}"/>'
+                "</testsuite>"
+            )
+            continue
         (tmp_path / filename).write_text(
             '<testsuite><testcase name="same" classname="tests.test_api" file="tests/test_api.py"/></testsuite>'
         )
