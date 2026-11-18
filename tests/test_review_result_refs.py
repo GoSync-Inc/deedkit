@@ -70,3 +70,14 @@ def test_a_malformed_codex_thread_ref_is_refused_before_any_write(reviewers, tri
     audit = s.audit_tail(principal='agent-b', limit=1)[0]
     assert audit['operation'] == 'record_review' and audit['outcome'] == 'denied'
     assert 'codex' not in json.dumps(audit) and 'result_ref' not in json.dumps(audit)
+
+
+# spec: ANYM-18
+@pytest.mark.parametrize('ref', ['codex://threads/' + 'a' * 32 + '----', 'codex://threads/' + '----' + 'a' * 32],
+                         ids=['hyphens-last', 'hyphens-first'])
+def test_a_codex_thread_ref_needs_canonical_uuid_text_not_misplaced_hyphens(reviewers, tripwire, ref):  # noqa: F811
+    # 32 hex digits and 4 hyphens in the wrong places still parse with UUID(), which ignores hyphen positions.
+    s, a, b = reviewers
+    with pytest.raises(APIError, match='invalid_review'):
+        s.record_review(b, **payload(result_ref=ref))
+    assert count(s) == 0
