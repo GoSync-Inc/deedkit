@@ -70,15 +70,17 @@ class Gone(Refused):
         self.branch = branch
 
 
-def run(argv, timeout, stdin=None):
+def run(argv, timeout, stdin=None, failure=None):
+    """`failure(done or None)` may append a closed diagnostic to the refusal; nothing else about the call changes."""
     try:
         # stdin is never the terminal, so an unattended run cannot wait on a prompt (ANYM-536).
         done = subprocess.run(argv, input=stdin, stdin=None if stdin is not None else subprocess.DEVNULL,
                               capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise Refused(f'{argv[0]} failed: {type(error).__name__}') from None
+        raise Refused(f'{argv[0]} failed: {type(error).__name__}' + (failure(None) if failure else '')) from None
     if done.returncode:
         message = f'{argv[0]} {argv[1] if len(argv) > 1 else ""} exited {done.returncode}'
+        message += failure(done) if failure else ''
         gone = GONE.fullmatch((done.stderr or '').strip()) if argv[0] == 'tiden' else None
         if argv[0] == 'tiden':  # 11-01: a bare "exited 1" left the cause unknowable; Tiden's own first error line only
             lines = re.sub(r'[^\x20-\x7e\n]', ' ', done.stderr or '').strip().splitlines()
@@ -155,8 +157,55 @@ def locked(state):
 
 # --- pull --------------------------------------------------------------------------------------------------------
 
+# A failed `ssh` names only closed words (ANYM-569: tick output carries IDs, counts and statuses only): which fixed
+# remote operation it was, read from the argv's known literal positions, and which known ssh client error pattern its
+# stderr matches. Exit 255 is usually ssh's own failure, but a remote command may also return 255: a category is an
+# observed pattern, not proof of a transport, auth or agent cause. Any other exit is `remote-exit`, its stderr unread.
+# Nothing from the host, paths, the command line, stdin, stdout or stderr is copied; an unknown shape is `unknown`.
+SSH_OPERATIONS = ('export-feedback', 'get-feedback-projection', 'record-feedback-projection')
+SSH_ERRORS = (  # first match wins: the more specific client errors come first
+    ('host-key', re.compile(r'Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED')),
+    ('agent-signing-failed', re.compile(r'sign_and_send_pubkey: signing failed|agent refused operation'
+                                        r'|communication with agent failed')),
+    ('auth-denied', re.compile(r'Permission denied \((?:publickey|password|keyboard-interactive|hostbased|gssapi)')),
+    ('name-resolution', re.compile(r'Could not resolve hostname|Name or service not known'
+                                   r'|nodename nor servname provided|Temporary failure in name resolution')),
+    ('connection-refused', re.compile(r'Connection refused')),
+    ('connection-timeout', re.compile(r'Connection timed out|Operation timed out|timed out during banner exchange')),
+    ('network-unreachable', re.compile(r'No route to host|Network is unreachable')),
+    ('connection-closed', re.compile(r'Connection closed by|Connection reset by|kex_exchange_identification'
+                                     r'|closed by remote host|Broken pipe')),
+    ('client-config', re.compile(r'Bad configuration option|Bad owner or permissions on|no argument after keyword'
+                                 r'|Unsupported option')),
+)
+
+
+def ssh_operation(argv):
+    """The fixed remote operation of `remote(host, argv)`, from literal positions only, else `unknown`."""
+    if argv == ['docker', 'inspect', '--format', '{{.Image}}', API_CONTAINER]:
+        return 'inspect-api-image'
+    if argv[:2] == ['docker', 'run']:
+        for at in range(2, len(argv) - 3):
+            if argv[at:at + 3] == ['python', '-m', 'messaging_service']:
+                return argv[at + 3] if argv[at + 3] in SSH_OPERATIONS else 'unknown'
+    return 'unknown'
+
+
+def ssh_failure(done):
+    """A closed stderr pattern category for exit 255 (observed, not a proven cause); `remote-exit` otherwise; never text."""
+    if done is None:
+        return 'none'
+    if done.returncode != 255:
+        return 'remote-exit'
+    if not (done.stderr or '').strip():
+        return 'empty'
+    return next((name for name, pattern in SSH_ERRORS if pattern.search(done.stderr)), 'unknown')
+
+
 def remote(host, argv, stdin=None):
-    return run(['ssh', '-o', 'BatchMode=yes', host, shlex.join(argv)], SSH_TIMEOUT, stdin)
+    operation = ssh_operation(argv)
+    return run(['ssh', '-o', 'BatchMode=yes', host, shlex.join(argv)], SSH_TIMEOUT, stdin,
+               lambda done: f' (operation {operation}; ssh {ssh_failure(done)})')
 
 
 def export_pages(host, since, ssh=None):
