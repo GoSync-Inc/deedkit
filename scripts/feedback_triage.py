@@ -212,11 +212,18 @@ def merge(state, items, head):
 
 # --- snapshot and match ------------------------------------------------------------------------------------------
 
+# Main with sources goes in documented requests of 50 (`--all --page-size`: the size of each request); measured 11-18 the
+# same bytes as the default 200 in 16 s, not 21 s, each request ~1 s, not ~4 s, under the CLI's 30 s per request. A
+# branch request costs about the same at any size, so branch reads keep the default and do not multiply requests.
+SOURCED_REQUEST = ('--all', '--page-size', '50')
+
+
 def tiden(*argv):
-    return parse(run(['tiden', *argv, '--format', 'json'], TIDEN_TIMEOUT), 'tiden ' + ' '.join(argv[:2]))
+    paged = SOURCED_REQUEST if argv[:2] == ('spec', 'list') and '--include-sources' in argv else ()
+    return parse(run(['tiden', *argv, *paged, '--format', 'json'], TIDEN_TIMEOUT), 'tiden ' + ' '.join(argv[:2]))
 
 
-def flatten(reply, what):
+def flatten(reply, what, unique=False):
     if not isinstance(reply, dict) or not isinstance(reply.get('requirements'), list):
         raise Refused(f'{what}: unexpected reply')
     specs, stack = [], list(reply['requirements'])
@@ -225,6 +232,9 @@ def flatten(reply, what):
         specs.append(spec)
         stack += spec.get('children') or []
     complete(reply, len(specs), what)
+    # A spec created or moved between two pages repeats a row while the count still matches; main holds each once.
+    if unique and len({spec.get('seqNum') for spec in specs}) != len(specs):
+        raise Refused(f'{what}: a spec repeated across pages')
     return [{'ref': f"ANYM-{spec['seqNum']}", 'title': spec.get('title') or '', 'status': spec.get('status'),
              'text': spec.get('content') or '', 'sources': [str(source) for source in spec.get('sources') or []]}
             for spec in specs]
@@ -245,7 +255,7 @@ def snapshot(state, read=None):
 def collect(read=None):
     """Tiden main and every open branch, read whole; nothing is written (ANYM-569)."""
     read = read or tiden
-    main = flatten(read('spec', 'list', '--branch', 'main', '--include-sources'), 'main')
+    main = flatten(read('spec', 'list', '--branch', 'main', '--include-sources'), 'main', unique=True)
     branches = read('branch', 'list')
     if not isinstance(branches, dict) or not isinstance(branches.get('branches'), list):
         raise Refused('branch list: unexpected reply')
@@ -264,7 +274,7 @@ def collect(read=None):
                 raise
             gone = True
     if gone:
-        main = flatten(read('spec', 'list', '--branch', 'main', '--include-sources'), 'main')
+        main = flatten(read('spec', 'list', '--branch', 'main', '--include-sources'), 'main', unique=True)
     return {'main': main, 'branches': branch_specs}
 
 
