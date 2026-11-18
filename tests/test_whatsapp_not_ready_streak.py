@@ -9,7 +9,7 @@ import psycopg
 import pytest
 
 from messaging_service import whatsapp_collector as wa
-from test_whatsapp_reconnect import NOT_READY, PAGE, Stop, fake_provider, page_worker
+from test_whatsapp_reconnect import NOT_READY, Stop, fake_provider, page_worker
 
 ERROR_ANSWERS = {'operation error': {'error': 'provider_operation_failed'},  # ProviderOperationError
                  'unavailable': {'error': 'media_unavailable'}}  # ProviderUnavailable
