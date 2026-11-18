@@ -34,7 +34,8 @@ def reference(value):
             # Validate malformed brackets/ports too; no network or URL resolution.
             _ = url.port
             return value
-        if re.fullmatch(r'codex://threads/[0-9a-fA-F-]{36}', value):
+        # Canonical 8-4-4-4-12 text only: UUID() alone ignores where the hyphens are.
+        if re.fullmatch(r'codex://threads/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', value):
             uuid_value(url.path.removeprefix('/'))
             return value
         if re.fullmatch(r'urn:personal-os:(project|task|record):[a-zA-Z0-9_.-]{1,128}', value):
