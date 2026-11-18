@@ -49,6 +49,8 @@ MODULE_REPORTS = {
     # `go test -json` streams of the `go` job, published as result rows (go_results), not JUnit.
     "whatsmeow": ("whatsmeow.json", "go", "whatsapp/whatsmeow"),
     "release_router": ("release-router.json", "go", "services/release-router"),
+    # The attestation verifier's own Go tests, one row per test (the root Python wrapper still runs them too).
+    "attest_verify": ("attest-verify.json", "go", "tools/attest-verify"),
     # DK65: hosted macOS and Windows jobs run the one platform-only case of a Linux module natively, under that
     # case's canonical identity; the Linux report keeps its own SKIP of it. Published in the second report phase.
     "android_vision": ("android-vision.xml", "python", "services/android"),

@@ -28,8 +28,17 @@ GO_IDENTITIES = json.loads((ROOT / "tests/fixtures/tiden-go-identities.json").re
 def go_test(check):
     """The package and the name of one real top-level test of a Go check's module."""
     module = tiden_ci.go_module_of(ROOT, check)
-    return module, next(item["title"] for item in GO_IDENTITIES
-                        if item["signature"].startswith(module + "::") and "/" not in item["title"])
+    frozen = (item["title"] for item in GO_IDENTITIES if item["signature"].startswith(module + "::") and "/" not in item["title"])
+    if check == "attest_verify":  # DK68: no historical Tiden identity yet, so one real declared test, never an invented name
+        found = next(frozen, None)
+        if found is not None:
+            return module, found
+        for path in sorted((ROOT / tiden_ci.MODULE_REPORTS[check][2]).glob("*_test.go")):
+            for name in tiden_ci.GO_TEST_FUNCTION.findall(path.read_text()):
+                if name.startswith("Test"):
+                    return module, name
+        raise ValueError("the attestation verifier declares no Go test")
+    return module, next(frozen)
 
 
 def go_stream(check, action="pass"):

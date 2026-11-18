@@ -54,11 +54,13 @@ CATEGORIES = ("missing-spec", "helper", "trivial", "duplicate", "dead-code")
 ENTRY_FIELDS = {"caseId", "externalId", "category", "reason"}
 # Fixed suites, one path rule each, in this order; anything else is unassigned and fails by itself.
 SUITES = ("root-python", "calendar", "calls-frontend", "calls", "gateway", "android", "inference", "agent-runner", "platform-contracts",
-          "release-router-go", "whatsmeow-go", "whatsapp-node", "npm", "deedkit-js", "ci")
+          "release-router-go", "attest-verify", "whatsmeow-go", "whatsapp-node", "npm", "deedkit-js", "ci")
 CALLS_WITHOUT_PATH = ("s:tests.test_voice", "s:tests.test_webrtc")
 BARE_GO_TEST = re.compile(r"[^/]*_test\.go")
 # Tiden's Go reporter records bare file names, so the router's cases are told apart by their package.
 ROUTER_SIGNATURE = "s:github.com/GoSync-Inc/deedkit/services/release-router::"
+# The attestation verifier's Go rows are told apart the same way (its Go module report, tools/attest-verify).
+ATTEST_SIGNATURE = "s:github.com/GoSync-Inc/deedkit/tools/attest-verify::"
 SHA = re.compile(r"[0-9a-f]{40}")
 # The sync backlog (ANYM-503). The rollout commit, the base of the pull request that added the check: it and older
 # commits are not checked (sync runs before 1a4b78d carry no `Tiden sync <sha>` title).
@@ -83,6 +85,8 @@ def suite(case: dict) -> str:
     # The router's package signature wins over every path rule: its rows carry bare or arbitrary file names.
     if path.startswith("services/release-router/") or external.startswith(ROUTER_SIGNATURE):
         return "release-router-go"
+    if path.startswith("tools/attest-verify/") or external.startswith(ATTEST_SIGNATURE):
+        return "attest-verify"
     if path.startswith("tests/"):
         return "root-python"
     if path.startswith("services/calendar/"):
