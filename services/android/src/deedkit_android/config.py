@@ -78,6 +78,8 @@ class BBConversationConfig(Strict):
     environment_id: str = Field(min_length=1)
     host_id: str = Field(min_length=1)
     workspace: str
+    # The provider the configured thread must report (ANYM-993): an admin choice, never a caller's.
+    provider: Literal['codex', 'claude-code'] = 'codex'
 
 
 class Config(Strict):

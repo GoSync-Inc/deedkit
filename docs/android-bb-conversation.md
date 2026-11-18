@@ -51,9 +51,20 @@ The Android config accepts an optional `bb_conversation` object, absent by defau
   "project_id": "existing-project",
   "environment_id": "existing-environment",
   "host_id": "existing-machine",
-  "workspace": "/absolute/existing/workspace"
+  "workspace": "/absolute/existing/workspace",
+  "provider": "codex"
 }
 ```
+
+`provider` is the provider the configured thread must report: `codex` (the default when
+the key is absent) or `claude-code`. Any other value, including `null`, refuses the
+configuration. It is an admin setting only; a caller never chooses it per message. To
+run the same conversation path in an existing Claude Code thread, point `thread_id` at
+that thread and set `"provider": "claude-code"` together, with no work running in either
+thread; every other check stays. Rollback is the same object back on the original Codex
+thread with `"provider": "codex"` (or the key removed). Receipts stay bound to the thread
+that sent them: a request ID sent through one thread is refused, not resent, while the
+other is configured.
 
 Use the already authorized principal/device and the verified existing BB target;
 do not copy credentials into this object. Preserve existing native/model pins,
