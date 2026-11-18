@@ -55,7 +55,9 @@ The native Go suites reach Tiden through the `checks / go` job (ANYM-421): it
 runs `go test -race -count=1 -json ./...` in `whatsapp/whatsmeow` and in
 `services/release-router` and uploads both streams in its `ci-evidence-go`
 fragment as module checks `deedkit-ci::whatsmeow` and
-`deedkit-ci::release_router`. The suites also still run in ci.yml's `native`
+`deedkit-ci::release_router`. The same job runs the attestation verifier's own Go tests
+(`tools/attest-verify`) the same way, as module check `deedkit-ci::attest_verify`, one row per test and subtest;
+`tests/test_attest_verify.py` still runs them too. The suites also still run in ci.yml's `native`
 job, which production promotion requires; a job of another workflow cannot feed
 this evidence. The complete Python module `tests/test_tiden_ci.py` runs once in
 this Go job after both native suites, using their fresh streams for its frozen

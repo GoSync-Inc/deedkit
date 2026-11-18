@@ -735,6 +735,7 @@ jobs:
           cache-dependency-path: |
             whatsapp/whatsmeow/go.sum
             services/release-router/go.sum
+            tools/attest-verify/go.sum
       - name: Check the whatsmeow fork against upstream and fork.patch
         id: whatsmeow_fork
         run: python3 scripts/check_whatsmeow_fork.py
@@ -755,6 +756,15 @@ jobs:
         if: ${{ !cancelled() }}
         working-directory: services/release-router
         run: go test -race -count=1 -json ./... > "$RUNNER_TEMP/ci-evidence/release-router.json"
+      - name: Attestation verifier tests
+        # Its own Go tests, one row per test (module check attest_verify); tests/test_attest_verify.py still runs them.
+        id: attest_verify
+        if: ${{ !cancelled() }}
+        working-directory: tools/attest-verify
+        run: go test -race -count=1 -json ./... > "$RUNNER_TEMP/ci-evidence/attest-verify.json"
+      - name: Name the failed attestation verifier tests in the log
+        if: ${{ !cancelled() && steps.attest_verify.outcome == 'failure' }}
+        run: python3 ci-tools/scripts/go_failures.py "$RUNNER_TEMP/ci-evidence/attest-verify.json"
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         if: ${{ !cancelled() }}
         with: {python-version: '3.13'}
@@ -772,15 +782,17 @@ jobs:
           DEEDKIT_GO_SOURCE_SHA: ${{ steps.source.outputs.sha }}
           WHATSMEOW_OUTCOME: ${{ steps.whatsmeow.outcome }}
           RELEASE_ROUTER_OUTCOME: ${{ steps.release_router.outcome }}
+          ATTEST_VERIFY_OUTCOME: ${{ steps.attest_verify.outcome }}
         run: uv run pytest --tb=short --durations=25 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/python-go.xml" tests/test_tiden_ci.py
       - name: Record the Go outcomes
         if: ${{ always() }}
         env:
           WHATSMEOW_OUTCOME: ${{ steps.whatsmeow.outcome }}
           RELEASE_ROUTER_OUTCOME: ${{ steps.release_router.outcome }}
+          ATTEST_VERIFY_OUTCOME: ${{ steps.attest_verify.outcome }}
           PYTHON_REPORTING_OUTCOME: ${{ steps.python_reporting.outcome }}
         run: |
-          python3 -c 'import json, os, pathlib; pathlib.Path(os.environ["RUNNER_TEMP"], "ci-evidence", "outcomes.json").write_text(json.dumps({"module_checks": {"whatsmeow": os.environ["WHATSMEOW_OUTCOME"], "release_router": os.environ["RELEASE_ROUTER_OUTCOME"]}, "checks": {"python": os.environ["PYTHON_REPORTING_OUTCOME"]}}))'
+          python3 -c 'import json, os, pathlib; pathlib.Path(os.environ["RUNNER_TEMP"], "ci-evidence", "outcomes.json").write_text(json.dumps({"module_checks": {"whatsmeow": os.environ["WHATSMEOW_OUTCOME"], "release_router": os.environ["RELEASE_ROUTER_OUTCOME"], "attest_verify": os.environ["ATTEST_VERIFY_OUTCOME"]}, "checks": {"python": os.environ["PYTHON_REPORTING_OUTCOME"]}}))'
       - name: Retain Go evidence even when a test fails
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

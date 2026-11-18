@@ -108,7 +108,7 @@ def evidence_for(tmp_path, name, commit, reports):
     """Synthetic fragments of every producer for `commit`, assembled and prepared by the repository's own tool."""
     # The drill prepares against the archived tree, so the Go streams name its real modules and tests.
     fragments = evidence_fragments(tmp_path / name, verify_files=VERIFY_REPORTS,
-                                   go_streams={check: go_stream(check) for check in ("whatsmeow", "release_router")})
+                                   go_streams={check: go_stream(check) for check in ("whatsmeow", "release_router", "attest_verify")})
     for path in fragments.rglob("*"):
         if path.is_file():
             path.write_text(path.read_text().replace("a" * 40, commit))
