@@ -7,12 +7,12 @@ privacy choice or test identity.
 
 | Spec | Correction | Authority or existing proof |
 |---|---|---|
-| ANYM-391 | State the receipt journal's existing 1000-entry and 4 MiB bounds; replace the stale statement that the entry bound is untested. | `TestNativeSendReceiptJournalIsBoundedTo1000Entries`, TC-10764: entry 1000 succeeds, the next is `spool_full`, and 1000 remain. The older byte-bound proof stays. |
-| ANYM-393 | Remove the stale “not asserted” annotation from the 1024-credential upload-rate bound. | `test_upload_rate_state_tracks_at_most_1024_credentials`, TC-4047: a new credential is refused while all 1024 are active and admitted after the idle interval. |
-| ANYM-402 | Remove the stale “not asserted” annotations for API and calendar probes using a specific bind address. | `test_api_healthcheck_requests_a_specific_bind_address`, TC-8114, and `test_calendar_healthcheck_requests_a_specific_bind_address`, TC-11731. |
+| ANYM-391 | State the receipt journal's existing 1000-entry and 4 MiB bounds; replace the stale statement that the entry bound is untested. | `TestNativeSendReceiptJournalIsBoundedTo1000Entries`, test UUID `a5aa5041-1cb8-40cb-acf7-63d761aa9a36`: entry 1000 succeeds, the next is `spool_full`, and 1000 remain. The older byte-bound proof stays. |
+| ANYM-393 | Remove the stale “not asserted” annotation from the 1024-credential upload-rate bound. | `test_upload_rate_state_tracks_at_most_1024_credentials`, test UUID `df8045e5-5501-4403-8c27-38413fe87a02`: a new credential is refused while all 1024 are active and admitted after the idle interval. |
+| ANYM-402 | Remove the stale “not asserted” annotations for API and calendar probes using a specific bind address. | `test_api_healthcheck_requests_a_specific_bind_address`, test UUID `700d57e2-08ec-4b58-bec9-3be3b9c1336d`, and `test_calendar_healthcheck_requests_a_specific_bind_address`, test UUID `52e3d870-b9bd-4737-bc81-16bc4fc899c5`. |
 | ANYM-70 | Include `deedkit_inference`, including audio, under its existing local-inference contract; state the adopted document default, audio maximum and mini timeout. | ANYM-685 criterion 1; ANYM-697 “Profile limits”; ANYM-702 “Document bound”. |
 | ANYM-185 | Reconcile the broad matcher-role denials with the already adopted, narrow retention reads, deletes and progress fields. | ANYM-446 criterion 7 and ANYM-447 criteria 1, 3 and 6. Other denials remain. |
-| ANYM-130 | Describe the migration range and newer-database refusal relative to the runtime's newest schema, retaining version 35 as the dated 2026-10-16 source review. | Existing immutable-migration rule and `test_a_database_newer_than_the_runtime_is_refused_and_nothing_changes`, TC-7736. |
+| ANYM-130 | Describe the migration range and newer-database refusal relative to the runtime's newest schema, retaining version 35 as the dated 2026-10-16 source review. | Existing immutable-migration rule and `test_a_database_newer_than_the_runtime_is_refused_and_nothing_changes`, test UUID `09a9e1e0-b20e-445e-ab5c-67cac935b270`. |
 
 The evidence annotations for ANYM-391, ANYM-393 and ANYM-402 retain their dated
 History entries and append the later linked proof. Their statuses remain
@@ -53,3 +53,6 @@ Decided by agents: reconcile stale evidence annotations, already adopted
 follow-ups and a dated schema number without changing what the user gets.
 Undo is a new PR-owned review branch restoring the previous content, with the
 same identities, statuses, sources and test links.
+
+Evidence references use persistent test UUIDs. A trace view's `TC-*` display
+caption is not used as the identity or as a canonical case number.
