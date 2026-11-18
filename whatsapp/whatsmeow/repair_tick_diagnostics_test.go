@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -159,21 +160,16 @@ func TestRepairDiagnosticNamesEachRefusedWriteWithoutItsErrorText(t *testing.T) 
 // spec: ANYM-809
 func TestRepairDiagnosticNamesAWriteThatEndedWithItsStatementContext(t *testing.T) {
 	s, p := diagnosticPass(t)
-	p.stmt = 200 * time.Millisecond
-	other, err := sql.Open("sqlite3", sqliteDSN(filepath.Join(s.Config.SessionDirectory, "capture.sqlite")))
-	if err != nil {
-		t.Fatal(err)
+	reached := 0
+	// At the load's first write, and only there, the statement waits for its own context to end.
+	hookWrite(t, s, "CREATE TABLE IF NOT EXISTS repair_progress", func(ctx context.Context) {
+		reached++
+		<-ctx.Done()
+	})
+	p.tick(context.Background())
+	if reached != 1 {
+		t.Fatal("the write was not reached", reached)
 	}
-	defer other.Close()
-	tx, err := other.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tx.Rollback()
-	if _, err = tx.Exec("UPDATE history_requests SET last_ms=last_ms"); err != nil { // the RESERVED lock: reads go on
-		t.Fatal(err)
-	}
-	p.tick(context.Background()) // the load's first write waits for the lock past its statement context
 	refusedWith(t, p, "load_create", "deadline")
 	if got := p.storageDiagnostic(); !strings.Contains(got, " elapsed=ge_2s ") && !strings.Contains(got, " elapsed=lt_2s ") &&
 		!strings.Contains(got, " elapsed=lt_500ms ") {
@@ -210,22 +206,75 @@ func TestRepairDiagnosticBelongsToTheTickOfTheErrorItExplains(t *testing.T) {
 // spec: ANYM-809
 func TestRepairDiagnosticNamesAWriteEndedByTheCallersCancellation(t *testing.T) {
 	s, p := diagnosticPass(t)
-	other, err := sql.Open("sqlite3", sqliteDSN(filepath.Join(s.Config.SessionDirectory, "capture.sqlite")))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer other.Close()
-	tx, err := other.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tx.Rollback()
-	if _, err = tx.Exec("UPDATE history_requests SET last_ms=last_ms"); err != nil {
-		t.Fatal(err)
-	}
 	ctx, cancel := context.WithCancel(context.Background())
-	timer := time.AfterFunc(100*time.Millisecond, cancel) // while the load's first write waits, well inside p.stmt
-	defer timer.Stop()
+	defer cancel()
+	reached := 0
+	// The caller cancels exactly when the load's first write starts; the driver then ends that statement.
+	hookWrite(t, s, "CREATE TABLE IF NOT EXISTS repair_progress", func(context.Context) {
+		reached++
+		cancel()
+	})
 	p.tick(ctx)
+	if reached != 1 {
+		t.Fatal("the write was not reached", reached)
+	}
 	refusedWith(t, p, "load_create", "canceled")
+}
+
+// hookWrite reopens the store's database through the same SQLite driver, wrapped so that a statement whose text
+// starts with prefix runs hook inside its own Exec call, with its own context, before the driver runs it. Test-local:
+// one connection, the store's DSN and page ceiling, nothing else changed.
+func hookWrite(t *testing.T, s *CaptureStore, prefix string, hook func(context.Context)) {
+	t.Helper()
+	connector := hookedConnector{dsn: sqliteDSN(filepath.Join(s.Config.SessionDirectory, "capture.sqlite")), drv: s.db.Driver(),
+		hook: func(ctx context.Context, query string) {
+			if strings.HasPrefix(query, prefix) {
+				hook(ctx)
+			}
+		}}
+	db := sql.OpenDB(connector)
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec("PRAGMA max_page_count=131072"); err != nil {
+		t.Fatal(err)
+	}
+	s.db.Close()
+	s.db = db
+}
+
+type hookedConnector struct {
+	dsn  string
+	drv  driver.Driver
+	hook func(ctx context.Context, query string)
+}
+
+func (c hookedConnector) Connect(context.Context) (driver.Conn, error) {
+	conn, err := c.drv.Open(c.dsn)
+	if err != nil {
+		return nil, err
+	}
+	return hookedConn{conn, c.hook}, nil
+}
+
+func (c hookedConnector) Driver() driver.Driver { return c.drv }
+
+type hookedConn struct {
+	driver.Conn
+	hook func(ctx context.Context, query string)
+}
+
+func (c hookedConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	c.hook(ctx, query)
+	return c.Conn.(driver.ExecerContext).ExecContext(ctx, query, args)
+}
+
+func (c hookedConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	return c.Conn.(driver.QueryerContext).QueryContext(ctx, query, args)
+}
+
+func (c hookedConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	return c.Conn.(driver.ConnPrepareContext).PrepareContext(ctx, query)
+}
+
+func (c hookedConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	return c.Conn.(driver.ConnBeginTx).BeginTx(ctx, opts)
 }
