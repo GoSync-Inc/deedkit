@@ -12,6 +12,34 @@ from test_usb_order_restart_recovery import count, forwards
 from test_usb_order_restart_recovery import rig  # noqa: F401 - shared synthetic listener/ADB fixture
 
 
+def observed(service, synthetic, roles):
+    """Bounded synthetic state for a failed wait: forward rows, USB entries, runs, handles and fake ADB calls."""
+    agents, role = service.app.state.agents, lambda request: roles.get(request, 'other')
+    state = {}
+    try:
+        state['forwards'] = [(role(r['request_id']), r['state'], r['collection'], r['reason'], r['recovery'])
+                             for r in forwards(service)]
+        state['entries'] = [(role(e.task), e.handle is not None, e.receipt is not None, e.connector and (
+            e.connector.state, e.connector.reason, e.connector.cleanup, e.connector.task and e.connector.task.done()))
+            for e in list(agents.usb.entries.values())]
+        state['ended'] = sorted(role(task) for _, task in list(agents.usb.ended))
+        state['runs'] = sorted((role(r.id), r.state) for r in list(agents.runs.values()))
+        state['handles'] = sorted((role(task), h.reason) for (_, task), h in list(agents.supervision.handles.items()))
+        state['calls'] = {flag: count(synthetic, flag) for flag in ('--no-rebind', '--remove', '--list')}
+        state['table'], state['packages'] = len(synthetic.table), list(synthetic.phone.packages)
+    except (RuntimeError, AttributeError, KeyError) as error:  # a concurrent change: report what was read
+        state['incomplete'] = type(error).__name__
+    return state
+
+
+def until_or_state(predicate, service, synthetic, roles):
+    """until(), adding the bounded synthetic state to its timeout message."""
+    try:
+        return until(predicate)
+    except AssertionError as error:
+        raise AssertionError('%s; state=%r' % (error, observed(service, synthetic, roles))) from None
+
+
 # spec: ANYM-997
 def test_an_ended_request_handle_never_reacquires_while_the_new_request_awaits_admission(rig, monkeypatch):  # noqa: F811
     from deedkit_android import app_skill_bundle
@@ -48,8 +76,9 @@ def test_an_ended_request_handle_never_reacquires_while_the_new_request_awaits_a
             assert count(rig, '--no-rebind') == 1
             release.set()
             service.finished(second)
-            old, new = until(lambda: (lambda r: r if len(r) == 2 and r[0]['state'] == 'closed' else None)(
-                forwards(service)))
+            # Later ordinary acquisitions may add rows; the reconnect outcome stays in the first two.
+            old, new = until_or_state(lambda: (lambda r: r[:2] if len(r) >= 2 and r[0]['state'] == 'closed' else None)(
+                forwards(service)), service, rig, {first: 'first', second: 'second'})
             assert old['id'] == lost['id'] and new['request_id'] == second
     finally:
         release.set()
