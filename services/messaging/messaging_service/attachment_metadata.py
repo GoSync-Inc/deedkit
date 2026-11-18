@@ -102,7 +102,7 @@ def attachment_fields(row, *, original_present=None):
             # Why the job waits now, not a code recorded while it was eligible (ANYM-284).
             reason=eligibility;action=describe(eligibility)['next_action'];phase=WAITING[eligibility]
         elif error:
-            phase='blocked' if error in ('paused_storage','disk_reserve','media_size_limit') else download_status
+            phase='blocked' if error in ('paused_storage','disk_reserve','media_size_limit','size_limit') else download_status
             action=describe(error,job_state=diagnostic_state)['next_action']
         else:
             action='get_attachment' if requested or state=='leased' else 'request_file_download' if state=='queued' else 'get_sync_status_for_chat'
@@ -183,7 +183,8 @@ def attachment_fields(row, *, original_present=None):
 # attachments. media_view derives it from attachment_fields' item only, so the two cannot disagree.
 MEDIA_STATES = ('queued', 'available_on_request', 'ready', 'failed', 'superseded', 'blocked')
 STAGE_STATES = ('queued', 'available_on_request', 'ready', 'failed', 'unsupported', 'not_applicable')
-BLOCKED_REASONS = {'collection_excluded': 'collection_excluded', 'media_size_limit': 'size_limit'}  # else policy
+BLOCKED_REASONS = {'collection_excluded': 'collection_excluded', 'media_size_limit': 'size_limit',
+    'size_limit': 'size_limit'}  # else policy; producers store size_limit (archive claim, collector fail_media)
 # Later stages of a file that will not reach them by itself: waiting for a request, failed, or never.
 _LATER = {'available_on_request': 'available_on_request', 'failed': 'failed', 'superseded': 'not_applicable',
     'blocked': 'not_applicable'}
