@@ -127,7 +127,7 @@ func runRepairToEnd(t *testing.T, p *repairPass) {
 	for i := 0; i < 1000 && !p.done; i++ {
 		p.tick(context.Background())
 		if p.lastError != "" {
-			t.Fatal("repair pass error", p.lastError)
+			t.Fatal("repair pass error", p.lastError, p.storageDiagnostic())
 		}
 	}
 	if !p.done {
