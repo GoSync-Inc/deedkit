@@ -13,6 +13,10 @@ def _npm_entries():
     return [entry for entry in config.get("IgnoredVulns", ()) if entry["id"].startswith("GHSA-")]
 
 
+# reads: packages/deedkit/package-lock.json
+# reads: packages/npm/package-lock.json
+# reads: services/calls/frontend/package-lock.json
+# reads: whatsapp/package-lock.json
 def _copies(lock, package):
     packages = json.loads((ROOT / lock).read_text()).get("packages", {})
     return {path: meta for path, meta in packages.items() if path.split("node_modules/")[-1] == package}
@@ -28,10 +32,6 @@ def test_an_npm_allowlist_entry_covers_only_dev_copies_in_the_lockfiles_it_names
         package, version = entry["reason"].split()[:2]
         found = False
         for lock in locks:
-            # reads: packages/deedkit/package-lock.json
-            # reads: packages/npm/package-lock.json
-            # reads: services/calls/frontend/package-lock.json
-            # reads: whatsapp/package-lock.json
             copies = _copies(lock, package)
             if not copies:
                 continue
