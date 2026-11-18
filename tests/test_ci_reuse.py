@@ -33,6 +33,9 @@ def go_test(check):
         found = next(frozen, None)
         if found is not None:
             return module, found
+        # reads: tools/attest-verify/main_test.go
+        # reads: tools/attest-verify/registry_test.go
+        # reads: tools/attest-verify/verify_test.go
         for path in sorted((ROOT / tiden_ci.MODULE_REPORTS[check][2]).glob("*_test.go")):
             for name in tiden_ci.GO_TEST_FUNCTION.findall(path.read_text()):
                 if name.startswith("Test"):

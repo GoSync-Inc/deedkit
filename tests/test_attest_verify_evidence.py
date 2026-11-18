@@ -21,7 +21,10 @@ URL = "https://github.com/example/repo/actions/runs/1/attempts/1"
 
 def declared(test):
     """The `_test.go` file of tools/attest-verify that declares this real top-level test."""
-    (file,) = [path.name for path in (ROOT / "tools/attest-verify").glob("*_test.go")
+    # reads: tools/attest-verify/main_test.go
+    # reads: tools/attest-verify/registry_test.go
+    # reads: tools/attest-verify/verify_test.go
+    (file,) =[path.name for path in (ROOT / "tools/attest-verify").glob("*_test.go")
                if re.search(rf"^func {test}\(", path.read_text(), re.M)]
     return file
 
