@@ -272,18 +272,29 @@ class UsbLifecycle:
         candidates=[(r,False) for r in self.agents.runs.values() if r.state=='running' and getattr(r,'session',None)]
         candidates += [(h,True) for h in self.agents.supervision.handles.values()]
         for origin,handle in candidates[:32]:
-            key=(origin.owner,origin.device)
+            key,kept=(origin.owner,origin.device),None
             if key in self.entries:
                 previous=self.entries[key]
                 receipt=self.journal.db.execute('SELECT * FROM android_usb_forwards WHERE id=?',
                                                 (previous.receipt,)).fetchone()
                 # Retention can arrive after connector finish, before Entry.admit attached its handle.
                 # That handle is still the original request, never authority for another acquisition.
-                if (not previous.connector.task.done() or receipt is None or not self.journal.settled(receipt)
+                if not previous.connector.task.done():
+                    continue
+                # Ended before claiming the serial or calling bind: no receipt, forward or watch to settle.
+                # Only a different request replaces it; the ended request itself is never admitted again.
+                if previous.receipt is None and previous.connector.cleanup=='not_needed' and (
+                        previous.close_task is None or previous.close_task.done()):
+                    if (origin is previous.origin or origin is previous.handle
+                            or (origin.task if handle else origin.id)==previous.task):
+                        continue
+                    kept=previous  # stays until a new request below is actually admitted in its place
+                elif (receipt is None or not self.journal.settled(receipt)
                         or origin is previous.origin or origin is previous.handle
                         or handle and origin.task==previous.task):
                     continue
-                del self.entries[key]
+                else:
+                    del self.entries[key]
             try:
                 entry=Entry(self,origin,handle=handle)
                 if not entry.packages() or self.journal.blocked(entry):
@@ -296,6 +307,8 @@ class UsbLifecycle:
                 entry.connector.start()
             except Refused:
                 self.entries.pop(key,None)
+                if kept is not None:
+                    self.entries[key]=kept
 
     def stop(self, owner, task):
         for entry in self.entries.values():
