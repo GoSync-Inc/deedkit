@@ -1061,7 +1061,8 @@ rendered Compose service without `image`, `build` and the revision and input lab
 of its env files, bind-mounted files and the top-level secrets and configs it uses (definition and
 file). A directory mounted read-only is configuration and is hashed by content (each entry's path and
 mode, file content, link target; at most 2000 entries and 64 MiB, beyond that the service is always
-recreated); a writable mounted directory (sessions, spools, data) counts by path only. A version constant (`INPUT_VERSION`) is part of the digest, so a
+recreated); a writable mounted directory (sessions, spools, data) counts by path only, and so does the staged-upload
+root `/data/files/.uploads` the collectors mount read-only (the API writes it). A version constant (`INPUT_VERSION`) is part of the digest, so a
 change of the rule recreates every service once. A recreated service's container carries the digest as
 the label `io.deedkit.production.inputs`.
 
