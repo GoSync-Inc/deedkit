@@ -1,0 +1,134 @@
+name: Apple Vision corpus on macOS
+# ANYM-966: the one test that needs Apple Vision runs natively on a GitHub-hosted macOS runner, on the committed
+# synthetic screens (services/android/tests/fixtures/screens). The Linux android step keeps its own SKIP of the same
+# test; this job adds the real execution. Its fragment passes only with one executed, passed test: a skip (no
+# Vision), a failure, an error, any other test or no report fails the job. Called by ci.yml/checks.yml only.
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        type: string
+        default: ''
+      added_tests:
+        # ci.yml `added_list`: the files autoloop pull requests add, deleted before any test builds (ANYM-578).
+        type: string
+        default: ''
+    outputs:
+      source_sha:
+        description: The commit this job checked out and tested
+        value: ${{ jobs.vision.outputs.source_sha }}
+permissions:
+  contents: read
+jobs:
+  vision:
+    name: Apple Vision corpus (macOS)
+    runs-on: macos-15
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_ref }}
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: ci-tools
+      - name: Delete the files autoloop pull requests add to tests before anything collects a test
+        env:
+          ADDED_TESTS: ${{ inputs.added_tests }}
+        run: python3 ci-tools/scripts/added_tests.py strip --root . --root ci-tools --evidence "$RUNNER_TEMP/ci-evidence"
+      - name: Start evidence record
+        id: source
+        run: |
+          mkdir -p "$RUNNER_TEMP/ci-evidence" "$RUNNER_TEMP/native-log"
+          git rev-parse HEAD > "$RUNNER_TEMP/ci-evidence/source-sha"
+          echo "$GITHUB_RUN_ATTEMPT" > "$RUNNER_TEMP/ci-evidence/attempt"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with: {python-version: '3.13'}
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with: {version: '0.9.26'}
+      - name: Install the locked Android service environment with the vision extra
+        working-directory: services/android
+        run: |
+          uv sync --locked --group dev --extra vision
+          uv run --no-sync python -c 'import sys, platform; print(sys.version, platform.mac_ver()[0], platform.machine())'
+      - name: Apple Vision corpus character error rate and list items (ANYM-966)
+        id: test
+        # The same invocation form as the Linux android step, so the report normalizes to the same test identity.
+        # No package is fetched from here on; the test itself reads only committed fixtures.
+        working-directory: services/android
+        env:
+          UV_OFFLINE: '1'
+        run: |
+          uv run --no-sync pytest -p no:cacheprovider -o junit_family=xunit1 \
+            --junitxml="$RUNNER_TEMP/ci-evidence/android-vision.xml" \
+            'tests/test_screen_quality.py::test_vision_corpus_character_error_rate_and_list_items_meet_the_bar' \
+            2>&1 | tee "$RUNNER_TEMP/native-log/android-vision.log"
+      - name: Require exactly one executed and passed Vision test
+        if: ${{ always() && steps.source.outcome == 'success' }}
+        env:
+          REPORT: ${{ runner.temp }}/ci-evidence/android-vision.xml
+          MODULE: android_vision
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+          EXPECTED_CLASSNAME: tests.test_screen_quality
+          EXPECTED_NAME: test_vision_corpus_character_error_rate_and_list_items_meet_the_bar
+          EXPECTED_FILE: tests/test_screen_quality.py
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          report = Path(os.environ['REPORT'])
+          expected = (os.environ['EXPECTED_CLASSNAME'], os.environ['EXPECTED_NAME'],
+                      os.path.normcase(os.path.normpath(os.environ['EXPECTED_FILE'])))
+          problem = None
+          try:
+              cases = list(ET.parse(report).getroot().iter('testcase'))
+              if len(cases) != 1:
+                  problem = f'{len(cases)} test cases in the report, expected exactly one'
+              else:
+                  case = cases[0]
+                  identity = (case.get('classname'), case.get('name'), os.path.normcase(os.path.normpath(case.get('file') or '')))
+                  outcome = next((child for child in case if child.tag in ('failure', 'error', 'skipped')), None)
+                  if identity != expected:
+                      problem = f'unexpected test {identity}'
+                  elif outcome is not None:
+                      problem = f"the test {outcome.tag}: {(outcome.get('message') or '')[:300]}"
+          except (OSError, ET.ParseError) as exc:
+              problem = f'no readable report: {exc}'
+          if problem is None and os.environ['TEST_OUTCOME'] != 'success':
+              problem = f"the test step ended {os.environ['TEST_OUTCOME']}"
+          state = 'failure' if problem else 'success'
+          (report.parent / 'outcomes.json').write_text(json.dumps({'module_checks': {os.environ['MODULE']: state}}))
+          if problem:
+              print(f'::error title={os.environ["MODULE"]}::{problem}')
+              sys.exit(1)
+          print(f'{os.environ["MODULE"]}: 1 test executed and passed: {expected[0]}::{expected[1]}')
+          PY
+      - name: Retain the report fragment even when the test fails
+        # The evidence job reads `ci-evidence-*`; this fragment holds only its own control files, report and exclusions.
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-evidence-vision-macos
+          path: ${{ runner.temp }}/ci-evidence
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+      - name: Retain the original test log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-log-vision-macos
+          path: ${{ runner.temp }}/native-log
+          if-no-files-found: warn
+          retention-days: 14
+          overwrite: true

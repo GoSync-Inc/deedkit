@@ -39,6 +39,24 @@ def go_stream(check, action="pass"):
         {"Action": action, "Package": package, "Test": test, "Elapsed": 0.01}, {"Action": action, "Package": package}))
 
 
+def native_fragments(fragments, sha, attempt):
+    """The hosted macOS and Windows jobs' fragments (DK65): each its one canonical case, passed."""
+    workspace = "D:\\a\\deedkit\\deedkit"
+    for job, (module,) in ((job, tiden_ci.FRAGMENTS[job][0]) for job in ("vision-macos", "deedkit-windows")):
+        fragment = fragments / f"ci-evidence-{job}"
+        fragment.mkdir()
+        (fragment / "source-sha").write_text(sha + "\n")
+        (fragment / "attempt").write_text(attempt + "\n")
+        (node,) = tiden_ci.NATIVE_EXECUTIONS[module]
+        file, name = node.split("::")
+        prefix = tiden_ci.MODULE_REPORTS[module][2] + "/"
+        source = (workspace + "\\" + file.replace("/", "\\")) if module in tiden_ci.WINDOWS_MODULES else file.removeprefix(prefix)
+        (fragment / tiden_ci.MODULE_REPORTS[module][0]).write_text(f'<testsuite><testcase name="{name}" file="{source}"/></testsuite>')
+        (fragment / "outcomes.json").write_text(json.dumps({"module_checks": {module: "success"}}))
+        if module in tiden_ci.WINDOWS_MODULES:
+            (fragment / "checkout-root").write_text(workspace + "\n")
+
+
 def queue_evidence(tmp_path, attempt="2", sha=SHA, git_branch=QUEUE_BRANCH, event="merge_group", tiden_branch="",
                    producer_url=PRODUCER_URL, shard_outcomes=None, shard_reports=None, exclusions=None):
     """The `ci-evidence` directory a passing merge queue run uploads, built by the real assemble and prepare.
@@ -88,6 +106,7 @@ def queue_evidence(tmp_path, attempt="2", sha=SHA, git_branch=QUEUE_BRANCH, even
     (added / "attempt").write_text(attempt + "\n")
     (added / "added.json").write_text(json.dumps({"result": "none", "runs": []}))
     (added / "outcomes.json").write_text(json.dumps({"module_checks": {}}))
+    native_fragments(fragments, sha, attempt)
     for fragment in fragments.iterdir():
         (fragment / "exclusions.json").write_text(json.dumps(exclusions or {"files": [], "provenance": []}, sort_keys=True))
     evidence = tmp_path / "queue-evidence"
@@ -516,11 +535,17 @@ def test_the_push_run_publishes_the_queue_evidence_to_main_under_its_own_run_url
     assert create[create.index("--description") + 1] == PUSH_URL
     assert json.loads((published / "tiden-route.json").read_text()) == {"branch": "main", "source": "explicit",
                                                                           "tested_in": PRODUCER_URL}
-    report = next(call for call in calls if call[1:3] == ["run", "report"])
+    runs = [call[1:3] for call in calls if call[1] == "run"]
+    report, platform = (call for call in calls if call[1:3] == ["run", "report"])
     names = sorted(Path(path).name for path in report[4:report.index("--product-id")])
     # The Go result rows go out re-identified for this push run (published-normalized-<check>.json).
     assert names == sorted([("published-" if check in tiden_ci.GO_MODULES else "") + tiden_ci.normalized_report(check)
-                            for check in ci_reuse.REPORT_CHECKS] + ["ci-checks-published.json"])
+                            for check in ci_reuse.REPORT_CHECKS if check not in tiden_ci.NATIVE_MODULES]
+                           + ["ci-checks-published.json"])
+    # DK65: the native reports go in one second call, in NATIVE_MODULES order, after the first and before complete.
+    assert [Path(path).name for path in platform[4:platform.index("--product-id")]] == [
+        tiden_ci.normalized_report(check) for check in tiden_ci.NATIVE_MODULES]
+    assert runs.index(["run", "complete"]) == runs.index(["run", "report"]) + 2 and runs.count(["run", "report"]) == 2
     # Executions and outcomes are the queue run's; the check rows carry this push run's IDs.
     rows = json.loads((published / "ci-checks-published.json").read_text())
     queue_rows = json.loads((evidence / "ci-checks.json").read_text())
