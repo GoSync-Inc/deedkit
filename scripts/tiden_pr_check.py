@@ -74,6 +74,11 @@ PREVIEW_CHANGES = ("additions", "modifications")
 PREVIEW_EMPTY = ("deletions", "testAdditions", "testModifications", "testDeletions", "testDuplicates",
                  "componentAdditions", "componentModifications", "componentDeletions")
 PREVIEW_OTHER = ("stats", "intentSession", "blockingSessions", "hasRequirementChanges", "autoMerge")
+# CLI 0.54 adds schema metadata (read 2026-11-18 from a retained preview): `schemaVersion` 3 with a `previewDigest` of
+# 64 lowercase hex. Only that exact pair is known; either half alone or any other value refuses. The digest's form is
+# checked, never its value: it is not verified here, and no merge call passes it.
+PREVIEW_SCHEMA = {"schemaVersion": 3}
+PREVIEW_DIGEST = re.compile(r"[0-9a-f]{64}")
 # Tests that verify no spec, as `<path>::<test>` patterns with the reason; widening it is a reviewed code change.
 NO_SPEC: tuple[tuple[str, str], ...] = ()
 TIMEOUT = 120
@@ -396,7 +401,12 @@ def preview_number(item: object) -> int:
 def preview_numbers(preview: dict, name: str) -> tuple[set[int], list[str]]:
     """The specs a merge preview changes, and the forbidden change classes it holds (anything but additions and
     modifications of specs). A forbidden preview returns no numbers; an unknown or malformed shape refuses."""
-    unknown = sorted(set(preview) - {*PREVIEW_CHANGES, *PREVIEW_EMPTY, *PREVIEW_OTHER})
+    metadata = {key for key in ("schemaVersion", "previewDigest") if key in preview}
+    if metadata and (len(metadata) != 2 or type(preview["schemaVersion"]) is not int
+                     or preview["schemaVersion"] != PREVIEW_SCHEMA["schemaVersion"]
+                     or not isinstance(preview["previewDigest"], str) or not PREVIEW_DIGEST.fullmatch(preview["previewDigest"])):
+        raise Refused(f"the preview of {name} has unsupported schema metadata")
+    unknown = sorted(set(preview) - {*PREVIEW_CHANGES, *PREVIEW_EMPTY, *PREVIEW_OTHER, *metadata})
     if unknown:
         raise Refused(f"the preview of {name} has unknown fields ({', '.join(map(shown, unknown))})")
     lists = {key: preview.get(key, []) for key in (*PREVIEW_CHANGES, *PREVIEW_EMPTY)}
