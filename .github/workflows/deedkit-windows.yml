@@ -1,0 +1,129 @@
+name: DeedKit JavaScript client on Windows
+# ANYM-261: the one packages/deedkit test that runs only on win32 ('a Windows alternate-stream output name is
+# refused', test/download.test.js) runs natively on a GitHub-hosted Windows runner with Node 24. The name pattern
+# selects that test alone: Node's JUnit reporter writes no row for a test the pattern deselects, so the report holds
+# one actual execution and the Linux run keeps its own 38 results, the SKIP of this test included. Its fetch is a
+# fake; nothing reaches the network. The fragment passes only with that one test executed and passed: a skip, a
+# failure, any other test or no report fails the job. Called by ci.yml/checks.yml only.
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        type: string
+        default: ''
+      added_tests:
+        # ci.yml `added_list`: the files autoloop pull requests add, deleted before any test builds (ANYM-578).
+        type: string
+        default: ''
+    outputs:
+      source_sha:
+        description: The commit this job checked out and tested
+        value: ${{ jobs.windows.outputs.source_sha }}
+permissions:
+  contents: read
+jobs:
+  windows:
+    name: DeedKit Windows-only test
+    runs-on: windows-2025
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_ref }}
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: ci-tools
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with: {python-version: '3.13'}
+      - name: Delete the files autoloop pull requests add to tests before anything collects a test
+        env:
+          ADDED_TESTS: ${{ inputs.added_tests }}
+        run: python ci-tools/scripts/added_tests.py strip --root . --root ci-tools --evidence "$RUNNER_TEMP/ci-evidence"
+      - name: Start evidence record
+        id: source
+        # checkout-root is the Windows path the report's absolute `file` attributes start with.
+        run: |
+          mkdir -p "$RUNNER_TEMP/ci-evidence" "$RUNNER_TEMP/native-log"
+          git rev-parse HEAD > "$RUNNER_TEMP/ci-evidence/source-sha"
+          echo "$GITHUB_RUN_ATTEMPT" > "$RUNNER_TEMP/ci-evidence/attempt"
+          printf '%s\n' "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/ci-evidence/checkout-root"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with: {node-version: '24'}
+      - name: Windows alternate-stream output name test (ANYM-261)
+        id: test
+        working-directory: packages/deedkit
+        run: |
+          node --version | tee "$RUNNER_TEMP/native-log/deedkit-npm-windows.log"
+          node --test --test-reporter=junit --test-name-pattern='^a Windows alternate-stream output name is refused$' \
+            test/download.test.js > "$RUNNER_TEMP/ci-evidence/deedkit-npm-windows.xml" \
+            2> >(tee -a "$RUNNER_TEMP/native-log/deedkit-npm-windows.log" >&2)
+      - name: Require exactly one executed and passed Windows test
+        if: ${{ always() && steps.source.outcome == 'success' }}
+        env:
+          REPORT: ${{ runner.temp }}/ci-evidence/deedkit-npm-windows.xml
+          MODULE: deedkit_npm_windows
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+          EXPECTED_CLASSNAME: test
+          EXPECTED_NAME: a Windows alternate-stream output name is refused
+          EXPECTED_FILE: ${{ github.workspace }}/packages/deedkit/test/download.test.js
+        run: |
+          python - <<'PY'
+          import json, os, sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          report = Path(os.environ['REPORT'])
+          expected = (os.environ['EXPECTED_CLASSNAME'], os.environ['EXPECTED_NAME'],
+                      os.path.normcase(os.path.normpath(os.environ['EXPECTED_FILE'])))
+          problem = None
+          try:
+              cases = list(ET.parse(report).getroot().iter('testcase'))
+              if len(cases) != 1:
+                  problem = f'{len(cases)} test cases in the report, expected exactly one'
+              else:
+                  case = cases[0]
+                  identity = (case.get('classname'), case.get('name'), os.path.normcase(os.path.normpath(case.get('file') or '')))
+                  outcome = next((child for child in case if child.tag in ('failure', 'error', 'skipped')), None)
+                  if identity != expected:
+                      problem = f'unexpected test {identity}'
+                  elif outcome is not None:
+                      problem = f"the test {outcome.tag}: {(outcome.get('message') or '')[:300]}"
+          except (OSError, ET.ParseError) as exc:
+              problem = f'no readable report: {exc}'
+          if problem is None and os.environ['TEST_OUTCOME'] != 'success':
+              problem = f"the test step ended {os.environ['TEST_OUTCOME']}"
+          state = 'failure' if problem else 'success'
+          (report.parent / 'outcomes.json').write_text(json.dumps({'module_checks': {os.environ['MODULE']: state}}))
+          if problem:
+              print(f'::error title={os.environ["MODULE"]}::{problem}')
+              sys.exit(1)
+          print(f'{os.environ["MODULE"]}: 1 test executed and passed: {expected[1]}')
+          PY
+      - name: Retain the report fragment even when the test fails
+        # The evidence job reads `ci-evidence-*`; this fragment holds only its own control files, report and exclusions.
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-evidence-deedkit-windows
+          path: ${{ runner.temp }}/ci-evidence
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+      - name: Retain the original test log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-log-deedkit-windows
+          path: ${{ runner.temp }}/native-log
+          if-no-files-found: warn
+          retention-days: 14
+          overwrite: true
