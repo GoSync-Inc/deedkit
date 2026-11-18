@@ -166,6 +166,7 @@ def test_the_apply_input_check_ignores_upload_churn_and_still_refuses_a_changed_
         p.check_inputs(project, item, document)
 
 
+# spec: ANYM-895
 def test_the_staged_upload_target_is_the_one_every_compose_file_and_the_store_declare():
     assert p.STAGED_UPLOADS == UPLOADS
     targets, files = set(), set()
