@@ -158,9 +158,10 @@ def locked(state):
 # --- pull --------------------------------------------------------------------------------------------------------
 
 # A failed `ssh` names only closed words (ANYM-569: tick output carries IDs, counts and statuses only): which fixed
-# remote operation it was, read from the argv's known literal positions, and which known ssh client error its stderr
-# shows. Exit 255 is ssh's own failure; any other exit is the remote command's, whose stderr is never read. Nothing
-# from the host, paths, the command line, stdin, stdout or stderr is copied; an unknown shape is `unknown`.
+# remote operation it was, read from the argv's known literal positions, and which known ssh client error pattern its
+# stderr matches. Exit 255 is usually ssh's own failure, but a remote command may also return 255: a category is an
+# observed pattern, not proof of a transport, auth or agent cause. Any other exit is `remote-exit`, its stderr unread.
+# Nothing from the host, paths, the command line, stdin, stdout or stderr is copied; an unknown shape is `unknown`.
 SSH_OPERATIONS = ('export-feedback', 'get-feedback-projection', 'record-feedback-projection')
 SSH_ERRORS = (  # first match wins: the more specific client errors come first
     ('host-key', re.compile(r'Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED')),
@@ -191,7 +192,7 @@ def ssh_operation(argv):
 
 
 def ssh_failure(done):
-    """`ssh`'s own closed stderr category for exit 255; `remote-exit` for the remote command's exit; never text."""
+    """A closed stderr pattern category for exit 255 (observed, not a proven cause); `remote-exit` otherwise; never text."""
     if done is None:
         return 'none'
     if done.returncode != 255:
