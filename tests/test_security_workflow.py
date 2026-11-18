@@ -115,9 +115,11 @@ def test_verify_fails_on_a_stale_uv_lock_and_keeps_the_seven_check_steps(tmp_pat
 def test_verify_runs_the_deedkit_package_tests():
     steps = _verify_steps()
     step = next(step for step in steps if step.get("id") == "deedkit_npm")
-    assert step["run"] == "npm test --prefix packages/deedkit"
+    # ANYM-261: the same `npm test` set through the native JUnit reporter into verify's evidence.
+    assert step["run"] == 'node --test --test-reporter=junit test/*.test.js > "$RUNNER_TEMP/ci-evidence/deedkit-npm.xml"'
+    assert step["working-directory"] == "packages/deedkit"
     assert step["if"] == "${{ !cancelled() }}"
-    assert "continue-on-error" not in step and "working-directory" not in step
+    assert "continue-on-error" not in step
 
 
 # spec: ANYM-324

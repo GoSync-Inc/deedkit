@@ -37,6 +37,7 @@ MODULE_REPORTS = {
     # The shared contract package the gateway depends on, run from its own directory in its own verify step.
     "platform_contracts": ("platform-contracts.xml", "python", "packages/platform-contracts"),
     "calendar": ("calendar.xml", "python", "services/calendar"),
+    "deedkit_npm": ("deedkit-npm.xml", "node", "packages/deedkit"),  # the JavaScript client's node:test run (ANYM-261)
     "calls": ("calls.xml", "python", "services/calls"),
     "calls_frontend": ("calls-frontend.xml", "node", "services/calls/frontend"),
     "inference": ("inference.xml", "python", "services/inference"),
