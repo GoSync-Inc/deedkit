@@ -351,7 +351,19 @@ class Store:
         # prompt OperationalError instead of a call that outlives the lease.
         # No server-side prepared statements: a cached SELECT * plan fails with "cached plan must
         # not change result type" once a migration adds a column under a running service (086304e6).
-        self.pool = ConnectionPool(dsn, min_size=1, max_size=6, timeout=5, open=True,
+        # check, at checkout and before any BEGIN: an idle socket with input waiting means the server spoke while the
+        # connection sat in the pool (a restart, terminate or idle timeout ends it with FATAL); only then the library's
+        # empty probe runs and a dead connection is replaced. A healthy one costs no statement; nothing is retried.
+        # poll, not select: a busy process can hold descriptors past select's 1024.
+        from psycopg_pool import ConnectionPool as LibraryPool
+        from select import POLLIN, poll
+
+        def check(c):
+            waiting = poll()
+            waiting.register(c, POLLIN)
+            if waiting.poll(0):
+                LibraryPool.check_connection(c)
+        self.pool = ConnectionPool(dsn, min_size=1, max_size=6, timeout=5, open=True, check=check,
             kwargs={'row_factory': dict_row, 'prepare_threshold': None, 'connect_timeout': 5,
                     'keepalives': 1, 'keepalives_idle': 30, 'keepalives_interval': 10,
                     'keepalives_count': 3, 'tcp_user_timeout': 30000,
