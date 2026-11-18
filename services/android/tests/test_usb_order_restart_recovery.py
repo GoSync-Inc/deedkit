@@ -177,6 +177,31 @@ def restore(rig, snapshot):
     rig.phone.packages = snapshot['packages']
 
 
+def initial_watch_state(service, rig, request):
+    """Bounded synthetic state when the first package watch did not arrive: the request's view, its USB entry,
+    retained handle and forward rows, and fake ADB counts. Identifiers are reduced to roles."""
+    agents, state = service.app.state.agents, {}
+    try:
+        view = service.get(request)
+        state['view'] = {k: view.get(k) for k in ('state', 'usb_source', 'native_supervision') if k in view}
+        state['forwards'] = [(r['request_id'] == request, r['state'], r['collection'], r['reason'], r['recovery'])
+                             for r in forwards(service)]
+        state['entries'] = [(e.task == request, e.handle is not None, e.receipt is not None, e.connector and (
+            e.connector.state, e.connector.reason, e.connector.cleanup, e.connector.task and e.connector.task.done()))
+            for e in list(agents.usb.entries.values())]
+        state['ended'] = [task == request for _, task in list(agents.usb.ended)]
+        state['handles'] = [(task == request, h.reason) for (_, task), h in list(agents.supervision.handles.items())]
+        state['refusal'] = agents.supervision.refusals.get(('one', request))
+        state['runs'] = [(r.id == request, r.state) for r in list(agents.runs.values())]
+        loop = agents.supervision.task
+        state['supervision_loop'] = None if loop is None else ('done' if loop.done() else 'running')
+        state['calls'] = {flag: count(rig, flag) for flag in ('--no-rebind', '--remove', '--list')}
+        state['watches'] = len(rig.phone.watches)
+    except (RuntimeError, AttributeError, KeyError) as error:  # a concurrent change: report what was read
+        state['incomplete'] = type(error).__name__
+    return state
+
+
 def first_life(rig, point):
     """One ordinary admitted request that crashes at point; returns (lease, crash snapshot)."""
     rig.hang[0] = {'intent': 'acquire', 'owned': 'verify', 'cleanup': 'remove'}.get(point)
@@ -196,7 +221,10 @@ def first_life(rig, point):
         elif point == 'watch':
             journal, rig.phone.journal = rig.phone.journal, []  # no notification yet: the order stays active
             service.finished(request)
-            until(lambda: rig.phone.packages)
+            try:
+                until(lambda: rig.phone.packages)
+            except AssertionError as error:
+                raise AssertionError('%s; state=%r' % (error, initial_watch_state(service, rig, request))) from None
             snapshot = crash(rig, service, lambda r: r['state'] == 'owned' and r['collection'] == 'unconfirmed')
             rig.phone.journal = journal
         else:
