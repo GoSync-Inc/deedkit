@@ -252,7 +252,7 @@ class UsbLifecycle:
         self.agents=agents
         self.journal=ForwardJournal(agents)
         self.entries={}
-        self.ended=set()  # (owner, request) whose entry ended before claiming the serial or calling bind
+        self.ended=set()  # (owner, request) whose USB entry ended; never admitted again
         self.closing=False
 
     def refresh(self):
@@ -282,18 +282,17 @@ class UsbLifecycle:
                 # That handle is still the original request, never authority for another acquisition.
                 if not previous.connector.task.done():
                     continue
+                # One acquisition per request: an ended entry's request is never admitted again, by run or handle.
+                self.ended.add((previous.owner,previous.task))
+                ended=(origin is previous.origin or origin is previous.handle
+                       or (origin.owner,origin.task if handle else origin.id) in self.ended)
                 # Ended before claiming the serial or calling bind: no receipt, forward or watch to settle.
-                # Only a different request replaces it; the ended request itself is never admitted again.
                 if previous.receipt is None and previous.connector.cleanup=='not_needed' and (
                         previous.close_task is None or previous.close_task.done()):
-                    self.ended.add((previous.owner,previous.task))
-                    if (origin is previous.origin or origin is previous.handle
-                            or (origin.owner,origin.task if handle else origin.id) in self.ended):
+                    if ended:
                         continue
                     kept=previous  # stays until a new request below is actually admitted in its place
-                elif (receipt is None or not self.journal.settled(receipt)
-                        or origin is previous.origin or origin is previous.handle
-                        or handle and origin.task==previous.task):
+                elif receipt is None or not self.journal.settled(receipt) or ended:
                     continue
                 else:
                     kept=previous  # stays until a new request below is actually admitted in its place
