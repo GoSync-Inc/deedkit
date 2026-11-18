@@ -7,3 +7,8 @@ id = "GO-2026-5932"
 ignoreUntil = 2026-12-11T00:00:00Z
 reason = "golang.org/x/crypto v0.58.0 in tools/attest-verify/go.mod and v0.57.0 in whatsapp/whatsmeow/go.mod: the unmaintained x/crypto/openpgp packages, which neither module imports (govulncheck v1.8.0 on 2026-11-09 in both: 0 called, module-level only). The fix (upstream 2f1f834330b2, openpgp carved out as its own module) exists only as pseudo-version v0.58.1-0.20261009181718-2f1f834330b2; v0.58.0 is still the latest tag, and a verifier rebuild moves three hash pins and the host binary, so the bump waits for the next tag; card: ANYM-941 x/crypto without openpgp"
 
+
+[[IgnoredVulns]]
+id = "GHSA-fc5q-39xc-vjpf"
+ignoreUntil = 2026-12-02T00:00:00Z
+reason = "picomatch 4.0.7 in services/calls/frontend/package-lock.json only, a dev dependency of vite 8.3.4 (direct and through tinyglobby 0.2.17 and fdir 6.5.0): ReDoS (CVE-2026-112366) needs an attacker-supplied glob, and picomatch runs only in `vite build` with Vite's default patterns (no vite config, no dev or preview server; the calls image copies only frontend/dist, which contains no picomatch code). The advisory lists no patched version: npm latest is 4.0.7 (2026-11-18) and upstream fix pull requests are unmerged, so the bump waits for the first fixed release; evidence docs/quality/osv-picomatch-ghsa-fc5q.md; card: ANYM-1002 picomatch fixed release"
