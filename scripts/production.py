@@ -1307,6 +1307,16 @@ def input_file_digest(path, *, configuration=False):
         raise Unreadable(f"{path} cannot be read") from exc
 
 
+# The messaging store's staged uploads (uploads.py: PROBE_FILES/.uploads, PROBE_FILES /data/files in every Compose
+# file). The API writes them; collectors mount the same directory read-only to send them: data, counted by path.
+STAGED_UPLOADS = "/data/files/.uploads"
+
+
+def mounted_configuration(volume):
+    """Whether a bind-mounted directory is configuration (hashed by content): read-only, except the staged uploads."""
+    return bool(volume.get("read_only")) and volume.get("target") != STAGED_UPLOADS
+
+
 def host_inputs(document, service):
     """The host-side parts of one rendered service: digests of its env files, of its bind-mounted files and of the
     files of the top-level secrets and configs it uses. Digests only; never a value. Raises Unreadable."""
@@ -1317,7 +1327,7 @@ def host_inputs(document, service):
     for volume in unit.get("volumes") or []:
         if isinstance(volume, dict) and volume.get("type") == "bind" and isinstance(volume.get("source"), str):
             mounts[volume["source"] + " -> " + str(volume.get("target"))] = input_file_digest(
-                volume["source"], configuration=bool(volume.get("read_only")))
+                volume["source"], configuration=mounted_configuration(volume))
     for kind in ("secrets", "configs"):
         for entry in unit.get(kind) or []:
             name = entry.get("source") if isinstance(entry, dict) else entry

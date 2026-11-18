@@ -394,7 +394,8 @@ def stubs(tmp_path):
     ssh = ['ssh', '-o', 'BatchMode=yes', 'deedkit-prod']
     export = triage.EXPORT + [IMAGE, 'python', '-m', 'messaging_service', 'export-feedback']
     replies = {
-        ('tiden', 'spec', 'list', '--branch', 'main', '--include-sources', '--format', 'json'): json.dumps(MAIN),
+        ('tiden', 'spec', 'list', '--branch', 'main', '--include-sources', '--all', '--page-size', '50', '--format',
+         'json'): json.dumps(MAIN),
         ('tiden', 'spec', 'list', '--branch', 'proposal/x', '--format', 'json'): json.dumps(PROPOSAL),
         ('tiden', 'branch', 'list', '--format', 'json'): json.dumps(BRANCHES),
         (*ssh, shlex.join(['docker', 'inspect', '--format', '{{.Image}}', triage.API_CONTAINER])): IMAGE + '\n',
