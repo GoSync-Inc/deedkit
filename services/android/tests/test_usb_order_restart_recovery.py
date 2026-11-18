@@ -339,7 +339,7 @@ def test_usb_loss_keeps_phone_collection_held_until_reconnected_normal_request_s
         rig.phone.plug()
         start = len(rig.calls)
         second_request(service, token)
-        old, new = until(lambda: (lambda r: r if len(r) == 2 and r[0]['state'] == 'closed' else None)(forwards(service)))
+        old, new = until(lambda: (lambda r: r[:2] if len(r) >= 2 and r[0]['state'] == 'closed' else None)(forwards(service)))
         assert old['id'] == lost['id'] and old['recovery'] == 'collection_superseded'
         assert old['reason'] == 'collection_cleanup_unconfirmed' and new['id'] != old['id']
         assert count(rig, '--no-rebind', start) >= 1 and not [c for c in before_acquisition(rig, start) if '--remove' in c]

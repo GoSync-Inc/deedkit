@@ -296,7 +296,7 @@ class UsbLifecycle:
                         or handle and origin.task==previous.task):
                     continue
                 else:
-                    del self.entries[key]
+                    kept=previous  # stays until a new request below is actually admitted in its place
             try:
                 entry=Entry(self,origin,handle=handle)
                 if not entry.packages() or self.journal.blocked(entry):
