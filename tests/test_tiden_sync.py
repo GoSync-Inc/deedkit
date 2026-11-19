@@ -169,6 +169,39 @@ def test_existing_links_are_kept_and_never_duplicated(root, server):
 
 
 # spec: ANYM-405
+def test_an_added_python_marker_id_links_existing_cases_once(root, server):
+    path = "tests/test_existing.py"
+    old = ("import pytest\n\n"
+           "class TestGroup:\n"
+           "    # spec: ANYM-12\n"
+           "    @pytest.mark.parametrize('value', [1, 2])\n"
+           "    def test_existing(self, value):\n"
+           "        pass\n\n"
+           "# spec: ANYM-12\ndef test_unchanged():\n    pass\n")
+    commit(root, {path: old}, "existing tests")
+    previous, added = spec(12), spec(50)
+    cases = [case(f"tests.test_existing.TestGroup::test_existing[{n}]", path, f"test_existing[{n}]")
+             for n in (1, 2)]
+    unrelated = case("tests.test_existing::test_unchanged", path, "test_unchanged")
+    server.set(main=[previous, added], tests=[*cases, unrelated],
+               links={row["id"]: [previous["id"]] for row in cases})
+    merged(root, server, {path: old.replace("    # spec: ANYM-12", "    # spec: ANYM-12, ANYM-50")}, "Spec: ANYM-50")
+
+    code, out = run(root, server)
+    assert code == 0, out
+    assert "0 added test(s)" in out
+    expected = {row["id"]: [previous["id"], added["id"]] for row in cases}
+    assert server.state()["links"] == expected
+    writes = server.writes()
+    assert len(writes) == len(cases)
+
+    code, out = run(root, server)
+    assert code == 0, out
+    assert server.state()["links"] == expected
+    assert server.writes() == writes
+
+
+# spec: ANYM-405
 def test_a_test_without_an_imported_case_or_an_unpersisted_link_fails_the_links_step_and_go_is_reported(root, server):
     full_server(server)
     server.set(fault={"test link-spec": "noop"})

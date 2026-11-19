@@ -6,7 +6,7 @@ validated. In order, each step reading back what it wrote:
 
 1. merge: merge `Tiden branch:` only when its merge preview holds just the specs the body names, with no deletion,
    test or component change, conflict or blocking session;
-2. links: link each test the commit adds to the specs its `spec:` marker names, add-only;
+2. links: link marked tests the commit adds, new cases of kept Go tests, and spec IDs added to kept Python tests;
 3. anchors: anchor each changed code file that no spec anchors to the primary (first named) spec, resending every
    existing source with its provenance and comparing every source on read-back;
 4. status: set each `Delivers:` spec Done, or Review while its text holds an `[open: live]` or `[open: measured]`
@@ -45,7 +45,7 @@ from tiden_ci import go_module_path  # noqa: E402
 from tiden_health import prose  # noqa: E402
 from tiden_pr_check import (BRANCH_NAME, GO_TEST, Test, anchor_map, blob, branch_status, changed,  # noqa: E402
                             diff_tests, language, listing, marker, parse_body, preview_number, preview_numbers,
-                            source_lines, story)
+                            python_tests, source_lines, story)
 
 SUBJECT = re.compile(r"\(#([1-9][0-9]*)\)$")
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -312,6 +312,33 @@ def kept_go_tests(root: Path, base: str, head: str, paths: list[str]) -> list[Te
     return found
 
 
+def kept_python_tests(root: Path, base: str, head: str, paths: list[str]) -> list[Test]:
+    """Existing Python tests with only the spec IDs that their marker gained in this commit."""
+    found = []
+    for path in paths:
+        if language(path) != "python":
+            continue
+        before, after = blob(root, base, path), blob(root, head, path)
+        if before is None or after is None:
+            continue
+        try:
+            previous = python_tests(before)
+        except SyntaxError:  # diff_tests already treated the unparseable parent as having no tests
+            continue
+        previous_lines, lines = source_lines(before, "python"), source_lines(after, "python")
+        old_markers = {name: marker(previous_lines, index, "#")[0] for name, index, _ in previous}
+        current = python_tests(after)
+        counts = Counter(name for name, _, _ in current)
+        for name, index, _ in current:
+            if name not in old_markers or counts[name] != 1:
+                continue
+            specs, _ = marker(lines, index, "#")
+            added = tuple(number for number in specs if number not in old_markers[name])
+            if added:
+                found.append(Test(path, name, index + 1, added))
+    return found
+
+
 def link(cli: str, product: str, tests: list, main: dict[int, dict], report, dry: bool = False,
          packages: dict[str, str | None] | None = None, kept: list | None = None) -> None:
     """Links the cases of each marked added test; `kept` are marked tests that existed before, linked when they have
@@ -320,7 +347,7 @@ def link(cli: str, product: str, tests: list, main: dict[int, dict], report, dry
     marked += [test for test in kept or [] if test.specs]
     old, deadline = {id(test) for test in kept or []}, time.monotonic() + KEPT_SECONDS
     if not marked:
-        report("links: no marked test added.")
+        report("links: no marked test to link.")
         return
     try:
         rows = identities(cli, product)
@@ -346,7 +373,7 @@ def link(cli: str, product: str, tests: list, main: dict[int, dict], report, dry
             missing.append(f"{shown(test.path)} {shown(test.name)} lies in no Go module")
             continue
         cases = matches(rows, test.path, test.name, package)
-        if id(test) in old:  # a test of the same name in a build-excluded or other file of the package is not this one
+        if id(test) in old and language(test.path) == "go":  # Go's signature identifies a package, not a file
             cases = [case for case in cases if case.get("filePath") == PurePosixPath(test.path).name]
         if not cases and id(test) in old:
             continue
@@ -492,7 +519,7 @@ def sync(root: Path, sha: str, number: int, body: str, cli: str, product: str, r
     paths = changed(root, parent, sha)
     code = [path for path in paths if not excluded(path)]
     tests = diff_tests(root, parent, sha, paths)
-    kept = kept_go_tests(root, parent, sha, paths)
+    kept = kept_python_tests(root, parent, sha, paths) + kept_go_tests(root, parent, sha, paths)
     report(f"Pull request #{number}, commit {sha}: {len(code)} code file(s), {len(tests)} added test(s); named "
            + (", ".join(f"ANYM-{n}" for n in lines.named) or "no spec")
            + (f"; branch {lines.branch}" if lines.branch else "") + ".")
