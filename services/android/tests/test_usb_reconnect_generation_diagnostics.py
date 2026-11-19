@@ -65,7 +65,10 @@ def test_an_ended_request_handle_never_reacquires_while_the_new_request_awaits_a
             lost, = until(lambda: [r for r in forwards(service) if r['state'] == 'held'])
             usb = service.app.state.agents.usb
             ended = usb.entries[('one', 'home')]
-            assert ended.task == first and ended.connector.task.done()
+            assert ended.task == first
+            # The 'held' commit precedes the connector task's completion in that same loop step; this thread can see
+            # the row in between (CI run 44354309423), so it waits for completion within until()'s bound.
+            until(lambda: ended.connector.task.done())
             rig.phone.plug()
             second = service.start(token, goal='native-control')['request_id']
             assert entered.wait(5)

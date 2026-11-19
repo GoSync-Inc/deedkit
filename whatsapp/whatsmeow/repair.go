@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -60,7 +61,12 @@ type repairPass struct {
 	counts    map[string]int64
 	lastError string
 	reported  string
-	next      *republishPass // ANYM-963: runs once this count is done; nil: the count only
+	// ticks numbers this pass's ticks; errorTick is the tick that set lastError. diagnostic describes the last
+	// repair_storage refusal in closed words, for tests and operators reading a failure (DK-91).
+	ticks      int64
+	errorTick  int64
+	diagnostic repairDiagnostic
+	next       *republishPass // ANYM-963: runs once this count is done; nil: the count only
 }
 
 func newRepairPass(s *CaptureStore) *repairPass {
@@ -180,13 +186,79 @@ func (p *repairPass) headroom(ctx context.Context) error {
 		v   *int64
 	}{{"PRAGMA max_page_count", &ceiling}, {"PRAGMA page_count", &pages}, {"PRAGMA freelist_count", &free}} {
 		if err := p.s.db.QueryRowContext(c, q.sql).Scan(q.v); err != nil {
-			return err
+			return headroomRefusal{contextReason(err, c, "headroom_read")}
 		}
 	}
 	if ceiling-pages+free < p.reservePages {
-		return errors.New("repair_storage")
+		return headroomRefusal{"page_reserve"}
 	}
-	return p.s.checkDisk(64 << 10)
+	if err := p.s.checkDisk(64 << 10); err != nil {
+		if err.Error() == "disk_reserve" { // checkDisk's own fixed code for a disk below its reserve
+			return headroomRefusal{"disk_reserve"}
+		}
+		return headroomRefusal{"disk_check"}
+	}
+	return nil
+}
+
+// repairDiagnostic is a storage refusal in closed words only: where (phase), why (reason), how long the failing
+// operation took on the monotonic clock (elapsed bucket) and in which tick. It never holds an error's text, SQL,
+// a file name or row content, and it does not change what the pass does.
+type repairDiagnostic struct {
+	tick                   int64
+	phase, reason, elapsed string
+}
+
+// headroomRefusal is headroom's error: the closed reason, never the underlying error. Its text stays the code the
+// callers already return.
+type headroomRefusal struct{ reason string }
+
+func (r headroomRefusal) Error() string { return "repair_storage" }
+
+func elapsedBucket(d time.Duration) string {
+	switch {
+	case d < 500*time.Millisecond:
+		return "lt_500ms"
+	case d < 2*time.Second:
+		return "lt_2s"
+	}
+	return "ge_2s"
+}
+
+// contextReason names a failed statement by its own context's state when that ended it, else the given reason.
+func contextReason(err error, c context.Context, otherwise string) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded) || errors.Is(c.Err(), context.DeadlineExceeded):
+		return "deadline"
+	case errors.Is(err, context.Canceled) || errors.Is(c.Err(), context.Canceled):
+		return "canceled"
+	}
+	return otherwise
+}
+
+// refuse records the diagnostic of a storage refusal of this tick and returns the unchanged code.
+func (p *repairPass) refuse(phase, reason string, started time.Time) string {
+	p.diagnostic = repairDiagnostic{tick: p.ticks, phase: phase, reason: reason, elapsed: elapsedBucket(time.Since(started))}
+	return "repair_storage"
+}
+
+// refuseHeadroom records a headroom refusal by the reason headroom gave.
+func (p *repairPass) refuseHeadroom(phase string, err error, started time.Time) string {
+	reason := "headroom_read"
+	var refusal headroomRefusal
+	if errors.As(err, &refusal) {
+		reason = refusal.reason
+	}
+	return p.refuse(phase, reason, started)
+}
+
+// storageDiagnostic describes the refusal behind lastError, only when both come from the same tick.
+func (p *repairPass) storageDiagnostic() string {
+	d := p.diagnostic
+	if p.lastError != "repair_storage" || d.tick == 0 || d.tick != p.errorTick {
+		return ""
+	}
+	return fmt.Sprintf("phase=%s reason=%s elapsed=%s tick=%d", d.phase, d.reason, d.elapsed, d.tick)
 }
 
 // repairCountsJSON is the stored counts column: the fixed integers only.
@@ -230,8 +302,9 @@ func (p *repairPass) load(ctx context.Context) string {
 			return "repair_read"
 		}
 	}
-	if p.headroom(ctx) != nil {
-		return "repair_storage"
+	started := time.Now()
+	if err := p.headroom(ctx); err != nil {
+		return p.refuseHeadroom("load_headroom", err, started)
 	}
 	// Three autocommit statements, each under the driver's exec interrupt, with
 	// capture priority between them; no explicit transaction, whose commit the
@@ -239,21 +312,24 @@ func (p *repairPass) load(ctx context.Context) string {
 	// of them resumes on the next tick: a table without this version's row is
 	// started again, and older versions' rows are only ever discarded.
 	for _, q := range []struct {
-		sql  string
-		args []any
+		phase string
+		sql   string
+		args  []any
 	}{
-		{`CREATE TABLE IF NOT EXISTS repair_progress(version INTEGER PRIMARY KEY,last_seq INTEGER NOT NULL,done INTEGER NOT NULL,counts TEXT NOT NULL)`, nil},
-		{"DELETE FROM repair_progress WHERE version<>?", []any{p.version}},
-		{"INSERT OR IGNORE INTO repair_progress(version,last_seq,done,counts)VALUES(?,0,0,?)", []any{p.version, repairCountsJSON(0, nil)}},
+		{"load_create", `CREATE TABLE IF NOT EXISTS repair_progress(version INTEGER PRIMARY KEY,last_seq INTEGER NOT NULL,done INTEGER NOT NULL,counts TEXT NOT NULL)`, nil},
+		{"load_delete", "DELETE FROM repair_progress WHERE version<>?", []any{p.version}},
+		{"load_insert", "INSERT OR IGNORE INTO repair_progress(version,last_seq,done,counts)VALUES(?,0,0,?)", []any{p.version, repairCountsJSON(0, nil)}},
 	} {
 		if stop, code := p.yield(ctx); stop {
 			return code
 		}
 		c, cancel := context.WithTimeout(ctx, p.stmt)
+		started := time.Now()
 		_, err := p.s.db.ExecContext(c, q.sql, q.args...)
+		reason := contextReason(err, c, "write_error") // read before cancel, which would end the context itself
 		cancel()
 		if err != nil {
-			return "repair_storage"
+			return p.refuse(q.phase, reason, started)
 		}
 	}
 	p.lastSeq, p.scanned, p.done, p.counts, p.loaded = 0, 0, false, map[string]int64{}, true
@@ -263,9 +339,10 @@ func (p *repairPass) load(ctx context.Context) string {
 // tick classifies at most one bounded batch. Every error is a fixed status
 // code; it never fails the provider and never carries row content.
 func (p *repairPass) tick(ctx context.Context) {
+	p.ticks++
 	code := p.step(ctx)
 	if code != "" {
-		p.lastError = code
+		p.lastError, p.errorTick = code, p.ticks
 	}
 	if p.done && p.next != nil {
 		p.next.tick(ctx)
@@ -352,8 +429,9 @@ func (p *repairPass) step(ctx context.Context) string {
 	if next == p.lastSeq && !done {
 		return "" // nothing to record
 	}
-	if p.headroom(ctx) != nil {
-		return "repair_storage"
+	started := time.Now()
+	if err := p.headroom(ctx); err != nil {
+		return p.refuseHeadroom("step_headroom", err, started)
 	}
 	doneFlag := 0
 	if done {
@@ -362,13 +440,17 @@ func (p *repairPass) step(ctx context.Context) string {
 	c, cancel = context.WithTimeout(ctx, p.stmt)
 	defer cancel()
 	// Fail closed: the in-memory progress moves only after the row is durable.
+	started = time.Now()
 	result, err := p.s.db.ExecContext(c, "UPDATE repair_progress SET last_seq=?,done=?,counts=? WHERE version=?", next, doneFlag, repairCountsJSON(scanned, counts), p.version)
 	if err != nil {
-		return "repair_storage"
+		return p.refuse("step_update", contextReason(err, c, "write_error"), started)
 	}
 	if n, err := result.RowsAffected(); err != nil || n != 1 {
 		p.loaded = false // the row is gone: start the version again from its durable state
-		return "repair_storage"
+		if err != nil {
+			return p.refuse("step_rows", "write_error", started)
+		}
+		return p.refuse("step_rows", "rows_affected", started)
 	}
 	p.lastSeq, p.scanned, p.counts, p.done = next, scanned, counts, done
 	return ""

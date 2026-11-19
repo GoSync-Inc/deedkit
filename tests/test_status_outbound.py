@@ -275,13 +275,35 @@ def test_outbound_query_failure_leaves_the_rest_of_the_status(out, monkeypatch):
 # spec: ANYM-671
 def test_outbound_queue_query_uses_the_pending_index(out):
     from messaging_service.outgoing import OUTBOUND_SQL
+    # A synthetic nonempty queue: one real queued send per account, cloned by fixture SQL. On an empty table the
+    # queued lateral's two partial indexes estimate alike and the plan comparison is degenerate. With queued rows,
+    # outgoing_pending's (account,created_at,id) order serves the aggregate's ORDER BY created_at,id, where
+    # outgoing_expiry would need a sort. Per account: 2000 settled sends over about 18 days, 100 more unexpired
+    # queued sends and 50 expired queued ones (4302 rows with the two real sends).
+    for account in ACCOUNTS:
+        send, = out.send(account)
+        for kind, count, status, offset, step, provider_id in (
+                ('h', 2000, 'sent', '0 seconds', '13 minutes', '(10000+g)::text'),
+                ('q', 100, 'queued', '0 seconds', '5 seconds', 'NULL'),
+                ('x', 50, 'queued', '11 minutes', '1 minute', 'NULL')):
+            out.sql(f'''INSERT INTO outgoing_messages SELECT (jsonb_populate_record(o,jsonb_build_object(
+                'id','{kind}_'||%s||'_'||g,'request_id','plan-{kind}-'||%s||'-'||lpad(g::text,5,'0'),
+                'status','{status}','provider_message_id',{provider_id},
+                'created_at',clock_timestamp()-interval '{offset}'-g*interval '{step}',
+                'expires_at',clock_timestamp()-interval '{offset}'-g*interval '{step}'+interval '10 minutes'))).*
+                FROM outgoing_messages o, generate_series(1,%s) g WHERE o.id=%s''', account, account, count, send)
     with out.store.pool.connection() as c:
-        # TRUNCATE resets rows but keeps pg_statistic. A previous module's analyzed 5,001-row send history
-        # otherwise makes this empty fixture choose outgoing_expiry instead, depending on shard assignment.
+        # ANALYZE of the populated table replaces any statistics a previous module left; on an empty table it would not.
         c.execute('ANALYZE outgoing_messages')
         c.execute('SET LOCAL enable_seqscan=off')
-        plan = '\n'.join(row['QUERY PLAN'] for row in c.execute('EXPLAIN ' + OUTBOUND_SQL, (list(ACCOUNTS),)))
-    assert 'outgoing_pending' in plan
+        snapshot = c.execute('EXPLAIN (FORMAT JSON) ' + OUTBOUND_SQL, (list(ACCOUNTS),)).fetchone()['QUERY PLAN']
+    plan = json.dumps(snapshot)  # the one captured plan: the assertion and its failure message both read it
+
+    def scans(node):  # this plan's outgoing index scans and sorts: index, estimated rows and cost, sort key
+        keep = node.get('Index Name', '').startswith('outgoing') or node['Node Type'] == 'Sort'
+        own = [(node['Node Type'], node.get('Index Name'), node['Plan Rows'], node['Total Cost'], node.get('Sort Key'))]
+        return (own if keep else []) + [s for child in node.get('Plans', []) for s in scans(child)]
+    assert 'outgoing_pending' in plan, scans(snapshot[0]['Plan'])
 
 
 # spec: ANYM-671
