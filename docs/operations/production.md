@@ -2442,7 +2442,8 @@ with the enable date). A long wait with fresh successes is a backlog draining at
 scope's success does not hide a stalled one: the groups are separate.
 
 The API raises Tiden events on shorter limits than this 24 hour by-hand rule (ANYM-785): `enrichment_stalled` (a live
-worker, queued rows and no `ready` for 6 h), `enrichment_starved` (50 or more queued rows in a scope sent 6-48 h ago),
+worker, queued rows, one of them waiting 6 h since the earlier of its update and its message, and no `ready` for
+6 h), `enrichment_starved` (50 or more queued rows in a scope sent 6-48 h ago),
 `enrichment_no_worker` (a mini row not enabled or expired, last published 30 min to 7 days ago). `get_sync_status` shows
 `enrichment_health` per account. Triage, read-only: the mini's `/healthz` and `busy.json`, the `refusal=` counts in the
 service log, the impact log.

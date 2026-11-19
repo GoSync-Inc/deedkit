@@ -23,9 +23,13 @@ STALLED, STARVED, NO_WORKER = 'enrichment_stalled', 'enrichment_starved', 'enric
 # A scope is (account, kind, profile_hash). Only current rows a claim could take count (a withheld file of an
 # on-request chat no agent asked for, ANYM-805, is not one): a row of a
 # replaced revision, a deleted message or an evicted original waits forever and would alert forever.
+# A queued scope stalls only once one of its rows has waited 6 h: a quiet scope's old ready beside a file deferred or
+# requeued minutes ago is no stall (production 2026-11-18, Tiden issue 20024443). A deferral refreshes updated_at, so a
+# row waits since the earlier of updated_at and its message's sent_at; a file deferred for 6 h stays a stall (11-05).
 SCOPES_SQL = 'WITH '+exclusion_sets(RECOGNITION_WITHHELD)+''',
     queued AS MATERIALIZED (
         SELECT m.account,e.kind,e.profile_hash,count(*) AS queued,min(e.updated_at) AS oldest_queued,
+            min(least(e.updated_at,m.sent_at)) AS oldest_waiting,
             count(*) FILTER (WHERE m.sent_at<=now()-make_interval(secs=>%(stall)s)
                 AND m.sent_at>=now()-make_interval(secs=>%(starved_age)s)) AS window_rows
         FROM attachment_enrichment e JOIN attachments a ON a.id=e.attachment JOIN messages m ON m.id=a.message
@@ -65,7 +69,8 @@ SCOPES_SQL = 'WITH '+exclusion_sets(RECOGNITION_WITHHELD)+''',
         GROUP BY 1,2)
     SELECT q.account,q.kind,q.queued,q.window_rows,
         coalesce(p.enabled AND p.expires_at>now(),false)
-            AND coalesce(r.newest,q.oldest_queued)<=now()-make_interval(secs=>%(stall)s) AS stalled
+            AND coalesce(r.newest,q.oldest_queued)<=now()-make_interval(secs=>%(stall)s)
+            AND q.oldest_waiting<=now()-make_interval(secs=>%(stall)s) AS stalled
     FROM queued q LEFT JOIN ready r USING(account,kind,profile_hash)
     LEFT JOIN processing_profiles p ON p.account=q.account AND p.kind=q.kind AND p.provider=%(provider)s
     UNION ALL
