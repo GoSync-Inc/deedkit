@@ -1332,9 +1332,14 @@ def test_no_repository_tool_links_tests_by_file_proximity_and_only_the_main_sync
     root = Path(__file__).resolve().parents[1]
     tracked = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], check=True, capture_output=True,
                              text=True).stdout.split("\0")
+    # Every tracked tool outside the test trees and the agent rules: code and configuration, never a document (`*.md`
+    # and `.claude/` are the documentation of docs_only.py), so the read below takes no document.
+    # reads: scripts/tiden_sync.py
+    # reads: .github/workflows/tiden-sync.yml
     tools = {path: (root / path).read_text(errors="replace") for path in tracked
              if path.endswith((".py", ".sh", ".yml", ".yaml", ".mjs", ".js", ".ts", ".go", ".json", ".toml"))
-             and not any(part in ("tests", "test") for part in Path(path).parts) and (root / path).is_file()}
+             and not path.startswith(".claude/") and not any(part in ("tests", "test") for part in Path(path).parts)
+             and (root / path).is_file()}
     assert "scripts/tiden_sync.py" in tools and ".github/workflows/tiden-sync.yml" in tools
     # `tiden test derive-links` writes exact-file links product-wide without review or a dry run.
     assert [path for path, text in tools.items() if "derive-links" in text] == []
