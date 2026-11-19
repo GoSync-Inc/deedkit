@@ -23,9 +23,9 @@ STALLED, STARVED, NO_WORKER = 'enrichment_stalled', 'enrichment_starved', 'enric
 # A scope is (account, kind, profile_hash). Only current rows a claim could take count (a withheld file of an
 # on-request chat no agent asked for, ANYM-805, is not one): a row of a
 # replaced revision, a deleted message or an evicted original waits forever and would alert forever.
-# A queued scope stalls only once one of its rows has waited 6 h: a quiet scope's old ready beside a file deferred or
-# requeued minutes ago is no stall (production 2026-11-18, Tiden issue 20024443). A deferral refreshes updated_at, so a
-# row waits since the earlier of updated_at and its message's sent_at; a file deferred for 6 h stays a stall (11-05).
+# ANYM-785 criterion 2: with an old ready row, stall also requires a queued row to have waited at least 6 h.
+# A minutes-old file deferred or requeued after a quiet period does not trigger it (Tiden issue 20024443).
+# A deferral refreshes updated_at, so count from the earlier of updated_at and the message's sent_at.
 SCOPES_SQL = 'WITH '+exclusion_sets(RECOGNITION_WITHHELD)+''',
     queued AS MATERIALIZED (
         SELECT m.account,e.kind,e.profile_hash,count(*) AS queued,min(e.updated_at) AS oldest_queued,
