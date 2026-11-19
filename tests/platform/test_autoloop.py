@@ -847,7 +847,7 @@ LIVE = os.environ.get('AUTOLOOP_CANARY') == '1' and autoloop.CLI.exists()
 
 
 # spec: ANYM-570
-@pytest.mark.skipif(not LIVE, reason='canary run on the owner Mac with the pinned CLI: AUTOLOOP_CANARY=1')
+@pytest.mark.skipif(not LIVE, reason='[tiden:host-required] Run on the owner Mac with the pinned CLI: AUTOLOOP_CANARY=1')
 def test_canary_the_real_cli_ignores_hostile_files_and_gives_one_valid_decision(tmp_path, monkeypatch, states):
     # A hostile parent of the reader's temp dir: settings with a hook, an MCP config, a plugin, memory, a symlink.
     parent = tmp_path / 'hostile'

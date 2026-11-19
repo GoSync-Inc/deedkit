@@ -933,8 +933,17 @@ run must land on the same-named or an intent branch, as described above. The job
 waits for live-doc sync and checks the resulting branch before reporting success.
 The authentic run then adopts existing case identities or imports the reported
 cases. Reported step failures and missing required verifications are also recorded
-as failed or blocked; optional test skips remain skipped. A test run is not a
-statement that every specification is covered.
+as failed or blocked. Ordinary optional skips are published as skipped.
+
+Prefix a pytest skip reason with `[tiden:host-required] ` when a designated host
+provides the required capability and publishes the test's results. CI retains
+the skip in its JUnit artifacts and counts. Tiden publication omits only the marked skip
+rows and verifies the uploaded attempt count after subtracting them. The branch
+gate uses the latest case result across run environments, so evidence for these
+tests comes from the host that actually runs them. The Claude CLI canary
+(ANYM-570) gets its result from the owner's Mac in `local-synthetic`. The Vision
+corpus (ANYM-966) gets its CI result from the hosted macOS job, which requires
+exactly one passing Vision execution. Both retain the same test identities.
 
 Link specs only to tests whose assertions actually verify them. Use
 `tiden test link-spec <test-id> --spec-id <spec-id> --branch <branch>` after
