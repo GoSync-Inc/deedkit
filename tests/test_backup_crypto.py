@@ -174,3 +174,69 @@ def test_a_late_calendar_manifest_never_admits_messaging_members(seeded, tmp_pat
         decrypt_snapshot(age_tar(tmp_path, recipient, [('database.dump', (messaging / 'database.dump').read_bytes()),
             ('manifest.json', json.dumps(manifest).encode()), (member, blob)]), tmp_path / 'identity', tmp_path / 'out')
     assert not (tmp_path / 'out').exists()
+
+
+def drill_records(count):
+    return [{'ref': f'r{i:04d}', 'provider_id': f'p{i}', 'revision': 1, 'transcript': f'synthetic meeting words {i}',
+             'summary': f'synthetic summary {i}'} for i in range(1, count + 1)]
+
+
+# spec: ANYM-731
+def test_the_recordings_restore_drill_restores_the_protected_point_into_scratch_and_passes_its_checks(tmp_path):
+    """Milestone D's code, in its order (docs/operations/recordings-archive-activation.md): decrypt the protected object
+    with the instance's identity into a scratch bundle, `verify_recordings_bundle`, `readback`, `archive_facts`; the
+    identity and the facts equal the manifest's and the baseline's. Real age, a synthetic archive in the store's shapes."""
+    from messaging_service import backup_recordings_continuity as cont
+    from messaging_service.backup_crypto import decrypt_snapshot_stream
+    from messaging_service.backup_recordings import create_recordings_snapshot, verify_recordings_bundle
+    recipient = real_age(tmp_path)
+    live = cont.synthetic_archive(tmp_path / 'live' / 'archive.sqlite', drill_records(5), events=7)
+    baseline = cont.archive_facts(live)  # what continuity.json holds for the protected point
+    create_recordings_snapshot(live, tmp_path / 'bundle')
+    manifest = verify_recordings_bundle(tmp_path / 'bundle')
+    protected = tmp_path / 'candidate.tar.age'
+    encrypt_snapshot(tmp_path / 'bundle', protected, recipient)
+    scratch = tmp_path / 'drill'
+    scratch.mkdir(mode=0o700)
+    with protected.open('rb') as source:
+        decrypt_snapshot_stream(source, tmp_path / 'identity', scratch / 'bundle', max_bytes=16 * 1024 ** 2)
+    restored = scratch / 'bundle' / 'state' / 'archive.sqlite'
+    assert verify_recordings_bundle(scratch / 'bundle') == manifest
+    cont.readback(restored)
+    facts = cont.archive_facts(restored)
+    assert facts == baseline and facts['archive'] == manifest['archive']
+    assert manifest['archive'] == {'archive_id': cont.SYNTHETIC_ARCHIVE_ID, 'incarnation': 1, 'sequence': 7, 'records': 5}
+    cont.judge(baseline, facts)  # the restored point passes the continuity rules against its own baseline
+    # Step 5: a restore from an older point at the same incarnation is refused by the next backup, never kept silently.
+    newer = cont.archive_facts(cont.synthetic_archive(tmp_path / 'newer.sqlite', drill_records(6), events=9))
+    with pytest.raises(cont.ContinuityRefused, match='^archive_sequence_lower$'):
+        cont.judge(newer, facts)
+
+
+# spec: ANYM-731
+@pytest.mark.parametrize('fault', ['other_identity', 'changed_ciphertext'])
+def test_the_recordings_restore_drill_publishes_nothing_from_a_wrong_key_or_a_changed_object(tmp_path, fault):
+    import subprocess
+    import tarfile
+    from messaging_service import backup_recordings_continuity as cont
+    from messaging_service.backup_crypto import decrypt_snapshot_stream
+    from messaging_service.backup_recordings import create_recordings_snapshot
+    recipient = real_age(tmp_path)
+    live = cont.synthetic_archive(tmp_path / 'live' / 'archive.sqlite', drill_records(3))
+    create_recordings_snapshot(live, tmp_path / 'bundle')
+    protected = tmp_path / 'candidate.tar.age'
+    encrypt_snapshot(tmp_path / 'bundle', protected, recipient)
+    identity = tmp_path / 'identity'
+    if fault == 'other_identity':
+        identity = tmp_path / 'other-identity'
+        subprocess.run(['age-keygen', '-o', str(identity)], check=True, capture_output=True)
+    else:
+        data = bytearray(protected.read_bytes())
+        data[-40] ^= 1  # inside the last authenticated payload chunk
+        protected.write_bytes(bytes(data))
+    scratch = tmp_path / 'drill'
+    scratch.mkdir(mode=0o700)
+    # A wrong key leaves age's output empty (tar reads no member); a changed chunk fails age's authentication.
+    with protected.open('rb') as source, pytest.raises((tarfile.ReadError, RuntimeError)):
+        decrypt_snapshot_stream(source, identity, scratch / 'bundle', max_bytes=16 * 1024 ** 2)
+    assert list(scratch.iterdir()) == []  # no bundle and no temporary directory is left in the scratch

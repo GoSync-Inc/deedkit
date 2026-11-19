@@ -229,7 +229,7 @@ def test_the_window_is_03_to_05_bali_time_and_the_pass_start_varies_by_date_insi
     assert len(set(starts)) > 30
 
 
-# spec: ANYM-896
+# spec: ANYM-896, ANYM-330
 def test_a_holder_change_in_the_daytime_is_deferred_with_its_next_window_and_the_rest_goes(tmp_path, monkeypatch):
     host = first(tmp_path, monkeypatch)
     before = host.ids()
@@ -480,7 +480,7 @@ def test_an_expand_migration_on_collector_leases_recreates_the_collectors_and_de
     assert host.outcome(both, COLLECTOR) == {"recreated": ["code", "migration"]}
 
 
-# spec: ANYM-896
+# spec: ANYM-896, ANYM-330
 def test_a_compatible_collector_only_change_keeps_the_holder_and_an_incompatible_one_stops_nothing(tmp_path, monkeypatch):
     host = first(tmp_path, monkeypatch)
     holder = host.ids()[HOLDER]

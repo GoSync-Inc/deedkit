@@ -1693,7 +1693,7 @@ def keep_outcomes(result):
     return {service: next(iter(value)) for service, value in result["services"]["synthetic"].items()}
 
 
-# spec: ANYM-895
+# spec: ANYM-895, ANYM-330
 def test_a_gateway_only_release_stops_and_ups_only_the_gateway_and_the_collectors_keep_their_containers(tmp_path, monkeypatch):
     host = KeepHost(tmp_path, monkeypatch)
     first = host.release(RELEASES[0])

@@ -10,6 +10,8 @@ from messaging_service.envelope import stable_id
 from messaging_service.presentation import render
 from messaging_service.store import APIError
 from test_archive import archive as archive,event
+from test_archive import (DOCUMENT,PREVIEW_DOCUMENT,UNREADABLE_FORMAT,business,jitter_event,open_conflicts,preview,shifted,
+    unreadable,wa_event,whatsapp_event,wire)
 
 ROOT=Path(__file__).resolve().parents[1]
 OLD_INSERT='''INSERT INTO message_conflicts(receipt_digest,message,observed_revision,
@@ -378,3 +380,112 @@ def test_collector_states_documents_conflict_keys_and_every_class():
         assert f'`{word}`' in text,word
     assert set(KNOWN)<set(EXPLANATIONS) and UNCLASSIFIED in EXPLANATIONS
     assert all(line and '\n' not in line for line in EXPLANATIONS.values())
+
+
+def plain(body):
+    """A plain WhatsApp chat text: not one of the business kinds ANYM-560 completes."""
+    return wa_event(body=body,formatting=wire(body),metadata={'message_kind':'text','provider_message_type':'chat','chat_type':'private'})
+
+
+PHOTO=[{'provider_id':'f1','mime':'image/jpeg','bytes':10,'filename':'p.jpg'}]
+NAMED_DOCUMENT=dict(body='report.pdf',formatting=UNREADABLE_FORMAT,media=DOCUMENT,origin='backfill',metadata={'chat_type':'private'})
+EMPTY_CAPTION=dict(body='',formatting=UNREADABLE_FORMAT,media=DOCUMENT,
+    metadata={'message_kind':'document','provider_message_type':'document','chat_type':'private'})
+# The ANYM-698 class table (W = WhatsApp, T = Telegram media) whose verdict is settled in code: the forward rules
+# (ANYM-558, 559, 560, 611, 612, 613) take a class out of the conflicts, and each class the research called
+# expected-unresolved stays one open conflict under the class its production query counted. W2 and T2 (fix cards
+# ANYM-717 and ANYM-718, not built) and W5 (an identity-store pair, ANYM-559's own tests) are not in this table.
+CLASS_TABLE=[
+    ('W1_sent_at_jitter_both_stamped',lambda:jitter_event(),
+        lambda:jitter_event(sent_at=shifted(3),origin='backfill',metadata={'timestamp_resolution':'second'}),'unchanged',[]),
+    ('W3_jitter_and_a_body_difference',lambda:jitter_event(),
+        lambda:jitter_event(sent_at=shifted(3),body='Другой текст',formatting=wire('Другой текст')),
+        'conflict',['whatsapp_sent_at_newer_version']),
+    ('W4_sent_at_gap_above_6_s',lambda:jitter_event(),lambda:jitter_event(sent_at=shifted(30)),
+        'conflict',['whatsapp_sent_at_newer_version']),
+    ('W6_sender_stub_without_a_sender',lambda:whatsapp_event('900@lid',formatting=wire(),direction='incoming'),
+        lambda:whatsapp_event('',formatting=wire(),direction='incoming',origin='backfill'),'unchanged',[]),
+    ('W7_sender_device_number_only',lambda:whatsapp_event('900:7@lid',formatting=wire()),
+        lambda:whatsapp_event('900@lid',formatting=wire()),'unchanged',[]),
+    ('W8_business_text_after_an_empty_revision',lambda:unreadable(origin='live'),lambda:business(),'edited',[]),
+    ('W9_plain_text_after_an_empty_revision',lambda:unreadable(origin='live'),lambda:plain('Обычный текст'),
+        'conflict',['whatsapp_body_equal_version']),
+    ('W10_empty_caption_against_a_file_name_body',lambda:wa_event(**EMPTY_CAPTION),lambda:wa_event(**NAMED_DOCUMENT),
+        'conflict',['whatsapp_body_equal_version']),
+    ('W11_candidate_of_unknown_kind_and_empty',lambda:wa_event(),lambda:unreadable(),'unchanged',[]),
+    ('W12_candidate_without_a_kind_and_empty',lambda:wa_event(),lambda:unreadable(metadata={'chat_type':'private'}),
+        'conflict',['whatsapp_body_equal_version']),
+    ('W13_two_texts_at_one_version',lambda:plain('Первый текст'),lambda:plain('Второй текст'),
+        'conflict',['whatsapp_body_equal_version']),
+    ('W15_an_attachment_on_one_side_only',lambda:plain('Подпись'),lambda:{**plain('Подпись'),'media':PHOTO},
+        'conflict',['whatsapp_media_equal_version']),
+    ('T1_media_without_a_page_id',lambda:preview(page=None),lambda:preview(page=None,media=PREVIEW_DOCUMENT,origin='reconcile'),
+        'conflict',['telegram_media_equal_version']),
+    ('T_media_with_the_same_page_id_on_both_sides',lambda:preview(),lambda:preview(media=PREVIEW_DOCUMENT,origin='reconcile'),
+        'unchanged',[]),
+]
+
+
+# spec: ANYM-698
+@pytest.mark.parametrize('retained,candidate,outcome,classes',[case[1:] for case in CLASS_TABLE],ids=[case[0] for case in CLASS_TABLE])
+def test_each_measured_conflict_class_ends_as_its_verdict_and_counts_in_the_account_line(archive,retained,candidate,outcome,classes):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    first=retained()
+    mid=ar.ingest(first)['message']
+    assert ar.ingest(candidate())['outcome']==outcome
+    assert open_conflicts(s,mid)==classes
+    # The account line counts what stays open by its class; a class a rule removed leaves no trace in it.
+    row=account(s,s.issue_key('class-reader',[first['account']]))
+    assert row['active_conflicts']==len(classes)
+    assert row['conflicts']['attention']+row['conflicts']['known']==len(classes)
+    assert [c['class'] for c in row['conflicts']['top_classes']]==classes
+
+
+# spec: ANYM-561
+def test_the_three_remaining_classes_end_as_their_classification_found_them(archive):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    # F: a Telegram media descriptor that differs at one edit_date (the provider_id here) stays a media conflict.
+    media=ar.ingest(preview(page=None))['message']
+    changed=[{**PREVIEW_DOCUMENT[0],'provider_id':'301'}]
+    assert ar.ingest(preview(page=None,media=changed,origin='reconcile'))['outcome']=='conflict'
+    assert open_conflicts(s,media)==['telegram_media_equal_version']
+    # D: lid-to-lid outgoing senders that differ only by a `:<device>` suffix are one sender, not a conflict.
+    lid=ar.ingest(whatsapp_event('900:12@lid',formatting=wire(),provider_id='true_900@lid_3EB0LIDDEV'))['message']
+    assert ar.ingest(whatsapp_event('900@lid',formatting=wire(),provider_id='true_900@lid_3EB0LIDDEV'))['outcome']=='unchanged'
+    assert open_conflicts(s,lid)==[]
+    # C-62: a candidate with an empty body against a retained text. Unreadable (kind unknown) it is no evidence;
+    # without a kind it is kept as a body conflict on purpose (ANYM-613), and the retained text stays.
+    unread=ar.ingest(wa_event(provider_id='false_900@lid_3EB0EMPTY1'))['message']
+    assert ar.ingest(unreadable(provider_id='false_900@lid_3EB0EMPTY1'))['outcome']=='unchanged'
+    kindless=ar.ingest(wa_event(provider_id='false_900@lid_3EB0EMPTY2'))['message']
+    assert ar.ingest(unreadable(provider_id='false_900@lid_3EB0EMPTY2',metadata={'chat_type':'private'}))['outcome']=='conflict'
+    assert open_conflicts(s,unread)==[] and open_conflicts(s,kindless)==['whatsapp_body_equal_version']
+    with s.pool.connection() as c:
+        assert c.execute('SELECT body FROM messages WHERE id=%s',(kindless,)).fetchone()['body']=='Первый текст lighthouse'
+
+
+# spec: ANYM-530
+def test_hundreds_of_conflicts_reach_an_agent_as_one_bounded_line_per_account_and_no_health_or_resolve_tool(archive):
+    ar,s,key,_=archive
+    mids=[contradict(ar,f'b{n}',body=f'Другой {n}') for n in range(12)]
+    mids+=[contradict(ar,f's{n}',sender='43') for n in range(11)]
+    mids+=[contradict(ar,f'd{n}',direction='outgoing') for n in range(2)]
+    mids+=[contradict(ar,f't{n}',sent_at='2026-10-01T11:59:55+00:00') for n in range(2)]
+    status=s.get_sync_status(key)
+    row=status['sources'][0]
+    # Criterion 4: per account a count, the top classes (attention first at an equal count) and one next step;
+    # no per-message conflict item by default.
+    assert row['active_conflicts']==27
+    assert set(row['conflicts'])=={'attention','known','top_classes','next_step'}
+    assert row['conflicts']['attention']==13 and row['conflicts']['known']==14 and row['conflicts']['next_step']=='inspect_chat'
+    assert [(c['class'],c['count']) for c in row['conflicts']['top_classes']]==[
+        ('telegram_body_equal_version',12),('telegram_sender_equal_version',11),('telegram_sent_at_equal_version',2)]
+    assert row['alerts'].count('archive_version_conflicts')==1
+    assert not [mid for mid in mids if mid in str(status)]
+    compact=str(render('get_sync_status',s.get_sync_status(key,refresh=True),'compact'))
+    assert not [mid for mid in mids if mid in compact]
+    # Declined by the research: a separate health tool (get_sync_status carries the alerts) and a bulk resolve.
+    tools=s.capabilities(key)['tool_manifest']['names']
+    assert 'get_sync_status' in tools and not [t for t in tools if 'health' in t or 'conflict' in t]
