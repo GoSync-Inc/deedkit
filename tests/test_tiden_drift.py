@@ -803,3 +803,69 @@ def test_the_state_listing_reads_all_runs_only_when_a_commit_waits(repo, server)
     runs[1] = sync(b, number=2)
     calls.clear()
     assert run(repo, server, syncs)[0] == 0 and calls == [True] and server.state()["watermark"] == b
+
+
+def unanchored(output):
+    """The changed code files a failed run names as having no anchor."""
+    return {line[2:] for line in output.splitlines() if line.startswith("- ")}
+
+
+# spec: ANYM-314
+def test_the_delta_audit_names_every_file_a_merge_changed_since_the_watermark_and_advances_once_with_its_reason(
+        repo, server):
+    from fnmatch import fnmatchcase
+    a = commit(repo, {"services/messaging/app.py": "a"}, "A")
+    git(repo, "checkout", "-q", "-b", "side")
+    commit(repo, {"services/calls/side.py": "s", "docs/side.md": "d"}, "side work")
+    git(repo, "checkout", "-q", "main")
+    commit(repo, {"services/messaging/app.py": "b", "scripts/tool.py": "t"}, "B")
+    git(repo, "merge", "-q", "--no-ff", "-m", "Merge side", "side")
+    c = commit(repo, {"deploy/x.example.json": "{}", "tests/test_tool.py": "t", "uv.lock": "l"}, "C")
+    git(repo, "push", "-q", "origin", "main")
+    code_files = {"services/messaging/app.py", "services/calls/side.py", "scripts/tool.py", "deploy/x.example.json"}
+    # Every changed file of the delta, the side branch's included, is matched to an anchor or named as missing one.
+    server.set(watermark=a, anchors=["services/messaging/app.py"])
+    code, output = run(repo, server)
+    assert code == 1 and unanchored(output) == code_files - {"services/messaging/app.py"}
+    assert server.state()["advances"] == [] and server.state()["watermark"] == a
+    # Each other changed file carries a reviewed reason instead of an anchor.
+    for path in ("docs/side.md", "tests/test_tool.py", "uv.lock"):
+        assert [reason for pattern, reason in EXCLUDED if fnmatchcase(path, pattern)][0]
+    server.set(anchors=sorted(code_files))
+    code, output = run(repo, server)
+    assert code == 0 and f"Watermark advanced to {c}." in output
+    # One compare-and-set advance from the read watermark with a named reason, then the watermark read back.
+    assert [(item["--from"], item["--to"], item["--reason"]) for item in server.state()["advances"]] == [
+        (a, c, "empty_sync")]
+    assert server.state()["watermark"] == c and server.state()["status_calls"] == 3
+
+
+# The file classes ANYM-505 anchored by hand: build, packaging, ignore and attribute files, migrations, the schema,
+# package markers, workflow, deployment and configuration files and root scripts. Each still needs its own anchor.
+CONFIG_FILES = ("services/calendar/Dockerfile", "services/calendar/pyproject.toml", "services/calendar/.gitignore",
+                "services/calendar/.gitattributes", "services/calendar/.dockerignore", ".gitignore", ".gitattributes",
+                ".github/dco.yml", ".github/workflows/security.yml", "tools/dev/pyproject.toml",
+                "services/messaging/messaging_service/schema.sql",
+                "services/messaging/messaging_service/migrations/002_archive.sql",
+                "services/messaging/messaging_service/__init__.py",
+                "services/calendar/family_calendar/providers/__init__.py", "deploy/admin.example.json",
+                "config/feedback-delivery.json", "scripts/check_stack.py", "media_benchmark.py")
+
+
+# spec: ANYM-505
+def test_every_code_and_config_file_class_anchored_by_hand_still_needs_its_own_anchor(repo, server):
+    tracked = set(subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z"], check=True, capture_output=True,
+                                 text=True).stdout.split("\0"))
+    assert set(CONFIG_FILES) <= tracked and not [path for path in CONFIG_FILES if excluded(path)]
+    a = commit(repo, {"README.md": "x"}, "A")
+    c = commit(repo, {path: "x" for path in CONFIG_FILES}, "B")
+    git(repo, "push", "-q", "origin", "main")
+    server.set(watermark=a, anchors=[])
+    code, output = run(repo, server)
+    assert code == 1 and unanchored(output) == set(CONFIG_FILES)
+    # One file left bare holds the watermark; the others' anchors do not cover it.
+    server.set(anchors=list(CONFIG_FILES[1:]))
+    code, output = run(repo, server)
+    assert code == 1 and unanchored(output) == {CONFIG_FILES[0]} and server.state()["advances"] == []
+    server.set(anchors=list(CONFIG_FILES))
+    assert run(repo, server)[0] == 0 and server.state()["watermark"] == c
