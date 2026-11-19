@@ -3358,6 +3358,99 @@ def test_every_tiden_cli_install_accepts_only_a_well_formed_shared_pin(tmp_path,
         assert all(expression in script for script in scripts) and expression in setup
 
 
+def fake_tiden_binary(version):
+    """A stand-in Tiden CLI that prints VERSION as `tiden version` does and logs every other call."""
+    return ("#!/bin/sh\n"
+            'echo "$*" >> "$FAKE_TIDEN_LOG"\n'
+            f'case "$1" in version) printf \'{{\\n  "version": "{version}",\\n  "os": "linux"\\n}}\\n\' ;;\n'
+            '  config) if [ "${4:-}" = - ]; then cat > /dev/null; fi; if [ "$2" = verify ]; then echo verified; fi ;;\n'
+            "esac\n")
+
+
+def agent_setup(tmp_path, local):
+    """A checkout holding the real setup script and a pin whose checksum is that of a synthetic release archive of the
+    pinned version; a fake `curl` serves the archive and logs each URL. LOCAL is the version of the binary already on
+    the machine, or None."""
+    import hashlib
+    import io
+    import os
+    import subprocess
+    import tarfile
+    root = Path(__file__).resolve().parents[1]
+    pinned = next(line.split("=", 1)[1] for line in (root / "docs/harness/tiden.md").read_text().splitlines()
+                  if line.startswith("TIDEN_CLI_VERSION="))
+    checkout, fakes, bin_dir = tmp_path / "checkout", tmp_path / "fakes", tmp_path / "home/.local/bin"
+    for directory in (checkout / "scripts", checkout / "docs/harness", fakes):
+        directory.mkdir(parents=True)
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w:gz") as tar:
+        body = fake_tiden_binary(pinned).encode()
+        member = tarfile.TarInfo("tiden")
+        member.size, member.mode = len(body), 0o755
+        tar.addfile(member, io.BytesIO(body))
+    (tmp_path / "release.tar.gz").write_bytes(archive.getvalue())
+    (checkout / "docs/harness/tiden.md").write_text(
+        f"TIDEN_CLI_VERSION={pinned}\nTIDEN_CLI_SHA256_linux_amd64={hashlib.sha256(archive.getvalue()).hexdigest()}\n")
+    (checkout / "scripts/tiden_agent_setup.sh").write_text((root / "scripts/tiden_agent_setup.sh").read_text())
+    (fakes / "curl").write_text('#!/bin/sh\nout=\nwhile [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift ;;'
+                                ' https://*) echo "$1" >> "$FAKE_CURL_LOG" ;; esac; shift; done\n'
+                                'cp "$FAKE_RELEASE" "$out"\n')
+    (fakes / "curl").chmod(0o755)
+    if local is not None:
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "tiden").write_text(fake_tiden_binary(local))
+        (bin_dir / "tiden").chmod(0o755)
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    environment = {"PATH": f"{fakes}{os.pathsep}{os.environ['PATH']}", "HOME": str(tmp_path / "home"),
+                   "TIDEN_API_TOKEN": "canary-" + "x" * 8, "TIDEN_BIN_DIR": str(bin_dir),
+                   "FAKE_TIDEN_LOG": str(tmp_path / "tiden.log"), "FAKE_CURL_LOG": str(tmp_path / "curl.log"),
+                   "FAKE_RELEASE": str(tmp_path / "release.tar.gz")}
+    return pinned, checkout, bin_dir, environment
+
+
+def downloads(tmp_path):
+    log = tmp_path / "curl.log"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+# spec: ANYM-509
+@pytest.mark.parametrize("local", [None, "0.38.0", "prerelease", "pinned"])
+def test_an_agent_session_s_local_tiden_cli_is_exactly_the_version_ci_pins(tmp_path, local):
+    import subprocess
+    pinned = Path(__file__).resolve().parents[1].joinpath("docs/harness/tiden.md").read_text()
+    pinned = next(line.split("=", 1)[1] for line in pinned.splitlines() if line.startswith("TIDEN_CLI_VERSION="))
+    present = {"prerelease": pinned + "-rc.1", "pinned": pinned}.get(local, local)
+    pinned, checkout, bin_dir, environment = agent_setup(tmp_path, present)
+    before = (bin_dir / "tiden").read_bytes() if present else None
+    done = subprocess.run(["sh", "scripts/tiden_agent_setup.sh"], cwd=checkout, env=environment,
+                          capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.splitlines()[-1] == f"Tiden CLI {pinned} ready: {bin_dir}/tiden"
+    version = subprocess.run([str(bin_dir / "tiden"), "version"], env=environment, capture_output=True, text=True)
+    assert json.loads(version.stdout)["version"] == pinned
+    if local == "pinned":
+        # The pinned binary already in place is kept, with no download.
+        assert downloads(tmp_path) == [] and (bin_dir / "tiden").read_bytes() == before
+    else:
+        # Any other local version, a prerelease of the pinned one included, is replaced by the pinned release.
+        assert downloads(tmp_path) == [
+            f"https://github.com/qase-tms/homebrew-tap/releases/download/v{pinned}/tiden_linux_amd64.tar.gz"]
+
+
+# spec: ANYM-509
+def test_an_archive_that_fails_the_pinned_checksum_leaves_the_previous_local_cli_in_place(tmp_path):
+    import subprocess
+    pinned, checkout, bin_dir, environment = agent_setup(tmp_path, "0.38.0")
+    before = (bin_dir / "tiden").read_bytes()
+    with open(tmp_path / "release.tar.gz", "ab") as archive:
+        archive.write(b"tampered")
+    done = subprocess.run(["sh", "scripts/tiden_agent_setup.sh"], cwd=checkout, env=environment,
+                          capture_output=True, text=True)
+    assert done.returncode != 0 and "ready" not in done.stdout
+    assert len(downloads(tmp_path)) == 1 and (bin_dir / "tiden").read_bytes() == before
+    assert not (tmp_path / "tiden.log").exists() or "config" not in (tmp_path / "tiden.log").read_text()
+
+
 # spec: ANYM-578
 @pytest.mark.parametrize("report, reason", [(None, "missing"), ("{", "not JSON"), ('{"result": "none", "runs": [{}]}', "malformed"),
                                             ('{"result": "passed"}', "malformed"),

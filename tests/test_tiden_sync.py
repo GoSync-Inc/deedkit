@@ -1303,3 +1303,40 @@ def test_a_ready_merge_names_text_and_source_changes_without_their_values(server
     assert ("ANYM-12 changed on main, but not on the checked branch (content, extra\\nReady merge of proposal/ready done., sources, title)") in out, out
     assert "(content, extra" in written and sentinel not in out + written
     assert not any(line.startswith("Ready merge of") for line in (out + written).splitlines())
+
+
+# spec: ANYM-506
+def test_a_ready_merge_never_takes_a_spec_s_component_off_main(server):
+    main = [spec(12), dict(spec(60, status="Backlog", content=f"Criteria.\n{READY_LINE}\n"), componentId="c-main")]
+    copy = spec(60, status="Backlog", content=f"Changed criteria.\n{REFRESHED}\n", branch=True)
+    preview = {"modifications": [{"mainVersion": {"seqNum": 60, "componentId": "c-main"},
+                                  "branchVersion": {"seqNum": 60, "componentId": None}}],
+               "stats": {"modifications": 1, "conflicts": 0}}
+    # A branch copy without the component (absent or null) would clear it on main: refused before any write.
+    for cleared in (copy, dict(copy, componentId=None)):
+        ready_server(server, main=main, branch=[cleared], preview=preview)
+        code, out = ready_run(server)
+        assert code == 1 and "ANYM-60 changes more than its text on proposal/ready (componentId)" in out, out
+        assert not server.writes()
+    # The same text change that keeps the component merges.
+    kept = {"modifications": [{"mainVersion": {"seqNum": 60, "componentId": "c-main"},
+                               "branchVersion": {"seqNum": 60, "componentId": "c-main"}}],
+            "stats": {"modifications": 1, "conflicts": 0}}
+    ready_server(server, main=main, branch=[dict(copy, componentId="c-main")], preview=kept)
+    code, out = ready_run(server)
+    assert code == 0, out
+
+
+# spec: ANYM-507
+def test_no_repository_tool_links_tests_by_file_proximity_and_only_the_main_sync_writes_links():
+    root = Path(__file__).resolve().parents[1]
+    tracked = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], check=True, capture_output=True,
+                             text=True).stdout.split("\0")
+    tools = {path: (root / path).read_text(errors="replace") for path in tracked
+             if path.endswith((".py", ".sh", ".yml", ".yaml", ".mjs", ".js", ".ts", ".go", ".json", ".toml"))
+             and not any(part in ("tests", "test") for part in Path(path).parts) and (root / path).is_file()}
+    assert "scripts/tiden_sync.py" in tools and ".github/workflows/tiden-sync.yml" in tools
+    # `tiden test derive-links` writes exact-file links product-wide without review or a dry run.
+    assert [path for path, text in tools.items() if "derive-links" in text] == []
+    # Links are written only by sync B, from the `# spec:` markers of the tests a merge adds.
+    assert [path for path, text in tools.items() if "link-spec" in text] == ["scripts/tiden_sync.py"]

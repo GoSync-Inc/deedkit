@@ -21,7 +21,10 @@ version=$(sed -n 's/^TIDEN_CLI_VERSION=\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)
 checksum=$(sed -n 's/^TIDEN_CLI_SHA256_linux_amd64=\([0-9a-f]\{64\}\)$/\1/p' "$pin" | head -n 1)
 [ -n "$version" ] && [ -n "$checksum" ] || { echo "no valid Tiden pin in $pin" >&2; exit 1; }
 
-if ! "$bin_dir/tiden" version 2>/dev/null | grep -q "$version"; then
+# Exactly the pinned version: a substring match would keep a prerelease or another build of it (ANYM-509).
+current=$(TIDEN_NO_AUTO_UPDATE=1 "$bin_dir/tiden" version 2>/dev/null \
+  | sed -n 's/^ *"version": *"\([^"]*\)".*$/\1/p' | head -n 1) || current=
+if [ "$current" != "$version" ]; then
   work=$(mktemp -d)
   trap 'rm -rf "$work"' EXIT
   curl --fail --silent --show-error --location -o "$work/tiden.tar.gz" \
