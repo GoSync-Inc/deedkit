@@ -122,6 +122,46 @@ def cli_fixture(monkeypatch, tmp_path, *, actual_branch="branch-id", status="pas
     return calls, manifest
 
 
+# spec: ANYM-570
+def test_publish_omits_only_skips_when_the_required_host_is_unavailable(tmp_path, monkeypatch):
+    import subprocess
+
+    cli_fixture(monkeypatch, tmp_path, status="failed", attempts=str(len(CHECKS) + 3))
+    skip = '<skipped type="pytest.skip" message="[tiden:host-required] Needs the owner host"/>'
+    cases = {"host_skip": skip, "ordinary_skip": '<skipped message="Feature unavailable"/>',
+             "host_pass": "", "host_failure": f"{skip}<error/>"}
+    rows = "".join(f'<testcase name="{name}" file="tests/sample.py">{outcome}</testcase>'
+                   for name, outcome in cases.items())
+    original = f'<testsuites><testsuite tests="4" skipped="2" errors="1">{rows}</testsuite></testsuites>'
+    (tmp_path / "python.xml").write_text(original)
+    (tmp_path / "collector.xml").write_text(
+        f'<testsuite><testcase name="standalone_skip" file="tests/example.mjs">{skip}</testcase></testsuite>')
+    manifest = prepare(tmp_path, tmp_path, metadata())
+    normalized = (tmp_path / "normalized-python.xml").read_bytes()
+    run = subprocess.run
+    uploaded = {}
+
+    def capture(args, **kwargs):
+        if args[1:3] == ["run", "report"]:
+            for argument in args[4:args.index("--product-id")]:
+                path = Path(argument)
+                if path.suffix == ".xml":
+                    uploaded[path.name] = ET.parse(path).getroot()
+        return run(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", capture)
+    assert publish(tmp_path, manifest, "intent/feature", "product")["status"] == "failed"
+    assert list(uploaded) == ["normalized-python.xml"]
+    suite = uploaded["normalized-python.xml"].find("testsuite")
+    assert suite.attrib == {"tests": "3", "skipped": "1", "errors": "1"}
+    assert {case.get("name"): [child.tag for child in case] for case in suite.findall("testcase")} == {
+        "ordinary_skip": ["skipped"], "host_pass": [], "host_failure": ["skipped", "error"],
+    }
+    assert manifest["test_counts"] == {"passed": 1, "failed": 1, "skipped": 3}
+    assert (tmp_path / "python.xml").read_text() == original
+    assert (tmp_path / "normalized-python.xml").read_bytes() == normalized
+
+
 def test_publisher_checks_the_final_resolved_branch_not_only_run_creation(tmp_path, monkeypatch):
     calls, manifest = cli_fixture(monkeypatch, tmp_path, actual_branch="wrong-branch")
     with pytest.raises(RuntimeError, match="expected branch"):

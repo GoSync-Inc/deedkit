@@ -87,7 +87,7 @@ def test_vision_corpus_character_error_rate_and_list_items_meet_the_bar():
     from deedkit_android.screen_vision import available
 
     if not available():
-        pytest.skip('Apple Vision (macOS with the vision extra) is not available here')
+        pytest.skip('[tiden:host-required] Apple Vision (macOS with the vision extra) is unavailable here')
     summary = evaluate(CORPUS, None, recognizer=lambda image, ocr: recognize(image, {**ocr, 'engine': 'vision'}))
     assert summary['screens'] >= 20
     assert summary['cer_percent'] <= 2.0, summary

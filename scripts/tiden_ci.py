@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 import re
 import signal
 import subprocess
+from tempfile import TemporaryDirectory
 import time
 import urllib.error
 import urllib.parse
@@ -52,7 +53,7 @@ MODULE_REPORTS = {
     # The attestation verifier's own Go tests, one row per test (the root Python wrapper still runs them too).
     "attest_verify": ("attest-verify.json", "go", "tools/attest-verify"),
     # DK65: hosted macOS and Windows jobs run the one platform-only case of a Linux module natively, under that
-    # case's canonical identity; the Linux report keeps its own SKIP of it. Published in the second report phase.
+    # case's canonical identity. Published in the second report phase.
     "android_vision": ("android-vision.xml", "python", "services/android"),
     "deedkit_npm_windows": ("deedkit-npm-windows.xml", "node", "packages/deedkit"),
 }
@@ -974,6 +975,35 @@ def platform_paths(directory, manifest):
     return paths
 
 
+def publication_reports(paths: list[str], staging: Path) -> tuple[list[str], int]:
+    """Keep the CI artifact intact and stage only JUnit reports that contain host-unavailable skips."""
+    marker = "[tiden:host-required] "
+    reports = []
+    omitted = 0
+    for path in map(Path, paths):
+        data = path.read_bytes() if path.suffix == ".xml" else b""
+        if marker.encode() in data:
+            document = ET.fromstring(data)
+            skips = [(parent, case) for parent in document.iter() for case in parent.findall("testcase")
+                     if case_status(case) == "skipped" and case.find("skipped").get("message", "").startswith(marker)]
+            if skips:
+                omitted += len(skips)
+                for parent, case in skips:
+                    parent.remove(case)
+                if next(document.iter("testcase"), None) is None:
+                    continue
+                for suite in document.iter():
+                    if suite.tag in {"testsuites", "testsuite"}:
+                        cases = list(suite.iter("testcase"))
+                        for attribute, count in (("tests", len(cases)), ("skipped", sum(case_status(c) == "skipped" for c in cases))):
+                            if attribute in suite.attrib:
+                                suite.set(attribute, str(count))
+                path = staging / path.name
+                ET.ElementTree(document).write(path, encoding="utf-8", xml_declaration=True)
+        reports.append(str(path))
+    return reports, omitted
+
+
 def wait_for_live_doc(call, seq, result):
     """Poll the run until Tiden's live-doc sync has finished (at most 20 reads, 3 seconds apart)."""
     for attempt in range(20):
@@ -996,13 +1026,13 @@ def check_association(call, result, routed, expected, branch):
                            f"(live doc {result.get('liveDocStatus')}, branch {result.get('branchId')})")
 
 
-def check_result(manifest, result):
-    """The run needs a terminal verdict that agrees with the manifest's counts and failures."""
+def check_result(manifest, result, omitted_skips):
+    """The verdict must agree with CI evidence after subtracting host-unavailable skips."""
     if result.get("status") not in {"passed", "failed"}:
         raise RuntimeError("Tiden run has no terminal test verdict")
     check_count = len(CHECKS) + (len(MODULE_REPORTS) if "module_checks" in manifest else 0)
     expected_attempts = sum(manifest["test_counts"].values()) + check_count
-    if int(result["stats"]["attempts"]) != expected_attempts:
+    if omitted_skips > manifest["test_counts"].get("skipped", 0) or int(result["stats"]["attempts"]) != expected_attempts - omitted_skips:
         raise RuntimeError("Tiden result count differs from the authentic CI evidence")
     if evidence_failures(manifest) and result["status"] != "failed":
         raise RuntimeError("Tiden verdict contradicts failed or incomplete CI evidence")
@@ -1065,16 +1095,21 @@ def publish(directory: Path, manifest: dict, branch: str | None, product: str, c
         if not named or run["buildSha"] != manifest["sha"]:
             raise RuntimeError("Tiden rewrote the explicit source association")
         paths, platform = evidence_paths(directory, manifest), platform_paths(directory, manifest)
-        call(["run", "report", seq, *paths], "report")
-        # DK65: native platform reports re-execute cases a base report already sent, under the same identity. They
-        # go in one later call, only after the base call returned, so they never race it; a failure aborts the run.
-        if platform:
-            call(["run", "report", seq, *platform], "platform report")
+        with TemporaryDirectory(prefix="tiden-report-", dir=directory) as staging:
+            paths, base_skips = publication_reports(paths, Path(staging))
+            platform, native_skips = publication_reports(platform, Path(staging))
+            omitted = base_skips + native_skips
+            if omitted:
+                print(f"Tiden publication: omitted {omitted} skips for unavailable hosts")
+            call(["run", "report", seq, *paths], "report")
+            # DK65: publish native platform evidence after the base call so any attempts of the same case stay ordered.
+            if platform:
+                call(["run", "report", seq, *platform], "platform report")
         result = call(["run", "complete", seq], "complete", allow_verdict=True)
         completed = True
         result = wait_for_live_doc(call, seq, result)
         check_association(call, result, routed, expected, branch)
-        check_result(manifest, result)
+        check_result(manifest, result, omitted)
         return result
     finally:
         if not completed:
