@@ -76,13 +76,13 @@ def s(seeded):
 
 # spec: ANYM-785
 def test_stall_raises_for_a_scope_whose_newest_ready_is_old(s):
-    profile(s);job(s);job(s, 'ready', age='7 hours')
+    profile(s);job(s, sent='7 hours');job(s, 'ready', age='7 hours')
     assert codes(s) == {'enrichment_stalled'}
 
 
 # spec: ANYM-805
 def test_withheld_group_rows_raise_no_stall_until_an_agent_asks(s):
-    profile(s);queued=job(s);job(s, 'ready', age='7 hours')
+    profile(s);queued=job(s, sent='7 hours');job(s, 'ready', age='7 hours')
     with s.pool.connection() as c:
         c.execute('''INSERT INTO media_jobs(id,account,message,descriptor,state)
             SELECT id,%s,message,'{}'::jsonb,'ready' FROM attachments WHERE id=%s''', (TG, queued))
@@ -124,7 +124,7 @@ def test_health_counts_reused_copies_without_naming_their_source(s):
 # spec: ANYM-785
 def test_another_scopes_fresh_ready_does_not_hide_a_stall(s):
     profile(s);profile(s, WA)
-    job(s);job(s, 'ready', age='7 hours')
+    job(s, sent='7 hours');job(s, 'ready', age='7 hours')
     job(s, 'ready', account=WA)
     job(s, 'ready', profile_hash='profile-b')
     job(s, 'ready', provider='openai')
@@ -142,6 +142,23 @@ def test_a_new_scope_with_seconds_old_rows_raises_nothing_and_an_old_one_does(s)
     profile(s);job(s, age='5 seconds')
     assert codes(s) == set()
     job(s, age='7 hours')
+    assert codes(s) == {'enrichment_stalled'}
+
+
+# spec: ANYM-785
+@pytest.mark.parametrize('code', ['model_backpressure', 'worker_stopping'])
+def test_a_file_queued_minutes_after_a_quiet_spell_is_no_stall_until_it_has_waited_six_hours(s, code):
+    # Production 2026-11-18 23:40Z (Tiden issue 20024443): a scope's last ready was 12 h old because nothing had
+    # arrived. A new file deferred or requeued at a deploy read as a stall at once, and its ready 7 min later ended it.
+    profile(s);job(s, 'ready', age='12 hours')
+    fresh = job(s)
+    with s.pool.connection() as c:
+        c.execute('UPDATE attachment_enrichment SET error_code=%s WHERE attachment=%s', (code, fresh))
+    assert codes(s) == set()
+    # The same file deferred again and again for 7 h (each deferral refreshes updated_at): the 11-05 stall.
+    with s.pool.connection() as c:
+        c.execute("UPDATE messages SET sent_at=clock_timestamp()-interval '7 hours' FROM attachments a "
+                  'WHERE a.id=%s AND messages.id=a.message', (fresh,))
     assert codes(s) == {'enrichment_stalled'}
 
 
