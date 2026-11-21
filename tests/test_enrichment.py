@@ -1112,7 +1112,7 @@ def refuse_request(_):
 
 # spec: ANYM-697
 def test_an_audio_profile_keeps_originals_up_to_200_mib_and_other_kinds_stay_at_32(tmp_path):
-    for kind,limit,accepted in [('audio',200*1024**2,True),('audio',200*1024**2+1,False),
+    for kind,limit,accepted in [('audio',512*1024**2,True),('audio',512*1024**2+1,False),
             ('image',32*1024**2,True),('image',32*1024**2+1,False),('document',33*1024**2,False)]:
         if accepted:assert mini(tmp_path,kind,max_input_bytes=limit)['max_input_bytes']==limit
         else:

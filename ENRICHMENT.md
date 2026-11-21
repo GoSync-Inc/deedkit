@@ -42,7 +42,7 @@ be labelled cloud. It takes no `local-heavy` lock: the work happens on the mini.
 | `timeout_seconds` | up to 900 (a 4-hour recording takes about 8.5 minutes); sent to the service as `X-Request-Deadline-Seconds`, its queue deadline |
 | `backpressure_seconds` | cooldown when the mini says "not now" and gives no `Retry-After`: 1 to 900, default 120 |
 | `audio_response_format` | `verbose_json` (default, with segments) or `json` |
-| `max_input_bytes` | the largest original the worker copies: default 20 MiB for `audio` and `image`, 32 MiB for `document` (ANYM-702); the most a profile may set is 200 MiB for `audio` and 32 MiB for `image` and `document` (ANYM-697). What is sent is capped separately, below |
+| `max_input_bytes` | the largest original the worker copies: default 20 MiB for `audio` and `image`, 32 MiB for `document` (ANYM-702); the most a profile may set is 512 MiB for `audio` and 32 MiB for `image` and `document` (ANYM-697). What is sent is capped separately, below |
 
 Audio uses `POST {base_url}/audio/transcriptions`; photos and documents use `POST {base_url}/chat/completions`, a
 document sending its extracted text without an image (scanned-PDF page images are not part of this connector).
@@ -97,7 +97,7 @@ bytes it needs. The original always stays in the archive; the metadata says what
   limit and the timeouts, and records `transcoded` and `transcode_lossy` true with `transcode_format` `opus`. On a note
   that was an mp3 or an mp4 that is expected: `opus` names the format sent, not the source's. Every other ASR provider
   keeps the mp3 transcode of ogg notes and `transcode_format` `mp3`.
-- **Large recordings (ANYM-697).** The original cap (`max_input_bytes`, up to 200 MiB for audio) is separate from
+- **Large recordings (ANYM-697).** The original cap (`max_input_bytes`, up to 512 MiB for audio) is separate from
   the upload cap: the file that is sent is at most 32 MiB less 64 KiB (the mini's body cap counts the multipart
   framing; `UPLOAD_LIMIT_BYTES`), whatever the profile says. A source that would go unchanged but is over that cap
   is transcoded to Opus too, so a 48 MiB mp3 of 50 minutes is sent as about 9 MB. By bytes a note of about 3 hours
@@ -110,7 +110,7 @@ bytes it needs. The original always stays in the archive; the metadata says what
   (the parent's copy of the original runs before that clock, bounded by bytes, and uses part of the lease's
   50-second margin), and the mini refuses a body slower than its `upload_seconds`; in a bad link window a note that fits by bytes ends as
   `model_timeout` or `model_http_error` and is retried. A `video/mp4` note is transcribed from its audio track
-  (`-vn`). The copy of a large original lives in the worker's `/tmp`: the `enricher-mini` tmpfs is 320 MiB; the other
+  (`-vn`). The copy of a large original lives in the worker's `/tmp`: the `enricher-mini` tmpfs is 640 MiB; the other
   workers keep 128 MiB, so raise their `/tmp` in the same edit before raising a local profile above 100 MiB.
   `enrichment_failed` on a large original can mean the tmpfs is smaller than the profile's cap (an operator mistake);
   it is also the worker's code for any unexpected error (a missing file, a permission or I/O error), so read the mount
