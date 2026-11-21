@@ -250,7 +250,8 @@ def services_on(network):
 
 # spec: ANYM-697
 def test_enricher_mini_has_a_tmpfs_for_a_200_mib_original_and_the_others_keep_128m():
-    assert mini_service()["tmpfs"] == ["/tmp:size=320m,noexec,nosuid"]
+    # Keep the historical Tiden test identity; the configured original ceiling is now 512 MiB.
+    assert mini_service()["tmpfs"] == ["/tmp:size=640m,noexec,nosuid"]
     assert overlay()["x-enrichment-common"]["tmpfs"] == ["/tmp:size=128m,noexec,nosuid"]
 
 
