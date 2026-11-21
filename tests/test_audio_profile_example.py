@@ -1,4 +1,4 @@
-"""ANYM-697: the committed mini enrichment example promises the full 200 MiB audio original, the runtime's own bound,
+"""ANYM-697: the committed mini enrichment example promises the full 512 MiB audio original, the runtime's own bound,
 so a fresh install matches the worker's working space. Pure file and profile validation; no inference or network.
 ANYM-709: the mini worker's working space holds that original, and the worker copies exactly up to that bound."""
 import hashlib
@@ -9,8 +9,9 @@ from pathlib import Path
 import pytest
 import yaml
 
+# Historical test names and parameter IDs are stable Tiden identities; assertions follow the current limit.
 ROOT = Path(__file__).resolve().parents[1]
-MIB_200 = 209_715_200
+AUDIO_LIMIT = 536_870_912
 
 
 def example():
@@ -30,8 +31,8 @@ def valid(profile, kind, tmp_path):
 def test_the_example_audio_profile_carries_the_runtime_200_mib_original_bound(tmp_path):
     from messaging_service.enrichment_providers import AUDIO_ORIGINAL_MAX_BYTES
     audio = example()['profiles']['audio']
-    assert audio['max_input_bytes'] == MIB_200 == AUDIO_ORIGINAL_MAX_BYTES
-    assert valid(audio, 'audio', tmp_path)['max_input_bytes'] == MIB_200
+    assert audio['max_input_bytes'] == AUDIO_LIMIT == AUDIO_ORIGINAL_MAX_BYTES
+    assert valid(audio, 'audio', tmp_path)['max_input_bytes'] == AUDIO_LIMIT
 
 
 # spec: ANYM-697
@@ -42,7 +43,7 @@ def test_the_example_audio_profile_one_byte_over_is_refused_by_the_profile_valid
 
 
 def tmpfs_bytes(entry):
-    """The size of a Compose `tmpfs` entry such as `/tmp:size=320m,noexec,nosuid`, in bytes."""
+    """The size of a Compose `tmpfs` entry such as `/tmp:size=640m,noexec,nosuid`, in bytes."""
     options = dict(item.partition('=')[::2] for item in entry.partition(':')[2].split(','))
     number, unit = options['size'][:-1], options['size'][-1].lower()
     return int(number) * 1024 ** {'k': 1, 'm': 2, 'g': 3}[unit]
@@ -64,7 +65,7 @@ def test_the_mini_working_space_holds_the_largest_audio_original_with_its_upload
     from messaging_service.enrichment_providers import UPLOAD_LIMIT_BYTES
     mini, common = overlay_tmpfs()
     largest = valid(example()['profiles']['audio'], 'audio', tmp_path)['max_input_bytes']
-    assert mini == 320 * 1024 ** 2 and largest == MIB_200
+    assert mini == 640 * 1024 ** 2 and largest == AUDIO_LIMIT
     assert largest + UPLOAD_LIMIT_BYTES + MAX_RESULT_BYTES <= mini
     # The other workers keep 128 MiB: the mini's audio profile would not fit there (the state before the release).
     assert common == 128 * 1024 ** 2 < largest
@@ -93,9 +94,9 @@ def test_the_example_audio_profile_copies_a_200_mib_original_and_refuses_one_byt
     files, work = tmp_path / 'files', tmp_path / 'work'
     files.mkdir()
     work.mkdir()
-    row = sparse_original(files, MIB_200 + extra)
+    row = sparse_original(files, AUDIO_LIMIT + extra)
     if accepted:
-        assert verified_copy(files, row, work, limit).stat().st_size == MIB_200
+        assert verified_copy(files, row, work, limit).stat().st_size == AUDIO_LIMIT
     else:
         with pytest.raises(ModelError, match='^original_size_limit$'):
             verified_copy(files, row, work, limit)
