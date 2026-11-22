@@ -224,7 +224,7 @@ publication is a failed CLI install or publication step, and the reporting job
 still succeeds. That covers a Tiden error, a refused route or association, a
 contradicting verdict or count and a hang past the step timeout. Every step of
 the reporting job has its own timeout, and together they stay below the job's
-25 minutes, so a hung Tiden call ends as a step failure and never as a cancelled
+26 minutes, so a hung Tiden call ends as a step failure and never as a cancelled
 job. The job then logs a `Tiden evidence not published` warning naming the
 failed step and writes `tiden-publication.json` (`published: false`: the
 publication was not verified). It retains that file with any Tiden response in

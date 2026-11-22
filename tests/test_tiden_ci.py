@@ -2616,11 +2616,13 @@ def test_a_failed_tiden_publication_warns_and_never_fails_the_reporting_job(tmp_
     warn = "Warn that the evidence was not published to Tiden"
     # The reporting steps may fail without failing the job. Queue, docs-only and reuse
     # receipts still fail it, and so does the job itself: no job-level failure suppression.
+    pilot_inputs = "Apply the test exclusion inventory before the Tiden pilot receipt test"
     pilot_runner, pilot_read = ("Set up pytest runner for the Tiden pilot receipt", "Read back the ANYM-508 pilot receipt links")
     assert [name for name, step in steps.items() if step.get("continue-on-error")] == [
-        install, pilot_runner, pilot_read, publication]
-    assert steps[pilot_runner]["if"] == (
+        install, pilot_inputs, pilot_runner, pilot_read, publication]
+    assert steps[pilot_inputs]["if"] == (
         "steps.install.outcome == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'")
+    assert steps[pilot_runner]["if"] == "steps.pilot_inputs.outcome == 'success'"
     assert steps[pilot_read]["if"] == "steps.pilot_uv.outcome == 'success'"
     assert '--pilot-receipt-junit "$RUNNER_TEMP/anym-508.xml"' in steps[publication]["run"]
     assert "continue-on-error" not in job
