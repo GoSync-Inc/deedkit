@@ -148,6 +148,16 @@ uses Tiden CLI 0.41.0 from the official release with a pinned SHA-256 checksum.
 Fork pull requests do not receive the Tiden secret or publish evidence. Package
 release workflows that do not pass this optional secret still verify packages.
 
+On a main push, the reporting job runs the ANYM-508 pilot receipt test even
+when the push reuses queue or pull request evidence. The test reads the 86
+recorded links on Tiden main, using only `tiden test links`. Its fixture contains
+case and spec identifiers and test signatures from the October 26 write receipt.
+The root shards skip this test without the opt-in, and the publisher omits those
+skips. It requires one fresh executed JUnit case from the main push and publishes
+that pass or failure with the other results. The `tiden-receipt` artifact retains
+the report. The ordinary CI verification and reused artifacts stay independent
+of this live read.
+
 ## Configuration
 
 In GitHub Actions repository settings, add:
@@ -214,7 +224,7 @@ publication is a failed CLI install or publication step, and the reporting job
 still succeeds. That covers a Tiden error, a refused route or association, a
 contradicting verdict or count and a hang past the step timeout. Every step of
 the reporting job has its own timeout, and together they stay below the job's
-20 minutes, so a hung Tiden call ends as a step failure and never as a cancelled
+26 minutes, so a hung Tiden call ends as a step failure and never as a cancelled
 job. The job then logs a `Tiden evidence not published` warning naming the
 failed step and writes `tiden-publication.json` (`published: false`: the
 publication was not verified). It retains that file with any Tiden response in

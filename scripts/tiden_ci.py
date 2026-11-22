@@ -1,7 +1,8 @@
 """Preserve real CI outcomes and explicitly associate evidence with a Tiden branch.
 
-The preparation runner has no Tiden credentials. The publishing runner executes
-only this tool and the pinned Tiden CLI, never tests or application code.
+The preparation runner has no Tiden credentials. The publishing runner uses this
+tool and the pinned Tiden CLI. On main pushes it also runs the isolated,
+read-only ANYM-508 receipt test.
 """
 from __future__ import annotations
 
@@ -959,6 +960,24 @@ def evidence_paths(directory, manifest):
     return paths
 
 
+def add_pilot_receipt(directory: Path, manifest: dict, report: Path, root: Path) -> dict:
+    """Add the fresh main-push execution without changing the reused CI artifact."""
+    if manifest.get("event") != "push" or manifest.get("git_branch") != "main":
+        raise ValueError("ANYM-508 receipt evidence requires a main push")
+    node = "tests/test_tiden_pilot_receipt.py::test_tiden_main_retains_the_archive_search_pilot_links"
+    try:
+        normalized, counts = normalize_junit(report, root, "python")
+        cases = executions(ET.fromstring(normalized).iter("testcase"), root)
+        if not any(cases == Counter({(node, status): 1}) for status in ("passed", "failed")):
+            raise ValueError("expected the one executed ANYM-508 receipt test")
+    except (OSError, ValueError, ET.ParseError):
+        raise ValueError("The main push has no valid executed ANYM-508 receipt test report") from None
+    name = "tiden-anym-508.xml"
+    (directory / name).write_bytes(normalized)
+    return {**manifest, "reports": [*manifest["reports"], name],
+            "test_counts": dict(Counter(manifest["test_counts"]) + counts)}
+
+
 def platform_paths(directory, manifest):
     """The manifest's native platform reports (DK65): plain, present, bounded, none a base report; none means no
     second report phase."""
@@ -1522,6 +1541,7 @@ def main() -> int:
     parser.add_argument("--fragments", type=Path)
     parser.add_argument("--producer", action="append", default=[], help="<job>:<job result>:<captured source SHA>")
     parser.add_argument("--source-root", type=Path, default=Path.cwd())
+    parser.add_argument("--pilot-receipt-junit", type=Path)
     parser.add_argument("--environment", choices=RELEASE_ENVIRONMENTS)
     parser.add_argument("--sha")
     parser.add_argument("--url")
@@ -1572,6 +1592,8 @@ def main() -> int:
         print(f"The evidence records {failures}; see ci-checks.json." if failures else "Every test and check passed.")
         return 1 if failures else 0
     manifest = published_manifest(directory, json.loads((directory / "manifest.json").read_text()))
+    if args.pilot_receipt_junit is not None:
+        manifest = add_pilot_receipt(directory, manifest, args.pilot_receipt_junit, args.source_root)
     if merge_queue_run(manifest):
         # publish() skips a queue run before any Tiden call: no credentials, map or route needed.
         result = publish(directory, manifest, None, "")

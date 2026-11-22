@@ -11,7 +11,7 @@
     "scripts/release_enroll.py": {"lines": 1432, "longest_function": 146},
     "scripts/release_migrations.py": {"lines": 1687, "longest_function": 143},
     "scripts/seamless_release.py": {"lines": 1189, "longest_function": 76},
-    "scripts/tiden_ci.py": {"lines": 1671, "longest_function": 103},
+    "scripts/tiden_ci.py": {"lines": 1693, "longest_function": 103},
     "services/android/src/deedkit_android/agent_run.py": {"lines": 1265, "longest_function": 93},
     "services/android/src/deedkit_android/codex_session.py": {"lines": 1077, "longest_function": 101},
     "services/calendar/family_calendar/service/core.py": {"lines": 1198, "longest_function": 101},
