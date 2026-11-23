@@ -1,88 +1,106 @@
 # DeedKit
 
-**A modular platform where agents delegate messaging, calendar and voice tasks.**
+**A self-hosted toolkit for AI agents to work with your messages, Android phone,
+calendar, recordings and voice calls.**
 
-This is the existing AnyMsg repository. The messaging packages keep the names
-`anymsg` and `messaging_service`; their accounts, database and APIs remain compatible.
+An agent can find a document in a conversation, read its contents, manage a
+calendar event, carry out a task in a phone app, or prepare a voice call with a
+specific goal. DeedKit connects those capabilities through a common MCP/HTTP
+gateway, with separate credentials and access for each agent.
 
-| Module | Source | Runtime |
+This is the existing AnyMsg project, expanded into independent modules. Install
+the parts you need. Messaging retains its `anymsg` and `messaging_service` names
+and compatible account, database and API identities.
+
+## What agents can do
+
+These capabilities are implemented in the experimental development source.
+Availability depends on the modules, providers and rights configured in your
+installation.
+
+| Module | Capabilities | Guide |
 | --- | --- | --- |
-| Recording integrations | `services/recordings` | Optional Omi metadata, transcripts and overviews; [setup](services/recordings/README.md) |
-| Common MCP gateway | `services/gateway` | Selected tools, per-agent credentials and exact action ceilings |
-| Messaging (AnyMsg) | `services/messaging` | Telegram/WhatsApp archive and domain operations |
-| Family calendar | `services/calendar` | Google API/CalDAV, family roles, explicit coverage and plans |
-| Voice calls | `services/calls` | Scoped briefs, calls, results and owner decisions |
+| **Messaging** | Read and search Telegram/WhatsApp conversations, people and attachments; send messages and perform supported messenger actions; follow new events and missing replies. | [Operations](MESSENGER_OPERATIONS.md), [search](SEARCH.md), [sending](SENDING.md) |
+| **Android** | Give a phone agent a natural-language goal, continue the same conversation, inspect progress and results, use installed apps and handle order-related conversations. | [Android service](services/android/README.md), [BB route](docs/android-bb-conversation.md) |
+| **Calendar** | Read Google Calendar and iCloud CalDAV accounts, find shared availability, preview changes and apply event operations with receipts and conflict checks. | [Calendar service](services/calendar/docs/SERVICE.md) |
+| **Recordings** | Read Omi and PLAUD transcripts and summaries; optionally keep a private text archive with local search. | [Recording integrations](services/recordings/README.md) |
+| **Voice calls** | Prepare a goal, run a voice conversation, collect answers, request owner decisions and retrieve the result; Gemini Live and Grok engines. | [Calls](services/calls/README.md), [readiness](services/calls/GROK.md) |
+| **Gateway** | Expose selected module tools through one MCP/REST endpoint, with per-agent credentials and action ceilings. | [Gateway](services/gateway/README.md) |
 
-Each module has its own environment and state. Install only the modules you need.
-The gateway communicates over HTTP and does not install provider libraries.
+### Messaging, files and memory
 
-```sh
-python scripts/deedkit.py resolve --profile config/profiles/calendar-reader.toml --json
-uv sync --project services/gateway --locked
-uv sync --project services/calendar --locked
+- Multiple Telegram and WhatsApp accounts with independent collection state.
+- Full-text and fuzzy search, Russian word forms, people, chat/date/sender
+  filters, nearby context, revisions and source references.
+- PDF, Office and table extraction, OCR, audio transcription and optional
+  image/document descriptions through local or API profiles.
+- Separate download, extraction and AI-processing states, searchable passages
+  and timestamped transcription segments.
+- Durable subscriptions and explicit acknowledgements. Configured wake
+  integrations can notify an agent about messages and processing results.
+- Encrypted streaming backups, integrity verification and quarantine restore.
+
+See [file indexing](FILE_INDEX.md), [media storage](MEDIA_STORAGE.md),
+[enrichment](ENRICHMENT.md), [subscriptions](SUBSCRIPTIONS.md) and
+[backup](BACKUP_STREAMING.md).
+
+### Android tasks and ongoing work
+
+The Android service runs on a Mac or Linux host connected to the phone over USB.
+A configured `android_task` route sends goals and follow-ups to an existing BB
+Codex conversation on that host. Separate native-agent and workflow paths are
+also available.
+
+There are navigation hints for Gojek, Grab, Tokopedia and Halodoc, courier-chat
+support, and order observation and wake mechanisms. App versions, device access
+and the configured route affect what works. Individual operations and synthetic
+tests do not establish a complete purchase-to-delivery scenario.
+
+### Voice calls are experimental
+
+Browser rehearsal, Telegram audio and Twilio phone/SIP/WhatsApp Business paths
+are implemented. Each channel needs its own configuration. Twilio WhatsApp
+calling is separate from the personal WhatsApp archive connector.
+
+Live acceptance of conversation quality, interruptions, latency and audible
+completion remains open. Putting the agent's voice into a Gojek/Grab in-app
+courier call is separate, unfinished work. Readiness checks and unit tests do not
+prove a working end-to-end call.
+
+## Connect an agent
+
+Use the gateway's Streamable HTTP MCP endpoint:
+
+```text
+https://your-gateway.example/mcp
+Authorization: Bearer <agent gateway key>
 ```
 
-See [runtime and access](docs/platform-runtime.md), [architecture](ARCHITECTURE.md),
-[verification boundaries](docs/quality/platform-acceptance.md) and
-[messaging layout](docs/migrations/messaging-layout.md).
-Deployment profiles require explicit private configuration before `up`; resolving a
-profile does not connect accounts or authorize external actions.
+The gateway also serves `POST /v1/<tool>`. Its JavaScript client supports the
+same catalog:
 
-## Messaging compatibility
+```js
+import { DeedKitClient } from 'deedkit';
 
-**Self-hosted Telegram and WhatsApp archive for AI agents. A GoSync open-source project.**
+const deedkit = new DeedKitClient({
+  baseUrl: 'https://your-gateway.example',
+  token: process.env.DEEDKIT_GATEWAY_KEY,
+});
+const available = await deedkit.platformCapabilities();
+const hits = await deedkit.call('messages_search', { query: 'contract' });
+```
 
-Collect messages and attachments once, then let agents search and read them through
-MCP or HTTP with separate credentials and account/chat permissions. Original files
-use SHA-256 deduplication; references to every source message stay separate.
+See the [DeedKit client and CLI](packages/deedkit/README.md). The gateway uses
+private backend credentials; connecting a client does not pair accounts or
+enable external actions.
 
-[Conversation view and compatibility](CONVERSATION.md) explain message kinds,
-ordering uncertainty and the last known dialogue turn.
+## Install the modules you need
 
-Development version: **0.9.19 — experimental**, PostgreSQL schema 96.
+Start with [personal installation](docs/personal-install.md) for your own server,
+or [server setup](SETUP.md) and [platform runtime](docs/platform-runtime.md).
+Android needs its USB host; calls and recordings have separate provider setup.
 
-The expanded live-operation catalog covers messages, registered attachments,
-reactions, groups, contacts and profile fields. Access requires explicit per-key
-grants and account opt-in; see [MESSENGER_OPERATIONS.md](MESSENGER_OPERATIONS.md).
-Published npm/PyPI release: **0.9.9**; sending and independent WhatsApp IPC lanes
-require the development source until the next package release.
-
-## What works
-
-- Multiple Telegram and WhatsApp accounts, each with its own session and collection state.
-- PostgreSQL full-text search, including Russian word forms, people/usernames,
-  chat/date/sender filters, nearby context and direct provider references.
-- Searchable file text, PDF/Office/table extraction, bounded OCR and optional
-  audio transcription or image/document enrichment through local or API profiles.
-- Per-chat history coverage, collector errors and separate download/extraction/analysis states.
-- Scoped agent keys, independent acknowledgements, immutable review records and revision evidence.
-- Durable collection queues, storage admission, processing budgets and a shared heavy-job lock.
-- Encrypted streaming backup with integrity checks and quarantine restore tools.
-- Persistent subscriptions to explicit chats and people, with passive event inspection
-  and separate original/text/transcript/description readiness events.
-  Independent event ACK, bounded waits and operator-registered signed hints are available;
-  [SUBSCRIPTIONS.md](SUBSCRIPTIONS.md) separates hints from verified host turns.
-
-Text sending through existing collectors is available with separate `send` rights
-and explicit account opt-in. The acting agent obtains exact owner confirmation;
-there is no server approval gate yet. See [SENDING.md](SENDING.md). Reads do not mark messages
-as read in Telegram or WhatsApp. Empty search results do not prove complete history.
-Original retention and independent searchable descriptions require explicit
-worker configuration; [media storage](MEDIA_STORAGE.md) describes the 30-day
-policy and best-effort original recovery. Durable history-wave execution and
-cross-occurrence AI artifact reuse remain planned. Optional cloud processing is
-off until explicitly configured.
-
-## Distribution
-
-- **Python `anymsg`**: server, operator CLI and HTTP client. Internal `messaging_service`
-  imports, database names and migration checksums remain compatible.
-- **npm `anymsg`**: dependency-free JavaScript HTTP client and CLI for an existing server.
-  It does not install PostgreSQL, Chromium or a second messenger session.
-- **Source / Docker**: [server setup](SETUP.md) and explicit collector overlays in `deploy/`.
-- **Your own server**: [personal install](docs/personal-install.md), one VPS, no maintainer tooling.
-
-For a source installation with Python 3.13:
+For a source checkout with Python 3.13:
 
 ```sh
 git clone https://github.com/GoSync-Inc/deedkit.git
@@ -91,76 +109,37 @@ uv sync --group dev
 uv run anymsg --help
 ```
 
-Registry installation (Python 3.13):
+Development source is experimental. Published packages can lag its feature set;
+check [releasing](RELEASING.md) and the relevant package guide.
 
-```sh
-pip install anymsg==0.9.9
-npm install anymsg@0.9.9
-```
+## Messaging compatibility
 
-Python installs the server/operator CLI and HTTP client; npm installs only the
-JavaScript HTTP client/CLI. Deployment prerequisites are in [SETUP.md](SETUP.md).
-Maintainer publication instructions are in [RELEASING.md](RELEASING.md).
+Python `anymsg` includes the messaging server, operator CLI and HTTP client.
+The [npm `anymsg` client](packages/npm/README.md) connects directly to a messaging
+server. The `deedkit` JavaScript client connects to the common gateway. Existing
+AnyMsg integrations remain supported.
 
-JavaScript client:
+## Boundaries and verification
 
-```js
-import { AnyMsgClient } from 'anymsg';
-const client = new AnyMsgClient({
-  baseUrl: 'https://messages.example.com',
-  token: process.env.ANYMSG_TOKEN,
-});
-const result = await client.search({ query: 'contract', limit: 10 });
-```
+- Use each agent's own scoped key. Sending, calling, pairing and provider-session
+  actions require the authorization described in the module guides.
+- Archive reads do not mark messages as read in Telegram or WhatsApp. History can
+  be partial; an empty search does not prove completeness.
+- Local/cloud processing and original retention require explicit configuration.
+  Configuration does not prove current provider connectivity or quality.
+- The messaging server's tested stack is Linux amd64, Python 3.13 and PostgreSQL
+  18. Windows server execution and Docker ARM support are not claimed.
+- WhatsApp uses unofficial whatsmeow by default, with an explicit browser
+  fallback. Never run two clients against one provider session.
 
-Python client:
-
-```python
-import os
-from anymsg import Client
-with Client('https://messages.example.com', os.environ['ANYMSG_TOKEN']) as client:
-    result = client.search(query='contract', limit=10)
-```
-
-Point a Streamable HTTP MCP client at `https://messages.example.com/mcp` and set
-`Authorization: Bearer <agent key>`. Use each agent's own scoped key. The server
-uses JSON POSTs; it does not provide a GET notification stream.
-
-## Operations and limits
-
-The tested server stack is Linux amd64, Python 3.13 and PostgreSQL 18.
-The default WhatsApp collector uses a Go whatsmeow adapter without Chromium or
-Node. The explicit browser fallback requires Node 24 and Chromium. Native host
-installations also need PostgreSQL backup tools; the Python wheel does not install
-these system dependencies or the Go binary. Windows server execution is unsupported;
-Docker ARM support is not claimed.
-
-Use separate deployments/databases for different owners. Multiple accounts in one
-installation do not create a tenant security boundary. Never run two clients against
-one provider session. History available to a linked WhatsApp device can be partial.
-WhatsApp adapters use unofficial `whatsmeow` (default) or `whatsapp-web.js`
-(explicit fallback). They are separate from the WhatsApp Business API. Check
-`list_messenger_operations` for the capabilities of each configured account;
-unsupported provider actions are hidden. Follow provider terms and use appropriately
-authorized account/chat scopes.
-
-See [ACCESS.md](ACCESS.md), [SEARCH.md](SEARCH.md), [FILE_INDEX.md](FILE_INDEX.md),
-[COLLECTORS.md](COLLECTORS.md), [MEDIA_STORAGE.md](MEDIA_STORAGE.md),
-[ENRICHMENT.md](ENRICHMENT.md) and [BACKUP_STREAMING.md](BACKUP_STREAMING.md).
-Run synthetic tests only: [CONTRIBUTING.md](CONTRIBUTING.md).
-Current work, priorities and delivery status live in the existing Tiden product;
-[BACKLOG.md](BACKLOG.md) provides navigation and historical IDs. Agents follow the
-[Tiden product workflow](docs/operations/tiden-product-workflow.md).
-Component responsibilities and verification boundaries: [ARCHITECTURE.md](ARCHITECTURE.md).
-Historical agent review context: [REVIEW_FOLLOWUP.md](REVIEW_FOLLOWUP.md).
-Optional runtime diagnostics: [TELEMETRY.md](TELEMETRY.md).
+See [architecture](ARCHITECTURE.md), [verification boundaries](docs/quality/platform-acceptance.md),
+[access](ACCESS.md), [data policy](docs/DATA-POLICY.md) and
+[contributing](CONTRIBUTING.md). Current work lives in the existing Tiden
+product; [backlog navigation](BACKLOG.md) links the historical IDs.
 
 ## License and security
 
 MIT for original GoSync code. Dependencies retain their own licenses; see
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and `deploy/MOBY-LICENSE`.
-Report vulnerabilities privately through [GitHub security advisories](https://github.com/GoSync-Inc/deedkit/security/advisories/new),
-not by posting session data or tokens in an issue. See [SECURITY.md](SECURITY.md).
-
-Platform operations: [profiles, access, backup, cutover and rollback](docs/operations/platform-cutover.md).
-Verified gateway/API promotions: [ready-before-route HTTP releases](docs/operations/seamless-release.md).
+[third-party notices](THIRD_PARTY_NOTICES.md). Report vulnerabilities privately
+through [GitHub security advisories](https://github.com/GoSync-Inc/deedkit/security/advisories/new).
+See [SECURITY.md](SECURITY.md).
