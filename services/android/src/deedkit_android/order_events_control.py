@@ -143,8 +143,13 @@ class OrderControl:
                       lifecycle=row['lifecycle'], responsible=row['responsible'], next_check_at=row['next_check_at'],
                       notice_only=bool(row.get('task_only')), revision=row['revision'], delivery=holds[:16],
                       delivery_more=len(holds)>16)
+        state = json.loads(row['state_json'])
+        if row['lifecycle'] == 'active' and row['package'] and isinstance(state, dict):
+            # An app status is evidence to reconcile, not a terminal lifecycle decision.
+            if state.get('status') in ('delivered', 'cancelled'):
+                result['completion_pending'] = state['status']
         if not compact:
-            result.update(state=json.loads(row['state_json']), original_user_words=row['original_user_words'])
+            result.update(state=state, original_user_words=row['original_user_words'])
         return result
 
     def _provider_changes(self, row, changes):
@@ -247,7 +252,14 @@ class OrderControl:
                     result.update(items=[self.view(r, compact=True) for r in rows[:8]], more=len(rows)>8)
                 else:
                     self._change(ctx, row, changes)
-                    result['snapshot'] = self.view(self.events._order(ctx.owner, ref))
+                    current = self.events._order(ctx.owner, ref)
+                    lifecycle = current['lifecycle']
+                    if row['lifecycle'] == 'active' and lifecycle != 'active' and current['package'] and not current['task_only']:
+                        message = 'Order marked as received.' if lifecycle == 'received' else 'Order marked as cancelled.'
+                        result['wake_id'] = self._notice(ctx, current, 'status', {
+                            'message': message, 'package': current['package'], 'terminal_lifecycle': lifecycle,
+                        }, key)
+                    result['snapshot'] = self.view(current)
             elif operation == 'next_check':
                 if row is None:
                     raise OrderRefused('obligation_ref_required')
@@ -305,7 +317,8 @@ class OrderControl:
         self.events.db.execute('UPDATE android_order_wakes SET payload=? WHERE wake_id=?', (document(payload), wake_id))
 
     def _notice(self, ctx, row, kind, content, identity):
-        if row['lifecycle'] != 'active':
+        if row['lifecycle'] != 'active' and not (kind == 'status' and
+                content.get('terminal_lifecycle') == row['lifecycle']):
             raise OrderRefused('order_closed')
         wake = str(uuid.uuid5(uuid.NAMESPACE_URL, 'native-notice:' + identity))
         content = content | self._event_actor(ctx)

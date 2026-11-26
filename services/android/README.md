@@ -968,6 +968,11 @@ absent until an order exists. Later calls may inspect earlier active obligations
 owner/device/thread without replacing their originating task or exact user words. Direct native ADB
 remains the phone tool path. This function does not execute phone actions or relay arbitrary RPCs.
 
+An active order whose saved app status is `delivered` or `cancelled` reports `completion_pending`.
+Use an explicit `update` for the bound order's `lifecycle` after confirming receipt or cancellation.
+Closing that order removes its next check, retires its queued wakes and commits one final owner
+status in the same transaction. The local read receipt retires that status from the feed.
+
 Only an actual original start receipt records the registration hash. A resumed unregistered/legacy
 conversation stays on its original thread with control unavailable; there is no public supported hot-add
 or replacement-thread workaround. The installed original-thread transition remains a root rollout

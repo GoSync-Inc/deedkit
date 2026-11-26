@@ -152,11 +152,15 @@ class OrderFeed:
                 self.events.db.execute("INSERT INTO android_order_feed_receipts VALUES(?,'read',?,?)",
                                        (wake_id, principal_id(principal), digest))
             elif not old:
-                if row['lifecycle'] != 'active' or wake['state'] not in ('pending', 'sending', 'unknown', 'accepted'):
+                terminal_status = (row['lifecycle'] in ('received', 'cancelled') and wake['kind'] == 'status'
+                                   and json.loads(wake['payload'] or '{}').get('terminal_lifecycle') == row['lifecycle'])
+                if not (row['lifecycle'] == 'active' or terminal_status) or wake['state'] not in (
+                        'pending', 'sending', 'unknown', 'accepted'):
                     raise OrderRefused('receipt_not_current')
                 self.events.db.execute("INSERT INTO android_order_feed_receipts VALUES(?,'read',?,?)",
                                        (wake_id, principal_id(principal), digest))
-                self.events.db.execute("UPDATE android_order_wakes SET state='accepted',hold_reason=NULL WHERE wake_id=?", (wake_id,))
+                self.events.db.execute("UPDATE android_order_wakes SET state=?,hold_reason=NULL WHERE wake_id=?",
+                                       ('done' if terminal_status else 'accepted', wake_id))
                 if row.get('task_only'):
                     self.control._close_settled_notice(owner, row['order_id'])
             return dict(wake_id=wake_id, grok_state='read', native_status='not_observed')

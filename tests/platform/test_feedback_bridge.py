@@ -974,7 +974,7 @@ def test_main_reports_one_fixed_line_and_exit_1_when_bb_is_down(tmp_path, capsys
     gw.submit(row(1))
     tasks.fail_all = fb.Uncertain('tasks_timeout')
     env = write_env(tmp_path)
-    assert fb.main(['run'], environ={'DEEDKIT_FEEDBACK_BRIDGE_ENV': str(env)}, gateway=gw, tasks=tasks) == 1
+    assert fb.main(['run'], environ={'DEEDKIT_FEEDBACK_BRIDGE_ENV': str(env)}, gateway=gw, tasks=tasks, now=lambda: NOW) == 1
     capture = capsys.readouterr()
     assert capture.out == '' and capture.err.strip() == 'feedback-bridge: tasks_timeout' and KEY not in capture.err
 
@@ -983,9 +983,9 @@ def test_main_reports_one_fixed_line_and_exit_1_when_bb_is_down(tmp_path, capsys
 def test_main_is_silent_when_nothing_changed_and_prints_one_line_when_it_did(tmp_path, capsys):
     gw, tasks = FakeGateway(), FakeTasks()
     env = {'DEEDKIT_FEEDBACK_BRIDGE_ENV': str(write_env(tmp_path))}
-    assert fb.main(['run'], environ=env, gateway=gw, tasks=tasks) == 0 and capsys.readouterr().out == ''
+    assert fb.main(['run'], environ=env, gateway=gw, tasks=tasks, now=lambda: NOW) == 0 and capsys.readouterr().out == ''
     gw.submit(row(1))
-    assert fb.main(['run'], environ=env, gateway=gw, tasks=tasks) == 0
+    assert fb.main(['run'], environ=env, gateway=gw, tasks=tasks, now=lambda: NOW) == 0
     assert capsys.readouterr().out.strip() == 'feedback-bridge: created=1 updated=0 written=0'
 
 
