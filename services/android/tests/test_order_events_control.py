@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from deedkit_android.order_events import OrderEvents, OrderRefused
+from deedkit_android.order_events import Notification, OrderEvents, OrderRefused
 from deedkit_android.order_events_control import NativeOrderContext, OrderControl
 from deedkit_android.order_events_feed import OrderFeed
 
@@ -387,3 +387,59 @@ def test_provider_reference_update_remains_unique_and_notification_targets_exact
     assert world.events.observe(world.principal, event) == 'recorded'
     assert {w['order_id'] for w in world.events.pending()} == {first}
     assert world.events._order('owner', second)['seen'] == 0
+
+
+# spec: ANYM-997
+@pytest.mark.parametrize(('lifecycle', 'app_status'), [('received', 'delivered'), ('cancelled', 'cancelled')])
+def test_one_of_two_orders_closes_with_a_durable_owner_status(world, lifecycle, app_status):
+    def context(call_id):
+        return replace(world.context, native_call_id=call_id, native_request_id=call_id)
+
+    def update(ref, changes, call_id):
+        return call(world, 'update', {'obligation_ref': ref, 'changes': changes}, context(call_id))
+
+    grab = call(world, 'bind', {'package': 'com.grabtaxi.passenger', 'provider_order_id': 'synthetic-grab',
+                               'next_check_at': 1060.0}, context('bind-grab'))['obligation_ref']
+    gojek = call(world, 'bind', {'package': 'com.gojek.app', 'provider_order_id': 'synthetic-gojek',
+                                'next_check_at': 1060.0}, context('bind-gojek'))['obligation_ref']
+    for package in ('com.grabtaxi.passenger', 'com.gojek.app'):
+        observation = Notification(event_id=f'push:{package}', owner='owner', device_id='phone',
+                                   order_id=None, source_order_id=None, package=package, source_id='usb',
+                                   auth_epoch=1, observed_at=world.now[0], observation_ref='synthetic-push')
+        assert world.events.observe(world.principal, observation) == 'recorded'
+        assert world.events.observe(world.principal, observation) == 'duplicate'
+    observations = {wake['order_id']: wake['wake_id'] for wake in world.events.pending()}
+    assert set(observations) == {grab, gojek}
+
+    pending = update(grab, {'state': {'status': app_status}}, 'app-status')
+    listing = call(world, 'update', {'changes': {}}, context('list-orders'))['items']
+    assert pending['lifecycle'] == 'active'
+    assert pending['snapshot']['completion_pending'] == app_status
+    assert {item['obligation_ref']: item.get('completion_pending') for item in listing} == {
+        grab: app_status, gojek: None,
+    }
+
+    earlier = call(world, 'notify', {'obligation_ref': grab, 'message': 'Checking the app status.'},
+                   context('earlier-status'))['wake_id']
+    closed = update(grab, {'lifecycle': lifecycle}, 'owner-confirmed')
+    assert closed['lifecycle'] == lifecycle and closed['next_check_at'] is None
+    assert 'completion_pending' not in closed['snapshot']
+    assert world.events.wake(observations[grab])['state'] == 'cancelled'
+    assert world.events.wake(earlier)['state'] == 'cancelled'
+    assert world.events.wake(observations[gojek])['state'] == 'pending'
+    assert world.events.order(world.principal, 'owner', gojek)['lifecycle'] == 'active'
+
+    wake_id = closed['wake_id']
+    assert update(grab, {'lifecycle': lifecycle}, 'owner-confirmed')['wake_id'] == wake_id
+    with pytest.raises(OrderRefused, match='responsibility_not_owned'):
+        update(grab, {'lifecycle': lifecycle}, 'second-attempt')
+    assert len(world.feed.read_source(world.principal, 'owner', 'phone', 0)['events']) == 1
+    payload = world.feed.fetch(world.principal, 'owner', 'phone', wake_id)['payload']
+    assert payload['terminal_lifecycle'] == lifecycle and payload['package'] == 'com.grabtaxi.passenger'
+    assert payload['message']
+    with pytest.raises(OrderRefused, match='wake_not_owned'):
+        world.feed.ack_read(SimpleNamespace(id='grok'), 'owner', 'phone', wake_id)
+    ack = world.feed.ack_read(world.principal, 'owner', 'phone', wake_id)
+    assert ack == world.feed.ack_read(world.principal, 'owner', 'phone', wake_id)
+    assert world.feed.read_source(world.principal, 'owner', 'phone', 0)['events'] == []
+    assert world.events.wake(observations[gojek])['state'] == 'pending'
