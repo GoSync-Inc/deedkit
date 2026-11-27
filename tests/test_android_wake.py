@@ -9,7 +9,7 @@ from uuid import uuid4
 import pytest
 
 from messaging_service import android_wake as aw
-from messaging_service.store import APIError
+from messaging_service.store import APIError, RUNTIME_SCHEMA
 
 REAL_READY = aw.ready
 
@@ -309,6 +309,45 @@ def test_new_table_role_counts_readlock_and_no_binding_or_identity_write(world):
         assert len(attempts) == 1
     finally:
         for role in reversed(roles): remove(store, role)
+
+
+# spec: ANYM-997
+def test_real_gateway_stages_with_fresh_delivery_heartbeats_but_cannot_write_them(world, monkeypatch):
+    from psycopg import sql
+    from messaging_service import heartbeats
+    from test_db_role_isolation import install, remove
+
+    store, _, actor, _ = world
+    monkeypatch.setattr(aw, 'ready', REAL_READY)
+    gateway = install(store, 'gateway_role.sql', 'messaging_gateway')
+    try:
+        with store.pool.connection() as c, c.transaction(force_rollback=True):
+            for name in heartbeats.COMPONENTS:
+                c.execute("""INSERT INTO component_heartbeats(component,version,schema_version,beat_at)
+                    VALUES(%s,%s,%s,clock_timestamp()) ON CONFLICT(component) DO UPDATE
+                    SET version=EXCLUDED.version,schema_version=EXCLUDED.schema_version,beat_at=EXCLUDED.beat_at""",
+                    (name, heartbeats.identity(), RUNTIME_SCHEMA))
+            c.execute(sql.SQL('SET LOCAL ROLE {}').format(sql.Identifier(gateway)))
+            assert aw.ready(c), heartbeats.mismatch(c)
+            assert c.execute("UPDATE component_heartbeats SET beat_at=clock_timestamp() WHERE component='api'").rowcount == 1
+            assert not c.execute("UPDATE component_heartbeats SET beat_at=clock_timestamp() WHERE component IN "
+                                 "('matcher','dispatcher')").rowcount
+            item = event()
+            body = dict(device_id='phone', journal_id='native-journal', after=0, next_after=1,
+                        events=[item | {'sequence': 1}])
+            binding = aw._binding(c, actor, 'phone', update=True)
+            assert aw._stage(c, actor, binding, body)['items'][0]['wake_id'] == item['wake_id']
+            c.execute('RESET ROLE')
+            for name in ('matcher', 'dispatcher'):
+                c.execute("UPDATE component_heartbeats SET beat_at=clock_timestamp()-interval '5 minutes' "
+                          "WHERE component=%s", (name,))
+                c.execute(sql.SQL('SET LOCAL ROLE {}').format(sql.Identifier(gateway)))
+                assert not aw.ready(c)
+                assert heartbeats.mismatch(c) == {'error': 'component_heartbeat_stale', 'component': name}
+                c.execute('RESET ROLE')
+                c.execute('UPDATE component_heartbeats SET beat_at=clock_timestamp() WHERE component=%s', (name,))
+    finally:
+        remove(store, gateway)
 
 
 # spec: ANYM-997
