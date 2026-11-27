@@ -169,3 +169,11 @@ GRANT SELECT ON android_wake_bindings TO messaging_gateway;
 GRANT UPDATE(journal_id,after_seq) ON android_wake_bindings TO messaging_gateway;
 GRANT SELECT,INSERT ON android_wake_intents TO messaging_gateway;
 GRANT EXECUTE ON FUNCTION public.lock_android_wake_binding(text,uuid,text) TO messaging_gateway;
+
+-- ANYM-997: ingestion checks the matcher and dispatcher versions and freshness before advancing the source cursor.
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT FROM pg_policies WHERE tablename='component_heartbeats' AND policyname='messaging_gateway_delivery_beat_read') THEN
+        CREATE POLICY messaging_gateway_delivery_beat_read ON component_heartbeats FOR SELECT TO messaging_gateway
+            USING (component IN ('matcher','dispatcher'));
+    END IF;
+END $$;
