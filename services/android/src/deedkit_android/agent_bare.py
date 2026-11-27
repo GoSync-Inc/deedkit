@@ -44,13 +44,15 @@ class BareRun(AgentRun):
         self.skills_before = {}
         self.stderr, self.stderr_reader, self.commands_started = bytearray(), None, 0
 
-    def prompt(self):
+    def prompt(self, *, current_orders=None):
         host = self.agents.read_config()
         request = self.request
         # Use the validated request, not executor substitutions: those stringify bools/ints.
         # Lease/auth tokens and secret declarations have no place in model input.
         body = {name: getattr(request, name) for name in (
             'goal', 'owner_instruction', 'params', 'apps', 'outputs')}
+        if current_orders:
+            body['current_orders'] = current_orders
         prompt = (f'Android phone on this host: {host.adb} -s {host.devices[self.device]}.\n'
                   "You are the owner's agent that does orders and tasks on this phone.\n"
                   'Caller input (nonsecret JSON):\n')

@@ -926,7 +926,15 @@ class PersistentRun(BareRun):
             self.native_previous_turn = session.last_turn_id
             if session.order_control_registered:
                 self.native_boundary = self.agents.supervision.boundary(session, self.owner, self.device)
-            return before_submit() if before_submit else prompt
+            if before_submit:
+                return before_submit()
+            if self.input_text is None and self.native_previous_turn is None and session.order_control_registered and self.authorize:
+                admit()
+                control = self.agents.order_control()
+                if control is not None:
+                    orders = control.reconnect_snapshot(self.authorize(), self.owner, self.device, session.thread_id)
+                    return self.prompt(current_orders=orders)
+            return prompt
 
         def started(turn_id):
             if not isinstance(turn_id, str) or not turn_id:

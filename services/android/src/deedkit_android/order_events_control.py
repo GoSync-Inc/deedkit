@@ -152,6 +152,29 @@ class OrderControl:
             result.update(state=state, original_user_words=row['original_user_words'])
         return result
 
+    def reconnect_snapshot(self, principal, owner, device, thread):
+        """Bounded, read-only context for the first admitted turn on this native thread."""
+        if principal_id(principal) != owner:
+            raise OrderRefused('control_not_owned')
+        rows = self.events.db.execute('''SELECT * FROM android_order_obligations
+            WHERE owner=? AND device_id=? AND native_thread_id=? AND source_id=? AND auth_epoch=?
+            AND lifecycle='active' AND task_only=0 ORDER BY order_id LIMIT 9''',
+            (owner, device, thread, self.source_id, self.auth_epoch)).fetchall()
+        if not rows:
+            return None
+        orders = []
+        for raw in rows[:8]:
+            row = dict(raw)
+            self.events._authorize(principal, row)
+            item = dict(obligation_ref=row['order_id'], package=row['package'],
+                        provider_order_id=row['provider_order_id'], responsible=row['responsible'],
+                        next_check_at=row['next_check_at'])
+            state = json.loads(row['state_json'])
+            if isinstance(state, dict) and state.get('status') in ('delivered', 'cancelled'):
+                item['completion_pending'] = state['status']
+            orders.append(item)
+        return {'items': orders, 'more': len(rows) > len(orders)}
+
     def _provider_changes(self, row, changes):
         for key in ('package', 'provider_order_id', 'source_order_id'):
             if key in changes:
