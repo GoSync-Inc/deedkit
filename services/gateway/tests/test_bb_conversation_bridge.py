@@ -9,7 +9,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from agent_gateway.app import create_app
-from agent_gateway.catalog import CATALOG
+from agent_gateway.catalog import CATALOG, public
 from agent_gateway.diagnostics import phone_state
 from test_policy import config
 from test_transport import rpc
@@ -173,3 +173,22 @@ def test_task_schema_and_control_boundary_are_the_packaged_contract():
     assert CATALOG['android_task']['scopes'] == ['android:control']
     assert CATALOG['android_task']['annotations']['destructiveHint'] is True
     assert set(CATALOG['android_task']['inputSchema']['properties']) == {'device_id', 'action', 'request_id', 'text'}
+
+
+# spec: ANYM-993
+def test_discovery_leaves_android_execution_to_the_phone_agent(chain):
+    app, *_ = chain
+    with TestClient(app) as client:
+        tools = {tool['name']: tool for tool in rpc(client, 'tools/list').json()['result']['tools']}
+    description = tools['android_task']['description']
+    assert "goal and the owner's constraints" in description
+    assert 'Leave navigation, tool choice and screenshots to the phone agent' in description
+    assert 'Only specify a payment method the owner actually requested' in description
+    assert 'forwards the owner' in description
+    assert 'does not grant phone, checkout or payment authority' in description
+
+    native = public(CATALOG['android_agent'])
+    goal = native['inputSchema']['properties']['goal']['description']
+    assert 'Leave navigation, tool choice and screenshots to the phone agent' in goal
+    assert 'Only specify a payment method the owner actually requested' in goal
+    assert 'verbatim owner_instruction/restrictions' in native['description']
