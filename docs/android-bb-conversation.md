@@ -2,7 +2,8 @@
 
 The owner uses Grok in mobile Devkit. The existing GoSync MCP endpoint forwards
 `android_task` to the existing Android service, which sends the owner's original
-words to one configured BB Codex conversation on the USB host. Its thread ID is
+words to one configured existing BB conversation on the USB host: a Codex thread by
+default, or a Claude Code thread when the config selects that provider. Its thread ID is
 the returned `task_id` for goals, clarifications and results. BB's existing atomic
 queue remains the only conversation manager. No new agent, queue, public listener,
 native session, model selection or authentication is created.
@@ -51,9 +52,20 @@ The Android config accepts an optional `bb_conversation` object, absent by defau
   "project_id": "existing-project",
   "environment_id": "existing-environment",
   "host_id": "existing-machine",
-  "workspace": "/absolute/existing/workspace"
+  "workspace": "/absolute/existing/workspace",
+  "provider": "codex"
 }
 ```
+
+`provider` is the provider the configured thread must report: `codex` (the default when
+the key is absent) or `claude-code`. Any other value, including `null`, refuses the
+configuration. It is an admin setting only; a caller never chooses it per message. To
+run the same conversation path in an existing Claude Code thread, point `thread_id` at
+that thread and set `"provider": "claude-code"` together, with no work running in either
+thread; every other check stays. Rollback is the same object back on the original Codex
+thread with `"provider": "codex"` (or the key removed). Receipts stay bound to the thread
+that sent them: a request ID sent through one thread is refused, not resent, while the
+other is configured.
 
 Use the already authorized principal/device and the verified existing BB target;
 do not copy credentials into this object. Preserve existing native/model pins,
@@ -61,23 +73,29 @@ history, namespaces, receipts and grants. Install the accepted green-main Androi
 wheel and gateway through the normal release paths after fresh work/call checks.
 Retain exact prior package/config/policy and the normal executable undo.
 
-The live switch is adding that object to the private Android configuration and
+The first activation is adding that object to the private Android configuration and
 adding `android_task` to the intended existing gateway profile in a new policy
-revision. Keep the same backend URL, credentials and public MCP registration.
+revision. A later provider switch changes only `thread_id` and `provider` in the
+existing object, as above; the tool membership and the gateway policy stay. Keep the same backend URL, credentials and public MCP registration.
 Retain the old tool path while verifying tools/list, phone-free status and original
 receipt handling through the real admitted caller. Configuration success alone
 does not prove that mobile Grok selected or used the tool.
 
-Then, with fresh phone ownership and one concrete owner goal, verify Grok → same
-Codex → basket before checkout → clarification/status/result → Grok. Do not invent
+Then, with fresh phone ownership and one concrete owner goal, verify Grok → the same
+configured conversation of the selected provider → basket before checkout →
+clarification/status/result → Grok. Do not invent
 products, address or budget. Basket preparation does not authorize payment or
 placing the order. Verify busy/unknown/repeat behavior on synthetic tests, not a
 real purchase. Remove the old caller tool path only as a separate final step after
 replacement acceptance; do not stop or delete the original conversation.
 
-Undo: restore the prior tool membership in a new, higher gateway policy revision,
-preserving concurrent fields with the normal comparison checks; never lower an
-accepted revision. Remove the optional `bb_conversation` config object. If reverting binaries, first remove the tool from
-the profile, then restore the accepted prior package through normal lifecycle
-checks. Preserve the state database, BB history and send receipts; never restore
+Undo of a provider switch: restore the previous `thread_id` and `provider` together in
+the existing object, with no work running in either thread; keep the object, the tool
+membership and the gateway policy. Undo of the first activation: restore the prior tool
+membership in a new, higher gateway policy revision, preserving concurrent fields with
+the normal comparison checks (never lower an accepted revision), then remove the
+optional `bb_conversation` config object. If reverting binaries, first remove the tool
+from the profile, then restore the accepted prior package through normal lifecycle
+checks; a package without `provider` refuses a config that still names it, so restore
+the Codex thread without the key first. Preserve the state database, BB history and send receipts; never restore
 an old database to undo a code change. No live patch of immutable releases.

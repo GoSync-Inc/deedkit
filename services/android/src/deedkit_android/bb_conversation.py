@@ -109,7 +109,7 @@ class Conversation:
         value = self._run(['thread', 'show', self.target.thread_id, '--json'])
         thread, environment = value.get('thread', {}), value.get('environment') or {}
         if (thread.get('id') != self.target.thread_id or thread.get('projectId') != self.target.project_id
-                or thread.get('environmentId') != self.target.environment_id or thread.get('providerId') != 'codex'
+                or thread.get('environmentId') != self.target.environment_id or thread.get('providerId') != self.target.provider
                 or environment.get('id') != self.target.environment_id or environment.get('hostId') != self.target.host_id
                 or environment.get('path') != self.target.workspace):
             raise Refused('conversation_binding_changed')
