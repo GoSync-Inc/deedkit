@@ -15,6 +15,13 @@ active conversation or queues/starts its next turn in that same conversation.
 An ordinary clarification is another message to that conversation. The agent
 interprets its meaning using the existing history.
 
+When delegating a goal, give the desired outcome, facts the phone agent needs and
+the owner's actual constraints. The phone agent chooses the app path, tools and
+whether it needs a screenshot. Include an exact payment method, a screenshot
+deliverable or specific UI steps when the owner asks for them. Keep checkout or
+payment limits as given. For example, “Prepare the Grab cart for the listed
+items within Rp150,000. Stop before placing the order.”
+
 `action=status` reads BB metadata; `action=result` reads the latest conversation
 output only when idle with no queued messages. The latter is explicitly scoped
 `latest_conversation_result`, not an independent order-completion receipt.
