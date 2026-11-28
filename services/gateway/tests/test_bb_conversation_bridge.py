@@ -187,8 +187,7 @@ def test_discovery_leaves_android_execution_to_the_phone_agent(chain):
     assert 'forwards the owner' in description
     assert 'does not grant phone, checkout or payment authority' in description
 
-    native = public(CATALOG['android_agent'])
-    goal = native['inputSchema']['properties']['goal']['description']
-    assert 'Leave navigation, tool choice and screenshots to the phone agent' in goal
-    assert 'Only specify a payment method the owner actually requested' in goal
-    assert 'verbatim owner_instruction/restrictions' in native['description']
+    native = public(CATALOG['android_agent'])['description']
+    assert 'Leave navigation, tool choice and screenshots to the phone agent' in native
+    assert 'Only specify a payment method the owner actually requested' in native
+    assert 'verbatim owner_instruction/restrictions' in native
